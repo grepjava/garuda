@@ -47,6 +47,10 @@ async def app(scope, receive, send):
         await websocket_endpoint(scope, receive, send)
         return
 
+    if scope["type"] == "webtransport":
+        await webtransport_endpoint(scope, receive, send)
+        return
+
     assert scope["type"] == "http"
     path = scope["path"]
 
@@ -297,3 +301,77 @@ async def websocket_endpoint(scope, receive, send):
             await send({"type": "websocket.send", "text": "echo:" + text})
         else:
             await send({"type": "websocket.send", "bytes": b"echo:" + message["bytes"]})
+
+
+async def webtransport_endpoint(scope, receive, send):
+    """Exercises every message the WebTransport extension defines.
+
+    /wt          echoes stream data and datagrams back the way they came
+    /wt-reject   refuses the session
+    /wt-push     opens a server-initiated stream and writes to it
+    /wt-close    accepts, then closes with a code and a reason
+    """
+    path = scope["path"]
+
+    message = await receive()
+    assert message["type"] == "webtransport.connect", message
+
+    if path == "/wt-reject":
+        await send({"type": "webtransport.close", "code": 403})
+        return
+
+    await send({"type": "webtransport.accept"})
+
+    if path == "/wt-close":
+        await send({"type": "webtransport.close", "code": 7,
+                    "reason": "asked to"})
+        return
+
+    if path == "/wt-push":
+        # Both directions, so the client can check the prefix of each.
+        await send({"type": "webtransport.stream.open", "bidirectional": False})
+        opened = await receive()
+        assert opened["type"] == "webtransport.stream.opened", opened
+        await send({"type": "webtransport.stream.send",
+                    "stream": opened["stream"], "data": b"push-uni",
+                    "end_stream": True})
+        await send({"type": "webtransport.stream.open", "bidirectional": True})
+        opened = await receive()
+        assert opened["type"] == "webtransport.stream.opened", opened
+        await send({"type": "webtransport.stream.send",
+                    "stream": opened["stream"], "data": b"push-bidi",
+                    "end_stream": True})
+
+    # Streams may be finished before their echo is written, so partial data is
+    # accumulated per stream and answered when the peer says it is done.
+    buffers = {}
+    while True:
+        message = await receive()
+        kind = message["type"]
+        if not kind.startswith("webtransport."):
+            # The connection went away underneath the session rather than the
+            # session ending; there is nothing left to answer.
+            return
+        if kind == "webtransport.disconnect":
+            return
+        if kind == "webtransport.datagram.receive":
+            await send({"type": "webtransport.datagram.send",
+                        "data": b"echo:" + message["data"]})
+        elif kind == "webtransport.stream.receive":
+            stream = message["stream"]
+            buffers[stream] = buffers.get(stream, b"") + message["data"]
+            if message["more_data"]:
+                continue
+            body = buffers.pop(stream)
+            if stream % 4 == 0:
+                # A bidirectional stream is answered on itself.
+                await send({"type": "webtransport.stream.send", "stream": stream,
+                            "data": b"echo:" + body, "end_stream": True})
+            else:
+                # A unidirectional one has to be answered on a new stream.
+                await send({"type": "webtransport.stream.open",
+                            "bidirectional": False})
+                opened = await receive()
+                await send({"type": "webtransport.stream.send",
+                            "stream": opened["stream"], "data": b"echo:" + body,
+                            "end_stream": True})

@@ -651,6 +651,12 @@ public struct Worker {
     mutating func dispatch(_ slot: Int) {
         switch appProtocol {
         case .wsgi:
+            // WSGI has no way to express a stream that outlives its response,
+            // so an extended CONNECT has nothing to be handed to.
+            if table[slot].pointee.h3Protocol.readableBytes > 0 {
+                failRequest(slot, status: 501)
+                return
+            }
             dispatchWSGI(slot)
         case .asgi:
             dispatchASGI(slot)
@@ -946,6 +952,10 @@ public struct Worker {
             h3.destroy()
             c.pointee.h3 = nil
         }
+        // A WebTransport session takes its streams with it, and they are the
+        // transport's rather than the table's, so they are released here
+        // before the parent link this needs is cut.
+        if c.pointee.wt != nil { releaseWebTransport(slot) }
         if let connection = c.pointee.quicRef {
             connection.applicationSlot = -1
             if let quic { quic.close(connection, nowMs: pg_monotonic_ms()) }
@@ -1172,7 +1182,14 @@ public struct Worker {
     mutating func resumeWriterIfDrained(_ slot: Int) {
         let c = table[slot]
         guard let waiter = c.pointee.drainWaiter else { return }
-        if c.pointee.write.readableBytes > config.writeLowWaterMark { return }
+        if c.pointee.wt != nil {
+            if wtOutstanding(slot) > config.writeLowWaterMark { return }
+        } else if c.pointee.isH3Stream {
+            if c.pointee.write.readableBytes > config.writeLowWaterMark { return }
+            if h3Outstanding(slot) > config.writeLowWaterMark { return }
+        } else if c.pointee.write.readableBytes > config.writeLowWaterMark {
+            return
+        }
         c.pointee.drainWaiter = nil
         if let r = pg_call2(ASGIRuntime.fnResolve, waiter, Interned.none) {
             pg_decref(r)
@@ -1189,9 +1206,16 @@ public struct Worker {
         let c = table[slot]
         guard let future = c.pointee.pendingReceive else { return }
         c.pointee.pendingReceive = nil
-        let message = c.pointee.flags.contains(.websocketMode)
-            ? ASGIWebSocketMessage.disconnect(code: c.pointee.ws.closeCode)
-            : ASGIMessage.httpDisconnect()
+        let message: PyObj?
+        if let session = c.pointee.wt {
+            session.disconnectDelivered = true
+            message = ASGIWebTransportMessage.disconnect(code: session.closeCode,
+                                                         reason: session.closeReason)
+        } else if c.pointee.flags.contains(.websocketMode) {
+            message = ASGIWebSocketMessage.disconnect(code: c.pointee.ws.closeCode)
+        } else {
+            message = ASGIMessage.httpDisconnect()
+        }
         if let message {
             if let r = pg_call2(ASGIRuntime.fnResolve, future, message) {
                 pg_decref(r)

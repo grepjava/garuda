@@ -88,6 +88,12 @@ public struct QUICReceiveStream {
     public var highWater: UInt64 = 0
     /// The limit we advertised.
     public var limit: UInt64 = 0
+    /// The largest limit the peer has been told, so that raising it is what
+    /// sends a frame rather than merely being behind one. Re-announcing a
+    /// limit the peer already has is not just waste: a stream that owes data
+    /// it cannot send yet would otherwise give the sender something to put in
+    /// a packet on every pass, forever.
+    public var announced: UInt64 = 0
     public var finalSize: UInt64?
     public var finished = false
     /// Set once the application has been told the stream ended.

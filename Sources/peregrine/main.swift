@@ -69,6 +69,13 @@ func printUsage() {
       --reload                 restart workers when source files change
       --no-uvloop              do not use uvloop even when installed
       --no-lifespan            skip the ASGI lifespan protocol
+      --tls-cert PATH          PEM certificate chain; enables TLS with ALPN
+      --tls-key PATH           PEM private key for it
+      --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
+      --no-http2               refuse HTTP/2 and answer HTTP/1.1 only
+      --http2-only             serve only HTTP/2 (h2c), with no HTTP/1 fallback
+      --http3                  also serve HTTP/3 over QUIC (needs TLS)
+      --quic-port PORT         UDP port for HTTP/3 (default: the TCP port)
       --no-websockets          reject WebSocket upgrades with 501
       --ws-max-message BYTES   largest accepted WebSocket message (16 MiB)
       --ws-ping-interval MS    keepalive ping period, 0 to disable (20000)

@@ -232,6 +232,7 @@ extension Worker {
 
     /// How much this stream has queued on the transport but not yet had
     /// acknowledged, which is what write backpressure is measured against.
+    @usableFromInline
     func h3Outstanding(_ streamSlot: Int) -> Int {
         let s = table[streamSlot]
         let parent = Int(s.pointee.parentSlot)

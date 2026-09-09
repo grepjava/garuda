@@ -21,9 +21,11 @@ public enum HTTP3FrameType {
     public static let pushPromise: UInt64 = 0x05
     public static let goaway: UInt64 = 0x07
     public static let maxPushID: UInt64 = 0x0d
-    /// RFC 9297: an HTTP datagram carried in a stream, which WebTransport uses
-    /// for its capsules.
-    public static let webTransportUni: UInt64 = 0x41
+    /// draft-ietf-webtrans-http3: the first varint on a client-initiated
+    /// bidirectional stream that belongs to a WebTransport session rather than
+    /// carrying a request. The session identifier follows, and everything after
+    /// that is the session's own bytes rather than frames.
+    public static let webTransportStream: UInt64 = 0x41
 
     /// Frame types HTTP/2 used that HTTP/3 forbids.
     @inlinable
@@ -84,4 +86,23 @@ public enum HTTP3Error {
     public static let qpackDecompressionFailed: UInt64 = 0x0200
     public static let qpackEncoderStreamError: UInt64 = 0x0201
     public static let qpackDecoderStreamError: UInt64 = 0x0202
+
+    /// draft-ietf-webtrans-http3: the session a stream belonged to has ended.
+    public static let webTransportSessionGone: UInt64 = 0x170d_7b68
+    /// A stream arrived for a session that has not been established, and we
+    /// were unwilling to hold it until one appeared.
+    public static let webTransportBufferedStreamRejected: UInt64 = 0x3994_bd84
+}
+
+/// The capsule protocol (RFC 9297), as WebTransport uses it.
+///
+/// Once a CONNECT stream has been accepted it stops carrying HTTP/3 frames and
+/// starts carrying capsules. The shape is the same -- a type, a length and a
+/// payload, all varints -- but the numbering is a separate registry, which is
+/// why these are not `HTTP3FrameType` values.
+public enum HTTP3Capsule {
+    /// draft-ietf-webtrans-http3: an application close code and a UTF-8 reason.
+    public static let closeWebTransportSession: UInt64 = 0x2843
+    /// The peer will accept no new streams but has not closed yet.
+    public static let drainWebTransportSession: UInt64 = 0x78ae
 }

@@ -418,13 +418,16 @@ extension QUICConnection {
                 continue
             }
 
-            // A reader that has caught up needs the peer told it may send more.
-            if stream.receive.limit > 0 && stream.receive.window < stream.receive.limit / 2 {
+            // A reader that has caught up needs the peer told it may send
+            // more -- once per raise. Saying it again would put a frame in
+            // every packet for as long as the stream had anything to send.
+            if stream.receive.limit > stream.receive.announced {
                 let need = 1 + quicVarintLength(id) + quicVarintLength(stream.receive.limit)
                 if writer.room >= need {
                     writer.varint(QUICFrameType.maxStreamData)
                     writer.varint(id)
                     writer.varint(stream.receive.limit)
+                    stream.receive.announced = stream.receive.limit
                     frames.maxStreamData.append(id)
                     ackEliciting = true
                 }
@@ -763,7 +766,12 @@ extension QUICConnection {
         if packet.frames.maxData { maxDataPending = true }
         if packet.frames.maxStreamsBidi { maxStreamsBidiPending = true }
         if packet.frames.maxStreamsUni { maxStreamsUniPending = true }
-        for id in packet.frames.maxStreamData { markWritable(id) }
+        for id in packet.frames.maxStreamData {
+            // A limit the peer never received is a limit it does not have, so
+            // the current one is announced again rather than the lost value.
+            streams[id]?.receive.announced = 0
+            markWritable(id)
+        }
         for id in packet.frames.resetStream {
             streams[id]?.send.resetSent = false
             markWritable(id)

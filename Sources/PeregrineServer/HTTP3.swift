@@ -44,8 +44,6 @@ public final class H3Connection {
     var peerQpackEncoder: UInt64 = .max
     var peerQpackDecoder: UInt64 = .max
 
-    /// Peer unidirectional streams whose type varint has not arrived yet.
-    var pendingUni: Set<UInt64> = []
     /// Peer unidirectional streams whose type we know and do not want.
     var ignoredUni: Set<UInt64> = []
 
@@ -59,6 +57,13 @@ public final class H3Connection {
     var streams: [UInt64: Int32] = [:]
     var goneAway = false
 
+    /// WebTransport sessions, by the identifier of their CONNECT stream.
+    var sessions: [UInt64: Int32] = [:]
+    /// Which session slot a WebTransport data stream belongs to.
+    var wtStreams: [UInt64: Int32] = [:]
+    /// Streams that named a session whose CONNECT has not arrived yet.
+    var wtOrphans: [UInt64: [(UInt64, Bool)]] = [:]
+
     init(quic: QUICConnection) {
         self.quic = quic
     }
@@ -67,6 +72,11 @@ public final class H3Connection {
         decoder.destroy()
     }
 }
+
+/// How many WebTransport sessions one connection may run at once. Each one
+/// costs a slot and an application task, so this is a limit on the client
+/// rather than a capability.
+let wtMaxSessions = 16
 
 extension Worker {
     // MARK: - Connection set-up
@@ -149,6 +159,12 @@ extension Worker {
         if h3.quic.peerAllowsDatagrams {
             body.writeVarint(HTTP3Setting.h3Datagram)
             body.writeVarint(1)
+            // Offered only alongside datagrams. A WebTransport session whose
+            // datagrams cannot be carried is a session that works differently
+            // from the one the client asked for, and saying so up front is
+            // better than discovering it a message in.
+            body.writeVarint(HTTP3Setting.webTransportMaxSessions)
+            body.writeVarint(UInt64(wtMaxSessions))
         }
         settings.writeVarint(UInt64(body.readableBytes))
         settings.write(UnsafePointer(body.readPointer), body.readableBytes)
@@ -183,6 +199,14 @@ extension Worker {
               let h3 = table[slot].pointee.h3 else { return }
         table[slot].pointee.lastActivity = pg_monotonic_ms()
 
+        // A stream that belongs to a WebTransport session is not HTTP/3 at
+        // all past its prefix: no frames, no QPACK, just bytes.
+        if let sessionSlot = h3.wtStreams[streamID].map(Int.init) {
+            wtStreamReadable(sessionSlot, h3, streamID)
+            flushQUIC(slot)
+            return
+        }
+
         if QUICStreamKind.isUnidirectional(streamID) {
             if QUICStreamKind.isServerInitiated(streamID) { return }
             readPeerUnidirectional(slot, h3, streamID)
@@ -196,6 +220,17 @@ extension Worker {
                                      code: UInt64) {
         let slot = Int(connection.applicationSlot)
         guard slot >= 0, let h3 = table[slot].pointee.h3 else { return }
+        if let sessionSlot = h3.wtStreams[streamID].map(Int.init) {
+            wtStreamAborted(sessionSlot, h3, streamID)
+            flushQUIC(slot)
+            return
+        }
+        if let sessionSlot = h3.sessions[streamID].map(Int.init) {
+            // The CONNECT stream is the session. Losing it loses the session.
+            endWebTransportSession(sessionSlot, clean: false)
+            flushQUIC(slot)
+            return
+        }
         if streamID == h3.peerControl {
             // The control stream is the connection: losing it loses the
             // connection with it.
@@ -212,17 +247,36 @@ extension Worker {
     mutating func http3StreamWritable(_ connection: QUICConnection, streamID: UInt64) {
         let slot = Int(connection.applicationSlot)
         guard slot >= 0, let h3 = table[slot].pointee.h3 else { return }
+        if let sessionSlot = h3.wtStreams[streamID].map(Int.init) {
+            wtStreamWritable(sessionSlot)
+            flushQUIC(slot)
+            return
+        }
         if let streamSlot = h3.streams[streamID].map(Int.init) {
-            _ = flushH3Stream(streamSlot)
-            resumeWriterIfDrained(streamSlot)
+            if table[streamSlot].pointee.wt != nil {
+                resumeWriterIfDrained(streamSlot)
+            } else {
+                _ = flushH3Stream(streamSlot)
+                resumeWriterIfDrained(streamSlot)
+            }
         }
         flushQUIC(slot)
     }
 
     mutating func http3Datagrams(_ connection: QUICConnection) {
-        // Datagrams belong to WebTransport sessions; until one exists there is
-        // nowhere for them to go.
+        let slot = Int(connection.applicationSlot)
+        guard slot >= 0, let h3 = table[slot].pointee.h3 else {
+            connection.incomingDatagrams.removeAll(keepingCapacity: true)
+            return
+        }
+        // Datagrams belong to WebTransport sessions; one that names no live
+        // session has nowhere to go, and dropping it is what unreliable means.
+        let arrived = connection.incomingDatagrams
         connection.incomingDatagrams.removeAll(keepingCapacity: true)
+        for payload in arrived {
+            wtDatagram(slot, h3, payload)
+        }
+        flushQUIC(slot)
     }
 
     // MARK: - Unidirectional streams
@@ -235,22 +289,37 @@ extension Worker {
             return
         }
 
-        if !h3.pendingUni.contains(streamID) && !isKnownUni(h3, streamID) {
-            // First bytes on this stream: read its type.
+        if !isKnownUni(h3, streamID) {
+            // First bytes on this stream: read its type. Nothing is consumed
+            // until the whole prefix is there, so a type split across packets
+            // simply waits rather than needing to be remembered.
             let available = stream.receive.ready.readableBytes
             if available == 0 { return }
-            var r = QUICReader(UnsafePointer(stream.receive.ready.readPointer), available)
+            let base = UnsafePointer(stream.receive.ready.readPointer)
+            var r = QUICReader(base, available)
             guard let type = r.varint() else {
-                // The type is a varint of up to eight bytes and may be split
-                // across packets.
+                // A varint is at most eight bytes; more than that and it is
+                // not one.
                 if available >= 8 {
                     h3.quic.close(HTTP3Error.generalProtocolError, application: true)
                 }
-                h3.pendingUni.insert(streamID)
+                return
+            }
+            if type == HTTP3StreamType.webTransport {
+                // The session identifier follows the type, and the two
+                // together are the whole prefix.
+                guard let sessionID = r.varint() else {
+                    if available >= 16 {
+                        h3.quic.close(HTTP3Error.generalProtocolError, application: true)
+                    }
+                    return
+                }
+                stream.receive.ready.consume(r.offset)
+                _ = adoptWebTransportStream(slot, h3, streamID, sessionID: sessionID,
+                                            bidirectional: false)
                 return
             }
             stream.receive.ready.consume(r.offset)
-            h3.pendingUni.remove(streamID)
             if !adoptUnidirectional(slot, h3, streamID, type: type) { return }
         }
 
@@ -399,6 +468,37 @@ extension Worker {
         // control stream may simply be behind -- but a request stream that
         // finishes without one is.
         var streamSlot = h3.streams[streamID].map(Int.init) ?? -1
+
+        // An accepted extended CONNECT stops carrying frames the moment it
+        // becomes a session: from there it is capsules.
+        if streamSlot >= 0, table[streamSlot].pointee.wt != nil {
+            readWTCapsules(streamSlot, h3, stream)
+            if table[streamSlot].pointee.state != .free {
+                h3.quic.extendStreamWindow(streamID, consumed: stream.receive.received)
+            }
+            return
+        }
+
+        // A bidirectional stream that opens with WEBTRANSPORT_STREAM is not a
+        // request. Nothing is consumed until both varints are there.
+        if streamSlot < 0 {
+            let available = stream.receive.ready.readableBytes
+            if available == 0 { return }
+            let base = UnsafePointer(stream.receive.ready.readPointer)
+            var r = QUICReader(base, available)
+            if let type = r.varint(), type == HTTP3FrameType.webTransportStream {
+                guard let sessionID = r.varint() else {
+                    if available >= 16 {
+                        h3.quic.close(HTTP3Error.frameError, application: true)
+                    }
+                    return
+                }
+                stream.receive.ready.consume(r.offset)
+                _ = adoptWebTransportStream(slot, h3, streamID, sessionID: sessionID,
+                                            bidirectional: true)
+                return
+            }
+        }
 
         while true {
             let available = stream.receive.ready.readableBytes
@@ -607,6 +707,7 @@ extension Worker {
         s.pointee.h2 = nil
         s.pointee.h3 = nil
         s.pointee.quicRef = nil
+        s.pointee.wt = nil
         s.pointee.responseRemaining = -1
         s.pointee.h3FrameType = 0
         s.pointee.h3FrameRemaining = 0

@@ -241,6 +241,19 @@ extension Worker {
             return
         }
 
+        // An extended CONNECT is a request only in its head. What it becomes
+        // is named by `:protocol`, and WebTransport is the one we speak.
+        if c.pointee.h3Protocol.readableBytes > 0 {
+            let p = UnsafePointer(c.pointee.h3Protocol.readPointer)
+            let n = c.pointee.h3Protocol.readableBytes
+            if n == 12 && equalsExact(p, 12, "webtransport") {
+                dispatchWebTransport(slot)
+            } else {
+                failRequest(slot, status: 501)
+            }
+            return
+        }
+
         // A WebSocket upgrade is still an HTTP request at this point; from here
         // it takes a different route entirely.
         if c.pointee.head.flags.contains(.upgrade) {
@@ -367,6 +380,9 @@ extension Worker {
     mutating func nextReceiveMessage(_ slot: Int, blocking: Bool) -> PyObj? {
         let c = table[slot]
 
+        if c.pointee.flags.contains(.webtransportMode) {
+            return nextWebTransportMessage(slot)
+        }
         if c.pointee.flags.contains(.websocketMode) {
             return nextWebSocketMessage(slot)
         }
@@ -624,6 +640,10 @@ extension Worker {
         if let r = c.pointee.receiveCallable { pg_decref(r); c.pointee.receiveCallable = nil }
         if let f = c.pointee.pendingReceive { pg_decref(f); c.pointee.pendingReceive = nil }
 
+        if c.pointee.flags.contains(.webtransportMode) {
+            webtransportTaskFinished(slot, error: error)
+            return
+        }
         if c.pointee.flags.contains(.websocketMode) {
             websocketTaskFinished(slot, error: error)
             return
@@ -658,7 +678,20 @@ extension Worker {
     /// must stop producing.
     @inlinable
     public func writerShouldPause(_ slot: Int) -> Bool {
-        table[slot].pointee.write.readableBytes > config.writeHighWaterMark
+        // A WebTransport session writes onto QUIC streams rather than into the
+        // slot's buffer, so what it is behind on is what the transport has
+        // queued and not yet had acknowledged.
+        if table[slot].pointee.wt != nil {
+            return wtOutstanding(slot) > config.writeHighWaterMark
+        }
+        // An HTTP/3 response is handed to the transport whole rather than
+        // written to a socket, so the slot's own buffer empties immediately
+        // and says nothing about how far behind the peer is. What it is behind
+        // on is what QUIC has queued and not yet had acknowledged.
+        if table[slot].pointee.isH3Stream {
+            return h3Outstanding(slot) > config.writeHighWaterMark
+        }
+        return table[slot].pointee.write.readableBytes > config.writeHighWaterMark
     }
 
     /// The Future `await send()` should suspend on. Owned reference.
@@ -724,7 +757,12 @@ func asgiSend(_ token: UInt64, _ args: PyObj?) -> PyObj? {
     guard let typeStr = pg_str_utf8_data(typeObj, &n) else { return nil }
     let t = UnsafeRawPointer(typeStr).assumingMemoryBound(to: UInt8.self)
 
-    if worker.pointee.table[slot].pointee.flags.contains(.websocketMode) {
+    if worker.pointee.table[slot].pointee.flags.contains(.webtransportMode) {
+        if !worker.pointee.webtransportSend(slot, type: t, typeLength: Int(n),
+                                            message: message) {
+            return nil
+        }
+    } else if worker.pointee.table[slot].pointee.flags.contains(.websocketMode) {
         if !worker.pointee.websocketSend(slot, type: t, typeLength: Int(n), message: message) {
             return nil
         }

@@ -93,11 +93,33 @@ public struct ASGIScopeBuilder {
                                client: PyObj?,
                                schemeOverride: PyObj? = nil,
                                websocket: Bool = false,
+                               webtransport: Bool = false,
                                subprotocols: PyObj? = nil) -> PyObj? {
         guard let scope = pg_dict_copy(prototype) else { return nil }
 
         if let schemeOverride, pg_dict_set(scope, Interned[.scheme], schemeOverride) != 0 {
             pg_decref(scope); return nil
+        }
+        if webtransport {
+            // ASGI has no standard WebTransport scope, so this one is
+            // Peregrine's, declared in `extensions` the way the specification
+            // says a server extension announces itself. Like a websocket it has
+            // no method: the CONNECT that carried it is the transport, not the
+            // request the application is answering.
+            if pg_dict_set(scope, Interned[.type], Interned[.vWebTransport]) != 0 {
+                pg_decref(scope); return nil
+            }
+            guard let extensions = pg_dict_new(), let empty = pg_dict_new() else {
+                pg_decref(scope); return nil
+            }
+            defer {
+                pg_decref(extensions)
+                pg_decref(empty)
+            }
+            if pg_dict_set(extensions, Interned[.vWebTransport], empty) != 0
+                || pg_dict_set(scope, Interned[.extensions], extensions) != 0 {
+                pg_decref(scope); return nil
+            }
         }
         if websocket {
             // A websocket scope has no method, and carries the subprotocols the
@@ -130,7 +152,7 @@ public struct ASGIScopeBuilder {
         }
 
         // method
-        if !websocket {
+        if !websocket && !webtransport {
             let methodCode = HTTPMethodCode(rawMethodIndex: head.method.rawValue)
             if let interned = Interned.methodName(methodCode) {
                 if pg_dict_set(scope, Interned[.method], interned) != 0 {

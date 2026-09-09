@@ -85,6 +85,11 @@ public struct ConnFlags: OptionSet, Sendable {
     /// same, so the two are told apart here rather than by looking upward.
     public static let http3Stream      = ConnFlags(rawValue: 1 << 16)
 
+    /// This slot is an accepted-or-pending WebTransport session rather than a
+    /// request: its extended CONNECT stream carries capsules, and the streams
+    /// and datagrams that belong to it are routed here.
+    public static let webtransportMode = ConnFlags(rawValue: 1 << 17)
+
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
     /// one of these here would leak state across a pipelined request.
@@ -164,6 +169,8 @@ public struct Connection {
     /// The `:protocol` of an extended CONNECT, which is how WebTransport and
     /// WebSocket-over-HTTP/3 announce themselves.
     public var h3Protocol = ByteBuffer()
+    /// The WebTransport session this extended CONNECT became, if it became one.
+    public var wt: WTSession? = nil
 
     /// True when this slot is one stream of a multiplexed connection rather
     /// than a connection in its own right.

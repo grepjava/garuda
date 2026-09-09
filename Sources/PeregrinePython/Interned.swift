@@ -32,6 +32,7 @@ public enum PyKey: Int, CaseIterable {
     // --- ASGI message keys ---
     case body, moreBody, status, trailers
     case text, bytesKey, subprotocol, subprotocols, code, reason
+    case data, stream, moreData, endStream, bidirectional
 
     // --- ASGI values ---
     case vHTTP, vWebsocket, vLifespan
@@ -45,6 +46,10 @@ public enum PyKey: Int, CaseIterable {
     case vWS, vWSS
     case vWebsocketConnect, vWebsocketAccept, vWebsocketReceive
     case vWebsocketSend, vWebsocketDisconnect, vWebsocketClose
+    case vWebTransport
+    case vWTConnect, vWTAccept, vWTClose, vWTDisconnect
+    case vWTStreamOpen, vWTStreamOpened, vWTStreamReceive, vWTStreamSend
+    case vWTDatagramReceive, vWTDatagramSend
 
     // --- method names for the ASGI scope ---
     case mGET, mHEAD, mPOST, mPUT, mDELETE, mPATCH, mOPTIONS, mCONNECT, mTRACE
@@ -69,6 +74,7 @@ private let keyNames: [StaticString] = [
 
     "body", "more_body", "status", "trailers",
     "text", "bytes", "subprotocol", "subprotocols", "code", "reason",
+    "data", "stream", "more_data", "end_stream", "bidirectional",
 
     "http", "websocket", "lifespan",
     "3.0", "2.3", "1.1", "1.0", "2", "3",
@@ -81,6 +87,12 @@ private let keyNames: [StaticString] = [
     "ws", "wss",
     "websocket.connect", "websocket.accept", "websocket.receive",
     "websocket.send", "websocket.disconnect", "websocket.close",
+    "webtransport",
+    "webtransport.connect", "webtransport.accept", "webtransport.close",
+    "webtransport.disconnect",
+    "webtransport.stream.open", "webtransport.stream.opened",
+    "webtransport.stream.receive", "webtransport.stream.send",
+    "webtransport.datagram.receive", "webtransport.datagram.send",
 
     "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "TRACE",
 

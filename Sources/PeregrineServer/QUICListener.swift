@@ -208,8 +208,16 @@ public final class QUICListener {
         _ = writeAll(connection, nowMs: nowMs)
     }
 
+    /// The most datagrams one connection may send before the others get a
+    /// turn. Congestion control is what normally stops this loop, so the cap
+    /// is generous; what it is really for is that a connection which believes
+    /// it always has something to send must not be able to hold the worker.
+    private static let datagramsPerTurn = 4096
+
     private func writeAll(_ connection: QUICConnection, nowMs: UInt64) -> Bool {
-        while true {
+        var remaining = QUICListener.datagramsPerTurn
+        while remaining > 0 {
+            remaining -= 1
             let n = connection.nextDatagram(sendBuffer, QUICListener.datagramSize, nowMs: nowMs)
             if n == 0 { return true }
             var peer = connection.peerAddress
@@ -226,6 +234,7 @@ public final class QUICListener {
                 return true
             }
         }
+        return true
     }
 
     // MARK: - Timers

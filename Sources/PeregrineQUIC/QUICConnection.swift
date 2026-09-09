@@ -173,6 +173,8 @@ public final class QUICConnection {
     var pathResponsePending: [[UInt8]] = []
 
     public internal(set) var events: [QUICEvent] = []
+    /// Streams already announced as writable in the current batch.
+    var writableAnnounced: Set<UInt64> = []
 
     let config: QUICServerConfig
 
@@ -237,7 +239,20 @@ public final class QUICConnection {
     public func takeEvents() -> [QUICEvent] {
         let out = events
         events.removeAll(keepingCapacity: true)
+        writableAnnounced.removeAll(keepingCapacity: true)
         return out
+    }
+
+    /// Says that a stream can take more, once per batch of events.
+    ///
+    /// A large transfer is acknowledged a packet at a time, and the layer
+    /// above only needs to hear that the transport caught up, not how many
+    /// times: one event per stream per drain is enough to release a producer
+    /// and cheap enough not to matter.
+    func noteWritable(_ id: UInt64) {
+        if writableAnnounced.insert(id).inserted {
+            events.append(QUICEvent(.streamWritable, streamID: id))
+        }
     }
 
     // MARK: - Receiving
@@ -445,7 +460,7 @@ public final class QUICConnection {
                 if let stream = streams[id], limit > stream.send.limit {
                     stream.send.limit = limit
                     markWritable(id)
-                    events.append(QUICEvent(.streamWritable, streamID: id))
+                    noteWritable(id)
                 }
 
             case QUICFrameType.maxStreamsBidi:
@@ -827,6 +842,9 @@ public final class QUICConnection {
             stream.receive.limit = unidirectional
                 ? localParameters.initialMaxStreamDataUni
                 : localParameters.initialMaxStreamDataBidiRemote
+            // The peer already knows this much: it read our transport
+            // parameters.
+            stream.receive.announced = stream.receive.limit
             stream.send.limit = unidirectional
                 ? 0
                 : peerParameters.initialMaxStreamDataBidiLocal
@@ -853,6 +871,7 @@ public final class QUICConnection {
         stream.receive.limit = unidirectional
             ? 0
             : localParameters.initialMaxStreamDataBidiLocal
+        stream.receive.announced = stream.receive.limit
         streams[id] = stream
         if unidirectional { nextLocalStreamUni += 1 } else { nextLocalStreamBidi += 1 }
         return id
@@ -1068,8 +1087,15 @@ public final class QUICConnection {
         }
         for frame in packet.frames.streams {
             guard let stream = streams[frame.id] else { continue }
+            let buffered = stream.send.data.readableBytes
             stream.send.acknowledge(frame.low, frame.high)
             if frame.fin { stream.send.finAcked = true }
+            // An acknowledgement is what actually frees the send buffer, so it
+            // is what a producer waiting for room has to be told about. Flow
+            // control alone is not enough: a peer with a large window never
+            // sends MAX_STREAM_DATA, and a producer parked on one would wait
+            // for a frame that is never coming.
+            if stream.send.data.readableBytes < buffered { noteWritable(frame.id) }
             if stream.isFinished { retireStream(frame.id) }
         }
         if packet.frames.handshakeDone { handshakeDonePending = false }
