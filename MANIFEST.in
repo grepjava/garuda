@@ -1,5 +1,8 @@
 include Package.swift
 include README.md
+include ARCHITECTURE.md
+include TRANSPORT.md
+recursive-include assets *.png
 recursive-include Sources *.swift *.c *.h *.modulemap
 recursive-include Tests *.swift
 recursive-include examples *.py
