@@ -44,7 +44,7 @@ start() {  # port app extra-args...
     shift 2
     cleanup
     PEREGRINE_SHUTDOWN_MARKER="$MARKER" "$BIN" --port "$port" --log-level error \
-        --venv "$VENV" --python-path "$HERE/examples" \
+        --venv "$VENV" --python-path "$HERE/examples" --python-path "$HERE/python" \
         --forwarded-allow-ips 127.0.0.1 "$@" "$app" \
         > "${TMPDIR:-/tmp}/peregrine-fw-$port.log" 2>&1 &
     for _ in $(seq 1 100); do

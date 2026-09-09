@@ -39,7 +39,7 @@ final class ReloadWatcher {
 
     init(config: ServerConfig) {
         var dirs: [String] = ["."]
-        if let extra = config.pythonPath {
+        for extra in config.pythonPaths {
             dirs.append(String(cString: extra))
         }
         self.roots = dirs

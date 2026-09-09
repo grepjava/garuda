@@ -65,3 +65,48 @@ import django
 
 django.setup()
 application = WSGIHandler()
+
+
+# --- ASGI, with WebTransport ------------------------------------------------
+#
+# Django's ASGI handler asserts scope["type"] == "http", so a session has to be
+# answered before it gets there. `asgi_application` is what to serve when you
+# want both; `application` above stays the WSGI entry point.
+
+from django.core.asgi import get_asgi_application  # noqa: E402
+
+from peregrine.contrib.django import WebTransportRouter  # noqa: E402
+
+asgi_application = WebTransportRouter(get_asgi_application())
+
+
+@asgi_application.route("wt/echo")
+async def wt_echo(session):
+    await session.accept()
+    async for stream in session.incoming_streams():
+        body = await stream.read()
+        if stream.bidirectional:
+            await stream.send(b"echo:" + body, end=True)
+        else:
+            reply = await session.create_stream(bidirectional=False)
+            await reply.send(b"echo:" + body, end=True)
+
+
+@asgi_application.route("wt/room/<str:name>/")
+async def wt_room(session):
+    await session.accept()
+    name = session.path_params["name"].encode()
+    stream = await session.create_stream(bidirectional=False)
+    await stream.send(b"welcome to " + name, end=True)
+    async for _ in session.incoming_streams():
+        pass
+
+
+@asgi_application.route("wt/n/<int:count>/")
+async def wt_count(session):
+    await session.accept()
+    count = session.path_params["count"]
+    stream = await session.create_stream(bidirectional=False)
+    await stream.send(("n=%d" % count).encode(), end=True)
+    async for _ in session.incoming_streams():
+        pass

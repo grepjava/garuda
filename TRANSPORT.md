@@ -347,6 +347,67 @@ Three details worth knowing:
 Before accept, `webtransport.close` refuses the session with an HTTP status: a
 code in 400–599 is used as one, anything else becomes 403.
 
+### Frameworks
+
+That extension is a message protocol, and writing against it directly is fine.
+What no framework can do unaided is *route* to it: a session is not a request,
+so it arrives with `scope["type"] == "webtransport"`, and every ASGI framework
+asserts on that field before it looks at the path. Starlette's router allows
+`http`, `websocket` and `lifespan`; Django's handler allows `http` alone.
+
+So `peregrine.contrib` puts a router in front, which answers sessions itself
+and hands everything else to the framework unchanged.
+
+```python
+from fastapi import FastAPI
+from peregrine.contrib.fastapi import WebTransportRouter
+
+api = FastAPI()
+app = WebTransportRouter(api)            # serve this one
+
+@app.route("/chat/{room}")
+async def chat(session):
+    await session.accept()
+    room = session.path_params["room"]
+    async for stream in session.incoming_streams():
+        await stream.send(b"welcome to " + room.encode(), end=True)
+```
+
+```python
+# Django asgi.py
+from django.core.asgi import get_asgi_application
+from peregrine.contrib.django import WebTransportRouter
+
+application = WebTransportRouter(get_asgi_application())
+
+@application.route("chat/<str:room>/")
+async def chat(session):
+    await session.accept()
+    ...
+```
+
+Paths keep each framework's own spelling — `{room}` for Starlette, Django's
+`<str:room>` and `<int:count>` converters for Django.
+
+`peregrine.webtransport.WebTransportSession` is what those hand the endpoint,
+and it is framework-agnostic: it demultiplexes the one ASGI `receive()` channel
+into streams, datagrams and the answers to stream-open requests, so an endpoint
+reads a stream as an async iterator rather than running its own state machine.
+Its queues are bounded, and a full queue stops the pump — which stops the
+flow-control window reopening, which stops the peer. Backpressure is preserved
+rather than turned into memory.
+
+FastAPI also gets `WebTransportEndpoint`, the class-based form that mirrors
+Starlette's `WebSocketEndpoint`, with `on_connect` / `on_stream` / `on_datagram`
+/ `on_disconnect`; streams and datagrams are dispatched concurrently.
+
+**HTTP/3 needs no integration at all.** A request is the same request whatever
+carried it, and `request.is_secure()`, `request.scheme` and `REMOTE_ADDR` are
+right over QUIC without either framework being told. `http_version(request)`
+and `is_http3(request)` are provided for applications that want to know, and
+`AltSvcMiddleware` for the case where HTTP/3 lives somewhere this process
+cannot see — a terminating proxy, or a different port.
+
 ---
 
 ## WSGI on a multiplexed stream
@@ -396,7 +457,7 @@ only that the understanding is consistent.
 ```bash
 <venv>/bin/python scripts/http2-test.py         # 116 checks against `h2`
 <venv>/bin/python scripts/http3-test.py         #  65 checks against `aioquic`
-<venv>/bin/python scripts/webtransport-test.py  #  27 checks against `aioquic`
+<venv>/bin/python scripts/webtransport-test.py  #  42 checks against `aioquic`
 
 h2spec -h 127.0.0.1 -p 8443 -t -k               # 146/146
 ```

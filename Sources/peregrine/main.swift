@@ -79,7 +79,7 @@ func printUsage() {
                                blocks, "unix", or "*" for every peer
       --venv DIR               virtualenv whose packages the app should import
       --no-auto-venv           ignore VIRTUAL_ENV from the environment
-      --python-path DIR        directory to prepend to sys.path
+      --python-path DIR        directory to prepend to sys.path (repeatable)
       --python-home DIR        PYTHONHOME for the embedded interpreter
       --reload                 restart workers when source files change
       --no-uvloop              do not use uvloop even when installed
@@ -306,7 +306,7 @@ while i < argc {
         config.maxWebsocketQueueBytes = max(1024, parseInt(v))
     } else if matches(arg, "--python-path") {
         guard let v = next("--python-path needs a directory") else { break }
-        config.pythonPath = v
+        config.pythonPaths.append(v)
     } else if matches(arg, "--python-home") {
         guard let v = next("--python-home needs a directory") else { break }
         config.pythonHome = v

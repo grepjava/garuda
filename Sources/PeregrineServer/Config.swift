@@ -62,7 +62,11 @@ public struct ServerConfig {
     public var serverName: UnsafePointer<CChar> = staticCString("localhost")
     public var serverPortString: UnsafePointer<CChar> = staticCString("8000")
     public var pythonHome: UnsafePointer<CChar>? = nil
-    public var pythonPath: UnsafePointer<CChar>? = nil
+    /// Directories to prepend to `sys.path`, in the order they were given.
+    /// Repeatable, because an application and the packages it needs are not
+    /// always in the same place.
+    public var pythonPaths: [UnsafePointer<CChar>] = []
+    @inlinable public var pythonPath: UnsafePointer<CChar>? { pythonPaths.first }
     public var preferUvloop = true
     public var callLifespan = true
     /// Directory of a virtualenv whose site-packages should be made importable.

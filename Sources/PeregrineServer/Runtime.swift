@@ -325,9 +325,16 @@ public enum Peregrine {
                                      isolated: false) else {
             return false
         }
-        if let extra = config.pythonPath { Interpreter.addSysPath(extra) }
-        Interpreter.addSysPath(staticCString("."))
+        // Order matters, and each of these prepends, so they are applied
+        // back to front. What comes out is: the directories the user named,
+        // in the order they named them, then the working directory, then the
+        // virtualenv. `--python-path` is the user saying "look here first",
+        // and a package installed in the environment must not silently win
+        // over one they pointed at -- which is the same rule PYTHONPATH
+        // follows against site-packages in an ordinary interpreter.
         if !activateVirtualenv(config) { return false }
+        Interpreter.addSysPath(staticCString("."))
+        for extra in config.pythonPaths.reversed() { Interpreter.addSysPath(extra) }
 
         // Internal Python types. Registered once per interpreter.
         guard PyTrampoline.register(),

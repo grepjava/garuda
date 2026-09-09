@@ -32,7 +32,7 @@ Source = "https://github.com/example/peregrine"
 
 [tool.setuptools]
 package-dir = { "" = "python" }
-packages = ["peregrine"]
+packages = ["peregrine", "peregrine.contrib"]
 include-package-data = true
 
 [tool.setuptools.package-data]

@@ -213,7 +213,7 @@ peregrine [options] MODULE:ATTRIBUTE
   --factory                the target is a factory returning the application
   --venv DIR               virtualenv whose packages the app should import
   --no-auto-venv           ignore VIRTUAL_ENV from the environment
-  --python-path DIR        directory to prepend to sys.path
+  --python-path DIR        directory to prepend to sys.path (repeatable)
   --python-home DIR        PYTHONHOME for the embedded interpreter
   --reload                 restart workers when source files change
   --no-uvloop              do not use uvloop even when installed
@@ -267,6 +267,29 @@ Checked against real applications rather than only the specifications
   and `REMOTE_ADDR` derived from forwarded headers, and blocking views
   overlapping properly on `--wsgi-threads`.
 
+Both run over HTTP/3 with no integration at all: a request is the same request
+whatever carried it. WebTransport is the exception, because a session is not a
+request — every ASGI framework asserts on the scope type before it routes — so
+`peregrine.contrib` puts a router in front that answers sessions and passes
+everything else through:
+
+```python
+from fastapi import FastAPI
+from peregrine.contrib.fastapi import WebTransportRouter
+
+api = FastAPI()
+app = WebTransportRouter(api)            # serve this one
+
+@app.route("/chat/{room}")
+async def chat(session):
+    await session.accept()
+    async for stream in session.incoming_streams():
+        await stream.send(b"hello " + await stream.read(), end=True)
+```
+
+The Django form is the same with `<str:room>` converters and
+`get_asgi_application()` underneath. [Details.](TRANSPORT.md#frameworks)
+
 ---
 
 ## Correctness and hardening
@@ -298,7 +321,9 @@ bash scripts/framework-test.sh                  #  21 checks against real
                                                 #   FastAPI and Django apps
 <venv>/bin/python scripts/http2-test.py         # 116 checks against `h2`
 <venv>/bin/python scripts/http3-test.py         #  65 checks against `aioquic`
-<venv>/bin/python scripts/webtransport-test.py  #  27 checks against `aioquic`
+<venv>/bin/python scripts/webtransport-test.py  #  42 checks against `aioquic`,
+                                                #   including the FastAPI and
+                                                #   Django integrations
 ```
 
 HTTP/2 conformance is checked with

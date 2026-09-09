@@ -101,13 +101,13 @@ def free_port():
 
 
 class Server:
-    def __init__(self, *args, app="asgi_app:app"):
+    def __init__(self, *args, app="asgi_app:app", env=None):
         self.port = free_port()
         cert, key = make_certs()
         cmd = [BIN, "--port", str(self.port), "--log-level", "error",
                "--http3", "--tls-cert", cert, "--tls-key", key,
                "--python-path", os.path.join(ROOT, "examples")] + list(args) + [app]
-        self.process = subprocess.Popen(cmd)
+        self.process = subprocess.Popen(cmd, env=env)
         deadline = time.time() + 15
         while time.time() < deadline:
             try:
@@ -450,6 +450,105 @@ async def alongside_requests():
             is_("the second answers its own", await client.wait_stream(b), b"echo:two")
 
 
+async def frameworks():
+    """The FastAPI and Django integrations, against the real frameworks.
+
+    Neither can route a WebTransport session itself -- both assert on the
+    scope type before they look at the path -- so what is being checked is
+    that the router in front of them answers sessions while the framework
+    still serves everything else.
+    """
+    print("\nFrameworks")
+    try:
+        import fastapi                                            # noqa: F401
+        import django                                             # noqa: F401
+    except ImportError:
+        print("  ..   skipped (needs fastapi and django)")
+        return
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.path.join(ROOT, "python") + os.pathsep + \
+        env.get("PYTHONPATH", "")
+
+    # Django routes are written with a trailing slash, as urlpatterns are;
+    # the router keeps each framework's own spelling rather than imposing one.
+    for label, app, room in (("fastapi", "fastapi_app:wt", "/wt/room/lobby"),
+                             ("django", "django_app:asgi_application",
+                              "/wt/room/lobby/")):
+        with Server(app=app, env=env) as server:
+            async with connect("127.0.0.1", server.port,
+                               configuration=configuration(),
+                               create_protocol=Client) as client:
+                session = client.connect_session("/wt/echo")
+                headers = await client.await_session(session)
+                is_("%s: a session is accepted" % label,
+                    headers.get(b":status"), b"200")
+
+                bidi = client.open_stream(session, data=b"hi", end=True)
+                is_("%s: a bidirectional stream is echoed" % label,
+                    await client.wait_stream(bidi), b"echo:hi")
+
+                known = set(client.stream_ended)
+                client.open_stream(session, unidirectional=True, data=b"uni",
+                                   end=True)
+                _, body = await client.wait_new_stream(known)
+                is_("%s: a unidirectional stream is answered" % label, body,
+                    b"echo:uni")
+
+                # A path parameter, in each framework's own spelling.
+                known = set(client.stream_ended)
+                opened = client.connect_session(room)
+                await client.await_session(opened)
+                _, body = await client.wait_new_stream(known)
+                is_("%s: a path parameter reaches the handler" % label, body,
+                    b"welcome to lobby")
+
+                # And the framework still serves ordinary requests.
+                request = client._quic.get_next_available_stream_id()
+                client._http.send_headers(stream_id=request, headers=[
+                    (b":method", b"GET"), (b":scheme", b"https"),
+                    (b":authority", b"localhost"), (b":path", b"/"),
+                ], end_stream=True)
+                client.transmit()
+                await client.wait_for(lambda: request in client.headers, 10)
+                is_("%s: ordinary requests still work" % label,
+                    client.headers.get(request, {}).get(b":status"), b"200")
+
+    # Two things only one of the two examples exercises.
+    with Server(app="fastapi_app:wt", env=env) as server:
+        async with connect("127.0.0.1", server.port,
+                           configuration=configuration(),
+                           create_protocol=Client) as client:
+            session = client.connect_session("/wt/chat")
+            await client.await_session(session)
+            bidi = client.open_stream(session, data=b"one", end=True)
+            is_("fastapi: a class endpoint handles streams",
+                await client.wait_stream(bidi), b"chat:one")
+            client.send_datagram(session, b"two")
+            got = await client.wait_datagrams(1)
+            is_("fastapi: and datagrams, concurrently", got[:1], [b"chat:two"])
+
+            rejected = client.connect_session("/wt/reject")
+            headers = await client.await_session(rejected)
+            is_("fastapi: an endpoint may refuse a session",
+                headers.get(b":status"), b"403")
+
+            missing = client.connect_session("/wt/nowhere")
+            headers = await client.await_session(missing)
+            is_("fastapi: an unrouted path is 404", headers.get(b":status"),
+                b"404")
+
+    with Server(app="django_app:asgi_application", env=env) as server:
+        async with connect("127.0.0.1", server.port,
+                           configuration=configuration(),
+                           create_protocol=Client) as client:
+            known = set(client.stream_ended)
+            counted = client.connect_session("/wt/n/42/")
+            await client.await_session(counted)
+            _, body = await client.wait_new_stream(known)
+            is_("django: an <int:> converter converts", body, b"n=42")
+
+
 def main():
     if not os.path.exists(BIN):
         sys.stderr.write("no peregrine binary at %s\n" % BIN)
@@ -464,6 +563,7 @@ def main():
     run(datagrams())
     run(closing())
     run(alongside_requests())
+    run(frameworks())
 
     print("\n%d passed, %d failed" % (PASS, FAIL))
     return 1 if FAIL else 0
