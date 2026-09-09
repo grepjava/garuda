@@ -383,6 +383,91 @@ async def flow_control():
                 (status, len(body), body == total), (200, len(total), True))
 
 
+def http1_headers(port, path, quic_port=None):
+    """One HTTP/1.1 request over TLS, returning its headers."""
+    import http.client
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.set_alpn_protocols(["http/1.1"])
+    conn = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=15)
+    try:
+        conn.request("GET", path)
+        response = conn.getresponse()
+        response.read()
+        return response.getheader("alt-svc"), len(response.headers.get_all("alt-svc") or [])
+    finally:
+        conn.close()
+
+
+def http2_alt_svc(port, path):
+    """The same over HTTP/2, where the header is encoded rather than written."""
+    try:
+        import h2.config
+        import h2.connection
+        import h2.events
+    except ImportError:
+        return None
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.set_alpn_protocols(["h2"])
+    sock = context.wrap_socket(socket.create_connection(("127.0.0.1", port), 15),
+                               server_hostname="localhost")
+    sock.settimeout(15)
+    try:
+        conn = h2.connection.H2Connection(
+            config=h2.config.H2Configuration(client_side=True))
+        conn.initiate_connection()
+        stream = conn.get_next_available_stream_id()
+        conn.send_headers(stream, [(":method", "GET"), (":scheme", "https"),
+                                   (":authority", "localhost"), (":path", path)],
+                          end_stream=True)
+        sock.sendall(conn.data_to_send())
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            data = sock.recv(65536)
+            if not data:
+                break
+            for event in conn.receive_data(data):
+                if isinstance(event, h2.events.ResponseReceived):
+                    return dict(event.headers).get(b"alt-svc")
+            out = conn.data_to_send()
+            if out:
+                sock.sendall(out)
+        return None
+    finally:
+        sock.close()
+
+
+async def alt_svc():
+    print("\nAlt-Svc")
+    # A client cannot find HTTP/3 by trying: it has to be told, on the TCP
+    # connection it already has.
+    with Server() as server:
+        value, count = http1_headers(server.port, "/")
+        is_("HTTP/1.1 advertises h3", value, 'h3=":%d"; ma=86400' % server.port)
+        is_("exactly once", count, 1)
+
+        value = http2_alt_svc(server.port, "/")
+        if value is None:
+            print("  ..   skipped the HTTP/2 check (no h2 library)")
+        else:
+            is_("HTTP/2 advertises it too", value,
+                b'h3=":%d"; ma=86400' % server.port)
+
+        value, count = http1_headers(server.port, "/altsvc")
+        is_("an application's own alt-svc is left alone", value, 'h3=":9999"')
+        is_("and is not doubled", count, 1)
+
+    # A separate UDP port is what the value has to name, not the TCP one.
+    port = free_port()
+    with Server("--quic-port", str(port)) as server:
+        value, _ = http1_headers(server.port, "/")
+        is_("a separate QUIC port is the one advertised", value,
+            'h3=":%d"; ma=86400' % port)
+
+
 async def main():
     if not os.path.exists(BIN):
         print("no such binary: %s" % BIN)
@@ -394,7 +479,7 @@ async def main():
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
     for test in (basics, request_bodies, multiplexing, cancellation,
-                 large_headers, response_framing, flow_control):
+                 large_headers, response_framing, flow_control, alt_svc):
         try:
             await test()
         except Exception:

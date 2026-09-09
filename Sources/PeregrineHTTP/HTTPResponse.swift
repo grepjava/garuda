@@ -20,6 +20,7 @@ public struct ResponseHeaderKind: OptionSet, Sendable {
     public static let connection       = ResponseHeaderKind(rawValue: 1 << 2)
     public static let date             = ResponseHeaderKind(rawValue: 1 << 3)
     public static let server           = ResponseHeaderKind(rawValue: 1 << 4)
+    public static let altSvc           = ResponseHeaderKind(rawValue: 1 << 5)
 }
 
 public enum HTTPResponseWriter {
@@ -80,6 +81,8 @@ public enum HTTPResponseWriter {
             if equalsLowercased(name.base, 4, "date") { return .date }
         case 6:
             if equalsLowercased(name.base, 6, "server") { return .server }
+        case 7:
+            if equalsLowercased(name.base, 7, "alt-svc") { return .altSvc }
         case 10:
             if equalsLowercased(name.base, 10, "connection") { return .connection }
         case 14:

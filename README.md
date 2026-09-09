@@ -554,6 +554,20 @@ kernel hashes datagrams to workers by four-tuple. A client that genuinely
 migrates may hash to a worker that has never heard of its connection, and
 recovers by making a new one.
 
+**A client cannot discover HTTP/3 by trying.** There is no upgrade, no
+well-known port, and nothing in a TCP response that implies a UDP one, so it
+has to be told on a connection it already has. With `--http3`, every response
+served over TCP -- HTTP/1.1 and HTTP/2, WSGI and ASGI alike -- carries
+
+```
+alt-svc: h3=":443"; ma=86400
+```
+
+naming the UDP port, which is `--quic-port` when it differs from the TCP one.
+The header is advisory (RFC 7838): a client that ignores it stays where it is.
+An application that sets its own `alt-svc` keeps it, and the server adds
+nothing beside it.
+
 ## WebTransport
 
 WebTransport (draft-ietf-webtrans-http3) runs on top of that: an extended

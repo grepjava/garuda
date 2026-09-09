@@ -530,6 +530,11 @@ extension Worker {
 
         if !seen.contains(.date) { HTTPResponseWriter.writeDate(&c.pointee.write, dates) }
         if !seen.contains(.server) { c.pointee.write.write("Server: peregrine\r\n") }
+        if let altSvc = config.altSvc, !seen.contains(.altSvc) {
+            c.pointee.write.write("Alt-Svc: ")
+            c.pointee.write.write(altSvc, config.altSvcLength)
+            c.pointee.write.writeCRLF()
+        }
         HTTPResponseWriter.writeConnection(&c.pointee.write,
                                            keepAlive: c.pointee.flags.contains(.keepAlive))
         HTTPResponseWriter.endHead(&c.pointee.write)

@@ -33,13 +33,20 @@ public struct WSGIRequestSnapshot {
     public var suppressBody = false
     /// 29 bytes of IMF-fixdate. Borrowed; must outlive the call.
     public var date: UnsafePointer<UInt8>
+    /// The Alt-Svc value advertising HTTP/3, or nil. Borrowed; lives for the
+    /// process.
+    public var altSvc: UnsafePointer<UInt8>? = nil
+    public var altSvcLength = 0
 
     public init(httpMinor: UInt8, keepAlive: Bool, suppressBody: Bool,
-                date: UnsafePointer<UInt8>) {
+                date: UnsafePointer<UInt8>,
+                altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0) {
         self.httpMinor = httpMinor
         self.keepAlive = keepAlive
         self.suppressBody = suppressBody
         self.date = date
+        self.altSvc = altSvc
+        self.altSvcLength = altSvcLength
     }
 }
 
@@ -212,6 +219,11 @@ public enum WSGIResponseBuilder {
         }
         if !seen.contains(.server) {
             out.write("Server: peregrine\r\n")
+        }
+        if let altSvc = snapshot.altSvc, !seen.contains(.altSvc) {
+            out.write("Alt-Svc: ")
+            out.write(altSvc, snapshot.altSvcLength)
+            out.writeCRLF()
         }
         HTTPResponseWriter.writeConnection(&out, keepAlive: plan.keepAlive)
         HTTPResponseWriter.endHead(&out)

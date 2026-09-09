@@ -38,6 +38,21 @@ func makeCString(_ value: Int) -> UnsafePointer<CChar> {
     return UnsafePointer(buf)
 }
 
+/// `h3=":443"; ma=86400` -- the Alt-Svc value advertising HTTP/3 on the UDP
+/// port. The lifetime is a day, long enough to be worth caching and short
+/// enough that turning HTTP/3 off is not a decision clients keep honouring.
+func makeAltSvc(port: UInt16) -> (UnsafePointer<UInt8>, Int) {
+    var buf = ByteBuffer(capacity: 32)
+    defer { buf.destroy() }
+    buf.write("h3=\":")
+    buf.writeDecimal(Int(port))
+    buf.write("\"; ma=86400")
+    let n = buf.readableBytes
+    let out = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
+    out.update(from: buf.readPointer, count: n)
+    return (UnsafePointer(out), n)
+}
+
 func printUsage() {
     let usage: StaticString = """
     peregrine -- a Python ASGI/WSGI server written in Swift
@@ -349,6 +364,14 @@ if config.http3Enabled && config.tlsCertPath == nil {
 if config.http3Enabled && config.unixPath != nil {
     Log.error("--http3 cannot be served over a unix socket")
     exit(2)
+}
+// A client cannot discover HTTP/3 by trying: there is no upgrade and no
+// well-known port. It has to be told, on a connection it already has, which
+// is what Alt-Svc is for (RFC 7838). Purely advisory -- a client that
+// ignores it stays on TCP and everything still works.
+if config.http3Enabled {
+    let udp = config.quicPort != 0 ? config.quicPort : config.port
+    (config.altSvc, config.altSvcLength) = makeAltSvc(port: udp)
 }
 
 if !sawApp {

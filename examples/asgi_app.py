@@ -146,6 +146,11 @@ async def app(scope, receive, send):
         n = int(scope["query_string"] or 100000)
         await reply(b"x" * n, content_type=b"application/octet-stream")
 
+    elif path == "/altsvc":
+        # An application that advertises its own alternative services; the
+        # server must not add a second header of its own.
+        await reply(b"mine\n", headers=[(b"alt-svc", b'h3=":9999"')])
+
     elif path == "/fixed":
         body = b"fixed length\n"
         await send({"type": "http.response.start", "status": 200,

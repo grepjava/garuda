@@ -100,6 +100,13 @@ public struct ServerConfig {
     public var http3Enabled = false
     /// The UDP port, when it differs from the TCP one. Zero means the same.
     public var quicPort: UInt16 = 0
+    /// The `Alt-Svc` value telling a client that reached us over TCP where
+    /// HTTP/3 lives, or nil when there is nothing to advertise.
+    ///
+    /// Built once at start-up rather than per response: it goes on every
+    /// response served over TCP and never changes.
+    public var altSvc: UnsafePointer<UInt8>? = nil
+    public var altSvcLength = 0
     public var http2Enabled = true
     /// Speak only HTTP/2 on this port, with no HTTP/1.1 fallback. What a
     /// proxy that talks h2c upstream (Envoy, Caddy) and a gRPC client expect,

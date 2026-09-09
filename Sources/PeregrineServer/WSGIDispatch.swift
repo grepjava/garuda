@@ -144,7 +144,9 @@ extension Worker {
         let snapshot = WSGIRequestSnapshot(httpMinor: c.pointee.head.httpMinor,
                                            keepAlive: c.pointee.flags.contains(.keepAlive),
                                            suppressBody: c.pointee.flags.contains(.suppressBody),
-                                           date: UnsafePointer(dates.bytes))
+                                           date: UnsafePointer(dates.bytes),
+                                           altSvc: config.altSvc,
+                                           altSvcLength: config.altSvcLength)
         // The buffer descriptor is copied out and back rather than passed
         // inout, because the flush below needs the connection to itself.
         var out = c.pointee.write

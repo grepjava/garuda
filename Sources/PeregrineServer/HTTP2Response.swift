@@ -137,6 +137,12 @@ extension Worker {
         if !seen.contains(.server) {
             encodeStatic(h2, "server", "peregrine", into: &block)
         }
+        // HTTP/2 is where this matters most: a browser here is already on TLS
+        // and already multiplexing, so the only thing it does not know is that
+        // there is a UDP port worth trying.
+        if let altSvc = config.altSvc, !seen.contains(.altSvc) {
+            encodeStatic(h2, "alt-svc", altSvc, config.altSvcLength, into: &block)
+        }
 
         // A response that can have no body at all ends here, with no DATA
         // frame to carry the flag.
