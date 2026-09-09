@@ -1,0 +1,10 @@
+.build/
+.build-install/
+.swiftpm/
+Package.resolved
+build/
+dist/
+*.egg-info/
+*.o
+*.pyc
+__pycache__/

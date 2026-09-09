@@ -1,0 +1,903 @@
+//===----------------------------------------------------------------------===//
+// The worker: one process, one poller, one interpreter.
+//
+// Structure of a request:
+//
+//   accept -> readingHead -> [readingBody] -> dispatching -> writing -> reuse
+//
+// The whole cycle touches the heap only for the Python objects the application
+// itself needs. Buffers come from a pool, connection records come from a slab,
+// parsing produces offsets rather than objects, and the response is serialised
+// straight into the connection write buffer.
+//===----------------------------------------------------------------------===//
+
+import CPeregrine
+import PeregrineCore
+import PeregrineASGI
+import PeregrineHTTP
+import PeregrinePython
+import PeregrineWSGI
+
+/// The per-process worker. Held behind a raw pointer rather than a class so
+/// that C callbacks (the asyncio reader, ASGI send/receive) can reach it
+/// without an ARC-managed context.
+nonisolated(unsafe) public var currentWorker: UnsafeMutablePointer<Worker>? = nil
+
+public struct Worker {
+    public var config: ServerConfig
+    public var poller: Poller
+    public var table: ConnectionTable
+    public var pool: BufferPool
+    public var dates: DateCache
+
+    public var listenFD: Int32
+    public var signalFD: Int32 = -1
+
+    /// One shared header table: parsing and environ/scope construction happen
+    /// back to back for a single request, so there is never a second live set.
+    public var headers: UnsafeMutablePointer<HTTPHeaderRef>
+
+    public var wsgi: WSGIRuntime? = nil
+    /// The optional WSGI thread pool. nil means the worker loop calls the
+    /// application inline, which is the original single-threaded model.
+    public var wsgiPool: WSGIPool? = nil
+    public var appProtocol: AppProtocol = .wsgi
+
+    public var running = true
+    /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
+    public var draining = false
+    /// When draining must stop being polite. A request that never completes
+    /// would otherwise hold the whole process open indefinitely.
+    public var drainDeadline: UInt64 = 0
+    public var lastSweep: UInt64 = 0
+    public var acceptSuspended = false
+
+    public init(config: ServerConfig, listenFD: Int32, poller: Poller) {
+        self.config = config
+        self.listenFD = listenFD
+        self.poller = poller
+        self.table = ConnectionTable(capacity: config.maxConnections)
+        self.pool = BufferPool(blockSize: config.readBufferSize,
+                               maxRetained: min(config.maxConnections, 1024))
+        self.dates = DateCache()
+        self.headers = UnsafeMutablePointer<HTTPHeaderRef>.allocate(capacity: config.maxHeaders)
+    }
+
+    public mutating func destroy() {
+        headers.deallocate()
+        pool.destroy()
+        dates.destroy()
+        table.destroy()
+        poller.destroy()
+        wsgi?.destroy()
+    }
+
+    // MARK: - Registration
+
+    public mutating func registerListener() -> Bool {
+        guard poller.add(listenFD, .read, token: PollToken.listener) else {
+            Log.error("failed to register the listening socket")
+            return false
+        }
+        if signalFD >= 0 {
+            _ = poller.add(signalFD, .read, token: PollToken.signals)
+        }
+        return true
+    }
+
+    /// Registers the pool's completion pipe, so a thread finishing a request
+    /// wakes the loop the same way a socket does.
+    public mutating func registerPool() -> Bool {
+        guard let wsgiPool else { return true }
+        guard poller.add(wsgiPool.wakeupFD, .read, token: PollToken.pool) else {
+            Log.error("failed to register the WSGI pool wakeup pipe")
+            return false
+        }
+        return true
+    }
+
+    @inline(__always)
+    mutating func setInterest(_ slot: Int, _ mask: PollMask) {
+        let c = table[slot]
+        if c.pointee.interest == mask.rawValue { return }
+        let token = PollToken.make(slot: slot, generation: c.pointee.generation)
+        _ = poller.modify(c.pointee.fd, mask, token: token)
+        c.pointee.interest = mask.rawValue
+    }
+
+    // MARK: - Event dispatch
+
+    /// Processes one batch of readiness events. Returns the number handled.
+    ///
+    /// Called directly by the WSGI loop, and by asyncio through the reader
+    /// callback in ASGI mode.
+    @discardableResult
+    public mutating func drain(timeoutMillis: Int32) -> Int {
+        let n = poller.wait(timeoutMillis: timeoutMillis)
+        if n <= 0 { return 0 }
+        processEvents(n)
+        return n
+    }
+
+    /// Dispatches `n` events already collected by the poller.
+    public mutating func processEvents(_ n: Int) {
+        var i = 0
+        while i < n {
+            let (token, mask) = poller.event(i)
+            i += 1
+            switch token {
+            case PollToken.listener:
+                acceptConnections()
+            case PollToken.signals:
+                handleSignals()
+            case PollToken.pool:
+                collectPoolResults()
+            default:
+                let slot = PollToken.slot(token)
+                let generation = PollToken.generation(token)
+                let c = table[slot]
+                // A stale event for a slot that has already been recycled.
+                if c.pointee.state == .free || c.pointee.generation != generation { continue }
+                handleConnectionEvent(slot, mask)
+            }
+        }
+    }
+
+    mutating func handleConnectionEvent(_ slot: Int, _ mask: PollMask) {
+        let c = table[slot]
+        c.pointee.lastActivity = pg_monotonic_ms()
+
+        if mask.contains(.error) {
+            closeConnection(slot)
+            return
+        }
+        if mask.wantsWrite {
+            if !flush(slot) { return }
+            // The socket accepting more is exactly the signal a pooled request
+            // blocked on backpressure is waiting for.
+            if c.pointee.poolJob != nil {
+                pumpPoolJob(slot)
+                return
+            }
+        }
+        if mask.wantsRead {
+            handleReadable(slot)
+            return
+        }
+        if mask.contains(.hangup) {
+            // Half-close with nothing pending: the peer is done talking.
+            if c.pointee.state == .readingHead && c.pointee.read.isEmpty {
+                closeConnection(slot)
+            } else {
+                c.pointee.flags.insert(.peerClosed)
+                // A running ASGI application may be parked on receive() waiting
+                // for exactly this, so wake it rather than leaving it hanging
+                // until the idle timeout.
+                if c.pointee.state == .dispatching || c.pointee.state == .websocket {
+                    c.pointee.flags.insert(.disconnected)
+                    deliverPendingReceive(slot)
+                }
+            }
+        }
+    }
+
+    // MARK: - Accept
+
+    mutating func acceptConnections() {
+        if draining { return }
+        // Bounded per wakeup so one busy listener cannot starve established
+        // connections of service.
+        var budget = 64
+        while budget > 0 {
+            budget -= 1
+            var peer = (Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0),
+                        Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0),
+                        Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0),
+                        Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0),
+                        Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0),
+                        Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0))
+            var port: UInt16 = 0
+            let fd: Int32 = withUnsafeMutableBytes(of: &peer) { raw in
+                pg_accept(listenFD, raw.baseAddress!.assumingMemoryBound(to: CChar.self),
+                          48, &port)
+            }
+            if fd < 0 {
+                let e = pg_errno()
+                if pg_err_is_again(e) != 0 || pg_err_is_intr(e) != 0 { return }
+                if e == EMFILE || e == ENFILE {
+                    // Descriptor exhaustion: stop asking for a moment rather
+                    // than spinning on a listener that stays readable.
+                    Log.warn("out of file descriptors; pausing accepts")
+                    _ = poller.modify(listenFD, [], token: PollToken.listener)
+                    acceptSuspended = true
+                    return
+                }
+                return
+            }
+
+            let slot = table.allocate()
+            if slot < 0 {
+                rejectOverCapacity(fd)
+                continue
+            }
+            let c = table[slot]
+            c.pointee.fd = fd
+            c.pointee.state = .readingHead
+            c.pointee.flags = []
+            c.pointee.interest = 0
+            c.pointee.read = pool.take()
+            c.pointee.write = ByteBuffer()
+            c.pointee.body = ByteBuffer()
+            c.pointee.head = HTTPRequestHead()
+            c.pointee.chunked = ChunkedDecoder()
+            c.pointee.bodyRemaining = 0
+            c.pointee.requestCount = 0
+            c.pointee.lastActivity = pg_monotonic_ms()
+            c.pointee.remoteAddrObj = nil
+            c.pointee.remotePortObj = nil
+            c.pointee.clientTuple = nil
+            c.pointee.task = nil
+            c.pointee.pendingReceive = nil
+            c.pointee.sendCallable = nil
+            c.pointee.receiveCallable = nil
+            c.pointee.drainWaiter = nil
+            c.pointee.poolJob = nil
+            c.pointee.responseRemaining = -1
+
+            if config.tcpNoDelay { _ = pg_set_nodelay(fd, 1) }
+
+            // Client address objects are built once per connection, not once
+            // per request: a keep-alive client pays for them a single time.
+            withUnsafeBytes(of: &peer) { raw in
+                let p = raw.baseAddress!.assumingMemoryBound(to: CChar.self)
+                var n = 0
+                while n < 48 && p[n] != 0 { n += 1 }
+                c.pointee.remoteAddrObj = pg_str_latin1(p, pg_ssize_t(n))
+            }
+            c.pointee.remotePortObj = pg_int(Int(port))
+
+            let token = PollToken.make(slot: slot, generation: c.pointee.generation)
+            if !poller.add(fd, .read, token: token) {
+                Log.error("failed to register an accepted connection")
+                closeConnection(slot)
+                continue
+            }
+            c.pointee.interest = PollMask.read.rawValue
+        }
+    }
+
+    /// Table is full: answer honestly and hang up instead of queueing.
+    func rejectOverCapacity(_ fd: Int32) {
+        let msg: StaticString = """
+        HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 19\r\n\r\nService Unavailable
+        """
+        _ = pg_write(fd, msg.utf8Start, msg.utf8CodeUnitCount)
+        _ = pg_close(fd)
+    }
+
+    // MARK: - Reading
+
+    /// Which buffer incoming bytes land in.
+    ///
+    /// This is the crux of head lifetime. A Content-Length body goes straight
+    /// into `body`, leaving the parsed head untouched in `read` for as long as
+    /// the application needs its slices. Chunked framing has to be decoded, so
+    /// there -- and only there -- the head is copied aside first and `read`
+    /// becomes scratch space.
+    enum FillTarget { case read, body }
+
+    mutating func handleReadable(_ slot: Int) {
+        let c = table[slot]
+        switch c.pointee.state {
+        case .free:
+            return
+        case .writing, .closing:
+            // Pipelined bytes arriving while the previous response drains: they
+            // wait in the socket buffer until we are ready to look at them.
+            setInterest(slot, .write)
+            return
+        case .readingHead:
+            if !fill(slot, .read, limit: config.maxHeadSize) { return }
+            processInput(slot)
+        case .readingBody:
+            let target: FillTarget = c.pointee.bodyRemaining < 0 ? .read : .body
+            if !fill(slot, target, limit: config.maxBodySize) { return }
+            processInput(slot)
+        case .websocket:
+            handleWebSocketReadable(slot)
+            return
+        case .dispatching:
+            // A pooled WSGI request has its whole body already; anything
+            // arriving now is the next pipelined request, and it waits in the
+            // socket buffer until this one is answered.
+            if c.pointee.poolJob != nil { return }
+            // ASGI keeps streaming the body while the application runs.
+            let target: FillTarget = c.pointee.bodyRemaining < 0 ? .read : .body
+            if !fill(slot, target, limit: config.maxBodySize) { return }
+            onBodyProgress(slot)
+        }
+
+        let s = table[slot]
+        if s.pointee.state != .free,
+           s.pointee.flags.contains(.peerClosed),
+           s.pointee.state == .readingHead || s.pointee.state == .readingBody,
+           s.pointee.write.isEmpty {
+            closeConnection(slot)
+        }
+    }
+
+    /// Drains the socket into the chosen buffer. Returns false if the
+    /// connection was closed.
+    mutating func fill(_ slot: Int, _ target: FillTarget, limit: Int) -> Bool {
+        let c = table[slot]
+        var closed = false
+        while true {
+            var n = 0
+            if target == .read {
+                if c.pointee.read.readableBytes >= limit { break }
+                c.pointee.read.reserve(config.readBufferSize)
+                let room = c.pointee.read.writableBytes
+                n = pg_read(c.pointee.fd, c.pointee.read.writePointer, room)
+                if n > 0 {
+                    c.pointee.read.advanceWriter(n)
+                    // A short read means the socket buffer is empty; asking
+                    // again would only earn an EAGAIN.
+                    if n < room { break }
+                    continue
+                }
+            } else {
+                if c.pointee.bodyRemaining <= 0 { break }
+                if c.pointee.body.readableBytes >= limit { break }
+                // Never ask for more than the declared body: the bytes after it
+                // belong to the next pipelined request.
+                let want = min(c.pointee.bodyRemaining, config.readBufferSize)
+                c.pointee.body.reserve(want)
+                n = pg_read(c.pointee.fd, c.pointee.body.writePointer, want)
+                if n > 0 {
+                    c.pointee.body.advanceWriter(n)
+                    c.pointee.bodyRemaining -= n
+                    if n < want { break }
+                    continue
+                }
+            }
+            if n == 0 { closed = true; break }
+            let e = pg_errno()
+            if pg_err_is_again(e) != 0 { break }
+            if pg_err_is_intr(e) != 0 { continue }
+            closeConnection(slot)
+            return false
+        }
+        if closed { c.pointee.flags.insert(.peerClosed) }
+        return true
+    }
+
+    /// Parses and dispatches as many pipelined requests as the buffer holds.
+    mutating func processInput(_ slot: Int) {
+        while true {
+            let c = table[slot]
+            switch c.pointee.state {
+            case .readingHead:
+                if c.pointee.read.readableBytes == 0 { return }
+                let origin = c.pointee.read.readerOffset
+                let base = UnsafePointer(c.pointee.read.readPointer)
+                var head = HTTPRequestHead()
+                let result = HTTPParser.parse(base, c.pointee.read.readableBytes,
+                                              maxHeadSize: config.maxHeadSize,
+                                              maxHeaders: config.maxHeaders,
+                                              headers: headers,
+                                              head: &head)
+                switch result {
+                case .incomplete:
+                    if c.pointee.read.readableBytes >= config.maxHeadSize {
+                        failRequest(slot, status: 431)
+                    }
+                    return
+                case .failure(let err):
+                    failRequest(slot, status: err.status)
+                    return
+                case .complete:
+                    c.pointee.head = head
+                    if !beginRequest(slot, origin: origin) { return }
+                }
+
+            case .readingBody:
+                if c.pointee.bodyRemaining < 0 {
+                    if !advanceChunkedBody(slot) { return }
+                } else if c.pointee.bodyRemaining > 0 {
+                    return                       // waiting on the socket
+                } else {
+                    c.pointee.state = .dispatching
+                }
+
+            case .dispatching:
+                dispatch(slot)
+                // A synchronous (WSGI) dispatch has already moved on to
+                // .writing by now. An ASGI dispatch has handed the request to a
+                // task and the state is still .dispatching: the connection now
+                // belongs to that task, and looping here would dispatch it
+                // again on every turn.
+                if table[slot].pointee.state == .dispatching { return }
+
+            default:
+                return
+            }
+
+            let d = table[slot]
+            if d.pointee.state == .free { return }
+            if d.pointee.state == .readingHead && d.pointee.read.readableBytes > 0 { continue }
+            if d.pointee.state == .readingBody || d.pointee.state == .dispatching { continue }
+            return
+        }
+    }
+
+    /// Sets up body framing once the head is parsed. Returns false when the
+    /// connection has been failed or closed.
+    mutating func beginRequest(_ slot: Int, origin: Int) -> Bool {
+        let c = table[slot]
+        c.pointee.headOrigin = origin
+        c.pointee.headInStore = false
+        c.pointee.requestCount &+= 1
+        c.pointee.flags.remove(.perRequest)
+        c.pointee.body.clear()
+        c.pointee.chunked = ChunkedDecoder()
+
+        var keepAlive = c.pointee.head.isKeepAlive
+        if config.maxRequestsPerConnection > 0,
+           c.pointee.requestCount >= config.maxRequestsPerConnection {
+            keepAlive = false
+        }
+        if draining { keepAlive = false }
+        if keepAlive {
+            c.pointee.flags.insert(.keepAlive)
+        } else {
+            c.pointee.flags.remove(.keepAlive)
+        }
+        if c.pointee.head.method == .head { c.pointee.flags.insert(.suppressBody) }
+
+        if c.pointee.head.contentLength > config.maxBodySize {
+            failRequest(slot, status: 413)
+            return false
+        }
+
+        let headEnd = c.pointee.head.headEnd
+
+        if c.pointee.head.isChunked {
+            // `read` is about to become scratch space for chunk framing, so the
+            // head has to move somewhere stable first.
+            c.pointee.headStore.clear()
+            c.pointee.headStore.write(UnsafePointer(c.pointee.read.pointer(at: origin)), headEnd)
+            c.pointee.headInStore = true
+        }
+
+        c.pointee.read.consume(headEnd)
+
+        // 100-continue: commit to reading the body only once we intend to.
+        if c.pointee.head.flags.contains(.expectContinue) {
+            c.pointee.write.write("HTTP/1.1 100 Continue\r\n\r\n")
+            if !flush(slot) { return false }
+        }
+
+        if c.pointee.head.isChunked {
+            c.pointee.bodyRemaining = -1
+            c.pointee.state = .readingBody
+        } else if c.pointee.head.contentLength > 0 {
+            let total = c.pointee.head.contentLength
+            // Anything of the body already buffered moves out of `read` now, so
+            // that no later socket read can land on top of the head.
+            let have = min(c.pointee.read.readableBytes, total)
+            if have > 0 {
+                c.pointee.body.reserve(min(total, 1 << 20))
+                c.pointee.body.write(UnsafePointer(c.pointee.read.readPointer), have)
+                c.pointee.read.consume(have)
+            }
+            c.pointee.bodyRemaining = total - have
+            c.pointee.state = c.pointee.bodyRemaining == 0 ? .dispatching : .readingBody
+        } else {
+            c.pointee.bodyRemaining = 0
+            c.pointee.state = .dispatching
+        }
+        return true
+    }
+
+    /// Decodes buffered chunked framing into the body buffer.
+    /// Returns true once the terminating chunk has been seen.
+    mutating func advanceChunkedBody(_ slot: Int) -> Bool {
+        let c = table[slot]
+        let available = c.pointee.read.readableBytes
+        if available == 0 {
+            if c.pointee.flags.contains(.peerClosed) { closeConnection(slot) }
+            return false
+        }
+        var consumed = 0
+        let base = UnsafePointer(c.pointee.read.readPointer)
+        let limit = config.maxBodySize
+        var overflow = false
+        let outcome = c.pointee.chunked.decode(base, available, consumed: &consumed) { p, n in
+            if c.pointee.body.readableBytes + n > limit { overflow = true; return }
+            c.pointee.body.write(p, n)
+        }
+        c.pointee.read.consume(consumed)
+        if overflow {
+            failRequest(slot, status: 413)
+            return false
+        }
+        switch outcome {
+        case .failure:
+            failRequest(slot, status: 400)
+            return false
+        case .needMore:
+            if c.pointee.flags.contains(.peerClosed) { closeConnection(slot) }
+            return false
+        case .finished:
+            c.pointee.bodyRemaining = 0
+            c.pointee.state = .dispatching
+            return true
+        }
+    }
+
+    mutating func dispatch(_ slot: Int) {
+        switch appProtocol {
+        case .wsgi:
+            dispatchWSGI(slot)
+        case .asgi:
+            dispatchASGI(slot)
+        }
+    }
+
+    // MARK: - Writing
+
+    /// Pushes buffered bytes to the socket. Returns false if the connection
+    /// was closed.
+    @discardableResult
+    mutating func flush(_ slot: Int) -> Bool {
+        let c = table[slot]
+        while c.pointee.write.readableBytes > 0 {
+            let n = pg_write(c.pointee.fd,
+                             c.pointee.write.readPointer,
+                             c.pointee.write.readableBytes)
+            if n > 0 {
+                c.pointee.write.consume(n)
+                continue
+            }
+            let e = pg_errno()
+            if pg_err_is_intr(e) != 0 { continue }
+            if pg_err_is_again(e) != 0 {
+                // A pooled request must not have read interest armed: nothing
+                // will consume pipelined bytes until it finishes, and a
+                // level-triggered poller would spin on them.
+                let pooled = c.pointee.poolJob != nil
+                setInterest(slot, pooled ? [.write] : [.read, .write])
+                // Partially drained still counts: a producer parked at the high
+                // water mark resumes as soon as the buffer falls below the low
+                // one, without waiting for the socket to empty completely.
+                resumeWriterIfDrained(slot)
+                return true
+            }
+            // EPIPE / ECONNRESET: the client is gone.
+            closeConnection(slot)
+            return false
+        }
+
+        resumeWriterIfDrained(slot)
+
+        // Drained.
+        if c.pointee.write.allocatedCapacity > config.readBufferSize * 4 {
+            // Do not let one large response pin an oversized buffer on an
+            // otherwise idle keep-alive connection.
+            c.pointee.write.destroy()
+        } else {
+            c.pointee.write.clear()
+        }
+
+        if c.pointee.state == .writing {
+            // An ASGI response can be fully flushed while the application task
+            // is still finishing. Recycling the slot now would let a pipelined
+            // request overwrite state the task still refers to.
+            if appProtocol == .asgi && c.pointee.task != nil {
+                setInterest(slot, [])
+                return true
+            }
+            finishResponse(slot)
+        } else if c.pointee.poolJob != nil {
+            setInterest(slot, [])
+        } else if c.pointee.state != .free {
+            setInterest(slot, .read)
+        }
+        return table[slot].pointee.state != .free
+    }
+
+    /// Blocks the worker until the socket accepts more data. Used only when a
+    /// synchronous WSGI response outgrows the high-water mark, where the choice
+    /// is between stalling this worker and buffering without bound.
+    mutating func flushWithBackpressure(_ slot: Int) -> Bool {
+        let c = table[slot]
+        while c.pointee.write.readableBytes > config.writeHighWaterMark {
+            let n = pg_write(c.pointee.fd,
+                             c.pointee.write.readPointer,
+                             c.pointee.write.readableBytes)
+            if n > 0 { c.pointee.write.consume(n); continue }
+            let e = pg_errno()
+            if pg_err_is_intr(e) != 0 { continue }
+            if pg_err_is_again(e) != 0 {
+                let r = pg_poll_single(c.pointee.fd, 1, 30_000)
+                if r <= 0 { closeConnection(slot); return false }
+                continue
+            }
+            closeConnection(slot)
+            return false
+        }
+        return true
+    }
+
+    /// Called once a full response has been written out.
+    mutating func finishResponse(_ slot: Int) {
+        let c = table[slot]
+        c.pointee.body.clear()
+        if !c.pointee.flags.contains(.keepAlive) || c.pointee.flags.contains(.peerClosed) {
+            closeConnection(slot)
+            return
+        }
+        c.pointee.state = .readingHead
+        c.pointee.head = HTTPRequestHead()
+        c.pointee.bodyRemaining = 0
+        c.pointee.lastActivity = pg_monotonic_ms()
+        setInterest(slot, .read)
+        // A pipelined request may already be sitting in the read buffer.
+        if c.pointee.read.readableBytes > 0 {
+            processInput(slot)
+        }
+    }
+
+    /// Emits a canned error response and closes.
+    mutating func failRequest(_ slot: Int, status: Int) {
+        let c = table[slot]
+        // With an application task still running, its next send() would append
+        // to whatever we wrote here and produce two responses on one
+        // connection. Closing is the only honest option.
+        if appProtocol == .asgi && c.pointee.task != nil {
+            Log.warn("closing connection after a request error with a live task")
+            closeConnection(slot)
+            return
+        }
+        c.pointee.flags.remove(.keepAlive)
+        dates.refresh()
+        c.pointee.write.clear()
+        HTTPResponseWriter.writeError(&c.pointee.write, status: status,
+                                      closeConnection: true, dateCache: dates)
+        c.pointee.state = .writing
+        _ = flush(slot)
+    }
+
+    /// One line per request, when --access-log is set.
+    ///
+    /// The head slices are still valid here: a Content-Length body is read into
+    /// its own buffer, and a chunked request keeps its head in `headStore`, so
+    /// nothing has overwritten the request line.
+    mutating func logAccess(_ slot: Int, status: Int) {
+        guard config.accessLog, Log.enabled(.info) else { return }
+        let c = table[slot]
+        let base = c.pointee.headBase()
+        let method = c.pointee.head.methodSlice
+        let target = c.pointee.head.target
+        Log.emit(.info) { line in
+            line.span(method.span(in: base))
+            line.str(" ")
+            line.span(target.span(in: base))
+            line.str(" ")
+            line.int(status)
+        }
+    }
+
+    // MARK: - Teardown
+
+    public mutating func closeConnection(_ slot: Int) {
+        let c = table[slot]
+        if c.pointee.state == .free { return }
+
+        // A producer parked in `await send()` has to be released, or its task
+        // never finishes and the interpreter never shuts down.
+        releaseDrainWaiter(slot)
+        // Likewise a consumer parked in `await receive()`. The disconnect is
+        // usually delivered when the peer hangs up, but a connection can also
+        // be dropped for reasons the application never sees -- a write that
+        // fails with EPIPE, or the shutdown deadline -- and a task left waiting
+        // for a message that can no longer arrive stays pending forever.
+        releasePendingReceive(slot)
+
+        // A pool thread may still be inside the application. Telling it the
+        // client is gone is all we can do; it unwinds and releases the job.
+        if let job = c.pointee.poolJob {
+            wsgiPool?.cancel(job)
+            c.pointee.poolJob = nil
+        }
+
+        if let t = c.pointee.task { pg_decref(t); c.pointee.task = nil }
+        if let f = c.pointee.pendingReceive { pg_decref(f); c.pointee.pendingReceive = nil }
+        if let s = c.pointee.sendCallable { pg_decref(s); c.pointee.sendCallable = nil }
+        if let r = c.pointee.receiveCallable { pg_decref(r); c.pointee.receiveCallable = nil }
+        if let a = c.pointee.remoteAddrObj { pg_decref(a); c.pointee.remoteAddrObj = nil }
+        if let p = c.pointee.remotePortObj { pg_decref(p); c.pointee.remotePortObj = nil }
+        if let t = c.pointee.clientTuple { pg_decref(t); c.pointee.clientTuple = nil }
+        if let k = c.pointee.ws.acceptKey { k.deallocate(); c.pointee.ws.acceptKey = nil }
+
+        if c.pointee.fd >= 0 {
+            _ = poller.remove(c.pointee.fd)
+            _ = pg_close(c.pointee.fd)
+            c.pointee.fd = -1
+        }
+        pool.give(c.pointee.read)
+        c.pointee.read = ByteBuffer()
+        c.pointee.write.destroy()
+        c.pointee.body.destroy()
+        table.release(slot)
+
+        if acceptSuspended && !draining {
+            acceptSuspended = false
+            _ = poller.modify(listenFD, .read, token: PollToken.listener)
+        }
+    }
+
+    // MARK: - Timeouts
+
+    mutating func sweepTimeouts() {
+        let now = pg_monotonic_ms()
+        if now &- lastSweep < 1000 { return }
+        lastSweep = now
+        dates.refresh()
+
+        // Past the grace period, whatever is still in flight is not going to
+        // finish. Dropping it is what turns "shut down when convenient" into a
+        // bounded operation an init system can rely on.
+        if draining && drainDeadline > 0 && now > drainDeadline {
+            let stranded = table.liveCount
+            if stranded > 0 {
+                Log.warn { line in
+                    line.str("graceful shutdown deadline reached with ")
+                    line.int(stranded)
+                    line.str(" connections still in flight; closing them")
+                }
+                var s = 0
+                while s < table.capacity {
+                    if table[s].pointee.state != .free { closeConnection(s) }
+                    s += 1
+                }
+            }
+            drainDeadline = 0
+            running = false
+            return
+        }
+
+        var slot = 0
+        while slot < table.capacity {
+            let c = table[slot]
+            defer { slot += 1 }
+            guard c.pointee.state != .free else { continue }
+            let idle = now &- c.pointee.lastActivity
+            switch c.pointee.state {
+            case .readingHead:
+                let limit = c.pointee.read.isEmpty
+                    ? config.keepAliveTimeoutMs
+                    : config.requestHeadTimeoutMs
+                if idle > limit { closeConnection(slot) }
+            case .readingBody, .writing:
+                if idle > config.requestHeadTimeoutMs { closeConnection(slot) }
+            case .websocket:
+                sweepWebSocket(slot, now: now)
+            default:
+                break
+            }
+        }
+    }
+
+    // MARK: - Signals
+
+    mutating func handleSignals() {
+        var buf = (UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0))
+        while true {
+            let n = withUnsafeMutableBytes(of: &buf) { raw in
+                pg_read(signalFD, raw.baseAddress!, 8)
+            }
+            if n <= 0 { break }
+            withUnsafeBytes(of: &buf) { raw in
+                let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                for i in 0..<Int(n) {
+                    switch Int32(p[i]) {
+                    case SIGTERM, SIGINT, SIGQUIT:
+                        beginDraining()
+                    default:
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    public mutating func beginDraining() {
+        if draining { return }
+        draining = true
+        drainDeadline = config.gracefulShutdownMs > 0
+            ? pg_monotonic_ms() &+ config.gracefulShutdownMs
+            : 0
+        Log.info("worker draining")
+        _ = poller.modify(listenFD, [], token: PollToken.listener)
+        // Idle keep-alive connections have nothing in flight; drop them now.
+        // Websockets are told the server is going away, which is what lets a
+        // client reconnect to another worker instead of waiting for a timeout.
+        var slot = 0
+        while slot < table.capacity {
+            let c = table[slot]
+            if c.pointee.state == .websocket {
+                sendCloseFrame(slot, code: WSCloseCode.goingAway,
+                               reason: nil, reasonLength: 0)
+            } else if c.pointee.state != .free && c.pointee.isIdle {
+                closeConnection(slot)
+            }
+            slot += 1
+        }
+        if quiescent { running = false }
+    }
+
+    /// Nothing left to finish: no live connections, and no pooled request still
+    /// running on a thread whose result the loop has yet to write out.
+    @inlinable
+    public var quiescent: Bool {
+        table.liveCount == 0 && (wsgiPool == nil || wsgiPool!.inFlight == 0)
+    }
+
+    @inlinable
+    public var hasWork: Bool { table.liveCount > 0 }
+
+    // MARK: - Write backpressure
+
+    /// Resolves a parked `await send()` once the buffer has drained enough to
+    /// take another batch.
+    mutating func resumeWriterIfDrained(_ slot: Int) {
+        let c = table[slot]
+        guard let waiter = c.pointee.drainWaiter else { return }
+        if c.pointee.write.readableBytes > config.writeLowWaterMark { return }
+        c.pointee.drainWaiter = nil
+        if let r = pg_call2(ASGIRuntime.fnResolve, waiter, Interned.none) {
+            pg_decref(r)
+        } else {
+            pg_err_clear()
+        }
+        pg_decref(waiter)
+    }
+
+    /// Hands a parked `await receive()` its disconnect, so the application
+    /// task unwinds instead of waiting on a Future nothing will resolve.
+    mutating func releasePendingReceive(_ slot: Int) {
+        guard appProtocol == .asgi else { return }
+        let c = table[slot]
+        guard let future = c.pointee.pendingReceive else { return }
+        c.pointee.pendingReceive = nil
+        let message = c.pointee.flags.contains(.websocketMode)
+            ? ASGIWebSocketMessage.disconnect(code: c.pointee.ws.closeCode)
+            : ASGIMessage.httpDisconnect()
+        if let message {
+            if let r = pg_call2(ASGIRuntime.fnResolve, future, message) {
+                pg_decref(r)
+            } else {
+                pg_err_clear()
+            }
+            pg_decref(message)
+        } else {
+            pg_err_clear()
+        }
+        pg_decref(future)
+    }
+
+    /// Releases a parked producer without waiting for a drain that will never
+    /// happen, because the connection is going away.
+    mutating func releaseDrainWaiter(_ slot: Int) {
+        let c = table[slot]
+        guard let waiter = c.pointee.drainWaiter else { return }
+        c.pointee.drainWaiter = nil
+        if let r = pg_call2(ASGIRuntime.fnResolve, waiter, Interned.none) {
+            pg_decref(r)
+        } else {
+            pg_err_clear()
+        }
+        pg_decref(waiter)
+    }
+}

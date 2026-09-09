@@ -1,0 +1,411 @@
+//===----------------------------------------------------------------------===//
+// Process model and worker start-up.
+//
+// One process per worker, each with its own interpreter and its own poller.
+//
+// How the listening socket is shared depends on the address family, because
+// the two families have opposite constraints:
+//
+//   * TCP: every worker opens its own socket with SO_REUSEPORT, so each gets an
+//     independent accept queue in the kernel. There is no shared accept lock,
+//     no thundering herd, and the kernel spreads connections by hashing the
+//     four-tuple.
+//   * Unix: a path can only be bound once. The supervisor therefore creates the
+//     listener and the workers inherit the descriptor across fork. Letting each
+//     worker bind for itself would have every worker unlink and replace the
+//     socket the previous one had just published, leaving only the last worker
+//     reachable.
+//
+// Threads are not used for request handling in ASGI mode: with an event loop
+// and a GIL there is nothing for a second thread to do. WSGI is different --
+// see WSGIPool -- because a synchronous application blocks on its own I/O.
+//===----------------------------------------------------------------------===//
+
+import CPeregrine
+import PeregrineCore
+import PeregrineHTTP
+import PeregrinePython
+import PeregrineWSGI
+
+public enum Peregrine {
+
+    /// Boots the server. Returns a process exit code.
+    public static func run(config: ServerConfig) -> Int32 {
+        Log.level = config.logLevel
+        Log.pid = Int(pg_getpid())
+        pg_ignore_sigpipe()
+        let limit = pg_raise_nofile_limit()
+        if limit > 0 && limit < Int(config.maxConnections) + 32 {
+            Log.warn { line in
+                line.str("file descriptor limit ")
+                line.int(Int(limit))
+                line.str(" is below max-connections; lower --max-connections or raise ulimit -n")
+            }
+        }
+
+        let workerCount = config.workers > 0 ? config.workers : Int(pg_cpu_count())
+
+        // --reload needs a supervisor to restart into, even with one worker.
+        if workerCount <= 1 && !config.reload {
+            guard let fd = openListener(config, reusePort: false, unlinkStale: true) else {
+                return 1
+            }
+            let ok = runWorker(config, listenFD: fd)
+            removeUnixPath(config)
+            return ok ? 0 : 1
+        }
+        return runSupervisor(config, workers: max(1, workerCount))
+    }
+
+    // MARK: - Listening socket
+
+    static func openListener(_ config: ServerConfig,
+                             reusePort: Bool,
+                             unlinkStale: Bool) -> Int32? {
+        let fd: Int32
+        if let path = config.unixPath {
+            fd = pg_listen_unix(path, config.backlog, unlinkStale ? 1 : 0)
+        } else {
+            fd = pg_listen_tcp(config.host, config.port, config.backlog,
+                               reusePort ? 1 : 0, config.ipv6Only ? 1 : 0)
+        }
+        if fd < 0 {
+            let e = pg_errno()
+            Log.error { line in
+                line.str("cannot listen: ")
+                line.cstr(pg_strerror(e))
+            }
+            return nil
+        }
+        return fd
+    }
+
+    static func removeUnixPath(_ config: ServerConfig) {
+        if let path = config.unixPath { _ = pg_unlink(path) }
+    }
+
+    // MARK: - Supervisor
+
+    static func runSupervisor(_ config: ServerConfig, workers: Int) -> Int32 {
+        // A unix listener is created once here and inherited; a TCP listener is
+        // only probed, so that a bad bind is one clear error rather than N
+        // identical ones from children.
+        var inherited: Int32 = -1
+        if config.unixPath != nil {
+            guard let fd = openListener(config, reusePort: false, unlinkStale: true) else {
+                return 1
+            }
+            inherited = fd
+        } else {
+            guard let probe = openListener(config, reusePort: true, unlinkStale: false) else {
+                return 1
+            }
+            _ = pg_close(probe)
+        }
+        defer { removeUnixPath(config) }
+
+        let signalFD = pg_signal_pipe_init()
+        let pids = UnsafeMutablePointer<pid_t>.allocate(capacity: workers)
+        defer { pids.deallocate() }
+        pids.initialize(repeating: 0, count: workers)
+
+        Log.info { line in
+            line.str("peregrine starting with ")
+            line.int(workers)
+            line.str(" workers")
+        }
+
+        for i in 0..<workers {
+            pids[i] = spawnWorker(config, inherited: inherited)
+            if pids[i] < 0 { return 1 }
+        }
+
+        let watcher = config.reload ? ReloadWatcher(config: config) : nil
+        if watcher != nil { Log.info("watching for source changes (--reload)") }
+
+        var shuttingDown = false
+        var killDeadline: UInt64 = 0
+        var alive = workers
+        var restarting = false
+
+        /// Signals every live worker and, past the grace period, kills it.
+        func signalAll(_ sig: Int32) {
+            for k in 0..<workers where pids[k] > 0 { _ = pg_kill(pids[k], sig) }
+        }
+
+        while alive > 0 {
+            var buf = (UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0))
+            let n = withUnsafeMutableBytes(of: &buf) { raw -> Int in
+                let r = pg_poll_single(signalFD, 0, 250)
+                if r <= 0 { return 0 }
+                return pg_read(signalFD, raw.baseAddress!, 8)
+            }
+            if n > 0 {
+                withUnsafeBytes(of: &buf) { raw in
+                    let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    for i in 0..<n {
+                        switch Int32(p[i]) {
+                        case SIGTERM, SIGINT, SIGQUIT:
+                            if !shuttingDown {
+                                shuttingDown = true
+                                Log.info("shutting down; signalling workers")
+                                signalAll(SIGTERM)
+                                // Workers get the same grace period they give
+                                // their own requests, plus a moment to exit.
+                                killDeadline = pg_monotonic_ms()
+                                    &+ config.gracefulShutdownMs &+ 2_000
+                            }
+                        case SIGHUP:
+                            if !shuttingDown {
+                                Log.info("SIGHUP: restarting workers")
+                                restarting = true
+                                signalAll(SIGTERM)
+                            }
+                        default:
+                            break
+                        }
+                    }
+                }
+            }
+
+            // Past the grace period a worker is no longer draining, it is
+            // stuck; the deadline is what makes shutdown bounded.
+            if shuttingDown && killDeadline > 0 && pg_monotonic_ms() > killDeadline {
+                Log.warn("workers did not exit within the shutdown grace period; killing")
+                signalAll(SIGKILL)
+                killDeadline = 0
+            }
+
+            if let watcher, !shuttingDown, watcher.changed() {
+                Log.info("source change detected; restarting workers")
+                restarting = true
+                signalAll(SIGTERM)
+            }
+
+            // Reap whatever has exited.
+            while true {
+                var status: Int32 = 0
+                let pid = pg_waitpid(-1, &status, 1)
+                if pid <= 0 { break }
+                var index = -1
+                for k in 0..<workers where pids[k] == pid { index = k }
+                if index >= 0 { pids[index] = 0 }
+                alive -= 1
+                if !shuttingDown {
+                    if !restarting {
+                        Log.warn { line in
+                            line.str("worker ")
+                            line.int(Int(pid))
+                            line.str(" exited; restarting")
+                        }
+                    }
+                    if index >= 0 {
+                        pids[index] = spawnWorker(config, inherited: inherited)
+                        if pids[index] > 0 { alive += 1 }
+                    }
+                }
+            }
+            if restarting && alive == workers { restarting = false }
+        }
+        if inherited >= 0 { _ = pg_close(inherited) }
+        Log.info("peregrine stopped")
+        return 0
+    }
+
+    static func spawnWorker(_ config: ServerConfig, inherited: Int32) -> pid_t {
+        let pid = pg_fork()
+        if pid < 0 {
+            Log.error("fork failed")
+            return -1
+        }
+        if pid > 0 { return pid }
+
+        // --- child ---
+        Log.pid = Int(pg_getpid())
+        // A fresh signal pipe: the inherited one belongs to the supervisor.
+        pg_signal_pipe_reset()
+        var fd = inherited
+        if fd < 0 {
+            guard let opened = openListener(config, reusePort: true, unlinkStale: false) else {
+                exitProcess(1)
+            }
+            fd = opened
+        }
+        let ok = runWorker(config, listenFD: fd)
+        exitProcess(ok ? 0 : 1)
+    }
+
+    static func exitProcess(_ code: Int32) -> Never {
+        exit(code)
+    }
+
+    // MARK: - Worker
+
+    /// Everything from here down runs inside a worker process.
+    static func runWorker(_ config: ServerConfig, listenFD: Int32) -> Bool {
+        guard Interpreter.initialize(program: staticCString("peregrine"),
+                                     home: config.pythonHome,
+                                     isolated: false) else {
+            return false
+        }
+        if let extra = config.pythonPath { Interpreter.addSysPath(extra) }
+        Interpreter.addSysPath(staticCString("."))
+        if !activateVirtualenv(config) { return false }
+
+        // Internal Python types. Registered once per interpreter.
+        guard PyTrampoline.register(),
+              PyImmediate.register(),
+              WSGIInputStream.register(),
+              WSGIStartResponse.register() else {
+            Log.error("failed to register internal Python types")
+            return false
+        }
+
+        var appRef = Interpreter.loadApplication(config.appSpec)
+        guard var app = appRef.optional else {
+            Log.error("could not load the application")
+            return false
+        }
+        if pg_is_callable(app) == 0 {
+            Log.error("the application object is not callable")
+            return false
+        }
+        if config.appIsFactory {
+            guard let produced = pg_call0(app) else {
+                PyError.logPending("calling the application factory")
+                return false
+            }
+            if pg_is_callable(produced) == 0 {
+                Log.error("the application factory did not return a callable")
+                pg_decref(produced)
+                return false
+            }
+            _ = appRef.take()
+            appRef = PyRef(stealing: produced)
+            app = produced
+        }
+        let proto = config.appProtocol ?? Interpreter.detectProtocol(app)
+
+        guard let poller = Poller(maxEvents: 256) else {
+            Log.error("cannot create the readiness poller")
+            return false
+        }
+
+        let workerPtr = UnsafeMutablePointer<Worker>.allocate(capacity: 1)
+        workerPtr.initialize(to: Worker(config: config, listenFD: listenFD, poller: poller))
+        currentWorker = workerPtr
+        workerPtr.pointee.appProtocol = proto
+        workerPtr.pointee.signalFD = pg_signal_pipe_init()
+
+        if proto == .wsgi {
+            let threads = max(1, config.wsgiThreads)
+            guard let runtime = WSGIRuntime(app: app,
+                                            serverName: config.serverName,
+                                            serverPort: config.serverPortString,
+                                            scheme: config.scheme,
+                                            rootPath: config.rootPath,
+                                            multiprocess: config.workers != 1,
+                                            multithread: threads > 1) else {
+                Log.error("could not prepare the WSGI runtime")
+                return false
+            }
+            workerPtr.pointee.wsgi = runtime
+            if threads > 1 {
+                guard let pool = WSGIPool(threads: threads, worker: workerPtr) else {
+                    Log.error("could not start the WSGI thread pool")
+                    return false
+                }
+                workerPtr.pointee.wsgiPool = pool
+                guard workerPtr.pointee.registerPool() else { return false }
+            }
+        } else {
+            guard ASGIRuntime.prepare(app: app, config: config) else {
+                Log.error("could not prepare the ASGI runtime")
+                return false
+            }
+        }
+
+        guard workerPtr.pointee.registerListener() else { return false }
+
+        Log.info { line in
+            line.str(proto == .wsgi ? "worker ready (WSGI) on " : "worker ready (ASGI) on ")
+            line.cstr(config.unixPath ?? config.host)
+            if config.unixPath == nil {
+                line.str(":")
+                line.int(Int(config.port))
+            }
+            if proto == .wsgi && config.wsgiThreads > 1 {
+                line.str(" with ")
+                line.int(config.wsgiThreads)
+                line.str(" application threads")
+            }
+        }
+
+        // The application object is deliberately leaked: it lives as long as
+        // the process and releasing it during finalisation is a hazard.
+        _ = appRef.take()
+
+        if proto == .wsgi {
+            runSynchronousLoop(workerPtr)
+        } else {
+            ASGIRuntime.runLoop(workerPtr)
+        }
+
+        workerPtr.pointee.destroy()
+        currentWorker = nil
+        Interpreter.finalize()
+        return true
+    }
+
+    /// Points the embedded interpreter at a virtualenv, so that `peregrine`
+    /// installed once on the system can serve an application whose dependencies
+    /// live in a project environment.
+    static func activateVirtualenv(_ config: ServerConfig) -> Bool {
+        var path = config.venvPath
+        if path == nil && !config.noAutoVenv {
+            path = pg_getenv("VIRTUAL_ENV")
+        }
+        guard let path, path[0] != 0 else { return true }
+        guard let fn = Interpreter.glueFunction("activate_venv") else { return false }
+        guard let pathObj = pg_str_utf8(path, pg_ssize_t(strlen(path))) else { return false }
+        defer { pg_decref(pathObj) }
+        guard let result = pg_call1(fn, pathObj) else {
+            PyError.logPending("activating the virtualenv")
+            return false
+        }
+        defer { pg_decref(result) }
+        if pg_is(result, Interned.none) == 0 {
+            var n: pg_ssize_t = 0
+            if let msg = pg_str_utf8_data(result, &n) {
+                Log.error { line in
+                    line.bytes(UnsafeRawPointer(msg).assumingMemoryBound(to: UInt8.self), Int(n))
+                }
+            }
+            // An explicit --venv that cannot be used is fatal; an inherited
+            // VIRTUAL_ENV that does not match is a warning, because the
+            // application may well be importable without it.
+            return config.venvPath == nil
+        }
+        return true
+    }
+
+    /// The WSGI loop. There is no asyncio here at all: the poller is the only
+    /// thing that ever blocks, and the GIL is released around it so that
+    /// application threads -- the optional pool, or background threads the
+    /// application started itself -- can run.
+    static func runSynchronousLoop(_ worker: UnsafeMutablePointer<Worker>) {
+        while worker.pointee.running {
+            let saved = pg_gil_save()
+            let n = worker.pointee.poller.wait(timeoutMillis: 200)
+            pg_gil_restore(saved)
+
+            if n > 0 { worker.pointee.processEvents(n) }
+            worker.pointee.sweepTimeouts()
+
+            if worker.pointee.draining && worker.pointee.quiescent {
+                worker.pointee.running = false
+            }
+        }
+        worker.pointee.wsgiPool?.shutdown(deadlineMs: worker.pointee.config.gracefulShutdownMs)
+    }
+}

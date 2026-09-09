@@ -1,0 +1,4 @@
+module CPython [system] {
+    header "shim.h"
+    export *
+}

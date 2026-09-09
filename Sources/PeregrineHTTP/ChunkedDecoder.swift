@@ -1,0 +1,130 @@
+//===----------------------------------------------------------------------===//
+// Incremental chunked transfer decoder.
+//
+// Resumable at any byte boundary, so a chunk header split across two TCP
+// segments costs nothing extra. Data is never copied here: the decoder hands
+// the caller a pointer into the read buffer and the caller decides whether that
+// becomes a Python bytes object or is streamed straight through.
+//===----------------------------------------------------------------------===//
+
+import PeregrineCore
+
+public struct ChunkedDecoder {
+    @usableFromInline
+    enum State: UInt8 {
+        case size, ext, sizeLF, data, dataCR, dataLF, trailerLine, trailerCR, done
+    }
+
+    @usableFromInline var state: State = .size
+    @usableFromInline var remaining: Int = 0
+    @usableFromInline var digits: Int = 0
+    /// Total decoded body bytes, checked against the configured body limit.
+    @usableFromInline var decoded: Int = 0
+    public var decodedBytes: Int { decoded }
+    /// True once the terminating zero-length chunk and trailers are consumed.
+    @inlinable public var isFinished: Bool { state == .done }
+
+    public init() {}
+
+    public enum Outcome {
+        case needMore
+        case finished
+        case failure(HTTPParseError)
+    }
+
+    /// Consumes as much of `base[0..<count]` as possible.
+    /// `sink` receives contiguous body runs; it is non-escaping, so no closure
+    /// context is heap-allocated.
+    @inlinable
+    public mutating func decode(
+        _ base: UnsafePointer<UInt8>,
+        _ count: Int,
+        consumed: inout Int,
+        _ sink: (UnsafePointer<UInt8>, Int) -> Void
+    ) -> Outcome {
+        var i = 0
+        while i < count {
+            switch state {
+            case .size:
+                let c = base[i]
+                if c == cCR {
+                    if digits == 0 { return .failure(.badChunk) }
+                    i &+= 1
+                    state = .sizeLF
+                } else if c == cSemicolon {
+                    if digits == 0 { return .failure(.badChunk) }
+                    i &+= 1
+                    state = .ext
+                } else {
+                    let v = hexValue(c)
+                    if v < 0 { return .failure(.badChunk) }
+                    // 15 hex digits keeps the running value inside Int64 with
+                    // room to spare; anything longer is malicious, not real.
+                    if digits >= 15 { return .failure(.badChunk) }
+                    remaining = (remaining << 4) | v
+                    digits &+= 1
+                    i &+= 1
+                }
+
+            case .ext:
+                // Chunk extensions are legal and universally ignored.
+                let idx = findByte(base + i, count &- i, cCR)
+                if idx < 0 { i = count } else { i &+= idx &+ 1; state = .sizeLF }
+
+            case .sizeLF:
+                if base[i] != cLF { return .failure(.badChunk) }
+                i &+= 1
+                digits = 0
+                state = remaining == 0 ? .trailerLine : .data
+
+            case .data:
+                let avail = count &- i
+                let take = avail < remaining ? avail : remaining
+                if take > 0 {
+                    sink(base + i, take)
+                    decoded &+= take
+                    remaining &-= take
+                    i &+= take
+                }
+                if remaining == 0 { state = .dataCR }
+
+            case .dataCR:
+                if base[i] != cCR { return .failure(.badChunk) }
+                i &+= 1
+                state = .dataLF
+            case .dataLF:
+                if base[i] != cLF { return .failure(.badChunk) }
+                i &+= 1
+                state = .size
+
+            case .trailerLine:
+                // Either the final CRLF, or a trailer field we skip.
+                if base[i] == cCR {
+                    i &+= 1
+                    state = .trailerCR
+                } else if base[i] == cLF {
+                    i &+= 1
+                    state = .done
+                    consumed = i
+                    return .finished
+                } else {
+                    let idx = findByte(base + i, count &- i, cLF)
+                    if idx < 0 { i = count } else { i &+= idx &+ 1 }
+                }
+
+            case .trailerCR:
+                if base[i] != cLF { return .failure(.badChunk) }
+                i &+= 1
+                state = .done
+                consumed = i
+                return .finished
+
+            case .done:
+                consumed = i
+                return .finished
+            }
+        }
+        consumed = i
+        return .needMore
+    }
+}
