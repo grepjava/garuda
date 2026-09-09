@@ -1,0 +1,9 @@
+# SwiftPM does not emit compile_commands.json, and python3-embed.pc is what
+# actually finds Python.h at build time. clangd opening these .c files — on
+# Windows especially — has neither, so it reports a missing Python.h and then
+# a cascade of undeclared identifiers. Suppress that noise; `swift build` is
+# the compiler that matters here.
+If:
+  PathMatch: .*/Sources/CPeregrine/.*\.c
+Diagnostics:
+  Suppress: "*"
