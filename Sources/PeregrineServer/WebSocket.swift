@@ -249,7 +249,7 @@ extension Worker {
         }
         defer { pg_decref(subprotocols) }
 
-        guard let scopeDict = ASGIRuntime.scope!.build(
+        guard let scopeDict = asgiScope!.build(
                 base: base,
                 head: c.pointee.head,
                 headers: headers,

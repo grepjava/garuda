@@ -63,6 +63,9 @@ func printUsage() {
       --port PORT              port to bind (default 8000)
       --unix PATH              listen on a unix socket instead
       --workers N              worker processes, 0 = one per CPU (default 1)
+      --free-threaded          run the workers as threads of one process
+                               instead of as processes; needs a free-threaded
+                               CPython (python3.13t or newer)
       --protocol wsgi|asgi     force the application protocol (default: detect)
       --factory                the target is a factory returning the application
       --root-path PATH         SCRIPT_NAME / ASGI root_path prefix
@@ -108,6 +111,7 @@ func printUsage() {
       peregrine --unix /run/app.sock --workers 4 \\
                 --forwarded-allow-ips 10.0.0.0/8 myapp:app
       peregrine --wsgi-threads 8 django_project.wsgi:application
+      peregrine --workers 0 --free-threaded myapp.asgi:app
 
     """
     _ = pg_write(1, usage.utf8Start, usage.utf8CodeUnitCount)
@@ -144,6 +148,13 @@ func printVersion() {
         let prefix: StaticString = " (CPython "
         append(prefix.utf8Start, prefix.utf8CodeUnitCount)
         append(py, len)
+        // A free-threaded interpreter is a different ABI, not a different
+        // setting, so it belongs in the same breath as the version. Packaging
+        // reads this line to decide which wheel tag the binary is for.
+        if pg_py_free_threaded() != 0 {
+            let ft: StaticString = " free-threaded"
+            append(ft.utf8Start, ft.utf8CodeUnitCount)
+        }
         let suffix: StaticString = ")"
         append(suffix.utf8Start, suffix.utf8CodeUnitCount)
     }
@@ -205,6 +216,8 @@ while i < argc {
     } else if matches(arg, "--workers") {
         guard let v = next("--workers needs a value") else { break }
         config.workers = max(0, parseInt(v))
+    } else if matches(arg, "--free-threaded") {
+        config.freeThreaded = true
     } else if matches(arg, "--protocol") {
         guard let v = next("--protocol needs wsgi or asgi") else { break }
         if matches(v, "wsgi") {
@@ -342,6 +355,15 @@ while i < argc {
 }
 
 if failed {
+    exit(2)
+}
+
+// Workers as threads only mean anything on an interpreter that can run them in
+// parallel. Refusing here rather than at start-up means the answer arrives
+// before a listening socket exists, and names the interpreter that was linked.
+if config.freeThreaded && pg_py_free_threaded() == 0 {
+    Log.error("--free-threaded needs a CPython built without the GIL (PEP 703):")
+    Log.error("python3.13t or newer. This binary is linked against a standard build.")
     exit(2)
 }
 

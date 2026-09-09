@@ -18,10 +18,24 @@ import PeregrineHTTP
 import PeregrinePython
 import PeregrineWSGI
 
-/// The per-process worker. Held behind a raw pointer rather than a class so
-/// that C callbacks (the asyncio reader, ASGI send/receive) can reach it
-/// without an ARC-managed context.
-nonisolated(unsafe) public var currentWorker: UnsafeMutablePointer<Worker>? = nil
+/// The worker this thread is running. Held behind a raw pointer rather than a
+/// class so that C callbacks (the asyncio reader, ASGI send/receive) can reach
+/// it without an ARC-managed context.
+///
+/// Thread-local, not global. With one worker per process the two are the same
+/// thing; under `--free-threaded` a process has several workers, each owning
+/// its own poller, connection table and event loop, and a callback arriving
+/// from Python has to land on the one belonging to the thread it is running on.
+/// The storage is a C `_Thread_local`, so reading it is a register-relative
+/// load rather than a lock or a `pthread_getspecific` call.
+public var currentWorker: UnsafeMutablePointer<Worker>? {
+    @inline(__always) get {
+        pg_worker_current()?.assumingMemoryBound(to: Worker.self)
+    }
+    @inline(__always) set {
+        pg_worker_set_current(UnsafeMutableRawPointer(newValue))
+    }
+}
 
 public struct Worker {
     public var config: ServerConfig
@@ -51,9 +65,41 @@ public struct Worker {
     public var wsgiPool: WSGIPool? = nil
     public var appProtocol: AppProtocol = .wsgi
 
+    // --- ASGI, one set per worker ---
+    //
+    // These were static, which was correct while a worker was a process. Under
+    // --free-threaded several workers share an interpreter, and each still
+    // needs its own event loop and its own scope builder -- the builder carries
+    // a mutable header-name cache and a scratch buffer, so sharing one across
+    // threads would be a data race. The application object and the glue
+    // functions stay process-wide on ASGIRuntime, because they are written once
+    // at start-up and only read afterwards.
+
+    /// This worker's asyncio event loop.
+    public var asgiLoop: PyObj? = nil
+    /// The lifespan driver, on the one worker that owns it. The ASGI lifespan
+    /// is per application, not per worker, so exactly one worker in the process
+    /// runs it; on every other worker this is nil.
+    public var asgiLifespan: PyObj? = nil
+    /// Prototype scope, interned keys and the memoised header-name cache.
+    public var asgiScope: ASGIScopeBuilder? = nil
+    /// `loop.add_reader` callback for the poller descriptor.
+    public var asgiDrainCallback: PyObj? = nil
+    /// The periodic housekeeping callback.
+    public var asgiTimerCallback: PyObj? = nil
+
     public var running = true
     /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
     public var draining = false
+    /// Whether this worker arms the `SIGALRM` watchdog when it starts draining.
+    ///
+    /// A worker process is the last word on its own lifetime, so it does. A
+    /// free-threaded worker thread is not: the process still has to join every
+    /// thread and run the lifespan shutdown after this worker has finished, and
+    /// a watchdog armed here would be the shorter of the two and would `_exit`
+    /// in the middle of that. The supervising thread arms one for the whole
+    /// process instead.
+    public var ownsExitWatchdog = true
     /// When draining must stop being polite. A request that never completes
     /// would otherwise hold the whole process open indefinitely.
     public var drainDeadline: UInt64 = 0
@@ -1150,8 +1196,10 @@ public struct Worker {
         // no supervisor has nobody to escalate to. This one is not -- it fires
         // from a signal handler and calls _exit. The extra margin covers the
         // task drain, the lifespan shutdown and interpreter finalisation.
-        let margin = config.gracefulShutdownMs / 1000 &+ 10
-        pg_exit_after(UInt32(truncatingIfNeeded: margin), 0)
+        if ownsExitWatchdog {
+            let margin = config.gracefulShutdownMs / 1000 &+ 10
+            pg_exit_after(UInt32(truncatingIfNeeded: margin), 0)
+        }
         Log.info("worker draining")
         _ = poller.modify(listenFD, [], token: PollToken.listener)
         // Idle keep-alive connections have nothing in flight; drop them now.

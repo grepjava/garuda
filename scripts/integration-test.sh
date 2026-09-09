@@ -8,6 +8,10 @@
 set -u
 
 BIN=${1:-${PEREGRINE:-$HOME/pgbuild/release/peregrine}}
+# Extra server flags, so the same suite can be pointed at a different execution
+# model without a second copy of it:
+#   PEREGRINE_EXTRA_ARGS="--workers 4 --free-threaded" bash scripts/integration-test.sh
+EXTRA=${PEREGRINE_EXTRA_ARGS:-}
 WSGI_PORT=8301
 ASGI_PORT=8302
 PASS=0
@@ -24,7 +28,8 @@ trap cleanup EXIT
 start() {
     local port=$1 app=$2
     cleanup
-    "$BIN" --port "$port" --log-level error --python-path examples "$app" \
+    # shellcheck disable=SC2086 -- EXTRA is a deliberate word-split flag list.
+    "$BIN" --port "$port" --log-level error --python-path examples $EXTRA "$app" \
         > "/tmp/peregrine-it-$port.log" 2>&1 &
     for _ in $(seq 1 50); do
         curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0

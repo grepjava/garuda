@@ -25,6 +25,20 @@ public struct ServerConfig {
     /// via SO_REUSEPORT, its own accept queue -- so there is no shared lock and
     /// no thundering herd. 0 means "one per CPU".
     public var workers = 1
+    /// Run the workers as threads of one process rather than as processes.
+    ///
+    /// Only meaningful on a free-threaded CPython (PEP 703, `python3.13t` and
+    /// later), where threads of one interpreter genuinely run in parallel. What
+    /// it buys is what a process could not: one copy of the application, one
+    /// set of import-time caches, one connection pool, one warm JIT -- and
+    /// `--reload`, HTTP/3 connection migration and shared in-process state all
+    /// stop being cross-process problems. What it costs is that a crash takes
+    /// every worker with it, so the process supervisor is worth keeping in
+    /// front of it in production.
+    public var freeThreaded = false
+    /// `workers` with 0 resolved to the CPU count, which is what every part of
+    /// start-up actually wants.
+    public var resolvedWorkers: Int { workers > 0 ? workers : Int(pg_cpu_count()) }
     public var maxConnections = 4096
 
     // --- limits ---

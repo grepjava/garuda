@@ -49,11 +49,14 @@ extension Worker {
 
         if let headerList = pg_dict_get(message, Interned[.headers]),
            pg_is(headerList, Interned.none) == 0 {
-            guard PySeq.isSequence(headerList) else {
+            guard let materialized = PySeq.iterable(headerList) else {
+                pg_err_clear()
                 pg_err_set_str(pg_exc_value(),
-                               "http.response.start headers must be a list of pairs")
+                               "http.response.start headers must be an iterable of pairs")
                 return false
             }
+            let headerList = materialized.seq
+            defer { if materialized.owned { pg_decref(headerList) } }
             let count = PySeq.count(headerList)
             var i = 0
             while i < count && failure == nil {

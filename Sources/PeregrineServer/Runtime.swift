@@ -19,6 +19,12 @@
 // Threads are not used for request handling in ASGI mode: with an event loop
 // and a GIL there is nothing for a second thread to do. WSGI is different --
 // see WSGIPool -- because a synchronous application blocks on its own I/O.
+//
+// `--free-threaded` changes that premise rather than that conclusion. On a
+// CPython built without the GIL (PEP 703) the workers become threads of one
+// process instead of processes, each still owning its own poller, connection
+// slab and event loop -- so nothing above the transport learns that it has
+// company. See FreeThreaded.swift.
 //===----------------------------------------------------------------------===//
 
 import CPeregrine
@@ -54,7 +60,14 @@ public enum Peregrine {
             guard makeTLSContext(config) != nil else { return 1 }
         }
 
-        let workerCount = config.workers > 0 ? config.workers : Int(pg_cpu_count())
+        let workerCount = config.resolvedWorkers
+
+        // Workers as threads. --reload still wants a process to restart into,
+        // so the two compose: the supervisor forks one child and that child
+        // runs every worker as a thread of itself.
+        if config.freeThreaded && !config.reload {
+            return runFreeThreaded(config, workers: workerCount, inherited: -1) ? 0 : 1
+        }
 
         // --reload needs a supervisor to restart into, even with one worker.
         if workerCount <= 1 && !config.reload {
@@ -65,7 +78,9 @@ public enum Peregrine {
             removeUnixPath(config)
             return ok ? 0 : 1
         }
-        return runSupervisor(config, workers: max(1, workerCount))
+        // Under --free-threaded the supervisor has exactly one child to watch,
+        // because the child holds all the workers itself.
+        return runSupervisor(config, workers: config.freeThreaded ? 1 : max(1, workerCount))
     }
 
     /// Builds the TLS context, with the ALPN list the rest of the
@@ -85,11 +100,10 @@ public enum Peregrine {
                                alpn: alpn, ciphers: config.tlsCiphers)
     }
 
-    /// The certificate for QUIC, loaded once per worker. QUIC cannot borrow
-    /// the SSL_CTX the TCP listener uses: it needs the primitives underneath,
-    /// not the record layer on top.
-    nonisolated(unsafe) static var quicCertKey: OpaquePointer? = nil
-
+    /// Builds the QUIC listener. QUIC cannot borrow the SSL_CTX the TCP listener
+    /// uses: it needs the primitives underneath, not the record layer on top, so
+    /// the certificate is loaded again here. The loaded key is owned by the
+    /// `QUICServerConfig` the listener carries, one per worker.
     static func makeQUICListener(_ config: ServerConfig) -> QUICListener? {
         guard let cert = config.tlsCertPath, let key = config.tlsKeyPath else {
             Log.error("--http3 needs --tls-cert and --tls-key: QUIC has no cleartext form")
@@ -111,7 +125,6 @@ public enum Peregrine {
             }
             return nil
         }
-        quicCertKey = certKey
 
         let port = config.quicPort != 0 ? config.quicPort : config.port
         let fd = pg_bind_udp(config.host, port, 1, config.ipv6Only ? 1 : 0)
@@ -301,6 +314,13 @@ public enum Peregrine {
         Log.pid = Int(pg_getpid())
         // A fresh signal pipe: the inherited one belongs to the supervisor.
         pg_signal_pipe_reset()
+        // A free-threaded child opens one listener per worker thread, so it is
+        // handed the inherited descriptor as-is and works the rest out itself.
+        if config.freeThreaded {
+            let ok = runFreeThreaded(config, workers: config.resolvedWorkers,
+                                     inherited: inherited)
+            exitProcess(ok ? 0 : 1)
+        }
         var fd = inherited
         if fd < 0 {
             guard let opened = openListener(config, reusePort: true, unlinkStale: false) else {
@@ -318,12 +338,24 @@ public enum Peregrine {
 
     // MARK: - Worker
 
-    /// Everything from here down runs inside a worker process.
-    static func runWorker(_ config: ServerConfig, listenFD: Int32) -> Bool {
+    /// The application, once the interpreter is up and it has been imported.
+    struct LoadedApplication {
+        let app: PyObj
+        let proto: AppProtocol
+    }
+
+    /// Everything that happens once per process: the interpreter, the search
+    /// path, the internal Python types, and the application itself.
+    ///
+    /// With workers as processes this runs once per worker, because a worker is
+    /// a process. Under `--free-threaded` it runs exactly once and every worker
+    /// thread shares what it produced -- which is the whole point: one import of
+    /// the application, one set of module-level caches, one connection pool.
+    static func bootInterpreter(_ config: ServerConfig) -> LoadedApplication? {
         guard Interpreter.initialize(program: staticCString("peregrine"),
                                      home: config.pythonHome,
                                      isolated: false) else {
-            return false
+            return nil
         }
         // Order matters, and each of these prepends, so they are applied
         // back to front. What comes out is: the directories the user named,
@@ -332,7 +364,7 @@ public enum Peregrine {
         // and a package installed in the environment must not silently win
         // over one they pointed at -- which is the same rule PYTHONPATH
         // follows against site-packages in an ordinary interpreter.
-        if !activateVirtualenv(config) { return false }
+        if !activateVirtualenv(config) { return nil }
         Interpreter.addSysPath(staticCString("."))
         for extra in config.pythonPaths.reversed() { Interpreter.addSysPath(extra) }
 
@@ -342,27 +374,27 @@ public enum Peregrine {
               WSGIInputStream.register(),
               WSGIStartResponse.register() else {
             Log.error("failed to register internal Python types")
-            return false
+            return nil
         }
 
         var appRef = Interpreter.loadApplication(config.appSpec)
         guard var app = appRef.optional else {
             Log.error("could not load the application")
-            return false
+            return nil
         }
         if pg_is_callable(app) == 0 {
             Log.error("the application object is not callable")
-            return false
+            return nil
         }
         if config.appIsFactory {
             guard let produced = pg_call0(app) else {
                 PyError.logPending("calling the application factory")
-                return false
+                return nil
             }
             if pg_is_callable(produced) == 0 {
                 Log.error("the application factory did not return a callable")
                 pg_decref(produced)
-                return false
+                return nil
             }
             _ = appRef.take()
             appRef = PyRef(stealing: produced)
@@ -370,56 +402,83 @@ public enum Peregrine {
         }
         let proto = config.appProtocol ?? Interpreter.detectProtocol(app)
 
+        // The application object is deliberately leaked: it lives as long as
+        // the process and releasing it during finalisation is a hazard.
+        _ = appRef.take()
+        return LoadedApplication(app: app, proto: proto)
+    }
+
+    /// Builds one worker: poller, connection slab, TLS, QUIC listener, and the
+    /// WSGI runtime when that is the protocol.
+    ///
+    /// The ASGI event loop is deliberately not set up here. How the loop and
+    /// the lifespan are arranged is precisely what differs between the process
+    /// model and the free-threaded one -- a process has one of each, a
+    /// free-threaded worker has a loop of its own and shares one lifespan with
+    /// its siblings -- so each caller does that part itself.
+    ///
+    /// `controlFD` is the descriptor the worker learns about shutdown through:
+    /// the process signal pipe for a worker process, and a pipe written by the
+    /// supervising thread for a worker thread. Either way it carries signal
+    /// numbers, so `handleSignals` does not know the difference.
+    static func makeWorker(_ config: ServerConfig,
+                           listenFD: Int32,
+                           controlFD: Int32,
+                           loaded: LoadedApplication) -> UnsafeMutablePointer<Worker>? {
         guard let poller = Poller(maxEvents: 256) else {
             Log.error("cannot create the readiness poller")
-            return false
+            return nil
         }
 
         let workerPtr = UnsafeMutablePointer<Worker>.allocate(capacity: 1)
         workerPtr.initialize(to: Worker(config: config, listenFD: listenFD, poller: poller))
         currentWorker = workerPtr
         if config.tlsEnabled {
-            guard let context = makeTLSContext(config) else { return false }
+            guard let context = makeTLSContext(config) else { return nil }
             workerPtr.pointee.tlsContext = context
         }
-        workerPtr.pointee.appProtocol = proto
-        workerPtr.pointee.signalFD = pg_signal_pipe_init()
+        workerPtr.pointee.appProtocol = loaded.proto
+        workerPtr.pointee.signalFD = controlFD
         if config.http3Enabled {
-            guard let listener = makeQUICListener(config) else { return false }
+            guard let listener = makeQUICListener(config) else { return nil }
             workerPtr.pointee.quic = listener
         }
 
-        if proto == .wsgi {
+        if loaded.proto == .wsgi {
             let threads = max(1, config.wsgiThreads)
-            guard let runtime = WSGIRuntime(app: app,
+            // PEP 3333 asks two questions about the environment the application
+            // is running in, and --free-threaded answers them the other way
+            // round from --workers: one process, several threads.
+            let siblings = config.resolvedWorkers > 1
+            guard let runtime = WSGIRuntime(app: loaded.app,
                                             serverName: config.serverName,
                                             serverPort: config.serverPortString,
                                             scheme: config.scheme,
                                             rootPath: config.rootPath,
-                                            multiprocess: config.workers != 1,
-                                            multithread: threads > 1) else {
+                                            multiprocess: !config.freeThreaded && siblings,
+                                            multithread: threads > 1
+                                                || (config.freeThreaded && siblings)) else {
                 Log.error("could not prepare the WSGI runtime")
-                return false
+                return nil
             }
             workerPtr.pointee.wsgi = runtime
             if threads > 1 {
                 guard let pool = WSGIPool(threads: threads, worker: workerPtr) else {
                     Log.error("could not start the WSGI thread pool")
-                    return false
+                    return nil
                 }
                 workerPtr.pointee.wsgiPool = pool
-                guard workerPtr.pointee.registerPool() else { return false }
-            }
-        } else {
-            guard ASGIRuntime.prepare(app: app, config: config) else {
-                Log.error("could not prepare the ASGI runtime")
-                return false
+                guard workerPtr.pointee.registerPool() else { return nil }
             }
         }
 
-        guard workerPtr.pointee.registerListener() else { return false }
-        guard workerPtr.pointee.registerQUIC() else { return false }
+        guard workerPtr.pointee.registerListener() else { return nil }
+        guard workerPtr.pointee.registerQUIC() else { return nil }
+        return workerPtr
+    }
 
+    /// The "worker ready" line. `threads` is 0 for a worker process.
+    static func logReady(_ config: ServerConfig, proto: AppProtocol, threads: Int) {
         Log.info { line in
             line.str(proto == .wsgi ? "worker ready (WSGI) on " : "worker ready (ASGI) on ")
             line.cstr(config.unixPath ?? config.host)
@@ -427,18 +486,37 @@ public enum Peregrine {
                 line.str(":")
                 line.int(Int(config.port))
             }
+            if threads > 0 {
+                line.str(" with ")
+                line.int(threads)
+                line.str(" free-threaded workers")
+            }
             if proto == .wsgi && config.wsgiThreads > 1 {
                 line.str(" with ")
                 line.int(config.wsgiThreads)
                 line.str(" application threads")
             }
         }
+    }
 
-        // The application object is deliberately leaked: it lives as long as
-        // the process and releasing it during finalisation is a hazard.
-        _ = appRef.take()
+    /// Everything from here down runs inside a worker process.
+    static func runWorker(_ config: ServerConfig, listenFD: Int32) -> Bool {
+        guard let loaded = bootInterpreter(config) else { return false }
+        guard let workerPtr = makeWorker(config, listenFD: listenFD,
+                                         controlFD: pg_signal_pipe_init(),
+                                         loaded: loaded) else {
+            return false
+        }
+        if loaded.proto == .asgi {
+            guard ASGIRuntime.prepare(workerPtr, app: loaded.app, config: config) else {
+                Log.error("could not prepare the ASGI runtime")
+                return false
+            }
+        }
 
-        if proto == .wsgi {
+        logReady(config, proto: loaded.proto, threads: 0)
+
+        if loaded.proto == .wsgi {
             runSynchronousLoop(workerPtr)
         } else {
             ASGIRuntime.runLoop(workerPtr)

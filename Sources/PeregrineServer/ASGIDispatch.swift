@@ -8,10 +8,15 @@
 // Swift when connections need service.
 //
 // That means:
-//   * one thread, one event loop, one interpreter -- no worker threads;
+//   * one thread and one event loop per worker -- no threads behind it;
 //   * no cross-thread queues and no call_soon_threadsafe wakeups;
 //   * the GIL is never handed back and forth, because nothing else wants it;
 //   * uvloop works unchanged, since add_reader is part of the loop contract.
+//
+// Under --free-threaded a process holds several workers, so several of these
+// arrangements sit side by side. Each is still entirely self-contained -- the
+// loops never speak to each other, and the state that used to be static here is
+// now per worker, reached through the thread-local `currentWorker`.
 //
 // `send` and `receive` are C-level callables (PyTrampoline) carrying a packed
 // (generation, slot) token rather than a Python closure over server state. A
@@ -28,10 +33,8 @@ import PeregrineHTTP
 import PeregrinePython
 
 public enum ASGIRuntime {
-    nonisolated(unsafe) static var scope: ASGIScopeBuilder? = nil
+    // --- process-wide, written once at start-up and only read afterwards ---
     nonisolated(unsafe) static var app: PyObj! = nil
-    nonisolated(unsafe) static var loop: PyObj! = nil
-    nonisolated(unsafe) static var lifespan: PyObj? = nil
     nonisolated(unsafe) static var fnSpawn: PyObj! = nil
     nonisolated(unsafe) static var fnResolve: PyObj! = nil
     nonisolated(unsafe) static var fnRunUntil: PyObj! = nil
@@ -40,13 +43,29 @@ public enum ASGIRuntime {
     nonisolated(unsafe) static var fnArmTimer: PyObj! = nil
     nonisolated(unsafe) static var fnTaskError: PyObj! = nil
     nonisolated(unsafe) static var fnFinish: PyObj! = nil
-    nonisolated(unsafe) static var drainCallback: PyObj! = nil
-    nonisolated(unsafe) static var timerCallback: PyObj! = nil
+    nonisolated(unsafe) static var fnNewLoop: PyObj! = nil
     nonisolated(unsafe) static var gracefulShutdownMs: UInt64 = 10_000
+    /// The `state` mapping the lifespan handler filled in, shared by every
+    /// worker in the process. ASGI says the same object is handed to every
+    /// request scope, and under `--free-threaded` "every" now spans threads.
+    nonisolated(unsafe) static var lifespanState: PyObj? = nil
+
+    // --- per worker, and therefore per thread ---
+    //
+    // Kept as accessors over the current worker so that the several dozen call
+    // sites below read exactly as they did when a worker was a process.
+
+    @inline(__always) static var loop: PyObj! { currentWorker?.pointee.asgiLoop }
+    @inline(__always) static var lifespan: PyObj? { currentWorker?.pointee.asgiLifespan }
+    @inline(__always) static var timerCallback: PyObj! {
+        currentWorker?.pointee.asgiTimerCallback
+    }
 
     // MARK: - Setup
 
-    public static func prepare(app application: PyObj, config: ServerConfig) -> Bool {
+    /// Resolves the glue functions and runs whatever has to happen once per
+    /// process. Called before any worker exists.
+    public static func prepareProcess(app application: PyObj, config: ServerConfig) -> Bool {
         app = application
 
         guard let spawn = Interpreter.glueFunction("spawn"),
@@ -73,63 +92,106 @@ public enum ASGIRuntime {
         }
         fnTaskError = taskError
         fnFinish = finish
+        fnNewLoop = newLoop
         gracefulShutdownMs = config.gracefulShutdownMs
+        return true
+    }
 
-        guard let l = pg_call1(newLoop, config.preferUvloop ? Interned.pyTrue : Interned.pyFalse) else {
+    /// Creates an event loop. One per worker; under `--free-threaded` that is
+    /// one per thread, plus the supervising thread's, which hosts the lifespan.
+    static func makeLoop(_ config: ServerConfig) -> PyObj? {
+        guard let l = pg_call1(fnNewLoop,
+                               config.preferUvloop ? Interned.pyTrue : Interned.pyFalse) else {
             PyError.logPending("creating the event loop")
-            return false
+            return nil
         }
-        loop = l
+        return l
+    }
 
-        // --- lifespan startup ---
-        var state: PyObj? = nil
-        if config.callLifespan {
-            guard let cls = pg_getattr(Interpreter.glue, "Lifespan") else {
-                PyError.logPending("loading the lifespan driver")
-                return false
-            }
-            defer { pg_decref(cls) }
-            guard let rootObj = pg_str_intern(config.rootPath) else { return false }
-            defer { pg_decref(rootObj) }
-            guard let ls = pg_call2(cls, application, rootObj) else {
-                PyError.logPending("creating the lifespan driver")
-                return false
-            }
-            lifespan = ls
-            guard let coro = pg_call_method0(ls, Interned[.nStartup]) else {
-                PyError.logPending("starting lifespan")
-                return false
-            }
-            let outcome = pg_call2(fnRunUntil, l, coro)
-            pg_decref(coro)
-            guard let outcome else {
-                PyError.logPending("running lifespan startup")
-                return false
-            }
-            defer { pg_decref(outcome) }
-            if pg_is(outcome, Interned.none) == 0 {
-                var n: pg_ssize_t = 0
-                if let msg = pg_str_utf8_data(outcome, &n) {
-                    Log.error { line in
-                        line.str("lifespan startup failed: ")
-                        line.bytes(UnsafeRawPointer(msg).assumingMemoryBound(to: UInt8.self), Int(n))
-                    }
+    /// Runs the ASGI lifespan startup handshake on `loop`, and publishes the
+    /// `state` mapping every request scope will carry.
+    ///
+    /// Once per process, never once per worker: `lifespan.startup` means the
+    /// application is opening its database pools and starting its background
+    /// tasks, and an application instance should do that once. With workers as
+    /// processes that distinction was invisible, because a process held exactly
+    /// one application. With workers as threads it is the whole question.
+    ///
+    /// Returns the lifespan driver, which the caller must keep and hand back to
+    /// `finish` at shutdown; nil means startup failed and the server must not
+    /// start.
+    static func startLifespan(app application: PyObj,
+                              loop l: PyObj,
+                              config: ServerConfig) -> PyObj?? {
+        guard config.callLifespan else { return .some(nil) }
+
+        guard let cls = pg_getattr(Interpreter.glue, "Lifespan") else {
+            PyError.logPending("loading the lifespan driver")
+            return nil
+        }
+        defer { pg_decref(cls) }
+        guard let rootObj = pg_str_intern(config.rootPath) else { return nil }
+        defer { pg_decref(rootObj) }
+        guard let ls = pg_call2(cls, application, rootObj) else {
+            PyError.logPending("creating the lifespan driver")
+            return nil
+        }
+        guard let coro = pg_call_method0(ls, Interned[.nStartup]) else {
+            PyError.logPending("starting lifespan")
+            return nil
+        }
+        let outcome = pg_call2(fnRunUntil, l, coro)
+        pg_decref(coro)
+        guard let outcome else {
+            PyError.logPending("running lifespan startup")
+            return nil
+        }
+        defer { pg_decref(outcome) }
+        if pg_is(outcome, Interned.none) == 0 {
+            var n: pg_ssize_t = 0
+            if let msg = pg_str_utf8_data(outcome, &n) {
+                Log.error { line in
+                    line.str("lifespan startup failed: ")
+                    line.bytes(UnsafeRawPointer(msg).assumingMemoryBound(to: UInt8.self), Int(n))
                 }
-                return false
             }
-            if let st = pg_getattr(ls, "state") { state = st } else { pg_err_clear() }
+            return nil
         }
+        if let st = pg_getattr(ls, "state") { lifespanState = st } else { pg_err_clear() }
+        return .some(ls)
+    }
 
+    /// Gives one worker the loop and scope builder it serves requests with.
+    /// The lifespan state is whatever `startLifespan` published, so every
+    /// worker in the process hands the application the same `state` mapping.
+    public static func prepareWorker(_ worker: UnsafeMutablePointer<Worker>,
+                                     config: ServerConfig,
+                                     loop l: PyObj) -> Bool {
+        worker.pointee.asgiLoop = l
         guard let builder = ASGIScopeBuilder(scheme: config.scheme,
                                              rootPath: config.rootPath,
                                              serverHost: config.serverName,
                                              serverPort: Int(config.port),
-                                             lifespanState: state) else {
+                                             lifespanState: lifespanState) else {
             PyError.logPending("preparing the ASGI scope")
             return false
         }
-        scope = builder
+        worker.pointee.asgiScope = builder
         return true
+    }
+
+    /// The whole ASGI setup for the one-worker-per-process case: process-wide
+    /// state, a loop, the lifespan on it, and the worker's scope builder.
+    public static func prepare(_ worker: UnsafeMutablePointer<Worker>,
+                               app application: PyObj,
+                               config: ServerConfig) -> Bool {
+        guard prepareProcess(app: application, config: config) else { return false }
+        guard let l = makeLoop(config) else { return false }
+        guard let ls = startLifespan(app: application, loop: l, config: config) else {
+            return false
+        }
+        worker.pointee.asgiLifespan = ls
+        return prepareWorker(worker, config: config, loop: l)
     }
 
     /// Hands the poller to asyncio and runs until the loop stops.
@@ -139,22 +201,24 @@ public enum ASGIRuntime {
             PyError.logPending("creating the loop callbacks")
             return
         }
-        drainCallback = drain
-        timerCallback = timer
+        worker.pointee.asgiDrainCallback = drain
+        worker.pointee.asgiTimerCallback = timer
+
+        guard let l = worker.pointee.asgiLoop else { return }
 
         // Prime the periodic sweep (idle timeouts, drain completion).
-        if let r = pg_call2(fnArmTimer, loop, timer) { pg_decref(r) } else { pg_err_clear() }
+        if let r = pg_call2(fnArmTimer, l, timer) { pg_decref(r) } else { pg_err_clear() }
 
         guard let pollFD = pg_int(Int(worker.pointee.poller.fd)) else { return }
         defer { pg_decref(pollFD) }
 
-        if let r = pg_call3(fnRunLoop, loop, pollFD, drain) {
+        if let r = pg_call3(fnRunLoop, l, pollFD, drain) {
             pg_decref(r)
         } else {
             PyError.logPending("running the event loop")
         }
 
-        shutdown()
+        shutdown(worker)
     }
 
     /// Shuts the loop down in the order an application expects.
@@ -165,11 +229,28 @@ public enum ASGIRuntime {
     /// cleanup -- closing database pools, flushing telemetry -- silently does
     /// not run. Request tasks are therefore drained first, with a deadline, and
     /// only then is the lifespan asked to shut down.
-    static func shutdown() {
+    ///
+    /// A worker that does not own the lifespan passes `None` in its place, so
+    /// it drains and closes its own loop and nothing more. Under
+    /// `--free-threaded` the lifespan lives on the supervising thread's loop
+    /// and is shut down there, after every worker thread has joined -- which is
+    /// the only ordering that does not pull the application's database pool out
+    /// from under a request still finishing on another thread.
+    static func shutdown(_ worker: UnsafeMutablePointer<Worker>) {
+        guard let l = worker.pointee.asgiLoop else { return }
+        finishLoop(l, lifespan: worker.pointee.asgiLifespan)
+        worker.pointee.asgiScope?.destroy()
+        worker.pointee.asgiScope = nil
+        worker.pointee.asgiLoop = nil
+    }
+
+    /// Drains one loop's request tasks, runs the lifespan shutdown when this
+    /// loop is the one carrying it, and closes the loop.
+    static func finishLoop(_ l: PyObj, lifespan ls0: PyObj?) {
         if let timeout = pg_int(Int(gracefulShutdownMs)) {
             defer { pg_decref(timeout) }
-            let ls = lifespan ?? Interned.none!
-            if let outcome = pg_call3(fnFinish, loop, ls, timeout) {
+            let ls = ls0 ?? Interned.none!
+            if let outcome = pg_call3(fnFinish, l, ls, timeout) {
                 defer { pg_decref(outcome) }
                 if pg_is(outcome, Interned.none) == 0 {
                     var n: pg_ssize_t = 0
@@ -189,8 +270,6 @@ public enum ASGIRuntime {
         } else {
             pg_err_clear()
         }
-        scope?.destroy()
-        scope = nil
     }
 }
 
@@ -236,7 +315,7 @@ extension Worker {
 
     mutating func dispatchASGI(_ slot: Int) {
         let c = table[slot]
-        guard ASGIRuntime.scope != nil else {
+        guard asgiScope != nil else {
             failRequest(slot, status: 500)
             return
         }
@@ -287,7 +366,7 @@ extension Worker {
             schemeOverride = https ? Interned[.vHTTPS] : Interned[.vHTTP]
         }
 
-        guard let scopeDict = ASGIRuntime.scope!.build(
+        guard let scopeDict = asgiScope!.build(
                 base: base,
                 head: c.pointee.head,
                 headers: headers,
@@ -464,11 +543,14 @@ extension Worker {
 
         if let headerList = pg_dict_get(message, Interned[.headers]),
            pg_is(headerList, Interned.none) == 0 {
-            guard PySeq.isSequence(headerList) else {
+            guard let materialized = PySeq.iterable(headerList) else {
+                pg_err_clear()
                 pg_err_set_str(pg_exc_value(),
-                               "http.response.start headers must be a list of pairs")
+                               "http.response.start headers must be an iterable of pairs")
                 return false
             }
+            let headerList = materialized.seq
+            defer { if materialized.owned { pg_decref(headerList) } }
             let count = PySeq.count(headerList)
             var i = 0
             while i < count {

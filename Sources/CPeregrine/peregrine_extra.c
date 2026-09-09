@@ -171,6 +171,38 @@ int pg_thread_spawn(void (*fn)(void *), void *arg) {
     return 0;
 }
 
+struct pg_thread { pthread_t tid; };
+
+pg_thread *pg_thread_start(void (*fn)(void *), void *arg) {
+    pg_thread *t = (pg_thread *)malloc(sizeof *t);
+    if (!t) return NULL;
+    struct thread_start *s = (struct thread_start *)malloc(sizeof *s);
+    if (!s) { free(t); return NULL; }
+    s->fn = fn;
+    s->arg = arg;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    /* A worker thread runs an interpreter and an application, not one request
+     * frame; it gets the same 8 MiB a main thread would have. */
+    pthread_attr_setstacksize(&attr, 1u << 23);
+    int rc = pthread_create(&t->tid, &attr, thread_trampoline, s);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) { free(s); free(t); errno = rc; return NULL; }
+    return t;
+}
+
+void pg_thread_join(pg_thread *t) {
+    if (!t) return;
+    pthread_join(t->tid, NULL);
+    free(t);
+}
+
+/* The current thread's Worker. See the comment in peregrine_sys.h. */
+static _Thread_local void *g_current_worker = NULL;
+
+void *pg_worker_current(void) { return g_current_worker; }
+void pg_worker_set_current(void *worker) { g_current_worker = worker; }
+
 /* ======================================================================== */
 /* SHA-1 and base64, for the WebSocket handshake                            */
 /* ======================================================================== */

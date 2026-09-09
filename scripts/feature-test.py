@@ -18,6 +18,7 @@ import json
 import os
 import random
 import re
+import shlex
 import signal
 import socket
 import ssl
@@ -31,6 +32,11 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+
+# Extra server flags, so most of the suite can be pointed at a different
+# execution model:  PEREGRINE_EXTRA_ARGS="--workers 4 --free-threaded"
+# The free-threaded section below sets its own flags and ignores this.
+EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
 
 PASS = 0
 FAIL = 0
@@ -74,6 +80,7 @@ class Server:
         self.tls = tls
         self.alpn = alpn
         cmd = [BIN, "--log-level", "error", "--python-path", os.path.join(ROOT, "examples")]
+        cmd += EXTRA
         if tls:
             cert, key = make_certs()
             cmd += ["--tls-cert", cert, "--tls-key", key]
@@ -1219,6 +1226,136 @@ def test_reload():
             os.unlink(scratch)
 
 
+def free_threaded_build():
+    """True when this binary is linked against a CPython without the GIL."""
+    out = subprocess.run([BIN, "--version"], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT).stdout.decode(errors="replace")
+    return "free-threaded" in out
+
+
+def test_free_threaded():
+    print("\nFree-threaded workers")
+
+    if not free_threaded_build():
+        # The refusal is the behaviour worth checking on a standard build: it
+        # has to be a clear error before anything binds, not a silent fallback
+        # to a single worker.
+        port = free_port()
+        proc = subprocess.run(
+            [BIN, "--free-threaded", "--port", str(port),
+             "--python-path", os.path.join(ROOT, "examples"), "asgi_app:app"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+        out = proc.stdout.decode(errors="replace")
+        check("--free-threaded is refused on a build with the GIL",
+              proc.returncode != 0 and "free-threaded" in out, out.strip()[:200])
+        print("  (linked against a standard CPython; the rest is skipped)")
+        return
+
+    # --- one process, several threads, all of them serving ---
+    port = free_port()
+    server = Server("--workers", "4", "--free-threaded", port=port)
+    try:
+        pids = set()
+        code = 0
+        for _ in range(40):
+            code, _hdrs, body = server.get("/pid")
+            if code != 200:
+                break
+            pids.add(body.strip())
+        is_("every request is answered", code, 200)
+        check("all workers share one process", len(pids) == 1,
+              "saw %d pids: %r" % (len(pids), pids))
+    finally:
+        server.stop()
+
+    # The threads are real, and more than one of them serves. /threadid is
+    # answered by whichever worker accepted the connection, so a spread of
+    # identities is the observable proof that the workers are separate threads.
+    port = free_port()
+    server = Server("--workers", "4", "--free-threaded", port=port)
+    try:
+        threads = set()
+        # New connections, not keep-alive: a reused connection stays on the
+        # worker that accepted it, which would only ever show one thread.
+        for _ in range(60):
+            code, _hdrs, body = server.get("/threadid")
+            if code == 200:
+                threads.add(body.strip())
+        check("requests are spread over several worker threads (%d seen)" % len(threads),
+              len(threads) > 1, "only %d thread served" % len(threads))
+    finally:
+        server.stop()
+
+    # --- the lifespan runs once, not once per worker ---
+    marker = os.path.join(tempfile.gettempdir(), "peregrine-ft-boot-%d" % os.getpid())
+    if os.path.exists(marker):
+        os.unlink(marker)
+    port = free_port()
+    server = Server("--workers", "4", "--free-threaded", port=port,
+                    env={"PEREGRINE_STARTUP_COUNTER": marker})
+    try:
+        server.get("/")
+        count = 0
+        if os.path.exists(marker):
+            with open(marker) as fh:
+                count = len(fh.read().split())
+        check("lifespan startup runs once for the whole process",
+              count == 1, "ran %d times" % count)
+    finally:
+        server.stop()
+        if os.path.exists(marker):
+            os.unlink(marker)
+
+    # --- shutdown: in-flight requests on worker threads are waited for, and
+    #     the lifespan shuts down only afterwards ---
+    marker = os.path.join(tempfile.gettempdir(), "peregrine-ft-shutdown-%d" % os.getpid())
+    if os.path.exists(marker):
+        os.unlink(marker)
+    port = free_port()
+    server = Server("--workers", "4", "--free-threaded",
+                    "--graceful-timeout", "10000", port=port,
+                    env={"PEREGRINE_SHUTDOWN_MARKER": marker})
+    s = server.connect(timeout=20)
+    s.sendall(b"GET /slow?1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    time.sleep(0.3)
+    code, elapsed = server.stop(timeout=25)
+    check("an in-flight request on a worker thread is waited for (%.1fs)" % elapsed,
+          0.5 < elapsed < 8.0, "%.1fs" % elapsed)
+    check("lifespan shutdown runs after the worker threads have drained",
+          os.path.exists(marker), "the application never saw lifespan.shutdown")
+    s.close()
+    if os.path.exists(marker):
+        os.unlink(marker)
+
+    # A request that will never finish must not hold the process open, even
+    # though the deadline now has to cross a thread boundary and then a join.
+    port = free_port()
+    server = Server("--workers", "3", "--free-threaded",
+                    "--graceful-timeout", "2000", port=port)
+    s = server.connect(timeout=30)
+    s.sendall(b"GET /slow?300 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    time.sleep(0.3)
+    code, elapsed = server.stop(timeout=40)
+    check("a stuck request does not block shutdown past the deadline (%.1fs)" % elapsed,
+          elapsed < 20.0, "%.1fs" % elapsed)
+    check("the process exited rather than being killed", code is not None,
+          "had to be SIGKILLed")
+    s.close()
+
+    # --- WSGI, where the workers are threads and PEP 3333 has to say so ---
+    port = free_port()
+    server = Server("--workers", "3", "--free-threaded", port=port,
+                    app="wsgi_app:application")
+    try:
+        code, _hdrs, body = server.get("/environ")
+        is_("WSGI free-threaded workers answer", code, 200)
+        text = body.decode() if isinstance(body, bytes) else body
+        check("wsgi.multithread is True", "multithread=True" in text, text[:200])
+        check("wsgi.multiprocess is False", "multiprocess=False" in text, text[:200])
+    finally:
+        server.stop()
+
+
 def main():
     if not os.path.exists(BIN):
         print("no such binary: %s" % BIN)
@@ -1230,7 +1367,7 @@ def main():
                  test_websocket_control_independence,
                  test_wsgi_threads, test_forwarded, test_multiworker_unix,
                  test_worker_restart, test_reload, test_graceful_shutdown,
-                 test_shutdown_is_bounded):
+                 test_shutdown_is_bounded, test_free_threaded):
         try:
             test()
         except Exception as exc:                            # noqa: BLE001

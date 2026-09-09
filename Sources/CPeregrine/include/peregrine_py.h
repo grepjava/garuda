@@ -110,6 +110,9 @@ PyObject *pg_list_empty_new(void);
 int       pg_list_append(PyObject *l, PyObject *v);     /* borrows v */
 pg_ssize_t pg_list_size(PyObject *l);
 PyObject *pg_list_get(PyObject *l, pg_ssize_t i);       /* borrowed */
+/* New list from any iterable. ASGI headers are specified as an iterable,
+ * and Sanic (among others) hands over a generator rather than a list. */
+PyObject *pg_as_list(PyObject *o);
 PyObject *pg_dict_new(void);
 /* Shallow copy. Copying a prepared prototype beats re-inserting the fifteen
  * constant WSGI environ entries on every request. */
@@ -214,6 +217,26 @@ PyThreadState *pg_gil_save(void);
 void pg_gil_restore(PyThreadState *ts);
 int  pg_gil_ensure(void);        /* PyGILState_Ensure, returned as int */
 void pg_gil_release(int state);
+
+/* --- Free threading (PEP 703) -------------------------------------------- */
+
+/* 1 when the libpython this was compiled against is a free-threaded build
+ * (`python3.13t` and later, Py_GIL_DISABLED in pyconfig.h), 0 otherwise.
+ *
+ * This is a compile-time answer, and that is the right one: a free-threaded
+ * interpreter has a different ABI and a different SONAME, so the build and the
+ * loaded library cannot disagree the way they can about a version number. */
+int pg_py_free_threaded(void);
+
+/* 1 when the GIL is actually switched on right now.
+ *
+ * On an ordinary build this is always 1. On a free-threaded build it is
+ * normally 0 -- but it is not a constant: PYTHON_GIL=1 turns the GIL back on,
+ * and so does importing an extension module that has not declared itself
+ * free-threading-safe. Either can happen while the application is being
+ * imported, long after start-up chose a concurrency model, which is why this
+ * is asked at runtime and asked again after the application has loaded. */
+int pg_py_gil_active(void);
 
 #ifdef __cplusplus
 }

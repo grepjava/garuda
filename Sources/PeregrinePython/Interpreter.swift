@@ -319,6 +319,7 @@ def activate_venv(path):
     import os
     import site
     import sys
+    import sysconfig
 
     if not path:
         return None
@@ -332,14 +333,20 @@ def activate_venv(path):
             candidate = os.path.join(lib, name, 'site-packages')
             if os.path.isdir(candidate):
                 found.append((name, candidate))
+    # Free-threaded installs use a "t" ABI tag (python3.14t), which is a
+    # different directory and a different set of wheels. Matching only the
+    # X.Y version would accept a GIL venv on a 3.14t embed, or the reverse.
+    abi = 'python%d.%d' % sys.version_info[:2]
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        abi += 't'
     win = os.path.join(path, 'Lib', 'site-packages')
     if os.path.isdir(win):
-        found.append(('python%d.%d' % sys.version_info[:2], win))
+        found.append((abi, win))
 
     if not found:
         return 'no site-packages directory under ' + path
 
-    want = 'python%d.%d' % sys.version_info[:2]
+    want = abi
     if not any(name == want for name, _ in found):
         have = ', '.join(name for name, _ in found)
         return ('virtualenv %s was built for %s but the embedded interpreter is %s'

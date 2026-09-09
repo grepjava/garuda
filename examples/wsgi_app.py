@@ -1,6 +1,7 @@
 """A small WSGI application used to exercise the server."""
 
 import os
+import threading
 import time
 
 
@@ -22,6 +23,15 @@ def application(environ, start_response):
     if path == "/pid":
         start_response("200 OK", [("Content-Type", "text/plain")])
         return [str(os.getpid()).encode()]
+
+    if path == "/environ":
+        # The two flags PEP 3333 defines for the execution model, which
+        # --workers and --free-threaded answer the opposite way round.
+        text = "multithread=%s multiprocess=%s thread=%s\n" % (
+            environ["wsgi.multithread"], environ["wsgi.multiprocess"],
+            threading.get_ident())
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [text.encode()]
 
     if path == "/env":
         keys = sorted(k for k in environ if k.startswith("HTTP_") or k in

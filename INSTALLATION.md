@@ -126,6 +126,53 @@ relocated or unusual installations; a virtualenv does not need it.
 
 ---
 
+## Building against free-threaded CPython
+
+`--free-threaded` needs a CPython built without the GIL (PEP 703). That is a
+different interpreter with a different ABI and a different library name —
+`libpython3.14t.so`, not `libpython3.14.so` — so it is chosen at *build* time,
+by which `python3-embed` the build resolves, not by a flag at runtime.
+
+Install one:
+
+```bash
+# Debian and Ubuntu, via deadsnakes
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt install python3.14-nogil python3.14-nogil-dev
+
+# or with uv, which ships the development files with it
+uv python install 3.14t
+```
+
+Then build with `pkg-config` pointed at it:
+
+```bash
+# a system install already has it on the default search path:
+python3.14t -m pip install .
+
+# a uv-managed one has to be named:
+ROOT=$(dirname $(dirname $(uv python find 3.14t)))
+PKG_CONFIG_PATH=$ROOT/lib/pkgconfig swift build -c release
+```
+
+Check what came out, because this is the one thing worth being sure of:
+
+```console
+$ peregrine --version
+peregrine 0.1.0 (CPython 3.14.6 free-threaded)
+```
+
+Without `free-threaded` on that line, `--free-threaded` will refuse to start —
+which is deliberate. The two builds are not interchangeable in either
+direction, so wheels are tagged apart (`cp314-cp314t` against `cp314-cp314`)
+and `pip` will not install one where the other belongs.
+
+Everything else is unchanged: the same source, the same options, the same
+application. See [CONFIG.md](CONFIG.md#free-threaded-python) for what the mode
+does once it is running.
+
+---
+
 ## Certificates, for TLS and HTTP/3
 
 HTTP/2 over TLS and HTTP/3 both need a certificate. QUIC has no cleartext form

@@ -194,7 +194,7 @@ extension Worker {
             c.pointee.clientTuple = pg_tuple2(addr, port)
         }
 
-        guard let scopeDict = ASGIRuntime.scope!.build(
+        guard let scopeDict = asgiScope!.build(
                 base: base,
                 head: c.pointee.head,
                 headers: headers,

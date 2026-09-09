@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import threading
 
 startup_ran = False
 
@@ -17,6 +18,11 @@ SHUTDOWN_MARKER = os.environ.get("PEREGRINE_SHUTDOWN_MARKER")
 # Only the feature test asks for it.
 STUBBORN_LIFESPAN = os.environ.get("PEREGRINE_STUBBORN_LIFESPAN")
 
+# One line appended per lifespan startup. Under --free-threaded several workers
+# share one application, so the count answers the question that model raises:
+# does `startup` run once, or once per worker?
+STARTUP_COUNTER = os.environ.get("PEREGRINE_STARTUP_COUNTER")
+
 
 async def app(scope, receive, send):
     global startup_ran, late_receive
@@ -27,6 +33,9 @@ async def app(scope, receive, send):
             if message["type"] == "lifespan.startup":
                 startup_ran = True
                 scope["state"]["shared"] = "from-lifespan"
+                if STARTUP_COUNTER:
+                    with open(STARTUP_COUNTER, "a") as fh:
+                        fh.write("%d\n" % os.getpid())
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 if SHUTDOWN_MARKER:
@@ -77,6 +86,11 @@ async def app(scope, receive, send):
 
     elif path == "/pid":
         await reply(str(os.getpid()).encode())
+
+    elif path == "/threadid":
+        # Under --free-threaded the workers are threads of one process, so this
+        # is what distinguishes them; under --workers they are all the same.
+        await reply(str(threading.get_ident()).encode())
 
     elif path == "/scope":
         interesting = {

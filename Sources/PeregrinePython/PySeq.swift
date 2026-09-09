@@ -45,6 +45,15 @@ public enum PySeq {
               let a = item(o, 0), let b = item(o, 1) else { return nil }
         return (a, b)
     }
+
+    /// ASGI says headers are an iterable of pairs, not a list. A generator
+    /// is materialised once; a list or tuple is borrowed.
+    @inlinable
+    public static func iterable(_ o: PyObj) -> (seq: PyObj, owned: Bool)? {
+        if isSequence(o) { return (o, false) }
+        guard let list = pg_as_list(o) else { return nil }
+        return (list, true)
+    }
 }
 
 /// A borrowed view of the bytes behind a Python object.

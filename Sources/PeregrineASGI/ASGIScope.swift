@@ -37,7 +37,9 @@ public struct ASGIScopeBuilder {
         self.scratchCapacity = scratchCapacity
         self.scratch = UnsafeMutablePointer<UInt8>.allocate(capacity: scratchCapacity)
         self.headerNames = PyStringCache(capacityLog2: 9)
-        self.lifespanState = lifespanState
+        // Borrowed until init succeeds: several workers share one process-wide
+        // mapping under --free-threaded, and a failed init must not drop it.
+        self.lifespanState = nil
         self.webtransportExtensions = nil
 
         var rootLen = 0
@@ -95,6 +97,10 @@ public struct ASGIScopeBuilder {
         guard pg_dict_set(extensions, Interned[.vWebTransport], emptyProxy) == 0,
               let extProxy = pg_mapping_proxy(extensions) else { return nil }
         self.webtransportExtensions = extProxy
+        if let shared = lifespanState {
+            pg_incref(shared)
+            self.lifespanState = shared
+        }
     }
 
     public func destroy() {

@@ -57,6 +57,57 @@ listening socket.
 
 ---
 
+## One thread per worker, when the interpreter allows it
+
+A worker is a process for one reason: the GIL. A second thread cannot serve a
+second request, so the only way to a second core is a second interpreter, and
+the only way to a second interpreter is a second process. CPython 3.13 shipped
+a build without the GIL (PEP 703) and that reasoning stops applying.
+`--free-threaded` is the option that says so — the workers become threads of
+one process, and nothing else about them changes.
+
+What makes that a small change rather than a rewrite is that a worker never
+reaches outside itself. It owns its poller, its connection slab, its buffer
+pool, its date cache and its event loop; the only things it reads that it does
+not own are written once at start-up and never again — the interned constants,
+the internal Python types, the glue functions, the application object. So the
+work was to move the last few pieces of per-worker state off the process:
+
+- `currentWorker` became a thread-local. It is what a `send`/`receive` callable
+  or the asyncio reader callback uses to find its worker, and those arrive from
+  Python carrying nothing but a connection token.
+- The ASGI event loop, the lifespan handle and the scope builder moved from
+  statics onto `Worker`. The scope builder is the one that mattered: it carries
+  a mutable memoised header-name cache and a scratch buffer, so one shared
+  across threads would have been a data race on the request path.
+
+The main thread is not a worker. It costs one mostly-idle thread and buys two
+orderings:
+
+- **Signals land somewhere that is not serving a request.** Worker threads are
+  started with every signal blocked; the main thread owns the signal pipe and
+  asks each worker to drain by writing down a pipe that worker already polls,
+  so `handleSignals` cannot tell the difference between that and a real signal.
+- **The lifespan is a process-level thing, and is treated as one.** It runs
+  once, on the main thread's own event loop — which keeps running, so a
+  background task the application started in `startup` is actually driven. Its
+  `state` mapping goes to every worker's scope builder. At shutdown every
+  worker drains and is joined *first*, and only then does the application get
+  `lifespan.shutdown`: closing the database pool while another thread is still
+  finishing a request with it is exactly the bug that ordering exists to avoid.
+
+What is genuinely shared is the application, which is the point. One import,
+one set of module-level caches, one connection pool, one warm JIT — instead of
+N copies. Four workers serving a CPU-bound application on four cores reach the
+same throughput either way, in 47 MB as threads against 143 MB as processes.
+
+The trade is isolation: a crash takes every worker with it, where the process
+supervisor would have restarted one. So the two compose rather than compete —
+`--free-threaded --reload` puts the supervisor in front of a single threaded
+child, and in production systemd plays the same part.
+
+---
+
 ## The asyncio integration is one file descriptor
 
 The interesting trick in the ASGI path: an epoll (or kqueue) descriptor is
@@ -69,9 +120,11 @@ loop.run_forever()
 ```
 
 asyncio then treats the entire server as one more readable descriptor. The
-result is one thread, one event loop, one interpreter: no cross-thread queues,
-no `call_soon_threadsafe` wakeups, no GIL handoffs — and uvloop works
-unchanged, because `add_reader` is part of the loop contract.
+result is one thread, one event loop per worker: no cross-thread queues, no
+`call_soon_threadsafe` wakeups, no GIL handoffs — and uvloop works unchanged,
+because `add_reader` is part of the loop contract. Under `--free-threaded` a
+process holds several of these, one per worker thread, and each is still the
+same self-contained arrangement — the loops never speak to each other.
 
 HTTP/3 adds one thing to this: QUIC has timers of its own — an acknowledgement
 owed in milliseconds, a probe that has to fire — so a worker serving QUIC

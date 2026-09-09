@@ -16,6 +16,7 @@ import asyncio
 import os
 import socket
 import ssl
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,10 @@ except ImportError:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+
+# Extra server flags, so the same suite can be pointed at a different
+# execution model:  PEREGRINE_EXTRA_ARGS="--workers 4 --free-threaded"
+EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
 
 PASS = 0
 FAIL = 0
@@ -102,7 +107,7 @@ class Server:
         cert, key = make_certs()
         cmd = [BIN, "--port", str(self.port), "--log-level", "error",
                "--http3", "--tls-cert", cert, "--tls-key", key,
-               "--python-path", os.path.join(ROOT, "examples")] + list(args) + [app]
+               "--python-path", os.path.join(ROOT, "examples")] + EXTRA + list(args) + [app]
         self.process = subprocess.Popen(cmd)
         # The TCP listener comes up with the UDP one, and is the easier of the
         # two to wait on.

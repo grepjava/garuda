@@ -15,6 +15,7 @@ Needs `h2` in the interpreter running it:  pip install h2
 import os
 import socket
 import ssl
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,10 @@ except ImportError:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+
+# Extra server flags, so the same suite can be pointed at a different
+# execution model:  PEREGRINE_EXTRA_ARGS="--workers 4 --free-threaded"
+EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
 
 # Set for the second pass, which runs everything again over TLS so that ALPN,
 # record boundaries and partial writes are exercised by the same checks.
@@ -102,7 +107,7 @@ class Server:
     def __init__(self, *args, app="asgi_app:app"):
         self.port = free_port()
         cmd = [BIN, "--port", str(self.port), "--log-level", "error",
-               "--python-path", os.path.join(ROOT, "examples")] + list(args)
+               "--python-path", os.path.join(ROOT, "examples")] + EXTRA + list(args)
         if USE_TLS:
             cert, key = make_certs()
             cmd += ["--tls-cert", cert, "--tls-key", key]

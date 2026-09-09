@@ -8,6 +8,7 @@ interpreter and environment.
 
 import os
 import sys
+import sysconfig
 
 __version__ = "0.1.0"
 __all__ = ["binary_path", "run", "main"]
@@ -22,12 +23,22 @@ def binary_path():
 
 
 def built_for():
-    """The Python version the binary was linked against, as a "3.13" string."""
+    """The Python the binary was linked against, as "3.13" or "3.13t".
+
+    The "t" marks a free-threaded build (PEP 703). It is part of the answer
+    because it is a different ABI, not a runtime setting: a binary embedding
+    3.14t cannot be served by 3.14 or the reverse.
+    """
     try:
         with open(os.path.join(_BIN_DIR, "interpreter.txt")) as fh:
             return fh.readline().strip()
     except OSError:
         return None
+
+
+def _running_version():
+    return "%d.%d%s" % (sys.version_info[0], sys.version_info[1],
+                        "t" if sysconfig.get_config_var("Py_GIL_DISABLED") else "")
 
 
 def _virtualenv():
@@ -70,7 +81,7 @@ def run(argv=None):
         )
 
     linked = built_for()
-    running = "%d.%d" % sys.version_info[:2]
+    running = _running_version()
     if linked and linked != running:
         sys.stderr.write(
             "peregrine: warning: this binary embeds Python %s but you are "

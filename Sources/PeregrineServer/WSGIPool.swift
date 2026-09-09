@@ -9,6 +9,11 @@
 // lets those waits overlap. CPU-bound applications get nothing from it, which
 // is why the default is still one thread and the inline path is unchanged.
 //
+// On a free-threaded interpreter (PEP 703) that last sentence stops holding:
+// pool threads then run Python in parallel, so the pool helps CPU-bound work
+// too. Nothing here has to change for that -- the split below was always about
+// who owns which memory, not about who holds the GIL.
+//
 // The split of responsibilities is what keeps this safe:
 //
 //   * The loop thread owns every connection, every buffer and the poller. It

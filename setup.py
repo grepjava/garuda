@@ -47,8 +47,21 @@ def _fail(message):
     raise SystemExit(1)
 
 
+def _free_threaded():
+    """True when this interpreter is a free-threaded build (PEP 703)."""
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
 def _running_version():
-    return "%d.%d" % sys.version_info[:2]
+    """The interpreter this build must produce a binary for.
+
+    A free-threaded build is "3.14t", not "3.14". The suffix is not cosmetic:
+    it is a different ABI with a different SONAME, so a binary linked against
+    one cannot load the other, and a wheel that claimed otherwise would install
+    happily and then fail at exec time.
+    """
+    return "%d.%d%s" % (sys.version_info[0], sys.version_info[1],
+                        "t" if _free_threaded() else "")
 
 
 def _check_toolchain():
@@ -91,10 +104,11 @@ def _linked_version(binary):
     Py_GetVersion() from the library the loader resolved.
     """
     result = subprocess.run([binary, "--version"], capture_output=True, text=True)
-    match = re.search(r"CPython (\d+)\.(\d+)", result.stdout)
+    match = re.search(r"CPython (\d+)\.(\d+)([^)]*)", result.stdout)
     if not match:
         return None
-    return "%s.%s" % (match.group(1), match.group(2))
+    suffix = "t" if "free-threaded" in match.group(3) else ""
+    return "%s.%s%s" % (match.group(1), match.group(2), suffix)
 
 
 class BinaryDistribution(Distribution):
@@ -166,8 +180,14 @@ if bdist_wheel is not None:
             # cp312-cp312-<platform>: the bundled executable is dynamically
             # linked against this exact libpython, so anything else is a
             # mis-install rather than a graceful degradation.
+            #
+            # A free-threaded interpreter takes the same interpreter tag and a
+            # distinct ABI tag -- cp314-cp314t -- which is what stops pip from
+            # installing a GIL-built wheel into python3.14t, and the other way
+            # round. They really are different binaries.
             interpreter = "cp%d%d" % sys.version_info[:2]
-            return interpreter, interpreter, platform_tag
+            abi = interpreter + ("t" if _free_threaded() else "")
+            return interpreter, abi, platform_tag
 
     COMMANDS = {"build_py": BuildWithSwift, "bdist_wheel": BinaryWheel}
 else:

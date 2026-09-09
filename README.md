@@ -30,7 +30,8 @@ peregrine --http3 --tls-cert cert.pem --tls-key key.pem myapp:app
 what to do when it goes wrong. [CONFIG.md](CONFIG.md) — configuring FastAPI and
 Django for every protocol here. [ARCHITECTURE.md](ARCHITECTURE.md) — how the
 server is built, and why. [TRANSPORT.md](TRANSPORT.md) — what each protocol
-does and what is implemented of it.
+does and what is implemented of it. [BENCHMARKS.md](BENCHMARKS.md) — hello-world
+throughput, processes against `--free-threaded`.
 
 ---
 
@@ -173,6 +174,20 @@ and the close capsule, through a documented
 [ASGI extension](TRANSPORT.md#the-asgi-extension) — ASGI has no WebTransport
 specification, so this one is Peregrine's.
 
+**Free-threaded CPython (PEP 703):** `--free-threaded` runs the workers as
+threads of one process rather than as processes, on an interpreter built
+without the GIL. Same parallelism, one copy of the application:
+
+```bash
+peregrine --workers 0 --free-threaded myapp:app
+```
+
+On four cores with a CPU-bound application that is 5,907 req/s in 47 MB against
+5,832 req/s in 143 MB for four worker processes — the throughput of processes
+at a third of the memory, because Django is imported once instead of four
+times. The ASGI lifespan runs once for the process, so an application opens one
+connection pool rather than one per worker. [Details.](CONFIG.md#free-threaded-python)
+
 ---
 
 ## Installing
@@ -204,6 +219,9 @@ peregrine [options] MODULE:ATTRIBUTE
   --port PORT              port to bind (default 8000)
   --unix PATH              listen on a unix socket instead
   --workers N              worker processes, 0 = one per CPU (default 1)
+  --free-threaded          run the workers as threads of one process
+                           instead of as processes; needs a free-threaded
+                           CPython (python3.13t or newer)
   --protocol wsgi|asgi     force the application protocol (default: detect)
   --root-path PATH         SCRIPT_NAME / ASGI root_path prefix
   --scheme http|https      scheme reported to the application

@@ -141,10 +141,10 @@ int pg_random_bytes(void *out, size_t n);
 /* ---------------------------------------------------------------------------
  * Threads
  *
- * The only threads in the server belong to the optional WSGI pool. They are
- * exposed as opaque handles because pthread_mutex_t and pthread_cond_t have
- * platform-dependent size and alignment that Swift would otherwise have to
- * mirror exactly.
+ * Threads belong to the optional WSGI pool and, under --free-threaded, to the
+ * workers themselves. They are exposed as opaque handles because
+ * pthread_mutex_t and pthread_cond_t have platform-dependent size and alignment
+ * that Swift would otherwise have to mirror exactly.
  * ------------------------------------------------------------------------- */
 
 typedef struct pg_mutex pg_mutex;
@@ -163,6 +163,25 @@ void pg_cond_broadcast(pg_cond *c);
 
 /* Starts a detached thread with every signal blocked. Returns 0 on success. */
 int pg_thread_spawn(void (*fn)(void *), void *arg);
+
+/* The same, joinable, for threads whose exit the caller has to observe: under
+ * --free-threaded the supervising thread must know that every worker has let go
+ * of its connections before the ASGI lifespan is allowed to shut down. Returns
+ * NULL on failure; the handle is freed by pg_thread_join. */
+typedef struct pg_thread pg_thread;
+pg_thread *pg_thread_start(void (*fn)(void *), void *arg);
+void pg_thread_join(pg_thread *t);
+
+/* Where the current thread's Worker lives.
+ *
+ * The server used to have exactly one worker per process, so this was a plain
+ * global. Under --free-threaded there is one per thread, and the C callbacks
+ * that need it -- the asyncio reader, ASGI send/receive -- are handed nothing
+ * but a connection token, so they have to find it themselves. A thread-local is
+ * the cheapest way to answer that: a register-relative load, no lock, and no
+ * change to any call site. */
+void *pg_worker_current(void);
+void pg_worker_set_current(void *worker);
 
 /* ---------------------------------------------------------------------------
  * WebSocket handshake primitives

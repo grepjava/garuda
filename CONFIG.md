@@ -348,6 +348,71 @@ peregrine \
 Add `--wsgi-threads 8` for a WSGI application that waits on I/O. Leave
 `--reload` for development only — it polls the source tree.
 
+---
+
+## Free-threaded Python
+
+On a CPython built without the GIL (PEP 703 — `python3.13t`, `python3.14t`),
+`--free-threaded` turns the workers into threads of one process instead of
+processes:
+
+```bash
+peregrine --workers 0 --free-threaded myapp:app
+```
+
+`--workers` still means the same thing; only what a worker *is* changes. Each
+one keeps its own poller, its own connection table and its own event loop, so
+nothing about request handling is different — they simply share an address
+space.
+
+What that buys, measured on a four-core machine with a CPU-bound application:
+
+| | throughput | resident memory |
+|---|---|---|
+| 1 worker | 1,695 req/s | — |
+| 4 workers, processes | 5,832 req/s | 143 MB |
+| 4 workers, threads | 5,907 req/s | 47 MB |
+
+The same parallelism for a third of the memory, because the application is
+imported once rather than four times. The larger the application, the wider
+that gap gets — it is the whole of Django, not the server, that was being
+copied.
+
+Hello-world `GET /` is the other way around: four processes still win on
+FastAPI, Django, Sanic and BlackSheep, and threads only tie on raw ASGI.
+That table is in [BENCHMARKS.md](BENCHMARKS.md). `--free-threaded` is the
+memory and shared-state option, not a request-rate upgrade on an empty view.
+
+Sharing one process also changes three things it is worth knowing about:
+
+- **The ASGI lifespan runs once**, not once per worker. That is what an
+  application means when it opens a connection pool in `startup`: one pool, for
+  the process. All the workers get the same `state` mapping. On shutdown the
+  order is inverted correctly — every worker finishes its in-flight requests
+  first, and only then does the application get `lifespan.shutdown`.
+- **`wsgi.multithread` is `True` and `wsgi.multiprocess` is `False`**, which is
+  the opposite of what `--workers` reports. An application that is not
+  thread-safe will notice. This is the same requirement `--wsgi-threads`
+  already makes, applied to the whole application rather than to one pool.
+- **A crash takes every worker with it.** With processes the supervisor
+  restarts the one that died. Keep a process supervisor in front in production —
+  systemd, or peregrine's own, by combining `--free-threaded` with `--reload`
+  in development.
+
+The option is refused, with an error, on an interpreter that has the GIL:
+running it there would silently be slower than `--workers`, not faster.
+`peregrine --version` says which kind of interpreter is embedded:
+
+```
+peregrine 0.1.0 (CPython 3.14.6 free-threaded)
+```
+
+One caveat that is not peregrine's to fix: importing an extension module that
+has not declared itself free-threading-safe switches the GIL back on for the
+whole process, and so does `PYTHON_GIL=1`. The server checks after loading the
+application and warns when that has happened, because the symptom otherwise is
+just "it is not any faster".
+
 `SIGTERM` and `SIGINT` drain gracefully within `--graceful-timeout`; `SIGHUP`
 restarts the workers without dropping the listening socket, which is how to
 pick up new code without dropping a connection.

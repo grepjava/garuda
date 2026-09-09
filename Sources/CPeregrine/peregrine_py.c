@@ -191,6 +191,7 @@ pg_ssize_t pg_list_size(PyObject *l) { return (pg_ssize_t)PyList_GET_SIZE(l); }
 PyObject *pg_list_get(PyObject *l, pg_ssize_t i) {
     return PyList_GET_ITEM(l, (Py_ssize_t)i);
 }
+PyObject *pg_as_list(PyObject *o) { return PySequence_List(o); }
 
 PyObject *pg_dict_new(void) { return PyDict_New(); }
 PyObject *pg_dict_copy(PyObject *d) { return PyDict_Copy(d); }
@@ -538,3 +539,38 @@ PyThreadState *pg_gil_save(void) { return PyEval_SaveThread(); }
 void pg_gil_restore(PyThreadState *ts) { PyEval_RestoreThread(ts); }
 int  pg_gil_ensure(void) { return (int)PyGILState_Ensure(); }
 void pg_gil_release(int state) { PyGILState_Release((PyGILState_STATE)state); }
+
+/* ======================================================================== */
+/* Free threading (PEP 703)                                                 */
+/* ======================================================================== */
+
+int pg_py_free_threaded(void) {
+#ifdef Py_GIL_DISABLED
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int pg_py_gil_active(void) {
+#ifdef Py_GIL_DISABLED
+    /* sys._is_gil_enabled() rather than the C-level PyUnstable_ spelling: the
+     * latter is not in the installed headers of every free-threaded build, and
+     * this is asked twice in the life of a process. */
+    if (!Py_IsInitialized()) return 0;
+    PyObject *sys = PyImport_ImportModule("sys");
+    if (!sys) { PyErr_Clear(); return 0; }
+    PyObject *fn = PyObject_GetAttrString(sys, "_is_gil_enabled");
+    Py_DECREF(sys);
+    if (!fn) { PyErr_Clear(); return 0; }
+    PyObject *res = PyObject_CallNoArgs(fn);
+    Py_DECREF(fn);
+    if (!res) { PyErr_Clear(); return 0; }
+    int enabled = PyObject_IsTrue(res);
+    Py_DECREF(res);
+    if (enabled < 0) { PyErr_Clear(); return 0; }
+    return enabled;
+#else
+    return 1;
+#endif
+}
