@@ -311,10 +311,14 @@ public struct Worker {
             // arriving now is the next pipelined request, and it waits in the
             // socket buffer until this one is answered.
             if c.pointee.poolJob != nil { return }
-            // ASGI keeps streaming the body while the application runs.
+            // ASGI keeps streaming the body while the application runs, but no
+            // further ahead than the high water mark: bytes an application has
+            // not asked for yet are better left in the socket than in memory.
             let target: FillTarget = c.pointee.bodyRemaining < 0 ? .read : .body
-            if !fill(slot, target, limit: config.maxBodySize) { return }
+            let ceiling = min(config.maxBodySize, config.bodyHighWaterMark)
+            if !fill(slot, target, limit: ceiling) { return }
             onBodyProgress(slot)
+            if table[slot].pointee.state != .free { updateBodyReadInterest(slot) }
         }
 
         let s = table[slot]
@@ -401,7 +405,23 @@ public struct Worker {
                 }
 
             case .readingBody:
-                if c.pointee.bodyRemaining < 0 {
+                // ASGI applications are given the request as soon as the head
+                // is parsed: the body arrives through receive(), which is what
+                // lets one reject an upload at byte one instead of after the
+                // last. WSGI has a blocking input stream and nowhere to wait,
+                // so it still gets the whole body first.
+                if appProtocol == .asgi {
+                    // Decode whatever chunk framing is already buffered, but do
+                    // not wait for the terminating chunk.
+                    if c.pointee.bodyRemaining < 0 { _ = advanceChunkedBody(slot) }
+                    let d = table[slot]
+                    switch d.pointee.state {
+                    case .readingBody, .dispatching:
+                        d.pointee.state = .dispatching
+                    default:
+                        return          // failed, closed, or already answered
+                    }
+                } else if c.pointee.bodyRemaining < 0 {
                     if !advanceChunkedBody(slot) { return }
                 } else if c.pointee.bodyRemaining > 0 {
                     return                       // waiting on the socket
@@ -618,7 +638,27 @@ public struct Worker {
         let c = table[slot]
         if c.pointee.poolJob != nil { return false }
         if c.pointee.state == .websocket { return !websocketQueueFull(slot) }
+        if c.pointee.state == .dispatching {
+            // Nothing left to read for this request, and a level-triggered
+            // poller would spin on the pipelined bytes behind it.
+            if c.pointee.bodyRemaining == 0 { return false }
+            return c.pointee.body.readableBytes < config.bodyHighWaterMark
+        }
         return true
+    }
+
+    /// Re-evaluates read interest for a request whose body is still arriving.
+    mutating func updateBodyReadInterest(_ slot: Int) {
+        let c = table[slot]
+        guard appProtocol == .asgi, c.pointee.state == .dispatching,
+              c.pointee.poolJob == nil else { return }
+        var mask: PollMask = readInterestAllowed(slot) ? .read : []
+        // A producer parked on backpressure is waiting for the socket, and the
+        // write side of this connection is not ours to switch off here.
+        if !c.pointee.write.isEmpty || c.pointee.drainWaiter != nil {
+            mask.insert(.write)
+        }
+        setInterest(slot, mask)
     }
 
     /// Blocks the worker until the socket accepts more data. Used only when a
@@ -644,9 +684,39 @@ public struct Worker {
         return true
     }
 
+    /// A last, non-blocking attempt to swallow the rest of a request body the
+    /// application never read. Returns true when nothing of the request is
+    /// left on the wire and the connection can be used again.
+    mutating func discardRequestRemainder(_ slot: Int) -> Bool {
+        let c = table[slot]
+        if c.pointee.bodyRemaining == 0 { return true }
+        // Chunked framing has to be decoded to find its end, and the decoder
+        // belongs to a request that is over; those connections just close.
+        if c.pointee.bodyRemaining < 0 { return false }
+        // Waiting for an upload that has not been sent yet would mean holding
+        // the connection open for a body nobody wants. Only what is already
+        // here is worth taking.
+        if c.pointee.bodyRemaining > config.bodyHighWaterMark { return false }
+        c.pointee.body.clear()
+        if !fill(slot, .body, limit: config.bodyHighWaterMark) { return false }
+        c.pointee.body.clear()
+        return c.pointee.bodyRemaining == 0
+    }
+
     /// Called once a full response has been written out.
     mutating func finishResponse(_ slot: Int) {
         let c = table[slot]
+        // An application that answers early -- a 401, a validation failure at
+        // byte one -- is exactly what dispatching before the body arrives is
+        // for. But the rest of that body is still coming and it is not a
+        // request, so it is swallowed if it is small and already here, and
+        // otherwise this response is the last one on the connection.
+        if c.pointee.bodyRemaining != 0, c.pointee.flags.contains(.keepAlive) {
+            if !discardRequestRemainder(slot) {
+                if table[slot].pointee.state == .free { return }
+                c.pointee.flags.remove(.keepAlive)
+            }
+        }
         c.pointee.body.clear()
         if !c.pointee.flags.contains(.keepAlive) || c.pointee.flags.contains(.peerClosed) {
             closeConnection(slot)

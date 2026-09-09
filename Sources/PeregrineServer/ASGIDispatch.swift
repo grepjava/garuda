@@ -312,9 +312,7 @@ extension Worker {
         // With the body already complete there is nothing more to read for this
         // request, and leaving READ armed on a level-triggered poller would spin
         // on any pipelined bytes. EPOLLRDHUP still reports a disconnect.
-        if c.pointee.bodyRemaining == 0 {
-            setInterest(slot, [])
-        }
+        updateBodyReadInterest(slot)
     }
 
     /// New body bytes arrived while the application is running.
@@ -337,6 +335,10 @@ extension Worker {
     }
 
     /// Resolves a `receive()` future if a message is now available.
+    ///
+    /// Delivering empties the body buffer, so read interest is re-evaluated
+    /// afterwards: this is what lifts backpressure once the application has
+    /// caught up.
     mutating func deliverPendingReceive(_ slot: Int) {
         let c = table[slot]
         guard let future = c.pointee.pendingReceive else { return }
@@ -349,6 +351,7 @@ extension Worker {
         }
         pg_decref(message)
         pg_decref(future)
+        updateBodyReadInterest(slot)
     }
 
     /// Builds the next ASGI receive message, or nil when nothing is ready.
@@ -744,6 +747,8 @@ func asgiReceive(_ token: UInt64, _ args: PyObj?) -> PyObj? {
 
     if let ready = worker.pointee.nextReceiveMessage(slot, blocking: false) {
         defer { pg_decref(ready) }
+        // Taking the buffered bytes is what makes room for the next read.
+        worker.pointee.updateBodyReadInterest(slot)
         return PyImmediate.make(ready)
     }
 

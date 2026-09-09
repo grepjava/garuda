@@ -172,6 +172,32 @@ async def app(scope, receive, send):
         except Exception:
             return
 
+    elif path == "/reject":
+        # Answers without reading a byte of the body. Nothing here can work
+        # unless the application is dispatched on the head alone.
+        await reply(b"denied\n", status=403)
+
+    elif path == "/drip":
+        # Reports the first chunk it is given, which is only interesting
+        # because the client deliberately has not sent the rest yet.
+        message = await receive()
+        first = message.get("body", b"") if message["type"] == "http.request" else b""
+        await reply(b"first-chunk:" + first + b"\n")
+
+    elif path == "/slowsink":
+        # Reads nothing for a moment, then drains. Whatever the client sends
+        # meanwhile has to wait in the socket rather than in this process.
+        await asyncio.sleep(float(scope["query_string"] or 1.0))
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            total += len(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+        await reply(str(total).encode() + b"\n")
+
     elif path == "/lateread":
         # Reads the body, answers, and then reads again. The request is over by
         # then, so the second read has to be told so rather than parked: the

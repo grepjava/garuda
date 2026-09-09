@@ -238,7 +238,7 @@ Run the suites:
 swift test                              # 80 unit tests: parser, chunking, buffers,
                                         #   writer, websocket framing, proxy trust
 bash scripts/integration-test.sh        # 38 end-to-end checks over both protocols
-python3 scripts/feature-test.py         # 85 checks for the failure modes a plain
+python3 scripts/feature-test.py         # 94 checks for the failure modes a plain
                                         #   request never reaches: slow consumers,
                                         #   stuck-request shutdown, lifespan
                                         #   cleanup, worker restarts, multiworker
@@ -404,6 +404,19 @@ backpressure, `http.disconnect`, and the lifespan protocol with state shared
 into request scopes. Applications that do not implement lifespan are detected
 and skipped. Response headers are accepted in any shape the specification
 allows — tuples or lists, `bytes`, `bytearray` or `str`.
+
+An ASGI application is started as soon as the request head is parsed, not once
+the body has finished arriving. That is what lets one reject an upload at byte
+one -- unauthorised, too large, wrong content type -- instead of paying to
+receive all of it first, and it is the only way `receive()` can mean anything on
+a request that is still being sent. Body bytes are read no further ahead than
+the application has asked for: past the high water mark the worker stops reading
+the socket, so an upload nobody is consuming costs TCP window rather than
+memory.
+
+Answering early leaves the rest of that body on the wire, and it is not a
+request. If what remains is small and already here it is swallowed and the
+connection is reused; otherwise that response is the last one on the connection.
 
 A `receive()` made after the response is complete is answered with
 `http.disconnect` rather than parked. The request is over at that point, and a

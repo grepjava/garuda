@@ -16,6 +16,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import signal
 import socket
@@ -23,6 +24,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -853,6 +855,103 @@ def test_response_length():
         is_("the server is still healthy afterwards", server.get("/")[0], 200)
 
 
+def test_streaming_request_bodies():
+    print("\nStreaming request bodies")
+    port = free_port()
+    with Server(port=port) as server:
+        # An application that answers on the head alone must not have to wait
+        # for an upload it has already refused.
+        s = server.connect(timeout=10)
+        s.sendall(b"POST /reject HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nA")
+        began = time.time()
+        try:
+            status, _, body = read_http_response(s)
+        except OSError:
+            status, body = 0, b""
+        elapsed = time.time() - began
+        check("a rejection arrives before the body does (%.2fs)" % elapsed,
+              status == 403, "status %s after %.2fs" % (status, elapsed))
+        is_("the rejection is the application's own", body.strip(), b"denied")
+        # The nine bytes still to come are not a request, so the connection
+        # cannot be handed to whatever would parse them next.
+        s.settimeout(5)
+        try:
+            trailing = s.recv(4096)
+        except OSError:
+            trailing = b""
+        s.close()
+        is_("a connection with an unread body is not reused", trailing, b"")
+
+        # Body chunks reach the application as they arrive, not once the
+        # declared length is complete.
+        s = server.connect(timeout=10)
+        s.sendall(b"POST /drip HTTP/1.1\r\nHost: x\r\nContent-Length: 20\r\n\r\nAAAAA")
+        try:
+            status, _, body = read_http_response(s)
+        except OSError:
+            status, body = 0, b""
+        s.close()
+        check("a partial body is delivered to receive()",
+              body.strip() == b"first-chunk:AAAAA", repr(body[:60]))
+
+        # And the whole body still arrives intact when the application does
+        # read all of it.
+        payload = bytes(random.getrandbits(8) for _ in range(64 * 1024))
+        s = server.connect(timeout=15)
+        s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n"
+                  % len(payload))
+        time.sleep(0.2)
+        s.sendall(payload)
+        status, _, body = read_http_response(s)
+        s.close()
+        is_("a body split across packets round trips exactly", body, payload)
+
+        is_("the server is still healthy afterwards", server.get("/")[0], 200)
+
+
+def test_request_backpressure():
+    print("\nRequest body backpressure")
+    port = free_port()
+    total = 8 * 1024 * 1024
+    with Server(port=port) as server:
+        # The first request through an embedded interpreter costs several MiB
+        # of imports and caches, which would swamp what is being measured.
+        for _ in range(3):
+            server.get("/")
+        base = server.rss_kb()
+        s = server.connect(timeout=30)
+        s.sendall(b"POST /slowsink?2.0 HTTP/1.1\r\nHost: x\r\n"
+                  b"Content-Length: %d\r\n\r\n" % total)
+
+        sent = [0]
+
+        def push():
+            block = b"y" * 65536
+            try:
+                while sent[0] < total:
+                    s.sendall(block)
+                    sent[0] += len(block)
+            except OSError:
+                pass
+
+        writer = threading.Thread(target=push)
+        writer.start()
+        # Sampled while the application is still asleep and reading nothing.
+        time.sleep(1.0)
+        growth = server.rss_kb() - base
+        stalled = sent[0]
+        check("the sender stalls when the application stops reading (%d of "
+              "%d KiB)" % (stalled // 1024, total // 1024), stalled < total,
+              "the whole upload was accepted while nobody was reading it")
+        check("an unread upload is left in the socket, not buffered (%d KiB)"
+              % growth, growth < 3000, "%d KiB of growth" % growth)
+        writer.join(60)
+        status, _, body = read_http_response(s)
+        s.close()
+        is_("the application still receives every byte",
+            body.strip(), str(total).encode())
+
+
 def test_receive_after_response():
     print("\nreceive() after the response is complete")
     port = free_port()
@@ -1025,7 +1124,8 @@ def main():
         return 2
     print("peregrine feature tests (%s)" % BIN)
     for test in (test_header_shapes, test_factory, test_websockets, test_backpressure,
-                 test_response_length, test_receive_after_response,
+                 test_response_length, test_streaming_request_bodies,
+                 test_request_backpressure, test_receive_after_response,
                  test_websocket_control_independence,
                  test_wsgi_threads, test_forwarded, test_multiworker_unix,
                  test_worker_restart, test_reload, test_graceful_shutdown,

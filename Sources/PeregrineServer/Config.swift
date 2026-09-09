@@ -38,6 +38,10 @@ public struct ServerConfig {
     /// completes again. Resuming at the high water mark would wake the producer
     /// for every single socket write; a gap gives it a whole batch to refill.
     public var writeLowWaterMark = 128 * 1024
+    /// Request bytes buffered ahead of an ASGI application before the worker
+    /// stops reading the socket. An application that streams an upload without
+    /// reading it as fast as it arrives should cost TCP window, not memory.
+    public var bodyHighWaterMark = 256 * 1024
     /// Requests per connection before a polite close, to bound memory growth
     /// from long-lived keep-alive clients.
     public var maxRequestsPerConnection: UInt32 = 0    // 0 = unlimited
