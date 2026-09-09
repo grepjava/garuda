@@ -209,18 +209,25 @@ class Lifespan:
         if self.unsupported:
             return None
         await self.queue.put({'type': 'lifespan.shutdown'})
+        timed_out = False
         try:
             await asyncio.wait_for(self.stopped.wait(), timeout)
         except asyncio.TimeoutError:
-            return 'lifespan shutdown timed out'
+            timed_out = True
         if self.task is not None and not self.task.done():
-            # The application returned from its shutdown handler but left the
-            # lifespan coroutine parked; it has nothing left to say.
+            # The application said what it had to say but left the lifespan
+            # coroutine parked, so cancel it. Awaiting that cancellation is a
+            # courtesy and not an obligation: an application that suppresses
+            # CancelledError would otherwise hold the process open for as long
+            # as it liked, which is the deadline this is here to keep.
             self.task.cancel()
-            try:
-                await self.task
-            except BaseException:
-                pass
+            _, alive = await asyncio.wait({self.task}, timeout=timeout)
+            if alive:
+                sys.stderr.write(
+                    '[warn]  lifespan task ignored cancellation and was '
+                    'abandoned\n')
+        if timed_out:
+            return 'lifespan shutdown timed out'
         return self.error
 
 
@@ -234,6 +241,7 @@ def finish(loop, lifespan, timeout_ms):
     application would never run the code after its `yield`.
     """
     timeout = max(0.0, timeout_ms / 1000.0)
+    deadline = timeout if timeout > 0 else 5.0
     ls = lifespan if lifespan is not None and lifespan is not Ellipsis else None
     if isinstance(ls, dict) or not hasattr(ls, 'shutdown'):
         ls = None
@@ -255,22 +263,33 @@ def finish(loop, lifespan, timeout_ms):
                 # that catches CancelledError and carries on would hold the
                 # loop open for ever, so the cancellation phase gets its own
                 # bound and whatever survives it is abandoned.
-                grace = timeout if timeout > 0 else 5.0
-                _, alive = await asyncio.wait(still, timeout=grace)
+                _, alive = await asyncio.wait(still, timeout=deadline)
                 if alive:
                     sys.stderr.write(
                         '[warn]  %d task(s) ignored cancellation and were '
                         'abandoned\n' % len(alive))
         if ls is not None:
-            return await ls.shutdown(timeout if timeout > 0 else 30.0)
+            return await ls.shutdown(deadline)
         return None
+
+    async def _close_asyncgens():
+        # shutdown_asyncgens() throws GeneratorExit into every live async
+        # generator, and a finally block that swallows it -- or merely awaits
+        # something slow -- waits here for ever. Same rule as everywhere else
+        # in this function: ask, wait a bounded time, then move on.
+        task = asyncio.ensure_future(loop.shutdown_asyncgens())
+        _, alive = await asyncio.wait({task}, timeout=deadline)
+        if alive:
+            task.cancel()
+            sys.stderr.write(
+                '[warn]  async generator shutdown did not finish in time\n')
 
     try:
         result = loop.run_until_complete(_run())
     finally:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
+            loop.run_until_complete(_close_asyncgens())
+        except BaseException:
             pass
         try:
             loop.close()

@@ -853,6 +853,37 @@ def test_response_length():
         is_("the server is still healthy afterwards", server.get("/")[0], 200)
 
 
+def test_receive_after_response():
+    print("\nreceive() after the response is complete")
+    port = free_port()
+    with Server(port=port) as server:
+        # Both requests go down one keep-alive connection, the second sent
+        # while the first application task is still in receive().
+        s = server.connect(timeout=10)
+        s.sendall(b"GET /lateread HTTP/1.1\r\nHost: x\r\n\r\n")
+        time.sleep(0.3)
+        s.sendall(b"GET /lateread-result HTTP/1.1\r\nHost: x\r\n\r\n")
+        raw = b""
+        try:
+            while raw.count(b"HTTP/1.1 ") < 2 and len(raw) < 8192:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+        except OSError:
+            pass
+        s.close()
+        check("the first response is delivered", b"first" in raw, repr(raw[:80]))
+        check("the connection is reused while the first task is still reading",
+              raw.count(b"HTTP/1.1 ") == 2,
+              "%d response(s), so the second request went unanswered"
+              % raw.count(b"HTTP/1.1 "))
+        check("a read after the response is complete reports the disconnect",
+              b"http.disconnect" in raw,
+              repr(raw.rsplit(b"\r\n\r\n", 1)[-1][:40]))
+        is_("the server is still healthy afterwards", server.get("/")[0], 200)
+
+
 def test_websocket_control_independence():
     print("\nWebSocket control frames without application reads")
     port = free_port()
@@ -940,6 +971,19 @@ def test_shutdown_is_bounded():
           code is not None, "had to be SIGKILLed by the test harness")
     s.close()
 
+    # The same refusal from the other end of the shutdown: a lifespan handler
+    # that reports itself finished and then ignores its own cancellation.
+    port = free_port()
+    server = Server("--graceful-timeout", "200", port=port,
+                    env={"PEREGRINE_STUBBORN_LIFESPAN": "1"})
+    is_("the server runs with a stubborn lifespan handler",
+        server.get("/")[0], 200)
+    code, elapsed = server.stop(timeout=30)
+    check("a lifespan handler that ignores cancellation does not block "
+          "shutdown (%.1fs)" % elapsed, elapsed < 5.0, "%.1fs" % elapsed)
+    check("that process also exited on its own",
+          code is not None, "had to be SIGKILLed by the test harness")
+
 
 def test_reload():
     print("\nDevelopment reload")
@@ -981,7 +1025,8 @@ def main():
         return 2
     print("peregrine feature tests (%s)" % BIN)
     for test in (test_header_shapes, test_factory, test_websockets, test_backpressure,
-                 test_response_length, test_websocket_control_independence,
+                 test_response_length, test_receive_after_response,
+                 test_websocket_control_independence,
                  test_wsgi_threads, test_forwarded, test_multiworker_unix,
                  test_worker_restart, test_reload, test_graceful_shutdown,
                  test_shutdown_is_bounded):

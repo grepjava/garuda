@@ -238,7 +238,7 @@ Run the suites:
 swift test                              # 80 unit tests: parser, chunking, buffers,
                                         #   writer, websocket framing, proxy trust
 bash scripts/integration-test.sh        # 38 end-to-end checks over both protocols
-python3 scripts/feature-test.py         # 78 checks for the failure modes a plain
+python3 scripts/feature-test.py         # 85 checks for the failure modes a plain
                                         #   request never reaches: slow consumers,
                                         #   stuck-request shutdown, lifespan
                                         #   cleanup, worker restarts, multiworker
@@ -348,7 +348,8 @@ application would never reach the code after its `yield`.
 Every layer of that is cooperative, and cooperation is not a guarantee: a task
 can catch `CancelledError` and carry on, a C extension can sit in a syscall, and
 a single worker started without `--workers` has no supervisor to escalate to. So
-the cancellation phase has its own bound, and behind all of it a `SIGALRM`
+the cancellation phase has its own bound, the lifespan handler's cancellation
+has one too, async generator cleanup has one, and behind all of it a `SIGALRM`
 watchdog `_exit`s the process once the grace period plus a margin has passed.
 A deadline that nothing enforces is not a deadline.
 
@@ -403,6 +404,11 @@ backpressure, `http.disconnect`, and the lifespan protocol with state shared
 into request scopes. Applications that do not implement lifespan are detected
 and skipped. Response headers are accepted in any shape the specification
 allows — tuples or lists, `bytes`, `bytearray` or `str`.
+
+A `receive()` made after the response is complete is answered with
+`http.disconnect` rather than parked. The request is over at that point, and a
+task waiting on a body nobody will read holds the connection with it: it cannot
+be handed to the next request until its task ends.
 
 **ASGI 3.0 (WebSocket):** the full connect / accept / receive / send / close
 cycle, subprotocol negotiation, extra handshake headers, fragmented messages,

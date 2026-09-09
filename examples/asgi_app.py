@@ -5,13 +5,21 @@ import os
 
 startup_ran = False
 
+# What /lateread was given by the receive() it made after its response was
+# already complete. ASGI says that is a disconnect.
+late_receive = "nothing"
+
 # The integration suite checks that lifespan shutdown actually runs, which it
 # can only observe from outside the process.
 SHUTDOWN_MARKER = os.environ.get("PEREGRINE_SHUTDOWN_MARKER")
 
+# A lifespan handler that says it is done and then refuses to be cancelled.
+# Only the feature test asks for it.
+STUBBORN_LIFESPAN = os.environ.get("PEREGRINE_STUBBORN_LIFESPAN")
+
 
 async def app(scope, receive, send):
-    global startup_ran
+    global startup_ran, late_receive
 
     if scope["type"] == "lifespan":
         while True:
@@ -25,7 +33,15 @@ async def app(scope, receive, send):
                     with open(SHUTDOWN_MARKER, "w") as fh:
                         fh.write("clean\n")
                 await send({"type": "lifespan.shutdown.complete"})
-                return
+                if not STUBBORN_LIFESPAN:
+                    return
+                # Said its piece and then sat there, deaf to cancellation.
+                # Waiting on this would mean no deadline at all.
+                while True:
+                    try:
+                        await asyncio.sleep(3600)
+                    except asyncio.CancelledError:
+                        pass
 
     if scope["type"] == "websocket":
         await websocket_endpoint(scope, receive, send)
@@ -155,6 +171,24 @@ async def app(scope, receive, send):
             await send({"type": "http.response.body", "body": b"abc"})
         except Exception:
             return
+
+    elif path == "/lateread":
+        # Reads the body, answers, and then reads again. The request is over by
+        # then, so the second read has to be told so rather than parked: the
+        # connection cannot be reused while this task is still waiting.
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            if not message.get("more_body", False):
+                break
+        await reply(b"first\n")
+        late_receive = (await receive())["type"]
+
+    elif path == "/lateread-result":
+        # A separate request, so what /lateread saw survives its own task.
+        await asyncio.sleep(0.3)
+        await reply(late_receive.encode() + b"\n")
 
     elif path == "/uncancellable":
         # Swallows cancellation and keeps going, which is what the shutdown

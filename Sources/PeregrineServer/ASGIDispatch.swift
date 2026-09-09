@@ -359,6 +359,15 @@ extension Worker {
             return nextWebSocketMessage(slot)
         }
 
+        // Once the response is complete the request is over as far as the
+        // application is concerned, whatever is left of the body. ASGI says
+        // receive() reports the disconnect then; parking instead would hold the
+        // task open, and the connection is not reusable until the task ends.
+        if c.pointee.flags.contains(.responseComplete) {
+            c.pointee.flags.insert(.disconnectSent)
+            return ASGIMessage.httpDisconnect()
+        }
+
         if c.pointee.flags.contains(.disconnected) || c.pointee.flags.contains(.peerClosed) {
             if c.pointee.flags.contains(.bodyDelivered)
                 || c.pointee.flags.contains(.disconnected) {
@@ -568,6 +577,13 @@ extension Worker {
             c.pointee.flags.remove(.keepAlive)
         }
         _ = flush(slot)
+
+        // A task already parked in receive() when the response completed has to
+        // be woken and told so, or it waits for a body the server will never
+        // read and the connection waits for the task.
+        if c.pointee.flags.contains(.responseComplete) {
+            deliverPendingReceive(slot)
+        }
 
         if overflow {
             pg_err_set_str(pg_exc_runtime(),
