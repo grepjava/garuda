@@ -26,9 +26,11 @@ peregrine --reload myapp:app                # restart on source changes
 peregrine --http3 --tls-cert cert.pem --tls-key key.pem myapp:app
 ```
 
-**Further reading:** [ARCHITECTURE.md](ARCHITECTURE.md) — how the server is
-built, and why. [TRANSPORT.md](TRANSPORT.md) — what each protocol does and what
-is implemented of it.
+**Further reading:** [INSTALLATION.md](INSTALLATION.md) — what to install and
+what to do when it goes wrong. [CONFIG.md](CONFIG.md) — configuring FastAPI and
+Django for every protocol here. [ARCHITECTURE.md](ARCHITECTURE.md) — how the
+server is built, and why. [TRANSPORT.md](TRANSPORT.md) — what each protocol
+does and what is implemented of it.
 
 ---
 
@@ -188,6 +190,9 @@ git clone https://github.com/grepjava/peregrine
 cd peregrine && swift build -c release
 ```
 
+Requirements, per-platform packages, certificates and the failure modes worth
+recognising: [INSTALLATION.md](INSTALLATION.md).
+
 ---
 
 ## Usage
@@ -265,7 +270,8 @@ Checked against real applications rather than only the specifications
   `anyio` worker threads FastAPI uses for synchronous endpoints.
 - **Django** — the WSGI handler, `StreamingHttpResponse`, `request.is_secure()`
   and `REMOTE_ADDR` derived from forwarded headers, and blocking views
-  overlapping properly on `--wsgi-threads`.
+  overlapping properly on `--wsgi-threads`; and the ASGI handler with Channels
+  consumers and WebTransport sessions layered over it.
 
 Both run over HTTP/3 with no integration at all: a request is the same request
 whatever carried it. WebTransport is the exception, because a session is not a
@@ -288,7 +294,10 @@ async def chat(session):
 ```
 
 The Django form is the same with `<str:room>` converters and
-`get_asgi_application()` underneath. [Details.](TRANSPORT.md#frameworks)
+`get_asgi_application()` underneath, and composes with Channels: Django serves
+`http`, Channels serves `websocket`, this serves `webtransport`.
+[How to configure both, protocol by protocol.](CONFIG.md)
+[What the router does.](TRANSPORT.md#frameworks)
 
 ---
 
@@ -306,7 +315,7 @@ code, because a test written against the same understanding as the code proves
 only that the understanding is consistent.
 
 ```bash
-swift test                                      # 106 unit tests: parser,
+swift test                                      # 114 unit tests: parser,
                                                 #   chunking, buffers, writer,
                                                 #   websocket framing, HPACK,
                                                 #   QUIC packet protection
@@ -317,11 +326,12 @@ python3 scripts/feature-test.py                 # 102 checks for the failure
                                                 #   stuck-request shutdown,
                                                 #   lifespan cleanup, worker
                                                 #   restarts, reload
-bash scripts/framework-test.sh                  #  21 checks against real
-                                                #   FastAPI and Django apps
+bash scripts/framework-test.sh                  #  27 checks against real
+                                                #   FastAPI and Django apps,
+                                                #   over HTTP/1.1 and HTTP/2
 <venv>/bin/python scripts/http2-test.py         # 116 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  65 checks against `aioquic`
-<venv>/bin/python scripts/webtransport-test.py  #  42 checks against `aioquic`,
+<venv>/bin/python scripts/http3-test.py         #  73 checks against `aioquic`
+<venv>/bin/python scripts/webtransport-test.py  #  51 checks against `aioquic`,
                                                 #   including the FastAPI and
                                                 #   Django integrations
 ```

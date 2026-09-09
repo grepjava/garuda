@@ -408,6 +408,12 @@ and `is_http3(request)` are provided for applications that want to know, and
 `AltSvcMiddleware` for the case where HTTP/3 lives somewhere this process
 cannot see — a terminating proxy, or a different port.
 
+Channels composes with the router rather than competing with it, and for the
+same reason it exists: Django serves `http`, Channels serves `websocket`, this
+serves `webtransport`, each layer owning exactly the scope types the one
+beneath it refuses. [CONFIG.md](CONFIG.md) has that composition in full, and
+what to configure in each framework for every protocol here.
+
 ---
 
 ## WSGI on a multiplexed stream
