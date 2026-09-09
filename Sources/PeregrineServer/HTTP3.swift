@@ -78,6 +78,10 @@ public final class H3Connection {
 /// rather than a capability.
 let wtMaxSessions = 16
 
+/// What `beginH3Request` reports when the request ran to completion before it
+/// returned, which only a synchronous application can do.
+let h3RequestFinished = -2
+
 extension Worker {
     // MARK: - Connection set-up
 
@@ -539,9 +543,23 @@ extension Worker {
                 // A header block is decoded whole: QPACK has no way to resume.
                 if available - header < length { return }
                 if streamSlot < 0 {
-                    streamSlot = beginH3Request(slot, h3, streamID,
-                                                base + header, length)
-                    if streamSlot < 0 { return }
+                    let outcome = beginH3Request(slot, h3, streamID,
+                                                 base + header, length)
+                    // Consumed whatever became of the request. A synchronous
+                    // application runs to completion inside `dispatch` and can
+                    // have answered and closed the stream before this line is
+                    // reached; leaving its own request bytes in the buffer
+                    // would start it a second time.
+                    stream.receive.ready.consume(header + length)
+                    if outcome == h3RequestFinished {
+                        // Anything still buffered belongs to a request that is
+                        // over, and the peer has been told to stop sending.
+                        stream.receive.ready.clear()
+                        return
+                    }
+                    if outcome < 0 { return }
+                    streamSlot = outcome
+                    continue
                 } else {
                     // Trailers. Nothing downstream wants them, but they still
                     // have to be well-formed.
@@ -667,9 +685,22 @@ extension Worker {
 
         let s = table[streamSlot]
         s.pointee.bodyRemaining = -1
+        // As on HTTP/2: ASGI starts on the head, WSGI waits for the whole
+        // body, because it is called once and cannot be handed the rest
+        // afterwards. The frame loop reads the DATA frames that follow and
+        // the end of the stream is what dispatches it.
+        if appProtocol == .wsgi {
+            s.pointee.state = .readingBody
+            return streamSlot
+        }
         s.pointee.state = .dispatching
         dispatch(streamSlot)
-        return h3.streams[streamID].map(Int.init) ?? -1
+        // A WSGI application called inline answers and finishes before this
+        // returns, taking its stream slot with it. That is a completed
+        // request, not a failed one, and the caller has to be able to tell
+        // the difference.
+        if let live = h3.streams[streamID] { return Int(live) }
+        return h3RequestFinished
     }
 
     mutating func openH3Stream(parent: Int, _ h3: H3Connection, streamID: UInt64) -> Int {

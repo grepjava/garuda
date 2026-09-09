@@ -73,6 +73,17 @@ extension Worker {
             failRequest(slot, status: 500)
             return
         }
+        // A multiplexed request carries its scheme as a pseudo-header, which
+        // is the only place it appears; a trusted proxy may still override it
+        // below, exactly as it does for HTTP/1.
+        if c.pointee.isStream && c.pointee.h2Scheme {
+            if pg_dict_set(environ, Interned[.wsgiURLScheme], Interned[.vHTTPS]) != 0 {
+                pg_decref(environ)
+                PyError.logPending("setting the request scheme")
+                failRequest(slot, status: 500)
+                return
+            }
+        }
         if !applyForwarded(forwarded, toEnviron: environ) {
             pg_decref(environ)
             PyError.logPending("applying forwarded headers")
@@ -141,12 +152,18 @@ extension Worker {
                                            result: PyObj) {
         let c = table[slot]
 
+        let multiplexed = c.pointee.isStream
         let snapshot = WSGIRequestSnapshot(httpMinor: c.pointee.head.httpMinor,
                                            keepAlive: c.pointee.flags.contains(.keepAlive),
                                            suppressBody: c.pointee.flags.contains(.suppressBody),
                                            date: UnsafePointer(dates.bytes),
-                                           altSvc: config.altSvc,
-                                           altSvcLength: config.altSvcLength)
+                                           // Alt-Svc says where HTTP/3 is; a
+                                           // client already multiplexing over
+                                           // HTTP/3 does not need telling, and
+                                           // one on HTTP/2 hears it from here.
+                                           altSvc: c.pointee.isH3Stream ? nil : config.altSvc,
+                                           altSvcLength: config.altSvcLength,
+                                           multiplexed: multiplexed)
         // The buffer descriptor is copied out and back rather than passed
         // inout, because the flush below needs the connection to itself.
         var out = c.pointee.write
@@ -215,6 +232,10 @@ extension Worker {
             c.pointee.write = tail
         }
 
+        // The application has returned, so the message is whole. On a stream
+        // that is what says where it ends -- there is no chunked terminator
+        // and no connection close to imply it.
+        c.pointee.flags.insert(.responseComplete)
         c.pointee.state = .writing
         _ = flush(slot)
     }
@@ -267,7 +288,10 @@ extension Worker {
                           httpMinor: c.pointee.head.httpMinor,
                           keepAlive: c.pointee.flags.contains(.keepAlive),
                           suppressBody: c.pointee.flags.contains(.suppressBody),
-                          date: UnsafePointer(dates.bytes))
+                          date: UnsafePointer(dates.bytes),
+                          altSvc: c.pointee.isH3Stream ? nil : config.altSvc,
+                          altSvcLength: config.altSvcLength,
+                          multiplexed: c.pointee.isStream)
         c.pointee.poolJob = job
         // The connection belongs to the job now. Read interest has to go: a
         // level-triggered poller would spin on pipelined bytes that nothing is
@@ -334,6 +358,7 @@ extension Worker {
         if !job.keepAlive { c.pointee.flags.remove(.keepAlive) }
         if job.chunked { c.pointee.flags.insert(.chunkedResponse) }
         logAccess(slot, status: job.status)
+        c.pointee.flags.insert(.responseComplete)
         c.pointee.state = .writing
         _ = flush(slot)
     }

@@ -339,6 +339,16 @@ extension Worker {
     /// New body bytes arrived while the application is running.
     mutating func onBodyProgress(_ slot: Int) {
         let c = table[slot]
+        // WSGI is called once, with the whole body, so a multiplexed request
+        // waits here until the stream ends rather than being dispatched on
+        // its head the way an ASGI one is.
+        if appProtocol == .wsgi && c.pointee.state == .readingBody {
+            if c.pointee.bodyRemaining == 0 {
+                c.pointee.state = .dispatching
+                dispatch(slot)
+            }
+            return
+        }
         if c.pointee.state != .dispatching { return }
 
         if c.pointee.flags.contains(.peerClosed) && c.pointee.bodyRemaining != 0 {

@@ -768,6 +768,12 @@ public struct Worker {
     /// is between stalling this worker and buffering without bound.
     mutating func flushWithBackpressure(_ slot: Int) -> Bool {
         let c = table[slot]
+        // A stream has no socket to wait on. Blocking the worker on the
+        // connection underneath would be worse than useless for HTTP/3: the
+        // acknowledgements that would let it drain arrive on the same loop
+        // that is blocked. So the bytes go to the transport, which holds them
+        // under the peer's flow control, and the producer keeps going.
+        if c.pointee.isStream { return flush(slot) }
         while c.pointee.write.readableBytes > config.writeHighWaterMark {
             let n = connWrite(slot,
                               c.pointee.write.readPointer,

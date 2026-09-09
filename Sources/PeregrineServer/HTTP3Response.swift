@@ -181,10 +181,18 @@ extension Worker {
         let parent = Int(s.pointee.parentSlot)
         if parent < 0 { return false }
         let p = table[parent]
-        guard p.pointee.state == .http3, let h3 = p.pointee.h3 else {
+        guard p.pointee.state == .http3, p.pointee.h3 != nil else {
             closeConnection(streamSlot)
             return false
         }
+        // A WSGI response arrives here as a staged head followed by body
+        // bytes, because the thread that produced it could not touch the
+        // connection's compressor. Nothing may go out before the head does.
+        if appProtocol == .wsgi && !s.pointee.flags.contains(.responseStarted) {
+            if !startMultiplexedWSGI(streamSlot) { return false }
+            if !s.pointee.flags.contains(.responseStarted) { return true }
+        }
+        guard let h3 = table[parent].pointee.h3 else { return false }
         let streamID = s.pointee.qstreamID
 
         let pending = s.pointee.write.readableBytes

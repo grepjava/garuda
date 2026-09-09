@@ -318,6 +318,9 @@ extension Worker {
             return
         }
         onBodyProgress(streamSlot)
+        // A WSGI application dispatched by that call has already produced its
+        // whole response, and the frames it wrote are waiting on the parent.
+        if table[slot].pointee.state == .http2 { _ = flush(slot) }
     }
 
     // MARK: HEADERS
@@ -468,6 +471,14 @@ extension Worker {
             s.pointee.bodyRemaining = -1
         }
 
+        // An ASGI application is started on the head, which is what lets it
+        // reject an upload at byte one. WSGI is called once with the whole
+        // body in hand, so it has to wait for the stream to end -- exactly as
+        // it does on HTTP/1.
+        if appProtocol == .wsgi && !endStream {
+            s.pointee.state = .readingBody
+            return
+        }
         s.pointee.state = .dispatching
         dispatch(streamSlot)
         if table[slot].pointee.state == .http2 { _ = flush(slot) }
@@ -886,10 +897,18 @@ extension Worker {
         let parent = Int(s.pointee.parentSlot)
         if parent < 0 { return false }
         let p = table[parent]
-        guard p.pointee.state == .http2, let h2 = p.pointee.h2 else {
+        guard p.pointee.state == .http2, p.pointee.h2 != nil else {
             closeConnection(streamSlot)
             return false
         }
+        // A WSGI response arrives here as a staged head followed by body
+        // bytes, because the thread that produced it could not touch the
+        // connection's HPACK table. Nothing may go out before the head does.
+        if appProtocol == .wsgi && !s.pointee.flags.contains(.responseStarted) {
+            if !startMultiplexedWSGI(streamSlot) { return false }
+            if !s.pointee.flags.contains(.responseStarted) { return true }
+        }
+        guard let h2 = table[parent].pointee.h2 else { return false }
 
         while true {
             let pending = s.pointee.write.readableBytes

@@ -55,6 +55,12 @@ public final class WSGIJob {
     let keepAliveIn: Bool
     let suppressBody: Bool
     let date: UnsafeMutablePointer<UInt8>
+    /// Borrowed; both live for the process.
+    let altSvc: UnsafePointer<UInt8>?
+    let altSvcLength: Int
+    /// The response is bound for an HTTP/2 or HTTP/3 stream, so its head is
+    /// staged rather than written as text.
+    let multiplexed: Bool
 
     // --- shared, guarded by the pool mutex ---
     var out = ByteBuffer()
@@ -72,7 +78,9 @@ public final class WSGIJob {
     init(slot: Int, generation: UInt32,
          environ: PyObj, startResponse: PyObj,
          httpMinor: UInt8, keepAlive: Bool, suppressBody: Bool,
-         date: UnsafePointer<UInt8>) {
+         date: UnsafePointer<UInt8>,
+         altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0,
+         multiplexed: Bool = false) {
         self.slot = slot
         self.generation = generation
         self.environ = environ
@@ -81,6 +89,9 @@ public final class WSGIJob {
         self.keepAliveIn = keepAlive
         self.suppressBody = suppressBody
         self.keepAlive = keepAlive
+        self.altSvc = altSvc
+        self.altSvcLength = altSvcLength
+        self.multiplexed = multiplexed
         // The Date header must be the one from when the request was accepted,
         // and the shared cache will have moved on by the time a slow
         // application returns.
@@ -327,7 +338,10 @@ public final class WSGIPool {
         let snapshot = WSGIRequestSnapshot(httpMinor: job.httpMinor,
                                            keepAlive: job.keepAliveIn,
                                            suppressBody: job.suppressBody,
-                                           date: UnsafePointer(job.date))
+                                           date: UnsafePointer(job.date),
+                                           altSvc: job.altSvc,
+                                           altSvcLength: job.altSvcLength,
+                                           multiplexed: job.multiplexed)
         let plan = WSGIResponseBuilder.writeHead(&staged,
                                                  statusObj: statusObj,
                                                  headerList: headerList,

@@ -33,6 +33,8 @@ public struct WSGIRuntime {
     @usableFromInline var headerKeys: PyStringCache
     @usableFromInline var protocol11: PyObj
     @usableFromInline var protocol10: PyObj
+    @usableFromInline var protocol2: PyObj
+    @usableFromInline var protocol3: PyObj
     @usableFromInline var scratch: UnsafeMutablePointer<UInt8>
     @usableFromInline let scratchCapacity: Int
     /// Interned SCRIPT_NAME prefix length, so PATH_INFO can be trimmed.
@@ -55,9 +57,13 @@ public struct WSGIRuntime {
         self.prototype = proto
 
         guard let p11 = pg_str_intern("HTTP/1.1"),
-              let p10 = pg_str_intern("HTTP/1.0") else { return nil }
+              let p10 = pg_str_intern("HTTP/1.0"),
+              let p2 = pg_str_intern("HTTP/2"),
+              let p3 = pg_str_intern("HTTP/3") else { return nil }
         self.protocol11 = p11
         self.protocol10 = p10
+        self.protocol2 = p2
+        self.protocol3 = p3
 
         var rootLen = 0
         while rootPath[rootLen] != 0 { rootLen += 1 }
@@ -101,6 +107,8 @@ public struct WSGIRuntime {
         pg_decref(prototype)
         pg_decref(protocol11)
         pg_decref(protocol10)
+        pg_decref(protocol2)
+        pg_decref(protocol3)
         headerKeys.destroy()
     }
 
@@ -171,8 +179,14 @@ public struct WSGIRuntime {
             }
         }
 
-        // SERVER_PROTOCOL
-        let proto = head.httpMinor == 1 ? protocol11 : protocol10
+        // SERVER_PROTOCOL. An application can see which version carried it,
+        // the same way an ASGI one reads scope["http_version"].
+        let proto: PyObj
+        switch head.httpMajor {
+        case 2: proto = protocol2
+        case 3: proto = protocol3
+        default: proto = head.httpMinor == 1 ? protocol11 : protocol10
+        }
         if pg_dict_set(env, Interned[.serverProtocol], proto) != 0 {
             pg_decref(env); return nil
         }

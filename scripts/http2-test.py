@@ -384,11 +384,105 @@ def test_response_framing():
         c.close()
 
 
+def test_wsgi():
+    """A WSGI application over HTTP/2.
+
+    PEP 3333 has no idea what a stream is, and it does not need one: the two
+    differ in how a message is framed, and framing is the server's job in both.
+    What has to be checked is that a head produced by code that only knows how
+    to write HTTP/1.1 comes out as a proper header block, and that nothing
+    belonging to HTTP/1 framing survives the trip.
+    """
+    print("\nWSGI")
+    for threads in (1, 4):
+        label = "pooled" if threads > 1 else "inline"
+        with Server("--wsgi-threads", str(threads),
+                    app="wsgi_app:application") as server:
+            c = Client(server)
+            s = c.request(path="/")
+            status, headers, body, _ = c.collect([s])
+            is_("a WSGI GET is answered (%s)" % label, status.get(s), 200)
+            is_("the body arrives intact (%s)" % label, body.get(s),
+                b"hello from peregrine\n")
+            is_("a length is declared (%s)" % label,
+                headers[s].get(b"content-length"), b"21")
+            check("no HTTP/1 framing survives (%s)" % label,
+                  not any(k in headers[s] for k in (b"connection",
+                                                    b"transfer-encoding",
+                                                    b"keep-alive")),
+                  str(sorted(headers[s])))
+            is_("the server names itself (%s)" % label,
+                headers[s].get(b"server"), b"peregrine")
+
+            s = c.request(path="/env")
+            _, _, body, _ = c.collect([s])
+            check("SERVER_PROTOCOL says HTTP/2 (%s)" % label,
+                  b"SERVER_PROTOCOL='HTTP/2'" in body.get(s, b""),
+                  body.get(s, b"")[:200])
+
+            s = c.request(path="/headers")
+            _, headers, _, _ = c.collect([s])
+            is_("application headers reach the client (%s)" % label,
+                (headers[s].get(b"x-one"), headers[s].get(b"x-two")), (b"1", b"2"))
+
+            # No Content-Length: a generator whose length nobody knows. On
+            # HTTP/1 that is chunked; here the stream ending is the framing.
+            s = c.request(path="/stream")
+            _, headers, body, _ = c.collect([s])
+            is_("a generator response arrives whole (%s)" % label, body.get(s),
+                b"".join(b"chunk-%d\n" % i for i in range(5)))
+            check("with no transfer-encoding (%s)" % label,
+                  b"transfer-encoding" not in headers[s], str(sorted(headers[s])))
+
+            # Large enough to be split across frames and, when pooled, to be
+            # handed over in pieces while the head is still being staged.
+            s = c.request(path="/big?300000")
+            status, _, body, _ = c.collect([s], deadline=30.0)
+            is_("a large WSGI response is intact (%s)" % label,
+                (status.get(s), len(body.get(s, b""))), (200, 300000))
+
+            s = c.request(method="HEAD", path="/")
+            status, headers, body, _ = c.collect([s])
+            is_("HEAD carries no body (%s)" % label,
+                (status.get(s), body.get(s, b"")), (200, b""))
+            is_("but still declares a length (%s)" % label,
+                headers[s].get(b"content-length"), b"21")
+
+            s = c.request(path="/write")
+            _, _, body, _ = c.collect([s])
+            is_("the legacy write() callable works (%s)" % label, body.get(s),
+                b"written and returned\n")
+
+            s = c.request(path="/nope")
+            status, _, _, _ = c.collect([s])
+            is_("an unknown path is 404 (%s)" % label, status.get(s), 404)
+
+            # wsgi.input is a single read of the whole body, so the request
+            # cannot be dispatched on its head the way an ASGI one is: the
+            # application would be called with nothing to read.
+            s = c.request(method="POST", path="/echo", body=b"a body")
+            status, _, body, _ = c.collect([s])
+            is_("a request body reaches the application (%s)" % label,
+                (status.get(s), body.get(s)), (200, b"a body"))
+
+            big = bytes(i % 251 for i in range(200000))
+            s = c.request(method="POST", path="/echo", body=big)
+            status, _, body, _ = c.collect([s], deadline=30.0)
+            is_("a body larger than the window round trips (%s)" % label,
+                (status.get(s), body.get(s) == big), (200, True))
+
+            s = c.request(method="POST", path="/echo")
+            status, _, body, _ = c.collect([s])
+            is_("an empty body is still a body (%s)" % label,
+                (status.get(s), body.get(s, b"")), (200, b""))
+            c.close()
+
+
 def run_all():
     global FAIL
     for test in (test_basics, test_multiplexing, test_request_bodies,
                  test_flow_control, test_cancellation, test_large_headers,
-                 test_response_framing):
+                 test_response_framing, test_wsgi):
         try:
             test()
         except Exception:

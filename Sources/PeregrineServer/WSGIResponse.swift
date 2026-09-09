@@ -37,16 +37,22 @@ public struct WSGIRequestSnapshot {
     /// process.
     public var altSvc: UnsafePointer<UInt8>? = nil
     public var altSvcLength = 0
+    /// The response travels on a multiplexed stream (HTTP/2 or HTTP/3), where
+    /// the head is a compressed header block rather than text, there is no
+    /// transfer encoding, and the stream ending is the framing.
+    public var multiplexed = false
 
     public init(httpMinor: UInt8, keepAlive: Bool, suppressBody: Bool,
                 date: UnsafePointer<UInt8>,
-                altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0) {
+                altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0,
+                multiplexed: Bool = false) {
         self.httpMinor = httpMinor
         self.keepAlive = keepAlive
         self.suppressBody = suppressBody
         self.date = date
         self.altSvc = altSvc
         self.altSvcLength = altSvcLength
+        self.multiplexed = multiplexed
     }
 }
 
@@ -60,8 +66,70 @@ public struct WSGIHeadPlan {
     public var keepAlive = true
     /// HEAD, 204, 304 and 1xx: headers only.
     public var suppressBody = false
+    /// The Content-Length that went out, or -1 when the framing is the end of
+    /// the message rather than a declared length.
+    public var declaredLength = -1
     /// A message for the log when `ok` is false.
     public var failure: StaticString = ""
+}
+
+/// The response head as a multiplexed connection needs it.
+///
+/// HTTP/2 and HTTP/3 compress their heads, and the compressor belongs to the
+/// connection -- it is a table that both ends keep in step, so it can only be
+/// touched by the thread that owns the connection. A WSGI application may be
+/// running on a pool thread, which owns nothing. So the head is staged in this
+/// neutral form, which any thread can write, and encoded on the loop thread
+/// that owns the connection.
+///
+///     u32  length of everything after this field
+///     u16  status
+///     u16  header count
+///     per header: u16 name length, u16 value length, name, value
+///
+/// The length prefix comes first so a reader can tell a head that is still
+/// being written from one that is complete: the pool hands over bytes as they
+/// are produced, and half a head is not something to start encoding.
+public enum WSGIHeadBlock {
+    public static let prefixLength = 4
+    /// Long enough for anything a real response carries, short enough that a
+    /// two-byte length is honest.
+    public static let maxField = 65535
+
+    @inlinable
+    public static func begin(_ out: inout ByteBuffer) -> Int {
+        let at = out.writerOffset
+        for _ in 0..<8 { out.writeByte(0) }   // length, status, count
+        return at
+    }
+
+    @inlinable
+    public static func append(_ out: inout ByteBuffer,
+                              name: ByteSpan, value: ByteSpan) -> Bool {
+        if name.count > maxField || value.count > maxField { return false }
+        out.writeByte(UInt8(truncatingIfNeeded: name.count >> 8))
+        out.writeByte(UInt8(truncatingIfNeeded: name.count))
+        out.writeByte(UInt8(truncatingIfNeeded: value.count >> 8))
+        out.writeByte(UInt8(truncatingIfNeeded: value.count))
+        out.write(name.base, name.count)
+        out.write(value.base, value.count)
+        return true
+    }
+
+    @inlinable
+    public static func finish(_ out: inout ByteBuffer, at: Int,
+                              status: Int, count: Int) {
+        let total = out.writerOffset - at - prefixLength
+        let p = out.pointer(at: at)
+        p[0] = UInt8(truncatingIfNeeded: total >> 24)
+        p[1] = UInt8(truncatingIfNeeded: total >> 16)
+        p[2] = UInt8(truncatingIfNeeded: total >> 8)
+        p[3] = UInt8(truncatingIfNeeded: total)
+        p[4] = UInt8(truncatingIfNeeded: status >> 8)
+        p[5] = UInt8(truncatingIfNeeded: status)
+        p[6] = UInt8(truncatingIfNeeded: count >> 8)
+        p[7] = UInt8(truncatingIfNeeded: count)
+    }
 }
 
 public enum WSGIResponseBuilder {
@@ -101,7 +169,44 @@ public enum WSGIResponseBuilder {
         }
 
         out.reserve(512)
-        HTTPResponseWriter.writeStatusLine(&out, raw: ByteSpan(statusPtr, Int(statusLen)))
+        // Two sinks, one walk. HTTP/1.1 gets text; a multiplexed stream gets
+        // the neutral block, because the head has to survive a hand-off to the
+        // thread that owns the compressor.
+        var blockAt = 0
+        var emitted = 0
+        if snapshot.multiplexed {
+            blockAt = WSGIHeadBlock.begin(&out)
+        } else {
+            HTTPResponseWriter.writeStatusLine(&out, raw: ByteSpan(statusPtr, Int(statusLen)))
+        }
+
+        /// Adds one header in whichever form this response is being built in.
+        func emit(_ name: ByteSpan, _ value: ByteSpan) -> Bool {
+            if snapshot.multiplexed {
+                // The same check the text writer makes. A header that could
+                // split an HTTP/1 response cannot split an HTTP/2 one, but it
+                // is still not a header, and the two paths should refuse the
+                // same things for the same reasons.
+                var i = 0
+                while i < name.count {
+                    if !isTokenChar(name.base[i]) { return false }
+                    i &+= 1
+                }
+                i = 0
+                while i < value.count {
+                    if !isFieldValueChar(value.base[i]) { return false }
+                    i &+= 1
+                }
+                if !WSGIHeadBlock.append(&out, name: name, value: value) { return false }
+                emitted += 1
+                return true
+            }
+            return HTTPResponseWriter.writeHeader(&out, name: name, value: value)
+        }
+
+        func emit(_ name: StaticString, _ value: ByteSpan) -> Bool {
+            emit(ByteSpan(name.utf8Start, name.utf8CodeUnitCount), value)
+        }
 
         var seen: ResponseHeaderKind = []
         var declaredLength = -1
@@ -149,7 +254,9 @@ public enum WSGIResponseBuilder {
                 if containsTokenLowercased(value.base, value.count, "close") {
                     plan.keepAlive = false
                 }
-            } else if !HTTPResponseWriter.writeHeader(&out, name: name, value: value) {
+            } else if name.count == 0 {
+                rejection = "rejected an empty response header name"
+            } else if !emit(name, value) {
                 // A CR or LF in an application-supplied header is a response
                 // splitting attempt; refuse the whole response rather than
                 // emit it.
@@ -202,8 +309,20 @@ public enum WSGIResponseBuilder {
             if ok { declaredLength = total }
         }
 
+        plan.declaredLength = declaredLength
+        var digits = ByteBuffer()
+        defer { digits.destroy() }
         if declaredLength >= 0 {
-            HTTPResponseWriter.writeContentLength(&out, declaredLength)
+            if snapshot.multiplexed {
+                digits.writeDecimal(declaredLength)
+                _ = emit("content-length",
+                         ByteSpan(UnsafePointer(digits.readPointer), digits.readableBytes))
+            } else {
+                HTTPResponseWriter.writeContentLength(&out, declaredLength)
+            }
+        } else if snapshot.multiplexed {
+            // Nothing to declare and nothing to chunk: on a multiplexed
+            // stream the ending of the stream is the framing.
         } else if snapshot.httpMinor == 1 {
             plan.chunked = true
             HTTPResponseWriter.writeChunkedEncoding(&out)
@@ -213,20 +332,40 @@ public enum WSGIResponseBuilder {
         }
 
         if !seen.contains(.date) {
-            out.write("Date: ")
-            out.write(snapshot.date, 29)
-            out.writeCRLF()
+            if snapshot.multiplexed {
+                _ = emit("date", ByteSpan(snapshot.date, 29))
+            } else {
+                out.write("Date: ")
+                out.write(snapshot.date, 29)
+                out.writeCRLF()
+            }
         }
         if !seen.contains(.server) {
-            out.write("Server: peregrine\r\n")
+            if snapshot.multiplexed {
+                let peregrine: StaticString = "peregrine"
+                _ = emit("server", ByteSpan(peregrine.utf8Start,
+                                            peregrine.utf8CodeUnitCount))
+            } else {
+                out.write("Server: peregrine\r\n")
+            }
         }
         if let altSvc = snapshot.altSvc, !seen.contains(.altSvc) {
-            out.write("Alt-Svc: ")
-            out.write(altSvc, snapshot.altSvcLength)
-            out.writeCRLF()
+            if snapshot.multiplexed {
+                _ = emit("alt-svc", ByteSpan(altSvc, snapshot.altSvcLength))
+            } else {
+                out.write("Alt-Svc: ")
+                out.write(altSvc, snapshot.altSvcLength)
+                out.writeCRLF()
+            }
         }
-        HTTPResponseWriter.writeConnection(&out, keepAlive: plan.keepAlive)
-        HTTPResponseWriter.endHead(&out)
+        if snapshot.multiplexed {
+            // Connection management is not the application's on HTTP/1 and
+            // does not exist at all here: the stream is the message.
+            WSGIHeadBlock.finish(&out, at: blockAt, status: code, count: emitted)
+        } else {
+            HTTPResponseWriter.writeConnection(&out, keepAlive: plan.keepAlive)
+            HTTPResponseWriter.endHead(&out)
+        }
         WSGIStartResponse.markHeadersSent(startResponse)
         plan.ok = true
         return plan

@@ -383,6 +383,80 @@ async def flow_control():
                 (status, len(body), body == total), (200, len(total), True))
 
 
+async def wsgi():
+    """A WSGI application over HTTP/3.
+
+    Same reasoning as the HTTP/2 suite: PEP 3333 knows nothing about streams
+    and does not have to. The head it produces is staged and encoded with
+    QPACK here, so what is checked is that it arrives as a header block and
+    that nothing belonging to HTTP/1 framing came with it.
+    """
+    print("\nWSGI")
+    for threads in (1, 4):
+        label = "pooled" if threads > 1 else "inline"
+        with Server("--wsgi-threads", str(threads),
+                    app="wsgi_app:application") as server:
+            async with connect("127.0.0.1", server.port, configuration=configuration(),
+                               create_protocol=Client) as client:
+                status, headers, body = await client.request("GET", "/")
+                is_("a WSGI GET is answered (%s)" % label, status, 200)
+                is_("the body arrives intact (%s)" % label, body,
+                    b"hello from peregrine\n")
+                is_("a length is declared (%s)" % label,
+                    headers.get(b"content-length"), b"21")
+                check("no HTTP/1 framing survives (%s)" % label,
+                      not any(k in headers for k in (b"connection",
+                                                     b"transfer-encoding",
+                                                     b"keep-alive")),
+                      str(sorted(headers)))
+
+                _, _, body = await client.request("GET", "/env")
+                check("SERVER_PROTOCOL says HTTP/3 (%s)" % label,
+                      b"SERVER_PROTOCOL='HTTP/3'" in body, body[:200])
+                check("the scheme is https (%s)" % label,
+                      b"wsgi.url_scheme='https'" in body, body[:400])
+
+                _, headers, body = await client.request("GET", "/stream")
+                is_("a generator response arrives whole (%s)" % label, body,
+                    b"".join(b"chunk-%d\n" % i for i in range(5)))
+                check("with no transfer-encoding (%s)" % label,
+                      b"transfer-encoding" not in headers, str(sorted(headers)))
+
+                status, _, body = await client.request("GET", "/big?300000")
+                is_("a large WSGI response is intact (%s)" % label,
+                    (status, len(body)), (200, 300000))
+
+                # HEAD is not checked here for the same reason as above: this
+                # application declares a length, and aioquic measures the
+                # correctly absent body against it. scripts/http2-test.py
+                # covers HEAD for WSGI, where the h2 library knows what it
+                # asked for.
+
+                _, _, body = await client.request("GET", "/write")
+                is_("the legacy write() callable works (%s)" % label, body,
+                    b"written and returned\n")
+
+                status, _, _ = await client.request("GET", "/nope")
+                is_("an unknown path is 404 (%s)" % label, status, 404)
+
+                # wsgi.input is a single read of the whole body, so the
+                # request cannot be dispatched on its head the way an ASGI
+                # one is: the application would find nothing to read.
+                status, _, body = await client.request("POST", "/echo",
+                                                       body=b"a body")
+                is_("a request body reaches the application (%s)" % label,
+                    (status, body), (200, b"a body"))
+
+                big = bytes(i % 251 for i in range(200000))
+                status, _, body = await client.request("POST", "/echo", body=big)
+                is_("a body larger than the window round trips (%s)" % label,
+                    (status, body == big), (200, True))
+
+                status, _, body = await client.request("POST", "/echo", body=b"")
+                is_("an empty body is still a body (%s)" % label,
+                    (status, body), (200, b""))
+
+
 def http1_headers(port, path, quic_port=None):
     """One HTTP/1.1 request over TLS, returning its headers."""
     import http.client
@@ -479,7 +553,7 @@ async def main():
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
     for test in (basics, request_bodies, multiplexing, cancellation,
-                 large_headers, response_framing, flow_control, alt_svc):
+                 large_headers, response_framing, flow_control, wsgi, alt_svc):
         try:
             await test()
         except Exception:
