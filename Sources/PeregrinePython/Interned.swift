@@ -35,7 +35,7 @@ public enum PyKey: Int, CaseIterable {
 
     // --- ASGI values ---
     case vHTTP, vWebsocket, vLifespan
-    case v30, v23, v11, v10
+    case v30, v23, v11, v10, v2, v3
     case vHTTPS
     case vHTTPRequest, vHTTPDisconnect
     case vHTTPResponseStart, vHTTPResponseBody
@@ -71,7 +71,7 @@ private let keyNames: [StaticString] = [
     "text", "bytes", "subprotocol", "subprotocols", "code", "reason",
 
     "http", "websocket", "lifespan",
-    "3.0", "2.3", "1.1", "1.0",
+    "3.0", "2.3", "1.1", "1.0", "2", "3",
     "https",
     "http.request", "http.disconnect",
     "http.response.start", "http.response.body",

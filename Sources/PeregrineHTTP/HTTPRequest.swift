@@ -79,6 +79,9 @@ public struct HTTPRequestHead {
     /// Query string without the leading `?`.
     public var query = HTTPSlice()
     public var httpMinor: UInt8 = 1
+    /// 1 for HTTP/1.x, 2 and 3 for the binary versions, where the parser is
+    /// only ever handed a head this server rebuilt.
+    public var httpMajor: UInt8 = 1
     public var headerCount: Int = 0
     /// -1 when absent.
     public var contentLength: Int = -1

@@ -239,6 +239,11 @@ while i < argc {
         config.venvPath = v
     } else if matches(arg, "--no-auto-venv") {
         config.noAutoVenv = true
+    } else if matches(arg, "--no-http2") {
+        config.http2Enabled = false
+    } else if matches(arg, "--http2-only") {
+        config.http2Only = true
+        config.http2Enabled = true
     } else if matches(arg, "--no-websockets") {
         config.websocketsEnabled = false
     } else if matches(arg, "--ws-max-message") {

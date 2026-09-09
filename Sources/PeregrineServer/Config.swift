@@ -83,6 +83,21 @@ public struct ServerConfig {
     /// address spoof and an untrusted X-Forwarded-Proto is a scheme spoof.
     public var trust = ForwardedTrust()
 
+    // --- http/2 ---
+    /// Serve HTTP/2 to clients that ask for it. Over cleartext that means the
+    /// connection preface; over TLS it means ALPN.
+    public var http2Enabled = true
+    /// Speak only HTTP/2 on this port, with no HTTP/1.1 fallback. What a
+    /// proxy that talks h2c upstream (Envoy, Caddy) and a gRPC client expect,
+    /// and the only way an invalid preface can be answered in HTTP/2 rather
+    /// than mistaken for a malformed HTTP/1 request line.
+    public var http2Only = false
+    /// Streams one connection may have in flight. Each costs a connection slot.
+    public var h2MaxConcurrentStreams = 128
+    /// The largest frame we will accept. 16 KiB is the floor every
+    /// implementation must support, and larger frames only add latency.
+    public var h2MaxFrameSize = 16 * 1024
+
     // --- websockets ---
     public var websocketsEnabled = true
     public var maxWebsocketMessageSize = 16 * 1024 * 1024

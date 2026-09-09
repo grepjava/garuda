@@ -119,7 +119,12 @@ public struct ASGIScopeBuilder {
         }
 
         // http_version
-        let httpVersion = head.httpMinor == 1 ? Interned[.v11] : Interned[.v10]
+        let httpVersion: PyObj
+        switch head.httpMajor {
+        case 2: httpVersion = Interned[.v2]
+        case 3: httpVersion = Interned[.v3]
+        default: httpVersion = head.httpMinor == 1 ? Interned[.v11] : Interned[.v10]
+        }
         if pg_dict_set(scope, Interned[.httpVersion], httpVersion) != 0 {
             pg_decref(scope); return nil
         }

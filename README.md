@@ -235,8 +235,9 @@ by a fixed limit, and connections by `--max-connections`; a full table answers
 Run the suites:
 
 ```bash
-swift test                              # 80 unit tests: parser, chunking, buffers,
-                                        #   writer, websocket framing, proxy trust
+swift test                              # 90 unit tests: parser, chunking, buffers,
+                                        #   writer, websocket framing, HPACK,
+                                        #   proxy trust
 bash scripts/integration-test.sh        # 38 end-to-end checks over both protocols
 python3 scripts/feature-test.py         # 94 checks for the failure modes a plain
                                         #   request never reaches: slow consumers,
@@ -245,6 +246,17 @@ python3 scripts/feature-test.py         # 94 checks for the failure modes a plai
                                         #   unix sockets, websockets, reload
 bash scripts/framework-test.sh          # 21 checks against real FastAPI and
                                         #   Django applications
+<venv>/bin/python scripts/http2-test.py # 24 HTTP/2 checks against the `h2`
+                                        #   library: multiplexing, flow control,
+                                        #   CONTINUATION, cancellation
+```
+
+HTTP/2 conformance is checked with [h2spec](https://github.com/summerwind/h2spec),
+which is not vendored here:
+
+```bash
+peregrine --port 8000 --http2-only examples.asgi_app:app &
+h2spec -h 127.0.0.1 -p 8000          # 146 tests, 146 passed
 ```
 
 The framework suite needs a virtualenv with `fastapi starlette django
@@ -322,6 +334,8 @@ peregrine [options] MODULE:ATTRIBUTE
   --reload                 restart workers when source files change
   --no-uvloop              do not use uvloop even when installed
   --no-lifespan            skip the ASGI lifespan protocol
+  --no-http2               refuse HTTP/2 and answer HTTP/1.1 only
+  --http2-only             serve only HTTP/2 (h2c), with no HTTP/1 fallback
   --no-websockets          reject WebSocket upgrades with 501
   --ws-max-message BYTES   largest accepted WebSocket message (16 MiB)
   --ws-ping-interval MS    keepalive ping period, 0 to disable (20000)
@@ -451,9 +465,57 @@ connection; one that sends less has the connection closed rather than leaving
 the client waiting on bytes that are not coming. Either way the application is
 told, and the connection is not reused.
 
+## HTTP/2
+
+Cleartext HTTP/2 is served to any client that opens with the connection preface
+-- `curl --http2-prior-knowledge`, a gRPC client, or a proxy configured to talk
+h2c upstream. The same port still answers HTTP/1.1, because the preface is
+recognised in full before anything is assumed. `--http2-only` drops the HTTP/1
+fallback for ports that only ever carry h2c, and `--no-http2` turns the whole
+thing off.
+
+The upgrade dance from RFC 7540 is deliberately absent: RFC 9113 removed it, no
+browser ever used it, and prior knowledge covers every cleartext client that
+exists.
+
+**The structural problem** is that a server built around one request per
+connection now has many. Peregrine keeps the connection slot as the transport --
+socket, read buffer, poller interest, HPACK tables, flow control -- and gives
+every stream a slot of its own from the same table, with `fd` set to -1 and a
+pointer back to the connection. A stream slot has a head, a body buffer, a write
+buffer, a task and a Content-Length budget, so ASGI dispatch, request-body
+streaming, write backpressure and disconnect delivery all work on a stream
+exactly as they work on a connection. Three things know the difference: writing
+(bytes become DATA frames on the parent instead of going to a socket), read
+interest (a stream has no descriptor), and teardown.
+
+The request head is rebuilt as HTTP/1.1 text and handed to the ordinary parser.
+That costs a copy and a parse per request; in exchange the scope builder, the
+trusted-proxy logic and the access log keep working on the representation they
+were written for, rather than growing a second one.
+
+**HPACK** is a full implementation -- static and dynamic tables, Huffman in both
+directions, the eviction rules -- checked against every example in RFC 7541
+appendix C. The Huffman table is generated from the RFC, and a unit test
+re-derives all 257 codes from their lengths alone, so a transcription error
+could not survive the build. Decoding hands out borrowed pointers rather than
+objects, and the dynamic table is a FIFO of descriptors over an append-only
+arena, so a compressed header block costs a memcpy per field and no allocations.
+
+**Flow control** is real in both directions. A response is held in the stream
+buffer until the peer's window allows it, which is what makes `await send()`
+apply backpressure on a multiplexed connection; the window is only given back
+as the application actually reads the request body, so an upload nobody is
+consuming stops rather than filling memory. The encoder never uses incremental
+indexing: mirroring the peer's table would save a few bytes on responses whose
+headers barely repeat, and Huffman coding of literals gets most of it for none
+of the bookkeeping.
+
 ## What is not
 
-- **HTTP/2 and HTTP/3.**
+- **HTTP/3.**
+- **TLS, so HTTP/2 in a browser.** Browsers only negotiate h2 over ALPN, so
+  today's HTTP/2 is for proxies, gRPC clients and prior-knowledge tools.
 - **TLS.** Terminate it upstream; that is where it belongs for this class of
   server anyway.
 - **`sendfile` for `wsgi.file_wrapper`.** The wrapper works and streams in

@@ -99,6 +99,9 @@ public struct Worker {
     @inline(__always)
     mutating func setInterest(_ slot: Int, _ mask: PollMask) {
         let c = table[slot]
+        // An HTTP/2 stream has no descriptor of its own; interest belongs to
+        // the connection carrying it.
+        if c.pointee.fd < 0 { return }
         if c.pointee.interest == mask.rawValue { return }
         let token = PollToken.make(slot: slot, generation: c.pointee.generation)
         _ = poller.modify(c.pointee.fd, mask, token: token)
@@ -158,6 +161,12 @@ public struct Worker {
             if c.pointee.poolJob != nil {
                 pumpPoolJob(slot)
                 return
+            }
+            // Room on the socket is what a stream blocked behind a slow client
+            // is waiting for.
+            if c.pointee.state == .http2, let h2 = c.pointee.h2 {
+                pumpAllStreams(slot, h2)
+                if table[slot].pointee.state == .free { return }
             }
         }
         if mask.wantsRead {
@@ -306,6 +315,12 @@ public struct Worker {
         case .websocket:
             handleWebSocketReadable(slot)
             return
+        case .http2:
+            // A few frames per turn: enough to keep the pipeline full without
+            // letting one connection monopolise the loop.
+            if !fill(slot, .read, limit: config.h2MaxFrameSize * 4) { return }
+            pumpHTTP2(slot)
+            return
         case .dispatching:
             // A pooled WSGI request has its whole body already; anything
             // arriving now is the next pipelined request, and it waits in the
@@ -382,6 +397,36 @@ public struct Worker {
             switch c.pointee.state {
             case .readingHead:
                 if c.pointee.read.readableBytes == 0 { return }
+                // The HTTP/2 preface is a valid HTTP/1.1 request line right up
+                // until it is not, so it can only be recognised in full, and
+                // only at the very start of a connection.
+                if config.http2Only && c.pointee.requestCount == 0 {
+                    // Nothing here is HTTP/1, so an incomplete preface is a
+                    // truncated preface and a wrong one is a protocol error.
+                    if c.pointee.read.readableBytes < HTTP2.preface.count {
+                        if looksLikeHTTP2(slot) { return }
+                        rejectBadPreface(slot)
+                        return
+                    }
+                    if looksLikeHTTP2(slot) { beginHTTP2(slot) } else { rejectBadPreface(slot) }
+                    return
+                }
+                if config.http2Enabled && c.pointee.requestCount == 0
+                    && looksLikeHTTP2(slot) {
+                    if c.pointee.read.readableBytes < HTTP2.preface.count { return }
+                    beginHTTP2(slot)
+                    return
+                }
+                // A connection that opened with "PRI " and then diverged was
+                // an HTTP/2 client, not an HTTP/1 request: answering in HTTP/1
+                // would be talking past it.
+                if config.http2Enabled && c.pointee.requestCount == 0
+                    && ((c.pointee.read.readableBytes >= 4
+                         && equalsExact(UnsafePointer(c.pointee.read.readPointer), 4, "PRI "))
+                        || looksLikeBareFrames(slot)) {
+                    rejectBadPreface(slot)
+                    return
+                }
                 let origin = c.pointee.read.readerOffset
                 let base = UnsafePointer(c.pointee.read.readPointer)
                 var head = HTTPRequestHead()
@@ -574,6 +619,8 @@ public struct Worker {
     @discardableResult
     mutating func flush(_ slot: Int) -> Bool {
         let c = table[slot]
+        // An HTTP/2 stream writes into its connection, not into a socket.
+        if c.pointee.isStream { return flushStream(slot) }
         while c.pointee.write.readableBytes > 0 {
             let n = pg_write(c.pointee.fd,
                              c.pointee.write.readPointer,
@@ -650,6 +697,9 @@ public struct Worker {
     /// Re-evaluates read interest for a request whose body is still arriving.
     mutating func updateBodyReadInterest(_ slot: Int) {
         let c = table[slot]
+        // HTTP/2 applies its backpressure with WINDOW_UPDATE instead: the
+        // connection must keep reading, or control frames stop being answered.
+        if c.pointee.isStream { return }
         guard appProtocol == .asgi, c.pointee.state == .dispatching,
               c.pointee.poolJob == nil else { return }
         var mask: PollMask = readInterestAllowed(slot) ? .read : []
@@ -706,6 +756,23 @@ public struct Worker {
     /// Called once a full response has been written out.
     mutating func finishResponse(_ slot: Int) {
         let c = table[slot]
+        if c.pointee.isStream {
+            // A response shorter than its Content-Length must not be ended
+            // cleanly; the client would take the truncation for the whole
+            // message. Otherwise, answering before the request finished
+            // arriving is ordinary in HTTP/2 and costs only a polite reset.
+            let code: H2Error?
+            if c.pointee.flags.contains(.responseComplete)
+                && c.pointee.responseRemaining > 0 {
+                code = .internalError
+            } else if c.pointee.bodyRemaining == 0 {
+                code = nil
+            } else {
+                code = .noError
+            }
+            closeStream(slot, resetWith: code)
+            return
+        }
         // An application that answers early -- a 401, a validation failure at
         // byte one -- is exactly what dispatching before the body arrives is
         // for. But the rest of that body is still coming and it is not a
@@ -736,6 +803,10 @@ public struct Worker {
     /// Emits a canned error response and closes.
     mutating func failRequest(_ slot: Int, status: Int) {
         let c = table[slot]
+        if c.pointee.isStream {
+            h2FailRequest(slot, status: status)
+            return
+        }
         // With an application task still running, its next send() would append
         // to whatever we wrote here and produce two responses on one
         // connection. Closing is the only honest option.
@@ -779,6 +850,30 @@ public struct Worker {
         let c = table[slot]
         if c.pointee.state == .free { return }
 
+        // An HTTP/2 connection takes its streams with it. Detaching each one
+        // first stops it from trying to tidy up a parent that is going away.
+        if let h2 = c.pointee.h2 {
+            let children = h2.streams
+            h2.streams.removeAll()
+            for (_, raw) in children {
+                let child = Int(raw)
+                if table[child].pointee.state != .free {
+                    table[child].pointee.parentSlot = -1
+                    closeConnection(child)
+                }
+            }
+            h2.destroy()
+            c.pointee.h2 = nil
+        }
+        let wasStream = c.pointee.isStream
+        if wasStream {
+            let parent = Int(c.pointee.parentSlot)
+            c.pointee.parentSlot = -1
+            if parent >= 0, let h2 = table[parent].pointee.h2 {
+                h2.streams.removeValue(forKey: c.pointee.streamID)
+            }
+        }
+
         // A producer parked in `await send()` has to be released, or its task
         // never finishes and the interpreter never shuts down.
         releaseDrainWaiter(slot)
@@ -815,8 +910,13 @@ public struct Worker {
             _ = pg_close(c.pointee.fd)
             c.pointee.fd = -1
         }
-        pool.give(c.pointee.read)
-        c.pointee.read = ByteBuffer()
+        // A stream never took a buffer from the pool.
+        if wasStream {
+            c.pointee.read.destroy()
+        } else {
+            pool.give(c.pointee.read)
+            c.pointee.read = ByteBuffer()
+        }
         c.pointee.write.destroy()
         c.pointee.body.destroy()
         table.release(slot)
@@ -873,6 +973,13 @@ public struct Worker {
                 if idle > config.requestHeadTimeoutMs { closeConnection(slot) }
             case .websocket:
                 sweepWebSocket(slot, now: now)
+            case .http2:
+                // Only an idle connection times out; a stream that is still
+                // running is the application's business, as in HTTP/1.
+                if let h2 = c.pointee.h2, h2.streams.isEmpty,
+                   idle > config.keepAliveTimeoutMs {
+                    closeConnection(slot)
+                }
             default:
                 break
             }

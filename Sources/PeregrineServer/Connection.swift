@@ -28,6 +28,9 @@ public enum ConnState: UInt8 {
     case dispatching
     /// The HTTP request became a WebSocket; framing is no longer HTTP.
     case websocket
+    /// The connection speaks HTTP/2. Requests live in stream slots of their
+    /// own; this one owns the socket, the HPACK state and the flow control.
+    case http2
     /// Response bytes are queued and the socket is not yet drained.
     case writing
     /// Everything is written; close once the buffer empties.
@@ -65,6 +68,9 @@ public struct ConnFlags: OptionSet, Sendable {
     /// websocket half of ASGI rather than the http half. Set before the
     /// handshake is answered, which is why it is separate from `.websocket`.
     public static let websocketMode    = ConnFlags(rawValue: 1 << 12)
+    /// HTTP/2: the END_STREAM flag has been sent, so the response is over on
+    /// the wire even if the slot is still waiting for its task.
+    public static let endStreamSent    = ConnFlags(rawValue: 1 << 13)
 
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
@@ -72,6 +78,7 @@ public struct ConnFlags: OptionSet, Sendable {
     public static let perRequest: ConnFlags = [
         .owesContinue, .chunkedResponse, .responseStarted, .responseComplete,
         .suppressBody, .disconnected, .disconnectSent, .bodyDelivered,
+        .endStreamSent,
     ]
 }
 
@@ -108,6 +115,27 @@ public struct Connection {
 
     public var lastActivity: UInt64 = 0
     public var requestCount: UInt32 = 0
+
+    // --- HTTP/2 ---
+    /// Connection state, on the slot that owns the socket.
+    public var h2: H2Connection? = nil
+    /// The slot owning the socket, when this slot is a stream; -1 otherwise.
+    public var parentSlot: Int32 = -1
+    public var streamID: UInt32 = 0
+    /// Flow control, in bytes. `send` is what the peer will accept from us,
+    /// `recv` what we have told the peer it may send.
+    public var sendWindow: Int = 0
+    public var recvWindow: Int = 0
+    public var pendingRecvUpdate: Int = 0
+    /// Body bytes received, for checking a declared Content-Length against
+    /// what actually arrived.
+    public var bodyReceived: Int = 0
+    /// The `:scheme` the client asked for was https.
+    public var h2Scheme = false
+
+    /// True when this slot is one stream of an HTTP/2 connection rather than
+    /// a connection in its own right.
+    @inlinable public var isStream: Bool { parentSlot >= 0 }
 
     /// Cached per-connection Python values so a keep-alive connection builds
     /// its client address once rather than per request.

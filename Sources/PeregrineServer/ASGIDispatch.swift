@@ -262,6 +262,7 @@ extension Worker {
         let forwardedClient = forwardedClientTuple(forwarded)
         defer { if let f = forwardedClient { pg_decref(f) } }
         var schemeOverride: PyObj? = nil
+        if c.pointee.isStream && c.pointee.h2Scheme { schemeOverride = Interned[.vHTTPS] }
         if let https = forwarded.https {
             schemeOverride = https ? Interned[.vHTTPS] : Interned[.vHTTP]
         }
@@ -352,6 +353,7 @@ extension Worker {
         pg_decref(message)
         pg_decref(future)
         updateBodyReadInterest(slot)
+        h2FlushWindowUpdates(slot)
     }
 
     /// Builds the next ASGI receive message, or nil when nothing is ready.
@@ -389,6 +391,7 @@ extension Worker {
             guard let bodyObj else { return nil }
             defer { pg_decref(bodyObj) }
             c.pointee.body.clear()
+            if c.pointee.isStream { h2NoteConsumed(slot, available) }
             if complete { c.pointee.flags.insert(.bodyDelivered) }
             return ASGIMessage.httpRequest(body: bodyObj, moreBody: !complete)
         }
@@ -407,6 +410,7 @@ extension Worker {
             pg_err_set_str(pg_exc_runtime(), "http.response.start sent twice")
             return false
         }
+        if c.pointee.isStream { return h2ResponseStart(slot, message: message) }
         guard let statusObj = pg_dict_get(message, Interned[.status]) else {
             pg_err_set_str(pg_exc_value(), "http.response.start needs a status")
             return false
@@ -749,6 +753,7 @@ func asgiReceive(_ token: UInt64, _ args: PyObj?) -> PyObj? {
         defer { pg_decref(ready) }
         // Taking the buffered bytes is what makes room for the next read.
         worker.pointee.updateBodyReadInterest(slot)
+        worker.pointee.h2FlushWindowUpdates(slot)
         return PyImmediate.make(ready)
     }
 
