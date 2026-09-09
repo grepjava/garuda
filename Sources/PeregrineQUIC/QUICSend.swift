@@ -309,7 +309,10 @@ extension QUICConnection {
         frames.crypto = (offset, offset + UInt64(length))
         ackEliciting = true
         if !cryptoSend[index].lost.isEmpty {
-            cryptoSend[index].lost.removeBelow(offset + UInt64(length))
+            // Exactly what went into this frame stops being owed -- not
+            // everything below it, which would drop a lower gap this packet
+            // did not carry.
+            cryptoSend[index].lost.subtract(offset, offset + UInt64(length))
         }
         if offset + UInt64(length) > cryptoSend[index].sent {
             cryptoSend[index].sent = offset + UInt64(length)
@@ -514,7 +517,7 @@ extension QUICConnection {
         frames.streams.append((stream.id, offset, offset + UInt64(length), fin))
         ackEliciting = true
         if isRetransmit {
-            stream.send.lost.removeBelow(offset + UInt64(length))
+            stream.send.lost.subtract(offset, offset + UInt64(length))
         } else {
             sentBytes &+= UInt64(length)
         }

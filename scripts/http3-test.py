@@ -202,7 +202,7 @@ def configuration():
 
 
 def run(coro):
-    return asyncio.run(asyncio.wait_for(coro, timeout=60))
+    return asyncio.run(asyncio.wait_for(coro, timeout=180))
 
 
 # --------------------------------------------------------------------------
@@ -457,6 +457,67 @@ async def wsgi():
                     (status, body), (200, b""))
 
 
+async def long_lived():
+    """A connection that outlives its stream concurrency limit.
+
+    A QUIC stream is credit as well as state: a peer may have only
+    initial_max_streams_bidi of them open, and it is given more only when the
+    server retires the ones that have finished. A server that never retires a
+    completed stream works perfectly for exactly that many requests and then
+    stops, with the next one waiting on credit that cannot arrive.
+    """
+    print("\nA long-lived connection")
+    with Server() as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            statuses = set()
+            bodies = set()
+            for _ in range(200):
+                status, _, body = await client.request("GET", "/")
+                statuses.add(status)
+                bodies.add(body)
+            is_("200 requests on one connection are all answered",
+                statuses, {200})
+            is_("and every one of them is the whole response", len(bodies), 1)
+
+
+async def key_update():
+    """A key update started by the client.
+
+    Either endpoint may rotate the packet protection keys at any time by
+    flipping the key phase bit (RFC 9001 section 6). The packet that announces
+    it arrives under keys the server has derived but not adopted, so the server
+    has to tell which keys apply from the header rather than by trying one set
+    and then another: decryption happens in place, and an attempt that fails
+    has already written over the packet a second attempt would need.
+    """
+    print("\nKey update")
+    with Server() as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            status, _, before = await client.request("GET", "/")
+            is_("a request before the update", status, 200)
+
+            client._quic.request_key_update()
+            client.transmit()
+
+            status, _, after = await client.request("GET", "/")
+            is_("the connection survives the update", status, 200)
+            is_("and answers the same thing", after, before)
+
+            # The phase stays flipped, so this one is ordinary traffic under
+            # the new keys rather than the announcement itself.
+            status, _, later = await client.request("GET", "/")
+            is_("and goes on working under the new keys", status, 200)
+            is_("with nothing lost in the change", later, before)
+
+            # And again, in the other direction of the phase bit.
+            client._quic.request_key_update()
+            client.transmit()
+            status, _, _ = await client.request("GET", "/")
+            is_("a second update works as well as the first", status, 200)
+
+
 def http1_headers(port, path, quic_port=None):
     """One HTTP/1.1 request over TLS, returning its headers."""
     import http.client
@@ -553,7 +614,8 @@ async def main():
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
     for test in (basics, request_bodies, multiplexing, cancellation,
-                 large_headers, response_framing, flow_control, wsgi, alt_svc):
+                 large_headers, response_framing, flow_control, long_lived,
+                 key_update, wsgi, alt_svc):
         try:
             await test()
         except Exception:

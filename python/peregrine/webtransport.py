@@ -256,7 +256,7 @@ class WebTransportSession:
                 elif kind == "webtransport.datagram.receive":
                     await self._datagrams.put(message["data"])
                 elif kind == "webtransport.stream.opened":
-                    await self._opened.put(message)
+                    await self._opened.put(self._register_opened(message))
                 elif kind == "webtransport.disconnect":
                     self.closed = True
                     self.close_code = message.get("code", 0)
@@ -274,18 +274,45 @@ class WebTransportSession:
             self._shut_down()
             raise
 
+    def _register_opened(self, message):
+        """Builds the stream object for an open this endpoint asked for.
+
+        It has to happen here, in the pump, rather than in `create_stream()`:
+        the peer may answer on that stream before `create_stream()` is
+        scheduled again, and the pump would then see data for a stream id it
+        knows nothing about and take it for one the peer had opened. Building
+        it at `stream.opened` and handing that same object back means there is
+        never a second object for the reply to be delivered to.
+        """
+        stream_id = message["stream"]
+        stream = self._streams.get(stream_id)
+        if stream is None:
+            bidirectional = message.get("bidirectional")
+            if bidirectional is None:
+                bidirectional = not (stream_id & 0x2)
+            stream = WebTransportStream(self, stream_id, bidirectional)
+            self._streams[stream_id] = stream
+        if not stream.bidirectional:
+            # Nothing will ever arrive on a unidirectional stream we opened.
+            stream._eof = True
+        return stream
+
     async def _on_stream_data(self, message):
         stream_id = message["stream"]
         stream = self._streams.get(stream_id)
         if stream is None:
-            # A stream the peer opened. Its direction is in the identifier:
-            # QUIC puts it in the low two bits, and bit 1 set means
-            # unidirectional.
+            # QUIC puts both facts in the identifier: bit 0 says who opened
+            # the stream, bit 1 whether it is unidirectional. Only a stream
+            # the *peer* opened is one to announce; an unknown id we opened
+            # ourselves is the answer arriving ahead of its `stream.opened`,
+            # and belongs to whoever is waiting in `create_stream()`.
+            locally_opened = bool(stream_id & 0x1)
             bidirectional = not (stream_id & 0x2)
             stream = WebTransportStream(self, stream_id, bidirectional,
-                                        writable=bidirectional)
+                                        writable=bidirectional or locally_opened)
             self._streams[stream_id] = stream
-            await self._incoming.put(stream)
+            if not locally_opened:
+                await self._incoming.put(stream)
         data = message.get("data") or b""
         if data:
             await stream._queue.put(data)
@@ -301,21 +328,20 @@ class WebTransportSession:
             "type": "webtransport.stream.open",
             "bidirectional": bool(bidirectional),
         })
-        message = await self._opened.get()
-        if message is _END:
+        stream = await self._opened.get()
+        if stream is _END:
             raise SessionClosed("the session ended before the stream opened")
-        stream = WebTransportStream(self, message["stream"],
-                                    message.get("bidirectional", bidirectional))
-        self._streams[stream.id] = stream
-        if not stream.bidirectional:
-            stream._eof = True
         return stream
 
     async def accept_stream(self):
-        """The next stream the peer opened, or None once the session ends."""
-        self._require_accepted()
-        stream = await self._incoming.get()
-        return None if stream is _END else stream
+        """The next stream the peer opened, or None once the session ends.
+
+        Reading outlives the session on purpose. What has already arrived is
+        still worth having when the peer goes away, and an iterator that ends
+        is easier to write against than one that raises.
+        """
+        self._require_started()
+        return await self._next(self._incoming)
 
     async def incoming_streams(self):
         """Async iterator over the streams the peer opens."""
@@ -334,10 +360,13 @@ class WebTransportSession:
                           "data": bytes(data)})
 
     async def receive_datagram(self):
-        """The next datagram, or None once the session ends."""
-        self._require_accepted()
-        data = await self._datagrams.get()
-        return None if data is _END else data
+        """The next datagram, or None once the session ends.
+
+        Like `accept_stream()`, this drains what arrived before the session
+        ended rather than refusing to look at it.
+        """
+        self._require_started()
+        return await self._next(self._datagrams)
 
     async def datagrams(self):
         """Async iterator over incoming datagrams."""
@@ -349,9 +378,29 @@ class WebTransportSession:
 
     # -- misc --------------------------------------------------------------
 
-    def _require_accepted(self):
+    async def _next(self, queue):
+        """One item from a receive queue, or None once nothing more can come.
+
+        The emptiness check is not an optimisation. `_shut_down()` drops its
+        sentinel when a queue is already full -- one more item would not fit --
+        so after draining a full queue there may be nothing left to wake a
+        reader with, and only the session state says the session is over.
+        """
+        if queue.empty() and self.closed:
+            return None
+        item = await queue.get()
+        return None if item is _END else item
+
+    def _require_started(self):
+        """For the receiving side: the session has to have been accepted, but
+        it does not have to still be open."""
         if not self.accepted:
             raise WebTransportError("the session has not been accepted yet")
+
+    def _require_accepted(self):
+        """For the sending side, where a closed session really is an error --
+        there is nowhere for the bytes to go."""
+        self._require_started()
         if self.closed:
             raise SessionClosed("the session has ended")
 

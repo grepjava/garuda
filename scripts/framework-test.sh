@@ -78,6 +78,10 @@ is "StreamingResponse is chunked" \
    "$(curl -sS -i --max-time 10 $H/stream | grep -ci '^transfer-encoding: chunked')" "1"
 is "StreamingResponse body" "$(curl -sS --max-time 10 $H/stream | tr '\n' ' ')" \
    "chunk-0 chunk-1 chunk-2 chunk-3 chunk-4 "
+has "the same view served over HTTP/1.1 says so" \
+    "$(curl -sS --max-time 10 $H/proto)" '"http_version":"1.1"'
+has "and over HTTP/2, with nothing changed in the application" \
+    "$(curl -sS --max-time 10 --http2-prior-knowledge $H/proto)" '"http_version":"2"'
 is "the generated OpenAPI document is served" \
    "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 $H/openapi.json)" "200"
 is "the docs page is served" \
@@ -144,6 +148,41 @@ if [ "$elapsed" -lt 2000 ]; then
     ok "8 blocking Django views overlap on the pool (${elapsed}ms)"
 else
     bad "8 blocking Django views overlap on the pool" "${elapsed}ms" "under 2000ms"
+fi
+
+# --------------------------------------------------- Django, over ASGI ------
+# The same project served as ASGI. Django's handler asserts the scope is http,
+# so a WebSocket needs Channels in front of it and a WebTransport session needs
+# peregrine.contrib.django in front of that -- and the ordinary views have to
+# go on working underneath both.
+echo
+echo "Django (ASGI: HTTP, WebSocket, WebTransport router)"
+start $WSGI_PORT django_app:asgi_application
+H="http://127.0.0.1:$WSGI_PORT"
+
+has "views are served through the WebTransport router" \
+    "$(curl -sS --max-time 10 $H/)" '"hello": "peregrine"'
+has "a view reports the version that carried it" \
+    "$(curl -sS --max-time 10 $H/proto)" '"http_version": "1.1"'
+has "and over HTTP/2, with nothing changed in the application" \
+    "$(curl -sS --max-time 10 --http2-prior-knowledge $H/proto)" '"http_version": "2"'
+
+if "$PY" -c 'import channels' 2>/dev/null; then
+    DJWS=$("$PY" - "$WSGI_PORT" <<'PYEOF'
+import asyncio, sys
+import websockets
+
+async def main():
+    async with websockets.connect("ws://127.0.0.1:%s/ws" % sys.argv[1]) as ws:
+        await ws.send("hello")
+        print(await ws.recv())
+
+asyncio.run(main())
+PYEOF
+)
+    is "a Channels consumer round-trips behind the router" "$DJWS" "echo:hello"
+else
+    echo "  ..   channels is not installed; the websocket check is skipped"
 fi
 
 echo

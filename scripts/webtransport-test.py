@@ -26,7 +26,8 @@ try:
     from aioquic.asyncio.protocol import QuicConnectionProtocol
     from aioquic.buffer import encode_uint_var
     from aioquic.h3.connection import H3Connection
-    from aioquic.h3.events import (DatagramReceived, HeadersReceived,
+    from aioquic.h3.events import (DataReceived, DatagramReceived,
+                                   HeadersReceived,
                                    WebTransportStreamDataReceived)
     from aioquic.quic.configuration import QuicConfiguration
 except ImportError:
@@ -106,7 +107,18 @@ class Server:
         cert, key = make_certs()
         cmd = [BIN, "--port", str(self.port), "--log-level", "error",
                "--http3", "--tls-cert", cert, "--tls-key", key,
-               "--python-path", os.path.join(ROOT, "examples")] + list(args) + [app]
+               "--python-path", os.path.join(ROOT, "examples"),
+               # Ahead of the virtualenv deliberately: an installed release of
+               # peregrine would otherwise shadow the checkout being tested.
+               "--python-path", os.path.join(ROOT, "python")]
+        # The framework examples import fastapi and django, which live in
+        # whatever interpreter is running this script. Naming that virtualenv
+        # explicitly means the script works when run as `<venv>/bin/python
+        # ...` and not only when the environment has been activated -- the
+        # server is a separate process and inherits nothing else from it.
+        if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+            cmd += ["--venv", sys.prefix]
+        cmd += list(args) + [app]
         self.process = subprocess.Popen(cmd, env=env)
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -143,6 +155,8 @@ class Client(QuicConnectionProtocol):
         self.connected = {}              # connect stream id -> Future
         self.stream_data = {}            # stream id -> bytes so far
         self.stream_ended = set()
+        self.body = {}                   # request stream id -> response body
+        self.body_ended = set()
         self.datagrams = []
         self.settings = None
         self._events = asyncio.Event()
@@ -200,6 +214,20 @@ class Client(QuicConnectionProtocol):
         self._quic.send_stream_data(session_id, capsule, end_stream=True)
         self.transmit()
 
+    # -- ordinary requests -------------------------------------------------
+
+    async def get(self, path, authority="localhost", timeout=10.0):
+        """A plain HTTP/3 GET, for checking what the framework itself serves."""
+        stream_id = self._quic.get_next_available_stream_id()
+        self._http.send_headers(stream_id=stream_id, headers=[
+            (b":method", b"GET"), (b":scheme", b"https"),
+            (b":authority", authority.encode()), (b":path", path.encode()),
+        ], end_stream=True)
+        self.transmit()
+        await self.wait_for(lambda: stream_id in self.body_ended, timeout)
+        return (self.headers.get(stream_id, {}).get(b":status"),
+                self.body.get(stream_id, b""))
+
     # -- waiting -----------------------------------------------------------
 
     async def wait_for(self, predicate, timeout=10.0):
@@ -239,6 +267,11 @@ class Client(QuicConnectionProtocol):
                 self.headers[sid] = dict(http_event.headers)
                 if sid in self.connected and not self.connected[sid].done():
                     self.connected[sid].set_result(self.headers[sid])
+            elif isinstance(http_event, DataReceived):
+                sid = http_event.stream_id
+                self.body[sid] = self.body.get(sid, b"") + http_event.data
+                if http_event.stream_ended:
+                    self.body_ended.add(sid)
             elif isinstance(http_event, WebTransportStreamDataReceived):
                 sid = http_event.stream_id
                 self.stream_data[sid] = self.stream_data.get(sid, b"") + http_event.data
@@ -503,16 +536,18 @@ async def frameworks():
                 is_("%s: a path parameter reaches the handler" % label, body,
                     b"welcome to lobby")
 
-                # And the framework still serves ordinary requests.
-                request = client._quic.get_next_available_stream_id()
-                client._http.send_headers(stream_id=request, headers=[
-                    (b":method", b"GET"), (b":scheme", b"https"),
-                    (b":authority", b"localhost"), (b":path", b"/"),
-                ], end_stream=True)
-                client.transmit()
-                await client.wait_for(lambda: request in client.headers, 10)
-                is_("%s: ordinary requests still work" % label,
-                    client.headers.get(request, {}).get(b":status"), b"200")
+                # And the framework still serves ordinary requests, on the
+                # same connection the session is on.
+                status, _ = await client.get("/")
+                is_("%s: ordinary requests still work" % label, status, b"200")
+
+                # The view needs no integration to be reached over HTTP/3; it
+                # is the same view, and it says so itself.
+                status, body = await client.get("/proto")
+                check("%s: a view is served over HTTP/3, and reports it"
+                      % label,
+                      status == b"200" and b'"http_version"' in body
+                      and b'"3"' in body, (status, body))
 
     # Two things only one of the two examples exercises.
     with Server(app="fastapi_app:wt", env=env) as server:
@@ -549,6 +584,119 @@ async def frameworks():
             is_("django: an <int:> converter converts", body, b"n=42")
 
 
+class Channel:
+    """A `receive`/`send` pair standing in for the server.
+
+    The session helper is a piece of message plumbing, and its races are
+    races between the pump and the endpoint -- ordering, not networking. They
+    reproduce far more reliably when the messages arrive exactly when the test
+    says they do than they would through a real connection.
+    """
+
+    def __init__(self, scripted=()):
+        self.inbox = asyncio.Queue()
+        self.sent = []
+        self.on_send = {}
+        for message in scripted:
+            self.inbox.put_nowait(message)
+
+    async def receive(self):
+        return await self.inbox.get()
+
+    async def send(self, message):
+        self.sent.append(message)
+        reply = self.on_send.get(message["type"])
+        if reply is not None:
+            reply(message)
+
+
+SCOPE = {"type": "webtransport", "path": "/probe", "headers": []}
+
+
+async def session_helper():
+    """peregrine.webtransport, driven directly."""
+    print("\nThe session helper")
+    sys.path.insert(0, os.path.join(ROOT, "python"))
+    from peregrine.webtransport import WebTransportSession
+    from peregrine.contrib.fastapi import WebTransportEndpoint
+
+    # A stream this endpoint opened, answered before create_stream() is
+    # scheduled again. The reply belongs to the stream create_stream()
+    # returns, not to a second object with the same id.
+    channel = Channel([{"type": "webtransport.connect"}])
+
+    def answer(_):
+        channel.inbox.put_nowait({"type": "webtransport.stream.opened",
+                                  "stream": 1, "bidirectional": True})
+        channel.inbox.put_nowait({"type": "webtransport.stream.receive",
+                                  "stream": 1, "data": b"pong",
+                                  "more_data": False})
+
+    channel.on_send["webtransport.stream.open"] = answer
+    session = WebTransportSession(SCOPE, channel.receive, channel.send)
+    await session.accept()
+    try:
+        stream = await asyncio.wait_for(session.create_stream(), 5)
+        body = await asyncio.wait_for(stream.read(), 5)
+        is_("a fast reply reaches the stream create_stream returned",
+            body, b"pong")
+    except asyncio.TimeoutError:
+        bad("a fast reply reaches the stream create_stream returned",
+            b"pong", "the read blocked")
+    check("and it is not announced as a stream the peer opened",
+          session._incoming.empty(),
+          "%d stream(s) queued" % session._incoming.qsize())
+    await session._stop()
+
+    # A stream handler that raises has to end the session, and has to do it
+    # when it raises rather than when the next stream arrives.
+    channel = Channel([{"type": "webtransport.connect"},
+                       {"type": "webtransport.stream.receive", "stream": 0,
+                        "data": b"x", "more_data": False}])
+    session = WebTransportSession(SCOPE, channel.receive, channel.send)
+
+    class Boom(WebTransportEndpoint):
+        async def on_stream(self, stream):
+            raise RuntimeError("the handler failed")
+
+    try:
+        await asyncio.wait_for(Boom(session).dispatch(), 5)
+        bad("a failing stream handler ends the endpoint", "no exception",
+            "RuntimeError")
+    except RuntimeError as error:
+        is_("a failing stream handler ends the endpoint", str(error),
+            "the handler failed")
+    except asyncio.TimeoutError:
+        bad("a failing stream handler ends the endpoint",
+            "the endpoint kept running", "RuntimeError")
+    await session._stop()
+
+    # What arrived before the peer went away is still worth reading.
+    channel = Channel([{"type": "webtransport.connect"},
+                       {"type": "webtransport.datagram.receive",
+                        "data": b"last"},
+                       {"type": "webtransport.disconnect", "code": 7,
+                        "reason": "done"}])
+    session = WebTransportSession(SCOPE, channel.receive, channel.send)
+    await session.accept()
+    for _ in range(20):                       # let the pump reach the end
+        if session.closed:
+            break
+        await asyncio.sleep(0)
+    check("a disconnect closes the session", session.closed)
+    try:
+        is_("a datagram queued before it is still readable",
+            await asyncio.wait_for(session.receive_datagram(), 5), b"last")
+        is_("and then the iterator ends rather than raising",
+            await asyncio.wait_for(session.receive_datagram(), 5), None)
+        is_("accept_stream ends the same way",
+            await asyncio.wait_for(session.accept_stream(), 5), None)
+    except Exception as error:
+        bad("a datagram queued before a disconnect is still readable",
+            b"last", "%s: %s" % (type(error).__name__, error))
+    await session._stop()
+
+
 def main():
     if not os.path.exists(BIN):
         sys.stderr.write("no peregrine binary at %s\n" % BIN)
@@ -557,6 +705,7 @@ def main():
         sys.stderr.write("openssl is needed to generate a test certificate\n")
         return 2
 
+    run(session_helper())
     run(settings_and_handshake())
     run(streams())
     run(server_streams())

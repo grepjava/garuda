@@ -59,6 +59,38 @@ public struct QUICByteRanges {
         return max(base, first.high)
     }
 
+    /// Removes exactly [low, high), splitting a range it falls inside.
+    ///
+    /// This is what an acknowledgement does to what is owed: it clears the
+    /// bytes that were acknowledged and *only* those. QUIC acknowledges
+    /// packets, and a packet carries one range of a stream, so an ACK arriving
+    /// for a later range says nothing at all about an earlier one still
+    /// waiting to be sent again.
+    public mutating func subtract(_ low: UInt64, _ high: UInt64) {
+        if high <= low { return }
+        var i = 0
+        while i < ranges.count {
+            let range = ranges[i]
+            if range.high <= low { i += 1; continue }
+            if range.low >= high { return }
+            if range.low < low && range.high > high {
+                // Removed from the middle: what is left is two ranges.
+                ranges[i].high = low
+                ranges.insert((high, range.high), at: i + 1)
+                return
+            }
+            if range.low < low {
+                ranges[i].high = low
+                i += 1
+            } else if range.high > high {
+                ranges[i].low = high
+                return
+            } else {
+                ranges.remove(at: i)
+            }
+        }
+    }
+
     public mutating func removeBelow(_ offset: UInt64) {
         while let first = ranges.first, first.high <= offset { ranges.removeFirst() }
         if var first = ranges.first, first.low < offset {
@@ -145,17 +177,41 @@ public struct QUICReceiveStream {
 
     private mutating func insertEarly(offset: UInt64, _ p: UnsafePointer<UInt8>, _ n: Int) {
         // Out of order is the exception, so this is allowed to be the slow
-        // path: a copy and a linear insert rather than a structure that would
+        // path: copies and a linear walk rather than a structure that would
         // cost something on every packet.
-        let bytes = [UInt8](UnsafeBufferPointer(start: p, count: n))
-        var i = 0
-        while i < early.count && early[i].offset < offset { i += 1 }
-        if i < early.count && early[i].offset == offset {
-            if early[i].bytes.count >= n { return }
-            early[i].bytes = bytes
-            return
+        //
+        // What is kept is only the part not held already, so `early` stays a
+        // set of disjoint ranges. That is what bounds it. Flow control bounds
+        // the *offsets* a peer may use, not the bytes it may send inside them:
+        // a 4 KiB window admits thousands of distinct offsets, each carrying
+        // nearly the whole window again, so storing every fragment whole is
+        // bounded by nothing. Disjoint ranges inside a window can never hold
+        // more than the window.
+        let high = offset &+ UInt64(n)
+        var low = offset
+
+        func piece(_ from: UInt64, _ to: UInt64) -> (offset: UInt64, bytes: [UInt8]) {
+            let start = Int(from &- offset)
+            return (from, [UInt8](UnsafeBufferPointer(start: p + start,
+                                                      count: Int(to &- from))))
         }
-        early.insert((offset, bytes), at: i)
+
+        var i = 0
+        while i < early.count
+            && early[i].offset &+ UInt64(early[i].bytes.count) <= low { i += 1 }
+        while low < high {
+            if i == early.count || early[i].offset >= high {
+                early.insert(piece(low, high), at: i)
+                return
+            }
+            let held = early[i]
+            if held.offset > low {
+                early.insert(piece(low, held.offset), at: i)
+                i += 1
+            }
+            low = held.offset &+ UInt64(held.bytes.count)
+            i += 1
+        }
     }
 
     private mutating func drainEarly() {
@@ -234,7 +290,11 @@ public struct QUICSendStream {
 
     public mutating func acknowledge(_ low: UInt64, _ high: UInt64) {
         acked.add(low, high)
-        lost.removeBelow(high)
+        // Only the acknowledged bytes stop being owed. Dropping everything
+        // below `high` would take an earlier lost range with it -- an ACK for
+        // 100..200 erasing the retransmission of 0..100, which the peer is
+        // still waiting for and will now never get.
+        lost.subtract(low, high)
         // Drop what can never be needed again.
         let contiguous = acked.contiguousEnd(from: base)
         if contiguous > base {
@@ -246,6 +306,10 @@ public struct QUICSendStream {
     public mutating func declareLost(_ low: UInt64, _ high: UInt64) {
         if high <= base { return }
         lost.add(max(low, base), high)
+        // A packet can be declared lost after part of what it carried was
+        // acknowledged in another one. Those bytes have arrived; sending them
+        // again would be a packet spent on nothing.
+        for range in acked.ranges { lost.subtract(range.low, range.high) }
     }
 
     public mutating func destroy() {

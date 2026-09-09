@@ -89,17 +89,25 @@ class _Converting:
 def http_version(request):
     """"1.0", "1.1", "2" or "3" -- whatever carried this request.
 
-    Works on a Django `HttpRequest` (through `SERVER_PROTOCOL`) and on a raw
-    ASGI scope, because a WebTransport endpoint has one and not the other.
+    Takes a Django `HttpRequest` of either kind, or a raw ASGI scope, because a
+    WebTransport endpoint has one and not the other.
+
+    The scope is consulted before `META`, and that order is load-bearing: an
+    `ASGIRequest` carries both, but Django builds its `META` from the scope by
+    hand and puts no `SERVER_PROTOCOL` in it. Reading `META` first would answer
+    "1.1" for every request Django ever serves over ASGI, HTTP/3 included.
     """
+    scope = getattr(request, "scope", None)
+    if isinstance(scope, dict) and "http_version" in scope:
+        return scope["http_version"]
     meta = getattr(request, "META", None)
     if meta is not None:
-        protocol = meta.get("SERVER_PROTOCOL", "HTTP/1.1")
-        return protocol.split("/", 1)[-1] if "/" in protocol else protocol
+        protocol = meta.get("SERVER_PROTOCOL")
+        if protocol:
+            return protocol.split("/", 1)[-1] if "/" in protocol else protocol
     if isinstance(request, dict):
         return request.get("http_version", "1.1")
-    scope = getattr(request, "scope", {})
-    return scope.get("http_version", "1.1")
+    return "1.1"
 
 
 def is_http3(request):

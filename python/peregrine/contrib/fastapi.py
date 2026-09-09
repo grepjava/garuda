@@ -107,17 +107,53 @@ class WebTransportEndpoint:
                                      self.session.close_reason)
 
     async def _streams(self):
+        """Runs one `on_stream` task per stream, and fails if any of them do.
+
+        A handler that raises has to reach `dispatch()`, which is the only
+        thing that can end the session -- and it has to reach it *when* it
+        raises, not whenever the next stream happens to arrive, because on a
+        session where no further stream ever arrives that is never. So the
+        failure is recorded by the done callback into a future this waits on
+        alongside the accept loop.
+        """
         running = set()
-        try:
+        failed = asyncio.get_running_loop().create_future()
+
+        def finished(task):
+            running.discard(task)
+            if task.cancelled() or failed.done():
+                return
+            error = task.exception()
+            if error is not None:
+                failed.set_exception(error)
+
+        async def accept():
             async for stream in self.session.incoming_streams():
                 task = asyncio.ensure_future(self.on_stream(stream))
                 running.add(task)
-                task.add_done_callback(running.discard)
+                task.add_done_callback(finished)
             if running:
                 await asyncio.gather(*running)
+
+        accepting = asyncio.ensure_future(accept())
+        try:
+            await asyncio.wait([accepting, failed],
+                               return_when=asyncio.FIRST_COMPLETED)
+            # A handler's failure is the more informative of the two, and the
+            # accept loop may have finished cleanly beside it.
+            if failed.done():
+                failed.result()
+            if accepting.done():
+                accepting.result()
         finally:
+            accepting.cancel()
             for task in list(running):
                 task.cancel()
+            await asyncio.gather(accepting, *running, return_exceptions=True)
+            if not failed.done():
+                failed.cancel()
+            elif not failed.cancelled():
+                failed.exception()      # retrieved, so asyncio does not warn
 
     async def _datagrams(self):
         async for data in self.session.datagrams():

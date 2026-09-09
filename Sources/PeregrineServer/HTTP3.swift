@@ -883,13 +883,20 @@ extension Worker {
     // MARK: - Tear-down
 
     mutating func closeH3Stream(_ streamSlot: Int) {
-        let s = table[streamSlot]
-        let parent = Int(s.pointee.parentSlot)
-        if parent >= 0, let h3 = table[parent].pointee.h3 {
-            h3.streams.removeValue(forKey: s.pointee.qstreamID)
-        }
-        s.pointee.parentSlot = -1
+        // Everything a stream slot needs on the way out is in
+        // `closeConnection`, including the one thing this used to skip by
+        // cutting the parent link first: telling the transport the stream has
+        // been released. Until it is told, the QUIC stream is never retired,
+        // and a stream concurrency limit is a budget that is never given
+        // back -- the connection serves exactly `initial_max_streams_bidi`
+        // requests and then stalls, the next one waiting on credit that
+        // cannot arrive.
+        let parent = Int(table[streamSlot].pointee.parentSlot)
         closeConnection(streamSlot)
+        // Retiring a stream queues MAX_STREAMS, and it has to go out now. The
+        // peer is one stream closer to its limit and may already be at it, so
+        // there is no packet of its own to carry the credit back on.
+        if parent >= 0, table[parent].pointee.state == .http3 { flushQUIC(parent) }
     }
 
     mutating func releaseQUICConnection(_ connection: QUICConnection) {

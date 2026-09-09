@@ -87,6 +87,10 @@ public final class QUICConnection {
     var previousKeysExpireMs: UInt64 = 0
     var currentKeyPhase = false
     var keyUpdatePermitted = false
+    /// The lowest packet number seen in the current key phase. A packet whose
+    /// phase is flipped and whose number is below this one is a straggler from
+    /// the phase before, not the start of a new one.
+    var currentPhaseFirstPacket: UInt64 = 0
     var tls: TLSServerHandshake?
 
     public private(set) var handshakeComplete = false
@@ -358,37 +362,50 @@ public final class QUICConnection {
     private func openOneRTT(_ p: UnsafeMutablePointer<UInt8>,
                             header: QUICPacketHeader, nowMs: UInt64) -> QUICProtect.Opened? {
         let level = QUICLevel.application.rawValue
-        // The phase cannot be read until the header is unmasked, so the
-        // current keys are tried first and the phase checked from the result.
-        if let opened = QUICProtect.open(p, pnOffset: header.pnOffset, end: header.end,
-                                         largestReceived: spaces[level].largestReceived,
-                                         keys: keys[level].receive.keys,
-                                         header: keys[level].receive.header) {
-            if opened.keyPhase == currentKeyPhase { return opened }
-            // The AEAD succeeded but the phase disagrees, which cannot happen:
-            // the keys are bound to the phase. Treat it as garbage.
+        // Header protection survives a key update -- RFC 9001 section 6 rekeys
+        // the packet protection keys and not the header ones -- so the phase
+        // bit can be read before any AEAD runs, and it decides which keys to
+        // use. It has to be done in that order, because decryption is in
+        // place: an attempt that fails has already written its garbage over
+        // the ciphertext, and a second set of keys tried on the same packet
+        // would be opening rubbish. That is what used to make a client's key
+        // update end the connection -- the packet that announced it was tried
+        // under the current keys first, and destroyed in the attempt.
+        guard let un = QUICProtect.unprotect(p, pnOffset: header.pnOffset,
+                                             end: header.end,
+                                             largestReceived: spaces[level].largestReceived,
+                                             header: keys[level].receive.header)
+        else { return nil }
+
+        if un.keyPhase == currentKeyPhase {
+            if let opened = QUICProtect.openBody(p, un, end: header.end,
+                                                 keys: keys[level].receive.keys) {
+                return opened
+            }
+            QUICProtect.restore(p, un)
             return nil
         }
 
-        // A different phase: either the peer has moved on, or this is an old
-        // packet from before we did.
-        if previousReceiveKeys.isValid && nowMs < previousKeysExpireMs,
-           let opened = QUICProtect.open(p, pnOffset: header.pnOffset, end: header.end,
-                                         largestReceived: spaces[level].largestReceived,
-                                         keys: previousReceiveKeys,
-                                         header: keys[level].receive.header),
-           opened.keyPhase != currentKeyPhase {
-            return opened
+        // The phase is flipped: either a straggler from before our last update
+        // or the peer starting a new one. The packet number tells them apart
+        // (RFC 9001 section 6.3) -- anything below where the current phase
+        // began was sent under the previous keys.
+        if previousReceiveKeys.isValid && nowMs < previousKeysExpireMs
+            && un.packetNumber < currentPhaseFirstPacket {
+            if let opened = QUICProtect.openBody(p, un, end: header.end,
+                                                 keys: previousReceiveKeys) {
+                return opened
+            }
+            QUICProtect.restore(p, un)
+            return nil
         }
         if keyUpdatePermitted && nextReceiveKeys.isValid,
-           let opened = QUICProtect.open(p, pnOffset: header.pnOffset, end: header.end,
-                                         largestReceived: spaces[level].largestReceived,
-                                         keys: nextReceiveKeys,
-                                         header: keys[level].receive.header),
-           opened.keyPhase != currentKeyPhase {
-            commitKeyUpdate(nowMs: nowMs)
+           let opened = QUICProtect.openBody(p, un, end: header.end,
+                                             keys: nextReceiveKeys) {
+            commitKeyUpdate(nowMs: nowMs, from: opened.packetNumber)
             return opened
         }
+        QUICProtect.restore(p, un)
         return nil
     }
 
@@ -587,8 +604,9 @@ public final class QUICConnection {
         for packet in result.acked { onPacketAcked(packet, level: level) }
         for packet in result.lost { onPacketLost(packet, level: level) }
         if !result.acked.isEmpty && level == .application && handshakeComplete {
-            // Once the peer acknowledges 1-RTT data the handshake is
-            // confirmed, which is what makes a key update safe.
+            // Belt and braces: a server confirms the handshake when it
+            // completes, so both of these are already set by the time any
+            // 1-RTT packet can be acknowledged.
             handshakeConfirmed = true
             keyUpdatePermitted = true
         }
@@ -986,6 +1004,14 @@ public final class QUICConnection {
         if tls.state == .complete && !handshakeComplete {
             handshakeComplete = true
             handshakeDonePending = true
+            // At a server the handshake is confirmed the moment it completes
+            // (RFC 9001 section 4.1.2), and that is what makes a key update
+            // legal. Waiting for the peer to acknowledge 1-RTT data instead
+            // would refuse the update that arrives *carrying* that
+            // acknowledgement -- which is where a client puts it, since the
+            // update is the next packet it sends.
+            handshakeConfirmed = true
+            keyUpdatePermitted = true
             selectedALPN = tls.selectedALPN
             serverName = tls.serverName
             peerParameters = tls.peerParameters
@@ -1061,8 +1087,9 @@ public final class QUICConnection {
         cryptoReceive[index] = QUICReceiveStream()
     }
 
-    private func commitKeyUpdate(nowMs: UInt64) {
+    private func commitKeyUpdate(nowMs: UInt64, from packetNumber: UInt64) {
         let level = QUICLevel.application.rawValue
+        currentPhaseFirstPacket = packetNumber
         previousReceiveKeys.destroy()
         previousReceiveKeys = keys[level].receive.keys
         // RFC 9001 section 6.5: the old keys are kept for three round trips,

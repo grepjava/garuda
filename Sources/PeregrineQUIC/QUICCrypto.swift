@@ -405,26 +405,29 @@ public enum QUICProtect {
         public var pnLength: Int
     }
 
-    /// Removes header protection and opens a packet in place.
+    /// A packet with its header protection removed and nothing else done to
+    /// it: the packet number is decoded, the key phase is readable, and no
+    /// AEAD has run. This is the state in which which-keys-apply is decided.
+    public struct Unprotected {
+        public var packetNumber: UInt64
+        public var pnLength: Int
+        public var keyPhase: Bool
+        public var headerLength: Int
+        var pnOffset: Int
+        var firstByte: UInt8                    // as it arrived
+        var mask: (UInt32, UInt8)
+    }
+
+    /// Removes header protection, in place.
     ///
-    /// `packet` is the start of the packet within the datagram and `end` is
-    /// one past its last byte. The header is rewritten unmasked and the
-    /// plaintext replaces the ciphertext, both in place: the datagram buffer
-    /// belongs to the receiver and nothing else reads it afterwards.
-    ///
-    /// A nil return is ordinary: a packet that will not open is discarded
-    /// without ceremony, since it may be a stray from an old key phase or
-    /// from somebody spraying the port. The header is put back as it was, so
-    /// the packet stays readable for a log line, but the payload is not --
-    /// decryption happens in place and the AEAD has already written over it
-    /// by the time the tag is found to be wrong. Nothing re-reads a packet
-    /// that failed: which keys apply is decided by the header, never by
-    /// trying one set after another.
-    public static func open(_ packet: UnsafeMutablePointer<UInt8>,
-                            pnOffset: Int, end: Int,
-                            largestReceived: Int64,
-                            keys: QUICKeys, header: QUICHeaderKey) -> Opened? {
-        guard let aead = keys.aead else { return nil }
+    /// Header protection is keyed separately from the payload and a key update
+    /// does not change it (RFC 9001 section 6), so this succeeds for every
+    /// phase and the phase bit it exposes is trustworthy before any packet
+    /// protection key has been chosen.
+    public static func unprotect(_ packet: UnsafeMutablePointer<UInt8>,
+                                 pnOffset: Int, end: Int,
+                                 largestReceived: Int64,
+                                 header: QUICHeaderKey) -> Unprotected? {
         let sampleOffset = pnOffset + 4
         if sampleOffset + quicHPSampleLength > end { return nil }
 
@@ -441,6 +444,7 @@ public enum QUICProtect {
         var truncated: UInt64 = 0
         var keyPhase = false
         var first: UInt8 = 0
+        let original = packet[0]
         withUnsafeBytes(of: mask) { raw in
             let m = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
             let isLong = (packet[0] & 0x80) != 0
@@ -452,45 +456,80 @@ public enum QUICProtect {
                 truncated = (truncated << 8) | UInt64(packet[pnOffset + i])
             }
         }
-        if pnOffset + pnLength + quicAEADTagLength > end {
-            // Undo, so a failed attempt leaves the packet as it was for the
-            // next set of keys to try.
-            withUnsafeBytes(of: mask) { raw in
-                let m = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
-                for i in 0..<pnLength { packet[pnOffset + i] ^= m[1 + i] }
-            }
+
+        var result = Unprotected(packetNumber: 0, pnLength: pnLength,
+                                 keyPhase: keyPhase,
+                                 headerLength: pnOffset + pnLength,
+                                 pnOffset: pnOffset, firstByte: original,
+                                 mask: mask)
+        if result.headerLength + quicAEADTagLength > end {
+            restore(packet, result)
             return nil
         }
-        let original = packet[0]
         packet[0] = first
+        result.packetNumber = quicDecodePacketNumber(largestReceived: largestReceived,
+                                                     truncated: truncated,
+                                                     bits: pnLength * 8)
+        return result
+    }
 
-        let headerLength = pnOffset + pnLength
-        let packetNumber = quicDecodePacketNumber(largestReceived: largestReceived,
-                                                  truncated: truncated,
-                                                  bits: pnLength * 8)
+    /// Puts a header back the way it arrived, so a packet that could not be
+    /// opened stays readable for a log line.
+    public static func restore(_ packet: UnsafeMutablePointer<UInt8>,
+                               _ un: Unprotected) {
+        packet[0] = un.firstByte
+        withUnsafeBytes(of: un.mask) { raw in
+            let m = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            for i in 0..<un.pnLength { packet[un.pnOffset + i] ^= m[1 + i] }
+        }
+    }
 
+    /// Opens the body of an unprotected packet, in place: the plaintext
+    /// replaces the ciphertext, since the datagram buffer belongs to the
+    /// receiver and nothing else reads it afterwards.
+    ///
+    /// **One set of keys, once.** The AEAD writes the plaintext out as it goes
+    /// and only then finds the tag wrong, so a failed attempt has already
+    /// destroyed the ciphertext and a second attempt would be decrypting
+    /// rubbish. Which keys apply is decided from the header -- by the level,
+    /// and for 1-RTT by the key phase and the packet number -- never by trying
+    /// one set after another.
+    public static func openBody(_ packet: UnsafeMutablePointer<UInt8>,
+                                _ un: Unprotected, end: Int,
+                                keys: QUICKeys) -> Opened? {
+        guard let aead = keys.aead else { return nil }
         var nonce = (UInt64(0), UInt32(0))
         let plaintextLength: Int = withUnsafeMutableBytes(of: &nonce) { raw in
             let n = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
-            keys.nonce(packetNumber, n)
-            let body = packet + headerLength
-            return Int(pg_aead_open(aead, n, packet, headerLength,
-                                    body, end - headerLength, body))
+            keys.nonce(un.packetNumber, n)
+            let body = packet + un.headerLength
+            return Int(pg_aead_open(aead, n, packet, un.headerLength,
+                                    body, end - un.headerLength, body))
         }
-        if plaintextLength < 0 {
-            // Only the header is restored; see above.
-            packet[0] = original
-            withUnsafeBytes(of: mask) { raw in
-                let m = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
-                for i in 0..<pnLength { packet[pnOffset + i] ^= m[1 + i] }
-            }
-            return nil
-        }
-
-        return Opened(packetNumber: packetNumber,
-                      payload: packet + headerLength,
+        if plaintextLength < 0 { return nil }
+        return Opened(packetNumber: un.packetNumber,
+                      payload: packet + un.headerLength,
                       payloadLength: plaintextLength,
-                      keyPhase: keyPhase,
-                      pnLength: pnLength)
+                      keyPhase: un.keyPhase,
+                      pnLength: un.pnLength)
+    }
+
+    /// Removes header protection and opens a packet in place, for the levels
+    /// where the header alone settles which keys apply.
+    ///
+    /// A nil return is ordinary: a packet that will not open is discarded
+    /// without ceremony, since it may be a stray or somebody spraying the
+    /// port.
+    public static func open(_ packet: UnsafeMutablePointer<UInt8>,
+                            pnOffset: Int, end: Int,
+                            largestReceived: Int64,
+                            keys: QUICKeys, header: QUICHeaderKey) -> Opened? {
+        guard keys.aead != nil,
+              let un = unprotect(packet, pnOffset: pnOffset, end: end,
+                                 largestReceived: largestReceived, header: header)
+        else { return nil }
+        if let opened = openBody(packet, un, end: end, keys: keys) { return opened }
+        restore(packet, un)
+        return nil
     }
 }

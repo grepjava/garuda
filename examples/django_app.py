@@ -53,12 +53,27 @@ def boom(request):
     raise RuntimeError("intentional django failure")
 
 
+def proto(request):
+    """What carried this request, and what else this connection could do.
+
+    The view is identical whether it was reached over HTTP/1.1, HTTP/2 or
+    HTTP/3 -- which is the point. Only the answer changes.
+    """
+    from peregrine.contrib.django import http_version, is_http3
+    return JsonResponse({
+        "http_version": http_version(request),
+        "http3": is_http3(request),
+        "scheme": request.scheme,
+    })
+
+
 urlpatterns = [
     path("", index),
     path("echo", echo),
     path("stream", stream),
     path("sleep", sleep),
     path("boom", boom),
+    path("proto", proto),
 ]
 
 import django
@@ -67,17 +82,50 @@ django.setup()
 application = WSGIHandler()
 
 
-# --- ASGI, with WebTransport ------------------------------------------------
+# --- ASGI: HTTP, WebSocket and WebTransport in one application ---------------
 #
-# Django's ASGI handler asserts scope["type"] == "http", so a session has to be
-# answered before it gets there. `asgi_application` is what to serve when you
-# want both; `application` above stays the WSGI entry point.
+# Django's ASGI handler asserts scope["type"] == "http", which rules out two
+# things at once: it will not route a WebSocket, and it will not route a
+# WebTransport session. Both answers have the same shape -- something in front
+# of Django that owns the scope types Django does not. Channels does the first,
+# peregrine.contrib.django the second, and they compose.
+#
+#   application       the WSGI entry point above, unchanged
+#   asgi_application  HTTP + WebSocket + WebTransport, over any HTTP version
 
 from django.core.asgi import get_asgi_application  # noqa: E402
 
 from peregrine.contrib.django import WebTransportRouter  # noqa: E402
 
-asgi_application = WebTransportRouter(get_asgi_application())
+django_asgi = get_asgi_application()
+
+try:
+    from channels.generic.websocket import AsyncWebsocketConsumer
+    from channels.routing import ProtocolTypeRouter, URLRouter
+except ImportError:
+    # Channels is optional. Without it Django serves HTTP and WebTransport,
+    # and a WebSocket upgrade gets a 404 from the router rather than a crash.
+    http_and_websocket = django_asgi
+else:
+
+    class EchoConsumer(AsyncWebsocketConsumer):
+        async def connect(self):
+            await self.accept()
+
+        async def receive(self, text_data=None, bytes_data=None):
+            if text_data is not None:
+                await self.send(text_data="echo:" + text_data)
+            else:
+                await self.send(bytes_data=b"echo:" + bytes_data)
+
+    websocket_urlpatterns = [path("ws", EchoConsumer.as_asgi())]
+
+    http_and_websocket = ProtocolTypeRouter({
+        "http": django_asgi,
+        "websocket": URLRouter(websocket_urlpatterns),
+    })
+
+asgi_application = WebTransportRouter(http_and_websocket)
 
 
 @asgi_application.route("wt/echo")
