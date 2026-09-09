@@ -66,6 +66,12 @@ let package = Package(
         .target(name: "PeregrineHTTP", dependencies: ["PeregrineCore"],
                 swiftSettings: sharedSwiftSettings),
 
+        // QUIC and its TLS 1.3 handshake. QUIC replaces the TLS record layer,
+        // so OpenSSL is used here only for primitives -- hash, HKDF, AEAD, key
+        // agreement, signature -- and the protocol above them is ours.
+        .target(name: "PeregrineQUIC", dependencies: ["PeregrineCore", "PeregrineHTTP"],
+                swiftSettings: sharedSwiftSettings),
+
         .target(name: "PeregrinePython", dependencies: ["CPython", "CPeregrine", "PeregrineCore"],
                 swiftSettings: sharedSwiftSettings),
 
@@ -79,14 +85,14 @@ let package = Package(
 
         .target(name: "PeregrineServer",
                 dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrinePython",
-                               "PeregrineWSGI", "PeregrineASGI"],
+                               "PeregrineWSGI", "PeregrineASGI", "PeregrineQUIC"],
                 swiftSettings: sharedSwiftSettings),
 
         .executableTarget(name: "peregrine", dependencies: ["PeregrineServer"],
                           swiftSettings: sharedSwiftSettings),
 
         .testTarget(name: "PeregrineTests",
-                    dependencies: ["PeregrineCore", "PeregrineHTTP"],
+                    dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrineQUIC"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
     ],
     cLanguageStandard: .gnu11
