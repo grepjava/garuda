@@ -16,6 +16,7 @@ import CPeregrine
 import PeregrineCore
 import PeregrineHTTP
 import PeregrinePython
+import PeregrineQUIC
 
 public enum ConnState: UInt8 {
     case free
@@ -31,6 +32,10 @@ public enum ConnState: UInt8 {
     /// The connection speaks HTTP/2. Requests live in stream slots of their
     /// own; this one owns the socket, the HPACK state and the flow control.
     case http2
+    /// The connection speaks HTTP/3 over QUIC. It owns no descriptor at all:
+    /// the socket belongs to the listener, and this slot exists so that a QUIC
+    /// connection can be a connection like any other.
+    case http3
     /// Response bytes are queued and the socket is not yet drained.
     case writing
     /// Everything is written; close once the buffer empties.
@@ -75,6 +80,10 @@ public struct ConnFlags: OptionSet, Sendable {
     public static let tlsHandshake     = ConnFlags(rawValue: 1 << 14)
     /// ALPN settled on HTTP/2, so this connection owes us a preface.
     public static let alpnH2           = ConnFlags(rawValue: 1 << 15)
+    /// This slot is one request stream of an HTTP/3 connection rather than of
+    /// an HTTP/2 one. Both are streams; almost nothing else about them is the
+    /// same, so the two are told apart here rather than by looking upward.
+    public static let http3Stream      = ConnFlags(rawValue: 1 << 16)
 
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
@@ -141,9 +150,26 @@ public struct Connection {
     /// The `:scheme` the client asked for was https.
     public var h2Scheme = false
 
-    /// True when this slot is one stream of an HTTP/2 connection rather than
-    /// a connection in its own right.
+    // --- HTTP/3 ---
+    /// Connection state, on the slot that owns the QUIC connection.
+    public var h3: H3Connection? = nil
+    /// The QUIC connection this slot owns, when it owns one.
+    public var quicRef: QUICConnection? = nil
+    /// The QUIC stream identifier, when this slot is an HTTP/3 request.
+    /// Separate from `streamID` because QUIC's are 62-bit.
+    public var qstreamID: UInt64 = 0
+    /// The frame being read on a request stream, and what is left of it.
+    public var h3FrameType: UInt64 = 0
+    public var h3FrameRemaining: Int = 0
+    /// The `:protocol` of an extended CONNECT, which is how WebTransport and
+    /// WebSocket-over-HTTP/3 announce themselves.
+    public var h3Protocol = ByteBuffer()
+
+    /// True when this slot is one stream of a multiplexed connection rather
+    /// than a connection in its own right.
     @inlinable public var isStream: Bool { parentSlot >= 0 }
+    /// ...and which kind, which decides how a response is framed.
+    @inlinable public var isH3Stream: Bool { flags.contains(.http3Stream) }
 
     /// Cached per-connection Python values so a keep-alive connection builds
     /// its client address once rather than per request.
@@ -198,6 +224,9 @@ public enum PollToken {
     public static let signals: UInt64 = .max - 1
     /// The WSGI pool completion pipe, when a thread pool is running.
     public static let pool: UInt64 = .max - 2
+    /// The QUIC socket. One descriptor serves every QUIC connection, so unlike
+    /// TCP there is no per-connection token.
+    public static let quic: UInt64 = .max - 3
     public static let slotBits: UInt64 = 24
     public static let slotMask: UInt64 = (1 << 24) - 1
 

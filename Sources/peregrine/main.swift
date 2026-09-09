@@ -250,6 +250,16 @@ while i < argc {
         config.venvPath = v
     } else if matches(arg, "--no-auto-venv") {
         config.noAutoVenv = true
+    } else if matches(arg, "--http3") {
+        config.http3Enabled = true
+    } else if matches(arg, "--quic-port") {
+        guard let v = next("--quic-port needs a port") else { break }
+        let p = parseInt(v)
+        if p <= 0 || p > 65535 {
+            Log.error("--quic-port must be between 1 and 65535")
+            exit(2)
+        }
+        config.quicPort = UInt16(p)
     } else if matches(arg, "--no-http2") {
         config.http2Enabled = false
     } else if matches(arg, "--http2-only") {
@@ -321,6 +331,16 @@ if config.tlsEnabled && !schemeGiven {
 }
 if (config.tlsCertPath == nil) != (config.tlsKeyPath == nil) {
     Log.error("--tls-cert and --tls-key go together")
+    exit(2)
+}
+// QUIC has no cleartext form, so HTTP/3 without a certificate is not a
+// degraded mode; it is nothing at all.
+if config.http3Enabled && config.tlsCertPath == nil {
+    Log.error("--http3 needs --tls-cert and --tls-key")
+    exit(2)
+}
+if config.http3Enabled && config.unixPath != nil {
+    Log.error("--http3 cannot be served over a unix socket")
     exit(2)
 }
 

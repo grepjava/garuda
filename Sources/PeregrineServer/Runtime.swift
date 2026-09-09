@@ -24,6 +24,7 @@
 import CPeregrine
 import PeregrineCore
 import PeregrineHTTP
+import PeregrineQUIC
 import PeregrinePython
 import PeregrineWSGI
 
@@ -82,6 +83,55 @@ public enum Peregrine {
         }
         return TLSContext.make(certPath: cert, keyPath: key,
                                alpn: alpn, ciphers: config.tlsCiphers)
+    }
+
+    /// The certificate for QUIC, loaded once per worker. QUIC cannot borrow
+    /// the SSL_CTX the TCP listener uses: it needs the primitives underneath,
+    /// not the record layer on top.
+    nonisolated(unsafe) static var quicCertKey: OpaquePointer? = nil
+
+    static func makeQUICListener(_ config: ServerConfig) -> QUICListener? {
+        guard let cert = config.tlsCertPath, let key = config.tlsKeyPath else {
+            Log.error("--http3 needs --tls-cert and --tls-key: QUIC has no cleartext form")
+            return nil
+        }
+        var error = [CChar](repeating: 0, count: 256)
+        let loaded: OpaquePointer? = error.withUnsafeMutableBufferPointer {
+            pg_certkey_load(cert, key, $0.baseAddress, 256)
+        }
+        guard let certKey = loaded else {
+            error.withUnsafeBufferPointer { buffer in
+                guard let base = buffer.baseAddress else { return }
+                var n = 0
+                while n < 256 && base[n] != 0 { n += 1 }
+                Log.error { line in
+                    line.str("http3: ")
+                    base.withMemoryRebound(to: UInt8.self, capacity: n) { line.bytes($0, n) }
+                }
+            }
+            return nil
+        }
+        quicCertKey = certKey
+
+        let port = config.quicPort != 0 ? config.quicPort : config.port
+        let fd = pg_bind_udp(config.host, port, 1, config.ipv6Only ? 1 : 0)
+        if fd < 0 {
+            let e = pg_errno()
+            Log.error { line in
+                line.str("cannot bind the QUIC socket: ")
+                line.cstr(pg_strerror(e))
+            }
+            return nil
+        }
+
+        var quicConfig = QUICServerConfig(certKey: certKey, alpn: [Array("h3".utf8)])
+        quicConfig.maxIdleTimeoutMs = UInt64(config.keepAliveTimeoutMs)
+        quicConfig.initialMaxStreamData = UInt64(config.bodyHighWaterMark)
+        quicConfig.initialMaxData = UInt64(config.bodyHighWaterMark) * 8
+        quicConfig.initialMaxStreamsBidi = UInt64(config.h2MaxConcurrentStreams)
+        let listener = QUICListener(fd: fd, config: quicConfig)
+        listener.maxConnections = config.maxConnections
+        return listener
     }
 
     // MARK: - Listening socket
@@ -327,6 +377,10 @@ public enum Peregrine {
         }
         workerPtr.pointee.appProtocol = proto
         workerPtr.pointee.signalFD = pg_signal_pipe_init()
+        if config.http3Enabled {
+            guard let listener = makeQUICListener(config) else { return false }
+            workerPtr.pointee.quic = listener
+        }
 
         if proto == .wsgi {
             let threads = max(1, config.wsgiThreads)
@@ -357,6 +411,7 @@ public enum Peregrine {
         }
 
         guard workerPtr.pointee.registerListener() else { return false }
+        guard workerPtr.pointee.registerQUIC() else { return false }
 
         Log.info { line in
             line.str(proto == .wsgi ? "worker ready (WSGI) on " : "worker ready (ASGI) on ")
@@ -426,11 +481,13 @@ public enum Peregrine {
     /// application started itself -- can run.
     static func runSynchronousLoop(_ worker: UnsafeMutablePointer<Worker>) {
         while worker.pointee.running {
+            let timeout = worker.pointee.quicPollTimeout(200)
             let saved = pg_gil_save()
-            let n = worker.pointee.poller.wait(timeoutMillis: 200)
+            let n = worker.pointee.poller.wait(timeoutMillis: timeout)
             pg_gil_restore(saved)
 
             if n > 0 { worker.pointee.processEvents(n) }
+            worker.pointee.quicTick()
             worker.pointee.sweepTimeouts()
 
             if worker.pointee.draining && worker.pointee.quiescent {

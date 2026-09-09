@@ -95,6 +95,11 @@ public struct ServerConfig {
     // --- http/2 ---
     /// Serve HTTP/2 to clients that ask for it. Over cleartext that means the
     /// connection preface; over TLS it means ALPN.
+    /// HTTP/3, which is HTTP over QUIC over UDP. It needs a certificate: QUIC
+    /// has no cleartext form at all.
+    public var http3Enabled = false
+    /// The UDP port, when it differs from the TCP one. Zero means the same.
+    public var quicPort: UInt16 = 0
     public var http2Enabled = true
     /// Speak only HTTP/2 on this port, with no HTTP/1.1 fallback. What a
     /// proxy that talks h2c upstream (Envoy, Caddy) and a gRPC client expect,

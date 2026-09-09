@@ -84,11 +84,22 @@ def stop_loop(loop):
     loop.call_soon(loop.stop)
 
 
+_TIMER_INTERVAL = 0.2
+
+
+def set_timer_interval(milliseconds):
+    # QUIC has deadlines of its own -- an acknowledgement owed in tens of
+    # milliseconds, a probe that has to fire -- so a server carrying HTTP/3
+    # cannot housekeep once every fifth of a second.
+    global _TIMER_INTERVAL
+    _TIMER_INTERVAL = milliseconds / 1000.0
+
+
 def arm_timer(loop, callback):
     # Periodic housekeeping (idle timeouts, drain completion) rides on the
     # loop timer wheel rather than a dedicated timerfd, which keeps the whole
     # server on one wakeup source.
-    loop.call_later(0.2, callback)
+    loop.call_later(_TIMER_INTERVAL, callback)
 
 
 def spawn(loop, coro, done_cb):

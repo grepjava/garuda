@@ -914,7 +914,10 @@ extension Worker {
         // is sometimes the only way to say it -- unless the response came up
         // short, where saying "that was all of it" would be a lie and the
         // stream is reset instead.
+        // A HEAD response is not short: the length it declares describes the
+        // body a GET would have had, and withholding that body is the point.
         let short = s.pointee.flags.contains(.responseComplete)
+            && !s.pointee.flags.contains(.suppressBody)
             && s.pointee.responseRemaining > 0
         if s.pointee.flags.contains(.responseComplete)
             && s.pointee.write.isEmpty

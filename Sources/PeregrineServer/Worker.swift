@@ -39,6 +39,12 @@ public struct Worker {
 
     /// TLS configuration, when the listener is https. One per worker.
     public var tlsContext: TLSContext? = nil
+    /// The QUIC socket, when HTTP/3 is enabled. One per worker, bound with
+    /// SO_REUSEPORT so each has its own receive queue.
+    public var quic: QUICListener? = nil
+    /// Throttle for QUIC timers, which are far finer than the once-a-second
+    /// connection sweep.
+    var lastQUICTick: UInt64 = 0
     public var wsgi: WSGIRuntime? = nil
     /// The optional WSGI thread pool. nil means the worker loop calls the
     /// application inline, which is the original single-threaded model.
@@ -66,6 +72,7 @@ public struct Worker {
     }
 
     public mutating func destroy() {
+        quic?.destroy()
         headers.deallocate()
         pool.destroy()
         dates.destroy()
@@ -137,6 +144,8 @@ public struct Worker {
                 handleSignals()
             case PollToken.pool:
                 collectPoolResults()
+            case PollToken.quic:
+                handleQUICEvent(mask)
             default:
                 let slot = PollToken.slot(token)
                 let generation = PollToken.generation(token)
@@ -329,6 +338,10 @@ public struct Worker {
         let c = table[slot]
         switch c.pointee.state {
         case .free:
+            return
+        case .http3:
+            // An HTTP/3 connection has no descriptor of its own, so readiness
+            // never reaches it this way.
             return
         case .writing, .closing:
             // Pipelined bytes arriving while the previous response drains: they
@@ -651,7 +664,8 @@ public struct Worker {
     @discardableResult
     mutating func flush(_ slot: Int) -> Bool {
         let c = table[slot]
-        // An HTTP/2 stream writes into its connection, not into a socket.
+        // A multiplexed stream writes into its connection, not into a socket.
+        if c.pointee.isH3Stream { return flushH3Stream(slot) }
         if c.pointee.isStream { return flushStream(slot) }
         while c.pointee.write.readableBytes > 0 {
             let n = connWrite(slot,
@@ -788,11 +802,16 @@ public struct Worker {
     /// Called once a full response has been written out.
     mutating func finishResponse(_ slot: Int) {
         let c = table[slot]
+        if c.pointee.isH3Stream {
+            finishH3Response(slot)
+            return
+        }
         if c.pointee.isStream {
             // A response shorter than its Content-Length must not be ended
             // cleanly; the client would take the truncation for the whole
             // message.
             if c.pointee.flags.contains(.responseComplete)
+                && !c.pointee.flags.contains(.suppressBody)
                 && c.pointee.responseRemaining > 0 {
                 closeStream(slot, resetWith: .internalError)
                 return
@@ -849,6 +868,10 @@ public struct Worker {
     /// Emits a canned error response and closes.
     mutating func failRequest(_ slot: Int, status: Int) {
         let c = table[slot]
+        if c.pointee.isH3Stream {
+            h3FailRequest(slot, status: status)
+            return
+        }
         if c.pointee.isStream {
             h2FailRequest(slot, status: status)
             return
@@ -911,11 +934,41 @@ public struct Worker {
             h2.destroy()
             c.pointee.h2 = nil
         }
+        // An HTTP/3 connection owns child streams the same way an HTTP/2 one
+        // does, and its transport has to be told the connection is over.
+        if let h3 = c.pointee.h3 {
+            for (_, child) in h3.streams {
+                if table[Int(child)].pointee.state != .free {
+                    table[Int(child)].pointee.parentSlot = -1
+                    closeConnection(Int(child))
+                }
+            }
+            h3.destroy()
+            c.pointee.h3 = nil
+        }
+        if let connection = c.pointee.quicRef {
+            connection.applicationSlot = -1
+            if let quic { quic.close(connection, nowMs: pg_monotonic_ms()) }
+            c.pointee.quicRef = nil
+        }
+        c.pointee.h3Protocol.destroy()
+
         let wasStream = c.pointee.isStream
         if wasStream {
             let parent = Int(c.pointee.parentSlot)
             c.pointee.parentSlot = -1
-            if parent >= 0, let h2 = table[parent].pointee.h2 {
+            if c.pointee.isH3Stream {
+                if parent >= 0, let h3 = table[parent].pointee.h3 {
+                    h3.streams.removeValue(forKey: c.pointee.qstreamID)
+                    // Only worth asking a peer to stop if it might still be
+                    // sending; a request that already ended has nothing left.
+                    if let stream = h3.quic.stream(c.pointee.qstreamID),
+                       !stream.receive.finished {
+                        h3.quic.stopSending(c.pointee.qstreamID, code: HTTP3Error.noError)
+                    }
+                    h3.quic.releaseStream(c.pointee.qstreamID)
+                }
+            } else if parent >= 0, let h2 = table[parent].pointee.h2 {
                 h2.streams.removeValue(forKey: c.pointee.streamID)
             }
         }
@@ -1024,8 +1077,16 @@ public struct Worker {
                 // A finished response still waiting for the rest of its
                 // request. The client was asked to hurry, not given forever.
                 if idle > config.requestHeadTimeoutMs {
-                    closeStream(slot, resetWith: .noError)
+                    if c.pointee.isH3Stream {
+                        closeH3Stream(slot)
+                    } else {
+                        closeStream(slot, resetWith: .noError)
+                    }
                 }
+            case .http3:
+                // Idleness is the transport's business here: QUIC has its own
+                // timeout, negotiated with the peer, and the listener runs it.
+                break
             case .http2:
                 // Only an idle connection times out; a stream that is still
                 // running is the application's business, as in HTTP/1.

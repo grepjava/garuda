@@ -66,6 +66,9 @@ public struct ByteBuffer {
     @inlinable public var readableBytes: Int { writerIndex &- readerIndex }
     /// Absolute index of the first unread byte, used to anchor parsed slices.
     @inlinable public var readerOffset: Int { readerIndex }
+    /// Absolute index one past the last written byte. Used where a length has
+    /// to be written before its contents are known and patched afterwards.
+    @inlinable public var writerOffset: Int { writerIndex }
     @inlinable public var writableBytes: Int { capacity &- writerIndex }
     @inlinable public var isEmpty: Bool { writerIndex == readerIndex }
     @inlinable public var allocated: Bool { storage != nil }

@@ -66,6 +66,11 @@ public enum ASGIRuntime {
         fnRunLoop = runLoop
         fnStopLoop = stopLoop
         fnArmTimer = armTimer
+        if config.http3Enabled, let setInterval = Interpreter.glueFunction("set_timer_interval"),
+           let value = pg_int(20) {
+            if let r = pg_call1(setInterval, value) { pg_decref(r) } else { pg_err_clear() }
+            pg_decref(value)
+        }
         fnTaskError = taskError
         fnFinish = finish
         gracefulShutdownMs = config.gracefulShutdownMs
@@ -196,12 +201,14 @@ private func asgiDrain(_ context: UInt64, _ args: PyObj?) -> PyObj? {
     guard let worker = currentWorker else { return nil }
     // Timeout 0: asyncio already told us there is something to collect.
     worker.pointee.drain(timeoutMillis: 0)
+    worker.pointee.quicTick()
     return nil
 }
 
 /// Periodic housekeeping: idle timeouts and shutdown completion.
 private func asgiTimer(_ context: UInt64, _ args: PyObj?) -> PyObj? {
     guard let worker = currentWorker else { return nil }
+    worker.pointee.quicTick()
     worker.pointee.sweepTimeouts()
 
     // `sweepTimeouts` clears `running` when the shutdown deadline passes, so
@@ -391,7 +398,7 @@ extension Worker {
             guard let bodyObj else { return nil }
             defer { pg_decref(bodyObj) }
             c.pointee.body.clear()
-            if c.pointee.isStream { h2NoteConsumed(slot, available) }
+            if c.pointee.isStream && !c.pointee.isH3Stream { h2NoteConsumed(slot, available) }
             if complete { c.pointee.flags.insert(.bodyDelivered) }
             return ASGIMessage.httpRequest(body: bodyObj, moreBody: !complete)
         }
@@ -410,6 +417,7 @@ extension Worker {
             pg_err_set_str(pg_exc_runtime(), "http.response.start sent twice")
             return false
         }
+        if c.pointee.isH3Stream { return h3ResponseStart(slot, message: message) }
         if c.pointee.isStream { return h2ResponseStart(slot, message: message) }
         guard let statusObj = pg_dict_get(message, Interned[.status]) else {
             pg_err_set_str(pg_exc_value(), "http.response.start needs a status")
