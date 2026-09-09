@@ -37,6 +37,8 @@ public struct Worker {
     /// back to back for a single request, so there is never a second live set.
     public var headers: UnsafeMutablePointer<HTTPHeaderRef>
 
+    /// TLS configuration, when the listener is https. One per worker.
+    public var tlsContext: TLSContext? = nil
     public var wsgi: WSGIRuntime? = nil
     /// The optional WSGI thread pool. nil means the worker loop calls the
     /// application inline, which is the original single-threaded model.
@@ -154,6 +156,14 @@ public struct Worker {
             closeConnection(slot)
             return
         }
+        if c.pointee.flags.contains(.tlsHandshake) {
+            if !driveHandshake(slot) { return }
+            // A client that sent its first request in the same flight as the
+            // last handshake record has it waiting inside OpenSSL already.
+            handleReadable(slot)
+            drainBufferedTLS(slot)
+            return
+        }
         if mask.wantsWrite {
             if !flush(slot) { return }
             // The socket accepting more is exactly the signal a pooled request
@@ -171,6 +181,7 @@ public struct Worker {
         }
         if mask.wantsRead {
             handleReadable(slot)
+            drainBufferedTLS(slot)
             return
         }
         if mask.contains(.hangup) {
@@ -252,6 +263,7 @@ public struct Worker {
             c.pointee.drainWaiter = nil
             c.pointee.poolJob = nil
             c.pointee.responseRemaining = -1
+            c.pointee.tls = nil
 
             if config.tcpNoDelay { _ = pg_set_nodelay(fd, 1) }
 
@@ -272,6 +284,24 @@ public struct Worker {
                 continue
             }
             c.pointee.interest = PollMask.read.rawValue
+            if tlsContext != nil && !beginTLS(slot) { continue }
+        }
+    }
+
+    /// Keeps reading while TLS holds decrypted bytes the poller cannot see.
+    ///
+    /// A record is decrypted whole, so one socket read can leave OpenSSL
+    /// holding more than the buffer took. The socket is then empty, a
+    /// level-triggered poller says nothing, and a request would sit there
+    /// until the idle timeout.
+    mutating func drainBufferedTLS(_ slot: Int) {
+        var rounds = 0
+        while rounds < 64 {
+            let c = table[slot]
+            if c.pointee.state == .free || c.pointee.tls == nil { return }
+            if !connHasBufferedInput(slot) { return }
+            rounds += 1
+            handleReadable(slot)
         }
     }
 
@@ -356,12 +386,13 @@ public struct Worker {
                 if c.pointee.read.readableBytes >= limit { break }
                 c.pointee.read.reserve(config.readBufferSize)
                 let room = c.pointee.read.writableBytes
-                n = pg_read(c.pointee.fd, c.pointee.read.writePointer, room)
+                n = connRead(slot, c.pointee.read.writePointer, room)
                 if n > 0 {
                     c.pointee.read.advanceWriter(n)
-                    // A short read means the socket buffer is empty; asking
-                    // again would only earn an EAGAIN.
-                    if n < room { break }
+                    // A short read means the socket buffer is empty and asking
+                    // again would only earn an EAGAIN -- unless TLS is holding
+                    // a decrypted record the socket no longer has.
+                    if n < room && !connHasBufferedInput(slot) { break }
                     continue
                 }
             } else {
@@ -371,11 +402,11 @@ public struct Worker {
                 // belong to the next pipelined request.
                 let want = min(c.pointee.bodyRemaining, config.readBufferSize)
                 c.pointee.body.reserve(want)
-                n = pg_read(c.pointee.fd, c.pointee.body.writePointer, want)
+                n = connRead(slot, c.pointee.body.writePointer, want)
                 if n > 0 {
                     c.pointee.body.advanceWriter(n)
                     c.pointee.bodyRemaining -= n
-                    if n < want { break }
+                    if n < want && !connHasBufferedInput(slot) { break }
                     continue
                 }
             }
@@ -400,7 +431,8 @@ public struct Worker {
                 // The HTTP/2 preface is a valid HTTP/1.1 request line right up
                 // until it is not, so it can only be recognised in full, and
                 // only at the very start of a connection.
-                if config.http2Only && c.pointee.requestCount == 0 {
+                if (config.http2Only || c.pointee.flags.contains(.alpnH2))
+                    && c.pointee.requestCount == 0 {
                     // Nothing here is HTTP/1, so an incomplete preface is a
                     // truncated preface and a wrong one is a protocol error.
                     if c.pointee.read.readableBytes < HTTP2.preface.count {
@@ -622,9 +654,9 @@ public struct Worker {
         // An HTTP/2 stream writes into its connection, not into a socket.
         if c.pointee.isStream { return flushStream(slot) }
         while c.pointee.write.readableBytes > 0 {
-            let n = pg_write(c.pointee.fd,
-                             c.pointee.write.readPointer,
-                             c.pointee.write.readableBytes)
+            let n = connWrite(slot,
+                              c.pointee.write.readPointer,
+                              c.pointee.write.readableBytes)
             if n > 0 {
                 c.pointee.write.consume(n)
                 continue
@@ -717,9 +749,9 @@ public struct Worker {
     mutating func flushWithBackpressure(_ slot: Int) -> Bool {
         let c = table[slot]
         while c.pointee.write.readableBytes > config.writeHighWaterMark {
-            let n = pg_write(c.pointee.fd,
-                             c.pointee.write.readPointer,
-                             c.pointee.write.readableBytes)
+            let n = connWrite(slot,
+                              c.pointee.write.readPointer,
+                              c.pointee.write.readableBytes)
             if n > 0 { c.pointee.write.consume(n); continue }
             let e = pg_errno()
             if pg_err_is_intr(e) != 0 { continue }
@@ -759,18 +791,32 @@ public struct Worker {
         if c.pointee.isStream {
             // A response shorter than its Content-Length must not be ended
             // cleanly; the client would take the truncation for the whole
-            // message. Otherwise, answering before the request finished
-            // arriving is ordinary in HTTP/2 and costs only a polite reset.
-            let code: H2Error?
+            // message.
             if c.pointee.flags.contains(.responseComplete)
                 && c.pointee.responseRemaining > 0 {
-                code = .internalError
-            } else if c.pointee.bodyRemaining == 0 {
-                code = nil
-            } else {
-                code = .noError
+                closeStream(slot, resetWith: .internalError)
+                return
             }
-            closeStream(slot, resetWith: code)
+            if c.pointee.bodyRemaining == 0 {
+                closeStream(slot, resetWith: nil)
+                return
+            }
+            // Answering before the upload finished is ordinary in HTTP/2. If
+            // what is left is small the stream stays open until it arrives --
+            // the bytes are dropped, but they are still counted and still
+            // checked against what the client promised. A large upload is not
+            // worth the wait and the client is told to stop.
+            let declared = c.pointee.head.flags.contains(.hasContentLength)
+                ? c.pointee.head.contentLength - c.pointee.bodyReceived
+                : 0
+            if declared <= config.bodyHighWaterMark {
+                c.pointee.state = .closing
+                c.pointee.body.clear()
+                releaseDrainWaiter(slot)
+                releasePendingReceive(slot)
+                return
+            }
+            closeStream(slot, resetWith: .noError)
             return
         }
         // An application that answers early -- a 401, a validation failure at
@@ -905,6 +951,7 @@ public struct Worker {
             c.pointee.ws.queuedBytes = 0
         }
 
+        endTLS(slot)
         if c.pointee.fd >= 0 {
             _ = poller.remove(c.pointee.fd)
             _ = pg_close(c.pointee.fd)
@@ -973,6 +1020,12 @@ public struct Worker {
                 if idle > config.requestHeadTimeoutMs { closeConnection(slot) }
             case .websocket:
                 sweepWebSocket(slot, now: now)
+            case .closing where c.pointee.isStream:
+                // A finished response still waiting for the rest of its
+                // request. The client was asked to hurry, not given forever.
+                if idle > config.requestHeadTimeoutMs {
+                    closeStream(slot, resetWith: .noError)
+                }
             case .http2:
                 // Only an idle connection times out; a stream that is still
                 // running is the application's business, as in HTTP/1.

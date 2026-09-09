@@ -263,24 +263,59 @@ extension Worker {
             return
         }
 
+        // The response can be finished while the request is still arriving.
+        // The stream stays open so that the rest of the upload is still
+        // checked and still counted against the window; the bytes themselves
+        // have nowhere to go.
+        let draining = s.pointee.state == .closing
+
         if length > 0 {
-            if s.pointee.body.readableBytes + length > config.maxBodySize {
-                streamError(slot, h2, header.streamID, .enhanceYourCalm)
-                return
-            }
-            s.pointee.body.write(payload + offset, length)
             s.pointee.bodyReceived += length
+            if draining {
+                if s.pointee.bodyReceived > config.maxBodySize {
+                    streamError(slot, h2, header.streamID, .noError)
+                    return
+                }
+            } else {
+                if s.pointee.body.readableBytes + length > config.maxBodySize {
+                    streamError(slot, h2, header.streamID, .enhanceYourCalm)
+                    return
+                }
+                s.pointee.body.write(payload + offset, length)
+            }
+        }
+
+        // RFC 9113 section 8.1.1: a body that disagrees with its declared
+        // length is malformed. Checked as it arrives rather than only at the
+        // end, so a client that has already overshot hears about it now.
+        if s.pointee.head.flags.contains(.hasContentLength)
+            && s.pointee.bodyReceived > s.pointee.head.contentLength {
+            streamError(slot, h2, header.streamID, .protocolError)
+            return
         }
 
         if header.flags.contains(.endStream) {
             s.pointee.bodyRemaining = 0
-            // RFC 9113 section 8.1.1: a declared length that does not match
-            // what arrived is a malformed request.
             if s.pointee.head.flags.contains(.hasContentLength)
                 && s.pointee.head.contentLength != s.pointee.bodyReceived {
                 streamError(slot, h2, header.streamID, .protocolError)
                 return
             }
+            if draining {
+                // The request has caught up with a response that was finished
+                // long ago.
+                closeStream(streamSlot, resetWith: nil)
+                return
+            }
+        }
+
+        if draining {
+            // Nobody is going to read these, but the window still has to move
+            // or the client stalls part way through an upload it was told to
+            // finish.
+            s.pointee.pendingRecvUpdate += length
+            h2FlushWindowUpdates(streamSlot)
+            return
         }
         onBodyProgress(streamSlot)
     }
@@ -688,8 +723,11 @@ extension Worker {
     mutating func handleGoawayFrame(_ slot: Int, _ h2: H2Connection, _ header: H2FrameHeader) {
         if header.streamID != 0 { connectionError(slot, .protocolError); return }
         if header.length < 8 { connectionError(slot, .frameSizeError); return }
+        // No new streams, but the connection is not ours to drop: the peer may
+        // still be reading a response, and closing on top of bytes it has
+        // already sent turns an orderly shutdown into a TCP reset. It closes
+        // when the last stream ends, when the peer hangs up, or on idle.
         h2.peerGoneAway = true
-        if h2.streams.isEmpty { closeConnection(slot) }
     }
 
     mutating func handleWindowUpdateFrame(_ slot: Int, _ h2: H2Connection,
@@ -741,8 +779,8 @@ extension Worker {
         }
         // One last push at the socket so the peer learns why, then done.
         while c.pointee.write.readableBytes > 0 {
-            let n = pg_write(c.pointee.fd, c.pointee.write.readPointer,
-                             c.pointee.write.readableBytes)
+            let n = connWrite(slot, c.pointee.write.readPointer,
+                              c.pointee.write.readableBytes)
             if n <= 0 { break }
             c.pointee.write.consume(n)
         }
@@ -999,8 +1037,8 @@ extension Worker {
             HTTP2.writeUInt32(H2Error.protocolError.rawValue, into: &out)
         }
         while c.pointee.write.readableBytes > 0 {
-            let n = pg_write(c.pointee.fd, c.pointee.write.readPointer,
-                             c.pointee.write.readableBytes)
+            let n = connWrite(slot, c.pointee.write.readPointer,
+                              c.pointee.write.readableBytes)
             if n <= 0 { break }
             c.pointee.write.consume(n)
         }

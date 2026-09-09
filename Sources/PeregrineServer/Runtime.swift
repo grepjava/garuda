@@ -43,6 +43,16 @@ public enum Peregrine {
             }
         }
 
+        // Certificates are checked once, here, rather than discovered to be
+        // unreadable inside each worker after the sockets are already open.
+        if config.tlsEnabled {
+            if pg_tls_available() == 0 {
+                Log.error("this build has no TLS support; rebuild against OpenSSL")
+                return 1
+            }
+            guard makeTLSContext(config) != nil else { return 1 }
+        }
+
         let workerCount = config.workers > 0 ? config.workers : Int(pg_cpu_count())
 
         // --reload needs a supervisor to restart into, even with one worker.
@@ -55,6 +65,23 @@ public enum Peregrine {
             return ok ? 0 : 1
         }
         return runSupervisor(config, workers: max(1, workerCount))
+    }
+
+    /// Builds the TLS context, with the ALPN list the rest of the
+    /// configuration implies. ALPN is the only way a browser will speak
+    /// HTTP/2, so it follows --no-http2 and --http2-only exactly.
+    static func makeTLSContext(_ config: ServerConfig) -> TLSContext? {
+        guard let cert = config.tlsCertPath, let key = config.tlsKeyPath else { return nil }
+        let alpn: UnsafePointer<CChar>
+        if !config.http2Enabled {
+            alpn = staticCString("http/1.1")
+        } else if config.http2Only {
+            alpn = staticCString("h2")
+        } else {
+            alpn = staticCString("h2,http/1.1")
+        }
+        return TLSContext.make(certPath: cert, keyPath: key,
+                               alpn: alpn, ciphers: config.tlsCiphers)
     }
 
     // MARK: - Listening socket
@@ -294,6 +321,10 @@ public enum Peregrine {
         let workerPtr = UnsafeMutablePointer<Worker>.allocate(capacity: 1)
         workerPtr.initialize(to: Worker(config: config, listenFD: listenFD, poller: poller))
         currentWorker = workerPtr
+        if config.tlsEnabled {
+            guard let context = makeTLSContext(config) else { return false }
+            workerPtr.pointee.tlsContext = context
+        }
         workerPtr.pointee.appProtocol = proto
         workerPtr.pointee.signalFD = pg_signal_pipe_init()
 

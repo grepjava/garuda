@@ -14,9 +14,10 @@ Needs `h2` in the interpreter running it:  pip install h2
 
 import os
 import socket
+import ssl
 import subprocess
 import sys
-import threading
+import tempfile
 import time
 
 try:
@@ -29,6 +30,33 @@ except ImportError:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+
+# Set for the second pass, which runs everything again over TLS so that ALPN,
+# record boundaries and partial writes are exercised by the same checks.
+USE_TLS = False
+CERTS = None
+
+
+def make_certs():
+    """A throwaway self-signed certificate, or None if openssl is missing."""
+    global CERTS
+    if CERTS is not None:
+        return CERTS
+    directory = tempfile.mkdtemp(prefix="peregrine-h2-tls-")
+    cert = os.path.join(directory, "cert.pem")
+    key = os.path.join(directory, "key.pem")
+    try:
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                        "-keyout", key, "-out", cert, "-days", "2", "-nodes",
+                        "-subj", "/CN=localhost",
+                        "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+                       check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        CERTS = (None, None)
+        return CERTS
+    CERTS = (cert, key)
+    return CERTS
 
 PASS = 0
 FAIL = 0
@@ -74,7 +102,11 @@ class Server:
     def __init__(self, *args, app="asgi_app:app"):
         self.port = free_port()
         cmd = [BIN, "--port", str(self.port), "--log-level", "error",
-               "--python-path", os.path.join(ROOT, "examples")] + list(args) + [app]
+               "--python-path", os.path.join(ROOT, "examples")] + list(args)
+        if USE_TLS:
+            cert, key = make_certs()
+            cmd += ["--tls-cert", cert, "--tls-key", key]
+        cmd += [app]
         self.proc = subprocess.Popen(cmd)
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -105,6 +137,14 @@ class Client:
     def __init__(self, server, timeout=15.0, window=None):
         self.sock = socket.create_connection(("127.0.0.1", server.port), timeout)
         self.sock.settimeout(timeout)
+        if USE_TLS:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(["h2"])
+            self.sock = context.wrap_socket(self.sock, server_hostname="localhost")
+            if self.sock.selected_alpn_protocol() != "h2":
+                raise SystemExit("ALPN did not settle on h2")
         self.conn = h2.connection.H2Connection(
             config=h2.config.H2Configuration(client_side=True))
         self.conn.initiate_connection()
@@ -344,22 +384,40 @@ def test_response_framing():
         c.close()
 
 
-def main():
-    if not os.path.exists(BIN):
-        print("no such binary: %s" % BIN)
-        return 2
-    print("peregrine HTTP/2 tests (%s, h2 %s)" % (BIN, h2.__version__))
+def run_all():
+    global FAIL
     for test in (test_basics, test_multiplexing, test_request_bodies,
                  test_flow_control, test_cancellation, test_large_headers,
                  test_response_framing):
         try:
             test()
         except Exception:
-            global FAIL
             FAIL += 1
             import traceback
             print("  FAIL %s raised" % test.__name__)
             traceback.print_exc()
+
+
+def main():
+    global USE_TLS
+    if not os.path.exists(BIN):
+        print("no such binary: %s" % BIN)
+        return 2
+    print("peregrine HTTP/2 tests (%s, h2 %s)" % (BIN, h2.__version__))
+    print("\n== cleartext (prior knowledge) ==")
+    run_all()
+
+    cert, _ = make_certs()
+    if cert is None:
+        print("\n== TLS: skipped, no openssl to make a certificate ==")
+    else:
+        # Everything again over TLS, where ALPN chooses the protocol and the
+        # record layer decides where the frame boundaries fall.
+        print("\n== TLS (ALPN) ==")
+        USE_TLS = True
+        run_all()
+        USE_TLS = False
+
     print("\npassed: %d   failed: %d" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1
 

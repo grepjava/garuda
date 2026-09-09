@@ -50,6 +50,13 @@ let package = Package(
                 // a define that reaches the module build would change glibc
                 // struct layouts relative to SwiftGlibc.
                 .headerSearchPath("include"),
+            ],
+            // TLS. OpenSSL supplies the primitives and the handshake; the
+            // protocol state above it is ours. Headers are reached only from
+            // peregrine_tls.c, never from anything Swift imports.
+            linkerSettings: [
+                .linkedLibrary("ssl"),
+                .linkedLibrary("crypto"),
             ]
         ),
 

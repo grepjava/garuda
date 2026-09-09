@@ -239,7 +239,7 @@ swift test                              # 90 unit tests: parser, chunking, buffe
                                         #   writer, websocket framing, HPACK,
                                         #   proxy trust
 bash scripts/integration-test.sh        # 38 end-to-end checks over both protocols
-python3 scripts/feature-test.py         # 94 checks for the failure modes a plain
+python3 scripts/feature-test.py         # 102 checks for the failure modes a plain
                                         #   request never reaches: slow consumers,
                                         #   stuck-request shutdown, lifespan
                                         #   cleanup, worker restarts, multiworker
@@ -247,7 +247,8 @@ python3 scripts/feature-test.py         # 94 checks for the failure modes a plai
 bash scripts/framework-test.sh          # 21 checks against real FastAPI and
                                         #   Django applications
 <venv>/bin/python scripts/http2-test.py # 24 HTTP/2 checks against the `h2`
-                                        #   library: multiplexing, flow control,
+                                        #   library, run twice -- cleartext and
+                                        #   TLS: multiplexing, flow control,
                                         #   CONTINUATION, cancellation
 ```
 
@@ -257,6 +258,9 @@ which is not vendored here:
 ```bash
 peregrine --port 8000 --http2-only examples.asgi_app:app &
 h2spec -h 127.0.0.1 -p 8000          # 146 tests, 146 passed
+
+peregrine --port 8443 --tls-cert cert.pem --tls-key key.pem examples.asgi_app:app &
+h2spec -h 127.0.0.1 -p 8443 -t -k    # 146 tests, 146 passed
 ```
 
 The framework suite needs a virtualenv with `fastapi starlette django
@@ -275,7 +279,7 @@ the interpreter it will serve applications for, and only the installing
 environment knows which one that is.
 
 ```bash
-sudo apt install python3-dev pkg-config     # or: brew install python@3.13
+sudo apt install python3-dev pkg-config libssl-dev   # or: brew install python@3.13 openssl
 # plus a Swift 6.1+ toolchain from https://swift.org/install
 
 pip install peregrine-server
@@ -334,6 +338,9 @@ peregrine [options] MODULE:ATTRIBUTE
   --reload                 restart workers when source files change
   --no-uvloop              do not use uvloop even when installed
   --no-lifespan            skip the ASGI lifespan protocol
+  --tls-cert PATH          PEM certificate chain; enables TLS with ALPN
+  --tls-key PATH           PEM private key for it
+  --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
   --no-http2               refuse HTTP/2 and answer HTTP/1.1 only
   --http2-only             serve only HTTP/2 (h2c), with no HTTP/1 fallback
   --no-websockets          reject WebSocket upgrades with 501
@@ -511,11 +518,35 @@ indexing: mirroring the peer's table would save a few bytes on responses whose
 headers barely repeat, and Huffman coding of literals gets most of it for none
 of the bookkeeping.
 
+## TLS
+
+```bash
+peregrine --tls-cert fullchain.pem --tls-key privkey.pem myapp:app
+```
+
+OpenSSL is handed the descriptor directly, so a TLS connection is the same
+connection as any other -- same slab slot, same poller interest, same buffers,
+same state machine -- and the read and write wrappers report `EAGAIN` the way a
+socket does, which is what keeps that true. Two things about TLS cannot be
+wrapped away, and both are handled explicitly: the handshake happens before any
+request exists and can want readability or writability at each step, and a
+record is decrypted whole, so OpenSSL can be holding bytes the socket no longer
+has -- which a level-triggered poller will never mention again.
+
+**ALPN** is what makes HTTP/2 reachable from a browser, and it is where the
+protocol is settled: `h2` if the client offers it, `http/1.1` otherwise, in the
+server's order of preference rather than the client's. `--no-http2` and
+`--http2-only` narrow the advertised list to match. A TLS listener also reports
+`https` to the application, so URLs it builds are right without being told.
+
+TLS 1.2 is the floor, renegotiation is off, and `--tls-ciphers` takes an
+OpenSSL cipher list for anyone who needs to narrow the 1.2 suites. Certificates
+are checked once at start-up rather than discovered to be unreadable inside
+each worker.
+
 ## What is not
 
 - **HTTP/3.**
-- **TLS, so HTTP/2 in a browser.** Browsers only negotiate h2 over ALPN, so
-  today's HTTP/2 is for proxies, gRPC clients and prior-knowledge tools.
 - **TLS.** Terminate it upstream; that is where it belongs for this class of
   server anyway.
 - **`sendfile` for `wsgi.file_wrapper`.** The wrapper works and streams in

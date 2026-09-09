@@ -83,6 +83,15 @@ public struct ServerConfig {
     /// address spoof and an untrusted X-Forwarded-Proto is a scheme spoof.
     public var trust = ForwardedTrust()
 
+    // --- tls ---
+    /// PEM certificate chain and private key. Both or neither.
+    public var tlsCertPath: UnsafePointer<CChar>? = nil
+    public var tlsKeyPath: UnsafePointer<CChar>? = nil
+    /// OpenSSL cipher list for TLS 1.2. TLS 1.3 suites are not configurable
+    /// here and do not need to be.
+    public var tlsCiphers: UnsafePointer<CChar>? = nil
+    public var tlsEnabled: Bool { tlsCertPath != nil && tlsKeyPath != nil }
+
     // --- http/2 ---
     /// Serve HTTP/2 to clients that ask for it. Over cleartext that means the
     /// connection preface; over TLS it means ALPN.

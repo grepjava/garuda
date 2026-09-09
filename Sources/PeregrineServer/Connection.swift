@@ -38,8 +38,8 @@ public enum ConnState: UInt8 {
 }
 
 public struct ConnFlags: OptionSet, Sendable {
-    public let rawValue: UInt16
-    @inlinable public init(rawValue: UInt16) { self.rawValue = rawValue }
+    public let rawValue: UInt32
+    @inlinable public init(rawValue: UInt32) { self.rawValue = rawValue }
 
     public static let keepAlive        = ConnFlags(rawValue: 1 << 0)
     public static let peerClosed       = ConnFlags(rawValue: 1 << 1)
@@ -71,6 +71,10 @@ public struct ConnFlags: OptionSet, Sendable {
     /// HTTP/2: the END_STREAM flag has been sent, so the response is over on
     /// the wire even if the slot is still waiting for its task.
     public static let endStreamSent    = ConnFlags(rawValue: 1 << 13)
+    /// The TLS handshake has not finished, so there is no request yet.
+    public static let tlsHandshake     = ConnFlags(rawValue: 1 << 14)
+    /// ALPN settled on HTTP/2, so this connection owes us a preface.
+    public static let alpnH2           = ConnFlags(rawValue: 1 << 15)
 
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
@@ -115,6 +119,10 @@ public struct Connection {
 
     public var lastActivity: UInt64 = 0
     public var requestCount: UInt32 = 0
+
+    /// The TLS session, when this connection has one. Streams never do: they
+    /// travel over their connection.
+    public var tls: OpaquePointer? = nil
 
     // --- HTTP/2 ---
     /// Connection state, on the slot that owns the socket.

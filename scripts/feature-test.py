@@ -20,6 +20,7 @@ import random
 import re
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -66,10 +67,16 @@ def is_(name, actual, expected):
 # --------------------------------------------------------------------------
 
 class Server:
-    def __init__(self, *args, app="asgi_app:app", port=None, unix=None, env=None):
+    def __init__(self, *args, app="asgi_app:app", port=None, unix=None, env=None,
+                 tls=False, alpn=None):
         self.port = port
         self.unix = unix
+        self.tls = tls
+        self.alpn = alpn
         cmd = [BIN, "--log-level", "error", "--python-path", os.path.join(ROOT, "examples")]
+        if tls:
+            cert, key = make_certs()
+            cmd += ["--tls-cert", cert, "--tls-key", key]
         if unix:
             cmd += ["--unix", unix]
         else:
@@ -96,13 +103,21 @@ class Server:
                 time.sleep(0.05)
         raise RuntimeError("server did not become ready")
 
-    def connect(self, timeout=5.0):
+    def connect(self, timeout=5.0, plaintext=False):
         if self.unix:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(timeout)
             s.connect(self.unix)
         else:
             s = socket.create_connection(("127.0.0.1", self.port), timeout=timeout)
+            s.settimeout(timeout)
+        if self.tls and not plaintext:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            if self.alpn:
+                context.set_alpn_protocols(self.alpn)
+            s = context.wrap_socket(s, server_hostname="localhost")
             s.settimeout(timeout)
         return s
 
@@ -199,6 +214,34 @@ def dechunk(raw):
         out += raw[:n]
         raw = raw[n + 2:]
     return out
+
+
+CERTS = None
+
+
+def make_certs():
+    """A throwaway self-signed certificate for the TLS checks."""
+    global CERTS
+    if CERTS is None:
+        directory = tempfile.mkdtemp(prefix="peregrine-tls-")
+        cert = os.path.join(directory, "cert.pem")
+        key = os.path.join(directory, "key.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                        "-keyout", key, "-out", cert, "-days", "2", "-nodes",
+                        "-subj", "/CN=localhost",
+                        "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        CERTS = (cert, key)
+    return CERTS
+
+
+def have_openssl():
+    try:
+        subprocess.run(["openssl", "version"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
 
 
 def free_port():
@@ -952,6 +995,64 @@ def test_request_backpressure():
             body.strip(), str(total).encode())
 
 
+def test_tls():
+    print("\nTLS")
+    if not have_openssl():
+        print("  --   skipped: no openssl to make a certificate")
+        return
+    port = free_port()
+    with Server(port=port, tls=True, alpn=["http/1.1"]) as server:
+        status, headers, body = server.get("/")
+        is_("a request over TLS is answered", status, 200)
+        is_("the body survives the record layer", body, b"hello from peregrine asgi\n")
+
+        # A TLS listener is https, and the application should be told so
+        # rather than having to guess from a port number.
+        _, _, raw = server.get("/scope")
+        check("the scope reports the https scheme", b'"scheme": "https"' in raw,
+              raw[:200].decode(errors="replace"))
+
+        # Records are 16 KiB at most, so anything larger proves the read side
+        # reassembles and the write side handles a partial SSL_write.
+        payload = bytes(random.getrandbits(8) for _ in range(300000))
+        s = server.connect(timeout=30)
+        s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n"
+                  % len(payload))
+        s.sendall(payload)
+        _, _, echoed = read_http_response(s)
+        s.close()
+        is_("a body far larger than a TLS record round trips", echoed, payload)
+
+    # ALPN is what makes HTTP/2 reachable from a browser, and the server picks
+    # from its own preference list rather than the client's.
+    port = free_port()
+    with Server(port=port, tls=True, alpn=["http/1.1", "h2"]) as server:
+        s = server.connect(timeout=10)
+        is_("the server prefers h2 when the client offers both",
+            s.selected_alpn_protocol(), "h2")
+        s.close()
+
+    port = free_port()
+    with Server(port=port, tls=True, alpn=["http/1.1"]) as server:
+        s = server.connect(timeout=10)
+        is_("a client that only offers http/1.1 gets it",
+            s.selected_alpn_protocol(), "http/1.1")
+        s.close()
+
+        # Plaintext to a TLS port is a mistake, not a request: it must be
+        # refused rather than answered in the clear.
+        s = server.connect(timeout=10, plaintext=True)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        try:
+            answer = s.recv(4096)
+        except OSError:
+            answer = b""
+        s.close()
+        check("a plaintext request to a TLS port is not answered in the clear",
+              not answer.startswith(b"HTTP/"), repr(answer[:40]))
+        is_("the server is still healthy afterwards", server.get("/")[0], 200)
+
+
 def test_receive_after_response():
     print("\nreceive() after the response is complete")
     port = free_port()
@@ -1124,7 +1225,7 @@ def main():
         return 2
     print("peregrine feature tests (%s)" % BIN)
     for test in (test_header_shapes, test_factory, test_websockets, test_backpressure,
-                 test_response_length, test_streaming_request_bodies,
+                 test_tls, test_response_length, test_streaming_request_bodies,
                  test_request_backpressure, test_receive_after_response,
                  test_websocket_control_independence,
                  test_wsgi_threads, test_forwarded, test_multiworker_unix,

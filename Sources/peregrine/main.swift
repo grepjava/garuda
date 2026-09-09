@@ -132,6 +132,7 @@ func printVersion() {
 
 var config = ServerConfig()
 var sawApp = false
+var schemeGiven = false
 var portSet = false
 
 let argc = Int(CommandLine.argc)
@@ -199,6 +200,16 @@ while i < argc {
     } else if matches(arg, "--scheme") {
         guard let v = next("--scheme needs a value") else { break }
         config.scheme = v
+        schemeGiven = true
+    } else if matches(arg, "--tls-cert") {
+        guard let v = next("--tls-cert needs a path") else { break }
+        config.tlsCertPath = v
+    } else if matches(arg, "--tls-key") {
+        guard let v = next("--tls-key needs a path") else { break }
+        config.tlsKeyPath = v
+    } else if matches(arg, "--tls-ciphers") {
+        guard let v = next("--tls-ciphers needs an OpenSSL cipher list") else { break }
+        config.tlsCiphers = v
     } else if matches(arg, "--backlog") {
         guard let v = next("--backlog needs a value") else { break }
         config.backlog = Int32(max(1, parseInt(v)))
@@ -299,6 +310,17 @@ while i < argc {
 }
 
 if failed {
+    exit(2)
+}
+
+// A TLS listener is https, and every URL the application builds should say so.
+// An explicit --scheme still wins: someone behind a terminating proxy may have
+// a reason.
+if config.tlsEnabled && !schemeGiven {
+    config.scheme = staticCString("https")
+}
+if (config.tlsCertPath == nil) != (config.tlsKeyPath == nil) {
+    Log.error("--tls-cert and --tls-key go together")
     exit(2)
 }
 
