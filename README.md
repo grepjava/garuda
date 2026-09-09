@@ -326,14 +326,16 @@ python3 scripts/feature-test.py                 # 102 checks for the failure
                                                 #   stuck-request shutdown,
                                                 #   lifespan cleanup, worker
                                                 #   restarts, reload
-bash scripts/framework-test.sh                  #  27 checks against real
+bash scripts/framework-test.sh                  #  30 checks against real
                                                 #   FastAPI and Django apps,
                                                 #   over HTTP/1.1 and HTTP/2
 <venv>/bin/python scripts/http2-test.py         # 116 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  73 checks against `aioquic`
-<venv>/bin/python scripts/webtransport-test.py  #  51 checks against `aioquic`,
-                                                #   including the FastAPI and
-                                                #   Django integrations
+<venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
+python3 scripts/contrib_test.py                 #  58 Python-only: routing,
+                                                #   converters, session helper
+<venv>/bin/python scripts/webtransport-test.py  # 115 including the above,
+                                                #   plus FastAPI and Django
+                                                #   over HTTP/3 and WebTransport
 ```
 
 HTTP/2 conformance is checked with
@@ -356,8 +358,9 @@ schedule, the header protection and the sample packets are the RFC's own bytes.
 - **QUIC connection migration across workers, and 0-RTT.** A connection
   survives a change of address, but not a change of worker, and every handshake
   is a full one.
-- **HTTP/3 server push, and WebSocket over HTTP/2 or HTTP/3.** Extended
-  `CONNECT` is advertised, but `webtransport` is the only `:protocol` served.
+- **HTTP/3 server push, and WebSocket over HTTP/2 or HTTP/3.** HTTP/3
+  advertises extended `CONNECT` because that is how WebTransport arrives;
+  `webtransport` is the only `:protocol` served. HTTP/2 does not advertise it.
 - **Windows.** The I/O layer is epoll/kqueue.
 
 By default a synchronous WSGI application occupies its worker for the duration

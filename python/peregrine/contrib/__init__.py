@@ -11,4 +11,8 @@ asserts on that field before routing: Starlette's router allows `http`,
 WebTransport endpoint has to be reached before the framework sees the scope,
 which is what the routers in this package do -- they answer WebTransport
 themselves and hand everything else to the application unchanged.
+
+Paths keep each framework's own spelling. Starlette `{name}` / `{name:int}`
+and Django `<str:name>` / `<int:name>` convert; a missing trailing slash is
+tried the other way, because a session cannot be HTTP-redirected.
 """

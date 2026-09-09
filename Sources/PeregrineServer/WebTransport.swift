@@ -44,6 +44,8 @@
 //     {"type": "webtransport.stream.open", "bidirectional": bool}
 //     {"type": "webtransport.stream.send", "stream": int, "data": bytes,
 //      "end_stream": bool}
+//     {"type": "webtransport.stream.pause", "stream": int}
+//     {"type": "webtransport.stream.resume", "stream": int}
 //     {"type": "webtransport.datagram.send", "data": bytes}
 //
 // A stream the application opens is answered with `webtransport.stream.opened`
@@ -70,6 +72,10 @@ public final class WTStream {
     public var finSent = false
     /// The application may not write to a peer's unidirectional stream.
     public var writable: Bool
+    /// The application is not reading this stream. Its bytes stay in the
+    /// QUIC buffer and its window does not reopen; every other stream still
+    /// does.
+    public var paused = false
 
     init(id: UInt64, bidirectional: Bool, writable: Bool) {
         self.id = id
@@ -97,6 +103,10 @@ public final class WTSession {
     /// nothing per `receive()`.
     var readable: [UInt64] = []
     var readableSet: Set<UInt64> = []
+    /// Readable, but the application asked us not to deliver. Resume moves
+    /// them back. Kept out of `readable` so a paused stream cannot spin the
+    /// take loop.
+    var pausedReadable: Set<UInt64> = []
     /// Streams we opened, waiting to be announced.
     var opened: [UInt64] = []
     /// Datagrams are unreliable by definition, so the queue is bounded and
@@ -111,7 +121,28 @@ public final class WTSession {
     }
 
     func markReadable(_ id: UInt64) {
+        if let stream = streams[id], stream.paused {
+            pausedReadable.insert(id)
+            return
+        }
         if readableSet.insert(id).inserted { readable.append(id) }
+    }
+
+    func pause(_ id: UInt64) {
+        guard let stream = streams[id], !stream.paused else { return }
+        stream.paused = true
+        if readableSet.remove(id) != nil {
+            if let i = readable.firstIndex(of: id) { readable.remove(at: i) }
+            pausedReadable.insert(id)
+        }
+    }
+
+    func resume(_ id: UInt64) {
+        guard let stream = streams[id], stream.paused else { return }
+        stream.paused = false
+        if pausedReadable.remove(id) != nil {
+            markReadable(id)
+        }
     }
 }
 
@@ -420,6 +451,10 @@ extension Worker {
             session.readableSet.remove(streamID)
             guard let stream = session.streams[streamID],
                   let quicStream = h3.quic.stream(streamID) else { continue }
+            if stream.paused {
+                session.pausedReadable.insert(streamID)
+                continue
+            }
 
             let available = quicStream.receive.ready.readableBytes
             let take = min(available, wtMaxChunk)
@@ -463,6 +498,11 @@ extension Worker {
                                 _ stream: WTStream) {
         if stream.writable && !stream.finSent { return }
         session.streams.removeValue(forKey: stream.id)
+        session.pausedReadable.remove(stream.id)
+        session.readableSet.remove(stream.id)
+        if let i = session.readable.firstIndex(of: stream.id) {
+            session.readable.remove(at: i)
+        }
         h3.wtStreams.removeValue(forKey: stream.id)
         h3.quic.releaseStream(stream.id)
     }
@@ -536,6 +576,14 @@ extension Worker {
 
         if typeLength == 24 && equalsExact(type, 24, "webtransport.stream.send") {
             return sendWebTransportStream(slot, session, message: message)
+        }
+
+        if typeLength == 25 && equalsExact(type, 25, "webtransport.stream.pause") {
+            return pauseWebTransportStream(slot, session, message: message)
+        }
+
+        if typeLength == 26 && equalsExact(type, 26, "webtransport.stream.resume") {
+            return resumeWebTransportStream(slot, session, message: message)
         }
 
         if typeLength == 26 && equalsExact(type, 26, "webtransport.datagram.send") {
@@ -668,6 +716,37 @@ extension Worker {
         h3.wtStreams[id] = Int32(slot)
         session.opened.append(id)
         flushQUIC(parent)
+        deliverPendingReceive(slot)
+        return true
+    }
+
+    private func wtStreamID(_ message: PyObj) -> UInt64? {
+        guard let idObj = pg_dict_get(message, Interned[.stream]) else {
+            pg_err_set_str(pg_exc_value(),
+                           "webtransport stream message needs a stream")
+            return nil
+        }
+        let raw = pg_int_as_long(idObj)
+        if raw < 0 {
+            pg_err_set_str(pg_exc_value(), "stream must be a non-negative integer")
+            return nil
+        }
+        return UInt64(raw)
+    }
+
+    /// Stops delivering one stream without stopping the session. Its bytes
+    /// stay in the QUIC receive buffer, so its window does not reopen.
+    private mutating func pauseWebTransportStream(_ slot: Int, _ session: WTSession,
+                                                  message: PyObj) -> Bool {
+        guard let id = wtStreamID(message) else { return false }
+        session.pause(id)
+        return true
+    }
+
+    private mutating func resumeWebTransportStream(_ slot: Int, _ session: WTSession,
+                                                   message: PyObj) -> Bool {
+        guard let id = wtStreamID(message) else { return false }
+        session.resume(id)
         deliverPendingReceive(slot)
         return true
     }

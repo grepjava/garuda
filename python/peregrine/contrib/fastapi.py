@@ -17,6 +17,8 @@ framework sees it:
         async for stream in session.incoming_streams():
             await stream.send(b"echo:" + await stream.read(), end=True)
 
+Paths use Starlette's spelling: `{room}`, `{count:int}`, `{id:uuid}`.
+
 Everything that is not a WebTransport session goes to `api` untouched, so the
 rest of the application is unaffected -- including over HTTP/3, which needs no
 integration at all because a request is the same request whatever carried it.
@@ -24,9 +26,14 @@ integration at all because a request is the same request whatever carried it.
 
 import asyncio
 
-from .asgi import AltSvcMiddleware
+from .asgi import (
+    AltSvcMiddleware,
+    http_version,
+    is_http3,
+    session_from,
+    supports_webtransport,
+)
 from .asgi import WebTransportRouter as _BaseRouter
-from ..webtransport import WebTransportSession
 
 __all__ = [
     "WebTransportRouter",
@@ -85,26 +92,37 @@ class WebTransportEndpoint:
         """Called once, after the session has ended."""
 
     async def dispatch(self):
-        await self.on_connect()
-        if not self.session.accepted:
-            return
-        tasks = [
-            asyncio.ensure_future(self._streams()),
-            asyncio.ensure_future(self._datagrams()),
-        ]
+        error = None
         try:
-            done, pending = await asyncio.wait(
-                tasks, return_when=asyncio.FIRST_EXCEPTION)
-            for task in pending:
-                task.cancel()
-            for task in done:
-                task.result()
+            await self.on_connect()
+            if not self.session.accepted:
+                return
+            tasks = [
+                asyncio.ensure_future(self._streams()),
+                asyncio.ensure_future(self._datagrams()),
+            ]
+            try:
+                done, pending = await asyncio.wait(
+                    set(tasks), return_when=asyncio.FIRST_EXCEPTION)
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    task.result()
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException as exc:
+            error = exc
+            raise
         finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await self.on_disconnect(self.session.close_code,
-                                     self.session.close_reason)
+            if self.session.accepted:
+                try:
+                    await self.on_disconnect(self.session.close_code,
+                                             self.session.close_reason)
+                except Exception:
+                    if error is None:
+                        raise
 
     async def _streams(self):
         """Runs one `on_stream` task per stream, and fails if any of them do.
@@ -137,7 +155,7 @@ class WebTransportEndpoint:
 
         accepting = asyncio.ensure_future(accept())
         try:
-            await asyncio.wait([accepting, failed],
+            await asyncio.wait({accepting, failed},
                                return_when=asyncio.FIRST_COMPLETED)
             # A handler's failure is the more informative of the two, and the
             # accept loop may have finished cleanly beside it.
@@ -175,23 +193,3 @@ class WebTransportRouter(_BaseRouter):
             super().add_route(path, run)
             return handler
         return super().add_route(path, handler)
-
-
-def http_version(request_or_scope):
-    """"1.0", "1.1", "2" or "3" -- whatever carried this request."""
-    scope = getattr(request_or_scope, "scope", request_or_scope)
-    return scope.get("http_version", "1.1")
-
-
-def is_http3(request_or_scope):
-    return http_version(request_or_scope) == "3"
-
-
-def supports_webtransport(request_or_scope):
-    scope = getattr(request_or_scope, "scope", request_or_scope)
-    return "webtransport" in (scope.get("extensions") or {})
-
-
-def session_from(scope, receive, send):
-    """A session built straight from an ASGI call, for custom routing."""
-    return WebTransportSession(scope, receive, send)

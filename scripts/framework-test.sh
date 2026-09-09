@@ -186,5 +186,16 @@ else
 fi
 
 echo
+echo "FastAPI through WebTransportRouter"
+start $ASGI_PORT fastapi_app:wt
+H="http://127.0.0.1:$ASGI_PORT"
+has "HTTP still works when the router is in front" \
+    "$(curl -sS --max-time 10 $H/)" '"hello":"peregrine"'
+has "lifespan still ran underneath the router" \
+    "$(curl -sS --max-time 10 $H/)" '"started":true'
+has "HTTP/1.1 does not advertise WebTransport on the request" \
+    "$(curl -sS --max-time 10 $H/proto)" '"webtransport":false'
+
+echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

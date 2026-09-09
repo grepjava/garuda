@@ -194,6 +194,7 @@ PyObject *pg_list_get(PyObject *l, pg_ssize_t i) {
 
 PyObject *pg_dict_new(void) { return PyDict_New(); }
 PyObject *pg_dict_copy(PyObject *d) { return PyDict_Copy(d); }
+PyObject *pg_mapping_proxy(PyObject *d) { return PyDictProxy_New(d); }
 int pg_dict_contains(PyObject *d, PyObject *k) { return PyDict_Contains(d, k); }
 int pg_dict_set(PyObject *d, PyObject *k, PyObject *v) { return PyDict_SetItem(d, k, v); }
 PyObject *pg_dict_get(PyObject *d, PyObject *k) {

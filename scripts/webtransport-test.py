@@ -36,6 +36,7 @@ except ImportError:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 CLOSE_WEBTRANSPORT_SESSION = 0x2843
 
@@ -369,6 +370,14 @@ async def streams():
             is_("a large stream survives flow control",
                 (len(body) if body else 0), len(b"echo:") + 400000)
 
+            hold = client.connect_session("/wt-hold")
+            await client.await_session(hold)
+            client.open_stream(hold, data=b"x" * (2 * 1024 * 1024), end=False)
+            fast = client.open_stream(hold, data=b"hello", end=True)
+            body = await client.wait_stream(fast, timeout=15)
+            is_("an unread stream does not stall the others",
+                body, b"echo:hello")
+
 
 async def server_streams():
     print("\nServer-initiated streams")
@@ -548,6 +557,11 @@ async def frameworks():
                       % label,
                       status == b"200" and b'"http_version"' in body
                       and b'"3"' in body, (status, body))
+                check("%s: an HTTP/3 request advertises WebTransport"
+                      % label,
+                      b'"webtransport": true' in body
+                      or b'"webtransport":true' in body,
+                      body)
 
     # Two things only one of the two examples exercises.
     with Server(app="fastapi_app:wt", env=env) as server:
@@ -573,6 +587,17 @@ async def frameworks():
             is_("fastapi: an unrouted path is 404", headers.get(b":status"),
                 b"404")
 
+            known = set(client.stream_ended)
+            counted = client.connect_session("/wt/n/7")
+            await client.await_session(counted)
+            _, body = await client.wait_new_stream(known)
+            is_("fastapi: a {count:int} converter converts", body, b"n=7")
+
+            slashed = client.connect_session("/wt/echo/")
+            headers = await client.await_session(slashed)
+            is_("fastapi: a trailing slash still matches",
+                headers.get(b":status"), b"200")
+
     with Server(app="django_app:asgi_application", env=env) as server:
         async with connect("127.0.0.1", server.port,
                            configuration=configuration(),
@@ -582,6 +607,11 @@ async def frameworks():
             await client.await_session(counted)
             _, body = await client.wait_new_stream(known)
             is_("django: an <int:> converter converts", body, b"n=42")
+
+            noslash = client.connect_session("/wt/n/42")
+            headers = await client.await_session(noslash)
+            is_("django: a missing trailing slash still matches",
+                headers.get(b":status"), b"200")
 
 
 class Channel:
@@ -698,14 +728,18 @@ async def session_helper():
 
 
 def main():
+    import contrib_test
+    contrib_test.run_all(ok, is_, check, bad)
+    run(session_helper())
+
     if not os.path.exists(BIN):
         sys.stderr.write("no peregrine binary at %s\n" % BIN)
+        print("\n%d passed, %d failed (server tests skipped)" % (PASS, FAIL))
         return 2
     if make_certs() == (None, None):
         sys.stderr.write("openssl is needed to generate a test certificate\n")
         return 2
 
-    run(session_helper())
     run(settings_and_handshake())
     run(streams())
     run(server_streams())

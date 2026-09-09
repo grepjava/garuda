@@ -84,7 +84,7 @@ from peregrine.contrib.fastapi import http_version, is_http3, supports_webtransp
 @app.get("/proto")
 def proto(request: Request):
     return {"http_version": http_version(request),      # "1.1", "2" or "3"
-            "webtransport": supports_webtransport(request)}
+            "webtransport": supports_webtransport(request)}  # True on HTTP/3
 ```
 
 [examples/fastapi_app.py:72](examples/fastapi_app.py#L72). This is for feature
@@ -126,23 +126,32 @@ async def echo(session):
 ```
 
 and the class, mirroring Starlette's `WebSocketEndpoint`
-([WTChat](examples/fastapi_app.py#L116)), which dispatches streams and
+([WTChat](examples/fastapi_app.py#L125)), which dispatches streams and
 datagrams concurrently so neither waits on the other:
 
 ```python
 class Chat(WebTransportEndpoint):
     async def on_connect(self):     await self.session.accept()
-    async def on_stream(self, s):   await s.send(b"chat:" + await s.read(), end=True)
+    async def on_stream(self, s):
+        body = await s.read()
+        if s.bidirectional:
+            await s.send(b"chat:" + body, end=True)
+        else:
+            reply = await self.session.create_stream(bidirectional=False)
+            await reply.send(b"chat:" + body, end=True)
     async def on_datagram(self, d): await self.session.send_datagram(b"chat:" + d)
 
 wt.add_route("/wt/chat", Chat)
 ```
 
-`{name}` in a path is a single-segment parameter, in Starlette's spelling, and
-arrives as `session.path_params["name"]`
-([/wt/room/{name}](examples/fastapi_app.py#L106)). Closing without accepting
-refuses the session with an HTTP status
-([/wt/reject](examples/fastapi_app.py#L129)); an unrouted path gets a 404.
+`{name}` in a path is a single-segment parameter, in Starlette's spelling;
+`{name:int}`, `{name:uuid}`, `{name:path}` and `{name:slug}` convert the same
+way Starlette's HTTP router does. They arrive as `session.path_params["name"]`
+([/wt/room/{name}](examples/fastapi_app.py#L106),
+[/wt/n/{count:int}](examples/fastapi_app.py#L116)). A missing or extra trailing
+slash is tried the other way — a session cannot be HTTP-redirected. Closing
+without accepting refuses the session with an HTTP status
+([/wt/reject](examples/fastapi_app.py#L143)); an unrouted path gets a 404.
 
 ---
 
@@ -233,8 +242,9 @@ async def count(session):
     count = session.path_params["count"]            # an int, converted
 ```
 
-`<str:>`, `<int:>`, `<slug:>` and `<uuid:>` are understood, the leading slash is
-optional, and `<int:>` converts rather than handing you a string.
+`<str:>`, `<int:>`, `<slug:>`, `<uuid:>` and `<path:>` are understood, the
+leading slash is optional, `<int:>` and `<uuid:>` convert rather than handing
+you a string, and a missing trailing slash is still matched.
 
 ### Settings worth knowing about
 
@@ -277,11 +287,12 @@ The suites do not rely on curl having HTTP/3, and drive both frameworks with
 `aioquic` instead:
 
 ```bash
-bash scripts/framework-test.sh                  # 27 checks: HTTP/1.1 and
+bash scripts/framework-test.sh                  # 30 checks: HTTP/1.1 and
                                                 #   HTTP/2 against both,
                                                 #   Starlette and Channels
                                                 #   websockets
-<venv>/bin/python scripts/webtransport-test.py  # 51 checks, of which 17 drive
+python3 scripts/contrib_test.py                 # 58 Python-only: routing
+<venv>/bin/python scripts/webtransport-test.py  # 115 checks, of which 22 drive
                                                 #   FastAPI and Django over
                                                 #   HTTP/3 and WebTransport
 ```

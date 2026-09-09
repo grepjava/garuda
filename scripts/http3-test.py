@@ -229,6 +229,8 @@ async def basics():
             status, _, body = await client.request("GET", "/scope")
             check("the scope reports HTTP/3", b'"http_version": "3"' in body, body[:200])
             check("the scope reports https", b'"scheme": "https"' in body, body[:200])
+            check("an HTTP/3 request advertises the WebTransport extension",
+                  b'"webtransport"' in body, body[:300])
 
 
 async def request_bodies():

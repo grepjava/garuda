@@ -173,10 +173,11 @@ The full suites, from a checkout, want a virtualenv with `aioquic`, `h2`,
 swift test                                      # 114 unit tests
 bash scripts/integration-test.sh                #  38 end-to-end checks
 python3 scripts/feature-test.py                 # 102 failure-mode checks
-bash scripts/framework-test.sh                  #  27 against FastAPI, Django
+bash scripts/framework-test.sh                  #  30 against FastAPI, Django
 <venv>/bin/python scripts/http2-test.py         # 116 against `h2`
-<venv>/bin/python scripts/http3-test.py         #  73 against `aioquic`
-<venv>/bin/python scripts/webtransport-test.py  #  51 against `aioquic`
+<venv>/bin/python scripts/http3-test.py         #  74 against `aioquic`
+python3 scripts/contrib_test.py                 #  58 Python-only
+<venv>/bin/python scripts/webtransport-test.py  # 115 including FastAPI/Django
 ```
 
 ---

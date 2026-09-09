@@ -19,9 +19,9 @@ session has to be answered before it reaches Django:
         ...
 
 Everything that is not a WebTransport session goes to Django untouched. Paths
-are written the way Django writes them -- `<str:name>`, `<int:name>`, `<slug:name>`
-and `<uuid:name>` are understood, and a leading slash is optional so a route
-reads like a `urlpatterns` entry.
+are written the way Django writes them -- `<str:name>`, `<int:name>`,
+`<slug:name>`, `<uuid:name>` and `<path:name>` are understood, and a leading
+slash is optional so a route reads like a `urlpatterns` entry.
 
 Django needs no integration at all for HTTP/3: a request is the same request
 whatever carried it, and `request.is_secure()`, `request.scheme` and
@@ -31,59 +31,41 @@ applications that want to know anyway.
 
 import re
 
+from .asgi import CONVERTERS as _CONVERTERS
 from .asgi import AltSvcMiddleware
 from .asgi import WebTransportRouter as _BaseRouter
+from .asgi import session_from, supports_webtransport
 
 __all__ = [
     "WebTransportRouter",
     "AltSvcMiddleware",
     "http_version",
     "is_http3",
+    "supports_webtransport",
+    "session_from",
 ]
 
-# Django's path() converters, as far as a single path segment is concerned.
+# Django's path() converters: `<int:pk>`, or `<name>` which is `str`.
 _CONVERTER = re.compile(r"<(?:([a-z]+):)?([A-Za-z_][A-Za-z0-9_]*)>")
-_INT = re.compile(r"^[0-9]+$")
 
 
 class WebTransportRouter(_BaseRouter):
-    """The generic router, with Django's path syntax and int conversion."""
+    """The generic router, with Django's path syntax and converter types."""
+
+    # Django's `path` converter is `.+` (at least one character); Starlette's
+    # is `.*`. Keep each framework's own rule.
+    converters = dict(_CONVERTERS)
+    converters["path"] = (r".+", None)
 
     def add_route(self, path, handler):
         if not path.startswith("/"):
             path = "/" + path
-        converters = {}
 
         def translate(match):
             kind, name = match.group(1) or "str", match.group(2)
-            converters[name] = kind
-            return "{%s}" % name
+            return "{%s:%s}" % (name, kind)
 
-        translated = _CONVERTER.sub(translate, path)
-        if converters:
-            handler = _Converting(handler, converters)
-        return super().add_route(translated, handler)
-
-
-class _Converting:
-    """Applies Django's converter semantics to what the pattern matched."""
-
-    def __init__(self, handler, converters):
-        self.handler = handler
-        self.converters = converters
-
-    async def __call__(self, session):
-        params = session.scope.get("path_params") or {}
-        for name, kind in self.converters.items():
-            value = params.get(name)
-            if value is None:
-                continue
-            if kind == "int":
-                if not _INT.match(value):
-                    await session.close(code=404)
-                    return
-                params[name] = int(value)
-        await self.handler(session)
+        return super().add_route(_CONVERTER.sub(translate, path), handler)
 
 
 def http_version(request):
@@ -92,10 +74,12 @@ def http_version(request):
     Takes a Django `HttpRequest` of either kind, or a raw ASGI scope, because a
     WebTransport endpoint has one and not the other.
 
-    The scope is consulted before `META`, and that order is load-bearing: an
-    `ASGIRequest` carries both, but Django builds its `META` from the scope by
-    hand and puts no `SERVER_PROTOCOL` in it. Reading `META` first would answer
-    "1.1" for every request Django ever serves over ASGI, HTTP/3 included.
+    The scope is consulted before `META`. An `ASGIRequest` carries both, but
+    Django builds `META` from the scope by hand and historically omitted
+    `SERVER_PROTOCOL`; reading `META` first would report "1.1" for every ASGI
+    request, HTTP/3 included. WSGI requests have no scope and fall through to
+    `SERVER_PROTOCOL`, which peregrine sets to `HTTP/2` or `HTTP/3` when that
+    is what carried them.
     """
     scope = getattr(request, "scope", None)
     if isinstance(scope, dict) and "http_version" in scope:

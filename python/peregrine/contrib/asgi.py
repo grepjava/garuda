@@ -19,6 +19,7 @@ router cannot do: it would assert on the scope type first.
 """
 
 import re
+import uuid
 
 from ..webtransport import WebTransportSession
 
@@ -28,24 +29,71 @@ __all__ = [
     "http_version",
     "is_http3",
     "supports_webtransport",
+    "session_from",
 ]
 
-_PARAM = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+def _to_uuid(value):
+    return uuid.UUID(value)
+
+
+# Starlette's convertors, plus Django's `slug`. `{name}` is `str`.
+CONVERTERS = {
+    "str": (r"[^/]+", None),
+    "int": (r"[0-9]+", int),
+    "float": (r"[0-9]+(?:\.[0-9]+)?", float),
+    "uuid": (
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        _to_uuid,
+    ),
+    "path": (r".*", None),
+    "slug": (r"[-a-zA-Z0-9_]+", None),
+}
+
+_PARAM = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)(?::([a-z]+))?\}")
 
 
 class _Route:
-    """One path pattern. `{name}` matches a single path segment."""
+    """One path pattern. `{name}` and `{name:int}` match the way Starlette does."""
 
-    def __init__(self, path, handler):
+    def __init__(self, path, handler, converters=None):
         self.path = path
         self.handler = handler
-        pattern = "^" + _PARAM.sub(r"(?P<\1>[^/]+)", re.escape(path)
-                                   .replace(r"\{", "{").replace(r"\}", "}")) + "$"
-        self.regex = re.compile(pattern)
+        self.converters = {}
+        converters = converters if converters is not None else CONVERTERS
+        parts = []
+        remainder = path
+        while True:
+            found = _PARAM.search(remainder)
+            if found is None:
+                parts.append(re.escape(remainder))
+                break
+            parts.append(re.escape(remainder[:found.start()]))
+            name, kind = found.group(1), found.group(2) or "str"
+            spec = converters.get(kind)
+            if spec is None:
+                raise ValueError("unknown path converter %r in %r" % (kind, path))
+            if name in self.converters:
+                raise ValueError("duplicate path parameter %r in %r" % (name, path))
+            pattern, convert = spec
+            self.converters[name] = convert
+            parts.append("(?P<%s>%s)" % (name, pattern))
+            remainder = remainder[found.end():]
+        self.regex = re.compile("^" + "".join(parts) + "$")
 
     def match(self, path):
         found = self.regex.match(path)
-        return found.groupdict() if found else None
+        if found is None:
+            return None
+        params = found.groupdict()
+        try:
+            for name, convert in self.converters.items():
+                if convert is not None and name in params:
+                    params[name] = convert(params[name])
+        except (ValueError, TypeError):
+            return None
+        return params
 
 
 class WebTransportRouter:
@@ -57,6 +105,8 @@ class WebTransportRouter:
     serves nothing else.
     """
 
+    converters = CONVERTERS
+
     def __init__(self, app=None, routes=None):
         self.app = app
         self.routes = []
@@ -66,7 +116,7 @@ class WebTransportRouter:
     # -- registration ------------------------------------------------------
 
     def add_route(self, path, handler):
-        self.routes.append(_Route(path, handler))
+        self.routes.append(_Route(path, handler, self.converters))
         return handler
 
     def route(self, path):
@@ -78,6 +128,13 @@ class WebTransportRouter:
 
     # -- ASGI --------------------------------------------------------------
 
+    def _lookup(self, path):
+        for route in self.routes:
+            params = route.match(path)
+            if params is not None:
+                return route, params
+        return None, None
+
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "webtransport":
             if self.app is None:
@@ -87,16 +144,30 @@ class WebTransportRouter:
             return
 
         path = scope.get("path", "/")
-        for route in self.routes:
-            params = route.match(path)
-            if params is None:
-                continue
+        route, params = self._lookup(path)
+        if route is None:
+            # A session cannot be redirected the way an HTTP request can, so
+            # a missing or extra trailing slash is tried the other way rather
+            # than refused. Exact matches still win.
+            alt = path[:-1] if path.endswith("/") and path != "/" else path + "/"
+            route, params = self._lookup(alt)
+        if route is not None:
             scope = dict(scope)
             scope["path_params"] = params
             session = WebTransportSession(scope, receive, send)
-            await route.handler(session)
-            if not session.closed:
-                await session.close()
+            error = None
+            try:
+                await route.handler(session)
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                if not session.closed:
+                    try:
+                        await session.close()
+                    except Exception:
+                        if error is None:
+                            raise
             return
 
         # No endpoint here. Refusing before accepting is an HTTP failure,
@@ -132,7 +203,7 @@ class AltSvcMiddleware:
         async def wrapped(message):
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers") or [])
-                if not any(k.lower() == b"alt-svc" for k, _ in headers):
+                if not any(_header_is(k, b"alt-svc") for k, _ in headers):
                     headers.append((b"alt-svc", self.value))
                 message = dict(message, headers=headers)
             await send(message)
@@ -142,7 +213,10 @@ class AltSvcMiddleware:
 
 def http_version(scope):
     """"1.0", "1.1", "2" or "3" -- whatever carried this request."""
-    return scope.get("http_version", "1.1")
+    scope = getattr(scope, "scope", scope)
+    if isinstance(scope, dict):
+        return scope.get("http_version", "1.1")
+    return "1.1"
 
 
 def is_http3(scope):
@@ -150,8 +224,27 @@ def is_http3(scope):
 
 
 def supports_webtransport(scope):
-    """Whether this server offers the WebTransport extension."""
+    """Whether this connection offers the WebTransport extension.
+
+    True on a `webtransport` scope, and on an HTTP/3 request whose server
+    advertised the extension. HTTP/1.1 and HTTP/2 never do -- WebTransport
+    is HTTP/3 only.
+    """
+    scope = getattr(scope, "scope", scope)
+    if not isinstance(scope, dict):
+        return False
     return "webtransport" in (scope.get("extensions") or {})
+
+
+def session_from(scope, receive, send):
+    """A session built straight from an ASGI call, for custom routing."""
+    return WebTransportSession(scope, receive, send)
+
+
+def _header_is(name, expected):
+    if isinstance(name, bytes):
+        return name.lower() == expected
+    return str(name).lower() == expected.decode()
 
 
 async def _not_found(scope, send):

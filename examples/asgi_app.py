@@ -92,6 +92,7 @@ async def app(scope, receive, send):
             "server": list(scope["server"]) if scope.get("server") else None,
             "state": dict(scope.get("state") or {}),
             "headers": {k.decode(): v.decode() for k, v in scope["headers"]},
+            "extensions": list((scope.get("extensions") or {}).keys()),
             "startup_ran": startup_ran,
         }
         import json
@@ -315,8 +316,19 @@ async def webtransport_endpoint(scope, receive, send):
     /wt-reject   refuses the session
     /wt-push     opens a server-initiated stream and writes to it
     /wt-close    accepts, then closes with a code and a reason
+    /wt-hold     accepts two streams, never reads the first, echoes the second
     """
     path = scope["path"]
+
+    if path == "/wt-hold":
+        from peregrine.webtransport import WebTransportSession
+        session = WebTransportSession(scope, receive, send)
+        await session.accept()
+        _held = await session.accept_stream()
+        live = await session.accept_stream()
+        await live.send(b"echo:" + await live.read(), end=True)
+        await session.close()
+        return
 
     message = await receive()
     assert message["type"] == "webtransport.connect", message

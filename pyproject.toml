@@ -9,7 +9,7 @@ description = "A Python ASGI/WSGI server written in Swift"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["asgi", "wsgi", "server", "http", "websockets"]
+keywords = ["asgi", "wsgi", "server", "http", "http2", "http3", "quic", "websockets", "webtransport"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Web Environment",
@@ -28,7 +28,7 @@ uvloop = ["uvloop>=0.19"]
 peregrine = "peregrine.__main__:main"
 
 [project.urls]
-Source = "https://github.com/example/peregrine"
+Source = "https://github.com/grepjava/peregrine"
 
 [tool.setuptools]
 package-dir = { "" = "python" }

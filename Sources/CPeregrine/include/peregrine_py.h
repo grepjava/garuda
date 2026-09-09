@@ -114,6 +114,9 @@ PyObject *pg_dict_new(void);
 /* Shallow copy. Copying a prepared prototype beats re-inserting the fifteen
  * constant WSGI environ entries on every request. */
 PyObject *pg_dict_copy(PyObject *d);
+/* Read-only view. Interned scope dicts are shared across requests; a proxy
+ * is what makes "applications are not entitled to mutate this" true. */
+PyObject *pg_mapping_proxy(PyObject *d);
 int       pg_dict_contains(PyObject *d, PyObject *k);
 int       pg_dict_set(PyObject *d, PyObject *k, PyObject *v);
 PyObject *pg_dict_get(PyObject *d, PyObject *k);        /* borrowed, NULL if absent */

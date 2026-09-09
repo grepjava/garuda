@@ -25,6 +25,8 @@ public struct ASGIScopeBuilder {
     @usableFromInline let rootPathLength: Int
     /// Shared lifespan state, shallow-copied into each request scope.
     @usableFromInline var lifespanState: PyObj?
+    /// `{"webtransport": {}}` as a mappingproxy, interned for the worker.
+    @usableFromInline var webtransportExtensions: PyObj?
 
     public init?(scheme: UnsafePointer<CChar>,
                  rootPath: UnsafePointer<CChar>,
@@ -36,6 +38,7 @@ public struct ASGIScopeBuilder {
         self.scratch = UnsafeMutablePointer<UInt8>.allocate(capacity: scratchCapacity)
         self.headerNames = PyStringCache(capacityLog2: 9)
         self.lifespanState = lifespanState
+        self.webtransportExtensions = nil
 
         var rootLen = 0
         while rootPath[rootLen] != 0 { rootLen += 1 }
@@ -45,12 +48,16 @@ public struct ASGIScopeBuilder {
         self.prototype = proto
 
         // scope["asgi"] = {"version": "3.0", "spec_version": "2.3"}
+        // A mappingproxy so a write cannot leak into every later request:
+        // the prototype is shallow-copied, and this value is shared.
         guard let asgiDict = pg_dict_new() else { return nil }
         defer { pg_decref(asgiDict) }
         guard pg_dict_set(asgiDict, Interned[.version], Interned[.v30]) == 0,
               pg_dict_set(asgiDict, Interned[.specVersion], Interned[.v23]) == 0,
-              pg_dict_set(proto, Interned[.type], Interned[.vHTTP]) == 0,
-              pg_dict_set(proto, Interned[.asgi], asgiDict) == 0
+              let asgiProxy = pg_mapping_proxy(asgiDict) else { return nil }
+        defer { pg_decref(asgiProxy) }
+        guard pg_dict_set(proto, Interned[.type], Interned[.vHTTP]) == 0,
+              pg_dict_set(proto, Interned[.asgi], asgiProxy) == 0
         else { return nil }
 
         guard let schemeObj = pg_str_intern(scheme),
@@ -74,6 +81,20 @@ public struct ASGIScopeBuilder {
         } else {
             pg_err_clear()
         }
+
+        // Shared across every HTTP/3 / WebTransport scope. Both dicts are
+        // wrapped so `scope["extensions"]["webtransport"]["x"] = 1` cannot
+        // mutate the interned object every later request would see.
+        guard let extensions = pg_dict_new(), let empty = pg_dict_new() else { return nil }
+        defer {
+            pg_decref(empty)
+            pg_decref(extensions)
+        }
+        guard let emptyProxy = pg_mapping_proxy(empty) else { return nil }
+        defer { pg_decref(emptyProxy) }
+        guard pg_dict_set(extensions, Interned[.vWebTransport], emptyProxy) == 0,
+              let extProxy = pg_mapping_proxy(extensions) else { return nil }
+        self.webtransportExtensions = extProxy
     }
 
     public func destroy() {
@@ -81,6 +102,7 @@ public struct ASGIScopeBuilder {
         pg_decref(prototype)
         headerNames.destroy()
         if let s = lifespanState { pg_decref(s) }
+        if let e = webtransportExtensions { pg_decref(e) }
     }
 
     /// Builds the scope for one request. Returns an owned reference.
@@ -101,23 +123,11 @@ public struct ASGIScopeBuilder {
             pg_decref(scope); return nil
         }
         if webtransport {
-            // ASGI has no standard WebTransport scope, so this one is
-            // Peregrine's, declared in `extensions` the way the specification
-            // says a server extension announces itself. Like a websocket it has
+            // ASGI has no standard WebTransport scope. Like a websocket it has
             // no method: the CONNECT that carried it is the transport, not the
-            // request the application is answering.
+            // request the application is answering. The extension itself is
+            // advertised below, after `http_version` is known.
             if pg_dict_set(scope, Interned[.type], Interned[.vWebTransport]) != 0 {
-                pg_decref(scope); return nil
-            }
-            guard let extensions = pg_dict_new(), let empty = pg_dict_new() else {
-                pg_decref(scope); return nil
-            }
-            defer {
-                pg_decref(extensions)
-                pg_decref(empty)
-            }
-            if pg_dict_set(extensions, Interned[.vWebTransport], empty) != 0
-                || pg_dict_set(scope, Interned[.extensions], extensions) != 0 {
                 pg_decref(scope); return nil
             }
         }
@@ -142,13 +152,26 @@ public struct ASGIScopeBuilder {
 
         // http_version
         let httpVersion: PyObj
+        var http3 = false
         switch head.httpMajor {
         case 2: httpVersion = Interned[.v2]
-        case 3: httpVersion = Interned[.v3]
+        case 3:
+            httpVersion = Interned[.v3]
+            http3 = true
         default: httpVersion = head.httpMinor == 1 ? Interned[.v11] : Interned[.v10]
         }
         if pg_dict_set(scope, Interned[.httpVersion], httpVersion) != 0 {
             pg_decref(scope); return nil
+        }
+
+        // Advertise on the session itself, and on ordinary HTTP/3 requests so
+        // an application can feature-detect without waiting for a CONNECT.
+        // HTTP/1.1 and HTTP/2 never carry WebTransport.
+        if webtransport || http3 {
+            if let ext = webtransportExtensions,
+               pg_dict_set(scope, Interned[.extensions], ext) != 0 {
+                pg_decref(scope); return nil
+            }
         }
 
         // method

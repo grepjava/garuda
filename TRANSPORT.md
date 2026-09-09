@@ -261,8 +261,10 @@ or oversized control frame, an invalid close code and non-UTF-8 text are each a
 protocol failure with the close code RFC 6455 prescribes.
 
 WebSocket over HTTP/2 and HTTP/3 (RFC 8441 / RFC 9220) is not implemented.
-`SETTINGS_ENABLE_CONNECT_PROTOCOL` is advertised, but `webtransport` is the
-only `:protocol` served.
+HTTP/3 advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` because that is how
+WebTransport arrives; `webtransport` is the only `:protocol` served. HTTP/2
+does not advertise it — nothing here would answer an extended CONNECT on that
+connection.
 
 ---
 
@@ -314,6 +316,8 @@ announced the way the specification says a server extension should be, in
 | `webtransport.close` | `code`, `reason` |
 | `webtransport.stream.open` | `bidirectional` |
 | `webtransport.stream.send` | `stream`, `data`, `end_stream` |
+| `webtransport.stream.pause` | `stream` |
+| `webtransport.stream.resume` | `stream` |
 | `webtransport.datagram.send` | `data` |
 
 ```python
@@ -340,9 +344,12 @@ Three details worth knowing:
 - **A stream the application opens is answered with
   `webtransport.stream.opened`** rather than by a return value, because ASGI's
   `send()` returns nothing. They arrive in the order they were asked for.
-- **Backpressure is the transport's.** The receive window only reopens as the
-  application reads, and `await send()` waits when the session has more queued
-  than acknowledged.
+- **Backpressure is the transport's, per stream.** `webtransport.stream.pause`
+  stops delivering one stream: its bytes stay in the QUIC receive buffer and
+  its window does not reopen. `resume` starts it again. The session's
+  `receive()` FIFO is not paused, so every other stream and every datagram
+  still move. `await send()` waits when the session has more queued than
+  acknowledged.
 
 Before accept, `webtransport.close` refuses the session with an HTTP status: a
 code in 400–599 is used as one, anything else becomes 403.
@@ -386,16 +393,18 @@ async def chat(session):
     ...
 ```
 
-Paths keep each framework's own spelling — `{room}` for Starlette, Django's
-`<str:room>` and `<int:count>` converters for Django.
+Paths keep each framework's own spelling — `{room}` and `{count:int}` for
+Starlette, Django's `<str:room>` and `<int:count>` converters for Django. A
+missing or extra trailing slash is tried the other way: a session cannot be
+HTTP-redirected.
 
 `peregrine.webtransport.WebTransportSession` is what those hand the endpoint,
 and it is framework-agnostic: it demultiplexes the one ASGI `receive()` channel
 into streams, datagrams and the answers to stream-open requests, so an endpoint
 reads a stream as an async iterator rather than running its own state machine.
-Its queues are bounded, and a full queue stops the pump — which stops the
-flow-control window reopening, which stops the peer. Backpressure is preserved
-rather than turned into memory.
+A full stream queue pauses that stream at the server rather than stopping the
+pump. Datagrams drop the oldest when their queue is full, matching the server.
+The queues are bounds, not buffers.
 
 FastAPI also gets `WebTransportEndpoint`, the class-based form that mirrors
 Starlette's `WebSocketEndpoint`, with `on_connect` / `on_stream` / `on_datagram`
@@ -462,8 +471,9 @@ only that the understanding is consistent.
 
 ```bash
 <venv>/bin/python scripts/http2-test.py         # 116 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  65 checks against `aioquic`
-<venv>/bin/python scripts/webtransport-test.py  #  42 checks against `aioquic`
+<venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
+python3 scripts/contrib_test.py                 #  58 Python-only
+<venv>/bin/python scripts/webtransport-test.py  # 115 including FastAPI/Django
 
 h2spec -h 127.0.0.1 -p 8443 -t -k               # 146/146
 ```

@@ -21,12 +21,12 @@ in every endpoint is both tedious and easy to get wrong.
             data = await stream.read()
             await stream.send(b"echo:" + data, end=True)
 
-Backpressure is preserved rather than papered over. The pump stops reading as
-soon as any queue is full, which stops the flow-control window from reopening,
-which stops the peer -- so a session nobody is reading costs the peer's window
-rather than this process's memory. The cost is that one unread stream holds up
-the others in the same session; the queues are sized so that only an
-application that has stopped reading entirely will notice.
+Backpressure is per stream, not per session. A full stream queue sends
+`webtransport.stream.pause`, which leaves that stream's bytes in the QUIC
+buffer so its window does not reopen. The pump keeps reading, so every other
+stream and every datagram still move. `resume` is sent when the application
+drains the queue again. Datagrams are unreliable: a full datagram queue drops
+the oldest, matching the server.
 """
 
 import asyncio
@@ -69,6 +69,8 @@ class WebTransportStream:
         self.bidirectional = bidirectional
         self.session = session
         self._queue = asyncio.Queue(maxsize=STREAM_QUEUE)
+        self._pending = []
+        self._paused = False
         self._eof = False
         self._writable = writable
         self._ended = False
@@ -77,17 +79,25 @@ class WebTransportStream:
 
     @property
     def at_eof(self):
-        return self._eof and self._queue.empty()
+        return self._eof and self._queue.empty() and not self._pending
 
     async def receive(self):
         """The next run of bytes, or None once the stream has ended."""
-        if self._eof and self._queue.empty():
+        if self._eof and self._queue.empty() and not self._pending:
             return None
+        self._pull_pending()
         chunk = await self._queue.get()
+        self._pull_pending()
         if chunk is _END:
             self._eof = True
+            await self.session._maybe_resume(self)
             return None
+        await self.session._maybe_resume(self)
         return chunk
+
+    def _pull_pending(self):
+        while self._pending and not self._queue.full():
+            self._queue.put_nowait(self._pending.pop(0))
 
     async def read(self):
         """Everything the peer sends, as one `bytes`."""
@@ -121,7 +131,7 @@ class WebTransportStream:
         await self.session._send({
             "type": "webtransport.stream.send",
             "stream": self.id,
-            "data": bytes(data),
+            "data": _as_bytes(data),
             "end_stream": bool(end),
         })
         if end:
@@ -156,6 +166,7 @@ class WebTransportSession:
 
         self._streams = {}
         self._incoming = asyncio.Queue(maxsize=INCOMING_QUEUE)
+        self._held = []
         self._datagrams = asyncio.Queue(maxsize=DATAGRAM_QUEUE)
         self._opened = asyncio.Queue()
         self._pump = None
@@ -199,7 +210,9 @@ class WebTransportSession:
             raise WebTransportError("the session has already been accepted")
         message = {"type": "webtransport.accept"}
         if headers:
-            message["headers"] = [(bytes(k), bytes(v)) for k, v in headers]
+            message["headers"] = [(_as_bytes(k, "header name"),
+                                   _as_bytes(v, "header value"))
+                                  for k, v in headers]
         await self._raw_send(message)
         self.accepted = True
         self._pump = asyncio.ensure_future(self._run())
@@ -214,12 +227,14 @@ class WebTransportSession:
         if self.closed:
             return
         self.closed = True
-        await self._raw_send({
-            "type": "webtransport.close",
-            "code": int(code),
-            "reason": reason,
-        })
-        await self._stop()
+        try:
+            await self._raw_send({
+                "type": "webtransport.close",
+                "code": int(code),
+                "reason": reason,
+            })
+        finally:
+            await self._stop()
 
     async def _stop(self):
         if self._pump is not None:
@@ -232,8 +247,10 @@ class WebTransportSession:
         self._shut_down()
 
     def _shut_down(self):
+        self._held.clear()
         for stream in self._streams.values():
             stream._eof = True
+            stream._pending.clear()
             _put_nowait(stream._queue, _END)
         _put_nowait(self._incoming, _END)
         _put_nowait(self._datagrams, _END)
@@ -254,9 +271,9 @@ class WebTransportSession:
                 if kind == "webtransport.stream.receive":
                     await self._on_stream_data(message)
                 elif kind == "webtransport.datagram.receive":
-                    await self._datagrams.put(message["data"])
+                    self._offer_datagram(message.get("data") or b"")
                 elif kind == "webtransport.stream.opened":
-                    await self._opened.put(self._register_opened(message))
+                    _put_nowait(self._opened, self._register_opened(message))
                 elif kind == "webtransport.disconnect":
                     self.closed = True
                     self.close_code = message.get("code", 0)
@@ -311,13 +328,15 @@ class WebTransportSession:
             stream = WebTransportStream(self, stream_id, bidirectional,
                                         writable=bidirectional or locally_opened)
             self._streams[stream_id] = stream
-            if not locally_opened:
-                await self._incoming.put(stream)
+            if not locally_opened and not self._announce(stream):
+                await self._pause_stream(stream)
         data = message.get("data") or b""
         if data:
-            await stream._queue.put(data)
+            self._offer_chunk(stream, data)
         if not message.get("more_data", False):
-            await stream._queue.put(_END)
+            self._offer_chunk(stream, _END)
+        if (stream._queue.full() or stream._pending) and not stream._paused:
+            await self._pause_stream(stream)
 
     # -- streams -----------------------------------------------------------
 
@@ -341,7 +360,63 @@ class WebTransportSession:
         is easier to write against than one that raises.
         """
         self._require_started()
-        return await self._next(self._incoming)
+        stream = await self._next(self._incoming)
+        await self._release_held()
+        return stream
+
+    def _announce(self, stream):
+        try:
+            self._incoming.put_nowait(stream)
+            return True
+        except asyncio.QueueFull:
+            self._held.append(stream)
+            return False
+
+    def _offer_chunk(self, stream, item):
+        try:
+            stream._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            stream._pending.append(item)
+
+    def _offer_datagram(self, data):
+        if self._datagrams.full():
+            try:
+                self._datagrams.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        _put_nowait(self._datagrams, data)
+
+    async def _pause_stream(self, stream):
+        if stream._paused or self.closed:
+            return
+        stream._paused = True
+        await self._raw_send({
+            "type": "webtransport.stream.pause",
+            "stream": stream.id,
+        })
+
+    async def _maybe_resume(self, stream):
+        if not stream._paused or self.closed:
+            return
+        if stream in self._held:
+            return
+        if stream._queue.qsize() > STREAM_QUEUE // 2 or stream._pending:
+            return
+        stream._paused = False
+        await self._raw_send({
+            "type": "webtransport.stream.resume",
+            "stream": stream.id,
+        })
+
+    async def _release_held(self):
+        while self._held and not self._incoming.full():
+            stream = self._held.pop(0)
+            try:
+                self._incoming.put_nowait(stream)
+            except asyncio.QueueFull:
+                self._held.insert(0, stream)
+                return
+            await self._maybe_resume(stream)
 
     async def incoming_streams(self):
         """Async iterator over the streams the peer opens."""
@@ -357,7 +432,7 @@ class WebTransportSession:
         """Sends an unreliable datagram. Delivery is not promised."""
         self._require_accepted()
         await self._send({"type": "webtransport.datagram.send",
-                          "data": bytes(data)})
+                          "data": _as_bytes(data)})
 
     async def receive_datagram(self):
         """The next datagram, or None once the session ends.
@@ -414,6 +489,16 @@ class WebTransportSession:
         else:
             await self._stop()
         return False
+
+
+def _as_bytes(data, name="data"):
+    """Bytes, bytearray, memoryview, or str. Not an int -- `bytes(3)` is
+    three NULs, which is never what an application meant."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return bytes(data)
+    if isinstance(data, str):
+        return data.encode()
+    raise TypeError("%s must be bytes or str, not %s" % (name, type(data).__name__))
 
 
 def _put_nowait(queue, item):

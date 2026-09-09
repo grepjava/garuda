@@ -59,11 +59,12 @@ def proto(request):
     The view is identical whether it was reached over HTTP/1.1, HTTP/2 or
     HTTP/3 -- which is the point. Only the answer changes.
     """
-    from peregrine.contrib.django import http_version, is_http3
+    from peregrine.contrib.django import http_version, is_http3, supports_webtransport
     return JsonResponse({
         "http_version": http_version(request),
         "http3": is_http3(request),
         "scheme": request.scheme,
+        "webtransport": supports_webtransport(request),
     })
 
 

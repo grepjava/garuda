@@ -113,11 +113,25 @@ async def wt_room(session):
         pass
 
 
+@wt.route("/wt/n/{count:int}")
+async def wt_count(session):
+    await session.accept()
+    stream = await session.create_stream(bidirectional=False)
+    await stream.send(("n=%d" % session.path_params["count"]).encode(), end=True)
+    async for _ in session.incoming_streams():
+        pass
+
+
 class WTChat(WebTransportEndpoint):
     """The class-based form, and the only endpoint here doing datagrams."""
 
     async def on_stream(self, stream):
-        await stream.send(b"chat:" + await stream.read(), end=True)
+        body = await stream.read()
+        if stream.bidirectional:
+            await stream.send(b"chat:" + body, end=True)
+        else:
+            reply = await self.session.create_stream(bidirectional=False)
+            await reply.send(b"chat:" + body, end=True)
 
     async def on_datagram(self, data):
         await self.session.send_datagram(b"chat:" + data)

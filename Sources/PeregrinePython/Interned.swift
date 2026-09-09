@@ -49,6 +49,7 @@ public enum PyKey: Int, CaseIterable {
     case vWebTransport
     case vWTConnect, vWTAccept, vWTClose, vWTDisconnect
     case vWTStreamOpen, vWTStreamOpened, vWTStreamReceive, vWTStreamSend
+    case vWTStreamPause, vWTStreamResume
     case vWTDatagramReceive, vWTDatagramSend
 
     // --- method names for the ASGI scope ---
@@ -92,6 +93,7 @@ private let keyNames: [StaticString] = [
     "webtransport.disconnect",
     "webtransport.stream.open", "webtransport.stream.opened",
     "webtransport.stream.receive", "webtransport.stream.send",
+    "webtransport.stream.pause", "webtransport.stream.resume",
     "webtransport.datagram.receive", "webtransport.datagram.send",
 
     "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "TRACE",
