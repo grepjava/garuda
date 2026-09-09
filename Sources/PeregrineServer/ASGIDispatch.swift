@@ -505,12 +505,25 @@ extension Worker {
             return false
         }
 
+        if c.pointee.flags.contains(.responseComplete) {
+            pg_err_set_str(pg_exc_runtime(),
+                           "http.response.body after the response was completed")
+            return false
+        }
+
         var more = false
         if let moreObj = pg_dict_get(message, Interned[.moreBody]) {
             more = pg_is_true(moreObj) == 1
         }
 
+        // A declared Content-Length is a promise to the client and to every
+        // intermediary between here and it. Both ways of breaking it are
+        // handled the same way: keep the promise on the wire, tell the
+        // application it has a bug, and close the connection so that nothing
+        // is left half-said and no later request reuses it.
         let suppress = c.pointee.flags.contains(.suppressBody)
+        var overflow = false
+
         if let bodyObj = pg_dict_get(message, Interned[.body]), !suppress {
             var data: UnsafePointer<CChar>?
             var len: pg_ssize_t = 0
@@ -518,23 +531,54 @@ extension Worker {
             if pg_as_bytes(bodyObj, &data, &len, &owner) != 0 { return false }
             defer { pg_release_bytes(owner) }
             if len > 0, let data {
-                let p = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
-                if c.pointee.flags.contains(.chunkedResponse) {
-                    HTTPResponseWriter.writeChunk(&c.pointee.write, p, Int(len))
-                } else {
-                    c.pointee.write.write(p, Int(len))
+                var take = Int(len)
+                if c.pointee.responseRemaining >= 0 {
+                    // Writing past the declared length would run into the next
+                    // response on a keep-alive connection, which is response
+                    // smuggling however innocent the intent.
+                    if take > c.pointee.responseRemaining {
+                        take = c.pointee.responseRemaining
+                        overflow = true
+                    }
+                    c.pointee.responseRemaining -= take
+                }
+                if take > 0 {
+                    let p = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
+                    if c.pointee.flags.contains(.chunkedResponse) {
+                        HTTPResponseWriter.writeChunk(&c.pointee.write, p, take)
+                    } else {
+                        c.pointee.write.write(p, take)
+                    }
                 }
             }
         }
 
-        if !more {
+        // The other half of the same promise: a client told to expect N bytes
+        // and given fewer waits for the rest until its own timeout.
+        let short = !more && !suppress && c.pointee.responseRemaining > 0
+
+        if !more || overflow || short {
             if c.pointee.flags.contains(.chunkedResponse) && !suppress {
                 HTTPResponseWriter.writeLastChunk(&c.pointee.write)
             }
             c.pointee.flags.insert(.responseComplete)
             c.pointee.state = .writing
         }
+        if overflow || short {
+            c.pointee.flags.remove(.keepAlive)
+        }
         _ = flush(slot)
+
+        if overflow {
+            pg_err_set_str(pg_exc_runtime(),
+                           "response body is longer than the declared Content-Length")
+            return false
+        }
+        if short {
+            pg_err_set_str(pg_exc_runtime(),
+                           "response ended before the declared Content-Length was sent")
+            return false
+        }
         return true
     }
 

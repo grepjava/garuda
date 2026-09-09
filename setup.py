@@ -6,6 +6,13 @@ source distribution and is compiled at install time: the interpreter it links
 must be the interpreter it will run applications for, and only the installing
 environment knows which one that is.
 
+That also decides how the wheel is tagged. Setuptools sees a pure-Python
+package containing a data file and would tag it `py3-none-any`, which claims
+the artifact works on any interpreter on any platform -- the opposite of the
+truth for a native executable with a hard libpython dependency. The wheel is
+therefore tagged for the exact CPython and platform it was built against, so
+pip refuses it anywhere it would not actually run.
+
 Requirements at install time:
   * a Swift toolchain (swift 6.1 or newer) on PATH
   * the Python development files for the interpreter being installed into,
@@ -13,6 +20,7 @@ Requirements at install time:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +28,15 @@ import sysconfig
 
 from setuptools import setup
 from setuptools.command.build_py import build_py
+from setuptools.dist import Distribution
+
+try:                                    # setuptools >= 70.1 vendors its own
+    from setuptools.command.bdist_wheel import bdist_wheel
+except ImportError:                     # older setuptools defers to `wheel`
+    try:
+        from wheel.bdist_wheel import bdist_wheel
+    except ImportError:
+        bdist_wheel = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BINARY = "peregrine"
@@ -28,6 +45,10 @@ BINARY = "peregrine"
 def _fail(message):
     sys.stderr.write("\nperegrine: %s\n\n" % message)
     raise SystemExit(1)
+
+
+def _running_version():
+    return "%d.%d" % sys.version_info[:2]
 
 
 def _check_toolchain():
@@ -47,6 +68,44 @@ def _check_toolchain():
             "(python3-dev on Debian and Ubuntu, python3-devel on Fedora,\n"
             "or a python.org / Homebrew framework build on macOS)."
         )
+    # pkg-config decides what Swift links, and it is not obliged to point at
+    # the interpreter running this build. Catching that here gives a clear
+    # message instead of a wheel that fails at import time.
+    version = subprocess.run(["pkg-config", "--modversion", "python3-embed"],
+                             capture_output=True, text=True)
+    resolved = version.stdout.strip()
+    if resolved and not resolved.startswith(_running_version()):
+        _fail(
+            "pkg-config resolves python3-embed to Python %s, but this build is\n"
+            "running under Python %s. The server would embed the wrong\n"
+            "interpreter. Install the development files for %s, or run pip\n"
+            "from the interpreter you intend to serve with."
+            % (resolved, _running_version(), _running_version())
+        )
+
+
+def _linked_version(binary):
+    """Asks the built binary which libpython it actually bound.
+
+    The authority is the binary, not pkg-config and not the headers: it reports
+    Py_GetVersion() from the library the loader resolved.
+    """
+    result = subprocess.run([binary, "--version"], capture_output=True, text=True)
+    match = re.search(r"CPython (\d+)\.(\d+)", result.stdout)
+    if not match:
+        return None
+    return "%s.%s" % (match.group(1), match.group(2))
+
+
+class BinaryDistribution(Distribution):
+    """Tells setuptools the package is platform-specific despite having no
+    Python extension modules of its own."""
+
+    def has_ext_modules(self):
+        return True
+
+    def is_pure(self):
+        return False
 
 
 class BuildWithSwift(build_py):
@@ -66,6 +125,19 @@ class BuildWithSwift(build_py):
         if not os.path.exists(built):
             _fail("the Swift build produced no binary at %s" % built)
 
+        linked = _linked_version(built)
+        if linked is None:
+            _fail("the built binary did not report its embedded interpreter; "
+                  "it may not have linked correctly.")
+        if linked != _running_version():
+            _fail(
+                "the built binary embeds Python %s but this build is running\n"
+                "under Python %s. The wheel would be tagged for the wrong\n"
+                "interpreter and the server would serve applications with a\n"
+                "different Python than the one its dependencies are installed\n"
+                "for." % (linked, _running_version())
+            )
+
         super().run()
 
         target_dir = os.path.join(self.build_lib, "peregrine", "_bin")
@@ -73,11 +145,33 @@ class BuildWithSwift(build_py):
         target = os.path.join(target_dir, BINARY)
         shutil.copy2(built, target)
         os.chmod(target, 0o755)
-        # Record what this binary was linked against, so the launcher can warn
-        # rather than fail obscurely when it is run under a different one.
+        # Recorded from the binary itself, so the launcher warns against the
+        # interpreter that is really embedded rather than the one that built it.
         with open(os.path.join(target_dir, "interpreter.txt"), "w") as fh:
-            fh.write("%d.%d\n" % sys.version_info[:2])
+            fh.write("%s\n" % linked)
             fh.write("%s\n" % (sysconfig.get_config_var("prefix") or ""))
 
 
-setup(cmdclass={"build_py": BuildWithSwift})
+if bdist_wheel is not None:
+
+    class BinaryWheel(bdist_wheel):
+        """Tags the wheel for the one interpreter and platform it can run on."""
+
+        def finalize_options(self):
+            super().finalize_options()
+            self.root_is_pure = False
+
+        def get_tag(self):
+            _, _, platform_tag = super().get_tag()
+            # cp312-cp312-<platform>: the bundled executable is dynamically
+            # linked against this exact libpython, so anything else is a
+            # mis-install rather than a graceful degradation.
+            interpreter = "cp%d%d" % sys.version_info[:2]
+            return interpreter, interpreter, platform_tag
+
+    COMMANDS = {"build_py": BuildWithSwift, "bdist_wheel": BinaryWheel}
+else:
+    COMMANDS = {"build_py": BuildWithSwift}
+
+
+setup(cmdclass=COMMANDS, distclass=BinaryDistribution)

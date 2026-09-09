@@ -111,6 +111,11 @@ pid_t pg_getpid(void);
 int  pg_cpu_count(void);
 /* Raise RLIMIT_NOFILE to its hard limit; returns the resulting soft limit. */
 long pg_raise_nofile_limit(void);
+/* Arms a SIGALRM that _exit()s the process after `seconds`, so a shutdown
+ * that wedges below the interpreter still terminates. 0 seconds disarms. */
+void pg_exit_after(unsigned seconds, int code);
+void pg_cancel_exit_timer(void);
+
 /* Ignore SIGPIPE: a peer that vanishes mid-response must surface as EPIPE from
  * write(), never as a process-killing signal. */
 void pg_ignore_sigpipe(void);

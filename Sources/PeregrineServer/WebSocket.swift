@@ -45,6 +45,18 @@ public struct WebSocketState {
     public var assembling = false
     public var validator = UTF8Validator()
 
+    /// Complete messages decoded but not yet handed to the application.
+    ///
+    /// Frames have to be decoded as they arrive rather than when the
+    /// application next calls `receive()`, because a ping must be answered
+    /// whether or not anyone is listening and a pong must be seen or the
+    /// server would time out a peer that is perfectly healthy. That means data
+    /// messages can arrive with nowhere to go, so they queue here -- bounded,
+    /// with the read side switched off when the bound is reached, which turns
+    /// a slow application into TCP backpressure rather than into memory.
+    public var queue: [PyObj] = []
+    public var queuedBytes = 0
+
     /// When the outstanding keepalive ping was sent, or 0.
     public var pingSentAt: UInt64 = 0
     /// Close code to report to the application.
@@ -297,6 +309,17 @@ extension Worker {
         }
         if c.pointee.ws.disconnectDelivered { return nil }
 
+        // Anything already decoded comes first, in arrival order.
+        if !c.pointee.ws.queue.isEmpty {
+            let message = c.pointee.ws.queue.removeFirst()
+            c.pointee.ws.queuedBytes -= messageWeight(message)
+            if c.pointee.ws.queuedBytes < 0 { c.pointee.ws.queuedBytes = 0 }
+            // Space has just been freed, so the read side may re-open and more
+            // frames may already be buffered behind this one.
+            pumpWebSocket(slot)
+            return message
+        }
+
         // Once the peer is gone, or we have closed, the only thing left to say
         // is how it ended.
         if !c.pointee.ws.accepted {
@@ -306,34 +329,59 @@ extension Worker {
             }
             return nil
         }
-
-        if let message = decodeWebSocketFrames(slot) { return message }
-
-        let d = table[slot]
-        if d.pointee.state == .free { return nil }
-        if d.pointee.ws.closeReceived || d.pointee.flags.contains(.peerClosed) {
-            d.pointee.ws.disconnectDelivered = true
-            return ASGIWebSocketMessage.disconnect(code: d.pointee.ws.closeCode)
+        if c.pointee.ws.closeReceived || c.pointee.flags.contains(.peerClosed) {
+            c.pointee.ws.disconnectDelivered = true
+            return ASGIWebSocketMessage.disconnect(code: c.pointee.ws.closeCode)
         }
         return nil
     }
 
-    /// Decodes buffered frames, answering control frames itself, until a data
-    /// message is complete or the buffer runs out.
-    mutating func decodeWebSocketFrames(_ slot: Int) -> PyObj? {
+    /// Roughly what a queued message costs, for the byte budget. The payload
+    /// dominates; the dict and its keys are noise beside it.
+    func messageWeight(_ message: PyObj) -> Int {
+        var total = 64
+        if let body = pg_dict_get(message, Interned[.bytesKey]), pg_is_bytes(body) != 0 {
+            total += Int(pg_bytes_len(body))
+        } else if let text = pg_dict_get(message, Interned[.text]), pg_is_str(text) != 0 {
+            var n: pg_ssize_t = 0
+            if pg_str_utf8_data(text, &n) != nil { total += Int(n) } else { pg_err_clear() }
+        }
+        return total
+    }
+
+    /// Whether the queue has taken as much as it should before the peer is
+    /// made to wait. One message is always allowed through, so a single
+    /// oversized message cannot deadlock against its own budget.
+    func websocketQueueFull(_ slot: Int) -> Bool {
+        let ws = table[slot].pointee.ws
+        if ws.queue.count >= config.maxWebsocketQueue { return true }
+        return !ws.queue.isEmpty && ws.queuedBytes >= config.maxWebsocketQueueBytes
+    }
+
+    /// Decodes every buffered frame: control frames are answered here and now,
+    /// and complete data messages are queued for the application.
+    ///
+    /// This runs on readability, not on `receive()`. Deferring it to the
+    /// application meant that a push-only endpoint -- or one simply busy
+    /// between receives -- left pings unanswered and, worse, never saw the
+    /// pong for the server's own keepalive ping, so the server would eventually
+    /// close a connection that was working perfectly.
+    mutating func pumpWebSocket(_ slot: Int) {
         let c = table[slot]
+        guard c.pointee.state == .websocket, c.pointee.ws.accepted else { return }
         let limit = config.maxWebsocketMessageSize
 
         while true {
+            if websocketQueueFull(slot) { break }
             let available = c.pointee.read.readableBytes
-            if available == 0 { return nil }
+            if available == 0 { break }
             let base = UnsafePointer(c.pointee.read.readPointer)
 
             let parsed = WebSocketCodec.parseHeader(base, available, maxPayload: limit)
             let header: WSFrameHeader
             switch parsed {
             case .needMore:
-                return nil
+                break
             case .failure(let err):
                 switch err {
                 case .messageTooBig:
@@ -341,87 +389,110 @@ extension Worker {
                 default:
                     failWebSocket(slot, code: WSCloseCode.protocolError)
                 }
-                return nil
+                return
             case .header(let h):
                 header = h
-            }
+                // Every frame from a client must be masked (RFC 6455 5.1); an
+                // unmasked one is either a broken client or an attempt to have
+                // an intermediary interpret the payload.
+                if !header.masked {
+                    failWebSocket(slot, code: WSCloseCode.protocolError)
+                    return
+                }
+                if available < header.totalLength { break }
 
-            // Every frame from a client must be masked (RFC 6455 5.1); an
-            // unmasked one is either a broken client or an attempt to have an
-            // intermediary interpret the payload.
-            if !header.masked {
-                failWebSocket(slot, code: WSCloseCode.protocolError)
-                return nil
-            }
-            if available < header.totalLength { return nil }
+                let payload = base + header.headerLength
+                let n = header.payloadLength
 
-            let payload = base + header.headerLength
-            let n = header.payloadLength
+                if header.opcode.isControl {
+                    handleControlFrame(slot, header, payload, n)
+                    if table[slot].pointee.state == .free { return }
+                    c.pointee.read.consume(header.totalLength)
+                    continue
+                }
 
-            if header.opcode.isControl {
-                let outcome = handleControlFrame(slot, header, payload, n)
-                c.pointee.read.consume(header.totalLength)
-                if let outcome { return outcome }
-                if table[slot].pointee.state == .free { return nil }
+                if !decodeDataFrame(slot, header, payload, n, limit) { return }
                 continue
             }
-
-            // --- data frame ---
-            if header.opcode == .continuation {
-                if !c.pointee.ws.assembling {
-                    failWebSocket(slot, code: WSCloseCode.protocolError)
-                    return nil
-                }
-            } else {
-                if c.pointee.ws.assembling {
-                    // A new data frame while a message is still in progress.
-                    failWebSocket(slot, code: WSCloseCode.protocolError)
-                    return nil
-                }
-                c.pointee.ws.assembling = true
-                c.pointee.ws.messageOpcode = header.opcode.rawValue
-                c.pointee.ws.validator = UTF8Validator()
-                c.pointee.body.clear()
-            }
-
-            if c.pointee.body.readableBytes + n > limit {
-                failWebSocket(slot, code: WSCloseCode.messageTooBig)
-                return nil
-            }
-
-            if n > 0 {
-                c.pointee.body.reserve(n)
-                WebSocketCodec.unmask(c.pointee.body.writePointer, payload, n, header.mask)
-                if c.pointee.ws.messageOpcode == WSOpcode.text.rawValue {
-                    if !c.pointee.ws.validator.feed(UnsafePointer(c.pointee.body.writePointer), n) {
-                        failWebSocket(slot, code: WSCloseCode.invalidPayload)
-                        return nil
-                    }
-                }
-                c.pointee.body.advanceWriter(n)
-            }
-            c.pointee.read.consume(header.totalLength)
-
-            if !header.fin { continue }
-
-            c.pointee.ws.assembling = false
-            let isText = c.pointee.ws.messageOpcode == WSOpcode.text.rawValue
-            if isText && !c.pointee.ws.validator.isComplete {
-                failWebSocket(slot, code: WSCloseCode.invalidPayload)
-                return nil
-            }
-            let count = c.pointee.body.readableBytes
-            let bodyPtr = count > 0 ? UnsafePointer(c.pointee.body.readPointer) : nil
-            let message = ASGIWebSocketMessage.receive(bytes: bodyPtr, count: count, text: isText)
-            c.pointee.body.clear()
-            return message
+            break
         }
+        updateWebSocketReadInterest(slot)
     }
 
-    /// Ping, pong and close. Returns a message for the application when the
-    /// frame ends the connection.
+    /// Accumulates one data frame, queueing the message when it completes.
+    /// Returns false once the connection has been failed.
+    private mutating func decodeDataFrame(_ slot: Int, _ header: WSFrameHeader,
+                                          _ payload: UnsafePointer<UInt8>, _ n: Int,
+                                          _ limit: Int) -> Bool {
+        let c = table[slot]
+        if header.opcode == .continuation {
+            if !c.pointee.ws.assembling {
+                failWebSocket(slot, code: WSCloseCode.protocolError)
+                return false
+            }
+        } else {
+            if c.pointee.ws.assembling {
+                // A new data frame while a message is still in progress.
+                failWebSocket(slot, code: WSCloseCode.protocolError)
+                return false
+            }
+            c.pointee.ws.assembling = true
+            c.pointee.ws.messageOpcode = header.opcode.rawValue
+            c.pointee.ws.validator = UTF8Validator()
+            c.pointee.body.clear()
+        }
+
+        if c.pointee.body.readableBytes + n > limit {
+            failWebSocket(slot, code: WSCloseCode.messageTooBig)
+            return false
+        }
+
+        if n > 0 {
+            c.pointee.body.reserve(n)
+            WebSocketCodec.unmask(c.pointee.body.writePointer, payload, n, header.mask)
+            if c.pointee.ws.messageOpcode == WSOpcode.text.rawValue {
+                if !c.pointee.ws.validator.feed(UnsafePointer(c.pointee.body.writePointer), n) {
+                    failWebSocket(slot, code: WSCloseCode.invalidPayload)
+                    return false
+                }
+            }
+            c.pointee.body.advanceWriter(n)
+        }
+        c.pointee.read.consume(header.totalLength)
+
+        if !header.fin { return true }
+
+        c.pointee.ws.assembling = false
+        let isText = c.pointee.ws.messageOpcode == WSOpcode.text.rawValue
+        if isText && !c.pointee.ws.validator.isComplete {
+            failWebSocket(slot, code: WSCloseCode.invalidPayload)
+            return false
+        }
+        let count = c.pointee.body.readableBytes
+        let bodyPtr = count > 0 ? UnsafePointer(c.pointee.body.readPointer) : nil
+        if let message = ASGIWebSocketMessage.receive(bytes: bodyPtr, count: count, text: isText) {
+            c.pointee.ws.queue.append(message)
+            c.pointee.ws.queuedBytes += count + 64
+        } else {
+            PyError.logPending("building a websocket message")
+        }
+        c.pointee.body.clear()
+        return true
+    }
+
+    /// Stops reading while the application is behind, and resumes when it
+    /// catches up. This is what makes the queue bound mean something.
+    mutating func updateWebSocketReadInterest(_ slot: Int) {
+        let c = table[slot]
+        guard c.pointee.state == .websocket else { return }
+        var mask: PollMask = websocketQueueFull(slot) ? [] : .read
+        if !c.pointee.write.isEmpty { mask.insert(.write) }
+        setInterest(slot, mask)
+    }
+
+    /// Ping, pong and close, all answered without involving the application.
     mutating func handleControlFrame(_ slot: Int, _ header: WSFrameHeader,
-                                     _ payload: UnsafePointer<UInt8>, _ n: Int) -> PyObj? {
+                                     _ payload: UnsafePointer<UInt8>, _ n: Int) {
         let c = table[slot]
         switch header.opcode {
         case .ping:
@@ -440,11 +511,9 @@ extension Worker {
                 c.pointee.write = out
                 _ = flush(slot)
             }
-            return nil
 
         case .pong:
             c.pointee.ws.pingSentAt = 0
-            return nil
 
         case .close:
             var code = WSCloseCode.noStatus
@@ -459,29 +528,29 @@ extension Worker {
                 // non-UTF-8 reason, is itself a protocol error.
                 if !WebSocketCodec.isSendableCloseCode(code) {
                     failWebSocket(slot, code: WSCloseCode.protocolError)
-                    return nil
+                    return
                 }
                 if n > 2 {
                     var v = UTF8Validator()
                     if !v.feed(p + 2, n - 2) || !v.isComplete {
                         failWebSocket(slot, code: WSCloseCode.invalidPayload)
-                        return nil
+                        return
                     }
                 }
             } else if n == 1 {
                 failWebSocket(slot, code: WSCloseCode.protocolError)
-                return nil
+                return
             }
             c.pointee.ws.closeReceived = true
             c.pointee.ws.closeCode = code
-            // The handshake is symmetric: echo the close and stop reading.
+            // The handshake is symmetric: echo the close and stop reading. The
+            // disconnect message itself is synthesised once the application has
+            // drained whatever was queued ahead of it.
             sendCloseFrame(slot, code: code == WSCloseCode.noStatus ? WSCloseCode.normal : code,
                            reason: nil, reasonLength: 0)
-            c.pointee.ws.disconnectDelivered = true
-            return ASGIWebSocketMessage.disconnect(code: code)
 
         default:
-            return nil
+            break
         }
     }
 
@@ -609,10 +678,11 @@ extension Worker {
         logAccess(slot, status: 101)
         _ = flush(slot)
         if table[slot].pointee.state == .free { return true }
-        // Frames may now arrive.
+        // Frames may now arrive, and a client that pipelined them behind the
+        // handshake has them sitting in the read buffer already.
         setInterest(slot, .read)
-        // A client that pipelined frames behind the handshake has them sitting
-        // in the read buffer already.
+        pumpWebSocket(slot)
+        if table[slot].pointee.state == .free { return true }
         deliverPendingReceive(slot)
         return true
     }
@@ -693,6 +763,10 @@ extension Worker {
         // let a peer pin twice the configured limit per connection.
         let limit = config.maxWebsocketMessageSize &+ 1024
         if !fill(slot, .read, limit: limit) { return }
+        if table[slot].pointee.state == .free { return }
+        // Decode now, whether or not anyone is waiting: control frames have to
+        // be answered on arrival.
+        pumpWebSocket(slot)
         if table[slot].pointee.state == .free { return }
         deliverPendingReceive(slot)
         let d = table[slot]

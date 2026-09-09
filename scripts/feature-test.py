@@ -797,6 +797,150 @@ def test_worker_restart():
         server.stop()
 
 
+def test_response_length():
+    print("\nResponse framing")
+    port = free_port()
+    with Server(port=port) as server:
+        # An overlong body must not reach the wire: on a keep-alive connection
+        # the excess would be read as the start of the next response.
+        s = server.connect(timeout=10)
+        s.sendall(b"GET /overlong HTTP/1.1\r\nHost: x\r\n\r\n")
+        try:
+            status, headers, body = read_http_response(s)
+        except OSError:
+            status, headers, body = 0, {}, b""
+        s.close()
+        is_("a body longer than Content-Length is truncated, not emitted",
+            body[:4], b"LO")
+        is_("the declared length is what the client is told",
+            headers.get("content-length"), "2")
+
+        # And the connection must not then be reused, because the response is
+        # not the one that was promised.
+        s = server.connect(timeout=10)
+        s.sendall(b"GET /overlong HTTP/1.1\r\nHost: x\r\n\r\n"
+                  b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        raw = b""
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+        except OSError:
+            pass
+        s.close()
+        is_("no second response is served on a mis-framed connection",
+            raw.count(b"HTTP/1.1 "), 1)
+
+        # A short body is the same promise broken the other way: the client
+        # would wait for bytes that are never coming.
+        s = server.connect(timeout=10)
+        s.sendall(b"GET /short HTTP/1.1\r\nHost: x\r\n\r\n")
+        raw = b""
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+        except OSError:
+            pass
+        s.close()
+        check("a short body closes the connection rather than hanging",
+              raw.startswith(b"HTTP/1.1 200"), repr(raw[:40]))
+
+        is_("the server is still healthy afterwards", server.get("/")[0], 200)
+
+
+def test_websocket_control_independence():
+    print("\nWebSocket control frames without application reads")
+    port = free_port()
+    # Short ping interval so the server's own keepalive is exercised too.
+    with Server("--ws-ping-interval", "400", "--ws-ping-timeout", "1500",
+                port=port) as server:
+        # A push-only endpoint: it never calls receive() after accepting.
+        ws = WebSocket(server, "/ws-silent", timeout=20)
+        is_("the push-only endpoint accepted", ws.status, 101)
+
+        ws.send(b"are-you-there", opcode=0x9)      # client ping
+        got_pong = False
+        ticks = 0
+        deadline = time.time() + 6
+        while time.time() < deadline and not got_pong:
+            fin, opcode, payload = ws.recv_frame()
+            if opcode == 0xA and payload == b"are-you-there":
+                got_pong = True
+            elif opcode == 0x9:                    # the server's own ping
+                ws.send(payload, opcode=0xA)
+            elif opcode == 0x1:
+                ticks += 1
+        check("a ping is answered by an endpoint that never calls receive()",
+              got_pong, "no pong arrived in 6s")
+
+        # The connection must still be alive: the server saw our pongs, so its
+        # own ping timeout must not have fired.
+        alive = False
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            try:
+                fin, opcode, payload = ws.recv_frame()
+            except (EOFError, OSError):
+                break
+            if opcode == 0x9:
+                ws.send(payload, opcode=0xA)
+            elif opcode == 0x1:
+                alive = True
+                break
+        check("answering pings keeps a push-only connection open", alive,
+              "the server closed a healthy connection")
+        ws.sock.close()
+
+    # An endpoint busy for three seconds before its first receive().
+    port = free_port()
+    with Server("--ws-ping-interval", "400", "--ws-ping-timeout", "1500",
+                port=port) as server:
+        ws = WebSocket(server, "/ws-slow", timeout=20)
+        ws.send("queued-while-busy")
+        ws.send(b"ping-while-busy", opcode=0x9)
+        pong_seen = False
+        echoed = None
+        deadline = time.time() + 12
+        while time.time() < deadline and echoed is None:
+            try:
+                fin, opcode, payload = ws.recv_frame()
+            except (EOFError, OSError):
+                break
+            if opcode == 0xA and payload == b"ping-while-busy":
+                pong_seen = True
+            elif opcode == 0x9:
+                ws.send(payload, opcode=0xA)
+            elif opcode == 0x1:
+                echoed = payload
+        check("a ping is answered while the application is busy", pong_seen,
+              "no pong while the endpoint was working")
+        is_("a message sent while the application was busy is not lost",
+            echoed, b"late:queued-while-busy")
+        ws.sock.close()
+
+
+def test_shutdown_is_bounded():
+    print("\nShutdown cannot be blocked by the application")
+    # A task that catches CancelledError and carries on. Cancellation is a
+    # request, not a guarantee, so something has to enforce the deadline.
+    port = free_port()
+    server = Server("--graceful-timeout", "1000", port=port)
+    s = server.connect(timeout=30)
+    s.sendall(b"GET /uncancellable HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    time.sleep(0.5)
+    code, elapsed = server.stop(timeout=45)
+    check("a task that ignores cancellation does not block shutdown (%.1fs)"
+          % elapsed, elapsed < 25.0, "%.1fs" % elapsed)
+    check("the process exited on its own rather than being killed",
+          code is not None, "had to be SIGKILLed by the test harness")
+    s.close()
+
+
 def test_reload():
     print("\nDevelopment reload")
     # A file inside the watched tree that no test depends on.
@@ -837,8 +981,10 @@ def main():
         return 2
     print("peregrine feature tests (%s)" % BIN)
     for test in (test_header_shapes, test_factory, test_websockets, test_backpressure,
+                 test_response_length, test_websocket_control_independence,
                  test_wsgi_threads, test_forwarded, test_multiworker_unix,
-                 test_worker_restart, test_reload, test_graceful_shutdown):
+                 test_worker_restart, test_reload, test_graceful_shutdown,
+                 test_shutdown_is_bounded):
         try:
             test()
         except Exception as exc:                            # noqa: BLE001

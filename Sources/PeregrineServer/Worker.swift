@@ -440,6 +440,9 @@ public struct Worker {
         c.pointee.flags.remove(.perRequest)
         c.pointee.body.clear()
         c.pointee.chunked = ChunkedDecoder()
+        // Response framing belongs to one request; a stale budget here would
+        // let the next response on a reused connection overrun or fall short.
+        c.pointee.responseRemaining = -1
 
         var keepAlive = c.pointee.head.isKeepAlive
         if config.maxRequestsPerConnection > 0,
@@ -562,11 +565,11 @@ public struct Worker {
             let e = pg_errno()
             if pg_err_is_intr(e) != 0 { continue }
             if pg_err_is_again(e) != 0 {
-                // A pooled request must not have read interest armed: nothing
-                // will consume pipelined bytes until it finishes, and a
-                // level-triggered poller would spin on them.
-                let pooled = c.pointee.poolJob != nil
-                setInterest(slot, pooled ? [.write] : [.read, .write])
+                // Read interest is only safe while something will actually
+                // consume what arrives: not while a pooled request owns the
+                // connection, and not while a websocket queue is full. A
+                // level-triggered poller would otherwise spin on those bytes.
+                setInterest(slot, readInterestAllowed(slot) ? [.read, .write] : [.write])
                 // Partially drained still counts: a producer parked at the high
                 // water mark resumes as soon as the buffer falls below the low
                 // one, without waiting for the socket to empty completely.
@@ -598,12 +601,24 @@ public struct Worker {
                 return true
             }
             finishResponse(slot)
-        } else if c.pointee.poolJob != nil {
-            setInterest(slot, [])
         } else if c.pointee.state != .free {
-            setInterest(slot, .read)
+            setInterest(slot, readInterestAllowed(slot) ? .read : [])
         }
         return table[slot].pointee.state != .free
+    }
+
+    /// Whether more bytes from this peer would have anywhere to go.
+    ///
+    /// They would not while a pooled request owns the connection (nothing will
+    /// look at them until it finishes) or while a websocket has queued as many
+    /// messages as it is allowed to. In both cases leaving read interest armed
+    /// on a level-triggered poller would spin.
+    @inline(__always)
+    func readInterestAllowed(_ slot: Int) -> Bool {
+        let c = table[slot]
+        if c.pointee.poolJob != nil { return false }
+        if c.pointee.state == .websocket { return !websocketQueueFull(slot) }
+        return true
     }
 
     /// Blocks the worker until the socket accepts more data. Used only when a
@@ -719,6 +734,11 @@ public struct Worker {
         if let p = c.pointee.remotePortObj { pg_decref(p); c.pointee.remotePortObj = nil }
         if let t = c.pointee.clientTuple { pg_decref(t); c.pointee.clientTuple = nil }
         if let k = c.pointee.ws.acceptKey { k.deallocate(); c.pointee.ws.acceptKey = nil }
+        if !c.pointee.ws.queue.isEmpty {
+            for message in c.pointee.ws.queue { pg_decref(message) }
+            c.pointee.ws.queue.removeAll(keepingCapacity: false)
+            c.pointee.ws.queuedBytes = 0
+        }
 
         if c.pointee.fd >= 0 {
             _ = poller.remove(c.pointee.fd)
@@ -818,6 +838,13 @@ public struct Worker {
         drainDeadline = config.gracefulShutdownMs > 0
             ? pg_monotonic_ms() &+ config.gracefulShutdownMs
             : 0
+        // Every deadline above this one is cooperative: a task can swallow
+        // cancellation, a C extension can sit in a syscall, and a worker with
+        // no supervisor has nobody to escalate to. This one is not -- it fires
+        // from a signal handler and calls _exit. The extra margin covers the
+        // task drain, the lifespan shutdown and interpreter finalisation.
+        let margin = config.gracefulShutdownMs / 1000 &+ 10
+        pg_exit_after(UInt32(truncatingIfNeeded: margin), 0)
         Log.info("worker draining")
         _ = poller.modify(listenFD, [], token: PollToken.listener)
         // Idle keep-alive connections have nothing in flight; drop them now.

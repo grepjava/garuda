@@ -133,6 +133,38 @@ async def app(scope, receive, send):
                                 (b"content-length", str(len(body)).encode())]})
         await send({"type": "http.response.body", "body": body})
 
+    elif path == "/overlong":
+        # Declares two bytes and then sends four. Emitting the excess would run
+        # into the next response on a keep-alive connection.
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/plain"),
+                                (b"content-length", b"2")]})
+        try:
+            await send({"type": "http.response.body", "body": b"LONG"})
+        except Exception:
+            # The server refuses it; report that it did rather than crashing.
+            return
+
+    elif path == "/short":
+        # Declares ten bytes and sends three, which would leave the client
+        # waiting for the rest until its own timeout.
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/plain"),
+                                (b"content-length", b"10")]})
+        try:
+            await send({"type": "http.response.body", "body": b"abc"})
+        except Exception:
+            return
+
+    elif path == "/uncancellable":
+        # Swallows cancellation and keeps going, which is what the shutdown
+        # path has to survive.
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                pass
+
     elif path == "/boom":
         raise RuntimeError("intentional asgi failure")
 
@@ -150,6 +182,26 @@ async def websocket_endpoint(scope, receive, send):
     if path == "/ws-reject":
         await send({"type": "websocket.close", "code": 1008})
         return
+
+    if path == "/ws-silent":
+        # Accepts and then never calls receive() again: a push-only endpoint.
+        # Ping and pong still have to be handled, or the peer times out.
+        await send({"type": "websocket.accept"})
+        while True:
+            await asyncio.sleep(0.5)
+            await send({"type": "websocket.send", "text": "tick"})
+
+    if path == "/ws-slow":
+        # Accepts, then does lengthy work before reading anything.
+        await send({"type": "websocket.accept"})
+        await asyncio.sleep(3.0)
+        while True:
+            message = await receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            if message["type"] == "websocket.receive":
+                await send({"type": "websocket.send",
+                            "text": "late:" + (message.get("text") or "")})
 
     accept = {"type": "websocket.accept"}
     if path == "/ws-sub":

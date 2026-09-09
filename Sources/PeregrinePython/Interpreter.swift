@@ -21,6 +21,7 @@ public enum Interpreter {
     private static let glueSource = #"""
 import asyncio
 import inspect
+import sys
 import traceback
 
 
@@ -250,7 +251,16 @@ def finish(loop, lifespan, timeout_ms):
             if still:
                 for t in still:
                     t.cancel()
-                await asyncio.gather(*still, return_exceptions=True)
+                # Cancellation is a request, not a guarantee. An application
+                # that catches CancelledError and carries on would hold the
+                # loop open for ever, so the cancellation phase gets its own
+                # bound and whatever survives it is abandoned.
+                grace = timeout if timeout > 0 else 5.0
+                _, alive = await asyncio.wait(still, timeout=grace)
+                if alive:
+                    sys.stderr.write(
+                        '[warn]  %d task(s) ignored cancellation and were '
+                        'abandoned\n' % len(alive))
         if ls is not None:
             return await ls.shutdown(timeout if timeout > 0 else 30.0)
         return None

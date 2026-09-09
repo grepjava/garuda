@@ -86,6 +86,12 @@ public struct ServerConfig {
     public var websocketPingIntervalMs: UInt64 = 20_000
     /// How long an unanswered ping may go before the connection is dropped.
     public var websocketPingTimeoutMs: UInt64 = 20_000
+    /// Decoded messages held for an application that has not asked for them
+    /// yet. Frames are decoded on arrival so that control frames are answered
+    /// promptly, so data messages need somewhere to wait; when the queue fills,
+    /// the read side is switched off and the peer feels it as TCP backpressure.
+    public var maxWebsocketQueue = 32
+    public var maxWebsocketQueueBytes = 4 * 1024 * 1024
 
     // --- development ---
     /// Restart workers when a watched source file changes.

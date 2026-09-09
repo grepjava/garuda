@@ -238,7 +238,7 @@ Run the suites:
 swift test                              # 80 unit tests: parser, chunking, buffers,
                                         #   writer, websocket framing, proxy trust
 bash scripts/integration-test.sh        # 38 end-to-end checks over both protocols
-python3 scripts/feature-test.py         # 66 checks for the failure modes a plain
+python3 scripts/feature-test.py         # 78 checks for the failure modes a plain
                                         #   request never reaches: slow consumers,
                                         #   stuck-request shutdown, lifespan
                                         #   cleanup, worker restarts, multiworker
@@ -268,6 +268,13 @@ sudo apt install python3-dev pkg-config     # or: brew install python@3.13
 
 pip install peregrine-server
 ```
+
+The build checks that `pkg-config` resolves `python3-embed` to the interpreter
+running the install, and then asks the finished binary which libpython it
+actually bound (`peregrine --version` reports it) before packaging anything.
+The wheel is tagged for that exact interpreter and platform -- `cp312-cp312-
+linux_x86_64`, not `py3-none-any` -- so pip refuses it anywhere it would not
+genuinely run.
 
 Installing into a virtualenv is the normal case, and the `peregrine` command
 then finds that environment by itself: it passes `--venv` for the prefix it is
@@ -318,6 +325,9 @@ peregrine [options] MODULE:ATTRIBUTE
   --no-websockets          reject WebSocket upgrades with 501
   --ws-max-message BYTES   largest accepted WebSocket message (16 MiB)
   --ws-ping-interval MS    keepalive ping period, 0 to disable (20000)
+  --ws-ping-timeout MS     how long an unanswered ping may go (20000)
+  --ws-max-queue N         messages buffered for a slow app (default 32)
+  --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
   --access-log             log one line per request
   --log-level LEVEL        debug, info, warning, error, silent
 ```
@@ -334,6 +344,13 @@ cancellation is actually delivered rather than merely requested — and only the
 does the application receive `lifespan.shutdown`. Doing it in that order is the
 point: cancelling every task first would cancel the lifespan task too, and the
 application would never reach the code after its `yield`.
+
+Every layer of that is cooperative, and cooperation is not a guarantee: a task
+can catch `CancelledError` and carry on, a C extension can sit in a syscall, and
+a single worker started without `--workers` has no supervisor to escalate to. So
+the cancellation phase has its own bound, and behind all of it a `SIGALRM`
+watchdog `_exit`s the process once the grace period plus a margin has passed.
+A deadline that nothing enforces is not a deadline.
 
 `SIGHUP` restarts the workers without dropping the listening socket.
 
@@ -390,7 +407,16 @@ allows — tuples or lists, `bytes`, `bytearray` or `str`.
 **ASGI 3.0 (WebSocket):** the full connect / accept / receive / send / close
 cycle, subprotocol negotiation, extra handshake headers, fragmented messages,
 text and binary, keepalive ping/pong with a dead-peer timeout, and a message
-size limit. The framing is strict where leniency would let a peer
+size limit.
+
+Frames are decoded as they arrive rather than when the application next calls
+`receive()`. That matters more than it sounds: a push-only endpoint, or one
+merely busy between receives, would otherwise leave pings unanswered and never
+see the pong for the server's own keepalive ping -- so the server would
+eventually close a connection that was working perfectly. Data messages
+therefore queue, bounded by `--ws-max-queue` and `--ws-max-queue-bytes`, and
+the read side switches off at the bound so a slow application becomes TCP
+backpressure rather than memory. The framing is strict where leniency would let a peer
 desynchronise the stream: an unmasked client frame, a set reserved bit, an
 unknown opcode, a fragmented or oversized control frame, an invalid close code
 and non-UTF-8 text are each a protocol failure with the close code RFC 6455
@@ -398,6 +424,13 @@ prescribes.
 
 **HTTP/1.1:** keep-alive, pipelining, chunked transfer in both directions,
 `Expect: 100-continue`, `HEAD`, and the statuses that forbid a body.
+
+A declared `Content-Length` is enforced rather than trusted. An application that
+sends more than it promised has the excess dropped instead of written, because
+those bytes would be read as the start of the next response on a keep-alive
+connection; one that sends less has the connection closed rather than leaving
+the client waiting on bytes that are not coming. Either way the application is
+told, and the connection is not reused.
 
 ## What is not
 

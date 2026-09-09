@@ -280,3 +280,37 @@ int pg_is_dir(const char *path) {
     if (stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode) ? 1 : 0;
 }
+
+/* ======================================================================== */
+/* Shutdown watchdog                                                        */
+/* ======================================================================== */
+
+/* Cancellation is cooperative all the way down: a task can catch
+ * CancelledError, a C extension can sit in a syscall, and a third-party
+ * library can block on a lock nobody will release. Every layer above this one
+ * has a deadline, but a deadline is only a promise if something enforces it.
+ * SIGALRM does, from outside the interpreter, with _exit rather than exit so
+ * that no atexit handler or interpreter finaliser can wedge it in turn. */
+
+static int g_watchdog_code = 0;
+
+static void watchdog_fire(int signo) {
+    (void)signo;
+    static const char msg[] =
+        "[error] shutdown exceeded its deadline; exiting immediately\n";
+    ssize_t r = write(2, msg, sizeof msg - 1);
+    (void)r;
+    _exit(g_watchdog_code);
+}
+
+void pg_exit_after(unsigned seconds, int code) {
+    g_watchdog_code = code;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = watchdog_fire;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(seconds);
+}
+
+void pg_cancel_exit_timer(void) { alarm(0); }

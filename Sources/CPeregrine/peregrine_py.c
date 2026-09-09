@@ -86,6 +86,15 @@ PyObject *pg_py_exec_module(const char *name, const char *src) {
 
 int pg_py_version_hex(void) { return (int)PY_VERSION_HEX; }
 
+/* The version of the libpython actually linked, read at runtime.
+ *
+ * PY_VERSION_HEX above is a compile-time constant baked in from whichever
+ * headers pkg-config pointed at; this is what the loader really bound. They
+ * are normally the same and it matters a great deal when they are not, which
+ * is why the two are reported separately. Py_GetVersion is safe before
+ * Py_Initialize. */
+const char *pg_py_runtime_version(void) { return Py_GetVersion(); }
+
 /* ======================================================================== */
 /* Reference counting                                                       */
 /* ======================================================================== */

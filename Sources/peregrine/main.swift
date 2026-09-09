@@ -73,6 +73,8 @@ func printUsage() {
       --ws-max-message BYTES   largest accepted WebSocket message (16 MiB)
       --ws-ping-interval MS    keepalive ping period, 0 to disable (20000)
       --ws-ping-timeout MS     how long an unanswered ping may go (20000)
+      --ws-max-queue N         messages buffered for a slow app (default 32)
+      --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
       --access-log             log one line per request
       --log-level LEVEL        debug, info, warning, error, silent
       --version                print the version and exit
@@ -89,7 +91,44 @@ func printUsage() {
     _ = pg_write(1, usage.utf8Start, usage.utf8CodeUnitCount)
 }
 
-let version: StaticString = "peregrine 0.1.0\n"
+let version: StaticString = "peregrine 0.1.0"
+
+/// Reports the build version and the CPython actually linked.
+///
+/// The linked interpreter is read at runtime rather than from the headers,
+/// because the two can disagree: Swift links whatever `python3-embed` resolved
+/// to, which is not necessarily the interpreter that ran the build. Packaging
+/// checks this output to tag the wheel for the right interpreter.
+func printVersion() {
+    var buf = [UInt8](repeating: 0, count: 256)
+    var n = 0
+
+    @inline(__always)
+    func append(_ p: UnsafePointer<UInt8>, _ count: Int) {
+        let take = min(count, buf.count - n - 1)
+        if take > 0 {
+            _ = buf.withUnsafeMutableBufferPointer { memcpy($0.baseAddress! + n, p, take) }
+            n += take
+        }
+    }
+
+    append(version.utf8Start, version.utf8CodeUnitCount)
+    if let raw = pg_py_runtime_version() {
+        let py = UnsafeRawPointer(raw).assumingMemoryBound(to: UInt8.self)
+        var len = 0
+        // Py_GetVersion returns "3.12.3 (main, ...) [GCC ...]"; only the
+        // version itself is wanted, so stop at the first space.
+        while py[len] != 0 && py[len] != 32 { len += 1 }
+        let prefix: StaticString = " (CPython "
+        append(prefix.utf8Start, prefix.utf8CodeUnitCount)
+        append(py, len)
+        let suffix: StaticString = ")"
+        append(suffix.utf8Start, suffix.utf8CodeUnitCount)
+    }
+    let newline: StaticString = "\n"
+    append(newline.utf8Start, newline.utf8CodeUnitCount)
+    buf.withUnsafeBufferPointer { _ = pg_write(1, $0.baseAddress!, n) }
+}
 
 var config = ServerConfig()
 var sawApp = false
@@ -120,7 +159,7 @@ while i < argc {
         printUsage()
         exit(0)
     } else if matches(arg, "--version") {
-        _ = pg_write(1, version.utf8Start, version.utf8CodeUnitCount)
+        printVersion()
         exit(0)
     } else if matches(arg, "--host") {
         guard let v = next("--host needs a value") else { break }
@@ -211,6 +250,12 @@ while i < argc {
     } else if matches(arg, "--ws-ping-timeout") {
         guard let v = next("--ws-ping-timeout needs milliseconds") else { break }
         config.websocketPingTimeoutMs = UInt64(max(100, parseInt(v)))
+    } else if matches(arg, "--ws-max-queue") {
+        guard let v = next("--ws-max-queue needs a message count") else { break }
+        config.maxWebsocketQueue = max(1, parseInt(v))
+    } else if matches(arg, "--ws-max-queue-bytes") {
+        guard let v = next("--ws-max-queue-bytes needs a byte count") else { break }
+        config.maxWebsocketQueueBytes = max(1024, parseInt(v))
     } else if matches(arg, "--python-path") {
         guard let v = next("--python-path needs a directory") else { break }
         config.pythonPath = v

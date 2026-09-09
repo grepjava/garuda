@@ -63,6 +63,9 @@ PyObject *pg_py_import(const char *name);
  * than through twenty C-API calls. */
 PyObject *pg_py_exec_module(const char *name, const char *src);
 int   pg_py_version_hex(void);
+/* Version string of the libpython that was actually linked. Safe to call
+ * before pg_py_init. */
+const char *pg_py_runtime_version(void);
 int   pg_py_is_initialized(void);
 
 /* --- reference counting -------------------------------------------------- */
