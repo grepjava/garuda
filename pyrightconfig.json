@@ -1,0 +1,11 @@
+{
+  "extraPaths": ["python"],
+  "pythonVersion": "3.12",
+  "executionEnvironments": [
+    {
+      "root": "examples",
+      "extraPaths": ["python"],
+      "reportMissingImports": false
+    }
+  ]
+}

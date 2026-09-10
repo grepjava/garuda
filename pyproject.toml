@@ -37,3 +37,15 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 peregrine = ["_bin/*"]
+
+# The installable package lives under python/, not the repo root. examples/
+# import FastAPI and Django, which are not dependencies of the server — they
+# are samples — so missing those imports is not a defect.
+[tool.pyright]
+extraPaths = ["python"]
+pythonVersion = "3.12"
+
+[[tool.pyright.executionEnvironments]]
+root = "examples"
+extraPaths = ["python"]
+reportMissingImports = false
