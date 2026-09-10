@@ -261,6 +261,13 @@ idea — refuse to buffer, and let the pressure reach whoever is producing.
 - **A peer flooding a WebSocket.** Decoded messages queue, bounded by
   `--ws-max-queue` and `--ws-max-queue-bytes`, and the read side switches off
   at the bound.
+- **A WSGI application streaming a response.** PEP 3333 makes this the
+  application's own problem to feel: a yielded block goes to the socket before
+  the next is requested, and a `write()` goes out before it returns, so a
+  producer faster than the client parks in the write that will not complete —
+  inline on the socket, and on a pool thread through the same high water mark
+  as everything else. Buffering it all until the application returns, which is
+  what the server used to do, hides the pressure and delays every byte.
 
 Bodies are bounded by `--max-body`, heads by `--max-header-size`, header count
 by a fixed limit, and connections by `--max-connections`; a full table answers

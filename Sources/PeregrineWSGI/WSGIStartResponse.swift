@@ -11,14 +11,35 @@
 // costs no second object. Almost every application ignores the return value, so
 // the common path allocates nothing at all beyond this one object per request.
 //
-// Nothing is sent from here. The status and header list are just parked on the
-// object; the server reads them after the application returns, which is what
-// lets it decide framing (Content-Length vs chunked) with full information.
+// start_response sends nothing: the status and header list are parked on the
+// object, and the server reads them after the application returns, which is
+// what lets it decide framing (Content-Length vs chunked) with full
+// information.
+//
+// `write` is the opposite, and has to be. PEP 3333 provides it for frameworks
+// whose output API is imperative, and requires the block to go out before the
+// call returns -- an application that writes a progress line and then works for
+// a second means the client to see that line during the second, not after it.
+// So a write reaches the server through a sink the server installs before it
+// calls the application: the first one sends the head (with no length to
+// declare, so chunked), and every one after it appends and flushes. Collecting
+// the blocks in a list here, which is what this did until it was measured,
+// delays every byte until the application returns.
 //===----------------------------------------------------------------------===//
 
 import CPeregrine
 import PeregrineCore
 import PeregrinePython
+
+/// Where the bytes handed to the legacy `write()` callable go.
+///
+/// Called with the context the server installed, the `start_response` object
+/// (which carries the parked status and headers, so the sink can send the head
+/// on the first write), and the block. Returns 0, or -1 with a Python exception
+/// set — which surfaces inside the application, at its `write()` call, where a
+/// dead client belongs.
+public typealias WSGIWriteSink =
+    @convention(c) (UnsafeMutableRawPointer?, PyObj?, PyObj?) -> Int32
 
 public enum WSGIStartResponse {
     nonisolated(unsafe) public private(set) static var type: PyObj! = nil
@@ -44,9 +65,20 @@ public enum WSGIStartResponse {
     @inlinable
     public static func headers(_ obj: PyObj) -> PyObj? { pg_obj_ref2(obj) }
 
-    /// Borrowed list of chunks passed to the legacy `write()` callable, or nil.
+    /// Installs the sink `write()` delivers to. The server does this before it
+    /// calls the application; `context` must outlive that call.
     @inlinable
-    public static func writtenChunks(_ obj: PyObj) -> PyObj? { pg_obj_ref3(obj) }
+    public static func setSink(_ obj: PyObj, _ sink: @escaping WSGIWriteSink,
+                               context: UnsafeMutableRawPointer?) {
+        pg_obj_set_ctx(obj, context)
+        pg_obj_set_ctx2(obj, unsafeBitCast(sink, to: UnsafeMutableRawPointer.self))
+    }
+
+    /// Whether the head is already on the wire. A `write()` puts it there
+    /// before the application returns; otherwise it goes out afterwards, when
+    /// `start_response` can no longer be called anyway.
+    @inlinable
+    public static func headersSent(_ obj: PyObj) -> Bool { pg_obj_i1(obj) != 0 }
 
     @inlinable
     public static func wasCalled(_ obj: PyObj) -> Bool { pg_obj_i0(obj) != 0 }
@@ -71,12 +103,27 @@ private func srCall(_ selfObj: PyObj?, _ args: PyObj?, _ kwargs: PyObj?) -> PyOb
     // is unambiguously the write callable.
     if n == 1 {
         let arg = pg_tuple_get(args, 0)!
-        if pg_obj_ref3(selfObj) == nil {
-            guard let list = pg_list_empty_new() else { return nil }
-            pg_obj_set_ref3(selfObj, list)
+        if pg_obj_i0(selfObj) == 0 {
+            pg_err_set_str(pg_exc_runtime(),
+                           "write() before start_response()")
+            return nil
         }
-        guard let list = pg_obj_ref3(selfObj) else { return nil }
-        if pg_list_append(list, arg) != 0 { return nil }
+        if pg_is_bytes(arg) == 0 {
+            pg_err_set_str(pg_exc_type(), "write() takes a bytes object")
+            return nil
+        }
+        guard let raw = pg_obj_ctx2(selfObj) else {
+            // The server always installs one before calling the application,
+            // so this is a bug here rather than in the application.
+            pg_err_set_str(pg_exc_runtime(), "write() has nowhere to write to")
+            return nil
+        }
+        let sink = unsafeBitCast(raw, to: WSGIWriteSink.self)
+        if sink(pg_obj_ctx(selfObj), selfObj, arg) != 0 {
+            // The sink set the exception; PEP 3333 wants the application to
+            // see it rather than the server to swallow it.
+            return nil
+        }
         let none = Interned.none!
         pg_incref(none)
         return none

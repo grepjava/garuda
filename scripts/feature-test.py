@@ -800,6 +800,67 @@ def test_wsgi_threads():
         is_("pooled large response", len(body), 250000)
 
 
+def test_wsgi_streaming():
+    print("\nWSGI streaming (PEP 3333 unbuffered output)")
+
+    def first_line_arrival(server, path, budget=6.0):
+        """Seconds until the first body byte lands, and the total."""
+        s = server.connect(timeout=budget + 4)
+        s.settimeout(budget + 4)
+        started = time.time()
+        s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                   % path).encode())
+        first = None
+        buf = b""
+        while True:
+            try:
+                chunk = s.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if first is None and b"\r\n\r\n" in buf:
+                if buf.split(b"\r\n\r\n", 1)[1].strip():
+                    first = time.time() - started
+            elif first is None and chunk.strip():
+                first = time.time() - started
+        total = time.time() - started
+        s.close()
+        return first, total, buf
+
+    # The application holds the connection for a second between blocks. If the
+    # server is buffering, both numbers land together at the end; if it is
+    # streaming, the first block is already there while the application waits.
+    for label, extra in (("inline", []), ("pooled", ["--wsgi-threads", "4"])):
+        port = free_port()
+        with Server(*extra, port=port, app="wsgi_app:application") as server:
+            for route, what in (("/slowwrite?1.0", "write()"),
+                                ("/slowstream?1.0", "a generator")):
+                first, total, buf = first_line_arrival(server, route)
+                check("%s: %s sends its first block before the application "
+                      "finishes (%s vs %.2fs)"
+                      % (label, what,
+                         "%.2fs" % first if first is not None else "never", total),
+                      first is not None and first < 0.5 < total,
+                      "first block at %s, response complete at %.2fs"
+                      % ("never" if first is None else "%.2fs" % first, total))
+                body = buf.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in buf else b""
+                check("%s: %s delivers the whole body" % (label, what),
+                      b"first" in body and b"second" in body,
+                      "body was %r" % body[:120])
+
+    # Framing, which the early head has to settle without a return value in
+    # hand: chunked unless the application declared a length of its own.
+    port = free_port()
+    with Server(port=port, app="wsgi_app:application") as server:
+        status, headers, body = server.get("/write")
+        is_("write() plus a returned iterable is chunked",
+            headers.get("transfer-encoding"), "chunked")
+        is_("write() output precedes the returned body", body,
+            b"written and returned\n")
+
+
 def test_header_shapes():
     print("\nFramework compatibility")
     port = free_port()
@@ -1393,7 +1454,8 @@ def main():
                  test_tls, test_response_length, test_streaming_request_bodies,
                  test_request_backpressure, test_receive_after_response,
                  test_websocket_control_independence,
-                 test_wsgi_threads, test_forwarded, test_multiworker_unix,
+                 test_wsgi_threads, test_wsgi_streaming,
+                 test_forwarded, test_multiworker_unix,
                  test_worker_restart, test_reload, test_graceful_shutdown,
                  test_shutdown_is_bounded, test_free_threaded):
         try:

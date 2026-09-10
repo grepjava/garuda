@@ -79,6 +79,26 @@ public final class WSGIJob {
     var chunked = false
     var keepAlive = true
     var status = 0
+    /// `suppressBody` as the head settled it, which is the request's own plus
+    /// whatever the status said (204, 304, 1xx).
+    var bodySuppressed = false
+
+    /// The pool running this job, so the legacy `write()` callable can reach
+    /// the hand-off from inside the application. Unowned because the pool owns
+    /// every job and outlives all of them.
+    unowned(unsafe) var pool: WSGIPool? = nil
+
+    /// What the response builder needs about the request. Taken at submit time
+    /// and never read from the connection, which belongs to the loop.
+    var snapshot: WSGIRequestSnapshot {
+        WSGIRequestSnapshot(httpMinor: httpMinor,
+                            keepAlive: keepAliveIn,
+                            suppressBody: suppressBody,
+                            date: UnsafePointer(date),
+                            altSvc: altSvc,
+                            altSvcLength: altSvcLength,
+                            multiplexed: multiplexed)
+    }
 
     init(slot: Int, generation: UInt32,
          environ: PyObj, startResponse: PyObj,
@@ -188,6 +208,13 @@ public final class WSGIPool {
 
     /// Queues a job. Called on the loop thread with the GIL held.
     public func submit(_ job: WSGIJob) {
+        job.pool = self
+        // Installed here, on the loop thread, before any pool thread can see
+        // the job: the application reaches `write()` only after that hand-off.
+        if let sr = job.startResponse {
+            WSGIStartResponse.setSink(sr, wsgiPooledWriteSink,
+                                      context: Unmanaged.passUnretained(job).toOpaque())
+        }
         pg_mutex_lock(mutex)
         running += 1
         pending.append(job)
@@ -340,41 +367,35 @@ public final class WSGIPool {
         var staged = ByteBuffer()
         defer { staged.destroy() }
 
-        let snapshot = WSGIRequestSnapshot(httpMinor: job.httpMinor,
-                                           keepAlive: job.keepAliveIn,
-                                           suppressBody: job.suppressBody,
-                                           date: UnsafePointer(job.date),
-                                           altSvc: job.altSvc,
-                                           altSvcLength: job.altSvcLength,
-                                           multiplexed: job.multiplexed)
-        let plan = WSGIResponseBuilder.writeHead(&staged,
+        var plan = WSGIHeadPlan()
+        if job.headersWritten {
+            // A write() inside the application already sent the head and
+            // settled the framing; only the return value is left.
+            plan.ok = true
+            plan.status = job.status
+            plan.chunked = job.chunked
+            plan.keepAlive = job.keepAlive
+            plan.suppressBody = job.bodySuppressed
+        } else {
+            plan = WSGIResponseBuilder.writeHead(&staged,
                                                  statusObj: statusObj,
                                                  headerList: headerList,
                                                  startResponse: startResponse,
                                                  result: result,
-                                                 snapshot: snapshot)
-        if !plan.ok {
-            Log.error(plan.failure)
-            job.failed = true
-            return
+                                                 snapshot: job.snapshot)
+            if !plan.ok {
+                Log.error(plan.failure)
+                job.failed = true
+                return
+            }
+            job.status = plan.status
+            job.chunked = plan.chunked
+            job.keepAlive = plan.keepAlive
+            job.bodySuppressed = plan.suppressBody
+            job.headersWritten = true
         }
-        job.status = plan.status
-        job.chunked = plan.chunked
-        job.keepAlive = plan.keepAlive
-        job.headersWritten = true
 
         if !plan.suppressBody {
-            // Legacy write() output goes out ahead of the iterable.
-            if let written = WSGIStartResponse.writtenChunks(startResponse) {
-                let n = Int(pg_list_size(written))
-                var k = 0
-                while k < n {
-                    guard let part = pg_list_get(written, pg_ssize_t(k)) else { break }
-                    k += 1
-                    if !emit(job, part, plan.chunked, &staged) { return }
-                }
-            }
-
             if PySeq.isSequence(result) {
                 let n = PySeq.count(result)
                 var k = 0
@@ -390,8 +411,11 @@ public final class WSGIPool {
                     return
                 }
                 defer { pg_decref(iterator) }
+                // One hand-off per block, so a generator that yields, waits and
+                // yields again reaches the client while it waits. A list is
+                // batched by `emit` instead: all of it is already in hand.
                 while let part = pg_iter_next(iterator) {
-                    let ok = emit(job, part, plan.chunked, &staged)
+                    let ok = emit(job, part, plan.chunked, &staged, flushNow: true)
                     pg_decref(part)
                     if !ok { return }
                 }
@@ -409,16 +433,71 @@ public final class WSGIPool {
         _ = handoff(job, &staged)
     }
 
-    /// Serialises one body part, handing bytes over once enough have piled up.
+    /// Serialises one body part, handing bytes over once enough have piled up --
+    /// or immediately, when something is waiting on the far side of this block.
     private func emit(_ job: WSGIJob, _ part: PyObj, _ chunked: Bool,
-                      _ staged: inout ByteBuffer) -> Bool {
+                      _ staged: inout ByteBuffer, flushNow: Bool = false) -> Bool {
         if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: chunked) {
             PyError.logPending("response body part")
             job.failed = true
             return false
         }
-        if staged.readableBytes < stageThreshold { return true }
+        if !flushNow && staged.readableBytes < stageThreshold { return true }
         return handoff(job, &staged)
+    }
+
+    // MARK: - The legacy write() callable, pooled
+
+    /// Sends one block the application passed to `write()`, head included if
+    /// this is the first of them. Runs on the pool thread, holding the GIL.
+    fileprivate func legacyWrite(_ job: WSGIJob, startResponse: PyObj, part: PyObj) -> Int32 {
+        var staged = ByteBuffer()
+        defer { staged.destroy() }
+
+        if !job.headersWritten {
+            guard let statusObj = WSGIStartResponse.status(startResponse),
+                  let headerList = WSGIStartResponse.headers(startResponse) else {
+                pg_err_set_str(pg_exc_runtime(), "write() before start_response()")
+                return -1
+            }
+            // Nothing has been returned yet and nothing can be in time, so the
+            // framing is whatever the application declared or chunked.
+            let plan = WSGIResponseBuilder.writeHead(&staged,
+                                                     statusObj: statusObj,
+                                                     headerList: headerList,
+                                                     startResponse: startResponse,
+                                                     result: nil,
+                                                     snapshot: job.snapshot)
+            if !plan.ok {
+                Log.error(plan.failure)
+                job.failed = true
+                pg_err_set_str(pg_exc_runtime(), "the response head was rejected")
+                return -1
+            }
+            job.status = plan.status
+            job.chunked = plan.chunked
+            job.keepAlive = plan.keepAlive
+            job.bodySuppressed = plan.suppressBody
+            job.headersWritten = true
+        }
+
+        // HEAD, 204, 304: the head goes out, the body is dropped.
+        if !job.bodySuppressed {
+            if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: job.chunked) {
+                job.failed = true
+                return -1
+            }
+        }
+        // Unconditional: this is the hand-off the application is waiting on,
+        // and it is where backpressure parks it if the client is behind.
+        if !handoff(job, &staged) {
+            job.failed = true
+            if pg_err_check() == 0 {
+                pg_err_set_str(pg_exc_os(), "the client closed the connection")
+            }
+            return -1
+        }
+        return 0
     }
 
     /// Publishes staged bytes and blocks while the loop is behind.
@@ -464,4 +543,22 @@ public final class WSGIPool {
 private func wsgiPoolThreadMain(_ raw: UnsafeMutableRawPointer?) {
     guard let raw else { return }
     Unmanaged<WSGIPool>.fromOpaque(raw).takeUnretainedValue().runThread()
+}
+
+/// The C entry point `write()` reaches on a pooled request. The job is the
+/// context, and it carries the pool: a pool thread has no thread-local worker
+/// and must never look for one.
+private func wsgiPooledWriteSink(_ ctx: UnsafeMutableRawPointer?,
+                                 _ startResponse: PyObj?,
+                                 _ part: PyObj?) -> Int32 {
+    guard let ctx, let startResponse, let part else {
+        pg_err_set_str(pg_exc_runtime(), "write() outside a request")
+        return -1
+    }
+    let job = Unmanaged<WSGIJob>.fromOpaque(ctx).takeUnretainedValue()
+    guard let pool = job.pool else {
+        pg_err_set_str(pg_exc_runtime(), "write() has nowhere to write to")
+        return -1
+    }
+    return pool.legacyWrite(job, startResponse: startResponse, part: part)
 }

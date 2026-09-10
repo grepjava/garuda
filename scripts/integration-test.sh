@@ -59,6 +59,12 @@ is "chunked request" \
 is "100-continue" "$(curl -sS --max-time 5 -H 'Expect: 100-continue' -d 'continued' $H/echo)" \
    "continued"
 is "legacy write() plus iterable" "$(curl -sS --max-time 5 $H/write)" "written and returned"
+# write() sends the head before the application returns, so there is no return
+# value to measure and the framing has to be chunked.
+is "legacy write() forces chunked framing" \
+   "$(curl -sS -i --max-time 5 $H/write | grep -ci '^transfer-encoding: chunked')" "1"
+is "legacy write() streams both blocks" \
+   "$(curl -sS --max-time 8 $H/slowwrite?0.2 | tr -d '\n')" "firstsecond"
 is "exactly one Content-Length" \
    "$(curl -sS -i --max-time 5 $H/ | grep -ci '^content-length')" "1"
 is "chunked response for a generator" \

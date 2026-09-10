@@ -141,6 +141,14 @@ semantics and the legacy `write` callable, `wsgi.file_wrapper`, iterable
 `close()`, repeated request headers folded per spec, automatic
 `Content-Length`/chunked framing.
 
+Output is unbuffered in the sense PEP 3333 means. A block yielded by an
+iterator goes to the socket before the next one is asked for, and a block
+handed to `write()` goes out before the call returns — taking the response head
+with it, if it is the first. A generator that yields a progress line and then
+works for a second is therefore seen to do so. A list or tuple return value is
+still written in one go, because every part of it is already in hand and
+nothing is waiting.
+
 **ASGI 3.0 (HTTP):** full scope including `client`, `server`, `raw_path` and
 `state`, streaming request bodies, streaming responses with genuine write
 backpressure, `http.disconnect`, and the lifespan protocol with state shared

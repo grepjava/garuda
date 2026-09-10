@@ -139,11 +139,16 @@ public enum WSGIResponseBuilder {
     /// `result` is inspected but not consumed: a list or tuple return value can
     /// have its total length summed here, which is what lets an ordinary
     /// application get a Content-Length without declaring one.
+    ///
+    /// It is nil when the head is being sent from inside the application, on
+    /// its first `write()`. There is no return value to measure then and there
+    /// never will be one in time, so unless the application declared a
+    /// Content-Length the framing is chunked.
     public static func writeHead(_ out: inout ByteBuffer,
                                  statusObj: PyObj,
                                  headerList: PyObj,
                                  startResponse: PyObj,
-                                 result: PyObj,
+                                 result: PyObj?,
                                  snapshot: WSGIRequestSnapshot) -> WSGIHeadPlan {
         var plan = WSGIHeadPlan()
         plan.keepAlive = snapshot.keepAlive
@@ -273,28 +278,14 @@ public enum WSGIResponseBuilder {
         // --- decide framing ---
         let forbidsBody = HTTPResponseWriter.statusForbidsBody(code)
         plan.suppressBody = snapshot.suppressBody || forbidsBody
-        let isSequence = PySeq.isSequence(result)
-
-        // Anything passed to the legacy write() callable is part of the body
-        // too, and has to be counted before a Content-Length is synthesised.
-        var writtenTotal = 0
-        if let written = WSGIStartResponse.writtenChunks(startResponse) {
-            let wn = Int(pg_list_size(written))
-            var k = 0
-            while k < wn {
-                if let part = pg_list_get(written, pg_ssize_t(k)), pg_is_bytes(part) != 0 {
-                    writtenTotal += Int(pg_bytes_len(part))
-                }
-                k += 1
-            }
-        }
+        let isSequence = result.map { PySeq.isSequence($0) } ?? false
 
         if forbidsBody {
             declaredLength = 0
         } else if declaredLength >= 0 {
             // Application knows its own length.
-        } else if isSequence {
-            var total = writtenTotal
+        } else if let result, isSequence {
+            var total = 0
             var ok = true
             let n = PySeq.count(result)
             var k = 0

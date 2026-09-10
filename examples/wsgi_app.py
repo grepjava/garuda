@@ -107,6 +107,28 @@ def application(environ, start_response):
         write(b"written ")
         return [b"and returned\n"]
 
+    if path == "/slowwrite":
+        # PEP 3333 says a written block goes out before write() returns, so the
+        # first line has to reach the client during the sleep, not after it.
+        write = start_response("200 OK", [("Content-Type", "text/plain")])
+        write(b"first\n")
+        time.sleep(float(environ.get("QUERY_STRING") or 1.0))
+        write(b"second\n")
+        return []
+
+    if path == "/slowstream":
+        # The same question for the ordinary iterable path: a block is due
+        # before the next one is asked for.
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        delay = float(environ.get("QUERY_STRING") or 1.0)
+
+        def produce():
+            yield b"first\n"
+            time.sleep(delay)
+            yield b"second\n"
+
+        return produce()
+
     start_response("404 Not Found", [("Content-Type", "text/plain")])
     return [b"not found\n"]
 

@@ -178,6 +178,16 @@ peregrine --port 8000 --workers 4 --wsgi-threads 8 myproject.wsgi:application
 overlap instead of queueing ([the pool](ARCHITECTURE.md#the-wsgi-thread-pool)). It
 does not help views that are busy on the CPU; `--workers` does.
 
+It also changes what a streaming response costs. PEP 3333 requires each yielded
+block to be transmitted before the next one is asked for, so the inline path
+makes one write syscall per block — on a `StreamingHttpResponse` yielding
+hundreds of small rows, that dominates. A pool thread instead hands each block
+to the loop, which writes it while the application produces the next one; the
+spec allows that, and it costs a mutex rather than a syscall. Measured on a view
+yielding two hundred 100-byte rows: **1,516 req/s inline against 9,632 req/s
+with `--wsgi-threads 4`**. Responses that return a list are unaffected either
+way — they are written in one call, and hello-world throughput does not move.
+
 Choose ASGI when you want WebSockets or WebTransport, and compose the entry
 point like this ([examples/django_app.py:85-128](examples/django_app.py#L85-L128)):
 

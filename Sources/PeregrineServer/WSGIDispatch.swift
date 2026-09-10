@@ -111,23 +111,62 @@ extension Worker {
         callInline(slot, environ: environ, startResponse: startResponse)
     }
 
+    /// Everything the response builder needs about this connection.
+    func wsgiSnapshot(_ slot: Int) -> WSGIRequestSnapshot {
+        let c = table[slot]
+        return WSGIRequestSnapshot(httpMinor: c.pointee.head.httpMinor,
+                                   keepAlive: c.pointee.flags.contains(.keepAlive),
+                                   suppressBody: c.pointee.flags.contains(.suppressBody),
+                                   date: UnsafePointer(dates.bytes),
+                                   // Alt-Svc says where HTTP/3 is; a client
+                                   // already multiplexing over HTTP/3 does not
+                                   // need telling, and one on HTTP/2 hears it
+                                   // from here.
+                                   altSvc: c.pointee.isH3Stream ? nil : config.altSvc,
+                                   altSvcLength: config.altSvcLength,
+                                   multiplexed: c.pointee.isStream)
+    }
+
     // MARK: - Inline execution
 
     private mutating func callInline(_ slot: Int, environ: PyObj, startResponse: PyObj) {
-        guard let result = wsgi!.call(environ: environ, startResponse: startResponse) else {
+        // The legacy write() callable sends as it is called, so it needs a way
+        // back to this connection while the application is still running. The
+        // box lives on this frame, which encloses the whole call.
+        var box = WSGIInlineWriteContext(slot: slot)
+        let result: PyObj? = withUnsafeMutablePointer(to: &box) { boxPtr in
+            WSGIStartResponse.setSink(startResponse, wsgiInlineWriteSink,
+                                      context: UnsafeMutableRawPointer(boxPtr))
+            return wsgi!.call(environ: environ, startResponse: startResponse)
+        }
+
+        // The client went away mid-write. The connection is closed and the
+        // response is logged; there is nothing left to send it on.
+        if box.dead {
+            if let result {
+                closeIterable(result)
+                pg_decref(result)
+            } else {
+                pg_err_clear()
+            }
+            return
+        }
+
+        guard let result else {
             PyError.logPending("application error")
+            if box.headSent {
+                // The head is already on the wire, so a 500 is not available
+                // any more. Dropping the connection is the only honest signal
+                // left -- and on a chunked response the missing terminator is
+                // exactly how a client is told the body is incomplete.
+                closeConnection(slot)
+                return
+            }
             failRequest(slot, status: 500)
             return
         }
         defer {
-            // PEP 3333: close() must be called if the iterable provides it.
-            if pg_hasattr(result, "close") == 1 {
-                if let r = pg_call_method0(result, Interned[.nClose]) {
-                    pg_decref(r)
-                } else {
-                    PyError.logPending("iterable close()")
-                }
-            }
+            closeIterable(result)
             pg_decref(result)
         }
 
@@ -140,7 +179,19 @@ extension Worker {
         }
 
         emitWSGIResponse(slot, status: statusObj, headerList: headerList,
-                         startResponse: startResponse, result: result)
+                         startResponse: startResponse, result: result,
+                         written: box)
+    }
+
+    /// PEP 3333: close() must be called if the iterable provides it.
+    private func closeIterable(_ result: PyObj) {
+        if pg_hasattr(result, "close") == 1 {
+            if let r = pg_call_method0(result, Interned[.nClose]) {
+                pg_decref(r)
+            } else {
+                PyError.logPending("iterable close()")
+            }
+        }
     }
 
     /// Serialises the response into the connection write buffer, flushing
@@ -149,21 +200,18 @@ extension Worker {
                                            status statusObj: PyObj,
                                            headerList: PyObj,
                                            startResponse: PyObj,
-                                           result: PyObj) {
+                                           result: PyObj,
+                                           written: WSGIInlineWriteContext) {
         let c = table[slot]
 
-        let multiplexed = c.pointee.isStream
-        let snapshot = WSGIRequestSnapshot(httpMinor: c.pointee.head.httpMinor,
-                                           keepAlive: c.pointee.flags.contains(.keepAlive),
-                                           suppressBody: c.pointee.flags.contains(.suppressBody),
-                                           date: UnsafePointer(dates.bytes),
-                                           // Alt-Svc says where HTTP/3 is; a
-                                           // client already multiplexing over
-                                           // HTTP/3 does not need telling, and
-                                           // one on HTTP/2 hears it from here.
-                                           altSvc: c.pointee.isH3Stream ? nil : config.altSvc,
-                                           altSvcLength: config.altSvcLength,
-                                           multiplexed: multiplexed)
+        // A write() already sent the head and settled the framing, so the only
+        // thing left is whatever the application returned on top of it.
+        if written.headSent {
+            emitWSGIBody(slot, result: result, plan: written.plan)
+            return
+        }
+
+        let snapshot = wsgiSnapshot(slot)
         // The buffer descriptor is copied out and back rather than passed
         // inout, because the flush below needs the connection to itself.
         var out = c.pointee.write
@@ -183,19 +231,14 @@ extension Worker {
         c.pointee.write = out
         applyPlan(slot, plan)
         logAccess(slot, status: plan.status)
+        emitWSGIBody(slot, result: result, plan: plan)
+    }
+
+    /// Writes whatever the application returned, and closes the message.
+    private mutating func emitWSGIBody(_ slot: Int, result: PyObj, plan: WSGIHeadPlan) {
+        let c = table[slot]
 
         if !plan.suppressBody {
-            // Legacy write() output goes out ahead of the iterable.
-            if let written = WSGIStartResponse.writtenChunks(startResponse) {
-                let n = Int(pg_list_size(written))
-                var k = 0
-                while k < n {
-                    guard let part = pg_list_get(written, pg_ssize_t(k)) else { break }
-                    k += 1
-                    if !appendBodyPart(slot, part, chunked: plan.chunked) { return }
-                }
-            }
-
             if PySeq.isSequence(result) {
                 let n = PySeq.count(result)
                 var k = 0
@@ -213,8 +256,15 @@ extension Worker {
                     return
                 }
                 defer { pg_decref(iterator) }
+                // Each block goes to the socket before the next one is asked
+                // for, which is what PEP 3333 requires of an iterator and the
+                // only way a generator that yields, waits, and yields again
+                // reaches the client while it waits. A list gets the batched
+                // treatment above instead: every part is already in hand, so
+                // nothing is kept waiting by writing them together.
                 while let part = pg_iter_next(iterator) {
-                    let ok = appendBodyPart(slot, part, chunked: plan.chunked)
+                    let ok = appendBodyPart(slot, part, chunked: plan.chunked,
+                                            flushNow: true)
                     pg_decref(part)
                     if !ok { return }
                 }
@@ -254,7 +304,13 @@ extension Worker {
 
     /// Appends one body part, applying backpressure. Returns false if the
     /// connection died.
-    private mutating func appendBodyPart(_ slot: Int, _ part: PyObj, chunked: Bool) -> Bool {
+    ///
+    /// `flushNow` is for the producers that have someone waiting on the other
+    /// end of the block -- an iterator between yields, a `write()` inside the
+    /// application. It costs one write syscall per block, which is the price of
+    /// the block actually leaving.
+    private mutating func appendBodyPart(_ slot: Int, _ part: PyObj, chunked: Bool,
+                                         flushNow: Bool = false) -> Bool {
         let c = table[slot]
         var out = c.pointee.write
         let ok = WSGIResponseBuilder.writeBodyPart(&out, part, chunked: chunked)
@@ -264,11 +320,80 @@ extension Worker {
             closeConnection(slot)
             return false
         }
-        // Keep memory bounded on large streaming responses.
+        // Keep memory bounded on large streaming responses. Checked before the
+        // flush below because it is the one that waits for the client, and a
+        // producer past the high water mark should be made to wait.
         if c.pointee.write.readableBytes > config.writeHighWaterMark {
-            if !flushWithBackpressure(slot) { return false }
+            return flushWithBackpressure(slot)
+        }
+        if flushNow, c.pointee.write.readableBytes > 0 {
+            return flush(slot)
         }
         return true
+    }
+
+    // MARK: - The legacy write() callable, inline
+
+    /// Sends one block the application passed to `write()`, head included if
+    /// this is the first of them.
+    fileprivate mutating func legacyWriteInline(
+        _ box: UnsafeMutablePointer<WSGIInlineWriteContext>,
+        startResponse: PyObj,
+        part: PyObj
+    ) -> Int32 {
+        // An application that caught the last failure and kept writing. The
+        // slot is closed and may already belong to another connection, so the
+        // only safe thing is to keep saying no.
+        if box.pointee.dead {
+            pg_err_set_str(pg_exc_os(), "the client closed the connection")
+            return -1
+        }
+        let slot = box.pointee.slot
+
+        if !box.pointee.headSent {
+            guard let statusObj = WSGIStartResponse.status(startResponse),
+                  let headerList = WSGIStartResponse.headers(startResponse) else {
+                pg_err_set_str(pg_exc_runtime(), "write() before start_response()")
+                return -1
+            }
+            let c = table[slot]
+            var out = c.pointee.write
+            // No return value exists yet and none can arrive in time, so the
+            // framing is whatever the application declared or chunked.
+            let plan = WSGIResponseBuilder.writeHead(&out,
+                                                     statusObj: statusObj,
+                                                     headerList: headerList,
+                                                     startResponse: startResponse,
+                                                     result: nil,
+                                                     snapshot: wsgiSnapshot(slot))
+            if !plan.ok {
+                out.clear()
+                c.pointee.write = out
+                Log.error(plan.failure)
+                box.pointee.dead = true
+                failRequest(slot, status: 500)
+                pg_err_set_str(pg_exc_runtime(), "the response head was rejected")
+                return -1
+            }
+            c.pointee.write = out
+            applyPlan(slot, plan)
+            logAccess(slot, status: plan.status)
+            box.pointee.plan = plan
+            box.pointee.headSent = true
+        }
+
+        // HEAD, 204, 304: the head goes out, the body is dropped. PEP 3333 has
+        // the application write it either way.
+        if box.pointee.plan.suppressBody { return 0 }
+
+        if !appendBodyPart(slot, part, chunked: box.pointee.plan.chunked, flushNow: true) {
+            box.pointee.dead = true
+            if pg_err_check() == 0 {
+                pg_err_set_str(pg_exc_os(), "the client closed the connection")
+            }
+            return -1
+        }
+        return 0
     }
 
     // MARK: - Pooled execution
@@ -362,4 +487,38 @@ extension Worker {
         c.pointee.state = .writing
         _ = flush(slot)
     }
+}
+
+// MARK: - The write() sink
+
+/// What the inline `write()` sink needs while the application runs, and what it
+/// leaves behind for the code that finishes the response.
+///
+/// It lives on `callInline`'s frame, which encloses the application call, so
+/// nothing can reach a `write()` after the frame is gone.
+struct WSGIInlineWriteContext {
+    let slot: Int
+    /// The framing the first write settled. The application's return value is
+    /// written on top of it, under the same rules.
+    var plan = WSGIHeadPlan()
+    var headSent = false
+    /// The client went away during a write, so the connection is already
+    /// closed and the slot must not be touched again.
+    var dead = false
+
+    init(slot: Int) { self.slot = slot }
+}
+
+/// The C entry point `write()` reaches. The worker comes from the thread-local
+/// rather than the context, because the inline path runs the application on the
+/// loop thread by definition.
+private func wsgiInlineWriteSink(_ ctx: UnsafeMutableRawPointer?,
+                                 _ startResponse: PyObj?,
+                                 _ part: PyObj?) -> Int32 {
+    guard let ctx, let startResponse, let part, let worker = currentWorker else {
+        pg_err_set_str(pg_exc_runtime(), "write() outside a request")
+        return -1
+    }
+    let box = ctx.assumingMemoryBound(to: WSGIInlineWriteContext.self)
+    return worker.pointee.legacyWriteInline(box, startResponse: startResponse, part: part)
 }
