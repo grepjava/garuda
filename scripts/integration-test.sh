@@ -99,8 +99,25 @@ has "space before colon is rejected" \
     "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\nFoo : bar\r\n\r\n')" "400"
 has "obs-fold is rejected" \
     "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\n  folded\r\n\r\n')" "400"
+# A lone `gzip` leaves chunked out of the list, so the body cannot be framed at
+# all: RFC 9112 6.3 asks for 400 there, and reserves 501 for the case where
+# chunked is final but wraps a coding the server cannot remove.
 has "unknown transfer coding is rejected" \
-    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n')" "501"
+    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n')" "400"
+has "chunked under an unknown coding is a 501" \
+    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n')" \
+    "501"
+has "a coding that merely ends in chunked is rejected" \
+    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n')" \
+    "400"
+has "chunked before another coding is rejected" \
+    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n')" \
+    "400"
+has "a repeated Transfer-Encoding is rejected" \
+    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')" \
+    "400"
+has "a second Host header is rejected" \
+    "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n')" "400"
 is "underscore headers are dropped (HTTP_X_A spoofing)" \
    "$(curl -sS --max-time 5 -H 'X_Spoofed: 1' $H/env | grep -c 'X_SPOOFED')" "0"
 

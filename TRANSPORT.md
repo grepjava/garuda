@@ -90,9 +90,16 @@ implementations disagree about where a message ends:
 - whitespace between a header name and its colon is rejected;
 - `Content-Length` together with `Transfer-Encoding` is rejected;
 - two disagreeing `Content-Length` values are rejected;
-- a transfer coding that is not `chunked` is refused rather than guessed at;
+- `Transfer-Encoding` is parsed as the comma-separated coding list it is, and
+  only a bare `chunked` frames a body. `xchunked` is not `chunked`, and neither
+  is `chunked;x=1`; a list whose last coding is not `chunked` cannot be framed
+  at all and is a 400 (RFC 9112 6.3), while `gzip, chunked` — framable, but
+  under a coding this server cannot remove — is a 501 (RFC 9112 6.1). A second
+  `Transfer-Encoding` field continues the same list, so it means the first
+  field's coding was not the final one: also a 400;
 - `obs-fold` continuation lines are rejected rather than unfolded;
-- HTTP/1.1 without `Host` is a 400.
+- HTTP/1.1 without `Host` is a 400, and so is a second `Host`, whether or not
+  the two agree (RFC 9112 3.2).
 
 On the response side, an application header containing CR or LF is refused
 outright — the classic response-splitting hole. On the request side, header

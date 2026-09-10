@@ -323,7 +323,8 @@ The Django form is the same with `<str:room>` converters and
 
 The HTTP/1.1 parser is strict wherever strictness prevents request smuggling —
 whitespace before a colon, `Content-Length` with `Transfer-Encoding`,
-disagreeing lengths, unknown transfer codings, `obs-fold`, a missing `Host`.
+disagreeing lengths, any `Transfer-Encoding` that is not a bare `chunked`,
+`obs-fold`, a missing or repeated `Host`.
 Response headers containing CR or LF are refused outright. Request header names
 containing underscores are dropped, and a `Proxy:` header is dropped entirely.
 [The full list.](TRANSPORT.md#strictness-that-prevents-smuggling)

@@ -113,12 +113,17 @@ public enum HTTPParseError: UInt16, Sendable {
     case conflictingFraming = 4002
     case unsupportedTransferEncoding = 501
     case badChunk = 4003
+    /// More than one Host field. RFC 9112 3.2 makes it a 400 even when the two
+    /// agree: a proxy that routes on one and an origin that routes on the other
+    /// is the whole of a host-desync attack.
+    case duplicateHost = 4004
 
     /// HTTP status to report for this failure.
     @inlinable
     public var status: Int {
         switch self {
-        case .badRequestLine, .badHeader, .conflictingFraming, .badChunk: return 400
+        case .badRequestLine, .badHeader, .conflictingFraming, .badChunk,
+             .duplicateHost: return 400
         case .badVersion: return 505
         case .uriTooLong: return 414
         case .headTooLarge, .tooManyHeaders: return 431

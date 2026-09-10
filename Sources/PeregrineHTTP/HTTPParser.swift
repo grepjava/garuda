@@ -11,7 +11,9 @@
 //     desync against downstream proxies)
 //   * Content-Length together with Transfer-Encoding is rejected outright
 //   * two Content-Length values that disagree is rejected
-//   * a Transfer-Encoding that does not end in `chunked` is rejected
+//   * Transfer-Encoding is parsed as the coding list it is, and only a bare
+//     `chunked` frames a body; anything else is rejected
+//   * a second Host field is rejected
 //   * obs-fold (a continuation line) is rejected rather than unfolded
 //===----------------------------------------------------------------------===//
 
@@ -113,6 +115,7 @@ public enum HTTPParser {
         var sawContentLength = false
         var contentLength = -1
         var chunked = false
+        var sawTransferEncoding = false
         var n = 0
 
         // ---- header fields ----
@@ -183,7 +186,10 @@ public enum HTTPParser {
 
             switch nameLen {
             case 4:
-                if equalsLowercased(np, 4, "host") { head.flags.insert(.hasHost) }
+                if equalsLowercased(np, 4, "host") {
+                    if head.flags.contains(.hasHost) { return .failure(.duplicateHost) }
+                    head.flags.insert(.hasHost)
+                }
             case 6:
                 if equalsLowercased(np, 6, "expect"),
                    containsTokenLowercased(vp, vLen, "100-continue") {
@@ -213,12 +219,13 @@ public enum HTTPParser {
                 }
             case 17:
                 if equalsLowercased(np, 17, "transfer-encoding") {
-                    // Only `chunked`, and only as the final coding.
-                    if vLen >= 7, equalsLowercased(vp + (vLen &- 7), 7, "chunked") {
-                        chunked = true
-                    } else {
-                        return .failure(.unsupportedTransferEncoding)
-                    }
+                    // Repeated fields are one list (RFC 9110 5.3), so a second
+                    // Transfer-Encoding means the first one's last coding was
+                    // not the final one, and the body cannot be framed.
+                    if sawTransferEncoding { return .failure(.conflictingFraming) }
+                    sawTransferEncoding = true
+                    if let e = checkTransferEncoding(vp, vLen) { return .failure(e) }
+                    chunked = true
                 }
             default:
                 break
@@ -245,6 +252,56 @@ public enum HTTPParser {
         head.headerCount = n
         head.headEnd = i
         return .complete
+    }
+
+    /// Checks one `Transfer-Encoding` value, which is a comma-separated list of
+    /// transfer-codings (RFC 9112 6.1) and not the single token it looks like.
+    ///
+    /// The suffix test this replaced -- does the value end in `chunked` --
+    /// accepted `xchunked`, and accepted `gzip, chunked` while quietly dropping
+    /// the gzip layer, which hands the application a body that is not the one
+    /// the client sent. Both are how a parser ends up framing a request
+    /// differently from the proxy in front of it.
+    ///
+    /// Only a bare `chunked` frames a body here:
+    ///
+    ///   * the final coding is not `chunked` -- `xchunked`, `gzip`,
+    ///     `chunked, gzip`, or `chunked;x=1`, since chunked takes no parameters
+    ///     -- so the body length cannot be determined and RFC 9112 6.3 requires
+    ///     400, not 501;
+    ///   * `chunked` is final but wraps a coding we cannot remove
+    ///     (`gzip, chunked`): 501, per RFC 9112 6.1.
+    ///
+    /// Empty elements are skipped rather than rejected: the list rule in
+    /// RFC 9110 5.6.1 requires a recipient to tolerate them, and they do not
+    /// change which coding is last.
+    ///
+    /// Returns nil when the value frames the body as plain chunked.
+    @inlinable
+    static func checkTransferEncoding(_ p: UnsafePointer<UInt8>, _ n: Int) -> HTTPParseError? {
+        var i = 0
+        var codings = 0
+        var lastIsChunked = false
+
+        while true {
+            var end = i
+            while end < n, p[end] != cComma { end &+= 1 }
+            // Trim OWS from both ends of this element.
+            var s = i
+            var e = end
+            while s < e, p[s] == cSP || p[s] == cHT { s &+= 1 }
+            while e > s, p[e &- 1] == cSP || p[e &- 1] == cHT { e &-= 1 }
+            if e > s {
+                codings &+= 1
+                lastIsChunked = equalsLowercased(p + s, e &- s, "chunked")
+            }
+            if end == n { break }
+            i = end &+ 1
+        }
+
+        // A Transfer-Encoding field with no coding in it frames nothing either.
+        if codings == 0 || !lastIsChunked { return .conflictingFraming }
+        return codings == 1 ? nil : .unsupportedTransferEncoding
     }
 
     /// Method classification by length and first byte: one comparison chain,

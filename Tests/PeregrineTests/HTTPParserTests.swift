@@ -170,8 +170,81 @@ struct HTTPParserTests {
 
     @Test("an unknown transfer coding is refused rather than guessed at")
     func unknownTransferEncoding() {
+        // A lone `gzip` leaves chunked out of the list entirely, so the body
+        // length cannot be determined: RFC 9112 6.3 makes that a 400, not the
+        // 501 an unimplemented-coding reading would suggest.
         let r = parse("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n")
+        #expect(isFailure(r, .conflictingFraming))
+    }
+
+    @Test("a coding that merely ends in `chunked` is not chunked")
+    func transferEncodingSuffixIsNotAToken() {
+        // The parser used to test the last seven bytes of the value, so every
+        // one of these framed a body as chunked and returned 200.
+        for value in ["xchunked", "not-chunked", "gzipchunked", "chunkedchunked"] {
+            let r = parse("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: \(value)\r\n\r\n")
+            #expect(isFailure(r, .conflictingFraming), "\(value) was accepted")
+        }
+    }
+
+    @Test("chunked under a coding we cannot remove is a 501")
+    func transferEncodingChunkedOverUnknown() {
+        // Framing is determinable -- chunked is final -- but the body under it
+        // is gzip, and handing that to the application as the entity body is
+        // worse than refusing.
+        let r = parse("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
         #expect(isFailure(r, .unsupportedTransferEncoding))
+        #expect(HTTPParseError.unsupportedTransferEncoding.status == 501)
+    }
+
+    @Test("chunked before another coding cannot frame a body")
+    func transferEncodingChunkedNotFinal() {
+        let r = parse("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n")
+        #expect(isFailure(r, .conflictingFraming))
+    }
+
+    @Test("chunked takes no parameters")
+    func transferEncodingChunkedWithParameter() {
+        let r = parse("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked;x=1\r\n\r\n")
+        #expect(isFailure(r, .conflictingFraming))
+    }
+
+    @Test("a second Transfer-Encoding field continues the same list")
+    func transferEncodingRepeated() {
+        // Two fields are one list, so the first field's `chunked` is no longer
+        // final -- the shape that desyncs a parser reading only the first
+        // header from one reading only the last.
+        let r = parse("POST / HTTP/1.1\r\nHost: x\r\n"
+                      + "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n")
+        #expect(isFailure(r, .conflictingFraming))
+        let r2 = parse("POST / HTTP/1.1\r\nHost: x\r\n"
+                       + "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n")
+        #expect(isFailure(r2, .conflictingFraming))
+    }
+
+    @Test("Transfer-Encoding is matched case-insensitively and tolerates OWS")
+    func transferEncodingSpelling() {
+        for value in ["Chunked", "CHUNKED", "  chunked  ", "chunked,", ", chunked"] {
+            parse("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: \(value)\r\n\r\n") {
+                r, head, _, _ in
+                #expect(r == .complete, "\(value) was rejected")
+                #expect(head.isChunked)
+            }
+        }
+    }
+
+    @Test("an empty Transfer-Encoding frames nothing")
+    func transferEncodingEmpty() {
+        #expect(isFailure(parse("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: \r\n\r\n"),
+                          .conflictingFraming))
+    }
+
+    @Test("a second Host header is rejected, agreeing or not")
+    func duplicateHost() {
+        #expect(isFailure(parse("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"), .duplicateHost))
+        #expect(isFailure(parse("GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n"), .duplicateHost))
+        #expect(isFailure(parse("GET / HTTP/1.1\r\nHost: a\r\nhOsT: b\r\n\r\n"), .duplicateHost))
+        #expect(HTTPParseError.duplicateHost.status == 400)
     }
 
     @Test("obs-fold continuation lines are rejected, not unfolded")
