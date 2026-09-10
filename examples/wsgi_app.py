@@ -4,6 +4,9 @@ import os
 import threading
 import time
 
+# Things an application is allowed to hold on to between requests.
+SAVED = {}
+
 
 def application(environ, start_response):
     path = environ["PATH_INFO"]
@@ -106,6 +109,32 @@ def application(environ, start_response):
         write = start_response("200 OK", [("Content-Type", "text/plain")])
         write(b"written ")
         return [b"and returned\n"]
+
+    if path == "/savewrite":
+        # Keep the write callable past the end of this request, which nothing
+        # in PEP 3333 stops an application doing. See /stalewrite.
+        write = start_response("200 OK", [("Content-Type", "text/plain")])
+        write(b"saved\n")
+        SAVED["write"] = write
+        return []
+
+    if path == "/stalewrite":
+        # Call the write callable the previous request left behind. Its request
+        # is over, so it must raise here rather than push bytes into this
+        # response -- or into whatever else now owns that connection slot.
+        stale = SAVED.get("write")
+        if stale is None:
+            outcome = b"nothing saved\n"
+        else:
+            try:
+                stale(b"stale")
+            except Exception as exc:
+                outcome = ("%s: %s\n" % (type(exc).__name__, exc)).encode()
+            else:
+                outcome = b"accepted\n"
+        start_response("200 OK", [("Content-Type", "text/plain"),
+                                  ("Content-Length", str(len(outcome)))])
+        return [outcome]
 
     if path == "/slowwrite":
         # PEP 3333 says a written block goes out before write() returns, so the

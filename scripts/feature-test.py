@@ -906,6 +906,35 @@ def test_wsgi_streaming():
         is_("write() output precedes the returned body", body,
             b"written and returned\n")
 
+    # A write callable outlives its request whenever the application stores it,
+    # and the machinery behind it does not: inline it is a stack frame that has
+    # returned, pooled it is a job that has been released. Calling it later has
+    # to raise, not write through either.
+    def stale_write(server):
+        """Saves the write callable on one request, calls it on the next."""
+        s = server.connect()
+        try:
+            s.sendall(b"GET /savewrite HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            first = read_http_response(s)
+            s.sendall(b"GET /stalewrite HTTP/1.1\r\nHost: localhost\r\n"
+                      b"Connection: close\r\n\r\n")
+            return first, read_http_response(s)
+        finally:
+            s.close()
+
+    for label, extra in (("inline", []), ("pooled", ["--wsgi-threads", "4"])):
+        port = free_port()
+        with Server(*extra, port=port, app="wsgi_app:application") as server:
+            first, second = stale_write(server)
+            is_("%s: the request that saves a write() is unaffected" % label,
+                first[2], b"saved\n")
+            status, headers, body = second
+            is_("%s: a write() saved by an earlier request raises" % label,
+                body, b"RuntimeError: write() called outside its own request\n")
+            is_("%s: the stale write() leaves this response intact" % label,
+                (status, headers.get("content-length")),
+                (200, str(len(body))))
+
 
 def test_header_shapes():
     print("\nFramework compatibility")

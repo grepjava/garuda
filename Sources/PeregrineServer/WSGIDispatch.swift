@@ -132,17 +132,31 @@ extension Worker {
     private mutating func callInline(_ slot: Int, environ: PyObj, startResponse: PyObj) {
         // The legacy write() callable sends as it is called, so it needs a way
         // back to this connection while the application is still running. The
-        // box lives on this frame, which encloses the whole call.
+        // box lives on this frame, and the pointer to it is bounded by the
+        // scope below -- which encloses the application call and the body walk
+        // after it, because an iterator is entitled to write() between yields.
         var box = WSGIInlineWriteContext(slot: slot)
-        let result: PyObj? = withUnsafeMutablePointer(to: &box) { boxPtr in
+        withUnsafeMutablePointer(to: &box) { boxPtr in
             WSGIStartResponse.setSink(startResponse, wsgiInlineWriteSink,
                                       context: UnsafeMutableRawPointer(boxPtr))
-            return wsgi!.call(environ: environ, startResponse: startResponse)
+            // start_response returns itself, so the application can keep the
+            // write callable past its own request. Unhooking the sink here,
+            // while the box is still alive, is what stops a later call writing
+            // through this frame into someone else's response.
+            defer { WSGIStartResponse.clearSink(startResponse) }
+            runInline(slot, environ: environ, startResponse: startResponse,
+                      box: boxPtr)
         }
+    }
+
+    private mutating func runInline(_ slot: Int, environ: PyObj,
+                                    startResponse: PyObj,
+                                    box: UnsafeMutablePointer<WSGIInlineWriteContext>) {
+        let result = wsgi!.call(environ: environ, startResponse: startResponse)
 
         // The client went away mid-write. The connection is closed and the
         // response is logged; there is nothing left to send it on.
-        if box.dead {
+        if box.pointee.dead {
             if let result {
                 closeIterable(result)
                 pg_decref(result)
@@ -154,7 +168,7 @@ extension Worker {
 
         guard let result else {
             PyError.logPending("application error")
-            if box.headSent {
+            if box.pointee.headSent {
                 // The head is already on the wire, so a 500 is not available
                 // any more. Dropping the connection is the only honest signal
                 // left -- and on a chunked response the missing terminator is
@@ -180,7 +194,7 @@ extension Worker {
 
         emitWSGIResponse(slot, status: statusObj, headerList: headerList,
                          startResponse: startResponse, result: result,
-                         written: box)
+                         written: box.pointee)
     }
 
     /// PEP 3333: close() must be called if the iterable provides it.
@@ -496,8 +510,9 @@ extension Worker {
 /// What the inline `write()` sink needs while the application runs, and what it
 /// leaves behind for the code that finishes the response.
 ///
-/// It lives on `callInline`'s frame, which encloses the application call, so
-/// nothing can reach a `write()` after the frame is gone.
+/// It lives on `callInline`'s frame, which encloses the whole response, and the
+/// sink is unhooked before that frame returns -- so a `write()` callable the
+/// application kept can no longer reach this box afterwards.
 struct WSGIInlineWriteContext {
     let slot: Int
     /// The framing the first write settled. The application's return value is

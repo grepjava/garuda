@@ -321,7 +321,16 @@ public final class WSGIPool {
         let gil = pg_gil_ensure()
         runApplication(job)
         if let e = job.environ { pg_decref(e); job.environ = nil }
-        if let s = job.startResponse { pg_decref(s); job.startResponse = nil }
+        if let s = job.startResponse {
+            // The sink points at this job, which nothing keeps alive once the
+            // loop has drained it. An application that stored the callable
+            // start_response returned would otherwise reach a freed job from
+            // some later request; clearing the sink under the GIL, before the
+            // last reference this side holds goes, makes that call raise.
+            WSGIStartResponse.clearSink(s)
+            pg_decref(s)
+            job.startResponse = nil
+        }
         pg_gil_release(gil)
 
         pg_mutex_lock(mutex)

@@ -74,6 +74,22 @@ public enum WSGIStartResponse {
         pg_obj_set_ctx2(obj, unsafeBitCast(sink, to: UnsafeMutableRawPointer.self))
     }
 
+    /// Unhooks the sink, which the server must do before the context behind it
+    /// goes away.
+    ///
+    /// This object outlives the request whenever the application keeps the
+    /// callable `start_response` returned -- nothing stops it storing that in a
+    /// module global and calling it during some later request. The context it
+    /// points at does not outlive the request: inline it is a frame that has
+    /// returned, pooled it is a job that has been released. Clearing it turns
+    /// such a call into a Python exception in the application that made it,
+    /// which is the only place it can honestly be reported.
+    @inlinable
+    public static func clearSink(_ obj: PyObj) {
+        pg_obj_set_ctx(obj, nil)
+        pg_obj_set_ctx2(obj, nil)
+    }
+
     /// Whether the head is already on the wire. A `write()` puts it there
     /// before the application returns; otherwise it goes out afterwards, when
     /// `start_response` can no longer be called anyway.
@@ -113,9 +129,11 @@ private func srCall(_ selfObj: PyObj?, _ args: PyObj?, _ kwargs: PyObj?) -> PyOb
             return nil
         }
         guard let raw = pg_obj_ctx2(selfObj) else {
-            // The server always installs one before calling the application,
-            // so this is a bug here rather than in the application.
-            pg_err_set_str(pg_exc_runtime(), "write() has nowhere to write to")
+            // The server installs a sink before it calls the application and
+            // removes it when the response is done, so getting here means the
+            // application kept the callable and called it after its request.
+            pg_err_set_str(pg_exc_runtime(),
+                           "write() called outside its own request")
             return nil
         }
         let sink = unsafeBitCast(raw, to: WSGIWriteSink.self)
