@@ -22,31 +22,20 @@ bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   
 is()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 has()  { case "$2" in *"$3"*) ok "$1";; *) bad "$1" "contains $3" "$2";; esac; }
 
-# The server this script started, and nothing else: matching by name would take
-# down another peregrine that happens to be running on the machine.
-SERVER_PID=""
-
-cleanup() {
-    [ -n "$SERVER_PID" ] || return 0
-    kill -TERM "$SERVER_PID" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        kill -0 "$SERVER_PID" 2>/dev/null || break
-        sleep 0.2
-    done
-    kill -KILL "$SERVER_PID" 2>/dev/null
-    wait "$SERVER_PID" 2>/dev/null
-    SERVER_PID=""
-}
-trap 'cleanup; exit 130' INT TERM
-trap cleanup EXIT
+# Only the server this script started is stopped, and it is stopped as a process
+# group so that `--workers N` leaves nothing behind.
+# shellcheck source=scripts/serverlib.sh
+. "$(dirname "$0")/serverlib.sh"
+cleanup() { server_stop; }
+server_trap_cleanup
 
 start() {
     local port=$1 app=$2
     cleanup
     # shellcheck disable=SC2086 -- EXTRA is a deliberate word-split flag list.
-    "$BIN" --port "$port" --log-level error --python-path examples $EXTRA "$app" \
-        > "/tmp/peregrine-it-$port.log" 2>&1 &
-    SERVER_PID=$!
+    server_start "$BIN" --port "$port" --log-level error \
+        --python-path examples $EXTRA "$app" \
+        > "/tmp/peregrine-it-$port.log" 2>&1
     for _ in $(seq 1 50); do
         curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
         sleep 0.2

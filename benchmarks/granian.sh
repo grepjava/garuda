@@ -18,18 +18,21 @@ CONNECTIONS=${CONNECTIONS:-64}
 WORKERS=${WORKERS:-1}
 URL="http://127.0.0.1:$PORT/"
 
-stop() {
-    pkill -9 -x peregrine 2>/dev/null
-    pkill -9 -f "/granian --" 2>/dev/null
-    sleep 1
-}
+# Only the server this script started is stopped, and as a process group, so
+# the workers it forked go with it and no unrelated server is touched.
+# shellcheck source=scripts/serverlib.sh
+. "$(dirname "$0")/../scripts/serverlib.sh"
+# The port too: a third-party server may put its workers in a session of
+# their own, where signalling the group cannot reach them.
+stop() { server_stop "$PORT"; }
+server_trap_cleanup
 
 bench() {
     local name="$1"
     shift
     stop
-    "$@" > /tmp/bench-server.log 2>&1 &
-    local pid=$!
+    server_start "$@" > /tmp/bench-server.log 2>&1
+    local pid=$SERVER_PID
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
         if curl -sS --max-time 1 -o /dev/null "$URL" 2>/dev/null; then

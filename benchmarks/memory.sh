@@ -11,12 +11,14 @@ PORT=8211
 CONNS=${CONNS:-500}
 URL="http://127.0.0.1:$PORT/"
 
-stop() {
-    pkill -9 -x peregrine 2>/dev/null
-    pkill -9 -f uvicorn 2>/dev/null
-    pkill -9 -f gunicorn 2>/dev/null
-    sleep 1
-}
+# Only the server this script started is stopped, and as a process group, so
+# the workers it forked go with it and no unrelated server is touched.
+# shellcheck source=scripts/serverlib.sh
+. "$(dirname "$0")/../scripts/serverlib.sh"
+# The port too: a third-party server may put its workers in a session of
+# their own, where signalling the group cannot reach them.
+stop() { server_stop "$PORT"; }
+server_trap_cleanup
 
 # Every descendant of $1, plus $1 itself.
 tree_pids() {
@@ -52,8 +54,9 @@ measure() {
     local name="$1"
     shift
     stop
-    "$@" > /dev/null 2>&1 &
-    local root=$!
+    server_start "$@" > /dev/null 2>&1
+    # The group leader, which is what the tree walk below starts from.
+    local root=$SERVER_PID
     sleep 4
     if ! curl -sS --max-time 3 -o /dev/null "$URL"; then
         echo "$name: failed to start"

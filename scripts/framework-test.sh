@@ -26,8 +26,12 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   %
 is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 has() { case "$2" in *"$3"*) ok "$1";; *) bad "$1" "$2" "contains $3";; esac; }
 
-cleanup() { pkill -9 -x peregrine 2>/dev/null; rm -f "$MARKER"; sleep 0.3; }
-trap cleanup EXIT
+# Only the server this script started is stopped, and as a process group, so
+# nothing is left behind and no unrelated peregrine is taken down with it.
+# shellcheck source=scripts/serverlib.sh
+. "$(dirname "$0")/serverlib.sh"
+cleanup() { server_stop; rm -f "$MARKER"; }
+server_trap_cleanup
 
 if [ ! -x "$PY" ]; then
     echo "no interpreter at $PY; create one and install fastapi starlette django websockets"
@@ -43,10 +47,13 @@ start() {  # port app extra-args...
     local port=$1 app=$2
     shift 2
     cleanup
-    PEREGRINE_SHUTDOWN_MARKER="$MARKER" "$BIN" --port "$port" --log-level error \
+    # Exported rather than prefixed on the call: a prefix assignment on a shell
+    # function leaks into the shell afterwards, which is not what it looks like.
+    export PEREGRINE_SHUTDOWN_MARKER="$MARKER"
+    server_start "$BIN" --port "$port" --log-level error \
         --venv "$VENV" --python-path "$HERE/examples" --python-path "$HERE/python" \
         --forwarded-allow-ips 127.0.0.1 "$@" "$app" \
-        > "${TMPDIR:-/tmp}/peregrine-fw-$port.log" 2>&1 &
+        > "${TMPDIR:-/tmp}/peregrine-fw-$port.log" 2>&1
     for _ in $(seq 1 100); do
         curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
         sleep 0.2
@@ -106,9 +113,10 @@ PYEOF
 )
 is "a real websockets client round-trips through Starlette" "$WS" "echo:hello 100005"
 
-# Graceful shutdown must run the FastAPI lifespan teardown.
+# Graceful shutdown must run the FastAPI lifespan teardown. TERM to the server
+# this script started, not to every peregrine on the machine.
 rm -f "$MARKER"
-pkill -x peregrine
+kill -TERM -- "-$SERVER_PID" 2>/dev/null
 sleep 2
 if [ -f "$MARKER" ]; then ok "the FastAPI lifespan shutdown ran"
 else bad "the FastAPI lifespan shutdown ran" "no marker written" "a marker file"; fi

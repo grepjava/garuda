@@ -16,36 +16,20 @@ DURATION=${DURATION:-10s}
 CONNECTIONS=${CONNECTIONS:-64}
 URL="http://127.0.0.1:$PORT/"
 
-# The PID of the server this script started, and nothing else. Matching by name
-# would take unrelated processes with it -- another peregrine, somebody's own
-# gunicorn, or a shell whose command line happens to contain the word.
-SERVER_PID=""
-
-stop() {
-    [ -n "$SERVER_PID" ] || return 0
-    # The reference servers fork workers, so signal the process group the server
-    # leads rather than the leader alone; `setsid` below is what makes it one.
-    kill -TERM -- "-$SERVER_PID" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        kill -0 "$SERVER_PID" 2>/dev/null || break
-        sleep 0.2
-    done
-    kill -KILL -- "-$SERVER_PID" 2>/dev/null
-    wait "$SERVER_PID" 2>/dev/null
-    SERVER_PID=""
-}
-
-# However the script ends -- finished, interrupted, or failed -- the server it
-# started goes with it.
-trap 'stop; exit 130' INT TERM
-trap 'stop' EXIT
+# Only the server this script started is stopped, and as a process group, so the
+# workers gunicorn and uvicorn fork go with it.
+# shellcheck source=scripts/serverlib.sh
+. "$(dirname "$0")/../scripts/serverlib.sh"
+# The port too: a third-party server may put its workers in a session of
+# their own, where signalling the group cannot reach them.
+stop() { server_stop "$PORT"; }
+server_trap_cleanup
 
 bench() {
     local name="$1"
     shift
     stop
-    setsid "$@" > /tmp/bench-server.log 2>&1 &
-    SERVER_PID=$!
+    server_start "$@" > /tmp/bench-server.log 2>&1
     sleep 3
     if ! curl -sS --max-time 3 -o /dev/null "$URL"; then
         echo "$name: FAILED TO START"
