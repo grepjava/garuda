@@ -264,10 +264,22 @@ idea — refuse to buffer, and let the pressure reach whoever is producing.
 - **A WSGI application streaming a response.** PEP 3333 makes this the
   application's own problem to feel: a yielded block goes to the socket before
   the next is requested, and a `write()` goes out before it returns, so a
-  producer faster than the client parks in the write that will not complete —
-  inline on the socket, and on a pool thread through the same high water mark
-  as everything else. Buffering it all until the application returns, which is
-  what the server used to do, hides the pressure and delays every byte.
+  producer faster than the client parks in the write that will not complete.
+  Inline that means draining the block to the socket entirely, waiting on
+  writability as often as it takes — stopping at the high water mark instead
+  strands up to that much of the block, and on the inline path there is nothing
+  to send it while the application runs. On a pool thread the same block is
+  handed to the loop, which writes it while the application produces the next
+  one, and the high water mark parks the thread. Buffering it all until the
+  application returns, which is what the server used to do, hides the pressure
+  and delays every byte.
+
+  The exception is a WSGI response on an HTTP/2 or HTTP/3 stream, where a block
+  can only go as far as the peer's flow-control window allows. Waiting for more
+  window inline would deadlock — the `WINDOW_UPDATE` that would release it
+  arrives on the loop that is blocked — so the bytes stay with the transport
+  and go out when the loop next runs. `--wsgi-threads` is what removes that
+  gap, because then the loop is running.
 
 Bodies are bounded by `--max-body`, heads by `--max-header-size`, header count
 by a fixed limit, and connections by `--max-connections`; a full table answers

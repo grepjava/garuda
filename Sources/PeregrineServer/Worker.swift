@@ -812,7 +812,17 @@ public struct Worker {
     /// Blocks the worker until the socket accepts more data. Used only when a
     /// synchronous WSGI response outgrows the high-water mark, where the choice
     /// is between stalling this worker and buffering without bound.
-    mutating func flushWithBackpressure(_ slot: Int) -> Bool {
+    /// Writes until the buffer is down to `target` bytes, waiting on the socket
+    /// when it will not take any more.
+    ///
+    /// `target` is the high water mark for a producer that only has to be kept
+    /// from running away with memory. It is 0 for one that has to be able to
+    /// say the block has been sent -- a WSGI `write()`, or an iterator between
+    /// yields -- because on the inline path the application runs on the loop
+    /// thread, so anything left here has nothing to send it until the
+    /// application returns. Stopping at the high water mark strands up to that
+    /// much of the block for as long as the application cares to sleep.
+    mutating func flushWithBackpressure(_ slot: Int, until target: Int? = nil) -> Bool {
         let c = table[slot]
         // A stream has no socket to wait on. Blocking the worker on the
         // connection underneath would be worse than useless for HTTP/3: the
@@ -820,7 +830,8 @@ public struct Worker {
         // that is blocked. So the bytes go to the transport, which holds them
         // under the peer's flow control, and the producer keeps going.
         if c.pointee.isStream { return flush(slot) }
-        while c.pointee.write.readableBytes > config.writeHighWaterMark {
+        let limit = target ?? config.writeHighWaterMark
+        while c.pointee.write.readableBytes > limit {
             let n = connWrite(slot,
                               c.pointee.write.readPointer,
                               c.pointee.write.readableBytes)

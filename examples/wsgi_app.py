@@ -116,6 +116,18 @@ def application(environ, start_response):
         write(b"second\n")
         return []
 
+    if path == "/bigwrite":
+        # A block far larger than the write buffer, then a pause. Anything the
+        # server has not sent by the time the pause starts cannot move until it
+        # ends -- on the inline path the application is holding the loop thread
+        # -- so this is how a stranded remainder becomes visible.
+        write = start_response("200 OK",
+                               [("Content-Type", "application/octet-stream")])
+        write(b"x" * (8 * 1024 * 1024))
+        time.sleep(float(environ.get("QUERY_STRING") or 1.0))
+        write(b"TAIL")
+        return []
+
     if path == "/slowstream":
         # The same question for the ordinary iterable path: a block is due
         # before the next one is asked for.

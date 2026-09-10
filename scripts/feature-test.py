@@ -850,6 +850,52 @@ def test_wsgi_streaming():
                       b"first" in body and b"second" in body,
                       "body was %r" % body[:120])
 
+    # A block bigger than the write buffer, delivered to a client too slow to
+    # take it in one go. Draining only down to the high water mark leaves up to
+    # that much of the block behind, and on the inline path nothing can send it
+    # while the application sleeps.
+    def bytes_before_the_pause(server, path, pace=0.004):
+        s = server.connect(timeout=40)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 1024)
+        s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                   % path).encode())
+        time.sleep(1.0)              # let the server fill the socket
+        s.settimeout(30)
+        last = time.time()
+        total = 0
+        widest = 0.0
+        before = 0
+        while True:
+            try:
+                chunk = s.recv(262144)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            now = time.time()
+            if now - last > widest:
+                widest, before = now - last, total
+            last = now
+            total += len(chunk)
+            if b"TAIL" in chunk:
+                break
+            time.sleep(pace)
+        s.close()
+        return before, total, widest
+
+    for label, extra in (("inline", []), ("pooled", ["--wsgi-threads", "4"])):
+        port = free_port()
+        with Server(*extra, port=port, app="wsgi_app:application") as server:
+            before, total, widest = bytes_before_the_pause(server, "/bigwrite?3.0")
+            block = 8 * 1024 * 1024
+            check("%s: an 8 MiB write() is drained before the application "
+                  "continues (%.2f of 8.00 MiB before a %.1fs pause)"
+                  % (label, before / (1024.0 * 1024.0), widest),
+                  before >= block, "%d bytes of %d arrived before the pause; "
+                  "the rest was stranded in the server's buffer" % (before, block))
+            check("%s: the whole 8 MiB response still arrives" % label,
+                  total >= block, "got %d bytes" % total)
+
     # Framing, which the early head has to settle without a return value in
     # hand: chunked unless the application declared a length of its own.
     port = free_port()

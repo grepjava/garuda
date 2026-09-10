@@ -307,8 +307,12 @@ extension Worker {
     ///
     /// `flushNow` is for the producers that have someone waiting on the other
     /// end of the block -- an iterator between yields, a `write()` inside the
-    /// application. It costs one write syscall per block, which is the price of
-    /// the block actually leaving.
+    /// application. The block is drained all the way out before control goes
+    /// back, waiting on the socket if the client is behind, because on this
+    /// path the application runs on the loop thread: whatever is left here has
+    /// nothing to send it until the application returns. That is one write
+    /// syscall per block when the client keeps up, and the application waiting
+    /// on the client when it does not, which is what backpressure means.
     private mutating func appendBodyPart(_ slot: Int, _ part: PyObj, chunked: Bool,
                                          flushNow: Bool = false) -> Bool {
         let c = table[slot]
@@ -320,14 +324,12 @@ extension Worker {
             closeConnection(slot)
             return false
         }
-        // Keep memory bounded on large streaming responses. Checked before the
-        // flush below because it is the one that waits for the client, and a
-        // producer past the high water mark should be made to wait.
+        if flushNow {
+            return flushWithBackpressure(slot, until: 0)
+        }
+        // A batched producer only has to be kept from running away with memory.
         if c.pointee.write.readableBytes > config.writeHighWaterMark {
             return flushWithBackpressure(slot)
-        }
-        if flushNow, c.pointee.write.readableBytes > 0 {
-            return flush(slot)
         }
         return true
     }
