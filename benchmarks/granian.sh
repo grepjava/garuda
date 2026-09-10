@@ -22,10 +22,12 @@ URL="http://127.0.0.1:$PORT/"
 # the workers it forked go with it and no unrelated server is touched.
 # shellcheck source=scripts/serverlib.sh
 . "$(dirname "$0")/../scripts/serverlib.sh"
-# The port too: a third-party server may put its workers in a session of
-# their own, where signalling the group cannot reach them.
-stop() { server_stop "$PORT"; }
+stop() { server_stop; }
 server_trap_cleanup
+
+# Nothing here will clear the port for itself: a listener that is already
+# there belongs to somebody else, and killing it is not this script's call.
+server_require_port_free "$PORT" || exit 1
 
 bench() {
     local name="$1"

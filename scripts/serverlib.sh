@@ -7,17 +7,29 @@
 # friends are wider still, since -f matches any command line containing the
 # word -- a text editor with the file open, or the invoking shell.
 #
-# Two things matter here:
+# Nothing here signals a process it cannot show it started:
 #
-#   * only the process this script started is signalled;
-#   * it is signalled as a process group, so the workers a supervisor forked go
-#     with it. Signalling the leader alone and then killing it after a timeout
-#     is how an orphaned worker survives to hold the port against the next run.
+#   * the server runs in a process group of its own, so the workers a
+#     supervisor forks are reached along with it. Signalling the leader alone
+#     and then killing it after a timeout is how an orphaned worker survives to
+#     hold the port against the next run;
+#   * descendants that leave that group -- granian's workers are
+#     `multiprocessing` children that start a session of their own -- are
+#     collected by walking the process tree *before* anything is signalled,
+#     because once the leader dies its children are re-parented and there is
+#     nothing left to prove they were ours.
+#
+# Killing whatever holds the port is deliberately not done. It reads as the
+# narrow option and is not: a harness calls `stop` before it starts anything, so
+# a port-based cleanup fires while the only listener is a server that has
+# nothing to do with this script. `server_require_port_free` says so and stops
+# instead.
 #
 # Usage:
 #
 #     . "$(dirname "$0")/serverlib.sh"
-#     server_start "$BIN" --port 8000 app:application > server.log 2>&1
+#     server_require_port_free 8210 || exit 1
+#     server_start "$BIN" --port 8210 app:application > server.log 2>&1
 #     ...
 #     server_stop
 #
@@ -40,36 +52,36 @@ server_start() {
     set +m
 }
 
-# Anything still listening on a port this script owns, once the group is gone.
-#
-# A server that puts itself in a session of its own cannot be reached by
-# signalling the process group -- granian's workers are `multiprocessing`
-# children that do exactly that -- and matching by name is what this file exists
-# to avoid. The port is the narrowest handle left: the script has already
-# claimed it, so whatever is still holding it is both the thing that escaped and
-# the thing that would break the next run.
-server_reap_port() {
-    local port=$1
-    command -v fuser >/dev/null 2>&1 || return 0
-    fuser -k -TERM "$port/tcp" >/dev/null 2>&1 || return 0
-    sleep 0.5
-    fuser -k -KILL "$port/tcp" >/dev/null 2>&1 || true
+# Every descendant of $1, plus $1 itself, as a space-separated list.
+server_descendants() {
+    local frontier=$1 out=$1 next p kids
+    while [ -n "$frontier" ]; do
+        next=""
+        for p in $frontier; do
+            kids=$(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')
+            next="$next $kids"
+        done
+        frontier=$(echo "$next" | xargs 2>/dev/null)
+        out="$out $frontier"
+    done
+    echo "$out" | xargs
 }
 
-# Stops the server and everything it forked. Safe to call when nothing is
+# Stops the server and everything it started. Safe to call when nothing is
 # running, and safe to call twice.
-#
-# With a port argument, anything still holding that port afterwards is reaped
-# too; pass it when the server being started is not ours.
 server_stop() {
-    local port=${1:-}
-    if [ -z "${SERVER_PID:-}" ]; then
-        [ -n "$port" ] && server_reap_port "$port"
-        return 0
-    fi
+    [ -n "${SERVER_PID:-}" ] || return 0
 
-    # A negative PID is the process group that PID leads.
+    # Taken while the tree is still intact, and only ever processes this script
+    # is the ancestor of.
+    local owned
+    owned=$(server_descendants "$SERVER_PID")
+
+    # A negative PID is the process group that PID leads; the list catches
+    # anything that left it.
     kill -TERM -- "-$SERVER_PID" 2>/dev/null
+    # shellcheck disable=SC2086 -- a deliberate list of pids.
+    kill -TERM $owned 2>/dev/null
 
     local waited=0
     local limit=$((SERVER_STOP_TIMEOUT * 5))
@@ -78,14 +90,27 @@ server_stop() {
         waited=$((waited + 1))
     done
 
-    # Whatever is still up has had its grace period. The group again, because
-    # the point is not to leave a worker behind holding the port.
+    # Whatever is still up has had its grace period. The point is not to leave a
+    # worker behind holding the port.
     kill -KILL -- "-$SERVER_PID" 2>/dev/null
+    # shellcheck disable=SC2086 -- a deliberate list of pids.
+    kill -KILL $owned 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
     SERVER_PID=""
-
-    [ -n "$port" ] && server_reap_port "$port"
     return 0
+}
+
+# True when nothing is listening on the port yet.
+#
+# A harness that finds the port taken should say so and stop. The alternatives
+# are both bad: measuring whatever is already there, or clearing it out of the
+# way, which means killing a process this script never started.
+server_require_port_free() {
+    local port=$1
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN || return 0
+    echo "port $port is already in use; stop whatever is on it and run this again" >&2
+    return 1
 }
 
 # `server_stop` on the way out, however the script ends.
