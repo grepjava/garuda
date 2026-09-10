@@ -11,6 +11,35 @@ import PeregrineCore
 import PeregrineHTTP
 import PeregrinePython
 
+/// Where the ASGI lifespan runs when workers are threads (`--free-threaded`).
+///
+/// With workers as processes the question does not arise: one process, one
+/// event loop, one lifespan. With workers as threads there are N loops in one
+/// interpreter, and ASGI has no answer for that -- the specification is written
+/// for a server with one loop, and says the lifespan runs on the loop that will
+/// process requests.
+public enum LifespanScope: Sendable {
+    /// One lifespan per worker loop, the reading that keeps the specification's
+    /// promise: whatever `startup` binds to the running loop -- an asyncpg pool,
+    /// an httpx client, a background task -- is awaited on that same loop.
+    ///
+    /// The cost is that `startup` runs N times against a single application
+    /// object, so an application that stores its pool in a module global or on
+    /// `app.state` keeps only the last one, and the workers that ran earlier are
+    /// back to reaching across loops. Such an application should put the pool in
+    /// the `state` mapping the lifespan scope hands it, which is per loop here,
+    /// or run with `.once` and no async resources.
+    case perWorker
+    /// One lifespan on the supervising thread's loop, which processes no
+    /// requests. `startup` runs exactly once, which is what an application that
+    /// opens a global resource in it expects, but nothing that resource binds to
+    /// its loop is then safe to await from a worker.
+    ///
+    /// Correct for applications whose `startup` only reads configuration, builds
+    /// synchronous objects, or opens connections that are not loop-bound.
+    case once
+}
+
 public struct ServerConfig {
     // --- listening ---
     public var host: UnsafePointer<CChar> = staticCString("127.0.0.1")
@@ -83,6 +112,9 @@ public struct ServerConfig {
     @inlinable public var pythonPath: UnsafePointer<CChar>? { pythonPaths.first }
     public var preferUvloop = true
     public var callLifespan = true
+    /// Only consulted under `--free-threaded`; a worker process always runs its
+    /// own lifespan on the one loop it has.
+    public var lifespanScope: LifespanScope = .perWorker
     /// Directory of a virtualenv whose site-packages should be made importable.
     /// nil means "use VIRTUAL_ENV if it is set".
     public var venvPath: UnsafePointer<CChar>? = nil

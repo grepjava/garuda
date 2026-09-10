@@ -87,6 +87,12 @@ func printUsage() {
       --reload                 restart workers when source files change
       --no-uvloop              do not use uvloop even when installed
       --no-lifespan            skip the ASGI lifespan protocol
+      --lifespan-scope WHICH   with --free-threaded, whether the lifespan runs
+                               per worker thread (worker, the default, so that
+                               what startup opens belongs to the loop that
+                               awaits it) or exactly once for the process
+                               (process, for start-up that opens nothing
+                               loop-bound)
       --tls-cert PATH          PEM certificate chain; enables TLS with ALPN
       --tls-key PATH           PEM private key for it
       --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
@@ -327,6 +333,15 @@ while i < argc {
         config.preferUvloop = false
     } else if matches(arg, "--no-lifespan") {
         config.callLifespan = false
+    } else if matches(arg, "--lifespan-scope") {
+        guard let v = next("--lifespan-scope needs worker or process") else { break }
+        if matches(v, "worker") { config.lifespanScope = .perWorker }
+        else if matches(v, "process") || matches(v, "once") { config.lifespanScope = .once }
+        else {
+            Log.error("unknown --lifespan-scope; use worker or process")
+            failed = true
+            break
+        }
     } else if matches(arg, "--access-log") {
         config.accessLog = true
     } else if matches(arg, "--log-level") {

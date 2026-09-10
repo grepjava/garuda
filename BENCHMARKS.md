@@ -109,8 +109,7 @@ is not the whole of the framework gap.
 - **`--workers` (processes) is the way to raise hello-world RPS.** That is
   how Peregrine uses every core today.
 - **`--free-threaded` is not a throughput upgrade on this contract.** It is
-  the same parallelism with one import, one lifespan and one set of
-  module-level caches. Measure RSS, or a CPU-bound view, if that is the
+  the same parallelism with one import and one set of module-level caches. Measure RSS, or a CPU-bound view, if that is the
   claim you want to test — [CONFIG.md](CONFIG.md#free-threaded-python) and
   [benchmarks/free_threaded.sh](benchmarks/free_threaded.sh).
 - These cells are empty `GET /`. They say nothing about bodies, HTTP/2,

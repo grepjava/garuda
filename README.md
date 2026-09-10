@@ -185,8 +185,10 @@ peregrine --workers 0 --free-threaded myapp:app
 On four cores with a CPU-bound application that is 5,907 req/s in 47 MB against
 5,832 req/s in 143 MB for four worker processes — the throughput of processes
 at a third of the memory, because Django is imported once instead of four
-times. The ASGI lifespan runs once for the process, so an application opens one
-connection pool rather than one per worker. [Details.](CONFIG.md#free-threaded-python)
+times. The ASGI lifespan runs once per worker thread, on the event loop that
+thread serves requests with, so what an application opens in `startup` is
+attached to the loop that will await
+it. [Details.](CONFIG.md#free-threaded-python)
 
 ---
 
@@ -241,6 +243,9 @@ peregrine [options] MODULE:ATTRIBUTE
   --reload                 restart workers when source files change
   --no-uvloop              do not use uvloop even when installed
   --no-lifespan            skip the ASGI lifespan protocol
+  --lifespan-scope WHICH   with --free-threaded, run the lifespan per worker
+                           thread (worker, default) or once for the whole
+                           process (process)
   --tls-cert PATH          PEM certificate chain; enables TLS with ALPN
   --tls-key PATH           PEM private key for it
   --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2

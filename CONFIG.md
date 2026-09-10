@@ -385,11 +385,36 @@ memory and shared-state option, not a request-rate upgrade on an empty view.
 
 Sharing one process also changes three things it is worth knowing about:
 
-- **The ASGI lifespan runs once**, not once per worker. That is what an
-  application means when it opens a connection pool in `startup`: one pool, for
-  the process. All the workers get the same `state` mapping. On shutdown the
-  order is inverted correctly — every worker finishes its in-flight requests
-  first, and only then does the application get `lifespan.shutdown`.
+- **The ASGI lifespan runs once per worker thread**, on the event loop that
+  thread will serve requests with, and each worker gets its own `state` mapping.
+  It is tempting to run it once for the process, since there is one application
+  — and that is what this used to do. It is wrong: `startup` is where an
+  application builds asyncio objects, and an asyncio object belongs to the loop
+  that was running when it was created. A pool built on the supervising thread's
+  loop and awaited from a worker's loop raises `got Future attached to a
+  different loop`, when it fails loudly at all. Each worker shuts its own
+  lifespan down on its own loop, after its own requests have drained.
+
+  The consequence to plan for is that `startup` runs N times against one
+  application object. The startups are serialised, so they do not race each
+  other, but an application that stores its pool in a module global or on
+  `app.state` keeps only the last one and puts every other worker back to
+  reaching across loops. Put per-worker resources in the `state` mapping the
+  lifespan scope hands you:
+
+  ```python
+  async def lifespan(app):
+      async with asyncpg.create_pool(DSN) as pool:
+          yield {"pool": pool}          # per worker thread, on its own loop
+
+  # in a handler: scope["state"]["pool"], or request.state.pool in Starlette
+  ```
+
+  `--lifespan-scope process` restores the single startup for applications whose
+  start-up opens nothing loop-bound — reading configuration, building
+  synchronous objects, warming a cache. There the lifespan lives on the
+  supervising thread's loop, all workers share its `state`, and shutdown waits
+  for every worker to be joined first.
 - **`wsgi.multithread` is `True` and `wsgi.multiprocess` is `False`**, which is
   the opposite of what `--workers` reports. An application that is not
   thread-safe will notice. This is the same requirement `--wsgi-threads`

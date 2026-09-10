@@ -1286,25 +1286,53 @@ def test_free_threaded():
     finally:
         server.stop()
 
-    # --- the lifespan runs once, not once per worker ---
-    marker = os.path.join(tempfile.gettempdir(), "peregrine-ft-boot-%d" % os.getpid())
-    if os.path.exists(marker):
-        os.unlink(marker)
-    port = free_port()
-    server = Server("--workers", "4", "--free-threaded", port=port,
-                    env={"PEREGRINE_STARTUP_COUNTER": marker})
-    try:
-        server.get("/")
-        count = 0
-        if os.path.exists(marker):
-            with open(marker) as fh:
-                count = len(fh.read().split())
-        check("lifespan startup runs once for the whole process",
-              count == 1, "ran %d times" % count)
-    finally:
-        server.stop()
+    # --- the lifespan follows the loop that will serve requests ---
+    #
+    # By default that is one lifespan per worker thread. Running it once for the
+    # whole process reads better until you ask which loop the pool it opened is
+    # attached to: the supervising thread's, which serves nothing.
+    def startup_count(*extra):
+        marker = os.path.join(tempfile.gettempdir(),
+                              "peregrine-ft-boot-%d" % os.getpid())
         if os.path.exists(marker):
             os.unlink(marker)
+        port = free_port()
+        server = Server("--workers", "4", "--free-threaded", *extra, port=port,
+                        env={"PEREGRINE_STARTUP_COUNTER": marker})
+        try:
+            server.get("/")
+            if not os.path.exists(marker):
+                return 0
+            with open(marker) as fh:
+                return len(fh.read().split())
+        finally:
+            server.stop()
+            if os.path.exists(marker):
+                os.unlink(marker)
+
+    count = startup_count()
+    check("lifespan startup runs once per worker thread",
+          count == 4, "ran %d times" % count)
+    count = startup_count("--lifespan-scope", "process")
+    check("--lifespan-scope process runs it once for the whole process",
+          count == 1, "ran %d times" % count)
+
+    # The point of the per-worker default: what `startup` binds to its loop is
+    # awaited on that same loop. /looptest asks the application to await a Future
+    # its lifespan created, which raises "attached to a different loop" when the
+    # two are not the same.
+    port = free_port()
+    server = Server("--workers", "4", "--free-threaded", port=port)
+    try:
+        verdicts = set()
+        for _ in range(20):
+            code, _hdrs, body = server.get("/looptest")
+            if code == 200:
+                verdicts.add(body.strip())
+        check("a resource opened in startup is usable from the worker's loop",
+              verdicts == {b"ok"}, "saw %r" % (verdicts,))
+    finally:
+        server.stop()
 
     # --- shutdown: in-flight requests on worker threads are waited for, and
     #     the lifespan shuts down only afterwards ---

@@ -20,7 +20,9 @@ STUBBORN_LIFESPAN = os.environ.get("PEREGRINE_STUBBORN_LIFESPAN")
 
 # One line appended per lifespan startup. Under --free-threaded several workers
 # share one application, so the count answers the question that model raises:
-# does `startup` run once, or once per worker?
+# does `startup` run once, or once per worker? It is once per worker by default,
+# because the lifespan follows the event loop that will serve the requests, and
+# once for the process under --lifespan-scope process.
 STARTUP_COUNTER = os.environ.get("PEREGRINE_STARTUP_COUNTER")
 
 
@@ -33,6 +35,11 @@ async def app(scope, receive, send):
             if message["type"] == "lifespan.startup":
                 startup_ran = True
                 scope["state"]["shared"] = "from-lifespan"
+                # A Future binds to the loop that was running when it was made,
+                # which makes it a stand-in for the database pool an application
+                # really opens here: /looptest awaits it and finds out whether
+                # the lifespan and the request are on the same loop.
+                scope["state"]["pool"] = asyncio.get_running_loop().create_future()
                 if STARTUP_COUNTER:
                     with open(STARTUP_COUNTER, "a") as fh:
                         fh.write("%d\n" % os.getpid())
@@ -87,6 +94,23 @@ async def app(scope, receive, send):
     elif path == "/pid":
         await reply(str(os.getpid()).encode())
 
+    elif path == "/looptest":
+        # "ok" means the resource the lifespan created is one this loop can
+        # await. Anything else is the cross-loop failure a shared lifespan
+        # produces, reported rather than raised so the test can read it.
+        pool = (scope.get("state") or {}).get("pool")
+        if pool is None:
+            verdict = "no-state"
+        else:
+            try:
+                await asyncio.wait_for(asyncio.shield(pool), 0.05)
+                verdict = "resolved"
+            except asyncio.TimeoutError:
+                verdict = "ok"
+            except RuntimeError as exc:
+                verdict = "cross-loop: %s" % exc
+        await reply(verdict.encode())
+
     elif path == "/threadid":
         # Under --free-threaded the workers are threads of one process, so this
         # is what distinguishes them; under --workers they are all the same.
@@ -110,7 +134,10 @@ async def app(scope, receive, send):
             "startup_ran": startup_ran,
         }
         import json
-        await reply(json.dumps(interesting, sort_keys=True).encode() + b"\n",
+        # `default` because the lifespan state carries the /looptest Future,
+        # and a scope dump should describe whatever is in there rather than
+        # fail on it.
+        await reply(json.dumps(interesting, sort_keys=True, default=repr).encode() + b"\n",
                     content_type=b"application/json")
 
     elif path == "/listpairs":

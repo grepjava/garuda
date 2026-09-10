@@ -24,30 +24,37 @@
 //     written once before any worker thread starts and only read afterwards.
 //
 // What is genuinely shared is the application, and that is the point. One
-// import, one set of module-level caches, one database pool, one warm JIT --
-// instead of N copies with N times the resident memory. It also means the ASGI
-// lifespan runs once, not once per worker, which is what an application means
-// when it opens a pool in `startup`.
+// import, one set of module-level caches, one warm JIT -- instead of N copies
+// with N times the resident memory.
+//
+// What is not shared is the ASGI lifespan. It is tempting to run it once, since
+// there is one application, and that is what this did at first; it is wrong.
+// `startup` is where an application builds asyncio objects, and an asyncio
+// object binds to the loop that was running when it was created. A pool built
+// on the supervising thread's loop and awaited from a worker's loop is the
+// "attached to a different loop" bug, when it fails loudly at all. So the
+// lifespan follows the loop: one per worker by default, each publishing its own
+// `state` mapping to the scopes that loop serves. `--lifespan-scope process`
+// asks for the other reading -- exactly one `startup` -- and is right only for
+// applications whose start-up opens nothing loop-bound.
 //
 // Structure of the process:
 //
 //   main thread          worker thread 0     worker thread 1     ...
 //   -----------          ---------------     ---------------
 //   interpreter, app
-//   lifespan startup
 //   spawn --------------> poller, slab       poller, slab
 //   signal pipe           event loop         event loop
-//   (asyncio loop
-//    hosting lifespan)    serving            serving
+//   (asyncio loop         lifespan startup   lifespan startup
+//    watching signals)      (serialised)       (serialised)
+//                         serving            serving
 //   SIGTERM ------------> drain              drain
+//                         lifespan shutdown  lifespan shutdown
 //   join <--------------- exit               exit
-//   lifespan shutdown
 //
 // The main thread is not a worker. It costs one mostly-idle thread and buys the
-// two orderings that matter: signals are delivered somewhere that is not in the
-// middle of serving a request, and the lifespan shutdown runs after every
-// worker has let go of its connections rather than while one is still using the
-// pool it is about to close.
+// ordering that matters: signals are delivered somewhere that is not in the
+// middle of serving a request.
 //===----------------------------------------------------------------------===//
 
 import CPeregrine
@@ -65,6 +72,10 @@ import PeregrineWSGI
 /// more here than the reference counting is worth avoiding.
 final class WorkerGroup {
     private let mutex: OpaquePointer
+    /// Held across one worker's lifespan startup, and never together with
+    /// `mutex`, so that polling the counters below never waits on an
+    /// application's `startup`.
+    private let startupMutex: OpaquePointer
     private var readyCount = 0
     private var failedCount = 0
     private var doneCount = 0
@@ -74,11 +85,29 @@ final class WorkerGroup {
 
     init?(count: Int) {
         guard let m = pg_mutex_new() else { return nil }
+        guard let s = pg_mutex_new() else { pg_mutex_free(m); return nil }
         self.mutex = m
+        self.startupMutex = s
         self.count = count
     }
 
-    deinit { pg_mutex_free(mutex) }
+    deinit {
+        pg_mutex_free(mutex)
+        pg_mutex_free(startupMutex)
+    }
+
+    /// Runs one worker's lifespan startup with no other worker inside its own.
+    ///
+    /// Every worker thread calls `startup` on the same application object, and
+    /// on a free-threaded interpreter those calls genuinely overlap. Application
+    /// start-up code has never had to be thread-safe -- it ran once per process
+    /// everywhere else -- so it is serialised here. This is start-up; the
+    /// serialisation costs nothing that matters.
+    func withStartupLock<T>(_ body: () -> T) -> T {
+        pg_mutex_lock(startupMutex)
+        defer { pg_mutex_unlock(startupMutex) }
+        return body()
+    }
 
     /// Every worker has either started serving or given up trying.
     var settled: Bool {
@@ -140,6 +169,10 @@ final class WorkerThread {
     let controlRead: Int32
     let controlWrite: Int32
     unowned let group: WorkerGroup
+    /// Under `.once`, the `state` mapping the one process-wide lifespan
+    /// published; under `.perWorker` this stays nil and the thread runs a
+    /// lifespan of its own.
+    var sharedLifespanState: PyObj? = nil
     private var handle: OpaquePointer? = nil
 
     init?(index: Int, config: ServerConfig, loaded: Peregrine.LoadedApplication,
@@ -200,19 +233,55 @@ final class WorkerThread {
             return
         }
         // The process, not this thread, decides when it is over: the drain here
-        // is followed by a join and a lifespan shutdown on the main thread.
+        // is followed by a join on the main thread.
         workerPtr.pointee.ownsExitWatchdog = false
 
+        /// Gives back everything this thread has taken and reports the failure,
+        /// so that start-up ends as one clear error rather than a server that
+        /// came up with fewer workers than it was asked for.
+        func abandon(_ what: StaticString) {
+            Log.error(what)
+            workerPtr.pointee.destroy()
+            workerPtr.deinitialize(count: 1)
+            workerPtr.deallocate()
+            currentWorker = nil
+            group.markFailed()
+            pg_gil_release(state)
+        }
+
         if loaded.proto == .asgi {
-            guard let loop = ASGIRuntime.makeLoop(config),
-                  ASGIRuntime.prepareWorker(workerPtr, config: config, loop: loop) else {
-                Log.error("could not prepare the ASGI runtime for a worker thread")
-                workerPtr.pointee.destroy()
-                workerPtr.deinitialize(count: 1)
-                workerPtr.deallocate()
-                currentWorker = nil
-                group.markFailed()
-                pg_gil_release(state)
+            guard let loop = ASGIRuntime.makeLoop(config) else {
+                abandon("could not create the event loop for a worker thread")
+                return
+            }
+
+            // The lifespan belongs to the loop that will await what it opened.
+            // Under `.perWorker` that is this loop, and this thread runs the
+            // handshake itself; under `.once` it already ran on the supervising
+            // thread and this worker only inherits the state mapping.
+            var scopeState = sharedLifespanState
+            var ownsScopeState = false
+            if config.lifespanScope == .perWorker {
+                guard let ls = group.withStartupLock({
+                    ASGIRuntime.startLifespan(app: loaded.app, loop: loop, config: config)
+                }) else {
+                    abandon("lifespan startup failed on a worker thread")
+                    return
+                }
+                // This worker's own lifespan, shut down on this loop once this
+                // worker has drained -- not on the main thread, and not while
+                // another worker is still serving from a pool of its own.
+                workerPtr.pointee.asgiLifespan = ls.driver
+                scopeState = ls.state
+                ownsScopeState = true
+            }
+
+            let prepared = ASGIRuntime.prepareWorker(workerPtr, config: config, loop: loop,
+                                                     lifespanState: scopeState)
+            // The scope builder holds a reference of its own now.
+            if ownsScopeState, let st = scopeState { pg_decref(st) }
+            guard prepared else {
+                abandon("could not prepare the ASGI runtime for a worker thread")
                 return
             }
         }
@@ -251,9 +320,9 @@ final class ThreadSupervisor {
     let group: WorkerGroup
     let config: ServerConfig
     let signalFD: Int32
-    /// The main thread's own event loop in ASGI mode: it hosts the lifespan and
-    /// whatever background tasks the application started in `startup`, and it
-    /// keeps running while the workers drain.
+    /// The main thread's own event loop in ASGI mode: it watches the signal
+    /// pipe and keeps running while the workers drain. Under
+    /// `--lifespan-scope process` it also hosts the one lifespan.
     var loop: PyObj? = nil
     var lifespan: PyObj? = nil
     var timerCallback: PyObj? = nil
@@ -365,25 +434,34 @@ extension Peregrine {
 
         guard let loaded = bootInterpreter(config) else { return false }
 
-        // --- process-wide ASGI setup, and the lifespan, before any worker ---
+        // --- process-wide ASGI setup, before any worker ---
         var mainLoop: PyObj? = nil
         var lifespan: PyObj? = nil
+        var sharedState: PyObj? = nil
         if loaded.proto == .asgi {
             guard ASGIRuntime.prepareProcess(app: loaded.app, config: config) else {
                 Log.error("could not prepare the ASGI runtime")
                 return false
             }
+            // The supervising thread needs a loop whether or not a lifespan
+            // runs on it: it is how the signal pipe is watched.
             guard let l = ASGIRuntime.makeLoop(config) else { return false }
             mainLoop = l
-            // Once per process, on the loop that will keep running for the life
-            // of the process -- so a background task the application starts in
-            // `startup` is actually driven, and its shutdown runs after every
-            // worker has finished with the resources it is about to release.
-            guard let ls = ASGIRuntime.startLifespan(app: loaded.app, loop: l,
-                                                     config: config) else {
-                return false
+            if config.lifespanScope == .once {
+                // One handshake, on a loop that serves no requests. Whatever it
+                // opened is therefore bound to a loop no worker awaits on --
+                // safe only for resources that are not loop-bound, which is why
+                // this is not the default.
+                guard let ls = ASGIRuntime.startLifespan(app: loaded.app, loop: l,
+                                                         config: config) else {
+                    return false
+                }
+                lifespan = ls.driver
+                // Held for the life of the process: worker threads take their
+                // own reference as they build their scopes, and they do that
+                // after this function has moved on.
+                sharedState = ls.state
             }
-            lifespan = ls
         }
 
         // Importing the application -- or uvloop, which `makeLoop` pulls in by
@@ -431,6 +509,7 @@ extension Peregrine {
                                             listenFD: fd, group: group) else {
                 return false
             }
+            member.sharedLifespanState = sharedState
             group.members.append(member)
         }
 
@@ -477,8 +556,13 @@ extension Peregrine {
 
         group.joinAll()
 
-        // Only now, with no worker holding a connection any more, does the
-        // application get told to shut down.
+        // Under `.perWorker` each worker has already drained its connections and
+        // run its own lifespan shutdown on its own loop, in that order, before
+        // the join above returned; `lifespan` is nil and this only closes the
+        // supervising loop. Under `.once` this is the one shutdown, and it runs
+        // here rather than earlier because no worker holds a connection any
+        // more -- the application's pool is not pulled out from under a request
+        // still finishing on another thread.
         if let l = mainLoop {
             ASGIRuntime.finishLoop(l, lifespan: lifespan)
         }

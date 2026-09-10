@@ -81,25 +81,37 @@ work was to move the last few pieces of per-worker state off the process:
   a mutable memoised header-name cache and a scratch buffer, so one shared
   across threads would have been a data race on the request path.
 
-The main thread is not a worker. It costs one mostly-idle thread and buys two
-orderings:
+The main thread is not a worker. It costs one mostly-idle thread and buys the
+ordering that matters: **signals land somewhere that is not serving a request.**
+Worker threads are started with every signal blocked; the main thread owns the
+signal pipe and asks each worker to drain by writing down a pipe that worker
+already polls, so `handleSignals` cannot tell the difference between that and a
+real signal.
 
-- **Signals land somewhere that is not serving a request.** Worker threads are
-  started with every signal blocked; the main thread owns the signal pipe and
-  asks each worker to drain by writing down a pipe that worker already polls,
-  so `handleSignals` cannot tell the difference between that and a real signal.
-- **The lifespan is a process-level thing, and is treated as one.** It runs
-  once, on the main thread's own event loop — which keeps running, so a
-  background task the application started in `startup` is actually driven. Its
-  `state` mapping goes to every worker's scope builder. At shutdown every
-  worker drains and is joined *first*, and only then does the application get
-  `lifespan.shutdown`: closing the database pool while another thread is still
-  finishing a request with it is exactly the bug that ordering exists to avoid.
+**The lifespan follows the event loop, not the process.** This started out the
+other way around — one lifespan on the main thread's loop, one `startup` for one
+application — and that was wrong. `startup` is where an application builds
+asyncio objects, and an asyncio object binds to the loop that was running when
+it was created; a pool built on the supervising loop and awaited from a worker's
+loop is the "attached to a different loop" error, when it fails loudly at all.
+So each worker thread runs the lifespan on its own loop and publishes its own
+`state` mapping to the scopes that loop serves, and shuts it down on that loop
+once its own requests have drained. The startups are serialised behind a mutex:
+they run against one application object that has never had to be thread-safe.
+
+`--lifespan-scope process` asks for the original reading — exactly one `startup`,
+on the supervising loop — which is right for start-up that opens nothing
+loop-bound, and only then. There the shutdown ordering is what it always was:
+every worker drains and is joined *first*, and only then does the application get
+`lifespan.shutdown`.
 
 What is genuinely shared is the application, which is the point. One import,
-one set of module-level caches, one connection pool, one warm JIT — instead of
-N copies. Four workers serving a CPU-bound application on four cores reach the
-same throughput either way, in 47 MB as threads against 143 MB as processes.
+one set of module-level caches, one warm JIT — instead of N copies. Four workers
+serving a CPU-bound application on four cores reach the same throughput either
+way, in 47 MB as threads against 143 MB as processes. Connection pools are the
+exception, and belong to their loop for the reason above: an application that
+wants one pool per worker thread puts it in the lifespan `state` mapping, which
+is per loop here, rather than in a module global.
 
 The trade is isolation: a crash takes every worker with it, where the process
 supervisor would have restarted one. So the two compose rather than compete —

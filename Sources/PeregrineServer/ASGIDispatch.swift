@@ -45,10 +45,22 @@ public enum ASGIRuntime {
     nonisolated(unsafe) static var fnFinish: PyObj! = nil
     nonisolated(unsafe) static var fnNewLoop: PyObj! = nil
     nonisolated(unsafe) static var gracefulShutdownMs: UInt64 = 10_000
-    /// The `state` mapping the lifespan handler filled in, shared by every
-    /// worker in the process. ASGI says the same object is handed to every
-    /// request scope, and under `--free-threaded` "every" now spans threads.
-    nonisolated(unsafe) static var lifespanState: PyObj? = nil
+
+    /// What one lifespan startup produced.
+    ///
+    /// `driver` is the object `finish` shuts the application down through, and
+    /// `state` is the mapping every request scope served by the same loop
+    /// carries. Both are nil under `--no-lifespan`.
+    ///
+    /// A lifespan belongs to the loop it ran on: the pools and background tasks
+    /// an application opens in `startup` bind themselves to the running loop,
+    /// so `state` may only be given to workers driving that same loop.
+    public struct Lifespan {
+        public var driver: PyObj? = nil
+        /// An owned reference. The scope builder takes one of its own, so the
+        /// caller releases this once every worker sharing the loop has it.
+        public var state: PyObj? = nil
+    }
 
     // --- per worker, and therefore per thread ---
     //
@@ -108,22 +120,23 @@ public enum ASGIRuntime {
         return l
     }
 
-    /// Runs the ASGI lifespan startup handshake on `loop`, and publishes the
-    /// `state` mapping every request scope will carry.
+    /// Runs the ASGI lifespan startup handshake on `loop` and returns the
+    /// driver and the `state` mapping it published.
     ///
-    /// Once per process, never once per worker: `lifespan.startup` means the
-    /// application is opening its database pools and starting its background
-    /// tasks, and an application instance should do that once. With workers as
-    /// processes that distinction was invisible, because a process held exactly
-    /// one application. With workers as threads it is the whole question.
+    /// Once per event loop that will process requests. `lifespan.startup` is
+    /// where an application opens its database pools and starts its background
+    /// tasks, and asyncio primitives bind to the loop that was running when
+    /// they were created: a pool built on one loop and awaited on another is
+    /// the classic "attached to a different loop" failure, when it fails
+    /// loudly at all. With workers as processes the two were never distinct,
+    /// because a process held one loop. With workers as threads they are, and
+    /// the loop is what the lifespan follows.
     ///
-    /// Returns the lifespan driver, which the caller must keep and hand back to
-    /// `finish` at shutdown; nil means startup failed and the server must not
-    /// start.
+    /// Returns nil when startup failed and the server must not start.
     static func startLifespan(app application: PyObj,
                               loop l: PyObj,
-                              config: ServerConfig) -> PyObj?? {
-        guard config.callLifespan else { return .some(nil) }
+                              config: ServerConfig) -> Lifespan? {
+        guard config.callLifespan else { return Lifespan() }
 
         guard let cls = pg_getattr(Interpreter.glue, "Lifespan") else {
             PyError.logPending("loading the lifespan driver")
@@ -157,16 +170,18 @@ public enum ASGIRuntime {
             }
             return nil
         }
-        if let st = pg_getattr(ls, "state") { lifespanState = st } else { pg_err_clear() }
-        return .some(ls)
+        var result = Lifespan(driver: ls)
+        if let st = pg_getattr(ls, "state") { result.state = st } else { pg_err_clear() }
+        return result
     }
 
     /// Gives one worker the loop and scope builder it serves requests with.
-    /// The lifespan state is whatever `startLifespan` published, so every
-    /// worker in the process hands the application the same `state` mapping.
+    /// `lifespanState` must come from the lifespan that ran on `l`, so that the
+    /// resources a scope hands the application belong to the loop awaiting them.
     public static func prepareWorker(_ worker: UnsafeMutablePointer<Worker>,
                                      config: ServerConfig,
-                                     loop l: PyObj) -> Bool {
+                                     loop l: PyObj,
+                                     lifespanState: PyObj?) -> Bool {
         worker.pointee.asgiLoop = l
         guard let builder = ASGIScopeBuilder(scheme: config.scheme,
                                              rootPath: config.rootPath,
@@ -190,8 +205,9 @@ public enum ASGIRuntime {
         guard let ls = startLifespan(app: application, loop: l, config: config) else {
             return false
         }
-        worker.pointee.asgiLifespan = ls
-        return prepareWorker(worker, config: config, loop: l)
+        worker.pointee.asgiLifespan = ls.driver
+        defer { if let st = ls.state { pg_decref(st) } }
+        return prepareWorker(worker, config: config, loop: l, lifespanState: ls.state)
     }
 
     /// Hands the poller to asyncio and runs until the loop stops.
@@ -230,12 +246,14 @@ public enum ASGIRuntime {
     /// not run. Request tasks are therefore drained first, with a deadline, and
     /// only then is the lifespan asked to shut down.
     ///
-    /// A worker that does not own the lifespan passes `None` in its place, so
-    /// it drains and closes its own loop and nothing more. Under
-    /// `--free-threaded` the lifespan lives on the supervising thread's loop
-    /// and is shut down there, after every worker thread has joined -- which is
-    /// the only ordering that does not pull the application's database pool out
-    /// from under a request still finishing on another thread.
+    /// A worker that does not own a lifespan passes `None` in its place, so it
+    /// drains and closes its own loop and nothing more. That is the case under
+    /// `--free-threaded --lifespan-scope process`, where the one lifespan lives
+    /// on the supervising thread's loop and is shut down there after every
+    /// worker thread has joined. With the default per-worker scope each worker
+    /// owns the lifespan that ran on its loop and shuts it down here, which is
+    /// both where the resources are and after this worker's own requests have
+    /// drained.
     static func shutdown(_ worker: UnsafeMutablePointer<Worker>) {
         guard let l = worker.pointee.asgiLoop else { return }
         finishLoop(l, lifespan: worker.pointee.asgiLifespan)
