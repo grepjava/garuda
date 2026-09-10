@@ -369,9 +369,11 @@ public final class WSGIPool {
         }
 
         // A list or tuple is complete before it is returned. An iterator is
-        // not: PEP 3333 lets the application call start_response from inside
-        // its first step, so that step is taken before the head is required.
-        // The block it produces is kept and written after the head.
+        // not: PEP 3333 puts the head on the wire at the first non-empty block
+        // it yields and not before, so the application may still call
+        // start_response from inside that step -- or call it again with
+        // exc_info to replace what it said, while nothing has gone out yet.
+        // The block that ends the search is kept and written after the head.
         var iterator: PyObj? = nil
         var first: PyObj? = nil
         defer {
@@ -385,7 +387,7 @@ public final class WSGIPool {
                 return
             }
             iterator = it
-            while !WSGIStartResponse.wasCalled(startResponse) {
+            while true {
                 guard let part = pg_iter_next(it) else { break }
                 // An empty block is the convention for a step that has nothing
                 // to say yet; keep asking until it has.

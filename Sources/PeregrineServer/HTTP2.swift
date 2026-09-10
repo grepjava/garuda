@@ -940,11 +940,18 @@ extension Worker {
             && s.pointee.responseRemaining > 0
         if s.pointee.flags.contains(.responseComplete)
             && s.pointee.write.isEmpty
-            && !short
             && !s.pointee.flags.contains(.endStreamSent) {
+            // Either way the stream is finished here: leaving a short one
+            // unterminated would hold it open on both sides for a body that
+            // is not coming, and the client would have no way to tell that
+            // from a server still thinking.
             s.pointee.flags.insert(.endStreamSent)
-            writeFrame(parent, length: 0, type: .data, flags: .endStream,
-                       streamID: s.pointee.streamID) { _ in }
+            if short {
+                writeRstStream(parent, s.pointee.streamID, .internalError)
+            } else {
+                writeFrame(parent, length: 0, type: .data, flags: .endStream,
+                           streamID: s.pointee.streamID) { _ in }
+            }
         }
 
         if !flush(parent) { return false }

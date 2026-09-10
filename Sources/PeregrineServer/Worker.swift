@@ -882,7 +882,11 @@ public struct Worker {
             if c.pointee.flags.contains(.responseComplete)
                 && !c.pointee.flags.contains(.suppressBody)
                 && c.pointee.responseRemaining > 0 {
-                closeStream(slot, resetWith: .internalError)
+                // The flush has already turned a short response into a reset
+                // unless it never got that far, so this is usually only the
+                // tidy-up that follows one.
+                closeStream(slot, resetWith:
+                    c.pointee.flags.contains(.endStreamSent) ? nil : .internalError)
                 return
             }
             if c.pointee.bodyRemaining == 0 {

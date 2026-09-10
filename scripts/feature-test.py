@@ -1037,6 +1037,14 @@ def test_wsgi_lazy_start_response():
             is_("%s: the body after the empty block still arrives" % label,
                 body, b"lazy\nstart\n")
 
+            # Nothing has gone out while the iterable yields empty blocks, so
+            # the application can still replace what it said.
+            status, headers, body = server.get("/lazyreplace")
+            is_("%s: exc_info replaces a head that has not been sent" % label,
+                status, 500)
+            is_("%s: the replacement response is what arrives" % label,
+                body, b"replaced\n")
+
 
 def test_header_shapes():
     print("\nFramework compatibility")

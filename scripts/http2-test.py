@@ -24,6 +24,7 @@ import time
 try:
     import h2.config
     import h2.connection
+    import h2.errors
     import h2.events
 except ImportError:
     sys.stderr.write("this script needs the h2 package: pip install h2\n")
@@ -480,6 +481,31 @@ def test_wsgi():
             status, _, body, _ = c.collect([s])
             is_("an empty body is still a body (%s)" % label,
                 (status.get(s), body.get(s, b"")), (200, b""))
+
+            # A message that is not the length it declared must not be ended as
+            # if it were whole. On a stream the ending is a flag on a frame, so
+            # the only honest ending left is a reset -- there is no connection
+            # close to mean anything here, and the connection itself is fine.
+            s = c.request(path="/shortbody")
+            status, headers, body, _ = c.collect([s])
+            is_("a short WSGI response declares the length it promised (%s)"
+                % label, headers.get(s, {}).get(b"content-length"), b"10")
+            is_("what it did produce still arrives (%s)" % label,
+                body.get(s, b""), b"12345")
+            is_("and the stream is reset rather than ended cleanly (%s)" % label,
+                c.reset.get(s), h2.errors.ErrorCodes.INTERNAL_ERROR)
+
+            s = c.request(path="/")
+            status, _, body, _ = c.collect([s])
+            is_("the connection survives a reset stream (%s)" % label,
+                (status.get(s), body.get(s)), (200, b"hello from peregrine\n"))
+
+            s = c.request(path="/overlong")
+            status, headers, body, _ = c.collect([s])
+            is_("an over-long WSGI response is cut to its declared length (%s)"
+                % label, body.get(s, b""), b"12")
+            check("and that stream ends cleanly, having kept its promise (%s)"
+                  % label, s not in c.reset, "reset with %r" % c.reset.get(s))
             c.close()
 
 

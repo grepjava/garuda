@@ -218,15 +218,17 @@ extension Worker {
         }
         defer { pg_decref(iterator) }
 
-        // PEP 3333: a server "must not assume that start_response() has been
-        // called before they begin iterating over the iterable". A generator
-        // that does its work up to the first yield calls it there, so the
-        // iterable is advanced until it does -- an empty block being the
-        // convention for a step that has nothing to say yet. The block that
-        // comes with the call is kept and written after the head.
+        // PEP 3333 puts the head on the wire at the first non-empty block the
+        // iterable yields, and not before: a server "must not assume that
+        // start_response() has been called before they begin iterating", and
+        // until something has actually been sent the application is still
+        // entitled to replace what it said with `start_response(..., exc_info)`.
+        // So the iterable is advanced to its first real block -- an empty one
+        // being the convention for a step with nothing to say yet -- and that
+        // block is what gets written after the head.
         var first: PyObj? = nil
         defer { if let first { pg_decref(first) } }
-        while !WSGIStartResponse.wasCalled(startResponse) {
+        while true {
             guard let part = pg_iter_next(iterator) else { break }
             if pg_is_bytes(part) != 0 && pg_bytes_len(part) == 0 {
                 pg_decref(part)

@@ -1,6 +1,7 @@
 """A small WSGI application used to exercise the server."""
 
 import os
+import sys
 import threading
 import time
 
@@ -152,6 +153,24 @@ def application(environ, start_response):
             yield b"start\n"
 
         return produce_lazily()
+
+    if path == "/lazyreplace":
+        # Nothing has been sent while the iterable is still yielding empty
+        # blocks, so PEP 3333 lets the application think again: a second
+        # start_response with exc_info replaces the first one instead of
+        # re-raising, and the client sees only the replacement.
+        def produce_then_fail():
+            start_response("200 OK", [("Content-Type", "text/plain")])
+            yield b""
+            try:
+                raise RuntimeError("changed my mind")
+            except RuntimeError:
+                start_response("500 Internal Server Error",
+                               [("Content-Type", "text/plain")],
+                               sys.exc_info())
+            yield b"replaced\n"
+
+        return produce_then_fail()
 
     if path == "/overlong":
         # Five bytes behind a promise of two. The client must never see the
