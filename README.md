@@ -139,7 +139,10 @@ one. Everything else is the same code for both — see
 `readline`, `readlines`, iteration), `start_response` including `exc_info`
 semantics and the legacy `write` callable, `wsgi.file_wrapper`, iterable
 `close()`, repeated request headers folded per spec, automatic
-`Content-Length`/chunked framing.
+`Content-Length`/chunked framing. `start_response` may be called from inside
+the first iteration of the returned iterable, as the spec requires a server to
+allow, and a `Content-Length` the application declares is
+[enforced](TRANSPORT.md#framing-is-enforced-not-trusted) rather than trusted.
 
 Output is unbuffered in the sense PEP 3333 means. A block yielded by an
 iterator goes to the socket before the next one is asked for, and a block

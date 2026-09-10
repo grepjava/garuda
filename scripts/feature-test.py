@@ -922,6 +922,29 @@ def test_wsgi_streaming():
         finally:
             s.close()
 
+    # The same thing with both requests sent at once. Finishing a response
+    # dispatches whatever was pipelined behind it, from inside the frame that
+    # served the first one, so this is where a sink cleared "when the request
+    # is over" is cleared too late.
+    def pipelined_stale_write(server):
+        s = server.connect()
+        try:
+            s.sendall(b"GET /savewrite HTTP/1.1\r\nHost: x\r\n\r\n"
+                      b"GET /stalewrite HTTP/1.1\r\nHost: x\r\n"
+                      b"Connection: close\r\n\r\n")
+            raw = b""
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                raw += chunk
+            return raw
+        finally:
+            s.close()
+
     for label, extra in (("inline", []), ("pooled", ["--wsgi-threads", "4"])):
         port = free_port()
         with Server(*extra, port=port, app="wsgi_app:application") as server:
@@ -934,6 +957,85 @@ def test_wsgi_streaming():
             is_("%s: the stale write() leaves this response intact" % label,
                 (status, headers.get("content-length")),
                 (200, str(len(body))))
+
+            raw = pipelined_stale_write(server)
+            check("%s: a stale write() cannot reach a pipelined request" % label,
+                  b"stale" not in raw, "the response stream was %r" % raw[:400])
+            check("%s: the pipelined stale write() raises instead" % label,
+                  b"RuntimeError" in raw, "the response stream was %r" % raw[:400])
+            is_("%s: both pipelined requests are answered once" % label,
+                raw.count(b"HTTP/1.1 200"), 2)
+
+
+def test_wsgi_declared_length():
+    print("\nWSGI Content-Length enforcement")
+
+    def with_one_behind(server, path):
+        """Everything the server sends when a second request is pipelined.
+
+        The second request is the point: a message that is not the length it
+        declared must be the last one on its connection, so the server must
+        never answer what was queued behind it.
+        """
+        s = server.connect()
+        try:
+            s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\n\r\n"
+                       "GET /pid HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                       % path).encode())
+            raw = b""
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except OSError:                     # timeout or reset
+                    break
+                if not chunk:
+                    break
+                raw += chunk
+            return raw
+        finally:
+            s.close()
+
+    # A declared length is the only thing that says where a message ends on a
+    # keep-alive connection. Whichever way the application breaks its own
+    # promise, the bytes on the wire have to keep it and the connection has to
+    # go: anything else is read as part of the next response.
+    for label, extra in (("inline", []), ("pooled", ["--wsgi-threads", "4"])):
+        port = free_port()
+        with Server(*extra, port=port, app="wsgi_app:application") as server:
+            for route, what, expected in (("/overlong", "a returned body", b"12"),
+                                          ("/overlongwrite", "write()", b"12"),
+                                          ("/shortbody", "a short body", b"12345")):
+                raw = with_one_behind(server, route)
+                head, _, body = raw.partition(b"\r\n\r\n")
+                is_("%s: the wire carries the declared length, not the produced "
+                    "one (%s)" % (label, what), body, expected)
+                check("%s: the announced Content-Length is unchanged (%s)"
+                      % (label, what),
+                      b"Content-Length: 2" in head if expected == b"12"
+                      else b"Content-Length: 10" in head,
+                      "the head was %r" % head[:200])
+                is_("%s: nothing pipelined behind it is answered (%s)"
+                    % (label, what), raw.count(b"HTTP/1.1 200"), 1)
+
+
+def test_wsgi_lazy_start_response():
+    print("\nWSGI start_response from the first iteration")
+
+    # PEP 3333 allows an application to call start_response from inside the
+    # first step of the iterable it returns, so the server has to advance the
+    # iterable before it can require a head.
+    for label, extra in (("inline", []), ("pooled", ["--wsgi-threads", "4"])):
+        port = free_port()
+        with Server(*extra, port=port, app="wsgi_app:application") as server:
+            status, headers, body = server.get("/lazystart")
+            is_("%s: a generator may call start_response at its first yield"
+                % label, status, 200)
+            is_("%s: its first block is not lost" % label, body, b"lazy\nstart\n")
+            status, headers, body = server.get("/lazystart?empty")
+            is_("%s: an empty block before start_response is allowed" % label,
+                status, 200)
+            is_("%s: the body after the empty block still arrives" % label,
+                body, b"lazy\nstart\n")
 
 
 def test_header_shapes():
@@ -1530,6 +1632,7 @@ def main():
                  test_request_backpressure, test_receive_after_response,
                  test_websocket_control_independence,
                  test_wsgi_threads, test_wsgi_streaming,
+                 test_wsgi_declared_length, test_wsgi_lazy_start_response,
                  test_forwarded, test_multiworker_unix,
                  test_worker_restart, test_reload, test_graceful_shutdown,
                  test_shutdown_is_bounded, test_free_threaded):

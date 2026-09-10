@@ -73,6 +73,55 @@ public struct WSGIHeadPlan {
     public var failure: StaticString = ""
 }
 
+/// Accounts a response body against the Content-Length its head declared.
+///
+/// A declared length is a promise about where the message ends, and on a
+/// keep-alive connection it is the only thing that says so: bytes past it are
+/// read as the start of the next response, and bytes short of it leave the
+/// client waiting for a body that is never coming. So the length is enforced
+/// rather than merely written. The wire keeps the promise whatever the
+/// application does -- excess never reaches it -- and the caller closes the
+/// connection afterwards, because a message that is not the length it declared
+/// cannot be followed by another one.
+///
+/// This is the same contract the ASGI path applies through
+/// `Connection.responseRemaining`; it lives here because a pooled WSGI thread
+/// owns no connection to keep it on.
+public struct WSGIBodyLimit {
+    /// Bytes still owed, or -1 when nothing was declared -- then the framing
+    /// is chunked or the end of the message, and there is nothing to enforce.
+    public private(set) var remaining = -1
+    /// The application produced more than it declared.
+    public private(set) var overflowed = false
+
+    public init() {}
+
+    /// Begins accounting for a head that has just gone out.
+    ///
+    /// A suppressed body (HEAD, 204, 304) declares a length that nobody is
+    /// going to send, so it is not accounted at all.
+    public init(_ plan: WSGIHeadPlan) {
+        if !plan.suppressBody { remaining = plan.declaredLength }
+    }
+
+    /// How many of `count` bytes may go out.
+    public mutating func take(_ count: Int) -> Int {
+        if remaining < 0 { return count }
+        if count > remaining {
+            overflowed = true
+            let allowed = remaining
+            remaining = 0
+            return allowed
+        }
+        remaining -= count
+        return count
+    }
+
+    /// Whether the finished message is the length the head promised. Only
+    /// meaningful once the application has stopped producing.
+    public var mismatched: Bool { overflowed || remaining > 0 }
+}
+
 /// The response head as a multiplexed connection needs it.
 ///
 /// HTTP/2 and HTTP/3 compress their heads, and the compressor belongs to the
@@ -364,20 +413,28 @@ public enum WSGIResponseBuilder {
 
     /// Appends one body part with the chosen framing. Returns false with a
     /// Python exception pending if the part is not bytes-like.
+    ///
+    /// `limit` is what stops a declared Content-Length being overrun: anything
+    /// past it is dropped here rather than written, and the caller sees
+    /// `limit.overflowed` afterwards.
     public static func writeBodyPart(_ out: inout ByteBuffer,
                                      _ part: PyObj,
-                                     chunked: Bool) -> Bool {
+                                     chunked: Bool,
+                                     limit: inout WSGIBodyLimit) -> Bool {
         var data: UnsafePointer<CChar>?
         var len: pg_ssize_t = 0
         var owner: PyObj?
         if pg_as_bytes(part, &data, &len, &owner) != 0 { return false }
         defer { pg_release_bytes(owner) }
         if len > 0, let data {
-            let p = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
-            if chunked {
-                HTTPResponseWriter.writeChunk(&out, p, Int(len))
-            } else {
-                out.write(p, Int(len))
+            let take = limit.take(Int(len))
+            if take > 0 {
+                let p = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
+                if chunked {
+                    HTTPResponseWriter.writeChunk(&out, p, take)
+                } else {
+                    out.write(p, take)
+                }
             }
         }
         return true

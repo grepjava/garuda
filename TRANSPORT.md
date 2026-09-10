@@ -80,7 +80,13 @@ intermediary between here and it. Both ways of breaking it are handled:
   client waiting on bytes that are not coming.
 
 Either way the application is told it has a bug, and the connection is not
-reused.
+reused. This holds for ASGI and for WSGI in both of its execution modes, and on
+a WSGI response it covers the returned iterable and the legacy `write()`
+callable alike — between them they produce one message, so they are accounted
+against one budget. `write()` is told directly, by an exception at the call that
+went too far; everywhere else it is a log line, because there is nothing left
+running to tell. On a multiplexed stream, where there is no connection to close,
+a short message ends as a reset rather than as a clean end of stream.
 
 ### Strictness that prevents smuggling
 

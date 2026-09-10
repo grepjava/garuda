@@ -136,6 +136,46 @@ def application(environ, start_response):
                                   ("Content-Length", str(len(outcome)))])
         return [outcome]
 
+    if path == "/lazystart":
+        # PEP 3333: "servers must not assume that start_response() has been
+        # called before they begin iterating over the iterable" -- a generator
+        # that does its work up to the first yield calls it from in there. With
+        # ?empty it yields a block before it has anything to say, which is the
+        # convention for "not yet".
+        lazy_empty = environ.get("QUERY_STRING") == "empty"
+
+        def produce_lazily():
+            if lazy_empty:
+                yield b""
+            start_response("200 OK", [("Content-Type", "text/plain")])
+            yield b"lazy\n"
+            yield b"start\n"
+
+        return produce_lazily()
+
+    if path == "/overlong":
+        # Five bytes behind a promise of two. The client must never see the
+        # other three: on a keep-alive connection it would read them as the
+        # start of the next response.
+        start_response("200 OK", [("Content-Type", "text/plain"),
+                                  ("Content-Length", "2")])
+        return [b"12345"]
+
+    if path == "/overlongwrite":
+        # The same promise broken through the imperative API instead.
+        write = start_response("200 OK", [("Content-Type", "text/plain"),
+                                          ("Content-Length", "2")])
+        write(b"12345")
+        return []
+
+    if path == "/shortbody":
+        # The other half of the promise: ten declared, five produced. The
+        # connection has to close, or the client waits for the rest until its
+        # own timeout -- or takes the next response for it.
+        start_response("200 OK", [("Content-Type", "text/plain"),
+                                  ("Content-Length", "10")])
+        return [b"12345"]
+
     if path == "/slowwrite":
         # PEP 3333 says a written block goes out before write() returns, so the
         # first line has to reach the client during the sleep, not after it.

@@ -140,9 +140,13 @@ extension Worker {
             WSGIStartResponse.setSink(startResponse, wsgiInlineWriteSink,
                                       context: UnsafeMutableRawPointer(boxPtr))
             // start_response returns itself, so the application can keep the
-            // write callable past its own request. Unhooking the sink here,
-            // while the box is still alive, is what stops a later call writing
-            // through this frame into someone else's response.
+            // write callable past its own request. Unhooking the sink stops a
+            // later call writing through this frame into someone else's
+            // response. `runInline` does that as soon as the application has
+            // stopped producing -- which is earlier than here, because
+            // completing a response dispatches whatever was pipelined behind
+            // it, from inside this frame. This is only the backstop for the
+            // paths that return before reaching that point.
             defer { WSGIStartResponse.clearSink(startResponse) }
             runInline(slot, environ: environ, startResponse: startResponse,
                       box: boxPtr)
@@ -168,6 +172,7 @@ extension Worker {
 
         guard let result else {
             PyError.logPending("application error")
+            WSGIStartResponse.clearSink(startResponse)
             if box.pointee.headSent {
                 // The head is already on the wire, so a 500 is not available
                 // any more. Dropping the connection is the only honest signal
@@ -184,17 +189,73 @@ extension Worker {
             pg_decref(result)
         }
 
+        // A list or tuple is complete before it is returned, so an application
+        // that has not called start_response by now never will.
+        if PySeq.isSequence(result) {
+            guard WSGIStartResponse.wasCalled(startResponse),
+                  let statusObj = WSGIStartResponse.status(startResponse),
+                  let headerList = WSGIStartResponse.headers(startResponse) else {
+                Log.error("application returned without calling start_response")
+                WSGIStartResponse.clearSink(startResponse)
+                failRequest(slot, status: 500)
+                return
+            }
+            emitWSGIResponse(slot, status: statusObj, headerList: headerList,
+                             startResponse: startResponse, result: result,
+                             iterator: nil, first: nil, box: box)
+            return
+        }
+
+        guard let iterator = pg_iter(result) else {
+            PyError.logPending("iterating the application response")
+            WSGIStartResponse.clearSink(startResponse)
+            if box.pointee.headSent {
+                closeConnection(slot)
+            } else {
+                failRequest(slot, status: 500)
+            }
+            return
+        }
+        defer { pg_decref(iterator) }
+
+        // PEP 3333: a server "must not assume that start_response() has been
+        // called before they begin iterating over the iterable". A generator
+        // that does its work up to the first yield calls it there, so the
+        // iterable is advanced until it does -- an empty block being the
+        // convention for a step that has nothing to say yet. The block that
+        // comes with the call is kept and written after the head.
+        var first: PyObj? = nil
+        defer { if let first { pg_decref(first) } }
+        while !WSGIStartResponse.wasCalled(startResponse) {
+            guard let part = pg_iter_next(iterator) else { break }
+            if pg_is_bytes(part) != 0 && pg_bytes_len(part) == 0 {
+                pg_decref(part)
+                continue
+            }
+            first = part
+            break
+        }
+
         guard WSGIStartResponse.wasCalled(startResponse),
               let statusObj = WSGIStartResponse.status(startResponse),
               let headerList = WSGIStartResponse.headers(startResponse) else {
-            Log.error("application returned without calling start_response")
-            failRequest(slot, status: 500)
+            if pg_err_check() != 0 {
+                PyError.logPending("application iterator raised")
+            } else {
+                Log.error("application returned without calling start_response")
+            }
+            WSGIStartResponse.clearSink(startResponse)
+            if box.pointee.headSent {
+                closeConnection(slot)
+            } else {
+                failRequest(slot, status: 500)
+            }
             return
         }
 
         emitWSGIResponse(slot, status: statusObj, headerList: headerList,
                          startResponse: startResponse, result: result,
-                         written: box.pointee)
+                         iterator: iterator, first: first, box: box)
     }
 
     /// PEP 3333: close() must be called if the iterable provides it.
@@ -215,13 +276,16 @@ extension Worker {
                                            headerList: PyObj,
                                            startResponse: PyObj,
                                            result: PyObj,
-                                           written: WSGIInlineWriteContext) {
+                                           iterator: PyObj?,
+                                           first: PyObj?,
+                                           box: UnsafeMutablePointer<WSGIInlineWriteContext>) {
         let c = table[slot]
 
         // A write() already sent the head and settled the framing, so the only
         // thing left is whatever the application returned on top of it.
-        if written.headSent {
-            emitWSGIBody(slot, result: result, plan: written.plan)
+        if box.pointee.headSent {
+            emitWSGIBody(slot, result: result, iterator: iterator, first: first,
+                         plan: box.pointee.plan, startResponse: startResponse, box: box)
             return
         }
 
@@ -239,55 +303,54 @@ extension Worker {
             out.clear()
             c.pointee.write = out
             Log.error(plan.failure)
+            WSGIStartResponse.clearSink(startResponse)
             failRequest(slot, status: 500)
             return
         }
         c.pointee.write = out
         applyPlan(slot, plan)
+        box.pointee.limit = WSGIBodyLimit(plan)
         logAccess(slot, status: plan.status)
-        emitWSGIBody(slot, result: result, plan: plan)
+        emitWSGIBody(slot, result: result, iterator: iterator, first: first,
+                     plan: plan, startResponse: startResponse, box: box)
     }
 
     /// Writes whatever the application returned, and closes the message.
-    private mutating func emitWSGIBody(_ slot: Int, result: PyObj, plan: WSGIHeadPlan) {
+    private mutating func emitWSGIBody(_ slot: Int, result: PyObj,
+                                       iterator: PyObj?, first: PyObj?,
+                                       plan: WSGIHeadPlan,
+                                       startResponse: PyObj,
+                                       box: UnsafeMutablePointer<WSGIInlineWriteContext>) {
         let c = table[slot]
+        let produced = produceWSGIBody(slot, result: result, iterator: iterator,
+                                       first: first, plan: plan, box: box)
 
-        if !plan.suppressBody {
-            if PySeq.isSequence(result) {
-                let n = PySeq.count(result)
-                var k = 0
-                while k < n {
-                    guard let part = PySeq.item(result, k) else { break }
-                    k += 1
-                    if !appendBodyPart(slot, part, chunked: plan.chunked) { return }
-                }
+        // The application has stopped producing, so no write() after this
+        // point is its own request's. It has to be unhooked here rather than
+        // when the frame goes: completing the response below flushes it,
+        // finishes it, and dispatches whatever was pipelined behind it -- all
+        // from inside this call. A callable the application saved would
+        // otherwise be reaching a live box while the next request runs.
+        WSGIStartResponse.clearSink(startResponse)
+        if !produced { return }
+
+        // A declared Content-Length is a promise about where the message ends.
+        // The wire has kept it either way -- anything past it was dropped as it
+        // was written -- so what is left is to say so and to stop the
+        // connection being reused for a message that is not the length it
+        // announced.
+        let limit = box.pointee.limit
+        if limit.mismatched {
+            if limit.overflowed {
+                Log.warn("application produced more than its declared Content-Length")
             } else {
-                guard let iterator = pg_iter(result) else {
-                    PyError.logPending("iterating the application response")
-                    // Headers are already queued; the only honest signal left
-                    // is to drop the connection.
-                    closeConnection(slot)
-                    return
-                }
-                defer { pg_decref(iterator) }
-                // Each block goes to the socket before the next one is asked
-                // for, which is what PEP 3333 requires of an iterator and the
-                // only way a generator that yields, waits, and yields again
-                // reaches the client while it waits. A list gets the batched
-                // treatment above instead: every part is already in hand, so
-                // nothing is kept waiting by writing them together.
-                while let part = pg_iter_next(iterator) {
-                    let ok = appendBodyPart(slot, part, chunked: plan.chunked,
-                                            flushNow: true)
-                    pg_decref(part)
-                    if !ok { return }
-                }
-                if pg_err_check() != 0 {
-                    PyError.logPending("application iterator raised")
-                    closeConnection(slot)
-                    return
-                }
+                Log.warn("application produced less than its declared Content-Length")
             }
+            c.pointee.flags.remove(.keepAlive)
+            // On a multiplexed stream there is no connection to close and no
+            // terminator to omit; this is what turns a short message into a
+            // reset rather than a clean end of stream.
+            c.pointee.responseRemaining = limit.remaining
         }
 
         if plan.chunked && !plan.suppressBody {
@@ -302,6 +365,61 @@ extension Worker {
         c.pointee.flags.insert(.responseComplete)
         c.pointee.state = .writing
         _ = flush(slot)
+    }
+
+    /// Walks the application's output onto the connection.
+    ///
+    /// Returns false when the connection did not survive it, in which case it
+    /// has already been closed and there is no message left to finish.
+    ///
+    /// `iterator` is nil for a list or tuple, whose parts are all in hand.
+    /// Otherwise it is the iterator the caller already started, and `first` is
+    /// the block it pulled to give the application somewhere to call
+    /// start_response from.
+    private mutating func produceWSGIBody(
+        _ slot: Int, result: PyObj,
+        iterator: PyObj?, first: PyObj?,
+        plan: WSGIHeadPlan,
+        box: UnsafeMutablePointer<WSGIInlineWriteContext>
+    ) -> Bool {
+        if plan.suppressBody { return true }
+
+        guard let iterator else {
+            let n = PySeq.count(result)
+            var k = 0
+            while k < n && !box.pointee.limit.overflowed {
+                guard let part = PySeq.item(result, k) else { break }
+                k += 1
+                if !appendBodyPart(slot, part, chunked: plan.chunked,
+                                   limit: &box.pointee.limit) { return false }
+            }
+            return true
+        }
+
+        // Each block goes to the socket before the next one is asked for,
+        // which is what PEP 3333 requires of an iterator and the only way a
+        // generator that yields, waits, and yields again reaches the client
+        // while it waits. A list gets the batched treatment above instead:
+        // every part is already in hand, so nothing is kept waiting by
+        // writing them together.
+        if let first {
+            if !appendBodyPart(slot, first, chunked: plan.chunked,
+                               limit: &box.pointee.limit, flushNow: true) { return false }
+        }
+        while !box.pointee.limit.overflowed, let part = pg_iter_next(iterator) {
+            let ok = appendBodyPart(slot, part, chunked: plan.chunked,
+                                    limit: &box.pointee.limit, flushNow: true)
+            pg_decref(part)
+            if !ok { return false }
+        }
+        if pg_err_check() != 0 {
+            PyError.logPending("application iterator raised")
+            // Headers are already queued; the only honest signal left is to
+            // drop the connection.
+            closeConnection(slot)
+            return false
+        }
+        return true
     }
 
     /// Records the framing decisions the builder made on the connection.
@@ -328,10 +446,12 @@ extension Worker {
     /// syscall per block when the client keeps up, and the application waiting
     /// on the client when it does not, which is what backpressure means.
     private mutating func appendBodyPart(_ slot: Int, _ part: PyObj, chunked: Bool,
+                                         limit: inout WSGIBodyLimit,
                                          flushNow: Bool = false) -> Bool {
         let c = table[slot]
         var out = c.pointee.write
-        let ok = WSGIResponseBuilder.writeBodyPart(&out, part, chunked: chunked)
+        let ok = WSGIResponseBuilder.writeBodyPart(&out, part, chunked: chunked,
+                                                   limit: &limit)
         c.pointee.write = out
         if !ok {
             PyError.logPending("response body part")
@@ -395,6 +515,7 @@ extension Worker {
             applyPlan(slot, plan)
             logAccess(slot, status: plan.status)
             box.pointee.plan = plan
+            box.pointee.limit = WSGIBodyLimit(plan)
             box.pointee.headSent = true
         }
 
@@ -402,11 +523,20 @@ extension Worker {
         // the application write it either way.
         if box.pointee.plan.suppressBody { return 0 }
 
-        if !appendBodyPart(slot, part, chunked: box.pointee.plan.chunked, flushNow: true) {
+        if !appendBodyPart(slot, part, chunked: box.pointee.plan.chunked,
+                           limit: &box.pointee.limit, flushNow: true) {
             box.pointee.dead = true
             if pg_err_check() == 0 {
                 pg_err_set_str(pg_exc_os(), "the client closed the connection")
             }
+            return -1
+        }
+        // Whatever went past the declared length was dropped rather than sent,
+        // and the application is the only place that can be reported: it is
+        // still running, and it is the one holding the promise it broke.
+        if box.pointee.limit.overflowed {
+            pg_err_set_str(pg_exc_runtime(),
+                           "write() went past the declared Content-Length")
             return -1
         }
         return 0
@@ -498,6 +628,11 @@ extension Worker {
         }
         if !job.keepAlive { c.pointee.flags.remove(.keepAlive) }
         if job.chunked { c.pointee.flags.insert(.chunkedResponse) }
+        // The thread has already dropped keep-alive for a message that is not
+        // the length it declared. On a multiplexed stream there is no
+        // connection to close, so this is what ends a short one as a reset
+        // rather than as a clean end of stream.
+        if job.limit.mismatched { c.pointee.responseRemaining = job.limit.remaining }
         logAccess(slot, status: job.status)
         c.pointee.flags.insert(.responseComplete)
         c.pointee.state = .writing
@@ -518,6 +653,9 @@ struct WSGIInlineWriteContext {
     /// The framing the first write settled. The application's return value is
     /// written on top of it, under the same rules.
     var plan = WSGIHeadPlan()
+    /// What is left of a declared Content-Length. Shared by `write()` and the
+    /// returned iterable, because between them they produce one message.
+    var limit = WSGIBodyLimit()
     var headSent = false
     /// The client went away during a write, so the connection is already
     /// closed and the slot must not be touched again.

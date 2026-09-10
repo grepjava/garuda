@@ -82,6 +82,9 @@ public final class WSGIJob {
     /// `suppressBody` as the head settled it, which is the request's own plus
     /// whatever the status said (204, 304, 1xx).
     var bodySuppressed = false
+    /// What is left of a declared Content-Length. Written by the thread before
+    /// `finished`, read by the loop afterwards, like the rest of the plan.
+    var limit = WSGIBodyLimit()
 
     /// The pool running this job, so the legacy `write()` callable can reach
     /// the hand-off from inside the application. Unowned because the pool owns
@@ -365,10 +368,44 @@ public final class WSGIPool {
             pg_decref(result)
         }
 
+        // A list or tuple is complete before it is returned. An iterator is
+        // not: PEP 3333 lets the application call start_response from inside
+        // its first step, so that step is taken before the head is required.
+        // The block it produces is kept and written after the head.
+        var iterator: PyObj? = nil
+        var first: PyObj? = nil
+        defer {
+            if let first { pg_decref(first) }
+            if let iterator { pg_decref(iterator) }
+        }
+        if !PySeq.isSequence(result) {
+            guard let it = pg_iter(result) else {
+                PyError.logPending("iterating the application response")
+                job.failed = true
+                return
+            }
+            iterator = it
+            while !WSGIStartResponse.wasCalled(startResponse) {
+                guard let part = pg_iter_next(it) else { break }
+                // An empty block is the convention for a step that has nothing
+                // to say yet; keep asking until it has.
+                if pg_is_bytes(part) != 0 && pg_bytes_len(part) == 0 {
+                    pg_decref(part)
+                    continue
+                }
+                first = part
+                break
+            }
+        }
+
         guard WSGIStartResponse.wasCalled(startResponse),
               let statusObj = WSGIStartResponse.status(startResponse),
               let headerList = WSGIStartResponse.headers(startResponse) else {
-            Log.error("application returned without calling start_response")
+            if pg_err_check() != 0 {
+                PyError.logPending("application iterator raised")
+            } else {
+                Log.error("application returned without calling start_response")
+            }
             job.failed = true
             return
         }
@@ -401,29 +438,19 @@ public final class WSGIPool {
             job.chunked = plan.chunked
             job.keepAlive = plan.keepAlive
             job.bodySuppressed = plan.suppressBody
+            job.limit = WSGIBodyLimit(plan)
             job.headersWritten = true
         }
 
         if !plan.suppressBody {
-            if PySeq.isSequence(result) {
-                let n = PySeq.count(result)
-                var k = 0
-                while k < n {
-                    guard let part = PySeq.item(result, k) else { break }
-                    k += 1
-                    if !emit(job, part, plan.chunked, &staged) { return }
-                }
-            } else {
-                guard let iterator = pg_iter(result) else {
-                    PyError.logPending("iterating the application response")
-                    job.failed = true
-                    return
-                }
-                defer { pg_decref(iterator) }
+            if let iterator {
                 // One hand-off per block, so a generator that yields, waits and
                 // yields again reaches the client while it waits. A list is
                 // batched by `emit` instead: all of it is already in hand.
-                while let part = pg_iter_next(iterator) {
+                if let first {
+                    if !emit(job, first, plan.chunked, &staged, flushNow: true) { return }
+                }
+                while !job.limit.overflowed, let part = pg_iter_next(iterator) {
                     let ok = emit(job, part, plan.chunked, &staged, flushNow: true)
                     pg_decref(part)
                     if !ok { return }
@@ -433,7 +460,29 @@ public final class WSGIPool {
                     job.failed = true
                     return
                 }
+            } else {
+                let n = PySeq.count(result)
+                var k = 0
+                while k < n && !job.limit.overflowed {
+                    guard let part = PySeq.item(result, k) else { break }
+                    k += 1
+                    if !emit(job, part, plan.chunked, &staged) { return }
+                }
             }
+        }
+
+        // The declared length is a promise about where the message ends, and
+        // the wire has kept it either way: anything past it was dropped as it
+        // was written. What is left is to stop the connection being reused for
+        // a message that is not the length it announced, which the loop does
+        // when it sees this.
+        if job.limit.mismatched {
+            if job.limit.overflowed {
+                Log.warn("application produced more than its declared Content-Length")
+            } else {
+                Log.warn("application produced less than its declared Content-Length")
+            }
+            job.keepAlive = false
         }
 
         if plan.chunked && !plan.suppressBody {
@@ -446,7 +495,8 @@ public final class WSGIPool {
     /// or immediately, when something is waiting on the far side of this block.
     private func emit(_ job: WSGIJob, _ part: PyObj, _ chunked: Bool,
                       _ staged: inout ByteBuffer, flushNow: Bool = false) -> Bool {
-        if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: chunked) {
+        if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: chunked,
+                                              limit: &job.limit) {
             PyError.logPending("response body part")
             job.failed = true
             return false
@@ -487,12 +537,14 @@ public final class WSGIPool {
             job.chunked = plan.chunked
             job.keepAlive = plan.keepAlive
             job.bodySuppressed = plan.suppressBody
+            job.limit = WSGIBodyLimit(plan)
             job.headersWritten = true
         }
 
         // HEAD, 204, 304: the head goes out, the body is dropped.
         if !job.bodySuppressed {
-            if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: job.chunked) {
+            if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: job.chunked,
+                                                  limit: &job.limit) {
                 job.failed = true
                 return -1
             }
@@ -504,6 +556,14 @@ public final class WSGIPool {
             if pg_err_check() == 0 {
                 pg_err_set_str(pg_exc_os(), "the client closed the connection")
             }
+            return -1
+        }
+        // Whatever went past the declared length was dropped rather than sent,
+        // and the application is the only place that can be reported: it is
+        // still running, and it is the one holding the promise it broke.
+        if job.limit.overflowed {
+            pg_err_set_str(pg_exc_runtime(),
+                           "write() went past the declared Content-Length")
             return -1
         }
         return 0
