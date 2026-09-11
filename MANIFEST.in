@@ -4,6 +4,7 @@ include ARCHITECTURE.md
 include TRANSPORT.md
 include INSTALLATION.md
 include CONFIG.md
+include DEPLOY.md
 recursive-include assets *.jpg *.png
 recursive-include Sources *.swift *.c *.h *.modulemap
 recursive-include Tests *.swift

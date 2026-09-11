@@ -126,8 +126,8 @@ PYTHON=python3.12 bash scripts/build-wheel.sh
 The wheel lands in `dist/` tagged for that interpreter. It vendors the Swift
 runtime and leaves `libpython` to whoever installs it. GitHub Actions builds
 the Linux matrix from [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)
-(`gh workflow run Wheels`); publishing to PyPI is a separate input, not the
-default.
+(`gh workflow run Wheels`). Uploading the wheels and the sdist is
+[DEPLOY.md](DEPLOY.md), not the workflow's optional publish input.
 
 ---
 

@@ -102,6 +102,8 @@ jobs:
           path: dist/peregrine_server-*.whl
           if-no-files-found: error
 
+  # Wheels only. The sdist goes up with them via scripts/publish-pypi.sh;
+  # that is the path DEPLOY.md describes. This job is a shortcut.
   publish:
     name: publish
     if: ${{ inputs.publish }}

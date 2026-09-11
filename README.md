@@ -31,7 +31,8 @@ what to do when it goes wrong. [CONFIG.md](CONFIG.md) — configuring FastAPI an
 Django for every protocol here. [ARCHITECTURE.md](ARCHITECTURE.md) — how the
 server is built, and why. [TRANSPORT.md](TRANSPORT.md) — what each protocol
 does and what is implemented of it. [BENCHMARKS.md](BENCHMARKS.md) — hello-world
-throughput, processes against `--free-threaded`.
+throughput, processes against `--free-threaded`. [DEPLOY.md](DEPLOY.md) — how
+a release reaches PyPI.
 
 ---
 
