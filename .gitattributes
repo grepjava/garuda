@@ -1,3 +1,8 @@
 # Linux and macOS only: keep LF in the working tree so the shell scripts and
 # the Swift sources are not rewritten with CRLF on a Windows checkout.
 * text=auto eol=lf
+
+# A fuzz corpus is exact bytes. CRLF is part of what these inputs are testing,
+# so nothing here may be normalised in either direction.
+fuzz/corpus/** -text
+*.bin binary

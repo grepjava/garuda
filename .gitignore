@@ -8,3 +8,7 @@ dist/
 *.o
 *.pyc
 __pycache__/
+
+# Inputs pgfuzz writes out when it finds something; keep them in
+# fuzz/corpus/<target>/ under a name, not here under a seed.
+pgfuzz-*.bin

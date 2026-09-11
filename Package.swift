@@ -91,8 +91,22 @@ let package = Package(
         .executableTarget(name: "peregrine", dependencies: ["PeregrineServer"],
                           swiftSettings: sharedSwiftSettings),
 
+        // The parsers that read bytes chosen by the peer, with the invariants
+        // that have to survive them. A library rather than part of `pgfuzz`
+        // because the test suite replays the same corpus through it.
+        .target(name: "PeregrineFuzzTargets",
+                dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrineQUIC"],
+                swiftSettings: sharedSwiftSettings),
+
+        // Not a product: a development tool, built by `swift build` and run by
+        // `swift run pgfuzz`, that nobody has to install.
+        .executableTarget(name: "pgfuzz",
+                          dependencies: ["CPeregrine", "PeregrineFuzzTargets"],
+                          swiftSettings: sharedSwiftSettings),
+
         .testTarget(name: "PeregrineTests",
-                    dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrineQUIC"],
+                    dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrineQUIC",
+                                   "PeregrineFuzzTargets"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
     ],
     cLanguageStandard: .gnu11
