@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/peregrine-logo-dark.jpg" alt="peregrine" width="360">
+  <img src="assets/peregrine-logo-bordered.png" alt="peregrine" width="360">
 </p>
 
 # Transports

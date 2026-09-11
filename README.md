@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/peregrine-logo-light.jpg" alt="peregrine" width="420">
+  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/peregrine-logo-bordered.png" alt="peregrine" width="420">
 </p>
 
 <p align="center">
