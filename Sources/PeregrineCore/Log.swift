@@ -50,6 +50,66 @@ public struct LogLine {
         len &+= writeDecimal(v, buf + len)
     }
 
+    /// Writes a JSON string, quotes included.
+    ///
+    /// Escapes what JSON requires and nothing else: a request target is the
+    /// peer's bytes, and a log line that can be broken by putting a quote in a
+    /// URL is a log injection rather than a log.
+    ///
+    /// `asciiOnly` additionally escapes every byte above 0x7F as `\u00XX`.
+    /// That is for a field whose bytes are not valid UTF-8 -- lossless, since
+    /// each byte becomes one escape, and valid JSON, which raw bytes would not
+    /// be. A field that is valid UTF-8 is written through unchanged, so an
+    /// ordinary non-ASCII URL stays readable.
+    public mutating func jsonString(_ p: UnsafePointer<UInt8>, _ n: Int,
+                                    asciiOnly: Bool = false) {
+        if len < cap { buf[len] = 0x22; len &+= 1 }        // "
+        var i = 0
+        while i < n {
+            let b = p[i]
+            i &+= 1
+            switch b {
+            case 0x22: escape(0x22)                        // \"
+            case 0x5C: escape(0x5C)                        // backslash
+            case 0x08: escape(0x62)                        // \b
+            case 0x0C: escape(0x66)                        // \f
+            case 0x0A: escape(0x6E)                        // \n
+            case 0x0D: escape(0x72)                        // \r
+            case 0x09: escape(0x74)                        // \t
+            default:
+                if b < 0x20 || (asciiOnly && b > 0x7F) {
+                    unicodeEscape(b)
+                } else if len < cap {
+                    buf[len] = b
+                    len &+= 1
+                }
+            }
+        }
+        if len < cap { buf[len] = 0x22; len &+= 1 }
+    }
+
+    @usableFromInline
+    mutating func escape(_ c: UInt8) {
+        if cap &- len < 2 { return }
+        buf[len] = 0x5C
+        buf[len &+ 1] = c
+        len &+= 2
+    }
+
+    /// `\u00XX`, the only escape that covers every byte JSON cannot carry.
+    @usableFromInline
+    mutating func unicodeEscape(_ b: UInt8) {
+        if cap &- len < 6 { return }
+        let digits: StaticString = "0123456789abcdef"
+        buf[len] = 0x5C
+        buf[len &+ 1] = 0x75                               // u
+        buf[len &+ 2] = 0x30
+        buf[len &+ 3] = 0x30
+        buf[len &+ 4] = digits.utf8Start[Int(b >> 4)]
+        buf[len &+ 5] = digits.utf8Start[Int(b & 0xF)]
+        len &+= 6
+    }
+
     @inlinable
     public mutating func cstr(_ p: UnsafePointer<CChar>) {
         var i = 0
@@ -85,6 +145,23 @@ public enum Log {
                 line.int(pid)
                 line.str(" ")
             }
+            body(&line)
+            if line.len < line.cap { line.buf[line.len] = cLF; line.len &+= 1 }
+            _ = pg_write(2, line.buf, line.len)
+        }
+    }
+
+    /// Emits a line with no level or pid prefix in front of it.
+    ///
+    /// For a line that is already structured: half a JSON object behind
+    /// `[info]  pid=1234` is not JSON, and a collector handed that is back to
+    /// writing a regex, which is the thing structured logging is for. The
+    /// caller puts whatever it wants of the prefix inside its own structure.
+    @inlinable
+    public static func emitBare(_ l: LogLevel, _ body: (inout LogLine) -> Void) {
+        guard l >= level else { return }
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1024) { raw in
+            var line = LogLine(raw.baseAddress!, 1024)
             body(&line)
             if line.len < line.cap { line.buf[line.len] = cLF; line.len &+= 1 }
             _ = pg_write(2, line.buf, line.len)

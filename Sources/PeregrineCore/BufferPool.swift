@@ -32,7 +32,11 @@ public struct BufferPool {
         self.blockSize = blockSize
         self.maxRetained = maxRetained
         self.count = 0
-        self.slots = UnsafeMutableRawPointer(malloc(MemoryLayout<UnsafeMutableRawPointer?>.stride * maxRetained)!)
+        let bytes = MemoryLayout<UnsafeMutableRawPointer?>.stride * maxRetained
+        guard let p = malloc(bytes) else {
+            allocationFailed(bytes, "the buffer pool's free list")
+        }
+        self.slots = UnsafeMutableRawPointer(p)
             .assumingMemoryBound(to: UnsafeMutableRawPointer?.self)
     }
 

@@ -41,8 +41,10 @@ public struct ByteBuffer {
     @inlinable
     public init(capacity: Int) {
         if capacity > 0 {
-            storage = UnsafeMutableRawPointer(malloc(capacity)!)
-                .assumingMemoryBound(to: UInt8.self)
+            guard let p = malloc(capacity) else {
+                allocationFailed(capacity, "a new buffer")
+            }
+            storage = UnsafeMutableRawPointer(p).assumingMemoryBound(to: UInt8.self)
             self.capacity = capacity
         } else {
             storage = nil
@@ -120,13 +122,23 @@ public struct ByteBuffer {
         }
         var newCap = capacity == 0 ? 512 : capacity
         let need = writerIndex &+ n
+        // Past this the doubling below would wrap and the loop would spin on a
+        // capacity that never reaches `need`. A hang is a worse way to report
+        // an impossible request than a message is.
+        if need < 0 || need > maxBufferCapacity {
+            allocationFailed(need, "a buffer past the largest this server grows")
+        }
         while newCap < need { newCap &*= 2 }
         if let old = storage {
-            let p = realloc(old, newCap)!
+            guard let p = realloc(old, newCap) else {
+                allocationFailed(newCap, "a growing buffer")
+            }
             storage = UnsafeMutableRawPointer(p).assumingMemoryBound(to: UInt8.self)
         } else {
-            storage = UnsafeMutableRawPointer(malloc(newCap)!)
-                .assumingMemoryBound(to: UInt8.self)
+            guard let p = malloc(newCap) else {
+                allocationFailed(newCap, "a growing buffer")
+            }
+            storage = UnsafeMutableRawPointer(p).assumingMemoryBound(to: UInt8.self)
         }
         capacity = newCap
     }

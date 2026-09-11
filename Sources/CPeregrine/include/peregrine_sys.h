@@ -91,6 +91,10 @@ int pg_err_is_intr(int e);       /* EINTR */
  * Time
  * ------------------------------------------------------------------------- */
 uint64_t pg_monotonic_ms(void);
+/* Precise monotonic microseconds. Unlike pg_monotonic_ms this never reads a
+ * coarse clock: it times a single request, where the coarse clock's few
+ * milliseconds of slack would be the whole measurement. */
+uint64_t pg_monotonic_us(void);
 /* IMF-fixdate, e.g. "Sun, 06 Nov 1994 08:49:37 GMT". Writes exactly 29 bytes,
  * no NUL. Returns 29. Hand-rolled: strftime() would pull in locale state. */
 int pg_http_date(char *buf29, int64_t unix_seconds);

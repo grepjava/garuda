@@ -133,6 +133,11 @@ public struct Connection {
 
     public var lastActivity: UInt64 = 0
     public var requestCount: UInt32 = 0
+    /// Monotonic microseconds at the moment this request was dispatched, for
+    /// the access log's duration. Only read when --access-log is on, and only
+    /// written then either: a clock read per request is small but it is not
+    /// nothing, and nobody should pay for a log they are not keeping.
+    public var requestStartUs: UInt64 = 0
 
     /// The TLS session, when this connection has one. Streams never do: they
     /// travel over their connection.

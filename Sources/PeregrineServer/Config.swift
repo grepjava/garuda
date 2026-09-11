@@ -191,6 +191,9 @@ public struct ServerConfig {
     // --- diagnostics ---
     public var logLevel: LogLevel = .info
     public var accessLog = false
+    /// Emit the access log as one JSON object per line, for a collector that
+    /// would otherwise be handed a regex.
+    public var accessLogJSON = false
 
     public init() {}
 }

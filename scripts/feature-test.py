@@ -1091,6 +1091,67 @@ def test_header_shapes():
             headers.get("x-shape"), "list")
 
 
+def test_access_log():
+    print("\nAccess log")
+
+    def served(args, raw_requests):
+        """Runs the requests, then returns everything the server logged."""
+        port = free_port()
+        server = Server(*args, "--log-level", "info", port=port,
+                        app="wsgi_app:application")
+        try:
+            for request in raw_requests:
+                s = server.connect()
+                try:
+                    s.sendall(request)
+                    read_http_response(s)
+                finally:
+                    s.close()
+        finally:
+            server.stop()
+        return server.proc.stdout.read().decode("utf-8", "replace").splitlines()
+
+    plain = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    # A target is the peer's bytes: a quote would end a JSON string early, and
+    # these bytes are not valid UTF-8 at all.
+    quoted = b'GET /has"quote HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'
+    invalid = b"GET /raw\xff\xfe HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+
+    lines = served(["--access-log"], [plain])
+    text = [ln for ln in lines if " / 200 " in ln]
+    check("the text access log has one line per request", len(text) == 1,
+          "logged %r" % lines)
+    check("it carries the method, target, status and duration",
+          bool(text) and re.search(r"GET / 200 \d+us", text[0]),
+          "line was %r" % (text[0] if text else None))
+
+    lines = served(["--access-log-format", "json"], [plain, quoted, invalid])
+    objects = []
+    for ln in lines:
+        if not ln.startswith("{"):
+            continue                      # the server's own start-up lines
+        try:
+            objects.append(json.loads(ln))
+        except ValueError as exc:
+            bad("a JSON access line parses", "an object", "%s in %r" % (exc, ln))
+            return
+    is_("--access-log-format json logs one object per request", len(objects), 3)
+    if len(objects) != 3:
+        return
+    ok("every JSON access line parses whole, prefix included")
+    is_("the object carries the request",
+        (objects[0].get("method"), objects[0].get("target"),
+         objects[0].get("status"), objects[0].get("proto")),
+        ("GET", "/", 200, "HTTP/1.1"))
+    check("and a duration in microseconds",
+          isinstance(objects[0].get("duration_us"), int),
+          "duration_us was %r" % objects[0].get("duration_us"))
+    is_("a quote in the target cannot break the line out of its string",
+        objects[1].get("target"), '/has"quote')
+    is_("a target that is not valid UTF-8 survives byte for byte",
+        objects[2].get("target"), "/rawÿþ")
+
+
 def test_factory():
     print("\nApplication loading")
     port = free_port()
@@ -1668,7 +1729,7 @@ def main():
                  test_tls, test_response_length, test_streaming_request_bodies,
                  test_request_backpressure, test_receive_after_response,
                  test_websocket_control_independence,
-                 test_wsgi_threads, test_wsgi_streaming,
+                 test_wsgi_threads, test_wsgi_streaming, test_access_log,
                  test_wsgi_declared_length, test_wsgi_lazy_start_response,
                  test_forwarded, test_multiworker_unix,
                  test_worker_restart, test_reload, test_graceful_shutdown,

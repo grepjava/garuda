@@ -340,6 +340,12 @@ uint64_t pg_monotonic_ms(void) {
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+uint64_t pg_monotonic_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+}
+
 int64_t pg_unix_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

@@ -358,6 +358,37 @@ peregrine \
 Add `--wsgi-threads 8` for a WSGI application that waits on I/O. Leave
 `--reload` for development only — it polls the source tree.
 
+### The access log
+
+`--access-log` gives one line per request:
+
+```
+GET /orders/17?expand=items 200 431us
+```
+
+`--access-log-format json` gives the same information as one JSON object per
+line, which is what to use when something is collecting these rather than
+someone reading them. It implies `--access-log`:
+
+```json
+{"level":"info","pid":8961,"method":"GET","target":"/orders/17","status":200,"duration_us":431,"proto":"HTTP/1.1"}
+```
+
+The whole line is the object — there is no `[info] pid=…` in front of it to
+strip — so a collector can parse it without being told where the JSON starts.
+
+`duration_us` is measured from the request being dispatched to the response
+head being settled and queued, not to the last byte of the body: for a
+streaming response that last byte is the client's pace rather than the
+application's, and a number that mixes the two says nothing about either.
+
+A request target is whatever bytes the peer sent. `"` and `\` are escaped, and
+a target that is not valid UTF-8 has its bytes escaped as `\u00XX` rather than
+being dropped or truncated — so the line is always parseable and the target is
+always recoverable, byte for byte.
+
+`--access-log` costs a clock read per request; without it there is none.
+
 ---
 
 ## Free-threaded Python

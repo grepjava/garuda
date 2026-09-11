@@ -107,6 +107,7 @@ func printUsage() {
       --ws-max-queue N         messages buffered for a slow app (default 32)
       --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
       --access-log             log one line per request
+      --access-log-format F    text (default) or json; implies --access-log
       --log-level LEVEL        debug, info, warning, error, silent
       --version                print the version and exit
       -h, --help               print this message
@@ -344,6 +345,20 @@ while i < argc {
         }
     } else if matches(arg, "--access-log") {
         config.accessLog = true
+    } else if matches(arg, "--access-log-format") {
+        guard let v = next("--access-log-format needs a value") else { break }
+        // Asking for a format is asking for the log: the alternative is a
+        // flag that silently does nothing without a second one beside it.
+        config.accessLog = true
+        if matches(v, "text") {
+            config.accessLogJSON = false
+        } else if matches(v, "json") {
+            config.accessLogJSON = true
+        } else {
+            Log.error("unknown --access-log-format; use text or json")
+            failed = true
+            break
+        }
     } else if matches(arg, "--log-level") {
         guard let v = next("--log-level needs a value") else { break }
         if matches(v, "debug") { config.logLevel = .debug }

@@ -695,6 +695,7 @@ public struct Worker {
     }
 
     mutating func dispatch(_ slot: Int) {
+        if config.accessLog { table[slot].pointee.requestStartUs = pg_monotonic_us() }
         switch appProtocol {
         case .wsgi:
             // WSGI has no way to express a stream that outlives its response,
@@ -977,13 +978,62 @@ public struct Worker {
         let base = c.pointee.headBase()
         let method = c.pointee.head.methodSlice
         let target = c.pointee.head.target
-        Log.emit(.info) { line in
-            line.span(method.span(in: base))
-            line.str(" ")
-            line.span(target.span(in: base))
-            line.str(" ")
-            line.int(status)
+        // Measured to here, where the response head is settled and queued --
+        // not to the last byte of the body, which for a streaming response is
+        // the client's pace rather than the application's.
+        let micros = c.pointee.requestStartUs == 0
+            ? 0 : Int(pg_monotonic_us() &- c.pointee.requestStartUs)
+
+        if !config.accessLogJSON {
+            Log.emit(.info) { line in
+                line.span(method.span(in: base))
+                line.str(" ")
+                line.span(target.span(in: base))
+                line.str(" ")
+                line.int(status)
+                line.str(" ")
+                line.int(micros)
+                line.str("us")
+            }
+            return
         }
+
+        // A target is the peer's bytes and need not be valid UTF-8, while a
+        // JSON string must be. Checking costs one pass over a few dozen bytes,
+        // and only when a JSON log was asked for.
+        let targetSpan = target.span(in: base)
+        var validator = UTF8Validator()
+        let wellFormed = validator.feed(targetSpan.base, targetSpan.count) && validator.isComplete
+        let proto = protocolName(slot)
+
+        // Bare: the whole line is the object, prefix included as fields, so a
+        // collector can read it without being told where the JSON starts.
+        Log.emitBare(.info) { line in
+            line.str("{\"level\":\"info\",\"pid\":")
+            line.int(Log.pid)
+            line.str(",\"method\":")
+            let m = method.span(in: base)
+            line.jsonString(m.base, m.count)
+            line.str(",\"target\":")
+            line.jsonString(targetSpan.base, targetSpan.count, asciiOnly: !wellFormed)
+            line.str(",\"status\":")
+            line.int(status)
+            line.str(",\"duration_us\":")
+            line.int(micros)
+            line.str(",\"proto\":\"")
+            line.str(proto)
+            line.str("\"}")
+        }
+    }
+
+    /// What the client is actually speaking, which the request head alone does
+    /// not say: an HTTP/2 or HTTP/3 request was rebuilt as HTTP/1.1 text to be
+    /// parsed, so its own head reads 1.1.
+    func protocolName(_ slot: Int) -> StaticString {
+        let c = table[slot]
+        if c.pointee.isH3Stream { return "HTTP/3" }
+        if c.pointee.isStream { return "HTTP/2" }
+        return c.pointee.head.httpMinor == 0 ? "HTTP/1.0" : "HTTP/1.1"
     }
 
     // MARK: - Teardown
