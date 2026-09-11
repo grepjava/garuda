@@ -1151,6 +1151,36 @@ def test_access_log():
     is_("a target that is not valid UTF-8 survives byte for byte",
         objects[2].get("target"), "/rawÿþ")
 
+    # A target is as long as the peer cares to make it, up to the head limit,
+    # and the line it goes into is a fixed stack buffer. Running out of buffer
+    # has to cut the target short, not the JSON: a line that stops mid-string
+    # is not an object, and without its newline it takes the next line with it.
+    long_target = b"GET /" + b"a" * 8000 + \
+        b" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    lines = served(["--access-log-format", "json"], [long_target, plain])
+    objects = []
+    for ln in lines:
+        if not ln.startswith("{"):
+            continue
+        try:
+            objects.append(json.loads(ln))
+        except ValueError as exc:
+            bad("a long target leaves the line valid JSON", "an object",
+                "%s in a line of %d bytes" % (exc, len(ln)))
+            return
+    is_("a target too long for the line does not break the JSON", len(objects), 2)
+    if len(objects) != 2:
+        return
+    check("the oversized line says it was truncated",
+          objects[0].get("truncated") is True, str(objects[0])[:120])
+    check("and still carries the fields after the target",
+          isinstance(objects[0].get("status"), int)
+          and isinstance(objects[0].get("duration_us"), int)
+          and objects[0].get("proto") == "HTTP/1.1",
+          str(objects[0])[-120:])
+    check("the line after it is untouched", objects[1].get("target") == "/",
+          str(objects[1])[:120])
+
 
 def test_metrics():
     print("\nPrometheus metrics")
@@ -1217,6 +1247,45 @@ def test_metrics():
               body.startswith(b"# HELP"), body[:80])
         is_("the application port has no metrics route",
             server.get("/metrics")[0], 404)
+
+        # A request that arrives in more than one segment is a request the
+        # server has only half of. Answering it early means closing under a
+        # peer still writing, which costs it an EPIPE on writes it was entitled
+        # to make and can cost it the answer, a close with bytes still inbound
+        # being a reset.
+        s = socket.create_connection(("127.0.0.1", metrics_port), timeout=10)
+        s.settimeout(10)
+        sent_whole = True
+        try:
+            for byte in b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n":
+                s.sendall(bytes([byte]))
+                time.sleep(0.01)
+        except OSError:
+            sent_whole = False
+        check("a scrape written one byte at a time is not cut off", sent_whole,
+              "the server closed the connection while the request was arriving")
+        status, _, body = read_http_response(s)
+        s.close()
+        is_("and it is answered in full", status, 200)
+        check("with the whole exposition", b"peregrine_requests_total" in body,
+              body[:80])
+
+        # Places to wait in are finite, and a peer that stops writing must not
+        # hold one for longer than the deadline.
+        stalled = []
+        for _ in range(12):
+            half = socket.create_connection(("127.0.0.1", metrics_port), timeout=10)
+            half.sendall(b"G")
+            stalled.append(half)
+        began = time.monotonic()
+        is_("a scrape still works while half-written ones are parked",
+            scrape(metrics_port)[0], 200)
+        is_("and so does the application", server.get("/")[0], 200)
+        check("neither waited on them",
+              time.monotonic() - began < 3.0,
+              "took %.1fs" % (time.monotonic() - began))
+        for half in stalled:
+            half.close()
 
     # Counting must cost nothing when nobody asked for it.
     port = free_port()

@@ -20,23 +20,49 @@ public struct LogLine {
     @usableFromInline var buf: UnsafeMutablePointer<UInt8>
     @usableFromInline var len: Int
     @usableFromInline let cap: Int
+    /// Where writers actually stop, which is `cap` until a caller keeps some
+    /// of the line back with `reserveTail`.
+    @usableFromInline var softCap: Int
+    /// True once anything has been clipped. A line that says what it is
+    /// missing is worth more than one that quietly reads as complete.
+    ///
+    /// Settable only in this file by convention rather than by access control:
+    /// the writers are `@inlinable`, so a private setter would put them out of
+    /// reach of the very callers that have to report the clipping.
+    public var truncated = false
 
     @inlinable
     init(_ p: UnsafeMutablePointer<UInt8>, _ cap: Int) {
         self.buf = p
         self.len = 0
         self.cap = cap
+        self.softCap = cap
+    }
+
+    /// Keeps `n` bytes back for a tail that must be writable whatever happens
+    /// in between -- the rest of a JSON object, say, whose variable-length
+    /// field must not be allowed to eat the punctuation that closes it.
+    @inlinable
+    public mutating func reserveTail(_ n: Int) { softCap = max(len, cap &- n) }
+
+    @inlinable
+    public mutating func releaseTail() { softCap = cap }
+
+    @usableFromInline
+    mutating func clip(_ want: Int, _ room: Int) -> Int {
+        if want > room { truncated = true; return room > 0 ? room : 0 }
+        return want
     }
 
     @inlinable
     public mutating func str(_ s: StaticString) {
-        let n = min(s.utf8CodeUnitCount, cap &- len)
+        let n = clip(s.utf8CodeUnitCount, softCap &- len)
         if n > 0 { memcpy(buf + len, s.utf8Start, n); len &+= n }
     }
 
     @inlinable
     public mutating func bytes(_ p: UnsafePointer<UInt8>, _ n0: Int) {
-        let n = min(n0, cap &- len)
+        let n = clip(n0, softCap &- len)
         if n > 0 { memcpy(buf + len, p, n); len &+= n }
     }
 
@@ -45,7 +71,7 @@ public struct LogLine {
 
     @inlinable
     public mutating func int(_ v: Int) {
-        if cap &- len < 24 { return }
+        if softCap &- len < 24 { truncated = true; return }
         if v < 0 { buf[len] = 45; len &+= 1; len &+= writeDecimal(-v, buf + len); return }
         len &+= writeDecimal(v, buf + len)
     }
@@ -63,7 +89,13 @@ public struct LogLine {
     /// ordinary non-ASCII URL stays readable.
     public mutating func jsonString(_ p: UnsafePointer<UInt8>, _ n: Int,
                                     asciiOnly: Bool = false) {
-        if len < cap { buf[len] = 0x22; len &+= 1 }        // "
+        if len < softCap { buf[len] = 0x22; len &+= 1 }    // "
+        // The closing quote is kept back before a single byte of content goes
+        // in. A string that runs out of line is a string that was cut short;
+        // one that also loses its quote is not JSON at all, and takes the next
+        // line with it.
+        let outerSoftCap = softCap
+        softCap = max(len, softCap &- 1)
         var i = 0
         while i < n {
             let b = p[i]
@@ -79,18 +111,21 @@ public struct LogLine {
             default:
                 if b < 0x20 || (asciiOnly && b > 0x7F) {
                     unicodeEscape(b)
-                } else if len < cap {
+                } else if len < softCap {
                     buf[len] = b
                     len &+= 1
+                } else {
+                    truncated = true
                 }
             }
         }
-        if len < cap { buf[len] = 0x22; len &+= 1 }
+        softCap = outerSoftCap
+        if len < softCap { buf[len] = 0x22; len &+= 1 }
     }
 
     @usableFromInline
     mutating func escape(_ c: UInt8) {
-        if cap &- len < 2 { return }
+        if softCap &- len < 2 { truncated = true; return }
         buf[len] = 0x5C
         buf[len &+ 1] = c
         len &+= 2
@@ -99,7 +134,7 @@ public struct LogLine {
     /// `\u00XX`, the only escape that covers every byte JSON cannot carry.
     @usableFromInline
     mutating func unicodeEscape(_ b: UInt8) {
-        if cap &- len < 6 { return }
+        if softCap &- len < 6 { truncated = true; return }
         let digits: StaticString = "0123456789abcdef"
         buf[len] = 0x5C
         buf[len &+ 1] = 0x75                               // u
@@ -113,7 +148,10 @@ public struct LogLine {
     @inlinable
     public mutating func cstr(_ p: UnsafePointer<CChar>) {
         var i = 0
-        while p[i] != 0 && len < cap { buf[len] = UInt8(bitPattern: p[i]); len &+= 1; i &+= 1 }
+        while p[i] != 0 && len < softCap {
+            buf[len] = UInt8(bitPattern: p[i]); len &+= 1; i &+= 1
+        }
+        if p[i] != 0 { truncated = true }
     }
 }
 
@@ -126,13 +164,21 @@ public enum Log {
     @inlinable
     public static func enabled(_ l: LogLevel) -> Bool { l >= level }
 
+    /// Bytes a log line gets. Large enough that a realistic request target --
+    /// which a JSON access line carries whole -- is written rather than cut,
+    /// and small enough to be a stack temporary on every request path.
+    ///
+    /// One byte past it is kept back for the newline, so a line that fills the
+    /// buffer is still a line rather than the start of the next one.
+    @usableFromInline static let capacity = 4096
+
     /// Assembles and emits one line. The closure is inlined into the caller so
     /// nothing escapes and nothing allocates.
     @inlinable
     public static func emit(_ l: LogLevel, _ body: (inout LogLine) -> Void) {
         guard l >= level else { return }
-        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1024) { raw in
-            var line = LogLine(raw.baseAddress!, 1024)
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: capacity) { raw in
+            var line = LogLine(raw.baseAddress!, capacity - 1)
             switch l {
             case .debug:   line.str("[debug] ")
             case .info:    line.str("[info]  ")
@@ -146,7 +192,8 @@ public enum Log {
                 line.str(" ")
             }
             body(&line)
-            if line.len < line.cap { line.buf[line.len] = cLF; line.len &+= 1 }
+            line.buf[line.len] = cLF
+            line.len &+= 1
             _ = pg_write(2, line.buf, line.len)
         }
     }
@@ -160,10 +207,11 @@ public enum Log {
     @inlinable
     public static func emitBare(_ l: LogLevel, _ body: (inout LogLine) -> Void) {
         guard l >= level else { return }
-        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 1024) { raw in
-            var line = LogLine(raw.baseAddress!, 1024)
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: capacity) { raw in
+            var line = LogLine(raw.baseAddress!, capacity - 1)
             body(&line)
-            if line.len < line.cap { line.buf[line.len] = cLF; line.len &+= 1 }
+            line.buf[line.len] = cLF
+            line.len &+= 1
             _ = pg_write(2, line.buf, line.len)
         }
     }

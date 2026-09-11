@@ -48,6 +48,10 @@ public struct Worker {
     /// The metrics scrape listener, or -1. Separate from `listenFD` in every
     /// sense: a different port, a different handler, no connection slot.
     public var metricsFD: Int32 = -1
+    /// Scrapes whose request has not finished arriving. Fixed in number, so
+    /// waiting for one can never become a way to use up this worker.
+    public var scrapes = [PendingScrape](repeating: PendingScrape(),
+                                         count: PollToken.metricsPendingCount)
     public var signalFD: Int32 = -1
 
     /// One shared header table: parsing and environ/scope construction happen
@@ -121,6 +125,7 @@ public struct Worker {
     }
 
     public mutating func destroy() {
+        closeScrapes()
         quic?.destroy()
         headers.deallocate()
         pool.destroy()
@@ -198,6 +203,10 @@ public struct Worker {
             case PollToken.metrics:
                 acceptMetricsScrapes()
             default:
+                if let pending = PollToken.metricsPendingIndex(token) {
+                    handleScrapeReadable(pending)
+                    continue
+                }
                 let slot = PollToken.slot(token)
                 let generation = PollToken.generation(token)
                 let c = table[slot]
@@ -1032,17 +1041,32 @@ public struct Worker {
             line.str(",\"method\":")
             let m = method.span(in: base)
             line.jsonString(m.base, m.count)
+            // A target is as long as the peer cares to make it, up to the head
+            // limit, and everything after it here is short and fixed. So the
+            // tail is reserved before the target goes in: a long one is cut
+            // short and says so, rather than eating the fields that close the
+            // object and the newline that ends the line.
+            line.reserveTail(Worker.accessLogTail)
             line.str(",\"target\":")
             line.jsonString(targetSpan.base, targetSpan.count, asciiOnly: !wellFormed)
+            line.releaseTail()
             line.str(",\"status\":")
             line.int(status)
             line.str(",\"duration_us\":")
             line.int(micros)
             line.str(",\"proto\":\"")
             line.str(proto)
-            line.str("\"}")
+            line.str("\"")
+            if line.truncated { line.str(",\"truncated\":true") }
+            line.str("}")
         }
     }
+
+    /// Room the JSON access line keeps for everything after the target:
+    /// `"status"`, `"duration_us"`, `"proto"`, the optional `"truncated"`, and
+    /// the punctuation closing the object. Generous on purpose -- being wrong
+    /// the other way is what this exists to prevent.
+    static let accessLogTail = 128
 
     /// What the client is actually speaking, which the request head alone does
     /// not say: an HTTP/2 or HTTP/3 request was rebuilt as HTTP/1.1 text to be
@@ -1206,6 +1230,7 @@ public struct Worker {
         if now &- lastSweep < 1000 { return }
         lastSweep = now
         dates.refresh()
+        if metricsFD >= 0 { sweepScrapes(now: now) }
 
         // Past the grace period, whatever is still in flight is not going to
         // finish. Dropping it is what turns "shut down when convenient" into a

@@ -360,7 +360,7 @@ swift test                                      # 127 unit tests: parser,
                                                 #   QUIC packet protection,
                                                 #   and the fuzz corpus
 bash scripts/integration-test.sh                #  47 end-to-end checks
-python3 scripts/feature-test.py                 # 178 checks for the failure
+python3 scripts/feature-test.py                 # 188 checks for the failure
                                                 #   modes a plain request never
                                                 #   reaches: slow consumers,
                                                 #   stuck-request shutdown,

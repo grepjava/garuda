@@ -241,6 +241,24 @@ public enum PollToken {
     public static let quic: UInt64 = .max - 3
     /// The metrics listener, when one is bound.
     public static let metrics: UInt64 = .max - 4
+    /// Scrapes whose request has not finished arriving. One token per pending
+    /// slot, so an event names its slot without a search. Kept clear of the
+    /// singletons above and far below any slot token.
+    public static let metricsPendingCount = 8
+    public static let metricsPendingBase: UInt64 = .max - 16
+
+    @inlinable
+    public static func metricsPending(_ index: Int) -> UInt64 {
+        metricsPendingBase &+ UInt64(index)
+    }
+
+    @inlinable
+    public static func metricsPendingIndex(_ token: UInt64) -> Int? {
+        guard token >= metricsPendingBase,
+              token < metricsPendingBase &+ UInt64(metricsPendingCount) else { return nil }
+        return Int(token &- metricsPendingBase)
+    }
+
     public static let slotBits: UInt64 = 24
     public static let slotMask: UInt64 = (1 << 24) - 1
 
