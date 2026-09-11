@@ -274,6 +274,11 @@ extension Worker {
         }
 
         let s = table[streamSlot]
+        // A stream has no descriptor, so no poller event ever refreshes it the
+        // way one refreshes an HTTP/1 connection. Arriving body bytes are what
+        // progress looks like here, and without this the request timeout is an
+        // absolute cap on the upload rather than a check for a stalled one.
+        s.pointee.lastActivity = pg_monotonic_ms()
         s.pointee.recvWindow -= header.length
         if s.pointee.recvWindow < 0 {
             streamError(slot, h2, header.streamID, .flowControlError)
@@ -957,6 +962,11 @@ extension Worker {
             writeFrame(parent, length: n, type: .data, flags: [], streamID: s.pointee.streamID) { out in
                 out.write(UnsafePointer(s.pointee.write.readPointer), n)
             }
+            // The other half of the same argument: bytes leaving is progress
+            // too, so a large response to a slow reader is not cut off part
+            // way through. A window the peer never opens is still a stall, and
+            // still times out, because nothing is written in that case.
+            s.pointee.lastActivity = pg_monotonic_ms()
             s.pointee.write.consume(n)
             s.pointee.sendWindow -= n
             h2.sendWindow -= n

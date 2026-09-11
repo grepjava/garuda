@@ -10,6 +10,9 @@ startup_ran = False
 # already complete. ASGI says that is a disconnect.
 late_receive = "nothing"
 
+# Whether the task behind /abandonable was cancelled when its client left.
+was_cancelled = "never ran"
+
 # The integration suite checks that lifespan shutdown actually runs, which it
 # can only observe from outside the process.
 SHUTDOWN_MARKER = os.environ.get("PEREGRINE_SHUTDOWN_MARKER")
@@ -27,7 +30,7 @@ STARTUP_COUNTER = os.environ.get("PEREGRINE_STARTUP_COUNTER")
 
 
 async def app(scope, receive, send):
-    global startup_ran, late_receive
+    global startup_ran, late_receive, was_cancelled
 
     if scope["type"] == "lifespan":
         while True:
@@ -183,6 +186,23 @@ async def app(scope, receive, send):
     elif path == "/sleep":
         await asyncio.sleep(0.25)
         await reply(b"slept\n")
+
+    elif path == "/abandonable":
+        # Sleeps without ever calling receive(), so nothing here is watching
+        # for http.disconnect. The only thing that can reach this task once
+        # the client goes away is cancellation, and `cancelled` is how the
+        # next request finds out whether it arrived.
+        global was_cancelled
+        was_cancelled = "no"
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            was_cancelled = "yes"
+            raise
+        await reply(b"finished anyway\n")
+
+    elif path == "/cancelled":
+        await reply(was_cancelled.encode() + b"\n")
 
     elif path == "/big":
         n = int(scope["query_string"] or 100000)

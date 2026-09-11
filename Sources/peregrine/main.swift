@@ -75,6 +75,7 @@ func printUsage() {
       --max-body BYTES         largest accepted request body (default 16 MiB)
       --max-header-size BYTES  largest accepted request head (default 32 KiB)
       --keep-alive MS          idle keep-alive timeout (default 5000)
+      --request-timeout MS     how long a request may stall mid-message (30000)
       --graceful-timeout MS    time in-flight requests get on shutdown (10000)
       --wsgi-threads N         WSGI application threads per worker (default 1)
       --forwarded-allow-ips L  proxies whose X-Forwarded-* headers are trusted:
@@ -269,6 +270,9 @@ while i < argc {
     } else if matches(arg, "--keep-alive") {
         guard let v = next("--keep-alive needs milliseconds") else { break }
         config.keepAliveTimeoutMs = UInt64(max(0, parseInt(v)))
+    } else if matches(arg, "--request-timeout") {
+        guard let v = next("--request-timeout needs milliseconds") else { break }
+        config.requestHeadTimeoutMs = UInt64(max(0, parseInt(v)))
     } else if matches(arg, "--graceful-timeout") {
         guard let v = next("--graceful-timeout needs milliseconds") else { break }
         config.gracefulShutdownMs = UInt64(max(0, parseInt(v)))

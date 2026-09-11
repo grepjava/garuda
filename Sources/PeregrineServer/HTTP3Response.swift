@@ -207,6 +207,10 @@ extension Worker {
             frame.write(UnsafePointer(s.pointee.write.readPointer), pending)
             h3.quic.send(streamID, UnsafePointer(frame.readPointer),
                          frame.readableBytes, fin: false)
+            // A stream slot is refreshed by the bytes that move on it, not by
+            // a poller event: it has no descriptor to have one. See the same
+            // note in HTTP2.flushStream.
+            s.pointee.lastActivity = pg_monotonic_ms()
             s.pointee.write.consume(pending)
         }
 

@@ -353,6 +353,21 @@ def test_cancellation():
         is_("the connection survives a reset stream", status.get(s2), 200)
         is_("the cancelled stream is not answered", status.get(s), None)
         is_("the cancelled request produced no body", body.get(s), None)
+
+        # RST_STREAM is the one disconnect that is not ambiguous: unlike a FIN
+        # on a socket, which may only mean the peer has finished talking, it
+        # says this request is over. /abandonable never calls receive(), so the
+        # http.disconnect message ASGI would deliver has nobody waiting for it
+        # and cancellation is the only thing that can still reach the task.
+        abandoned = c.request(path="/abandonable")
+        time.sleep(0.3)
+        c.conn.reset_stream(abandoned, error_code=8)
+        c.flush()
+        time.sleep(0.5)
+        s3 = c.request(path="/cancelled")
+        status, _, body, _ = c.collect([s3], deadline=10.0)
+        is_("a reset stream cancels the task nobody is left to talk to",
+            body.get(s3, b"").strip(), b"yes")
         c.close()
 
 
@@ -417,6 +432,50 @@ def test_rapid_reset():
         s = c.request(path="/")
         status, _, _, _ = c.collect([s], deadline=10.0)
         is_("other connections are unaffected", status.get(s), 200)
+        c.close()
+
+
+def test_slow_stream():
+    """A stream that is making progress must not hit the request timeout.
+
+    A stream slot has no descriptor, so nothing refreshes it the way a poller
+    event refreshes an HTTP/1 connection. Without the stream itself recording
+    the bytes that move on it, the timeout stops being a check for a stalled
+    request and becomes an absolute cap on a slow one.
+
+    WSGI, because PEP 3333 hands the application a whole body and so leaves the
+    stream reading until END_STREAM -- which is the state the sweep looks at.
+    """
+    print("\nSlow but steady streams")
+    with Server("--request-timeout", "2000", app="wsgi_app:application") as server:
+        c = Client(server)
+        body = b"abcdefghij"
+        stream = c.request(method="POST", path="/echo",
+                           extra=[("content-length", str(len(body)))], end=False)
+        # Six seconds of dribbling against a two-second timeout: any absolute
+        # cap fires long before the last byte.
+        killed = None
+        began = time.monotonic()
+        for i in range(len(body)):
+            time.sleep(0.6)
+            try:
+                c.conn.send_data(stream, body[i:i + 1], end_stream=(i == len(body) - 1))
+                c.flush()
+            except (OSError, h2.exceptions.H2Error) as exc:
+                killed = "%.1fs in: %s" % (time.monotonic() - began,
+                                           type(exc).__name__)
+                break
+            c.step(timeout=0.01)
+        if killed is not None:
+            bad("a steadily uploaded body outlives the request timeout",
+                "the upload to finish", "the server dropped the stream " + killed)
+            c.close()
+            return
+        status, _, echoed, _ = c.collect([stream], deadline=10.0)
+        is_("a steadily uploaded body outlives the request timeout",
+            status.get(stream), 200)
+        is_("and arrives whole", echoed.get(stream), body)
+        is_("the stream is not reset out from under it", c.reset.get(stream), None)
         c.close()
 
 
@@ -598,6 +657,7 @@ def run_all():
     global FAIL
     for test in (test_basics, test_multiplexing, test_request_bodies,
                  test_flow_control, test_cancellation, test_rapid_reset,
+                 test_slow_stream,
                  test_large_headers,
                  test_response_framing, test_wsgi):
         try:

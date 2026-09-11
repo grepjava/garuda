@@ -1140,7 +1140,29 @@ public struct Worker {
             c.pointee.poolJob = nil
         }
 
-        if let t = c.pointee.task { pg_decref(t); c.pointee.task = nil }
+        // A task is still here only because the connection is being torn down
+        // underneath it. Dropping our reference would not stop it: asyncio
+        // holds its own, so the coroutine would run on to completion for a
+        // client that is already gone -- finishing a query, calling a service,
+        // and handing the answer to a `send()` that discards it. Cancelling is
+        // the only thing that actually reaches it.
+        //
+        // Everything it might still have done is already lost at this point:
+        // the slot is about to be recycled and its generation bumped, so a
+        // send() lands nowhere and a receive() resolves to nothing. What the
+        // application gets instead is a CancelledError at its next await,
+        // which runs `finally` blocks the way any other cancellation does.
+        if let t = c.pointee.task {
+            if let result = pg_call_method0(t, Interned[.nCancel]) {
+                pg_decref(result)
+            } else {
+                // A task that has already finished refuses to be cancelled,
+                // which is not news worth carrying up the stack.
+                pg_err_clear()
+            }
+            pg_decref(t)
+            c.pointee.task = nil
+        }
         if let f = c.pointee.pendingReceive { pg_decref(f); c.pointee.pendingReceive = nil }
         if let s = c.pointee.sendCallable { pg_decref(s); c.pointee.sendCallable = nil }
         if let r = c.pointee.receiveCallable { pg_decref(r); c.pointee.receiveCallable = nil }

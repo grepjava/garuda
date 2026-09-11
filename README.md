@@ -243,6 +243,7 @@ peregrine [options] MODULE:ATTRIBUTE
   --max-body BYTES         largest accepted request body (default 16 MiB)
   --max-header-size BYTES  largest accepted request head (default 32 KiB)
   --keep-alive MS          idle keep-alive timeout (default 5000)
+  --request-timeout MS     how long a request may stall mid-message (30000)
   --graceful-timeout MS    time in-flight requests get on shutdown (10000)
   --wsgi-threads N         WSGI application threads per worker (default 1)
   --forwarded-allow-ips L  proxies whose X-Forwarded-* headers are trusted
@@ -368,7 +369,7 @@ python3 scripts/feature-test.py                 # 178 checks for the failure
 bash scripts/framework-test.sh                  #  30 checks against real
                                                 #   FastAPI and Django apps,
                                                 #   over HTTP/1.1 and HTTP/2
-<venv>/bin/python scripts/http2-test.py         # 146 checks against `h2`
+<venv>/bin/python scripts/http2-test.py         # 154 checks against `h2`
 <venv>/bin/python scripts/http3-test.py         #  73 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only: routing,
                                                 #   converters, session helper

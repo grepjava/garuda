@@ -633,6 +633,10 @@ extension Worker {
     private mutating func appendH3Body(_ streamSlot: Int,
                                        _ p: UnsafePointer<UInt8>, _ n: Int) -> Bool {
         let s = table[streamSlot]
+        // Body bytes are what progress looks like on a stream slot, which has
+        // no descriptor and so never sees a poller event. See the same note in
+        // HTTP2.handleDataFrame.
+        s.pointee.lastActivity = pg_monotonic_ms()
         s.pointee.bodyReceived += n
         if s.pointee.head.flags.contains(.hasContentLength)
             && s.pointee.bodyReceived > s.pointee.head.contentLength {

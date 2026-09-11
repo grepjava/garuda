@@ -206,6 +206,19 @@ and is sent `GOAWAY(ENHANCE_YOUR_CALM)`. A reset that arrives after the
 response was already finished is a race rather than an attack, and costs
 nothing.
 
+### A stream measures its own progress
+
+`--request-timeout` asks whether a request has stalled, and on HTTP/1 the
+answer comes from the poller: every readable or writable event on the socket is
+progress, so a slow-but-moving transfer is never mistaken for a stuck one.
+
+A stream has no socket, so it has no events to be refreshed by, and it records
+the bytes that move on it instead — DATA in, DATA out. Without that the timeout
+would stop asking whether the request is stalled and start capping how long it
+may take, which for an upload over a thin link is a different question with a
+much worse answer. A window the peer never opens is still a stall, and still
+times out: nothing is written in that case, so nothing is recorded.
+
 Conformance is checked with [h2spec](https://github.com/summerwind/h2spec):
 **146/146 over TLS**, for ASGI and WSGI alike.
 
@@ -507,7 +520,7 @@ code, because a test written against the same understanding as the code proves
 only that the understanding is consistent.
 
 ```bash
-<venv>/bin/python scripts/http2-test.py         # 146 checks against `h2`
+<venv>/bin/python scripts/http2-test.py         # 154 checks against `h2`
 <venv>/bin/python scripts/http3-test.py         #  73 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only
 <venv>/bin/python scripts/webtransport-test.py  # 115 including FastAPI/Django
