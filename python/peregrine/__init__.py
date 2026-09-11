@@ -10,7 +10,7 @@ import os
 import sys
 import sysconfig
 
-__version__ = "0.8.0"
+__version__ = "1.0.0"
 __all__ = ["binary_path", "run", "main"]
 
 _BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bin")
@@ -76,8 +76,8 @@ def run(argv=None):
     if binary is None:
         raise SystemExit(
             "peregrine: the server binary is missing from %s.\n"
-            "The package is compiled at install time; reinstall it from source\n"
-            "with a Swift toolchain available." % _BIN_DIR
+            "Reinstall peregrine-server for this interpreter; a matching wheel\n"
+            "or a Swift toolchain (for the sdist) is required." % _BIN_DIR
         )
 
     linked = built_for()
@@ -89,8 +89,34 @@ def run(argv=None):
             "Python %s.\n" % (linked, running, linked)
         )
 
+    _prepend_loader_path(_library_search_path())
     command = [binary] + _default_arguments(argv) + argv
     os.execv(binary, command)
+
+
+def _library_search_path():
+    """Directories the dynamic loader needs besides the binary's own rpath.
+
+    libpython stays with the interpreter that imported this package. The
+    Swift runtime is vendored next to the binary; the rpath finds it on
+    Linux, and DYLD_LIBRARY_PATH covers the same ground on macOS.
+    """
+    dirs = []
+    libdir = sysconfig.get_config_var("LIBDIR")
+    if libdir and os.path.isdir(libdir):
+        dirs.append(libdir)
+    bundled = os.path.join(_BIN_DIR, "lib")
+    if os.path.isdir(bundled):
+        dirs.append(bundled)
+    return dirs
+
+
+def _prepend_loader_path(dirs):
+    if not dirs:
+        return
+    key = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+    existing = os.environ.get(key, "")
+    os.environ[key] = os.pathsep.join(dirs + ([existing] if existing else []))
 
 
 def main():

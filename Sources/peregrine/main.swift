@@ -127,7 +127,7 @@ func printUsage() {
     _ = pg_write(1, usage.utf8Start, usage.utf8CodeUnitCount)
 }
 
-let version: StaticString = "peregrine 0.8.0"
+let version: StaticString = "peregrine 1.0.0"
 
 /// Reports the build version and the CPython actually linked.
 ///

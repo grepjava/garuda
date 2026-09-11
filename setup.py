@@ -1,22 +1,22 @@
 """Builds the Swift server and packages the resulting binary.
 
 Peregrine embeds CPython rather than talking to it over a socket, so the binary
-is linked against one specific libpython. That is why this project ships as a
-source distribution and is compiled at install time: the interpreter it links
-must be the interpreter it will run applications for, and only the installing
-environment knows which one that is.
+is linked against one specific libpython. A prebuilt wheel is therefore tagged
+for the exact CPython and platform it was built against
+(`cp312-cp312-linux_x86_64`, `cp314-cp314t-...`) so pip refuses it anywhere it
+would not actually run. When no wheel matches, pip falls back to the sdist and
+this file compiles the server against the installing interpreter.
 
-That also decides how the wheel is tagged. Setuptools sees a pure-Python
-package containing a data file and would tag it `py3-none-any`, which claims
-the artifact works on any interpreter on any platform -- the opposite of the
-truth for a native executable with a hard libpython dependency. The wheel is
-therefore tagged for the exact CPython and platform it was built against, so
-pip refuses it anywhere it would not actually run.
+The wheel does not vendor libpython -- that would fight the interpreter the
+user already has. It does vendor the Swift runtime next to the binary, with a
+relative rpath, so a machine that has never seen this toolchain can still
+exec the server.
 
-Requirements at install time:
+Requirements when compiling (sdist or `scripts/build-wheel.sh`):
   * a Swift toolchain (swift 6.1 or newer) on PATH
   * the Python development files for the interpreter being installed into,
     which pkg-config exposes as python3-embed (python3-dev / python3-devel)
+  * patchelf on Linux, so the binary can be made relocatable
 """
 
 import os
@@ -126,12 +126,166 @@ def _linked_version(binary):
     The authority is the binary, not pkg-config and not the headers: it reports
     Py_GetVersion() from the library the loader resolved.
     """
-    result = subprocess.run([binary, "--version"], capture_output=True, text=True)
+    env = os.environ.copy()
+    libdir = sysconfig.get_config_var("LIBDIR")
+    if libdir:
+        key = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        env[key] = libdir + os.pathsep + env.get(key, "")
+    result = subprocess.run(
+        [binary, "--version"], capture_output=True, text=True, env=env)
     match = re.search(r"CPython (\d+)\.(\d+)([^)]*)", result.stdout)
     if not match:
         return None
     suffix = "t" if "free-threaded" in match.group(3) else ""
     return "%s.%s%s" % (match.group(1), match.group(2), suffix)
+
+
+# The Swift runtime travels with the binary. libpython, libssl and the rest of
+# the OS do not -- they belong to the machine that runs the wheel.
+_BUNDLE_HINTS = ("swift", "dispatch", "blocksruntime")
+_NEVER_BUNDLE = (
+    "libpython", "libssl", "libcrypto", "libc.so", "libm.so", "libdl.so",
+    "libpthread", "librt.so", "libgcc", "libstdc++", "ld-linux",
+    "linux-vdso", "libz.so", "libxml2", "libicu", "libcurl", "libbsd",
+    "libedit", "libncurses", "libsqlite", "liblzma", "libffi", "libsystem",
+)
+
+
+def _require_relocate():
+    return os.environ.get("PEREGRINE_REQUIRE_RELOCATE", "").strip() not in ("", "0")
+
+
+def _should_bundle(name, path):
+    # Match against the SONAME / basename, from the start. A substring
+    # check on the whole line would skip libswiftGlibc.so because
+    # "libc.so" sits inside "glibc.so".
+    base = os.path.basename(name or path).lower()
+    if any(base == token or base.startswith(token) for token in _NEVER_BUNDLE):
+        return False
+    haystack = ("%s %s" % (base, path)).lower()
+    return any(token in haystack for token in _BUNDLE_HINTS)
+
+
+def _linux_runtime_paths(binary):
+    """SONAME -> resolved path for every Swift library ldd can see."""
+    try:
+        output = subprocess.check_output(
+            ["ldd", binary], text=True, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        _fail("ldd could not read %s: %s" % (binary, exc))
+    found = {}
+    for line in output.splitlines():
+        if "=>" not in line:
+            continue
+        soname, _, rest = line.strip().partition("=>")
+        path = rest.strip().split()[0]
+        if path in ("", "not"):
+            continue
+        soname = soname.strip()
+        if _should_bundle(soname, path) and os.path.isfile(path):
+            found[soname] = path
+    return found
+
+
+def _macos_runtime_paths(binary):
+    """install name -> resolved path for every Swift library otool can see."""
+    try:
+        output = subprocess.check_output(
+            ["otool", "-L", binary], text=True, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        _fail("otool could not read %s: %s" % (binary, exc))
+    found = {}
+    for line in output.splitlines()[1:]:
+        path = line.strip().split()[0]
+        if path.startswith("/usr/lib/") or path.startswith("/System/"):
+            continue
+        if not os.path.isfile(path):
+            continue
+        name = os.path.basename(path)
+        if _should_bundle(name, path):
+            found[path] = path
+    return found
+
+
+def _copy_runtime(binary, resolved):
+    lib_dir = os.path.join(os.path.dirname(binary), "lib")
+    os.makedirs(lib_dir, exist_ok=True)
+    copied = []
+    for name, path in resolved.items():
+        dest = os.path.join(lib_dir, os.path.basename(name))
+        shutil.copy2(path, dest)
+        copied.append(dest)
+    return lib_dir, copied
+
+
+def _relocate_linux(binary):
+    if shutil.which("patchelf") is None:
+        message = (
+            "patchelf is required to make the binary relocatable.\n"
+            "Install it (patchelf on Debian and Ubuntu) and try again."
+        )
+        if _require_relocate():
+            _fail(message)
+        sys.stderr.write("peregrine: %s\n" % message)
+        return
+    resolved = _linux_runtime_paths(binary)
+    if not resolved:
+        message = "ldd found no Swift runtime libraries to vendor next to %s" % binary
+        if _require_relocate():
+            _fail(message)
+        sys.stderr.write("peregrine: %s\n" % message)
+        return
+    lib_dir, copied = _copy_runtime(binary, resolved)
+    subprocess.check_call(["patchelf", "--set-rpath", "$ORIGIN/lib", binary])
+    for path in copied:
+        subprocess.check_call(["patchelf", "--set-rpath", "$ORIGIN", path])
+    sys.stderr.write(
+        "peregrine: vendored %d Swift libraries into %s\n" % (len(copied), lib_dir)
+    )
+
+
+def _relocate_macos(binary):
+    resolved = _macos_runtime_paths(binary)
+    if not resolved:
+        message = "otool found no Swift runtime libraries to vendor next to %s" % binary
+        if _require_relocate():
+            _fail(message)
+        sys.stderr.write("peregrine: %s\n" % message)
+        return
+    lib_dir, copied = _copy_runtime(binary, resolved)
+    # -add_rpath fails if the path is already there; that is not an error.
+    add = subprocess.run(
+        ["install_name_tool", "-add_rpath", "@loader_path/lib", binary],
+        capture_output=True, text=True)
+    if add.returncode != 0 and "would duplicate" not in (add.stderr or ""):
+        _fail("install_name_tool -add_rpath failed: %s" % add.stderr.strip())
+    for original, dest in zip(resolved.values(), copied):
+        name = os.path.basename(dest)
+        subprocess.check_call(
+            ["install_name_tool", "-id", "@rpath/%s" % name, dest])
+        subprocess.check_call(
+            ["install_name_tool", "-change", original,
+             "@loader_path/lib/%s" % name, binary])
+    sys.stderr.write(
+        "peregrine: vendored %d Swift libraries into %s\n" % (len(copied), lib_dir)
+    )
+
+
+def _relocate(binary):
+    """Vendors the Swift runtime next to the binary and rewrites its rpath.
+
+    A wheel has to run on a machine that has never seen this toolchain.
+    libpython stays with the user's interpreter -- the tag already promised
+    that pairing.
+    """
+    if sys.platform.startswith("linux"):
+        _relocate_linux(binary)
+    elif sys.platform == "darwin":
+        _relocate_macos(binary)
+    elif _require_relocate():
+        _fail("relocating the binary is not implemented on %s" % sys.platform)
+    else:
+        sys.stderr.write("peregrine: skipping relocate on %s\n" % sys.platform)
 
 
 class BinaryDistribution(Distribution):
@@ -187,6 +341,19 @@ class BuildWithSwift(build_py):
         with open(os.path.join(target_dir, "interpreter.txt"), "w") as fh:
             fh.write("%s\n" % linked)
             fh.write("%s\n" % (sysconfig.get_config_var("prefix") or ""))
+
+        # A wheel has to run on a machine that has never seen this Swift
+        # toolchain. libpython stays with the user's interpreter -- the tag
+        # already promised that pairing -- and the Swift runtime travels
+        # next to the binary with a relative rpath.
+        _relocate(target)
+        relocated = _linked_version(target)
+        if relocated != linked:
+            _fail(
+                "the relocated binary no longer reports Python %s "
+                "(got %s). The Swift runtime may not have been vendored."
+                % (linked, relocated)
+            )
 
 
 if bdist_wheel is not None:

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/peregrine-mark.png" alt="peregrine" width="420">
+  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/peregrine-cursive-segoe.png" alt="peregrine" width="560">
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@ serialisation step, and no second process. Swift owns the accept loop, the HTTP
 parser and the response writer; Python owns the application.
 
 ```
-pip install peregrine-server                # compiled at install time
+pip install peregrine-server                # wheel if one matches; else compiled
 
 peregrine --port 8000 myapp:application     # WSGI, protocol auto-detected
 peregrine --port 8000 --workers 0 myapp:app # ASGI, one worker per CPU
@@ -206,8 +206,9 @@ it. [Details.](CONFIG.md#free-threaded-python)
 
 ## Installing
 
-Peregrine embeds CPython rather than talking to it over a socket, so the binary
-is built against the interpreter it will run inside:
+A wheel is tagged for one CPython and one platform. When one matches, `pip`
+installs it and Swift is not required. When none does, `pip` compiles the
+sdist against the interpreter you are installing into:
 
 ```bash
 pip install peregrine-server

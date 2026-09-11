@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/peregrine-mark.png" alt="peregrine" width="360">
+  <img src="assets/peregrine-cursive-segoe.png" alt="peregrine" width="480">
 </p>
 
 # Configuring FastAPI and Django
@@ -532,7 +532,7 @@ running it there would silently be slower than `--workers`, not faster.
 `peregrine --version` says which kind of interpreter is embedded:
 
 ```
-peregrine 0.8.0 (CPython 3.14.6 free-threaded)
+peregrine 1.0.0 (CPython 3.14.6 free-threaded)
 ```
 
 One caveat that is not peregrine's to fix: importing an extension module that

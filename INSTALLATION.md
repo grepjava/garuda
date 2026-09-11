@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/peregrine-mark.png" alt="peregrine" width="360">
+  <img src="assets/peregrine-cursive-segoe.png" alt="peregrine" width="480">
 </p>
 
 # Installing Peregrine
@@ -8,19 +8,27 @@ Peregrine embeds CPython rather than talking to it over a socket, so the server
 binary is linked against one specific `libpython`. That single fact decides
 everything unusual about installing it:
 
-* **It is compiled when you install it.** The interpreter it links must be the
-  interpreter it will run applications for, and only the installing environment
-  knows which one that is. There is no universal wheel to download.
+* **A wheel is tagged for exactly one interpreter and platform**
+  (`cp312-cp312-linux_x86_64`, `cp314-cp314t-...`). `pip` will refuse it
+  anywhere else, which is the correct answer rather than a limitation: a native
+  executable with a hard `libpython` dependency does not degrade gracefully.
+* **When a wheel matches, Swift is not required.** The Swift runtime travels
+  with the binary; `libpython` comes from the interpreter you install into.
+* **When no wheel matches, `pip` falls back to the sdist and compiles.** That
+  needs a Swift toolchain and takes a few minutes. The interpreter it links
+  must be the one it will run applications for.
 * **Install it into the environment it will serve.** A virtualenv's packages
   are only importable by the interpreter that virtualenv belongs to.
-* **The wheel is tagged for exactly one interpreter and platform**
-  (`cp312-cp312-linux_x86_64`, say). `pip` will refuse it anywhere else, which
-  is the correct answer rather than a limitation: a native executable with a
-  hard `libpython` dependency does not degrade gracefully.
 
 ---
 
 ## What you need
+
+A matching Linux wheel needs the interpreter itself and the usual system
+libraries (`libssl`, `libicu`). Swift is not on that list.
+
+Building from the sdist — no wheel for your tag, a checkout, a free-threaded
+interpreter that has not been built yet — still needs:
 
 | | |
 |---|---|
@@ -28,12 +36,13 @@ everything unusual about installing it:
 | **Swift** | 6.1 or newer, on `PATH`. From [swift.org/install](https://swift.org/install); on Linux, `swiftly` is the least painful route |
 | **OpenSSL** | development files. TLS 1.3, and QUIC's use of it, need `libssl` and `libcrypto` |
 | **pkg-config** | how the build locates all of the above |
+| **patchelf** | Linux only; rewrites the binary so the Swift runtime can travel with it |
 | **An OS with epoll or kqueue** | Linux, or macOS 14+. Not Windows — see [below](#windows) |
 
 ### Ubuntu and Debian
 
 ```bash
-sudo apt install python3-dev libssl-dev pkg-config curl
+sudo apt install python3-dev libssl-dev pkg-config curl patchelf
 # Swift: https://swift.org/install — swiftly installs and manages toolchains
 swift --version                       # expect 6.1 or newer
 ```
@@ -66,12 +75,15 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install peregrine-server
 ```
 
-The Swift build runs during the install and takes a few minutes. When it
-finishes:
+If PyPI has a wheel for this interpreter and platform, `pip` installs it in
+seconds and Swift is not required. Otherwise it falls back to the sdist, the
+Swift build runs, and that takes a few minutes. The first published wheels are
+tagged `linux_x86_64` for the builder's glibc — recent Linux, not every Linux.
+Older distros compile from the sdist. When it finishes:
 
 ```bash
 $ peregrine --version
-peregrine 0.8.0 (CPython 3.12.3)
+peregrine 1.0.0 (CPython 3.12.3)
 ```
 
 That second number is read out of the built binary at runtime, not out of the
@@ -101,6 +113,21 @@ drive mounted into WSL, for instance — build somewhere native instead:
 ```bash
 swift build -c release --scratch-path ~/pgbuild
 ```
+
+### Building a wheel
+
+A checkout that already has Swift can produce the same artifact CI uploads:
+
+```bash
+sudo apt install patchelf                 # Linux; rewrites the rpath
+PYTHON=python3.12 bash scripts/build-wheel.sh
+```
+
+The wheel lands in `dist/` tagged for that interpreter. It vendors the Swift
+runtime and leaves `libpython` to whoever installs it. GitHub Actions builds
+the Linux matrix from [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)
+(`gh workflow run Wheels`); publishing to PyPI is a separate input, not the
+default.
 
 ---
 
@@ -163,7 +190,7 @@ Check what came out, because this is the one thing worth being sure of:
 
 ```console
 $ peregrine --version
-peregrine 0.8.0 (CPython 3.14.6 free-threaded)
+peregrine 1.0.0 (CPython 3.14.6 free-threaded)
 ```
 
 Without `free-threaded` on that line, `--free-threaded` will refuse to start —
@@ -235,9 +262,14 @@ python3 scripts/contrib_test.py                 #  58 Python-only
 
 ## When it goes wrong
 
-**`no Swift toolchain found on PATH`** — install Swift 6.1+ and make sure
-`swift --version` works in the same shell `pip` runs in. `sudo pip` will not
-see a toolchain installed for your user.
+**`no Swift toolchain found on PATH`** — `pip` fell back to the sdist because
+no wheel matched this interpreter and platform. Install Swift 6.1+ and make
+sure `swift --version` works in the same shell `pip` runs in. `sudo pip` will
+not see a toolchain installed for your user.
+
+**`patchelf is required to make the binary relocatable`** — Linux source
+builds need `patchelf` so the Swift runtime can travel with the binary.
+`sudo apt install patchelf`.
 
 **`pkg-config cannot find python3-embed`** — the development files for that
 interpreter are missing. `python3-dev` on Debian and Ubuntu, `python3-devel` on

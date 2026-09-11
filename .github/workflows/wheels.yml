@@ -1,0 +1,125 @@
+# Prebuilt wheels for the interpreters the project claims to support.
+#
+# Each wheel embeds one libpython and the Swift runtime that binary was
+# linked against. The tag (cp312-cp312-linux_x86_64, cp314-cp314t-...) is
+# the pairing; pip will not install it anywhere else. libpython itself is
+# not vendored -- the user's matching interpreter supplies it.
+#
+# Started by hand, like CI. Building five release binaries is a bill, and
+# publishing is a separate input so a dry run cannot reach PyPI.
+
+name: Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload the wheels to PyPI
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWIFT_VERSION: "6.1.2"
+  SWIFT_PLATFORM: ubuntu24.04
+  SWIFT_SLUG: ubuntu2404
+  PEREGRINE_REQUIRE_RELOCATE: "1"
+
+jobs:
+  linux:
+    name: linux · python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
+            libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev \
+            patchelf
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Cache the Swift toolchain
+        id: swift-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/swift
+          key: swift-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_PLATFORM }}
+
+      - name: Swift toolchain
+        if: steps.swift-cache.outputs.cache-hit != 'true'
+        run: |
+          dir="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}"
+          url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_SLUG}"
+          url="${url}/swift-${SWIFT_VERSION}-RELEASE/${dir}.tar.gz"
+          curl -fsSL "$url" -o /tmp/swift.tar.gz
+          tar -xzf /tmp/swift.tar.gz -C /tmp
+          sudo cp -r "/tmp/${dir}/usr" /opt/swift
+
+      - name: Environment
+        run: |
+          echo "/opt/swift/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=${pythonLocation}/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${pythonLocation}/lib" >> "$GITHUB_ENV"
+
+      - name: Which interpreter is being embedded
+        run: |
+          swift --version
+          python --version
+          pkg-config --modversion python3-embed
+          pkg-config --libs python3-embed
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --quiet --disable-pip-version-check build
+          python -m build --wheel
+
+      - name: The wheel starts without the toolchain on the loader path
+        run: |
+          wheel=$(ls dist/peregrine_server-*.whl)
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --quiet --disable-pip-version-check "$wheel"
+          # The launcher must find libpython from the venv's interpreter and
+          # the Swift runtime from the wheel. The toolchain's LD_LIBRARY_PATH
+          # is the thing a real user will not have.
+          env -u LD_LIBRARY_PATH /tmp/smoke/bin/peregrine --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.python }}
+          path: dist/peregrine_server-*.whl
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    if: ${{ inputs.publish }}
+    needs: linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: What will be uploaded
+        run: ls -l dist/*.whl
+
+      - name: Upload to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check twine
+          python3 -m twine upload --non-interactive dist/*.whl

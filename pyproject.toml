@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peregrine-server"
-version = "0.8.0"
+version = "1.0.0"
 description = "A Python ASGI/WSGI server written in Swift"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 keywords = ["asgi", "wsgi", "server", "http", "http2", "http3", "quic", "websockets", "webtransport"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Web Environment",
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
@@ -36,7 +36,7 @@ packages = ["peregrine", "peregrine.contrib"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-peregrine = ["_bin/*"]
+peregrine = ["_bin/*", "_bin/lib/*"]
 
 # The installable package lives under python/, not the repo root. examples/
 # import FastAPI and Django, which are not dependencies of the server — they

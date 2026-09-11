@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/peregrine-mark.png" alt="peregrine" width="360">
+  <img src="assets/peregrine-cursive-segoe.png" alt="peregrine" width="480">
 </p>
 
 # Architecture
