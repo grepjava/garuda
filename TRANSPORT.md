@@ -523,7 +523,7 @@ only that the understanding is consistent.
 <venv>/bin/python scripts/http2-test.py         # 154 checks against `h2`
 <venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only
-<venv>/bin/python scripts/webtransport-test.py  # 115 including FastAPI/Django
+<venv>/bin/python scripts/webtransport-test.py  # 117 including FastAPI/Django
 
 h2spec -h 127.0.0.1 -p 8443 -t -k               # 146/146
 ```

@@ -381,6 +381,22 @@ async def webtransport_endpoint(scope, receive, send):
     """
     path = scope["path"]
 
+    if path == "/wt-abort":
+        # Reads one peer stream to its end and reports what it got on a stream
+        # of its own. A peer that resets rather than finishes has to end that
+        # read: if a reset left the reader parked, nothing below this line
+        # would ever run and the client would wait for a stream that never
+        # comes.
+        from peregrine.webtransport import WebTransportSession
+        session = WebTransportSession(scope, receive, send)
+        await session.accept()
+        stream = await session.accept_stream()
+        body = await stream.read()
+        out = await session.create_stream(bidirectional=False)
+        await out.send(b"ended:" + body, end=True)
+        await session.close()
+        return
+
     if path == "/wt-hold":
         from peregrine.webtransport import WebTransportSession
         session = WebTransportSession(scope, receive, send)

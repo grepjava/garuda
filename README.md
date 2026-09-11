@@ -373,7 +373,7 @@ bash scripts/framework-test.sh                  #  30 checks against real
 <venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only: routing,
                                                 #   converters, session helper
-<venv>/bin/python scripts/webtransport-test.py  # 115 including the above,
+<venv>/bin/python scripts/webtransport-test.py  # 117 including the above,
                                                 #   plus FastAPI and Django
                                                 #   over HTTP/3 and WebTransport
 swift run -c release pgfuzz                     # mutation fuzzing of every

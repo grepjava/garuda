@@ -379,6 +379,36 @@ async def streams():
                 body, b"echo:hello")
 
 
+async def aborted_streams():
+    """A peer that resets a stream rather than finishing it.
+
+    The two are the same thing to an application -- there is nothing it can do
+    about either -- so a reset ends the read. What matters is that it ends it
+    at all: a reader left parked on a stream the peer has abandoned is a
+    coroutine, a queue and a slot held for as long as the session lives.
+    """
+    print("\nAborted streams")
+    with Server() as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            session = client.connect_session("/wt-abort")
+            await client.await_session(session)
+
+            known = set(client.stream_ended)
+            # Bytes, then a reset instead of a FIN. The application is inside
+            # `read()` by the time the reset lands.
+            aborted = client.open_stream(session, data=b"half", end=False)
+            await asyncio.sleep(0.2)
+            client._quic.reset_stream(aborted, 0x01)
+            client.transmit()
+
+            new, body = await client.wait_new_stream(known, timeout=10)
+            check("a reset ends the read on that stream", new is not None,
+                  "the application never got past its read, so the stream it "
+                  "answers on was never opened")
+            is_("and what arrived before the reset is kept", body, b"ended:half")
+
+
 async def server_streams():
     print("\nServer-initiated streams")
     with Server() as server:
@@ -742,6 +772,7 @@ def main():
 
     run(settings_and_handshake())
     run(streams())
+    run(aborted_streams())
     run(server_streams())
     run(datagrams())
     run(closing())
