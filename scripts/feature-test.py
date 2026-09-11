@@ -10,6 +10,10 @@ workers sharing one unix socket, or a protocol that is not HTTP at all.
 
 Only the standard library is used, including the WebSocket client, so the suite
 runs anywhere the server does.
+
+Every duration here is measured with time.monotonic(). Half of these checks are
+"did this happen before that", and a wall clock can be stepped backwards under
+them -- which is a failure in a suite that is supposed to be about the server.
 """
 
 import base64
@@ -97,8 +101,8 @@ class Server:
         self.wait_ready()
 
     def wait_ready(self, timeout=15.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 out = self.proc.stdout.read().decode(errors="replace")
                 raise RuntimeError("server exited during start-up:\n" + out)
@@ -155,15 +159,15 @@ class Server:
     def stop(self, sig=signal.SIGTERM, timeout=20.0):
         if self.proc.poll() is not None:
             return self.proc.returncode, 0.0
-        started = time.time()
+        started = time.monotonic()
         self.proc.send_signal(sig)
         try:
             self.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait()
-            return None, time.time() - started
-        return self.proc.returncode, time.time() - started
+            return None, time.monotonic() - started
+        return self.proc.returncode, time.monotonic() - started
 
     def __enter__(self):
         return self
@@ -514,8 +518,8 @@ def test_websockets():
                 port=port) as server:
         ws = WebSocket(server, "/ws", timeout=15)
         dropped = False
-        deadline = time.time() + 10
-        while time.time() < deadline:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
             try:
                 ws.recv_frame()               # pings, which we deliberately ignore
             except (EOFError, OSError):
@@ -552,10 +556,10 @@ def test_backpressure():
 
         peak = baseline
         read = 0
-        deadline = time.time() + 6.0
+        deadline = time.monotonic() + 6.0
         # Read slowly on purpose: 32 KB every 100 ms is far below what the
         # application produces.
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             time.sleep(0.1)
             try:
                 chunk = s.recv(32768)
@@ -756,13 +760,13 @@ def test_wsgi_threads():
             except Exception as exc:                       # noqa: BLE001
                 results.append(repr(exc))
 
-        started = time.time()
+        started = time.monotonic()
         threads = [threading.Thread(target=hit) for _ in range(8)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        elapsed = time.time() - started
+        elapsed = time.monotonic() - started
         is_("all pooled requests answered", results.count(200), 8)
         check("8 concurrent 0.5s WSGI requests overlap (%.2fs)" % elapsed,
               elapsed < 2.0, "%.2fs, so they serialised" % elapsed)
@@ -773,8 +777,8 @@ def test_wsgi_threads():
         s.sendall(b"GET /firehose?134217728 HTTP/1.1\r\nHost: x\r\n"
                   b"Connection: close\r\n\r\n")
         peak = baseline
-        deadline = time.time() + 4.0
-        while time.time() < deadline:
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
             time.sleep(0.1)
             try:
                 if not s.recv(32768):
@@ -807,7 +811,7 @@ def test_wsgi_streaming():
         """Seconds until the first body byte lands, and the total."""
         s = server.connect(timeout=budget + 4)
         s.settimeout(budget + 4)
-        started = time.time()
+        started = time.monotonic()
         s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
                    % path).encode())
         first = None
@@ -822,10 +826,10 @@ def test_wsgi_streaming():
             buf += chunk
             if first is None and b"\r\n\r\n" in buf:
                 if buf.split(b"\r\n\r\n", 1)[1].strip():
-                    first = time.time() - started
+                    first = time.monotonic() - started
             elif first is None and chunk.strip():
-                first = time.time() - started
-        total = time.time() - started
+                first = time.monotonic() - started
+        total = time.monotonic() - started
         s.close()
         return first, total, buf
 
@@ -861,7 +865,7 @@ def test_wsgi_streaming():
                    % path).encode())
         time.sleep(1.0)              # let the server fill the socket
         s.settimeout(30)
-        last = time.time()
+        last = time.monotonic()
         total = 0
         widest = 0.0
         before = 0
@@ -872,7 +876,7 @@ def test_wsgi_streaming():
                 break
             if not chunk:
                 break
-            now = time.time()
+            now = time.monotonic()
             if now - last > widest:
                 widest, before = now - last, total
             last = now
@@ -1159,12 +1163,12 @@ def test_streaming_request_bodies():
         # for an upload it has already refused.
         s = server.connect(timeout=10)
         s.sendall(b"POST /reject HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nA")
-        began = time.time()
+        began = time.monotonic()
         try:
             status, _, body = read_http_response(s)
         except OSError:
             status, body = 0, b""
-        elapsed = time.time() - began
+        elapsed = time.monotonic() - began
         check("a rejection arrives before the body does (%.2fs)" % elapsed,
               status == 403, "status %s after %.2fs" % (status, elapsed))
         is_("the rejection is the application's own", body.strip(), b"denied")
@@ -1350,8 +1354,8 @@ def test_websocket_control_independence():
         ws.send(b"are-you-there", opcode=0x9)      # client ping
         got_pong = False
         ticks = 0
-        deadline = time.time() + 6
-        while time.time() < deadline and not got_pong:
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and not got_pong:
             fin, opcode, payload = ws.recv_frame()
             if opcode == 0xA and payload == b"are-you-there":
                 got_pong = True
@@ -1365,8 +1369,8 @@ def test_websocket_control_independence():
         # The connection must still be alive: the server saw our pongs, so its
         # own ping timeout must not have fired.
         alive = False
-        deadline = time.time() + 4
-        while time.time() < deadline:
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
             try:
                 fin, opcode, payload = ws.recv_frame()
             except (EOFError, OSError):
@@ -1389,8 +1393,8 @@ def test_websocket_control_independence():
         ws.send(b"ping-while-busy", opcode=0x9)
         pong_seen = False
         echoed = None
-        deadline = time.time() + 12
-        while time.time() < deadline and echoed is None:
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline and echoed is None:
             try:
                 fin, opcode, payload = ws.recv_frame()
             except (EOFError, OSError):
@@ -1451,9 +1455,9 @@ def test_reload():
         time.sleep(0.4)
         with open(scratch, "w") as fh:
             fh.write("MARK = 2\n")
-        deadline = time.time() + 15.0
+        deadline = time.monotonic() + 15.0
         after = before
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             time.sleep(0.3)
             try:
                 status, _, body = server.get("/pid", timeout=5)

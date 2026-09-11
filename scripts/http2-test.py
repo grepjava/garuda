@@ -114,8 +114,8 @@ class Server:
             cmd += ["--tls-cert", cert, "--tls-key", key]
         cmd += [app]
         self.proc = subprocess.Popen(cmd)
-        deadline = time.time() + 15
-        while time.time() < deadline:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
             try:
                 socket.create_connection(("127.0.0.1", self.port), 0.25).close()
                 return
@@ -189,12 +189,12 @@ class Client:
     def send_body(self, stream, body, end=True):
         """Sends a body of any size, waiting for window when it runs out."""
         sent = 0
-        deadline = time.time() + 30
+        deadline = time.monotonic() + 30
         while sent < len(body):
             window = min(self.conn.local_flow_control_window(stream),
                          self.conn.max_outbound_frame_size)
             if window <= 0:
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     raise RuntimeError("no window for the request body")
                 self.step()
                 continue
@@ -237,8 +237,8 @@ class Client:
     def collect(self, streams, deadline=25.0):
         """Runs until every stream in `streams` has ended, or time runs out."""
         wanted = set(streams)
-        limit = time.time() + deadline
-        while not wanted <= self.ended and time.time() < limit:
+        limit = time.monotonic() + deadline
+        while not wanted <= self.ended and time.monotonic() < limit:
             if not self.step():
                 break
         return self.status, self.headers, self.body, self.events
@@ -288,10 +288,10 @@ def test_multiplexing():
         c = Client(server)
         # Each of these sleeps 250ms in the application. Run sequentially they
         # would take two and a half seconds.
-        began = time.time()
+        began = time.monotonic()
         streams = [c.request(path="/sleep") for _ in range(10)]
         status, _, body, _ = c.collect(streams)
-        elapsed = time.time() - began
+        elapsed = time.monotonic() - began
         is_("every stream is answered", len(status), 10)
         check("all ten succeeded", all(v == 200 for v in status.values()), str(status))
         check("they ran concurrently (%.2fs for 10 x 250ms)" % elapsed, elapsed < 1.5,

@@ -350,12 +350,13 @@ code, because a test written against the same understanding as the code proves
 only that the understanding is consistent.
 
 ```bash
-swift test                                      # 114 unit tests: parser,
+swift test                                      # 126 unit tests: parser,
                                                 #   chunking, buffers, writer,
                                                 #   websocket framing, HPACK,
-                                                #   QUIC packet protection
-bash scripts/integration-test.sh                #  38 end-to-end checks
-python3 scripts/feature-test.py                 # 102 checks for the failure
+                                                #   QUIC packet protection,
+                                                #   and the fuzz corpus
+bash scripts/integration-test.sh                #  45 end-to-end checks
+python3 scripts/feature-test.py                 # 159 checks for the failure
                                                 #   modes a plain request never
                                                 #   reaches: slow consumers,
                                                 #   stuck-request shutdown,
@@ -364,14 +365,23 @@ python3 scripts/feature-test.py                 # 102 checks for the failure
 bash scripts/framework-test.sh                  #  30 checks against real
                                                 #   FastAPI and Django apps,
                                                 #   over HTTP/1.1 and HTTP/2
-<venv>/bin/python scripts/http2-test.py         # 116 checks against `h2`
+<venv>/bin/python scripts/http2-test.py         # 140 checks against `h2`
 <venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only: routing,
                                                 #   converters, session helper
 <venv>/bin/python scripts/webtransport-test.py  # 115 including the above,
                                                 #   plus FastAPI and Django
                                                 #   over HTTP/3 and WebTransport
+swift run -c release pgfuzz                     # mutation fuzzing of every
+                                                #   parser that reads bytes
+                                                #   from the network
 ```
+
+[CI](.github/workflows/ci.yml) runs all of it on every push, against CPython
+3.11 through 3.14 and a free-threaded 3.14, on Linux and macOS, plus the
+fuzzer under AddressSanitizer. The suites are the ones above — there is no
+CI-only test path, so a green run there means what a green run here means.
+[More on the fuzzing.](fuzz/README.md)
 
 HTTP/2 conformance is checked with
 [h2spec](https://github.com/summerwind/h2spec), which is not vendored here:

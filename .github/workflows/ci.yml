@@ -1,0 +1,203 @@
+# Every suite in this repository, on every interpreter it claims to support.
+#
+# Peregrine embeds libpython rather than talking to it over a socket, so the
+# binary is bound to the interpreter it was linked against: a build that works
+# on 3.12 says nothing about 3.14, and a free-threaded interpreter is a
+# different build again. That is what the matrix is for. The suites themselves
+# are the ones a developer runs by hand -- there is no CI-only test path, so a
+# green run here means the same thing as a green run locally.
+#
+# The Swift toolchain is downloaded from swift.org the way the Dockerfile does
+# it, rather than through a third-party action: one less thing between a commit
+# and what runs on it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWIFT_VERSION: "6.1.2"
+  SWIFT_PLATFORM: ubuntu24.04
+  SWIFT_SLUG: ubuntu2404
+
+jobs:
+  linux:
+    name: linux · python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # gcc is here for its runtime objects, not its compiler: Swift drives
+      # clang, and clang links against crtbeginS.o and libgcc.
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
+            libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Cache the Swift toolchain
+        id: swift-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/swift
+          key: swift-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_PLATFORM }}
+
+      - name: Swift toolchain
+        if: steps.swift-cache.outputs.cache-hit != 'true'
+        run: |
+          dir="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}"
+          url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_SLUG}"
+          url="${url}/swift-${SWIFT_VERSION}-RELEASE/${dir}.tar.gz"
+          curl -fsSL "$url" -o /tmp/swift.tar.gz
+          tar -xzf /tmp/swift.tar.gz -C /tmp
+          sudo cp -r "/tmp/${dir}/usr" /opt/swift
+
+      - name: Environment
+        run: |
+          echo "/opt/swift/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=${pythonLocation}/lib/pkgconfig" >> "$GITHUB_ENV"
+          # The interpreter is a shared library that has to be found at run
+          # time as well as link time.
+          echo "LD_LIBRARY_PATH=${pythonLocation}/lib" >> "$GITHUB_ENV"
+
+      # Proving the right interpreter was found is worth ten seconds; finding
+      # out from a confusing ImportError after a five-minute build is not.
+      - name: Which interpreter is being embedded
+        run: |
+          swift --version
+          pkg-config --modversion python3-embed
+          pkg-config --libs python3-embed
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Unit tests and the fuzz corpus
+        run: swift test
+
+      - name: Integration tests
+        run: bash scripts/integration-test.sh .build/release/peregrine
+
+      - name: Feature tests
+        run: python3 scripts/feature-test.py .build/release/peregrine
+
+      - name: HTTP/2 and HTTP/3
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check h2 aioquic
+          python3 scripts/http2-test.py .build/release/peregrine
+          python3 scripts/http3-test.py .build/release/peregrine
+
+      # A worker per core, and the request path shared between them, is the
+      # shape most deployments actually run.
+      - name: The same suites with four workers
+        run: |
+          PEREGRINE_EXTRA_ARGS="--workers 4" \
+            bash scripts/integration-test.sh .build/release/peregrine
+          PEREGRINE_EXTRA_ARGS="--workers 4" \
+            python3 scripts/feature-test.py .build/release/peregrine
+
+  macos:
+    name: macos · python 3.13
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Homebrew packages
+        run: brew install pkg-config openssl@3 python@3.13
+
+      # macOS ships no OpenSSL to build against, so the one Homebrew installs
+      # has to be named -- for the C target's headers as well as the linker.
+      - name: Environment
+        run: |
+          echo "PKG_CONFIG_PATH=$(brew --prefix python@3.13)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Which interpreter is being embedded
+        run: |
+          swift --version
+          pkg-config --modversion python3-embed
+
+      - name: Build
+        run: |
+          swift build -c release \
+            -Xcc -I"$(brew --prefix openssl@3)/include" \
+            -Xlinker -L"$(brew --prefix openssl@3)/lib"
+
+      - name: Unit tests and the fuzz corpus
+        run: |
+          swift test \
+            -Xcc -I"$(brew --prefix openssl@3)/include" \
+            -Xlinker -L"$(brew --prefix openssl@3)/lib"
+
+      - name: Integration tests
+        run: bash scripts/integration-test.sh .build/release/peregrine
+
+      - name: Feature tests
+        run: "$(brew --prefix python@3.13)/bin/python3 scripts/feature-test.py .build/release/peregrine"
+
+  fuzz:
+    name: fuzz · address sanitizer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
+            libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev python3-dev
+
+      - name: Cache the Swift toolchain
+        id: swift-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/swift
+          key: swift-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_PLATFORM }}
+
+      - name: Swift toolchain
+        if: steps.swift-cache.outputs.cache-hit != 'true'
+        run: |
+          dir="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}"
+          url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_SLUG}"
+          url="${url}/swift-${SWIFT_VERSION}-RELEASE/${dir}.tar.gz"
+          curl -fsSL "$url" -o /tmp/swift.tar.gz
+          tar -xzf /tmp/swift.tar.gz -C /tmp
+          sudo cp -r "/tmp/${dir}/usr" /opt/swift
+
+      - name: Environment
+        run: echo "/opt/swift/bin" >> "$GITHUB_PATH"
+
+      # A release build already traps on an overflow or an out-of-bounds Array
+      # access. What it does not see is a read one byte past a raw pointer,
+      # which is most of what these parsers are made of.
+      - name: Build with AddressSanitizer
+        run: swift build -c release -Xswiftc -sanitize=address
+
+      # The seed is printed, and re-running with --seed reproduces the run
+      # exactly, so anything this finds can be reproduced from the log.
+      - name: Fuzz the parsers
+        run: .build/release/pgfuzz --seconds 60
+
+      - name: Keep what it found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgfuzz-findings
+          path: pgfuzz-*.bin
+          if-no-files-found: ignore

@@ -111,8 +111,8 @@ class Server:
         self.process = subprocess.Popen(cmd)
         # The TCP listener comes up with the UDP one, and is the easier of the
         # two to wait on.
-        deadline = time.time() + 15
-        while time.time() < deadline:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
             try:
                 socket.create_connection(("127.0.0.1", self.port), 0.25).close()
                 return
@@ -269,10 +269,10 @@ async def multiplexing():
     with Server() as server:
         async with connect("127.0.0.1", server.port, configuration=configuration(),
                            create_protocol=Client) as client:
-            started = time.time()
+            started = time.monotonic()
             results = await asyncio.gather(*[
                 client.request("GET", "/sleep") for _ in range(10)])
-            elapsed = time.time() - started
+            elapsed = time.monotonic() - started
             is_("ten concurrent requests all answer",
                 [r[0] for r in results], [200] * 10)
             # /sleep waits 250ms. Serialised that would be 2.5 seconds.
@@ -566,8 +566,8 @@ def http2_alt_svc(port, path):
                                    (":authority", "localhost"), (":path", path)],
                           end_stream=True)
         sock.sendall(conn.data_to_send())
-        deadline = time.time() + 15
-        while time.time() < deadline:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
             data = sock.recv(65536)
             if not data:
                 break
