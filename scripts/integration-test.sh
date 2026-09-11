@@ -45,8 +45,20 @@ start() {
     exit 1
 }
 
+# macOS ships no timeout(1) -- it is GNU coreutils, installed there as
+# gtimeout if at all. Without one these requests still run; they just have no
+# ceiling, which is only a problem for a server that hangs.
+if command -v timeout > /dev/null 2>&1; then
+    TIMEOUT=timeout
+elif command -v gtimeout > /dev/null 2>&1; then
+    TIMEOUT=gtimeout
+else
+    TIMEOUT=""
+fi
+
 raw() {  # raw request bytes -> response
-    printf '%b' "$2" | timeout 5 nc 127.0.0.1 "$1"
+    # shellcheck disable=SC2086 -- TIMEOUT is empty when there is no timeout(1).
+    printf '%b' "$2" | $TIMEOUT ${TIMEOUT:+5} nc 127.0.0.1 "$1"
 }
 
 # ---------------------------------------------------------------- WSGI ------

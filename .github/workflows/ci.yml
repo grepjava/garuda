@@ -13,9 +13,11 @@
 
 name: CI
 
+# Started by hand -- `gh workflow run CI --ref <branch>` or the Actions tab --
+# rather than on every push. The matrix is seven jobs and the fuzz job runs for
+# five minutes; that is a bill, not a background cost, and the suites it runs
+# are the ones a developer already runs locally before pushing.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -96,10 +98,17 @@ jobs:
       - name: Feature tests
         run: python3 scripts/feature-test.py .build/release/peregrine
 
-      - name: HTTP/2 and HTTP/3
+      - name: HTTP/2
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check h2 aioquic
+          python3 -m pip install --quiet --disable-pip-version-check h2
           python3 scripts/http2-test.py .build/release/peregrine
+
+      # aioquic's C extension has no free-threaded build yet, so HTTP/3 is
+      # checked on the interpreters whose test client can be installed.
+      - name: HTTP/3
+        if: ${{ !endsWith(matrix.python, 't') }}
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check aioquic
           python3 scripts/http3-test.py .build/release/peregrine
 
       # A worker per core, and the request path shared between them, is the
