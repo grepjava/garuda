@@ -89,32 +89,33 @@ Reproduce with `bash benchmarks/run.sh`.
 
 | WSGI, 1 worker | req/s | p50 | p99 |
 |---|---:|---:|---:|
-| **peregrine** | **103,376** | 0.46 ms | 3.65 ms |
-| gunicorn (sync) | 4,750 | 12.07 ms | 26.14 ms |
-| gunicorn (gthread ×8) | 2,115 | 29.35 ms | 43.43 ms |
+| **peregrine** | **100,603** | 0.49 ms | 3.37 ms |
+| gunicorn (sync) | 4,464 | 12.86 ms | 28.93 ms |
+| gunicorn (gthread ×8) | 2,041 | 30.74 ms | 45.07 ms |
 
 | ASGI, 1 worker | req/s | p50 | p99 |
 |---|---:|---:|---:|
-| **peregrine** | **57,039** | 0.94 ms | 4.69 ms |
-| uvicorn (uvloop + httptools) | 44,293 | 1.33 ms | 5.10 ms |
-| uvicorn (asyncio + h11) | 5,293 | 10.95 ms | 25.73 ms |
+| **peregrine** | **55,526** | 0.98 ms | 4.61 ms |
+| uvicorn (uvloop + httptools) | 43,361 | 1.34 ms | 5.08 ms |
+| uvicorn (asyncio + h11) | 5,343 | 11.08 ms | 25.60 ms |
 
 Roughly 22× gunicorn on WSGI and 1.3× uvicorn's fastest configuration on ASGI.
 Run-to-run variance on this box is around ±10%, so treat the ratios rather than
-the absolute figures as the result.
+the absolute figures as the result. Each cell is the median of three runs.
 
 Resident memory for the same application (`bash benchmarks/memory.sh`), summed
 over the whole process tree:
 
 | | idle | under 500 connections |
 |---|---:|---:|
-| peregrine (wsgi) | 29.9 MB | 32.2 MB |
-| gunicorn (sync) | 46.6 MB | 46.6 MB |
-| peregrine (asgi) | 29.9 MB | 33.2 MB |
-| uvicorn (uvloop) | 28.9 MB | 33.9 MB |
+| peregrine (wsgi) | 31.7 MB | 33.8 MB |
+| gunicorn (sync) | 45.4 MB | 45.5 MB |
+| peregrine (asgi) | 31.7 MB | 34.8 MB |
+| uvicorn (uvloop) | 28.3 MB | 33.3 MB |
 
-Nearly all of that is CPython itself: the server binary is ~1.2 MB and a live
-connection costs one 16 KiB pooled read buffer plus a ~200-byte slot.
+Nearly all of that is CPython itself: the server binary is ~1.0 MB of text and
+data, and a live connection costs one 16 KiB pooled read buffer plus a
+~200-byte slot.
 
 These are trivial-response benchmarks, so they measure server overhead rather
 than application throughput — which is the point. A real application doing
