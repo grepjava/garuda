@@ -141,6 +141,19 @@ has "a repeated Transfer-Encoding is rejected" \
     "400"
 has "a second Host header is rejected" \
     "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n')" "400"
+has "a chunked trailer section is accepted" \
+    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: 1\r\n\r\n')" \
+    "hello"
+# Trailers decode to no body, so the body limit never grows while they arrive:
+# without a ceiling of their own a peer could stream them for as long as it
+# liked and hold a connection, a slot and a read buffer for free.
+TRAILERS=""
+for _ in $(seq 1 1000); do
+    TRAILERS="${TRAILERS}X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"
+done
+has "a trailer section past the head limit is rejected" \
+    "$(raw $WSGI_PORT "POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n${TRAILERS}\r\n")" \
+    "431"
 is "underscore headers are dropped (HTTP_X_A spoofing)" \
    "$(curl -sS --max-time 5 -H 'X_Spoofed: 1' $H/env | grep -c 'X_SPOOFED')" "0"
 

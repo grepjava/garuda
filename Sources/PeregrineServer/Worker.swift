@@ -604,7 +604,7 @@ public struct Worker {
         c.pointee.requestCount &+= 1
         c.pointee.flags.remove(.perRequest)
         c.pointee.body.clear()
-        c.pointee.chunked = ChunkedDecoder()
+        c.pointee.chunked = ChunkedDecoder(maxTrailerBytes: config.maxHeadSize)
         // Response framing belongs to one request; a stale budget here would
         // let the next response on a reused connection overrun or fall short.
         c.pointee.responseRemaining = -1
@@ -690,8 +690,8 @@ public struct Worker {
             return false
         }
         switch outcome {
-        case .failure:
-            failRequest(slot, status: 400)
+        case .failure(let error):
+            failRequest(slot, status: error.status)
             return false
         case .needMore:
             if c.pointee.flags.contains(.peerClosed) { closeConnection(slot) }

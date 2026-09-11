@@ -210,8 +210,9 @@ struct ChunkedDecoderTests {
 
     /// Feeds `text` in slices of `step` bytes to prove the decoder resumes at
     /// any byte boundary.
-    private func decode(_ text: String, step: Int) -> (String, ChunkedDecoder.Outcome) {
-        var decoder = ChunkedDecoder()
+    private func decode(_ text: String, step: Int,
+                        maxTrailerBytes: Int = 32 * 1024) -> (String, ChunkedDecoder.Outcome) {
+        var decoder = ChunkedDecoder(maxTrailerBytes: maxTrailerBytes)
         var out = [UInt8]()
         let pending = Array(text.utf8)
         var outcome = ChunkedDecoder.Outcome.needMore
@@ -291,6 +292,26 @@ struct ChunkedDecoderTests {
         let (body, outcome) = decode(text, step: text.utf8.count)
         #expect(body == "hello")
         if case .finished = outcome {} else { Issue.record("expected finished") }
+    }
+
+    @Test("a trailer section past its limit fails instead of going on forever")
+    func trailersBounded() {
+        // Trailers decode to no body, so the body limit never grows while they
+        // arrive: without a ceiling of their own a peer could stream them for
+        // as long as it liked and hold the connection for free.
+        let field = "X-Pad: aaaaaaaaaaaaaaaaaaaa\r\n"
+        let under = "1\r\na\r\n0\r\n" + String(repeating: field, count: 3) + "\r\n"
+        let (body, ok) = decode(under, step: 8, maxTrailerBytes: 256)
+        #expect(body == "a")
+        if case .finished = ok {} else { Issue.record("a small trailer section should pass") }
+
+        let over = "1\r\na\r\n0\r\n" + String(repeating: field, count: 40) + "\r\n"
+        let (_, outcome) = decode(over, step: 8, maxTrailerBytes: 256)
+        if case .failure(let e) = outcome {
+            #expect(e.status == 431)
+        } else {
+            Issue.record("expected failure")
+        }
     }
 
     @Test("a malformed chunk size fails instead of guessing")

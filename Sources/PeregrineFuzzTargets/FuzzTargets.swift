@@ -133,8 +133,14 @@ public enum Fuzz {
     // MARK: - Chunked transfer coding
 
     private static func chunked(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
+        // A trailer cap far below the server's, so inputs this short can still
+        // reach it. Derived from the length rather than fixed, so the corpus
+        // explores both sides of the limit -- and the same on both runs, or
+        // the two would not be comparable.
+        let trailerCap = 8 &+ (n & 63)
+
         var whole = [UInt8]()
-        var wholeDecoder = ChunkedDecoder()
+        var wholeDecoder = ChunkedDecoder(maxTrailerBytes: trailerCap)
         var wholeConsumed = 0
         let wholeOutcome = wholeDecoder.decode(base, n, consumed: &wholeConsumed) { p, k in
             whole.append(contentsOf: UnsafeBufferPointer(start: p, count: k))
@@ -146,7 +152,7 @@ public enum Fuzz {
         // The same bytes one at a time. Where a read happens to split is the
         // peer's choice, so it must not be able to change what is decoded.
         var piecewise = [UInt8]()
-        var pieceDecoder = ChunkedDecoder()
+        var pieceDecoder = ChunkedDecoder(maxTrailerBytes: trailerCap)
         var offset = 0
         var pieceOutcome = ChunkedDecoder.Outcome.needMore
         while offset < n {

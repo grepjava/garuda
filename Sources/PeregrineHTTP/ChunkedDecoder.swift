@@ -22,10 +22,24 @@ public struct ChunkedDecoder {
     /// Total decoded body bytes, checked against the configured body limit.
     @usableFromInline var decoded: Int = 0
     public var decodedBytes: Int { decoded }
+    /// Bytes seen since the terminating chunk.
+    ///
+    /// Trailers decode to nothing, so the body limit never grows while they
+    /// arrive and nothing else here would ever stop. A peer that sends
+    /// `0\r\n` and then streams trailer fields forever would hold a
+    /// connection, a slot and a read buffer for as long as it cared to, at no
+    /// cost to itself -- so the trailer section gets a ceiling of its own.
+    @usableFromInline var trailerSeen: Int = 0
+    @usableFromInline let maxTrailerBytes: Int
     /// True once the terminating zero-length chunk and trailers are consumed.
     @inlinable public var isFinished: Bool { state == .done }
 
-    public init() {}
+    /// The default matches the default head limit: a trailer section is a
+    /// header section that arrives late, and there is no reason for it to be
+    /// allowed to be larger than the one at the front of the message.
+    public init(maxTrailerBytes: Int = 32 * 1024) {
+        self.maxTrailerBytes = maxTrailerBytes
+    }
 
     public enum Outcome {
         case needMore
@@ -122,12 +136,13 @@ public struct ChunkedDecoder {
                 // message a line early whenever a field arrived split from its
                 // own terminator.
                 let idx = findByte(base + i, count &- i, cLF)
-                if idx < 0 {
-                    i = count
-                } else {
-                    i &+= idx &+ 1
-                    state = .trailerLine
-                }
+                let take = idx < 0 ? count &- i : idx &+ 1
+                trailerSeen &+= take
+                // Every byte of the section except its final CRLF passes
+                // through here, so this one test bounds the whole of it.
+                if trailerSeen > maxTrailerBytes { return .failure(.headTooLarge) }
+                i &+= take
+                if idx >= 0 { state = .trailerLine }
 
             case .trailerCR:
                 if base[i] != cLF { return .failure(.badChunk) }
