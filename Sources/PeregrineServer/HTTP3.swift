@@ -652,7 +652,9 @@ extension Worker {
             // still counted and still checked.
             return true
         }
-        if s.pointee.body.readableBytes + n > config.maxBodySize {
+        // Cumulative, as on the other two: `bodyReceived` has already been
+        // advanced by this run, and is what the upload actually totals.
+        if s.pointee.bodyReceived > config.maxBodySize {
             failRequest(streamSlot, status: 413)
             return false
         }

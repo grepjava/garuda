@@ -304,7 +304,10 @@ extension Worker {
                     return
                 }
             } else {
-                if s.pointee.body.readableBytes + length > config.maxBodySize {
+                // Cumulative, not buffered: an application reading as the
+                // body arrives keeps the buffer small, and a limit measured
+                // there is no limit on the upload at all.
+                if s.pointee.bodyReceived > config.maxBodySize {
                     streamError(slot, h2, header.streamID, .enhanceYourCalm)
                     return
                 }

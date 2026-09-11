@@ -321,6 +321,56 @@ async def cancellation():
                 body.strip(), b"yes")
 
 
+async def spoofed_address():
+    """A forged packet must not redirect a connection.
+
+    A connection ID travels in clear, so anyone who can see one can put it in
+    a UDP header of their own. If the server believed the source address of
+    such a packet, one forged datagram would send everything the connection
+    had yet to write -- the client's own replies included -- wherever the
+    sender liked.
+    """
+    print("\nAddress spoofing")
+    with Server() as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            status, _, _ = await client.request("GET", "/")
+            is_("the connection works before the forgery", status, 200)
+
+            # The identifier the client puts in the packets it sends, which is
+            # the one the server routes on.
+            cid = client._quic._peer_cid.cid
+            attacker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            attacker.settimeout(2.0)
+            attacker.bind(("127.0.0.1", 0))
+            # A short header with the fixed bit set, the connection's own id,
+            # and a payload that will not authenticate as anything.
+            forged = bytes([0x40]) + cid + os.urandom(64)
+            attacker.sendto(forged, ("127.0.0.1", server.port))
+            await asyncio.sleep(0.3)
+
+            # The real client must still be answered. Before the fix the
+            # server had already switched to the attacker's address, and this
+            # request timed out.
+            try:
+                status, _, body = await asyncio.wait_for(
+                    client.request("GET", "/"), 10)
+            except asyncio.TimeoutError:
+                status, body = None, b""
+            is_("a forged packet does not redirect the connection", status, 200)
+            is_("and the answer still reaches the client that asked",
+                body, b"hello from peregrine asgi\n")
+
+            leaked = b""
+            try:
+                leaked = attacker.recv(65536)
+            except OSError:
+                pass
+            check("nothing was sent to the forged address", not leaked,
+                  "%d bytes went to the attacker" % len(leaked))
+            attacker.close()
+
+
 async def large_headers():
     print("\nHeader compression")
     with Server() as server:
@@ -636,7 +686,7 @@ async def main():
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
     for test in (basics, request_bodies, multiplexing, cancellation,
-                 large_headers, response_framing, flow_control, long_lived,
+                 spoofed_address, large_headers, response_framing, flow_control, long_lived,
                  key_update, wsgi, alt_svc):
         try:
             await test()

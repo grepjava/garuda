@@ -690,7 +690,12 @@ public struct Worker {
         let limit = config.maxBodySize
         var overflow = false
         let outcome = c.pointee.chunked.decode(base, available, consumed: &consumed) { p, n in
-            if c.pointee.body.readableBytes + n > limit { overflow = true; return }
+            // Against everything decoded, not against what is still sitting in
+            // the buffer: ASGI takes the body as it arrives, so buffered bytes
+            // fall as fast as they rise and a paced upload of any size would
+            // never reach the limit. `decodedBytes` has not yet counted this
+            // run, which is what makes the sum the total including it.
+            if c.pointee.chunked.decodedBytes + n > limit { overflow = true; return }
             c.pointee.body.write(p, n)
         }
         c.pointee.read.consume(consumed)
@@ -1038,15 +1043,16 @@ public struct Worker {
         Log.emitBare(.info) { line in
             line.str("{\"level\":\"info\",\"pid\":")
             line.int(Log.pid)
+            // The method and the target are both as long as the peer cares to
+            // make them, up to the head limit -- a method is a token, and a
+            // token has no length of its own. Everything after them here is
+            // short and fixed, so the tail is reserved before either goes in:
+            // a long one is cut short and says so, rather than eating the
+            // fields that close the object and the newline that ends the line.
+            line.reserveTail(Worker.accessLogTail)
             line.str(",\"method\":")
             let m = method.span(in: base)
             line.jsonString(m.base, m.count)
-            // A target is as long as the peer cares to make it, up to the head
-            // limit, and everything after it here is short and fixed. So the
-            // tail is reserved before the target goes in: a long one is cut
-            // short and says so, rather than eating the fields that close the
-            // object and the newline that ends the line.
-            line.reserveTail(Worker.accessLogTail)
             line.str(",\"target\":")
             line.jsonString(targetSpan.base, targetSpan.count, asciiOnly: !wellFormed)
             line.releaseTail()

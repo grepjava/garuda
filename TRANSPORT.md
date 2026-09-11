@@ -520,8 +520,8 @@ code, because a test written against the same understanding as the code proves
 only that the understanding is consistent.
 
 ```bash
-<venv>/bin/python scripts/http2-test.py         # 154 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
+<venv>/bin/python scripts/http2-test.py         # 162 checks against `h2`
+<venv>/bin/python scripts/http3-test.py         #  78 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only
 <venv>/bin/python scripts/webtransport-test.py  # 117 including FastAPI/Django
 

@@ -435,6 +435,48 @@ def test_rapid_reset():
         c.close()
 
 
+def test_body_limit():
+    """--max-body is a limit on the upload, not on what happens to be buffered.
+
+    An ASGI application reads the body as it arrives, so the buffer empties as
+    fast as it fills. A limit measured there would let a peer send any amount
+    at all provided it sent it slowly enough.
+    """
+    print("\nBody limits")
+    with Server("--max-body", "1024", app="asgi_app:app") as server:
+        c = Client(server)
+        stream = c.request(method="POST", path="/echo", end=False)
+        sent = 0
+        killed = None
+        for _ in range(8):
+            try:
+                c.conn.send_data(stream, b"x" * 512, end_stream=False)
+                c.flush()
+            except (OSError, h2.exceptions.H2Error) as exc:
+                killed = type(exc).__name__
+                break
+            sent += 512
+            # Slow enough for the application to have taken each block.
+            time.sleep(0.15)
+            c.step(timeout=0.01)
+            if c.reset.get(stream) is not None:
+                killed = "reset %s" % c.reset[stream]
+                break
+        check("a paced upload cannot walk past --max-body",
+              killed is not None and sent <= 2048,
+              "sent %d bytes with no complaint" % sent)
+        is_("and the stream is not answered 200", c.status.get(stream), None)
+        c.close()
+
+        # Under the limit, everything still works.
+        c = Client(server)
+        ok_stream = c.request(method="POST", path="/echo", body=b"y" * 512)
+        status, _, body, _ = c.collect([ok_stream], deadline=10.0)
+        is_("a body inside the limit is served", status.get(ok_stream), 200)
+        is_("and comes back whole", body.get(ok_stream), b"y" * 512)
+        c.close()
+
+
 def test_slow_stream():
     """A stream that is making progress must not hit the request timeout.
 
@@ -657,7 +699,7 @@ def run_all():
     global FAIL
     for test in (test_basics, test_multiplexing, test_request_bodies,
                  test_flow_control, test_cancellation, test_rapid_reset,
-                 test_slow_stream,
+                 test_slow_stream, test_body_limit,
                  test_large_headers,
                  test_response_framing, test_wsgi):
         try:

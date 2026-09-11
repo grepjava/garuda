@@ -1218,6 +1218,62 @@ def test_access_log():
     is_("every alignment logged one parseable line", parsed, 4)
 
 
+def test_body_limit():
+    print("\nBody limits")
+
+    def paced_upload(app, chunks=8, size=512):
+        """Uploads in chunks slow enough for the application to drain each one."""
+        port = free_port()
+        server = Server("--max-body", "1024", "--log-level", "error",
+                        port=port, app=app)
+        try:
+            s = server.connect(timeout=10)
+            s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\n"
+                      b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            sent = 0
+            try:
+                for _ in range(chunks):
+                    s.sendall(b"%x\r\n" % size + b"x" * size + b"\r\n")
+                    sent += size
+                    # The point of the pacing: an application reading as it
+                    # goes keeps the buffer small, so a limit measured on
+                    # buffered bytes is no limit at all.
+                    time.sleep(0.15)
+                s.sendall(b"0\r\n\r\n")
+            except OSError:
+                pass
+            data = b""
+            try:
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass
+            s.close()
+            return sent, data
+        finally:
+            server.stop()
+
+    for app, name in (("wsgi_app:application", "WSGI"), ("asgi_app:app", "ASGI")):
+        sent, data = paced_upload(app)
+        body = data.partition(b"\r\n\r\n")[2]
+        check("%s: a paced upload cannot walk past --max-body" % name,
+              sent <= 2048 and b"200 OK" not in data.split(b"\r\n")[0],
+              "sent %d bytes and got %r" % (sent, data.split(b"\r\n")[0]))
+        check("%s: and none of it comes back echoed" % name,
+              body.count(b"x") < 1024,
+              "echoed %d bytes" % body.count(b"x"))
+
+    # The limit still lets a body under it through, on both.
+    for app, name in (("wsgi_app:application", "WSGI"), ("asgi_app:app", "ASGI")):
+        sent, data = paced_upload(app, chunks=1, size=512)
+        check("%s: a body inside the limit is still served" % name,
+              b"200" in data.split(b"\r\n")[0],
+              "%r" % data.split(b"\r\n")[0])
+
+
 def test_metrics():
     print("\nPrometheus metrics")
 
@@ -1908,7 +1964,7 @@ def main():
                  test_websocket_control_independence,
                  test_wsgi_threads, test_wsgi_streaming, test_access_log,
                  test_wsgi_declared_length, test_wsgi_lazy_start_response,
-                 test_metrics,
+                 test_metrics, test_body_limit,
                  test_forwarded, test_multiworker_unix,
                  test_worker_restart, test_reload, test_graceful_shutdown,
                  test_shutdown_is_bounded, test_free_threaded):

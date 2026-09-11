@@ -64,6 +64,22 @@ def _running_version():
                         "t" if _free_threaded() else "")
 
 
+def _same_release(pkg_version, running):
+    """Whether two version strings name the same CPython release.
+
+    Major and minor and nothing else. The free-threaded suffix is deliberately
+    ignored here: it describes an ABI rather than a release, and pkg-config
+    does not report it even when the headers it found are the free-threaded
+    ones.
+    """
+    def numbers(text):
+        match = re.match(r"(\d+)\.(\d+)", text)
+        return match.groups() if match else None
+
+    left, right = numbers(pkg_version), numbers(running)
+    return left is not None and left == right
+
+
 def _check_toolchain():
     if shutil.which("swift") is None:
         _fail(
@@ -87,7 +103,14 @@ def _check_toolchain():
     version = subprocess.run(["pkg-config", "--modversion", "python3-embed"],
                              capture_output=True, text=True)
     resolved = version.stdout.strip()
-    if resolved and not resolved.startswith(_running_version()):
+    # Only the numbers are comparable here. A free-threaded interpreter calls
+    # itself "3.14t", because the suffix is a different ABI with a different
+    # SONAME -- but its own python3-embed.pc says "3.14", exactly as the GIL
+    # build's does. Comparing the two strings rejected the very pairing the
+    # check exists to accept: a free-threaded interpreter and its own headers.
+    # Which ABI was actually linked is settled after the build instead, by
+    # asking the binary, which is the one authority that cannot be wrong.
+    if resolved and not _same_release(resolved, _running_version()):
         _fail(
             "pkg-config resolves python3-embed to Python %s, but this build is\n"
             "running under Python %s. The server would embed the wrong\n"

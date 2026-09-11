@@ -115,9 +115,21 @@ public final class QUICListener {
         if let connection = connections[header.dcid] {
             // A client is free to change address mid-connection; the
             // connection ID, not the four-tuple, is what identifies it.
-            connection.peerAddress = message.peer
-            connection.localAddress = message.local
+            //
+            // But a connection ID is in clear on the wire, so anyone who can
+            // see one can put it in a UDP header of their own. Believing the
+            // source address before the packet has decrypted would let that
+            // packet redirect everything this connection has yet to send --
+            // the client's replies included -- to wherever the sender liked,
+            // for the cost of one forged datagram. So the address moves only
+            // once a packet from it has authenticated and proved newer than
+            // anything seen before; anything else is answered where the peer
+            // already was.
             connection.receive(p, length, ecn: message.ecn, nowMs: nowMs)
+            if connection.acceptedNewPacket {
+                connection.peerAddress = message.peer
+                connection.localAddress = message.local
+            }
             return connection
         }
 

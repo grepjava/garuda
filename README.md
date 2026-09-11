@@ -360,7 +360,7 @@ swift test                                      # 127 unit tests: parser,
                                                 #   QUIC packet protection,
                                                 #   and the fuzz corpus
 bash scripts/integration-test.sh                #  47 end-to-end checks
-python3 scripts/feature-test.py                 # 190 checks for the failure
+python3 scripts/feature-test.py                 # 196 checks for the failure
                                                 #   modes a plain request never
                                                 #   reaches: slow consumers,
                                                 #   stuck-request shutdown,
@@ -369,8 +369,8 @@ python3 scripts/feature-test.py                 # 190 checks for the failure
 bash scripts/framework-test.sh                  #  30 checks against real
                                                 #   FastAPI and Django apps,
                                                 #   over HTTP/1.1 and HTTP/2
-<venv>/bin/python scripts/http2-test.py         # 154 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
+<venv>/bin/python scripts/http2-test.py         # 162 checks against `h2`
+<venv>/bin/python scripts/http3-test.py         #  78 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only: routing,
                                                 #   converters, session helper
 <venv>/bin/python scripts/webtransport-test.py  # 117 including the above,

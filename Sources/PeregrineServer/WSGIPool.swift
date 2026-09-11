@@ -321,8 +321,19 @@ public final class WSGIPool {
     }
 
     private func execute(_ job: WSGIJob) {
+        // A job cancelled before a thread reached it has no one left to answer.
+        // Running it anyway is work done for a client that has gone, and under
+        // a burst of connections that arrive and leave it is most of the work
+        // the pool does -- every cancelled job still sat in the queue and still
+        // called the application, which is the expensive part. The references
+        // it holds are still released below, on this thread and under the GIL,
+        // exactly as they would have been.
+        pg_mutex_lock(mutex)
+        let abandoned = job.cancelled
+        pg_mutex_unlock(mutex)
+
         let gil = pg_gil_ensure()
-        runApplication(job)
+        if !abandoned { runApplication(job) }
         if let e = job.environ { pg_decref(e); job.environ = nil }
         if let s = job.startResponse {
             // The sink points at this job, which nothing keeps alive once the

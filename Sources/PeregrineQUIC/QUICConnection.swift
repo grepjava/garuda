@@ -263,8 +263,20 @@ public final class QUICConnection {
 
     /// Takes one UDP datagram. The buffer is modified in place -- headers are
     /// unmasked and payloads decrypted where they lie.
+    /// Whether the datagram just handed to `receive` carried a packet that
+    /// both authenticated and was newer than anything seen before.
+    ///
+    /// This is what a caller needs before it believes the address a datagram
+    /// arrived from. Anyone can put a connection ID in a UDP header -- they
+    /// are on the wire in clear -- so a source address is a claim until a
+    /// packet from it decrypts. A reordered or duplicated packet does not
+    /// count either: it authenticates, but it says nothing about where the
+    /// peer is now (RFC 9000 section 9.3).
+    public private(set) var acceptedNewPacket = false
+
     public func receive(_ datagram: UnsafeMutablePointer<UInt8>, _ count: Int,
                         ecn: UInt8, nowMs: UInt64) {
+        acceptedNewPacket = false
         if status == .drained { return }
         bytesReceived += count
 
@@ -342,6 +354,7 @@ public final class QUICConnection {
         if Int64(packet.packetNumber) > spaces[space].largestReceived {
             spaces[space].largestReceived = Int64(packet.packetNumber)
             spaces[space].largestReceivedAtMs = nowMs
+            acceptedNewPacket = true
         }
         spaces[space].acks.add(packet.packetNumber)
         spaces[space].ackPending = true
