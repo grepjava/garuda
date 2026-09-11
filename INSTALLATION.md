@@ -9,7 +9,7 @@ binary is linked against one specific `libpython`. That single fact decides
 everything unusual about installing it:
 
 * **A wheel is tagged for exactly one interpreter and platform**
-  (`cp312-cp312-linux_x86_64`, `cp314-cp314t-...`). `pip` will refuse it
+  (`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`). `pip` will refuse it
   anywhere else, which is the correct answer rather than a limitation: a native
   executable with a hard `libpython` dependency does not degrade gracefully.
 * **When a wheel matches, Swift is not required.** The Swift runtime travels
@@ -78,8 +78,9 @@ pip install peregrine-server
 If PyPI has a wheel for this interpreter and platform, `pip` installs it in
 seconds and Swift is not required. Otherwise it falls back to the sdist, the
 Swift build runs, and that takes a few minutes. The first published wheels are
-tagged `linux_x86_64` for the builder's glibc — recent Linux, not every Linux.
-Older distros compile from the sdist. When it finishes:
+tagged `manylinux_2_N` for the builder's glibc (Ubuntu 24.04 is `2_39`) —
+recent Linux, not every Linux. Older distros compile from the sdist. When
+it finishes:
 
 ```bash
 $ peregrine --version

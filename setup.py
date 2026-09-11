@@ -3,7 +3,7 @@
 Peregrine embeds CPython rather than talking to it over a socket, so the binary
 is linked against one specific libpython. A prebuilt wheel is therefore tagged
 for the exact CPython and platform it was built against
-(`cp312-cp312-linux_x86_64`, `cp314-cp314t-...`) so pip refuses it anywhere it
+(`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`) so pip refuses it anywhere it
 would not actually run. When no wheel matches, pip falls back to the sdist and
 this file compiles the server against the installing interpreter.
 
@@ -138,6 +138,33 @@ def _linked_version(binary):
         return None
     suffix = "t" if "free-threaded" in match.group(3) else ""
     return "%s.%s%s" % (match.group(1), match.group(2), suffix)
+
+
+def _manylinux_platform_tag(platform_tag):
+    """PyPI rejects the linux_* tag. It accepts manylinux_x_y, which is a
+    glibc floor. That is what this build can honestly claim: the binary
+    was linked on this glibc, so it will not load on an older one.
+
+    It is not a full auditwheel repair. libpython, libssl and libicu stay
+    with the machine -- the first because the wheel tag already promised
+    one interpreter, the others because they are ordinary system libraries
+    on the distros this tag will install onto.
+    """
+    if not platform_tag.startswith("linux_"):
+        return platform_tag
+    try:
+        raw = os.confstr("CS_GNU_LIBC_VERSION") or ""
+    except (ValueError, OSError):
+        raw = ""
+    match = re.match(r"glibc (\d+)\.(\d+)", raw)
+    if not match:
+        _fail(
+            "this Linux build has no glibc version, so it cannot be tagged\n"
+            "for PyPI. manylinux_x_y is a glibc floor; without one there is\n"
+            "nothing honest to write."
+        )
+    arch = platform_tag[len("linux_"):]
+    return "manylinux_%s_%s_%s" % (match.group(1), match.group(2), arch)
 
 
 # The Swift runtime travels with the binary. libpython, libssl and the rest of
@@ -377,7 +404,7 @@ if bdist_wheel is not None:
             # round. They really are different binaries.
             interpreter = "cp%d%d" % sys.version_info[:2]
             abi = interpreter + ("t" if _free_threaded() else "")
-            return interpreter, abi, platform_tag
+            return interpreter, abi, _manylinux_platform_tag(platform_tag)
 
     COMMANDS = {"build_py": BuildWithSwift, "bdist_wheel": BinaryWheel}
 else:

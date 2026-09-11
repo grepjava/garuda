@@ -13,7 +13,7 @@ Usage:
     PEREGRINE_BINARY=/path/to/release/peregrine python3.14t setupdist.py bdist_wheel
 
 The resulting wheel is placed in dist/ and is tagged specifically:
-    Linux / WSL: peregrine_server-1.0.0-cp314-cp314t-linux_x86_64.whl
+    Linux / WSL: peregrine_server-1.0.0-cp314-cp314t-manylinux_2_39_x86_64.whl
     macOS:       peregrine_server-1.0.0-cp314-cp314t-macosx_14_0_arm64.whl
 """
 

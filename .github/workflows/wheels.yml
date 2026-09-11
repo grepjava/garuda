@@ -1,9 +1,11 @@
 # Prebuilt wheels for the interpreters the project claims to support.
 #
 # Each wheel embeds one libpython and the Swift runtime that binary was
-# linked against. The tag (cp312-cp312-linux_x86_64, cp314-cp314t-...) is
-# the pairing; pip will not install it anywhere else. libpython itself is
-# not vendored -- the user's matching interpreter supplies it.
+# linked against. The tag (cp312-cp312-manylinux_2_39_x86_64,
+# cp314-cp314t-...) is the pairing; pip will not install it anywhere else.
+# The manylinux_2_N platform is this image's glibc -- PyPI rejects linux_*.
+# libpython itself is not vendored -- the user's matching interpreter
+# supplies it.
 #
 # Started by hand, like CI. Building five release binaries is a bill, and
 # publishing is a separate input so a dry run cannot reach PyPI.

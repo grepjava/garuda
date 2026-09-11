@@ -23,12 +23,14 @@ Two kinds of file, always the same version as `pyproject.toml`:
 
 | Artifact | Who needs it |
 |---|---|
-| **Wheels** (`cp312-cp312-linux_x86_64`, `cp314-cp314t-...`) | anyone whose interpreter and platform match; Swift is not required |
+| **Wheels** (`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`) | anyone whose interpreter, ABI and glibc match; Swift is not required |
 | **sdist** (`peregrine_server-X.Y.Z.tar.gz`) | everyone else; `pip` compiles it against the installing interpreter |
 
 A wheel vendors the Swift runtime and leaves `libpython` to the user's
-interpreter. The first wheels are tagged `linux_x86_64` for the builder's
-glibc — recent Linux, not every Linux. macOS wheels are not built yet.
+interpreter. The platform tag is `manylinux_2_N` for the builder's glibc
+(Ubuntu 24.04 is `2_39`). PyPI rejects `linux_*`; it will not take a wheel
+that still has that tag. Older glibc compiles from the sdist. macOS wheels
+are not built yet.
 
 The GitHub Actions publish job uploads **wheels only**. The script below
 uploads the sdist as well. Use the script.
