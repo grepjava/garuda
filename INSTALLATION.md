@@ -67,7 +67,7 @@ finishes:
 
 ```bash
 $ peregrine --version
-peregrine 0.1.0 (CPython 3.12.3)
+peregrine 0.8.0 (CPython 3.12.3)
 ```
 
 That second number is read out of the built binary at runtime, not out of the
@@ -159,7 +159,7 @@ Check what came out, because this is the one thing worth being sure of:
 
 ```console
 $ peregrine --version
-peregrine 0.1.0 (CPython 3.14.6 free-threaded)
+peregrine 0.8.0 (CPython 3.14.6 free-threaded)
 ```
 
 Without `free-threaded` on that line, `--free-threaded` will refuse to start —
