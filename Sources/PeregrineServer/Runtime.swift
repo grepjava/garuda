@@ -62,6 +62,15 @@ public enum Peregrine {
 
         let workerCount = config.resolvedWorkers
 
+        // Before any fork: children inherit the mapping, and a page mapped
+        // after one would be private to whoever mapped it.
+        if config.metricsPort != 0 {
+            if pg_metrics_init(Int32(max(1, workerCount))) != 0 {
+                Log.error("cannot map the shared metrics page")
+                return 1
+            }
+        }
+
         // Workers as threads. --reload still wants a process to restart into,
         // so the two compose: the supervisor forks one child and that child
         // runs every worker as a thread of itself.
@@ -206,7 +215,7 @@ public enum Peregrine {
         }
 
         for i in 0..<workers {
-            pids[i] = spawnWorker(config, inherited: inherited)
+            pids[i] = spawnWorker(config, inherited: inherited, index: i)
             if pids[i] < 0 { return 1 }
         }
 
@@ -290,7 +299,7 @@ public enum Peregrine {
                         }
                     }
                     if index >= 0 {
-                        pids[index] = spawnWorker(config, inherited: inherited)
+                        pids[index] = spawnWorker(config, inherited: inherited, index: index)
                         if pids[index] > 0 { alive += 1 }
                     }
                 }
@@ -302,7 +311,8 @@ public enum Peregrine {
         return 0
     }
 
-    static func spawnWorker(_ config: ServerConfig, inherited: Int32) -> pid_t {
+    static func spawnWorker(_ config: ServerConfig, inherited: Int32,
+                            index: Int = 0) -> pid_t {
         let pid = pg_fork()
         if pid < 0 {
             Log.error("fork failed")
@@ -328,7 +338,7 @@ public enum Peregrine {
             }
             fd = opened
         }
-        let ok = runWorker(config, listenFD: fd)
+        let ok = runWorker(config, listenFD: fd, metricsSlot: index)
         exitProcess(ok ? 0 : 1)
     }
 
@@ -424,7 +434,8 @@ public enum Peregrine {
     static func makeWorker(_ config: ServerConfig,
                            listenFD: Int32,
                            controlFD: Int32,
-                           loaded: LoadedApplication) -> UnsafeMutablePointer<Worker>? {
+                           loaded: LoadedApplication,
+                           metricsSlot: Int = 0) -> UnsafeMutablePointer<Worker>? {
         guard let poller = Poller(maxEvents: 256) else {
             Log.error("cannot create the readiness poller")
             return nil
@@ -439,6 +450,26 @@ public enum Peregrine {
         }
         workerPtr.pointee.appProtocol = loaded.proto
         workerPtr.pointee.signalFD = controlFD
+
+        // This thread's slot of the shared page, and its own scrape listener:
+        // every worker binds the metrics port with SO_REUSEPORT, exactly as
+        // they all bind the service port.
+        if config.metricsPort != 0 {
+            Metrics.bind(slot: metricsSlot)
+            Metrics.set(PG_M_SLOTS_CAPACITY, UInt64(config.maxConnections))
+            let host = config.metricsHost ?? config.host
+            let fd = pg_listen_tcp(host, config.metricsPort, 64, 1,
+                                   config.ipv6Only ? 1 : 0)
+            if fd < 0 {
+                let e = pg_errno()
+                Log.error { line in
+                    line.str("cannot listen on the metrics port: ")
+                    line.cstr(pg_strerror(e))
+                }
+                return nil
+            }
+            workerPtr.pointee.metricsFD = fd
+        }
         if config.http3Enabled {
             guard let listener = makeQUICListener(config) else { return nil }
             workerPtr.pointee.quic = listener
@@ -473,6 +504,7 @@ public enum Peregrine {
         }
 
         guard workerPtr.pointee.registerListener() else { return nil }
+        guard workerPtr.pointee.registerMetricsListener() else { return nil }
         guard workerPtr.pointee.registerQUIC() else { return nil }
         return workerPtr
     }
@@ -500,11 +532,13 @@ public enum Peregrine {
     }
 
     /// Everything from here down runs inside a worker process.
-    static func runWorker(_ config: ServerConfig, listenFD: Int32) -> Bool {
+    static func runWorker(_ config: ServerConfig, listenFD: Int32,
+                          metricsSlot: Int = 0) -> Bool {
         guard let loaded = bootInterpreter(config) else { return false }
         guard let workerPtr = makeWorker(config, listenFD: listenFD,
                                          controlFD: pg_signal_pipe_init(),
-                                         loaded: loaded) else {
+                                         loaded: loaded,
+                                         metricsSlot: metricsSlot) else {
             return false
         }
         if loaded.proto == .asgi {

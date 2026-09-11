@@ -108,6 +108,8 @@ func printUsage() {
       --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
       --access-log             log one line per request
       --access-log-format F    text (default) or json; implies --access-log
+      --metrics-port PORT      serve Prometheus metrics on this port
+      --metrics-host HOST      what the metrics port binds (default --host)
       --log-level LEVEL        debug, info, warning, error, silent
       --version                print the version and exit
       -h, --help               print this message
@@ -345,6 +347,18 @@ while i < argc {
         }
     } else if matches(arg, "--access-log") {
         config.accessLog = true
+    } else if matches(arg, "--metrics-port") {
+        guard let v = next("--metrics-port needs a value") else { break }
+        let p = parseInt(v)
+        if p <= 0 || p > 65535 {
+            Log.error("--metrics-port must be between 1 and 65535")
+            failed = true
+            break
+        }
+        config.metricsPort = UInt16(p)
+    } else if matches(arg, "--metrics-host") {
+        guard let v = next("--metrics-host needs a value") else { break }
+        config.metricsHost = v
     } else if matches(arg, "--access-log-format") {
         guard let v = next("--access-log-format needs a value") else { break }
         // Asking for a format is asking for the log: the alternative is a

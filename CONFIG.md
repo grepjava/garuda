@@ -389,6 +389,55 @@ always recoverable, byte for byte.
 
 `--access-log` costs a clock read per request; without it there is none.
 
+### Metrics
+
+`--metrics-port 9100` serves the Prometheus text exposition format:
+
+```
+peregrine_requests_total{status="2xx"} 10241
+peregrine_connections_accepted_total 812
+peregrine_connections_active 37
+peregrine_connection_slots 8192
+peregrine_buffer_pool_hits_total 774
+peregrine_buffer_pool_misses_total 38
+peregrine_workers 4
+peregrine_request_duration_seconds_bucket{le="0.001000"} 9987
+peregrine_request_duration_seconds_sum 4.271038
+peregrine_request_duration_seconds_count 10241
+```
+
+A port of its own, not a route. The application owns every path on the service
+port, and monitoring that can be reached through the application — or an
+application that can be reached through monitoring — is a configuration
+accident waiting for a bad day. Nothing on the metrics port goes anywhere near
+the request path; it is accepted, answered and closed on the loop thread.
+
+**One scrape answers for every worker.** Workers are separate processes under
+`--workers` and threads under `--free-threaded`; in both cases the counters
+live in a page mapped before anything forked, each worker writing only its own
+slot. A scrape lands on whichever worker `SO_REUSEPORT` gives it and reports
+the sum, so the numbers do not jump about between scrapes. `peregrine_workers`
+says how many are being summed.
+
+**Bind it somewhere private.** `--metrics-host` defaults to `--host`, so a
+server on `0.0.0.0` publishes its metrics there too. They contain no request
+data — counts, durations and connection totals — but they are still nobody
+else's business:
+
+```bash
+peregrine --host 0.0.0.0 --port 8443 \
+          --metrics-port 9100 --metrics-host 127.0.0.1 \
+          myapp:app
+```
+
+`peregrine_buffer_pool_hits_total` against `_misses_total` is worth watching:
+misses that keep climbing mean connections are outliving the pool's free list,
+or that `--read-buffer` is smaller than what requests actually need.
+
+Counting costs one load, one add and one store per event, on a cache line no
+other worker touches. With no `--metrics-port` there is no page and the
+counters do nothing at all.
+
 ---
 
 ## Free-threaded Python

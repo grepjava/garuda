@@ -45,6 +45,9 @@ public struct Worker {
     public var dates: DateCache
 
     public var listenFD: Int32
+    /// The metrics scrape listener, or -1. Separate from `listenFD` in every
+    /// sense: a different port, a different handler, no connection slot.
+    public var metricsFD: Int32 = -1
     public var signalFD: Int32 = -1
 
     /// One shared header table: parsing and environ/scope construction happen
@@ -192,6 +195,8 @@ public struct Worker {
                 collectPoolResults()
             case PollToken.quic:
                 handleQUICEvent(mask)
+            case PollToken.metrics:
+                acceptMetricsScrapes()
             default:
                 let slot = PollToken.slot(token)
                 let generation = PollToken.generation(token)
@@ -282,6 +287,7 @@ public struct Worker {
                 if e == EMFILE || e == ENFILE {
                     // Descriptor exhaustion: stop asking for a moment rather
                     // than spinning on a listener that stays readable.
+                    Metrics.add(PG_M_CONNECTIONS_REJECTED)
                     Log.warn("out of file descriptors; pausing accepts")
                     _ = poller.modify(listenFD, [], token: PollToken.listener)
                     acceptSuspended = true
@@ -295,6 +301,8 @@ public struct Worker {
                 rejectOverCapacity(fd)
                 continue
             }
+            Metrics.add(PG_M_CONNECTIONS_ACCEPTED)
+            Metrics.set(PG_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount))
             let c = table[slot]
             c.pointee.fd = fd
             c.pointee.state = .readingHead
@@ -362,6 +370,7 @@ public struct Worker {
 
     /// Table is full: answer honestly and hang up instead of queueing.
     func rejectOverCapacity(_ fd: Int32) {
+        Metrics.add(PG_M_CONNECTIONS_REJECTED)
         let msg: StaticString = """
         HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 19\r\n\r\nService Unavailable
         """
@@ -695,7 +704,9 @@ public struct Worker {
     }
 
     mutating func dispatch(_ slot: Int) {
-        if config.accessLog { table[slot].pointee.requestStartUs = pg_monotonic_us() }
+        if config.accessLog || Metrics.enabled {
+            table[slot].pointee.requestStartUs = pg_monotonic_us()
+        }
         switch appProtocol {
         case .wsgi:
             // WSGI has no way to express a stream that outlives its response,
@@ -958,6 +969,7 @@ public struct Worker {
             closeConnection(slot)
             return
         }
+        logAccess(slot, status: status)
         c.pointee.flags.remove(.keepAlive)
         dates.refresh()
         c.pointee.write.clear()
@@ -973,8 +985,14 @@ public struct Worker {
     /// its own buffer, and a chunked request keeps its head in `headStore`, so
     /// nothing has overwritten the request line.
     mutating func logAccess(_ slot: Int, status: Int) {
-        guard config.accessLog, Log.enabled(.info) else { return }
         let c = table[slot]
+        if Metrics.enabled {
+            let started = c.pointee.requestStartUs
+            Metrics.requestFinished(status: status,
+                                    micros: started == 0
+                                        ? -1 : Int(pg_monotonic_us() &- started))
+        }
+        guard config.accessLog, Log.enabled(.info) else { return }
         let base = c.pointee.headBase()
         let method = c.pointee.head.methodSlice
         let target = c.pointee.head.target
@@ -1041,6 +1059,11 @@ public struct Worker {
     public mutating func closeConnection(_ slot: Int) {
         let c = table[slot]
         if c.pointee.state == .free { return }
+        Metrics.add(PG_M_CONNECTIONS_CLOSED)
+        // Written here rather than only when this worker happens to serve a
+        // scrape: a gauge nobody updates is a number from whenever it last was
+        // true, which for the other workers is never.
+        Metrics.set(PG_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount &- 1))
 
         // An HTTP/2 connection takes its streams with it. Detaching each one
         // first stops it from trying to tidy up a parent that is going away.

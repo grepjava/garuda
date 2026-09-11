@@ -1152,6 +1152,78 @@ def test_access_log():
         objects[2].get("target"), "/rawÿþ")
 
 
+def test_metrics():
+    print("\nPrometheus metrics")
+
+    def scrape(port, path="/metrics"):
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                       % path).encode())
+            return read_http_response(s)
+        finally:
+            s.close()
+
+    def values(body):
+        out = {}
+        for line in body.decode().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            name, _, value = line.rpartition(" ")
+            out[name] = float(value)
+        return out
+
+    # Two workers, so the interesting part is whether a scrape that lands on
+    # one of them answers for both.
+    port, metrics_port = free_port(), free_port()
+    with Server("--workers", "2", "--metrics-port", str(metrics_port),
+                port=port, app="wsgi_app:application") as server:
+        for _ in range(7):
+            server.get("/")
+        server.get("/nope")
+
+        status, headers, body = scrape(metrics_port)
+        is_("the metrics port answers a scrape", status, 200)
+        check("with the content type Prometheus expects",
+              "version=0.0.4" in (headers.get("content-type") or ""),
+              headers.get("content-type"))
+
+        v = values(body)
+        is_("requests are counted by status class, across every worker",
+            (v.get('peregrine_requests_total{status="2xx"}'),
+             v.get('peregrine_requests_total{status="4xx"}')),
+            (7.0, 1.0))
+        is_("the scrape reports every worker's counters",
+            v.get("peregrine_workers"), 2.0)
+        check("connections are counted",
+              v.get("peregrine_connections_accepted_total", 0) >= 8,
+              "accepted %r" % v.get("peregrine_connections_accepted_total"))
+        check("the duration histogram counts every request",
+              v.get("peregrine_request_duration_seconds_count") == 8.0,
+              "count was %r" % v.get("peregrine_request_duration_seconds_count"))
+        check("and its buckets are cumulative",
+              v.get('peregrine_request_duration_seconds_bucket{le="+Inf"}') == 8.0,
+              "+Inf was %r"
+              % v.get('peregrine_request_duration_seconds_bucket{le="+Inf"}'))
+        check("the buffer pool reports hits and misses",
+              "peregrine_buffer_pool_hits_total" in v
+              and "peregrine_buffer_pool_misses_total" in v,
+              str(sorted(k for k in v if "pool" in k)))
+
+        # The scrape port is not a way into the application, and the service
+        # port is not a way to the counters.
+        _, _, body = scrape(metrics_port, path="/")
+        check("the metrics port serves metrics and not the application",
+              body.startswith(b"# HELP"), body[:80])
+        is_("the application port has no metrics route",
+            server.get("/metrics")[0], 404)
+
+    # Counting must cost nothing when nobody asked for it.
+    port = free_port()
+    with Server(port=port, app="wsgi_app:application") as server:
+        is_("without --metrics-port the server still serves", server.get("/")[0], 200)
+
+
 def test_factory():
     print("\nApplication loading")
     port = free_port()
@@ -1731,6 +1803,7 @@ def main():
                  test_websocket_control_independence,
                  test_wsgi_threads, test_wsgi_streaming, test_access_log,
                  test_wsgi_declared_length, test_wsgi_lazy_start_response,
+                 test_metrics,
                  test_forwarded, test_multiworker_unix,
                  test_worker_restart, test_reload, test_graceful_shutdown,
                  test_shutdown_is_bounded, test_free_threaded):

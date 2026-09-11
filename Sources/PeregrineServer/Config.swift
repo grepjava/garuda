@@ -194,6 +194,13 @@ public struct ServerConfig {
     /// Emit the access log as one JSON object per line, for a collector that
     /// would otherwise be handed a regex.
     public var accessLogJSON = false
+    /// Port for the Prometheus scrape listener, or 0 for none. A port of its
+    /// own rather than a path on the service port: the application owns its
+    /// own routes, and monitoring must not be reachable through them.
+    public var metricsPort: UInt16 = 0
+    /// What the scrape listener binds. nil follows --host; see CONFIG.md for
+    /// why that is usually not what you want on a public interface.
+    public var metricsHost: UnsafePointer<CChar>? = nil
 
     public init() {}
 }

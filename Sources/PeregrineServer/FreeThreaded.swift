@@ -226,7 +226,8 @@ final class WorkerThread {
 
         guard let workerPtr = Peregrine.makeWorker(config, listenFD: listenFD,
                                                    controlFD: controlRead,
-                                                   loaded: loaded) else {
+                                                   loaded: loaded,
+                                                   metricsSlot: index) else {
             currentWorker = nil
             group.markFailed()
             pg_gil_release(state)

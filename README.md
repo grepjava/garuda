@@ -271,6 +271,9 @@ peregrine [options] MODULE:ATTRIBUTE
   --ws-max-queue N         messages buffered for a slow app (default 32)
   --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
   --access-log             log one line per request
+  --access-log-format F    text (default) or json; implies --access-log
+  --metrics-port PORT      serve Prometheus metrics on this port
+  --metrics-host HOST      what the metrics port binds (default --host)
   --log-level LEVEL        debug, info, warning, error, silent
 ```
 
@@ -407,6 +410,10 @@ schedule, the header protection and the sample packets are the RFC's own bytes.
   advertises extended `CONNECT` because that is how WebTransport arrives;
   `webtransport` is the only `:protocol` served. HTTP/2 does not advertise it.
 - **Windows.** The I/O layer is epoll/kqueue.
+- **Tracing.** There are Prometheus metrics on `--metrics-port` and a JSON
+  access log, but no OpenTelemetry spans and nothing that follows a request
+  into the application. An ASGI middleware is the right place for that, and
+  there are good ones.
 
 By default a synchronous WSGI application occupies its worker for the duration
 of the call. Scale with `--workers`, and with `--wsgi-threads` when the

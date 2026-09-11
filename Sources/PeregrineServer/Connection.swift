@@ -239,6 +239,8 @@ public enum PollToken {
     /// The QUIC socket. One descriptor serves every QUIC connection, so unlike
     /// TCP there is no per-connection token.
     public static let quic: UInt64 = .max - 3
+    /// The metrics listener, when one is bound.
+    public static let metrics: UInt64 = .max - 4
     public static let slotBits: UInt64 = 24
     public static let slotMask: UInt64 = (1 << 24) - 1
 

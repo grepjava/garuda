@@ -11,6 +11,8 @@
 // no atomics and no thread-local indirection.
 //===----------------------------------------------------------------------===//
 
+import CPeregrine
+
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
@@ -46,8 +48,13 @@ public struct BufferPool {
         if count > 0 {
             count &-= 1
             let p = slots[count].unsafelyUnwrapped
+            // Once per connection, and a no-op when nothing is scraping: the
+            // ratio of these two is how you tell a pool that is working from
+            // one whose blocks are all the wrong size.
+            pg_metrics_add_local(Int32(PG_M_POOL_HITS), 1)
             return ByteBuffer(adopting: p, capacity: blockSize)
         }
+        pg_metrics_add_local(Int32(PG_M_POOL_MISSES), 1)
         return ByteBuffer(capacity: blockSize)
     }
 
