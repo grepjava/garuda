@@ -305,6 +305,21 @@ async def cancellation():
             is_("a cancelled request does not disturb the connection",
                 (status, body), (200, b"hello from peregrine asgi\n"))
 
+            # A reset stream is an unambiguous end, unlike a FIN on a socket,
+            # which may only mean the peer has finished talking. /abandonable
+            # never calls receive(), so nothing is waiting for the disconnect
+            # message and cancellation is all that can reach the task -- which
+            # also shows the request really did start, and that a flood of
+            # resets would be paying for application work rather than nothing.
+            abandoned = client.start("GET", "/abandonable")
+            await asyncio.sleep(0.3)
+            client._quic.reset_stream(abandoned, 0x010c)
+            client.transmit()
+            await asyncio.sleep(0.5)
+            status, _, body = await client.request("GET", "/cancelled")
+            is_("a reset stream cancels the task nobody is left to talk to",
+                body.strip(), b"yes")
+
 
 async def large_headers():
     print("\nHeader compression")
