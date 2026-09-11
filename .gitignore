@@ -1,5 +1,6 @@
 .build/
 .build-install/
+.build-dist/
 .swiftpm/
 Package.resolved
 build/
@@ -8,6 +9,12 @@ dist/
 *.o
 *.pyc
 __pycache__/
+
+# The PyPI upload token. A publishing credential, so it lives on the machine
+# that publishes and nowhere else -- least of all in a public history, where
+# removing it means rewriting every commit after it and rotating the token
+# anyway.
+.pypi-token
 
 # Inputs pgfuzz writes out when it finds something; keep them in
 # fuzz/corpus/<target>/ under a name, not here under a seed.
