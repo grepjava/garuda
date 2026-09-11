@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/peregrine-main.png" alt="peregrine" width="360">
+</p>
+
 # Benchmarks
 
 These numbers are from one machine, one load generator and six hello-world

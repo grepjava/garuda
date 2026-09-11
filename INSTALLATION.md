@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/peregrine-main.png" alt="peregrine" width="360">
+</p>
+
 # Installing Peregrine
 
 Peregrine embeds CPython rather than talking to it over a socket, so the server

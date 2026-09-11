@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/peregrine-main.png" alt="peregrine" width="360">
+</p>
+
 # Configuring FastAPI and Django
 
 The governing rule is that **the protocol is a server flag, not an application
