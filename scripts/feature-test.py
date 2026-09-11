@@ -1094,8 +1094,13 @@ def test_header_shapes():
 def test_access_log():
     print("\nAccess log")
 
-    def served(args, raw_requests):
-        """Runs the requests, then returns everything the server logged."""
+    def served_bytes(args, raw_requests):
+        """Runs the requests and returns the log lines as the bytes they are.
+
+        Bytes rather than text on purpose: a lenient decode is exactly the
+        thing that would repair a line broken in the middle of a character,
+        and a collector reading the file will not be so kind.
+        """
         port = free_port()
         server = Server(*args, "--log-level", "info", port=port,
                         app="wsgi_app:application")
@@ -1109,7 +1114,12 @@ def test_access_log():
                     s.close()
         finally:
             server.stop()
-        return server.proc.stdout.read().decode("utf-8", "replace").splitlines()
+        return server.proc.stdout.read().split(b"\n")
+
+    def served(args, raw_requests):
+        """The same, decoded, for the checks that are about text."""
+        return [ln.decode("utf-8", "replace")
+                for ln in served_bytes(args, raw_requests)]
 
     plain = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     # A target is the peer's bytes: a quote would end a JSON string early, and
@@ -1180,6 +1190,32 @@ def test_access_log():
           str(objects[0])[-120:])
     check("the line after it is untouched", objects[1].get("target") == "/",
           str(objects[1])[:120])
+
+    # Cutting a target short must not cut a character in half: a JSON string
+    # that is not UTF-8 is not JSON, whatever a lenient decode makes of it.
+    # Four alignments, so the cut lands at each offset within a four-byte one.
+    emoji = "\U0001f426".encode("utf-8")
+    requests = [b"GET /" + b"a" * pad + emoji * 1600
+                + b" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                for pad in range(4)]
+    broken = []
+    parsed = 0
+    for raw in served_bytes(["--access-log-format", "json"], requests):
+        if not raw.startswith(b"{"):
+            continue
+        try:
+            # json.loads on bytes insists the bytes are valid UTF-8, which is
+            # the whole point of feeding it bytes.
+            obj = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            broken.append("%s in a line of %d bytes" % (exc, len(raw)))
+            continue
+        parsed += 1
+        if not obj.get("target", "").startswith("/"):
+            broken.append("target came back as %r" % obj.get("target")[:40])
+    check("a target cut mid-character still leaves valid UTF-8",
+          not broken, "; ".join(broken[:3]))
+    is_("every alignment logged one parseable line", parsed, 4)
 
 
 def test_metrics():

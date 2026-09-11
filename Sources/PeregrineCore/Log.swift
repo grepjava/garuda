@@ -99,28 +99,55 @@ public struct LogLine {
         var i = 0
         while i < n {
             let b = p[i]
-            i &+= 1
+            var escaped: UInt8 = 0
             switch b {
-            case 0x22: escape(0x22)                        // \"
-            case 0x5C: escape(0x5C)                        // backslash
-            case 0x08: escape(0x62)                        // \b
-            case 0x0C: escape(0x66)                        // \f
-            case 0x0A: escape(0x6E)                        // \n
-            case 0x0D: escape(0x72)                        // \r
-            case 0x09: escape(0x74)                        // \t
-            default:
-                if b < 0x20 || (asciiOnly && b > 0x7F) {
-                    unicodeEscape(b)
-                } else if len < softCap {
-                    buf[len] = b
-                    len &+= 1
-                } else {
-                    truncated = true
-                }
+            case 0x22: escaped = 0x22                      // \"
+            case 0x5C: escaped = 0x5C                      // backslash
+            case 0x08: escaped = 0x62                      // \b
+            case 0x0C: escaped = 0x66                      // \f
+            case 0x0A: escaped = 0x6E                      // \n
+            case 0x0D: escaped = 0x72                      // \r
+            case 0x09: escaped = 0x74                      // \t
+            default: break
             }
+            if escaped != 0 {
+                if softCap &- len < 2 { truncated = true; break }
+                escape(escaped)
+                i &+= 1
+                continue
+            }
+            if b < 0x20 || (asciiOnly && b > 0x7F) {
+                if softCap &- len < 6 { truncated = true; break }
+                unicodeEscape(b)
+                i &+= 1
+                continue
+            }
+            // A character wider than a byte goes in whole or not at all. Half
+            // of one is not UTF-8, and a JSON string that is not UTF-8 is not
+            // JSON -- which a parser reading the raw bytes will say, however
+            // well a lenient decode papers over it first.
+            let width = b < 0x80 ? 1 : utf8Width(b)
+            if i &+ width > n { truncated = true; break }
+            if softCap &- len < width { truncated = true; break }
+            memcpy(buf + len, p + i, width)
+            len &+= width
+            i &+= width
         }
         softCap = outerSoftCap
         if len < softCap { buf[len] = 0x22; len &+= 1 }
+    }
+
+    /// Bytes in the UTF-8 sequence a lead byte opens.
+    ///
+    /// A byte that is not a lead byte is taken alone: this is only reached for
+    /// a field already known to be well formed, and guessing a width for a
+    /// stray continuation byte would be worse than copying it as it is.
+    @usableFromInline
+    func utf8Width(_ lead: UInt8) -> Int {
+        if lead < 0xC0 { return 1 }
+        if lead < 0xE0 { return 2 }
+        if lead < 0xF0 { return 3 }
+        return 4
     }
 
     @usableFromInline

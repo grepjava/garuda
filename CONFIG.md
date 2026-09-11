@@ -391,7 +391,9 @@ That is true up to the length of the line, which is assembled in a fixed
 buffer. Rather than let a very long target run off the end — leaving a string
 unterminated, an object unclosed, and no newline to separate it from whatever
 is logged next — the target is cut short and the object carries
-`"truncated":true` alongside the fields that follow it. Every line is a
+`"truncated":true` alongside the fields that follow it. The cut lands on a
+character boundary rather than in the middle of one, so the line is still
+valid UTF-8 and a parser reading the raw bytes will take it. Every line is a
 complete object, whatever the peer asked for.
 
 `--access-log` costs a clock read per request; without it there is none.
