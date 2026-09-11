@@ -370,7 +370,7 @@ bash scripts/framework-test.sh                  #  30 checks against real
                                                 #   FastAPI and Django apps,
                                                 #   over HTTP/1.1 and HTTP/2
 <venv>/bin/python scripts/http2-test.py         # 162 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  78 checks against `aioquic`
+<venv>/bin/python scripts/http3-test.py         #  82 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only: routing,
                                                 #   converters, session helper
 <venv>/bin/python scripts/webtransport-test.py  # 117 including the above,

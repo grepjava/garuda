@@ -224,6 +224,8 @@ extension Worker {
         if s.pointee.flags.contains(.responseComplete)
             && !s.pointee.flags.contains(.endStreamSent) {
             s.pointee.flags.insert(.endStreamSent)
+            // An answered stream earns back one cancellation.
+            if h3.resetBudget < h3.resetBudgetCap { h3.resetBudget &+= 1 }
             if short {
                 h3.quic.resetStream(streamID, code: HTTP3Error.internalError)
             } else {

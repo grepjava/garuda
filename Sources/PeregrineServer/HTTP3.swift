@@ -57,6 +57,11 @@ public final class H3Connection {
     var streams: [UInt64: Int32] = [:]
     var goneAway = false
 
+    /// How many streams this peer may still cancel before it has finished any.
+    /// See `http3StreamAborted`.
+    var resetBudget: Int
+    let resetBudgetCap: Int
+
     /// WebTransport sessions, by the identifier of their CONNECT stream.
     var sessions: [UInt64: Int32] = [:]
     /// Which session slot a WebTransport data stream belongs to.
@@ -64,8 +69,10 @@ public final class H3Connection {
     /// Streams that named a session whose CONNECT has not arrived yet.
     var wtOrphans: [UInt64: [(UInt64, Bool)]] = [:]
 
-    init(quic: QUICConnection) {
+    init(quic: QUICConnection, resetBudget: Int) {
         self.quic = quic
+        self.resetBudgetCap = resetBudget
+        self.resetBudget = resetBudget
     }
 
     func destroy() {
@@ -106,7 +113,8 @@ extension Worker {
         c.pointee.interest = 0
         c.pointee.flags = []
         c.pointee.lastActivity = pg_monotonic_ms()
-        let h3 = H3Connection(quic: connection)
+        let h3 = H3Connection(quic: connection,
+                              resetBudget: max(100, config.h2MaxConcurrentStreams * 2))
         c.pointee.h3 = h3
         c.pointee.quicRef = connection
         connection.applicationSlot = Int32(slot)
@@ -244,6 +252,25 @@ extension Worker {
         guard let streamSlot = h3.streams[streamID].map(Int.init) else { return }
         // The application finds out the way it finds out about any hang-up.
         table[streamSlot].pointee.flags.insert(.disconnected)
+        // The same accounting HTTP/2 keeps, for the same attack. A stream
+        // costs a header decode and a task whatever happens to it afterwards,
+        // and cancelling it hands the credit straight back, so a peer that
+        // only ever cancels can keep a worker busy without ever holding more
+        // than one stream open. QUIC makes this dearer than HTTP/2 did -- a
+        // cancellation is a packet of its own, not eight bytes trailing the
+        // request -- but dearer is not bounded, so it is bounded here.
+        //
+        // A cancellation arriving after the response was finished is a race,
+        // not a reset, and is charged nothing.
+        if !table[streamSlot].pointee.flags.contains(.endStreamSent) {
+            h3.resetBudget &-= 1
+            if h3.resetBudget <= 0 {
+                Log.warn("h3 peer cancelled far more streams than it completed")
+                // The connection goes, and takes this stream with it.
+                h3.quic.close(HTTP3Error.excessiveLoad, application: true)
+                return
+            }
+        }
         closeH3Stream(streamSlot)
         flushQUIC(slot)
     }

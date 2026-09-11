@@ -206,6 +206,15 @@ and is sent `GOAWAY(ENHANCE_YOUR_CALM)`. A reset that arrives after the
 response was already finished is a race rather than an attack, and costs
 nothing.
 
+HTTP/3 keeps the same account for the same reason. QUIC has no `RST_STREAM`
+frame, but closing a stream queues `MAX_STREAMS`, and a credit handed back is a
+credit handed back whatever it is called; a peer that resets every stream it
+opens holds one at a time and keeps a worker decoding headers indefinitely. The
+cancellation is dearer to send than HTTP/2's — a packet of its own rather than
+eight bytes trailing the request — but dearer is not bounded, so `RESET_STREAM`
+and `STOP_SENDING` on a request stream spend from the same allowance, and a
+peer that exhausts it is closed with `H3_EXCESSIVE_LOAD`.
+
 ### A stream measures its own progress
 
 `--request-timeout` asks whether a request has stalled, and on HTTP/1 the
@@ -521,7 +530,7 @@ only that the understanding is consistent.
 
 ```bash
 <venv>/bin/python scripts/http2-test.py         # 162 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  78 checks against `aioquic`
+<venv>/bin/python scripts/http3-test.py         #  82 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only
 <venv>/bin/python scripts/webtransport-test.py  # 117 including FastAPI/Django
 

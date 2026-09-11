@@ -28,6 +28,7 @@ try:
     from aioquic.h3.connection import H3Connection
     from aioquic.h3.events import DataReceived, HeadersReceived
     from aioquic.quic.configuration import QuicConfiguration
+    from aioquic.quic.events import ConnectionTerminated
 except ImportError:
     sys.stderr.write("this script needs the aioquic package: pip install aioquic\n")
     raise SystemExit(2)
@@ -142,6 +143,8 @@ class Client(QuicConnectionProtocol):
         self._http = H3Connection(self._quic)
         self._events = {}
         self._waiters = {}
+        # The last CONNECTION_CLOSE, for the tests that expect one.
+        self.terminated = None
 
     def start(self, method, path, authority="localhost", body=None, headers=(),
               end_stream=True):
@@ -175,6 +178,8 @@ class Client(QuicConnectionProtocol):
         return await self.collect(self.start(method, path, **kwargs))
 
     def quic_event_received(self, event):
+        if isinstance(event, ConnectionTerminated):
+            self.terminated = event
         for http_event in self._http.handle_event(event):
             if isinstance(http_event, (HeadersReceived, DataReceived)):
                 sid = http_event.stream_id
@@ -319,6 +324,47 @@ async def cancellation():
             status, _, body = await client.request("GET", "/cancelled")
             is_("a reset stream cancels the task nobody is left to talk to",
                 body.strip(), b"yes")
+
+
+async def rapid_reset():
+    """Cancelling without finishing has to cost the peer something.
+
+    The HTTP/2 shape of this is CVE-2023-44487: open a stream, cancel it, and
+    the concurrency credit comes straight back, so a peer can keep the server
+    decoding headers and starting tasks while never holding more than one
+    stream open. QUIC has the same property -- closing a stream queues
+    MAX_STREAMS -- so it needs the same accounting.
+    """
+    print("\nRapid reset")
+    with Server() as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            status, _, _ = await client.request("GET", "/")
+            is_("the connection works before the flood", status, 200)
+
+            # /slow never answers within the test, so nothing earns its
+            # cancellation back and the allowance only falls. The pairs go out
+            # together, the way an attacker would send them: a response that
+            # had already finished would be a race, not a reset, and is
+            # charged nothing.
+            sent = 0
+            for _ in range(12):
+                if client.terminated is not None:
+                    break
+                for _ in range(32):
+                    try:
+                        stream_id = client.start("GET", "/slow?5")
+                    except ValueError:
+                        break       # out of stream credit; let the server catch up
+                    client._quic.reset_stream(stream_id, 0x010c)
+                    sent += 1
+                client.transmit()
+                await asyncio.sleep(0.15)
+
+            check("the peer is cut off for cancelling what it never finished",
+                  client.terminated is not None, "%d resets sent, still open" % sent)
+            if client.terminated is not None:
+                is_("and told why", client.terminated.error_code, 0x0107)  # H3_EXCESSIVE_LOAD
 
 
 async def spoofed_address():
@@ -685,7 +731,7 @@ async def main():
         return 0
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
-    for test in (basics, request_bodies, multiplexing, cancellation,
+    for test in (basics, request_bodies, multiplexing, cancellation, rapid_reset,
                  spoofed_address, large_headers, response_framing, flow_control, long_lived,
                  key_update, wsgi, alt_svc):
         try:
