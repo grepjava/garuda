@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/peregrine-main.png" alt="peregrine" width="360">
+  <img src="assets/peregrine-impact.png" alt="peregrine" width="360">
 </p>
 
 # Benchmarks
