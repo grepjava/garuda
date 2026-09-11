@@ -255,6 +255,28 @@ struct ChunkedDecoderTests {
         }
     }
 
+    @Test("a trailer field ends where it ends, however the reads fell")
+    func trailersResumable() {
+        // Found by pgfuzz. A trailer field skipped in one read, and then its
+        // own terminating LF arriving in the next, used to be read as the
+        // empty line that ends the trailer section -- so the message ended a
+        // line early for a peer that wrote slowly, and the CRLF it did not
+        // consume became the start of whatever came next.
+        let text = "1\r\na\r\n0\r\nX-Trailer: value\r\n\r\n"
+        for step in 1...text.utf8.count {
+            let (body, outcome) = decode(text, step: step)
+            #expect(body == "a", "step \(step)")
+            if case .finished = outcome {} else { Issue.record("step \(step): not finished") }
+        }
+        // The same line without the section terminator behind it is not the
+        // end of anything, at any step.
+        let unfinished = "1\r\na\r\n0\r\nX-Trailer: value\r\n"
+        for step in 1...unfinished.utf8.count {
+            let (_, outcome) = decode(unfinished, step: step)
+            if case .finished = outcome { Issue.record("step \(step): finished early") }
+        }
+    }
+
     @Test("chunk extensions are skipped")
     func extensions() {
         let text = "5;name=value\r\nhello\r\n0\r\n\r\n"

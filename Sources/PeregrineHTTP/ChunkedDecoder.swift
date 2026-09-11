@@ -12,7 +12,8 @@ import PeregrineCore
 public struct ChunkedDecoder {
     @usableFromInline
     enum State: UInt8 {
-        case size, ext, sizeLF, data, dataCR, dataLF, trailerLine, trailerCR, done
+        case size, ext, sizeLF, data, dataCR, dataLF
+        case trailerLine, trailerSkip, trailerCR, done
     }
 
     @usableFromInline var state: State = .size
@@ -98,7 +99,8 @@ public struct ChunkedDecoder {
                 state = .size
 
             case .trailerLine:
-                // Either the final CRLF, or a trailer field we skip.
+                // At the start of a line: either the empty one that ends the
+                // trailer section, or a trailer field to skip.
                 if base[i] == cCR {
                     i &+= 1
                     state = .trailerCR
@@ -108,8 +110,23 @@ public struct ChunkedDecoder {
                     consumed = i
                     return .finished
                 } else {
-                    let idx = findByte(base + i, count &- i, cLF)
-                    if idx < 0 { i = count } else { i &+= idx &+ 1 }
+                    state = .trailerSkip
+                }
+
+            case .trailerSkip:
+                // Inside a trailer field, whose content is ignored; only the
+                // LF that ends it matters. Being a state of its own is what
+                // makes that LF mean the same thing however the reads fell:
+                // finding it back in `.trailerLine` would read the end of a
+                // field as the empty line that ends the section, and end the
+                // message a line early whenever a field arrived split from its
+                // own terminator.
+                let idx = findByte(base + i, count &- i, cLF)
+                if idx < 0 {
+                    i = count
+                } else {
+                    i &+= idx &+ 1
+                    state = .trailerLine
                 }
 
             case .trailerCR:
