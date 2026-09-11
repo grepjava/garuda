@@ -26,6 +26,7 @@ try:
     import h2.connection
     import h2.errors
     import h2.events
+    import h2.exceptions
 except ImportError:
     sys.stderr.write("this script needs the h2 package: pip install h2\n")
     raise SystemExit(2)
@@ -355,6 +356,90 @@ def test_cancellation():
         c.close()
 
 
+def test_rapid_reset():
+    """CVE-2023-44487.
+
+    A reset frees the stream slot immediately, so the concurrency limit alone
+    never sees a peer that opens a stream and cancels it in the same breath --
+    while the server still decodes a header block, builds a request and starts
+    an application task for every one. What bounds it here is the ratio of
+    cancelled streams to answered ones, so the first half of this checks that
+    an ordinary client, which cancels among requests it completes, is left
+    alone.
+    """
+    print("\nRapid reset")
+    with Server() as server:
+        c = Client(server)
+        for _ in range(40):
+            done = c.request(path="/")
+            c.collect([done], deadline=10.0)
+            cancelled = c.request(path="/")
+            c.conn.reset_stream(cancelled, error_code=8)
+            c.flush()
+        s = c.request(path="/")
+        status, _, _, _ = c.collect([s], deadline=10.0)
+        is_("cancelling alongside completed requests is not penalised",
+            status.get(s), 200)
+        c.close()
+
+        # Now the same thing with nothing ever completed.
+        c = Client(server)
+        terminated = None
+        try:
+            for _ in range(12):
+                # One write carrying many HEADERS/RST_STREAM pairs, which is
+                # the shape of the attack: every stream is cancelled before
+                # the server has had a chance to answer any of them, so none
+                # of the cancellations is the harmless post-response race.
+                burst(c, 64)
+                # Drained as we go, or the server is talking into a socket
+                # buffer nobody reads and the GOAWAY never gets looked at.
+                c.step(timeout=0.05)
+                terminated = goaway_code(c)
+                if terminated is not None:
+                    break
+        except (OSError, h2.exceptions.H2Error):
+            pass
+        deadline = time.monotonic() + 5
+        while terminated is None and time.monotonic() < deadline:
+            try:
+                if not c.step(timeout=0.5):
+                    break
+            except (OSError, h2.exceptions.H2Error):
+                break
+            terminated = goaway_code(c)
+        is_("a flood of cancellations is told to enhance its calm",
+            None if terminated is None else int(terminated), 11)
+        c.close()
+
+        # The server itself is still there for everyone else.
+        c = Client(server)
+        s = c.request(path="/")
+        status, _, _, _ = c.collect([s], deadline=10.0)
+        is_("other connections are unaffected", status.get(s), 200)
+        c.close()
+
+
+def burst(client, count):
+    """Opens and cancels `count` streams in a single write."""
+    for _ in range(count):
+        stream = client.conn.get_next_available_stream_id()
+        client.conn.send_headers(stream, [
+            (":method", "GET"), (":scheme", "http"),
+            (":authority", "127.0.0.1:%d" % client.port), (":path", "/"),
+        ], end_stream=True)
+        client.conn.reset_stream(stream, error_code=8)
+    client.flush()
+
+
+def goaway_code(client):
+    """The error code from a GOAWAY, if one has arrived."""
+    for event in client.events:
+        if isinstance(event, h2.events.ConnectionTerminated):
+            return event.error_code
+    return None
+
+
 def test_large_headers():
     print("\nHeader blocks larger than a frame")
     with Server() as server:
@@ -512,7 +597,8 @@ def test_wsgi():
 def run_all():
     global FAIL
     for test in (test_basics, test_multiplexing, test_request_bodies,
-                 test_flow_control, test_cancellation, test_large_headers,
+                 test_flow_control, test_cancellation, test_rapid_reset,
+                 test_large_headers,
                  test_response_framing, test_wsgi):
         try:
             test()

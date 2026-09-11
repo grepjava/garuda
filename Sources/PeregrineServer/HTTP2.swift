@@ -66,6 +66,23 @@ public final class H2Connection {
     /// Trailers, which are decoded to keep HPACK in sync and then dropped.
     var headerIsTrailer = false
 
+    /// What is left of this connection's allowance for cancelled streams.
+    ///
+    /// A RST_STREAM frees the stream slot at once, so a peer that opens a
+    /// stream and cancels it in the same breath never reaches the concurrency
+    /// limit, while still making the server decode a header block, build a
+    /// request and start an application task for every one of them. That is
+    /// CVE-2023-44487, and a limit on concurrency is by construction no defence
+    /// against it.
+    ///
+    /// Cancelling is legitimate -- a browser does it whenever a user navigates
+    /// away -- so what is bounded is not the count but the ratio: every stream
+    /// this server answers buys back one cancellation, up to the cap. A client
+    /// that cancels among requests it also completes never notices; one that
+    /// only ever cancels spends the budget and is sent away.
+    var resetBudget: Int
+    let resetBudgetCap: Int
+
     var sentGoaway = false
     var peerGoneAway = false
     /// Set once the preface and our first SETTINGS have been exchanged.
@@ -78,6 +95,11 @@ public final class H2Connection {
         maxConcurrentStreams = config.h2MaxConcurrentStreams
         maxHeaderListSize = config.maxHeadSize
         recvWindow = initialWindowSize
+        // Deep enough that a whole window of streams can be cancelled at once,
+        // which is what a navigation away from a page full of subresources
+        // actually looks like.
+        resetBudgetCap = max(100, config.h2MaxConcurrentStreams * 2)
+        resetBudget = resetBudgetCap
         decoder = HPACKDecoder(maxTableSize: 4096)
     }
 
@@ -652,6 +674,17 @@ extension Worker {
         // The application finds out the way it finds out about any hang-up.
         let s = table[streamSlot]
         s.pointee.flags.insert(.disconnected)
+        // A cancellation that arrives after the response was already finished
+        // costs nothing and is charged nothing: it is a race, not a reset.
+        if !s.pointee.flags.contains(.endStreamSent) {
+            h2.resetBudget &-= 1
+            if h2.resetBudget <= 0 {
+                Log.warn("h2 peer cancelled far more streams than it completed")
+                // The connection goes, and takes this stream with it.
+                connectionError(slot, .enhanceYourCalm)
+                return
+            }
+        }
         closeStream(streamSlot, resetWith: nil)
     }
 
@@ -946,6 +979,8 @@ extension Worker {
             // is not coming, and the client would have no way to tell that
             // from a server still thinking.
             s.pointee.flags.insert(.endStreamSent)
+            // An answered stream earns back one cancellation.
+            if h2.resetBudget < h2.resetBudgetCap { h2.resetBudget &+= 1 }
             if short {
                 writeRstStream(parent, s.pointee.streamID, .internalError)
             } else {
