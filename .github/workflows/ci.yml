@@ -15,7 +15,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -114,9 +113,19 @@ jobs:
 
   macos:
     name: macos · python 3.13
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      # The Xcode this image selects by default can be older than the tools
+      # version the package declares -- it was Swift 5.10 the first time this
+      # ran. The newest one installed is not, and asking for the newest rather
+      # than a version number survives the image being updated.
+      - name: Newest installed Xcode
+        run: |
+          newest=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$newest" ]; then sudo xcode-select -s "$newest"; fi
+          swift --version
 
       - name: Homebrew packages
         run: brew install pkg-config openssl@3 python@3.13

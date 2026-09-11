@@ -890,13 +890,31 @@ def test_wsgi_streaming():
     for label, extra in (("inline", []), ("pooled", ["--wsgi-threads", "4"])):
         port = free_port()
         with Server(*extra, port=port, app="wsgi_app:application") as server:
-            before, total, widest = bytes_before_the_pause(server, "/bigwrite?3.0")
+            sleeps = 3.0
+            before, total, widest = bytes_before_the_pause(server,
+                                                           "/bigwrite?%.1f" % sleeps)
             block = 8 * 1024 * 1024
-            check("%s: an 8 MiB write() is drained before the application "
-                  "continues (%.2f of 8.00 MiB before a %.1fs pause)"
+            # The failure being looked for is bytes stranded in the server
+            # while the application sleeps: the client waits out the sleep and
+            # only then gets the rest. That shows up as a gap the length of the
+            # sleep with the block still owed.
+            #
+            # The longest gap is only that sleep if it is anywhere near as
+            # long. A slow reader stalls a sender for a fraction of a second
+            # routinely, and on the pooled path the loop keeps writing while
+            # the application sleeps, so there may be no long gap at all --
+            # which is itself proof that nothing was stranded. Taking the
+            # longest gap for the sleep regardless is how this check used to
+            # measure a 0.7s stall on a busy machine and call 32 KB the whole
+            # response.
+            stranded = widest >= sleeps / 2 and before < block
+            check("%s: an 8 MiB write() is not left in the server's buffer "
+                  "while the application sleeps (%.2f of 8.00 MiB before the "
+                  "longest gap, %.1fs)"
                   % (label, before / (1024.0 * 1024.0), widest),
-                  before >= block, "%d bytes of %d arrived before the pause; "
-                  "the rest was stranded in the server's buffer" % (before, block))
+                  not stranded, "%d bytes of %d arrived before a %.1fs pause; "
+                  "the rest was stranded in the server's buffer"
+                  % (before, block, widest))
             check("%s: the whole 8 MiB response still arrives" % label,
                   total >= block, "got %d bytes" % total)
 
