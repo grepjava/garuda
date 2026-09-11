@@ -353,13 +353,13 @@ code, because a test written against the same understanding as the code proves
 only that the understanding is consistent.
 
 ```bash
-swift test                                      # 126 unit tests: parser,
+swift test                                      # 127 unit tests: parser,
                                                 #   chunking, buffers, writer,
                                                 #   websocket framing, HPACK,
                                                 #   QUIC packet protection,
                                                 #   and the fuzz corpus
-bash scripts/integration-test.sh                #  45 end-to-end checks
-python3 scripts/feature-test.py                 # 159 checks for the failure
+bash scripts/integration-test.sh                #  47 end-to-end checks
+python3 scripts/feature-test.py                 # 178 checks for the failure
                                                 #   modes a plain request never
                                                 #   reaches: slow consumers,
                                                 #   stuck-request shutdown,
@@ -368,8 +368,8 @@ python3 scripts/feature-test.py                 # 159 checks for the failure
 bash scripts/framework-test.sh                  #  30 checks against real
                                                 #   FastAPI and Django apps,
                                                 #   over HTTP/1.1 and HTTP/2
-<venv>/bin/python scripts/http2-test.py         # 140 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
+<venv>/bin/python scripts/http2-test.py         # 146 checks against `h2`
+<venv>/bin/python scripts/http3-test.py         #  73 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only: routing,
                                                 #   converters, session helper
 <venv>/bin/python scripts/webtransport-test.py  # 115 including the above,

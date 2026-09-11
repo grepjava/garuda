@@ -105,7 +105,13 @@ implementations disagree about where a message ends:
   field's coding was not the final one: also a 400;
 - `obs-fold` continuation lines are rejected rather than unfolded;
 - HTTP/1.1 without `Host` is a 400, and so is a second `Host`, whether or not
-  the two agree (RFC 9112 3.2).
+  the two agree (RFC 9112 3.2);
+- the chunked trailer section is bounded by `--max-header-size`, the same limit
+  the header section at the front of the message gets. Trailers decode to no
+  body, so `--max-body` never grows while they arrive, and without a ceiling of
+  their own a peer could stream them for as long as it liked and hold a
+  connection, a slot and a read buffer for free. Past the limit the request is
+  a 431.
 
 On the response side, an application header containing CR or LF is refused
 outright — the classic response-splitting hole. On the request side, header
@@ -181,6 +187,24 @@ peer's window allows it, which is what makes `await send()` apply backpressure
 on a multiplexed connection; the window is only given back as the application
 actually reads the request body, so an upload nobody is consuming stops rather
 than filling memory.
+
+### Cancellation has a budget
+
+`RST_STREAM` frees a stream slot at once, so a limit on concurrent streams is
+by construction no defence against a peer that opens a stream and cancels it in
+the same breath: the count never rises, while the server still decodes a header
+block, builds a request and starts an application task for every one. That is
+CVE-2023-44487, the rapid reset.
+
+Cancelling is legitimate — a browser does it whenever a user navigates away —
+so what is bounded here is not the count but the ratio. A connection starts
+with an allowance of twice the concurrent-stream limit it advertises (256),
+every cancelled stream that was never answered spends one, and every stream the
+server does answer earns one back. A client that cancels among requests it also
+completes never comes near it; one that only ever cancels spends the allowance
+and is sent `GOAWAY(ENHANCE_YOUR_CALM)`. A reset that arrives after the
+response was already finished is a race rather than an attack, and costs
+nothing.
 
 Conformance is checked with [h2spec](https://github.com/summerwind/h2spec):
 **146/146 over TLS**, for ASGI and WSGI alike.
@@ -483,8 +507,8 @@ code, because a test written against the same understanding as the code proves
 only that the understanding is consistent.
 
 ```bash
-<venv>/bin/python scripts/http2-test.py         # 116 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  74 checks against `aioquic`
+<venv>/bin/python scripts/http2-test.py         # 146 checks against `h2`
+<venv>/bin/python scripts/http3-test.py         #  73 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only
 <venv>/bin/python scripts/webtransport-test.py  # 115 including FastAPI/Django
 
