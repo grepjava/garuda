@@ -165,8 +165,14 @@ jobs:
       - name: Integration tests
         run: bash scripts/integration-test.sh .build/release/peregrine
 
+      # A versioned Homebrew python puts `python3.13` in its bin and keeps
+      # `python3` in libexec, so the interpreter has to be named in full. It is
+      # named at all -- rather than left to whatever `python3` is on PATH --
+      # because it is the one the binary under test was linked against.
       - name: Feature tests
-        run: "$(brew --prefix python@3.13)/bin/python3 scripts/feature-test.py .build/release/peregrine"
+        run: |
+          "$(brew --prefix python@3.13)/bin/python3.13" \
+            scripts/feature-test.py .build/release/peregrine
 
   fuzz:
     name: fuzz · address sanitizer

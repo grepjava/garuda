@@ -571,10 +571,17 @@ def test_backpressure():
             peak = max(peak, server.rss_kb())
         s.close()
 
-        growth = peak - baseline
-        check("a slow consumer does not grow the worker without bound "
-              "(baseline %d KB, peak %d KB, read %d KB)" % (baseline, peak, read // 1024),
-              growth < 65536, "grew by %d KB" % growth)
+        # rss_kb reads /proc, so there is no number to compare on a platform
+        # without one. Saying so is better than subtracting -1 from -1 and
+        # reporting that nothing grew.
+        if baseline < 0 or peak < 0:
+            print("  --   skipped: no /proc to read the worker's RSS from")
+        else:
+            growth = peak - baseline
+            check("a slow consumer does not grow the worker without bound "
+                  "(baseline %d KB, peak %d KB, read %d KB)"
+                  % (baseline, peak, read // 1024),
+                  growth < 65536, "grew by %d KB" % growth)
         # The producer must actually have been throttled rather than finishing.
         check("the producer was throttled rather than buffering the response",
               read < 268435456, "read the whole 256 MB")
