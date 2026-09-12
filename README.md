@@ -261,8 +261,10 @@ peregrine [options] MODULE:ATTRIBUTE
   --lifespan-scope WHICH   with --free-threaded, run the lifespan per worker
                            thread (worker, default) or once for the whole
                            process (process)
-  --tls-cert PATH          PEM certificate chain; enables TLS with ALPN
-  --tls-key PATH           PEM private key for it
+  --tls-cert PATH          PEM certificate chain; enables TLS with ALPN.
+                           Repeatable, with a --tls-key each: the first pair
+                           is the default and the rest are chosen by SNI
+  --tls-key PATH           PEM private key for the preceding --tls-cert
   --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
   --no-http2               refuse HTTP/2 and answer HTTP/1.1 only
   --http2-only             serve only HTTP/2 (h2c), with no HTTP/1 fallback
@@ -274,6 +276,10 @@ peregrine [options] MODULE:ATTRIBUTE
   --ws-ping-timeout MS     how long an unanswered ping may go (20000)
   --ws-max-queue N         messages buffered for a slow app (default 32)
   --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
+  --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
+                           without calling the application (repeatable)
+  --health-check-path P    answer P with 200 in the server, without calling
+                           the application (e.g. /healthz)
   --access-log             log one line per request
   --access-log-format F    text (default) or json; implies --access-log
   --metrics-port PORT      serve Prometheus metrics on this port
@@ -285,10 +291,14 @@ The protocol is detected by inspecting the callable: a coroutine function, or
 one taking three positional parameters, is ASGI; two parameters is WSGI. Force
 it with `--protocol` if your application is wrapped in something opaque.
 
-`SIGTERM` or `SIGINT` drains gracefully, with a deadline; `SIGHUP` restarts the
-workers without dropping the listening socket. The
-[shutdown sequence](ARCHITECTURE.md#shutdown) is more careful than it looks,
-and deliberately so.
+`SIGTERM` or `SIGINT` drains gracefully, with a deadline. `SIGHUP` replaces
+every worker one at a time, each replacement accepting on the socket its
+predecessor had before that one is asked to stop, so nothing is refused and
+nothing is reset -- which also makes it the certbot deploy hook, because the
+replacements read the certificate off disk again. See
+[reloading without a restart](CONFIG.md#reloading-without-a-restart), and the
+[shutdown sequence](ARCHITECTURE.md#shutdown), which is more careful than it
+looks and deliberately so.
 
 ### Behind a reverse proxy
 
@@ -406,7 +416,13 @@ schedule, the header protection and the sample packets are the RFC's own bytes.
 ## What is not
 
 - **`sendfile` for `wsgi.file_wrapper`.** The wrapper works and streams in
-  chunks, but does not yet drop into `sendfile(2)`.
+  chunks, but does not yet drop into `sendfile(2)` the way `--static-dir`
+  does.
+- **Byte ranges and directory indexes for `--static-dir`.** It serves assets
+  with an `ETag` and answers `If-None-Match`; it is not a file server.
+- **SNI for HTTP/3.** Several certificates are chosen by name over TCP;
+  HTTP/3 serves the first pair whatever the client asks for, because the QUIC
+  handshake here is built from the primitives rather than driven by OpenSSL.
 - **QUIC connection migration across workers, and 0-RTT.** A connection
   survives a change of address, but not a change of worker, and every handshake
   is a full one.
