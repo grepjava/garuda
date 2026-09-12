@@ -25,6 +25,35 @@ import sys
 import traceback
 
 
+# Set by the server to a callable of (level: int, message: str). Levels match
+# LogLevel: 0 debug, 1 info, 2 warning, 3 error.
+_log_sink = None
+_log_level = 1
+
+
+def _install_log(sink, level):
+    global _log_sink, _log_level
+    _log_sink = sink
+    _log_level = level
+
+
+def log_level():
+    """The server's --log-level, as the integer the sink expects."""
+    return _log_level
+
+
+def log(level, message):
+    """Writes one line through the server's logger.
+
+    Used by peregrine.logging to put Python's logging output into the same
+    stream, in the same format, behind the same level -- so a collector sees
+    one log rather than two that happen to share a file descriptor.
+    """
+    sink = _log_sink
+    if sink is not None:
+        sink(level, message)
+
+
 def detect_protocol(app):
     """Classify a callable as a WSGI or an ASGI application."""
     target = app

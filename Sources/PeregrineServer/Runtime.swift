@@ -727,6 +727,11 @@ public enum Peregrine {
             return nil
         }
 
+        // Before the application is imported, so that a logging call at module
+        // level in the application is already going to the server's log rather
+        // than to whatever logging falls back to.
+        installPythonLogging()
+
         var appRef = Interpreter.loadApplication(config.appSpec)
         guard var app = appRef.optional else {
             Log.error("could not load the application")
