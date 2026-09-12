@@ -31,6 +31,20 @@ int pg_tls_available(void);
 pg_tls_ctx *pg_tls_ctx_new(const char *cert_path, const char *key_path,
                            const char *alpn, const char *ciphers,
                            char *err, size_t err_len);
+/* Adds another certificate, for SNI. The first one given to pg_tls_ctx_new is
+ * the default; these are chosen by the name the client asks for, matched
+ * against the DNS names inside each certificate. Returns 0 and fills `err` on
+ * failure. */
+int pg_tls_ctx_add(pg_tls_ctx *ctx, const char *cert_path, const char *key_path,
+                   const char *ciphers, char *err, size_t err_len);
+
+/* How many certificates are loaded, and the names of each -- for the start-up
+ * log, so an operator can see what the server believes it can serve. Returns 0
+ * when the index is past the end. */
+int pg_tls_ctx_host_count(pg_tls_ctx *ctx);
+int pg_tls_ctx_names(pg_tls_ctx *ctx, int host_index, int name_index,
+                     char *out, size_t out_len);
+
 void pg_tls_ctx_free(pg_tls_ctx *ctx);
 
 pg_tls *pg_tls_new(pg_tls_ctx *ctx, int fd);

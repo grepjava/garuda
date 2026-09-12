@@ -38,6 +38,18 @@ pg_tls_ctx *pg_tls_ctx_new(const char *cert_path, const char *key_path,
     }
     return NULL;
 }
+int pg_tls_ctx_add(pg_tls_ctx *ctx, const char *cert_path, const char *key_path,
+                   const char *ciphers, char *err, size_t err_len) {
+    (void)ctx; (void)cert_path; (void)key_path; (void)ciphers;
+    if (err && err_len) snprintf(err, err_len, "this binary was built without OpenSSL");
+    return 0;
+}
+int pg_tls_ctx_host_count(pg_tls_ctx *ctx) { (void)ctx; return 0; }
+int pg_tls_ctx_names(pg_tls_ctx *ctx, int host_index, int name_index,
+                     char *out, size_t out_len) {
+    (void)ctx; (void)host_index; (void)name_index; (void)out; (void)out_len;
+    return 0;
+}
 void pg_tls_ctx_free(pg_tls_ctx *ctx) { (void)ctx; }
 pg_tls *pg_tls_new(pg_tls_ctx *ctx, int fd) { (void)ctx; (void)fd; return NULL; }
 void pg_tls_free(pg_tls *tls) { (void)tls; }
@@ -58,10 +70,32 @@ void pg_tls_shutdown(pg_tls *tls) { (void)tls; }
 #else
 
 #include <stdio.h>
+#include <strings.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>
+
+/* One certificate, with the names it is valid for.
+ *
+ * The names come out of the certificate rather than from configuration: a
+ * certificate already carries the list of hosts it is good for, in its subject
+ * alternative names, and asking the operator to repeat it is asking them to
+ * get it wrong. */
+struct pg_tls_host {
+    SSL_CTX *ctx;
+    char **names;
+    int name_count;
+};
+
+#define PG_TLS_MAX_HOSTS 64
 
 struct pg_tls_ctx {
+    struct pg_tls_host hosts[PG_TLS_MAX_HOSTS];
+    int host_count;
+    /* hosts[0]: what a client with no SNI, or an unrecognised one, is served.
+     * Answering with the first certificate rather than refusing is what every
+     * other server does, and it leaves the decision with the client, which can
+     * see the name mismatch and say so in terms its user understands. */
     SSL_CTX *ctx;
     /* ALPN preference list in wire format: length-prefixed, most preferred
      * first. Held here because the callback runs per connection. */
@@ -139,24 +173,84 @@ static int alpn_select(SSL *ssl, const unsigned char **out, unsigned char *out_l
     return SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
-int pg_tls_available(void) { return 1; }
+/* Remembers one name a certificate is valid for. Names arrive as ASN.1
+ * strings, which are counted rather than terminated and may legally contain an
+ * embedded NUL -- a name like that is a forgery attempt, so it is dropped. */
+static void add_name(struct pg_tls_host *host, const char *name, int len) {
+    if (len <= 0 || len > 255) return;
+    if (memchr(name, 0, (size_t)len) != NULL) return;
+    char **grown = realloc(host->names, (size_t)(host->name_count + 1) * sizeof *grown);
+    if (!grown) return;
+    host->names = grown;
+    char *copy = malloc((size_t)len + 1);
+    if (!copy) return;
+    memcpy(copy, name, (size_t)len);
+    copy[len] = 0;
+    host->names[host->name_count++] = copy;
+}
 
-pg_tls_ctx *pg_tls_ctx_new(const char *cert_path, const char *key_path,
-                           const char *alpn, const char *ciphers,
-                           char *err, size_t err_len) {
-    struct pg_tls_ctx *wrapper = calloc(1, sizeof *wrapper);
-    if (!wrapper) {
-        if (err && err_len) snprintf(err, err_len, "out of memory");
-        return NULL;
-    }
-    wrapper->ctx = SSL_CTX_new(TLS_server_method());
-    if (!wrapper->ctx) {
-        last_error(err, err_len, "cannot create a TLS context");
-        free(wrapper);
-        return NULL;
-    }
-    SSL_CTX *ctx = wrapper->ctx;
+/* The DNS names in a certificate: its subject alternative names, or its common
+ * name when it has none. CN is deprecated for this and still turns up in
+ * certificates people generate by hand for a private service. */
+static void collect_names(struct pg_tls_host *host) {
+    X509 *cert = SSL_CTX_get0_certificate(host->ctx);
+    if (!cert) return;
 
+    GENERAL_NAMES *sans = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+    if (sans) {
+        int n = sk_GENERAL_NAME_num(sans);
+        for (int i = 0; i < n; i++) {
+            const GENERAL_NAME *entry = sk_GENERAL_NAME_value(sans, i);
+            if (!entry || entry->type != GEN_DNS) continue;
+            add_name(host, (const char *)ASN1_STRING_get0_data(entry->d.dNSName),
+                     ASN1_STRING_length(entry->d.dNSName));
+        }
+        GENERAL_NAMES_free(sans);
+    }
+
+    if (host->name_count == 0) {
+        char common[256];
+        int len = X509_NAME_get_text_by_NID(X509_get_subject_name(cert),
+                                            NID_commonName, common, sizeof common);
+        if (len > 0) add_name(host, common, len);
+    }
+}
+
+/* RFC 6125 name matching: case-insensitive, and a wildcard covers exactly one
+ * label. `*.example.com` is a.example.com but not a.b.example.com, and not
+ * example.com itself. */
+static int host_matches(const char *pattern, const char *host) {
+    if (pattern[0] == '*' && pattern[1] == '.') {
+        const char *dot = strchr(host, '.');
+        if (!dot) return 0;
+        return strcasecmp(dot + 1, pattern + 2) == 0;
+    }
+    return strcasecmp(pattern, host) == 0;
+}
+
+/* Picks the certificate for the name the client asked for. */
+static int sni_select(SSL *ssl, int *unused_alert, void *arg) {
+    (void)unused_alert;
+    struct pg_tls_ctx *wrapper = (struct pg_tls_ctx *)arg;
+    const char *asked = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (!asked || !*asked) return SSL_TLSEXT_ERR_OK;
+
+    for (int i = 0; i < wrapper->host_count; i++) {
+        for (int j = 0; j < wrapper->hosts[i].name_count; j++) {
+            if (!host_matches(wrapper->hosts[i].names[j], asked)) continue;
+            SSL_set_SSL_CTX(ssl, wrapper->hosts[i].ctx);
+            return SSL_TLSEXT_ERR_OK;
+        }
+    }
+    /* Unrecognised: the default certificate, and the client decides. */
+    return SSL_TLSEXT_ERR_OK;
+}
+
+/* Everything that is the same for every certificate. SSL_set_SSL_CTX swaps the
+ * certificate but carries almost nothing else over, so each context has to be
+ * able to stand on its own. */
+static int configure_common(SSL_CTX *ctx, struct pg_tls_ctx *wrapper,
+                            const char *ciphers, char *err, size_t err_len) {
     /* TLS 1.2 is the floor; everything below it is broken in public. */
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION
@@ -168,49 +262,121 @@ pg_tls_ctx *pg_tls_ctx_new(const char *cert_path, const char *key_path,
     if (ciphers && *ciphers) {
         if (SSL_CTX_set_cipher_list(ctx, ciphers) != 1) {
             last_error(err, err_len, "no usable ciphers in the list given");
-            SSL_CTX_free(ctx);
-            free(wrapper);
-            return NULL;
+            return 0;
         }
     }
+    if (wrapper->alpn) SSL_CTX_set_alpn_select_cb(ctx, alpn_select, wrapper);
+    return 1;
+}
 
+/* Loads a certificate and key into a fresh context and records its names. */
+static int add_host(struct pg_tls_ctx *wrapper, const char *cert_path,
+                    const char *key_path, const char *ciphers,
+                    char *err, size_t err_len) {
+    if (wrapper->host_count >= PG_TLS_MAX_HOSTS) {
+        if (err && err_len) snprintf(err, err_len, "too many certificates");
+        return 0;
+    }
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        last_error(err, err_len, "cannot create a TLS context");
+        return 0;
+    }
+    if (!configure_common(ctx, wrapper, ciphers, err, err_len)) {
+        SSL_CTX_free(ctx);
+        return 0;
+    }
     if (SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1) {
         last_error(err, err_len, "cannot load the certificate");
         SSL_CTX_free(ctx);
-        free(wrapper);
-        return NULL;
+        return 0;
     }
     if (SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) != 1) {
         last_error(err, err_len, "cannot load the private key");
         SSL_CTX_free(ctx);
-        free(wrapper);
-        return NULL;
+        return 0;
     }
     if (SSL_CTX_check_private_key(ctx) != 1) {
         last_error(err, err_len, "the private key does not match the certificate");
         SSL_CTX_free(ctx);
-        free(wrapper);
+        return 0;
+    }
+
+    struct pg_tls_host *host = &wrapper->hosts[wrapper->host_count++];
+    host->ctx = ctx;
+    host->names = NULL;
+    host->name_count = 0;
+    collect_names(host);
+    return 1;
+}
+
+int pg_tls_available(void) { return 1; }
+
+int pg_tls_ctx_add(pg_tls_ctx *wrapper, const char *cert_path, const char *key_path,
+                   const char *ciphers, char *err, size_t err_len) {
+    if (!wrapper) return 0;
+    return add_host(wrapper, cert_path, key_path, ciphers, err, err_len);
+}
+
+int pg_tls_ctx_names(pg_tls_ctx *wrapper, int host_index, int name_index,
+                     char *out, size_t out_len) {
+    if (!wrapper || host_index < 0 || host_index >= wrapper->host_count) return 0;
+    struct pg_tls_host *host = &wrapper->hosts[host_index];
+    if (name_index < 0 || name_index >= host->name_count) return 0;
+    if (out && out_len) snprintf(out, out_len, "%s", host->names[name_index]);
+    return 1;
+}
+
+int pg_tls_ctx_host_count(pg_tls_ctx *wrapper) {
+    return wrapper ? wrapper->host_count : 0;
+}
+
+pg_tls_ctx *pg_tls_ctx_new(const char *cert_path, const char *key_path,
+                           const char *alpn, const char *ciphers,
+                           char *err, size_t err_len) {
+    struct pg_tls_ctx *wrapper = calloc(1, sizeof *wrapper);
+    if (!wrapper) {
+        if (err && err_len) snprintf(err, err_len, "out of memory");
         return NULL;
     }
 
+    /* Before the first context, so that `configure_common` can install the
+     * callback on every one of them. */
     if (alpn && *alpn) {
         wrapper->alpn = encode_alpn(alpn, &wrapper->alpn_len);
         if (!wrapper->alpn) {
             if (err && err_len) snprintf(err, err_len, "out of memory");
-            SSL_CTX_free(ctx);
             free(wrapper);
             return NULL;
         }
-        SSL_CTX_set_alpn_select_cb(ctx, alpn_select, wrapper);
     }
+
+    if (!add_host(wrapper, cert_path, key_path, ciphers, err, err_len)) {
+        free(wrapper->alpn);
+        free(wrapper);
+        return NULL;
+    }
+
+    /* The first certificate is the default, and the one the SNI callback hangs
+     * off: the callback runs before the context is swapped, so it has to be
+     * installed on whichever context the connection starts on. */
+    wrapper->ctx = wrapper->hosts[0].ctx;
+    SSL_CTX_set_tlsext_servername_callback(wrapper->ctx, sni_select);
+    SSL_CTX_set_tlsext_servername_arg(wrapper->ctx, wrapper);
     return wrapper;
 }
 
-void pg_tls_ctx_free(pg_tls_ctx *ctx) {
-    if (!ctx) return;
-    if (ctx->ctx) SSL_CTX_free(ctx->ctx);
-    free(ctx->alpn);
-    free(ctx);
+void pg_tls_ctx_free(pg_tls_ctx *wrapper) {
+    if (!wrapper) return;
+    for (int i = 0; i < wrapper->host_count; i++) {
+        for (int j = 0; j < wrapper->hosts[i].name_count; j++) {
+            free(wrapper->hosts[i].names[j]);
+        }
+        free(wrapper->hosts[i].names);
+        if (wrapper->hosts[i].ctx) SSL_CTX_free(wrapper->hosts[i].ctx);
+    }
+    free(wrapper->alpn);
+    free(wrapper);
 }
 
 pg_tls *pg_tls_new(pg_tls_ctx *ctx, int fd) {

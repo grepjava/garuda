@@ -94,8 +94,11 @@ func printUsage() {
                                awaits it) or exactly once for the process
                                (process, for start-up that opens nothing
                                loop-bound)
-      --tls-cert PATH          PEM certificate chain; enables TLS with ALPN
-      --tls-key PATH           PEM private key for it
+      --tls-cert PATH          PEM certificate chain; enables TLS with ALPN.
+                               Repeatable, with a --tls-key each: the first
+                               pair is the default and the rest are picked by
+                               SNI, using the names inside each certificate
+      --tls-key PATH           PEM private key for the preceding --tls-cert
       --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
       --no-http2               refuse HTTP/2 and answer HTTP/1.1 only
       --http2-only             serve only HTTP/2 (h2c), with no HTTP/1 fallback
@@ -176,6 +179,12 @@ func printVersion() {
 }
 
 var config = ServerConfig()
+
+// --tls-cert and --tls-key are repeatable and paired by the order they appear,
+// so that a server with several names carries several certificates. The first
+// pair is the default; the rest are chosen by SNI.
+var tlsCerts: [UnsafePointer<CChar>] = []
+var tlsKeys: [UnsafePointer<CChar>] = []
 var sawApp = false
 var schemeGiven = false
 var portSet = false
@@ -250,10 +259,10 @@ while i < argc {
         schemeGiven = true
     } else if matches(arg, "--tls-cert") {
         guard let v = next("--tls-cert needs a path") else { break }
-        config.tlsCertPath = v
+        tlsCerts.append(v)
     } else if matches(arg, "--tls-key") {
         guard let v = next("--tls-key needs a path") else { break }
-        config.tlsKeyPath = v
+        tlsKeys.append(v)
     } else if matches(arg, "--tls-ciphers") {
         guard let v = next("--tls-ciphers needs an OpenSSL cipher list") else { break }
         config.tlsCiphers = v
@@ -414,6 +423,21 @@ while i < argc {
 
 if failed {
     exit(2)
+}
+
+// Pair the certificates with their keys, in the order they were given. An
+// unequal count is a mistake worth stopping for: pairing what is there and
+// ignoring the remainder would serve the wrong certificate for a name, which
+// shows up as a browser warning rather than as an error here.
+if tlsCerts.count != tlsKeys.count {
+    Log.error("--tls-cert and --tls-key go together, one key per certificate")
+    exit(2)
+}
+if let cert = tlsCerts.first, let key = tlsKeys.first {
+    config.tlsCertPath = cert
+    config.tlsKeyPath = key
+    config.tlsExtraCerts = Array(zip(tlsCerts.dropFirst(), tlsKeys.dropFirst()))
+        .map { (cert: $0.0, key: $0.1) }
 }
 
 // Workers as threads only mean anything on an interpreter that can run them in

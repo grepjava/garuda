@@ -65,7 +65,8 @@ public enum Peregrine {
                 Log.error("this build has no TLS support; rebuild against OpenSSL")
                 return 1
             }
-            guard makeTLSContext(config) != nil else { return 1 }
+            guard let context = makeTLSContext(config) else { return 1 }
+            context.logCertificateNames()
         }
 
         let workerCount = config.resolvedWorkers
@@ -115,8 +116,14 @@ public enum Peregrine {
         } else {
             alpn = staticCString("h2,http/1.1")
         }
-        return TLSContext.make(certPath: cert, keyPath: key,
-                               alpn: alpn, ciphers: config.tlsCiphers)
+        guard let context = TLSContext.make(certPath: cert, keyPath: key,
+                                            alpn: alpn, ciphers: config.tlsCiphers)
+        else { return nil }
+        for extra in config.tlsExtraCerts {
+            guard context.add(certPath: extra.cert, keyPath: extra.key,
+                              ciphers: config.tlsCiphers) else { return nil }
+        }
+        return context
     }
 
     /// Builds the QUIC listener. QUIC cannot borrow the SSL_CTX the TCP listener

@@ -135,8 +135,23 @@ public struct ServerConfig {
 
     // --- tls ---
     /// PEM certificate chain and private key. Both or neither.
+    ///
+    /// This is the default pair: what a client that sends no SNI, or asks for
+    /// a name no certificate claims, is served.
     public var tlsCertPath: UnsafePointer<CChar>? = nil
     public var tlsKeyPath: UnsafePointer<CChar>? = nil
+    /// Further certificate/key pairs, chosen per connection by SNI.
+    ///
+    /// Which names each one covers is read out of the certificate itself --
+    /// its subject alternative names, or its common name if it has none --
+    /// rather than configured alongside it. The certificate already carries
+    /// that list, and a second copy of it in a command line is a second copy
+    /// to get wrong.
+    ///
+    /// TCP only. HTTP/3 serves the default pair whatever the client asks for:
+    /// the QUIC handshake here is written from the primitives rather than
+    /// driven by OpenSSL, and it has no SNI selection of its own yet.
+    public var tlsExtraCerts: [(cert: UnsafePointer<CChar>, key: UnsafePointer<CChar>)] = []
     /// OpenSSL cipher list for TLS 1.2. TLS 1.3 suites are not configurable
     /// here and do not need to be.
     public var tlsCiphers: UnsafePointer<CChar>? = nil

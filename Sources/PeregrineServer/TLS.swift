@@ -55,6 +55,60 @@ public final class TLSContext {
         return TLSContext(raw: ctx)
     }
 
+    /// Adds another certificate for SNI to choose from.
+    public func add(certPath: UnsafePointer<CChar>,
+                    keyPath: UnsafePointer<CChar>,
+                    ciphers: UnsafePointer<CChar>?) -> Bool {
+        var error = [CChar](repeating: 0, count: 256)
+        let ok = error.withUnsafeMutableBufferPointer { buffer in
+            pg_tls_ctx_add(raw, certPath, keyPath, ciphers, buffer.baseAddress, 256)
+        }
+        if ok == 0 {
+            error.withUnsafeBufferPointer { buffer in
+                guard let base = buffer.baseAddress else { return }
+                var n = 0
+                while n < 256 && base[n] != 0 { n += 1 }
+                Log.error { line in
+                    line.str("tls: ")
+                    base.withMemoryRebound(to: UInt8.self, capacity: n) { p in
+                        line.bytes(p, n)
+                    }
+                }
+            }
+            return false
+        }
+        return true
+    }
+
+    /// Logs what each loaded certificate claims to be good for, so that a
+    /// name served by the wrong certificate is visible at start-up rather
+    /// than in a browser warning.
+    public func logCertificateNames() {
+        let hosts = Int(pg_tls_ctx_host_count(raw))
+        guard hosts > 1 else { return }
+        var name = [CChar](repeating: 0, count: 256)
+        for host in 0..<hosts {
+            var index = 0
+            while true {
+                let found = name.withUnsafeMutableBufferPointer { buffer -> Bool in
+                    guard let base = buffer.baseAddress else { return false }
+                    guard pg_tls_ctx_names(raw, Int32(host), Int32(index), base, 256) != 0
+                    else { return false }
+                    Log.info { line in
+                        line.str("tls: certificate ")
+                        line.int(host + 1)
+                        if host == 0 { line.str(" (default)") }
+                        line.str(" serves ")
+                        line.cstr(base)
+                    }
+                    return true
+                }
+                if !found { break }
+                index += 1
+            }
+        }
+    }
+
     init(raw: OpaquePointer) { self.raw = raw }
 
     deinit { pg_tls_ctx_free(raw) }
