@@ -271,13 +271,17 @@ public enum Peregrine {
 
         /// Forks the worker for `slot`, handing it that slot's listener and
         /// letting it drop the handles on every other slot's.
-        func spawn(_ slot: Int) -> pid_t {
+        func spawn(_ slot: Int) -> (pid: pid_t, ready: Int32) {
             spawnWorker(config, listeners: listeners, listenerCount: count,
                         index: slot, metricsSlot: metricsSlotOf[slot])
         }
 
         for i in 0..<workers {
-            pids[i] = spawn(i)
+            let started = spawn(i)
+            // Nothing is waiting on readiness at start-up: there is no worker
+            // being replaced, so there is nothing to hold on to it for.
+            if started.ready >= 0 { _ = pg_close(started.ready) }
+            pids[i] = started.pid
             if pids[i] < 0 { return 1 }
         }
 
@@ -322,12 +326,54 @@ public enum Peregrine {
         /// silently skipped.
         var restartPending = false
 
+        // A handover in flight. The replacement has been forked and the worker
+        // it replaces has *not* been signalled yet, because until the
+        // replacement is actually accepting the old one is the only thing
+        // serving that slot. Retiring it first does not drop connections --
+        // the socket belongs to the supervisor -- but it does leave the slot's
+        // accept queue unserved for as long as an interpreter takes to boot.
+        var handoverSlot = -1
+        var handoverOld: pid_t = 0
+        var handoverReadyFD: Int32 = -1
+        var handoverDeadline: UInt64 = 0
+
+        /// How long to wait for a replacement to report ready before retiring
+        /// the old worker regardless.
+        ///
+        /// Generous, because the wait is safe: the worker being replaced is
+        /// still serving throughout it. This only bounds the case of a
+        /// replacement that is alive but never finishes importing, where the
+        /// alternative is a reload that was asked for and never happened.
+        let readyTimeoutMs: UInt64 = 60_000
+
         /// Signals every live worker -- including the ones already draining,
         /// which shutdown still has to reach -- and, past the grace period,
         /// kills it.
         func signalAll(_ sig: Int32) {
             for k in 0..<workers where retiring[k] > 0 { _ = pg_kill(retiring[k], sig) }
+            // Mid-handover the outgoing worker is in neither array, and a
+            // shutdown still has to reach it.
+            if handoverOld > 0 { _ = pg_kill(handoverOld, sig) }
             for k in 0..<workers where pids[k] > 0 { _ = pg_kill(pids[k], sig) }
+        }
+
+        /// Clears the handover state, releasing the readiness pipe.
+        func clearHandover() {
+            if handoverReadyFD >= 0 { _ = pg_close(handoverReadyFD) }
+            handoverSlot = -1
+            handoverOld = 0
+            handoverReadyFD = -1
+            handoverDeadline = 0
+        }
+
+        /// The replacement is accepting, so the worker it replaced can go.
+        func retireHandover() {
+            guard handoverSlot >= 0 else { return }
+            let slot = handoverSlot
+            let old = handoverOld
+            clearHandover()
+            retiring[slot] = old
+            _ = pg_kill(old, SIGTERM)
         }
 
         /// Replaces the slot at `restartCursor`, then advances. One slot is in
@@ -352,7 +398,7 @@ public enum Peregrine {
                 // being written to by the worker it is replacing.
                 flipMetricsSlot(i)
                 let fresh = spawn(i)
-                if fresh < 0 {
+                if fresh.pid < 0 {
                     // Keep the worker that is already serving. A failed fork is
                     // a bad moment to also give up the process that works.
                     Log.error("cannot spawn a replacement worker; keeping the current one")
@@ -361,12 +407,15 @@ public enum Peregrine {
                     restartPending = false
                     return
                 }
-                pids[i] = fresh
+                pids[i] = fresh.pid
                 alive += 1
-                retiring[i] = old
-                // Only now: the replacement is bound and accepting, so the old
-                // worker can leave the SO_REUSEPORT group without a gap.
-                _ = pg_kill(old, SIGTERM)
+                // The old worker is left alone until the replacement reports
+                // that it is accepting; see the handover state above. Both are
+                // serving the slot until then, which is the point.
+                handoverSlot = i
+                handoverOld = old
+                handoverReadyFD = fresh.ready
+                handoverDeadline = pg_monotonic_ms() &+ readyTimeoutMs
                 return
             }
             restartCursor = -1
@@ -391,11 +440,47 @@ public enum Peregrine {
         }
 
         while alive > 0 {
+            // A pending handover is the one thing this loop waits on that is
+            // not a signal, and the wait is measured in the tens of
+            // milliseconds an interpreter takes to boot, so the idle quarter
+            // second would be most of the delay it exists to remove.
+            let waitMs: Int32 = handoverReadyFD >= 0 ? 5 : 250
             var buf = (UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0))
             let n = withUnsafeMutableBytes(of: &buf) { raw -> Int in
-                let r = pg_poll_single(signalFD, 0, 250)
+                let r = pg_poll_single(signalFD, 0, waitMs)
                 if r <= 0 { return 0 }
                 return pg_read(signalFD, raw.baseAddress!, 8)
+            }
+
+            if handoverReadyFD >= 0 {
+                // Readable is the replacement saying it is accepting; an error
+                // is the pipe hanging up because it died first, which the reap
+                // below turns into keeping the worker it was replacing.
+                // Any event at all, then read to find out which it was. A
+                // worker signals by writing one byte and closing, so by the
+                // time the supervisor looks the pipe usually reports POLLIN and
+                // POLLHUP together and a poll cannot tell "ready" from "died
+                // during start-up" -- it reports the hangup either way. The
+                // read can: one byte is the signal, end of file is the death.
+                if pg_poll_single(handoverReadyFD, 0, 0) != 0 {
+                    var byte: UInt8 = 0
+                    let got = withUnsafeMutableBytes(of: &byte) { raw in
+                        pg_read(handoverReadyFD, raw.baseAddress!, 1)
+                    }
+                    if got == 1 {
+                        retireHandover()
+                    } else {
+                        // The reap below has the pid and puts the slot back;
+                        // all that is needed here is to stop watching a pipe
+                        // with nothing left to say.
+                        _ = pg_close(handoverReadyFD)
+                        handoverReadyFD = -1
+                    }
+                } else if handoverDeadline > 0 && pg_monotonic_ms() > handoverDeadline {
+                    Log.error("a replacement worker has not started serving after 60s;")
+                    Log.error("retiring the worker it replaces anyway, as the reload asked")
+                    retireHandover()
+                }
             }
             if n > 0 {
                 withUnsafeBytes(of: &buf) { raw in
@@ -440,6 +525,39 @@ public enum Peregrine {
                 if pid <= 0 { break }
                 alive -= 1
 
+                // A replacement that died before it ever served. The worker it
+                // was meant to replace has not been signalled and is still
+                // serving, so the slot goes back to it and the pass stops --
+                // replacing the rest with something that cannot start would
+                // turn one bad worker into no workers.
+                if handoverSlot >= 0 && pid == pids[handoverSlot] {
+                    let slot = handoverSlot
+                    let old = handoverOld
+                    clearHandover()
+                    flipMetricsSlot(slot)
+                    pids[slot] = old
+                    restartCursor = -1
+                    restartPending = false
+                    Log.error { line in
+                        line.str("replacement worker ")
+                        line.int(Int(pid))
+                        line.str(" exited before it started serving; keeping the current one")
+                    }
+                    continue
+                }
+
+                // The worker being replaced died on its own before it was
+                // asked to. Its replacement is already up, so there is nothing
+                // to hand over and the pass simply carries on.
+                if handoverSlot >= 0 && pid == handoverOld {
+                    clearHandover()
+                    if !shuttingDown && restartCursor >= 0 {
+                        restartCursor += 1
+                        advanceRestart()
+                    }
+                    continue
+                }
+
                 // A worker that was handed over is gone on purpose, and its
                 // replacement has been serving since before it was signalled.
                 var retired = -1
@@ -463,7 +581,11 @@ public enum Peregrine {
                         line.str(" exited; restarting")
                     }
                     if index >= 0 {
-                        pids[index] = spawn(index)
+                        // A crash replacement has nobody to hand over from, so
+                        // its readiness is nothing to wait for either.
+                        let restarted = spawn(index)
+                        if restarted.ready >= 0 { _ = pg_close(restarted.ready) }
+                        pids[index] = restarted.pid
                         if pids[index] > 0 { alive += 1 }
                     }
                 }
@@ -481,19 +603,41 @@ public enum Peregrine {
         return 0
     }
 
+    /// Forks a worker and returns its pid together with the read end of its
+    /// readiness pipe, which becomes readable when the worker starts accepting
+    /// and hangs up if it dies first. The caller owns that descriptor.
     static func spawnWorker(_ config: ServerConfig,
                             listeners: UnsafeMutablePointer<Int32>,
                             listenerCount: Int,
                             index: Int,
-                            metricsSlot: Int) -> pid_t {
+                            metricsSlot: Int) -> (pid: pid_t, ready: Int32) {
+        var fds: (Int32, Int32) = (-1, -1)
+        let piped = withUnsafeMutableBytes(of: &fds) { raw in
+            pg_pipe(raw.baseAddress!.assumingMemoryBound(to: Int32.self))
+        }
+        if piped != 0 {
+            Log.error("cannot create the worker readiness pipe")
+            return (-1, -1)
+        }
+
         let pid = pg_fork()
         if pid < 0 {
             Log.error("fork failed")
-            return -1
+            _ = pg_close(fds.0)
+            _ = pg_close(fds.1)
+            return (-1, -1)
         }
-        if pid > 0 { return pid }
+        if pid > 0 {
+            // The supervisor keeps the read end only. Holding the write end
+            // too would stop the pipe ever hanging up, and the hangup is how a
+            // worker that dies during start-up is noticed.
+            _ = pg_close(fds.1)
+            return (pid, fds.0)
+        }
 
         // --- child ---
+        _ = pg_close(fds.0)
+        readyPipeFD = fds.1
         Log.pid = Int(pg_getpid())
         // A fresh signal pipe: the inherited one belongs to the supervisor.
         pg_signal_pipe_reset()
@@ -698,8 +842,42 @@ public enum Peregrine {
         return workerPtr
     }
 
+    /// The write end of the readiness pipe, in a worker process.
+    ///
+    /// Set once before the interpreter boots and read once when it is serving,
+    /// on the one thread that does either, so the unchecked global is the same
+    /// kind of claim `Log.pid` makes.
+    nonisolated(unsafe) static var readyPipeFD: Int32 = -1
+
+    /// Tells the supervisor this process is now accepting.
+    ///
+    /// A reload waits for this before retiring the worker being replaced. The
+    /// alternative -- signalling the old one as soon as the new one is forked --
+    /// leaves the slot's accept queue unserved for as long as an interpreter
+    /// takes to boot and an application takes to import, which is not a dropped
+    /// connection but is a stalled one: measured at 94ms against an 18ms
+    /// baseline before this existed.
+    ///
+    /// Closing the pipe is itself the fallback signal. If this process dies
+    /// before it is ready the supervisor sees the read end hang up, rather than
+    /// waiting out the timeout.
+    static func signalReady() {
+        guard readyPipeFD >= 0 else { return }
+        var byte: UInt8 = 1
+        // The write fails with EPIPE whenever nobody is waiting -- at start-up
+        // the supervisor drops the read end straight away, because there is no
+        // worker being replaced to hold it for. SIGPIPE is ignored process-wide
+        // from `run`, so that is a return value and not a signal.
+        _ = withUnsafeBytes(of: &byte) { raw in
+            pg_write(readyPipeFD, raw.baseAddress!, 1)
+        }
+        _ = pg_close(readyPipeFD)
+        readyPipeFD = -1
+    }
+
     /// The "worker ready" line. `threads` is 0 for a worker process.
     static func logReady(_ config: ServerConfig, proto: AppProtocol, threads: Int) {
+        signalReady()
         Log.info { line in
             line.str(proto == .wsgi ? "worker ready (WSGI) on " : "worker ready (ASGI) on ")
             line.cstr(config.unixPath ?? config.host)

@@ -146,6 +146,20 @@ else
         "only $DISTINCT distinct pids, having started with $BEFORE_COUNT"
 fi
 
+# Losing nothing is not the whole of it: retiring a worker before its
+# replacement is serving stalls the slot for as long as an interpreter takes to
+# boot, which is an outage that reports itself as latency rather than as errors.
+# The bound is loose on purpose -- it is there to catch the handover regressing
+# to "signal first, hope second", which measured just over a second, not to pin
+# a number that depends on the machine. Idle p99.9 here is about 12ms.
+MAX_MS=$(python3 -c 'import json,sys; print(int(float(json.load(open(sys.argv[1]))["max_ms"])))' "$RESULT")
+if [ "$MAX_MS" -lt 250 ]; then
+    ok "no request stalled across a handover (max ${MAX_MS}ms)"
+else
+    bad "no request stalled across a handover" \
+        "worst case ${MAX_MS}ms, which is the shape of a worker retired before its replacement was serving"
+fi
+
 if grep -q "reloading workers" "$LOG"; then
     ok "the supervisor logged the reload"
 else
