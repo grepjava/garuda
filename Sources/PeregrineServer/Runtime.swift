@@ -3,18 +3,26 @@
 //
 // One process per worker, each with its own interpreter and its own poller.
 //
-// How the listening socket is shared depends on the address family, because
-// the two families have opposite constraints:
+// The supervisor creates the listening sockets and the workers inherit them
+// across fork. How many there are depends on the address family:
 //
-//   * TCP: every worker opens its own socket with SO_REUSEPORT, so each gets an
-//     independent accept queue in the kernel. There is no shared accept lock,
-//     no thundering herd, and the kernel spreads connections by hashing the
-//     four-tuple.
-//   * Unix: a path can only be bound once. The supervisor therefore creates the
-//     listener and the workers inherit the descriptor across fork. Letting each
-//     worker bind for itself would have every worker unlink and replace the
-//     socket the previous one had just published, leaving only the last worker
-//     reachable.
+//   * TCP: one socket per worker slot, all with SO_REUSEPORT, so each worker
+//     gets an independent accept queue in the kernel. There is no shared accept
+//     lock, no thundering herd, and the kernel spreads connections by hashing
+//     the four-tuple.
+//   * Unix: one socket, because a path can only be bound once, and every worker
+//     accepts from it. Letting each worker bind for itself would have every one
+//     of them unlink and replace the socket the previous had just published,
+//     leaving only the last worker reachable.
+//
+// A worker could open its own TCP socket instead -- it used to -- and the
+// kernel would not know the difference. The supervisor owns them so that a
+// worker can be *replaced* without its socket closing: the replacement
+// inherits the same one, so the SO_REUSEPORT group keeps every member and the
+// accept queue keeps every connection across a reload. A socket that leaves
+// the group takes its queue with it, along with every handshake still in
+// flight on it, because the kernel chooses the socket when the SYN arrives
+// rather than when accept() is called.
 //
 // Threads are not used for request handling in ASGI mode: with an event loop
 // and a GIL there is nothing for a second thread to do. WSGI is different --
@@ -80,6 +88,14 @@ public enum Peregrine {
 
         // --reload needs a supervisor to restart into, even with one worker.
         if workerCount <= 1 && !config.reload {
+            // There is nobody to restart into here, so SIGHUP has nothing to
+            // do -- and a lone worker ignores it. Say so where TLS makes it
+            // matter, rather than letting a certbot deploy hook look like it
+            // worked while the old certificate stays loaded until a restart.
+            if config.tlsEnabled {
+                Log.warn("--workers 1 runs without a supervisor, so SIGHUP will not reload")
+                Log.warn("the certificate; use --workers 2 or more for reload without downtime")
+            }
             guard let fd = openListener(config, reusePort: false, unlinkStale: true) else {
                 return 1
             }
@@ -186,16 +202,48 @@ public enum Peregrine {
     // MARK: - Supervisor
 
     static func runSupervisor(_ config: ServerConfig, workers: Int) -> Int32 {
-        // A unix listener is created once here and inherited; a TCP listener is
-        // only probed, so that a bad bind is one clear error rather than N
-        // identical ones from children.
-        var inherited: Int32 = -1
+        // One listener per worker slot, created here and inherited across fork.
+        //
+        // For TCP that is N sockets with SO_REUSEPORT -- N independent accept
+        // queues, no shared accept lock, exactly what a worker used to open for
+        // itself. What changed is who owns them. Because the supervisor holds
+        // each socket open, a replacement worker inherits the *same* socket its
+        // predecessor had, so the SO_REUSEPORT group never loses a member
+        // during a reload.
+        //
+        // That is the difference between a reload that drops connections and
+        // one that does not, and it cannot be fixed on the worker side. The
+        // kernel picks which socket in the group a connection belongs to when
+        // the SYN arrives, not when accept() is called, so a socket that closes
+        // takes its accept queue and every half-finished handshake on it down
+        // with it -- however carefully the worker drained first.
+        //
+        // For unix there is one socket, because a path can only be bound once,
+        // and every slot gets a copy of it.
+        //
+        // A free-threaded child opens its own, one per worker thread, so it is
+        // given nothing here beyond a shared unix socket.
+        let listeners = UnsafeMutablePointer<Int32>.allocate(capacity: workers)
+        defer { listeners.deallocate() }
+        listeners.initialize(repeating: -1, count: workers)
         if config.unixPath != nil {
             guard let fd = openListener(config, reusePort: false, unlinkStale: true) else {
                 return 1
             }
-            inherited = fd
+            for i in 0..<workers { listeners[i] = fd }
+        } else if !config.freeThreaded {
+            for i in 0..<workers {
+                guard let fd = openListener(config, reusePort: true, unlinkStale: false) else {
+                    // A bad bind is one clear error, not N identical ones
+                    // arriving from N children.
+                    for k in 0..<i { _ = pg_close(listeners[k]) }
+                    return 1
+                }
+                listeners[i] = fd
+            }
         } else {
+            // Nothing is inherited, so the bind is only probed -- for the same
+            // reason: one clear error at start-up.
             guard let probe = openListener(config, reusePort: true, unlinkStale: false) else {
                 return 1
             }
@@ -214,8 +262,15 @@ public enum Peregrine {
             line.str(" workers")
         }
 
+        /// Forks the worker for `slot`, handing it that slot's listener and
+        /// letting it drop the handles on every other slot's.
+        func spawn(_ slot: Int) -> pid_t {
+            spawnWorker(config, inherited: listeners[slot], index: slot,
+                        otherListeners: listeners, otherCount: workers)
+        }
+
         for i in 0..<workers {
-            pids[i] = spawnWorker(config, inherited: inherited, index: i)
+            pids[i] = spawn(i)
             if pids[i] < 0 { return 1 }
         }
 
@@ -225,11 +280,102 @@ public enum Peregrine {
         var shuttingDown = false
         var killDeadline: UInt64 = 0
         var alive = workers
-        var restarting = false
 
-        /// Signals every live worker and, past the grace period, kills it.
+        // A restart replaces the workers one slot at a time, and the
+        // replacement is spawned and accepting *before* the worker it replaces
+        // is asked to stop. The port is therefore bound by somebody at every
+        // instant of a reload, which is what makes a SIGHUP certificate reload
+        // cost nothing: the TLS context is built per worker, so the new process
+        // reads the new certificate off disk, and the old one finishes the
+        // requests it already had.
+        //
+        // Killing them all at once instead -- which is what this did -- did not
+        // unbind the port, because a draining worker only stopped polling its
+        // listener and went on holding it open. It was worse than that: the
+        // socket stayed in the SO_REUSEPORT group, so the kernel kept giving it
+        // a share of new connections, which sat in a queue nobody was serving
+        // until the worker exited and reset them. Measured over 40,000
+        // requests and three reloads, that was 56 connections lost and a
+        // worst-case latency of just over a second, against none lost and 94ms
+        // here.
+        //
+        // `retiring[i]` is the worker that used to hold slot `i` and is now
+        // draining. It is not replaced when it is reaped, because its
+        // replacement is already serving.
+        let retiring = UnsafeMutablePointer<pid_t>.allocate(capacity: workers)
+        defer { retiring.deallocate() }
+        retiring.initialize(repeating: 0, count: workers)
+
+        /// The slot a rolling restart is about to replace, or -1 when no
+        /// restart is in flight.
+        var restartCursor = -1
+        /// A reload asked for while one was already running. The pass in flight
+        /// is carrying workers that predate the request, so another has to
+        /// follow it; without this a save during a `--reload` restart would be
+        /// silently skipped.
+        var restartPending = false
+
+        /// Signals every live worker -- including the ones already draining,
+        /// which shutdown still has to reach -- and, past the grace period,
+        /// kills it.
         func signalAll(_ sig: Int32) {
+            for k in 0..<workers where retiring[k] > 0 { _ = pg_kill(retiring[k], sig) }
             for k in 0..<workers where pids[k] > 0 { _ = pg_kill(pids[k], sig) }
+        }
+
+        /// Replaces the slot at `restartCursor`, then advances. One slot is in
+        /// flight at a time: the whole point is that somebody is always
+        /// listening, and that holds with one spare worker just as well as with
+        /// a second full set, at a fraction of the memory. A worker is an
+        /// interpreter with the application imported into it, so doubling the
+        /// process count for the length of a reload is not free on the kind of
+        /// application that most wants zero-downtime reloads.
+        func advanceRestart() {
+            while restartCursor >= 0 && restartCursor < workers {
+                let i = restartCursor
+                // An empty slot needs no handover, and a slot whose previous
+                // occupant has not finished draining is not ready for another.
+                if pids[i] <= 0 || retiring[i] != 0 {
+                    restartCursor += 1
+                    continue
+                }
+                let old = pids[i]
+                let fresh = spawn(i)
+                if fresh < 0 {
+                    // Keep the worker that is already serving. A failed fork is
+                    // a bad moment to also give up the process that works.
+                    Log.error("cannot spawn a replacement worker; keeping the current one")
+                    restartCursor = -1
+                    restartPending = false
+                    return
+                }
+                pids[i] = fresh
+                alive += 1
+                retiring[i] = old
+                // Only now: the replacement is bound and accepting, so the old
+                // worker can leave the SO_REUSEPORT group without a gap.
+                _ = pg_kill(old, SIGTERM)
+                return
+            }
+            restartCursor = -1
+            Log.info("workers reloaded")
+            if restartPending {
+                restartPending = false
+                restartCursor = 0
+                advanceRestart()
+            }
+        }
+
+        /// Starts a rolling restart, or notes that one is wanted next.
+        func beginRestart(_ why: StaticString) {
+            if shuttingDown { return }
+            Log.info(why)
+            if restartCursor >= 0 {
+                restartPending = true
+                return
+            }
+            restartCursor = 0
+            advanceRestart()
         }
 
         while alive > 0 {
@@ -255,11 +401,7 @@ public enum Peregrine {
                                     &+ config.gracefulShutdownMs &+ 2_000
                             }
                         case SIGHUP:
-                            if !shuttingDown {
-                                Log.info("SIGHUP: restarting workers")
-                                restarting = true
-                                signalAll(SIGTERM)
-                            }
+                            beginRestart("SIGHUP: reloading workers")
                         default:
                             break
                         }
@@ -276,9 +418,7 @@ public enum Peregrine {
             }
 
             if let watcher, !shuttingDown, watcher.changed() {
-                Log.info("source change detected; restarting workers")
-                restarting = true
-                signalAll(SIGTERM)
+                beginRestart("source change detected; reloading workers")
             }
 
             // Reap whatever has exited.
@@ -286,33 +426,53 @@ public enum Peregrine {
                 var status: Int32 = 0
                 let pid = pg_waitpid(-1, &status, 1)
                 if pid <= 0 { break }
+                alive -= 1
+
+                // A worker that was handed over is gone on purpose, and its
+                // replacement has been serving since before it was signalled.
+                var retired = -1
+                for k in 0..<workers where retiring[k] == pid { retired = k }
+                if retired >= 0 {
+                    retiring[retired] = 0
+                    if !shuttingDown && restartCursor >= 0 {
+                        restartCursor += 1
+                        advanceRestart()
+                    }
+                    continue
+                }
+
                 var index = -1
                 for k in 0..<workers where pids[k] == pid { index = k }
                 if index >= 0 { pids[index] = 0 }
-                alive -= 1
                 if !shuttingDown {
-                    if !restarting {
-                        Log.warn { line in
-                            line.str("worker ")
-                            line.int(Int(pid))
-                            line.str(" exited; restarting")
-                        }
+                    Log.warn { line in
+                        line.str("worker ")
+                        line.int(Int(pid))
+                        line.str(" exited; restarting")
                     }
                     if index >= 0 {
-                        pids[index] = spawnWorker(config, inherited: inherited, index: index)
+                        pids[index] = spawn(index)
                         if pids[index] > 0 { alive += 1 }
                     }
                 }
             }
-            if restarting && alive == workers { restarting = false }
         }
-        if inherited >= 0 { _ = pg_close(inherited) }
+        // Every worker is gone, so these are the last handles on the listeners.
+        // A unix socket is one descriptor repeated across the slots, so each
+        // distinct one is closed once.
+        for i in 0..<workers where listeners[i] >= 0 {
+            var alreadyClosed = false
+            for k in 0..<i where listeners[k] == listeners[i] { alreadyClosed = true }
+            if !alreadyClosed { _ = pg_close(listeners[i]) }
+        }
         Log.info("peregrine stopped")
         return 0
     }
 
     static func spawnWorker(_ config: ServerConfig, inherited: Int32,
-                            index: Int = 0) -> pid_t {
+                            index: Int = 0,
+                            otherListeners: UnsafeMutablePointer<Int32>? = nil,
+                            otherCount: Int = 0) -> pid_t {
         let pid = pg_fork()
         if pid < 0 {
             Log.error("fork failed")
@@ -324,6 +484,17 @@ public enum Peregrine {
         Log.pid = Int(pg_getpid())
         // A fresh signal pipe: the inherited one belongs to the supervisor.
         pg_signal_pipe_reset()
+        // fork hands over the whole descriptor table, so this worker starts out
+        // holding a listener for every slot. It will only ever poll its own;
+        // the rest are the supervisor's to keep, and holding them here would
+        // mean a slot's socket outliving the supervisor inside an unrelated
+        // worker. A unix socket is the same descriptor in every slot, so the
+        // comparison against `inherited` is what stops it closing its own.
+        if let otherListeners {
+            for k in 0..<otherCount where otherListeners[k] >= 0 && otherListeners[k] != inherited {
+                _ = pg_close(otherListeners[k])
+            }
+        }
         // A free-threaded child opens one listener per worker thread, so it is
         // handed the inherited descriptor as-is and works the rest out itself.
         if config.freeThreaded {

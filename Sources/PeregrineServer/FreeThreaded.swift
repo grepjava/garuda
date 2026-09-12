@@ -236,6 +236,11 @@ final class WorkerThread {
         // The process, not this thread, decides when it is over: the drain here
         // is followed by a join on the main thread.
         workerPtr.pointee.ownsExitWatchdog = false
+        // On TCP each thread opened its own SO_REUSEPORT listener and may close
+        // it when it drains. On a unix socket every thread in this process is
+        // accepting from the one descriptor bound by the supervisor, so closing
+        // it here would take the other threads off the socket too.
+        workerPtr.pointee.ownsListener = (config.unixPath == nil)
 
         /// Gives back everything this thread has taken and reports the failure,
         /// so that start-up ends as one clear error rather than a server that

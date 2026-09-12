@@ -107,6 +107,20 @@ public struct Worker {
     /// in the middle of that. The supervising thread arms one for the whole
     /// process instead.
     public var ownsExitWatchdog = true
+    /// Whether this worker may close its handle on `listenFD` when it drains.
+    ///
+    /// A worker *process* may: the descriptor it holds is its own copy of a
+    /// socket the supervisor created and keeps open, so closing it releases a
+    /// handle and nothing else. The socket stays bound, stays in the
+    /// `SO_REUSEPORT` group, and keeps its accept queue -- which is what lets a
+    /// replacement take the slot over without a connection being dropped.
+    ///
+    /// A free-threaded worker *thread* on a unix socket may not: there the one
+    /// descriptor is shared by every thread in the process, and closing it
+    /// would take the rest of them off the socket too. Those threads stop
+    /// polling and leave it open, which costs nothing -- they were all taking
+    /// from one queue anyway, so the threads still running keep draining it.
+    public var ownsListener = true
     /// When draining must stop being polite. A request that never completes
     /// would otherwise hold the whole process open indefinitely.
     public var drainDeadline: UInt64 = 0
@@ -956,6 +970,7 @@ public struct Worker {
         c.pointee.state = .readingHead
         c.pointee.head = HTTPRequestHead()
         c.pointee.bodyRemaining = 0
+        c.pointee.flags.insert(.servedRequest)
         c.pointee.lastActivity = pg_monotonic_ms()
         setInterest(slot, .read)
         // A pipelined request may already be sitting in the read buffer.
@@ -1342,21 +1357,41 @@ public struct Worker {
             pg_exit_after(UInt32(truncatingIfNeeded: margin), 0)
         }
         Log.info("worker draining")
-        _ = poller.modify(listenFD, [], token: PollToken.listener)
         // Idle keep-alive connections have nothing in flight; drop them now.
         // Websockets are told the server is going away, which is what lets a
         // client reconnect to another worker instead of waiting for a timeout.
+        //
+        // `.servedRequest` is what keeps this off connections that were
+        // accepted a moment ago and have not been read from yet. Those look
+        // exactly like idle keep-alive connections -- `readingHead`, nothing
+        // buffered -- but the client has already sent a request on them and is
+        // waiting for the answer, so closing one is a dropped request, not a
+        // tidied-up socket. They stay, and the drain deadline bounds them.
         var slot = 0
         while slot < table.capacity {
             let c = table[slot]
             if c.pointee.state == .websocket {
                 sendCloseFrame(slot, code: WSCloseCode.goingAway,
                                reason: nil, reasonLength: 0)
-            } else if c.pointee.state != .free && c.pointee.isIdle {
+            } else if c.pointee.state != .free && c.pointee.isIdle
+                        && c.pointee.flags.contains(.servedRequest) {
                 closeConnection(slot)
             }
             slot += 1
         }
+
+        // Stop taking new work, and give up this worker's handle on the
+        // listener. What is already queued on it is not lost: the supervisor
+        // owns the socket and the replacement worker inherited the same one, so
+        // the queue keeps being served by whoever takes over the slot. Leaving
+        // it polled instead would have a draining worker compete for
+        // connections it is about to stop serving.
+        _ = poller.modify(listenFD, [], token: PollToken.listener)
+        if ownsListener && listenFD >= 0 {
+            _ = pg_close(listenFD)
+            listenFD = -1
+        }
+
         if quiescent { running = false }
     }
 

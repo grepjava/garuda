@@ -90,6 +90,17 @@ public struct ConnFlags: OptionSet, Sendable {
     /// and datagrams that belong to it are routed here.
     public static let webtransportMode = ConnFlags(rawValue: 1 << 17)
 
+    /// A request has completed on this connection, so it is idle between
+    /// requests rather than newly accepted.
+    ///
+    /// `isIdle` cannot tell those apart -- both are `readingHead` with an empty
+    /// buffer -- and a drain treats them very differently. Closing a keep-alive
+    /// connection between requests is correct and expected. Closing one that
+    /// has never served anything drops a request the client has already put on
+    /// the wire, which it sees as a truncated response rather than as a hint to
+    /// open a new connection.
+    public static let servedRequest    = ConnFlags(rawValue: 1 << 18)
+
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
     /// one of these here would leak state across a pipelined request.
