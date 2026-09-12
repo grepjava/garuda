@@ -19,3 +19,7 @@ __pycache__/
 # Inputs pgfuzz writes out when it finds something; keep them in
 # fuzz/corpus/<target>/ under a name, not here under a seed.
 pgfuzz-*.bin
+
+# A local knowledge-graph index of this tree, rebuilt from the source it
+# describes. Machine-written, large, and stale the moment anything is edited.
+graphify-out/
