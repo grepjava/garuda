@@ -212,6 +212,27 @@ elapsed=$(( ($(date +%s%N) - start_ms) / 1000000 ))
 if [ "$elapsed" -lt 2000 ]; then ok "20 concurrent 250ms requests overlap (${elapsed}ms)"
 else bad "concurrency" "<2000ms" "${elapsed}ms"; fi
 
+# ------------------------------------------------- health check path --------
+# Answered in the worker, so the interesting cases are the ones where it must
+# NOT answer: a different path, and a method that is not a read. Both have to
+# reach the application, or the flag has quietly taken a route away from it.
+EXTRA="$EXTRA --health-check-path /healthz"
+start "$WSGI_PORT" wsgi_app:application
+HB="http://127.0.0.1:$WSGI_PORT"
+
+is "health path answers 200"          "$(curl -sS -o /dev/null -w '%{http_code}' $HB/healthz)"      "200"
+is "health path has an empty body"    "$(curl -sS -o /dev/null -w '%{size_download}' $HB/healthz)"  "0"
+is "health path ignores the query"    "$(curl -sS -o /dev/null -w '%{http_code}' "$HB/healthz?probe=1")" "200"
+is "health path answers HEAD"         "$(curl -sS -I -o /dev/null -w '%{http_code}' $HB/healthz)"   "200"
+is "POST to it reaches the app"       "$(curl -sS -X POST -o /dev/null -w '%{http_code}' $HB/healthz)" "404"
+is "a longer path reaches the app"    "$(curl -sS -o /dev/null -w '%{http_code}' $HB/healthzz)"     "404"
+is "a prefix of it reaches the app"   "$(curl -sS -o /dev/null -w '%{http_code}' $HB/health)"       "404"
+is "the application still answers"    "$(curl -sS $HB/)"  "hello from peregrine"
+# Answering without dispatching must not break the connection for what follows.
+is "keep-alive survives a probe" \
+   "$(raw $WSGI_PORT 'GET /healthz HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from peregrine')" \
+   "1"
+
 # ------------------------------------------------------------- summary ------
 echo
 echo "passed: $PASS   failed: $FAIL"

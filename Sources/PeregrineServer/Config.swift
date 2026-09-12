@@ -189,6 +189,18 @@ public struct ServerConfig {
     public var reloadIntervalMs: UInt64 = 500
 
     // --- diagnostics ---
+    /// A path the server answers itself, with 200 and an empty body, or nil.
+    ///
+    /// For an orchestrator's liveness probe. It is answered in the worker
+    /// before anything reaches Python, which is the point: a probe that runs
+    /// through the application measures the application, so it goes unanswered
+    /// exactly when every worker is busy -- and an orchestrator reads an
+    /// unanswered liveness probe as a process to kill. This one says the
+    /// accept loop is running, which is what liveness is.
+    ///
+    /// Off unless asked for. Answering a path the application also serves would
+    /// shadow it, and the server has no business guessing that /healthz is free.
+    public var healthPath: UnsafePointer<CChar>? = nil
     public var logLevel: LogLevel = .info
     public var accessLog = false
     /// Emit the access log as one JSON object per line, for a collector that

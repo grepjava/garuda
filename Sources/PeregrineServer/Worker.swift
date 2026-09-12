@@ -735,6 +735,14 @@ public struct Worker {
         if config.accessLog || Metrics.enabled {
             table[slot].pointee.requestStartUs = pg_monotonic_us()
         }
+        // --health-check-path, answered here rather than in the application.
+        // This is the only interception on the path to dispatch, and it is
+        // opt-in, so an application that wants to answer its own probe simply
+        // does not pass the flag.
+        if config.healthPath != nil && isHealthCheck(slot) {
+            respondHealthy(slot)
+            return
+        }
         switch appProtocol {
         case .wsgi:
             // WSGI has no way to express a stream that outlives its response,
@@ -977,6 +985,58 @@ public struct Worker {
         if c.pointee.read.readableBytes > 0 {
             processInput(slot)
         }
+    }
+
+    /// Whether this request is the path `--health-check-path` named.
+    ///
+    /// An exact match against the path with the query string already split off,
+    /// so `/healthz?probe=1` still counts. GET and HEAD only: a liveness probe
+    /// is a read, and answering a POST to the same path would shadow a route
+    /// the application may well have.
+    mutating func isHealthCheck(_ slot: Int) -> Bool {
+        guard let want = config.healthPath else { return false }
+        let c = table[slot]
+        let method = c.pointee.head.method
+        guard method == .get || method == .head else { return false }
+        let path = c.pointee.head.path
+        let wanted = Int(strlen(want))
+        guard path.count == wanted else { return false }
+        let base = c.pointee.headBase() + Int(path.offset)
+        var i = 0
+        while i < wanted {
+            if base[i] != UInt8(bitPattern: want[i]) { return false }
+            i += 1
+        }
+        return true
+    }
+
+    /// Answers the health probe: 200, no body, connection untouched.
+    mutating func respondHealthy(_ slot: Int) {
+        let c = table[slot]
+        // HTTP/2 and HTTP/3 already have a path that writes a status with an
+        // empty body and ends the stream. It was written for error codes, but
+        // there is nothing about it that is specific to them.
+        if c.pointee.isH3Stream {
+            h3FailRequest(slot, status: 200)
+            return
+        }
+        if c.pointee.isStream {
+            h2FailRequest(slot, status: 200)
+            return
+        }
+        logAccess(slot, status: 200)
+        dates.refresh()
+        HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: 200)
+        HTTPResponseWriter.writeDate(&c.pointee.write, dates)
+        c.pointee.write.write("Server: peregrine\r\n")
+        HTTPResponseWriter.writeContentLength(&c.pointee.write, 0)
+        HTTPResponseWriter.writeConnection(&c.pointee.write,
+                                           keepAlive: c.pointee.flags.contains(.keepAlive))
+        HTTPResponseWriter.endHead(&c.pointee.write)
+        c.pointee.state = .writing
+        // `flush` calls finishResponse once the buffer drains, so a keep-alive
+        // connection goes back to reading heads without anything further here.
+        _ = flush(slot)
     }
 
     /// Emits a canned error response and closes.

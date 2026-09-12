@@ -107,6 +107,8 @@ func printUsage() {
       --ws-ping-timeout MS     how long an unanswered ping may go (20000)
       --ws-max-queue N         messages buffered for a slow app (default 32)
       --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
+      --health-check-path P    answer P with 200 in the server, without
+                               calling the application (e.g. /healthz)
       --access-log             log one line per request
       --access-log-format F    text (default) or json; implies --access-log
       --metrics-port PORT      serve Prometheus metrics on this port
@@ -349,6 +351,14 @@ while i < argc {
             failed = true
             break
         }
+    } else if matches(arg, "--health-check-path") {
+        guard let v = next("--health-check-path needs a path") else { break }
+        if v[0] != 47 {   // '/'
+            Log.error("--health-check-path must start with /")
+            failed = true
+            break
+        }
+        config.healthPath = v
     } else if matches(arg, "--access-log") {
         config.accessLog = true
     } else if matches(arg, "--metrics-port") {
