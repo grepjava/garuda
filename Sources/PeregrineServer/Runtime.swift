@@ -72,40 +72,34 @@ public enum Peregrine {
 
         // Before any fork: children inherit the mapping, and a page mapped
         // after one would be private to whoever mapped it.
+        //
+        // Twice as many slots as workers, because a reload overlaps the worker
+        // being replaced with its replacement and they must not write to the
+        // same one. They are both live at that moment -- the old one is still
+        // finishing requests -- so sharing a slot would have each overwrite the
+        // other's gauges and report a connection count belonging to neither.
+        // The pair for slot `i` is `i` and `i + workerCount`, and a handover
+        // moves to whichever of the two is free.
         if config.metricsPort != 0 {
-            if pg_metrics_init(Int32(max(1, workerCount))) != 0 {
+            if pg_metrics_init(Int32(max(1, workerCount) * 2)) != 0 {
                 Log.error("cannot map the shared metrics page")
                 return 1
             }
         }
 
-        // Workers as threads. --reload still wants a process to restart into,
-        // so the two compose: the supervisor forks one child and that child
-        // runs every worker as a thread of itself.
-        if config.freeThreaded && !config.reload {
-            return runFreeThreaded(config, workers: workerCount, inherited: -1) ? 0 : 1
-        }
-
-        // --reload needs a supervisor to restart into, even with one worker.
-        if workerCount <= 1 && !config.reload {
-            // There is nobody to restart into here, so SIGHUP has nothing to
-            // do -- and a lone worker ignores it. Say so where TLS makes it
-            // matter, rather than letting a certbot deploy hook look like it
-            // worked while the old certificate stays loaded until a restart.
-            if config.tlsEnabled {
-                Log.warn("--workers 1 runs without a supervisor, so SIGHUP will not reload")
-                Log.warn("the certificate; use --workers 2 or more for reload without downtime")
-            }
-            guard let fd = openListener(config, reusePort: false, unlinkStale: true) else {
-                return 1
-            }
-            let ok = runWorker(config, listenFD: fd)
-            removeUnixPath(config)
-            return ok ? 0 : 1
-        }
-        // Under --free-threaded the supervisor has exactly one child to watch,
-        // because the child holds all the workers itself.
-        return runSupervisor(config, workers: config.freeThreaded ? 1 : max(1, workerCount))
+        // Everything runs under a supervisor, including a single worker and
+        // including --free-threaded, where the supervisor has one child that
+        // holds every worker as a thread of itself.
+        //
+        // It used to be skipped in both of those cases, which cost one process
+        // and lost SIGHUP: the reload is the supervisor replacing a child, so
+        // with no supervisor there was nothing to reload into and the signal
+        // did nothing at all. A lone worker ignores SIGHUP, and so does the
+        // free-threaded thread supervisor -- silently, in both cases, which is
+        // the worst way for a certbot deploy hook to fail.
+        return runSupervisor(config,
+                             workers: config.freeThreaded ? 1 : max(1, workerCount),
+                             listeners: workerCount)
     }
 
     /// Builds the TLS context, with the ALPN list the rest of the
@@ -201,8 +195,13 @@ public enum Peregrine {
 
     // MARK: - Supervisor
 
-    static func runSupervisor(_ config: ServerConfig, workers: Int) -> Int32 {
-        // One listener per worker slot, created here and inherited across fork.
+    /// `workers` is how many children the supervisor watches; `listeners` is how
+    /// many listening sockets to create. They differ under `--free-threaded`,
+    /// where one child holds every worker as a thread and therefore wants every
+    /// socket.
+    static func runSupervisor(_ config: ServerConfig, workers: Int,
+                              listeners listenerCount: Int) -> Int32 {
+        // One listener per worker, created here and inherited across fork.
         //
         // For TCP that is N sockets with SO_REUSEPORT -- N independent accept
         // queues, no shared accept lock, exactly what a worker used to open for
@@ -219,20 +218,18 @@ public enum Peregrine {
         // with it -- however carefully the worker drained first.
         //
         // For unix there is one socket, because a path can only be bound once,
-        // and every slot gets a copy of it.
-        //
-        // A free-threaded child opens its own, one per worker thread, so it is
-        // given nothing here beyond a shared unix socket.
-        let listeners = UnsafeMutablePointer<Int32>.allocate(capacity: workers)
+        // and every worker accepts from it.
+        let count = max(1, listenerCount)
+        let listeners = UnsafeMutablePointer<Int32>.allocate(capacity: count)
         defer { listeners.deallocate() }
-        listeners.initialize(repeating: -1, count: workers)
+        listeners.initialize(repeating: -1, count: count)
         if config.unixPath != nil {
             guard let fd = openListener(config, reusePort: false, unlinkStale: true) else {
                 return 1
             }
-            for i in 0..<workers { listeners[i] = fd }
-        } else if !config.freeThreaded {
-            for i in 0..<workers {
+            for i in 0..<count { listeners[i] = fd }
+        } else {
+            for i in 0..<count {
                 guard let fd = openListener(config, reusePort: true, unlinkStale: false) else {
                     // A bad bind is one clear error, not N identical ones
                     // arriving from N children.
@@ -241,13 +238,6 @@ public enum Peregrine {
                 }
                 listeners[i] = fd
             }
-        } else {
-            // Nothing is inherited, so the bind is only probed -- for the same
-            // reason: one clear error at start-up.
-            guard let probe = openListener(config, reusePort: true, unlinkStale: false) else {
-                return 1
-            }
-            _ = pg_close(probe)
         }
         defer { removeUnixPath(config) }
 
@@ -258,15 +248,32 @@ public enum Peregrine {
 
         Log.info { line in
             line.str("peregrine starting with ")
-            line.int(workers)
+            line.int(config.freeThreaded ? count : workers)
             line.str(" workers")
+        }
+
+        // Metrics slots come in pairs, so that a worker and the replacement
+        // overlapping it never write to the same one -- see `pg_metrics_init`.
+        // `metricsSlotOf[i]` is the slot the worker currently in `i` was given,
+        // and a handover takes the other half of the pair. Under
+        // --free-threaded it is a base rather than a slot: the child's threads
+        // take `base + their own index`.
+        let metricsSlotOf = UnsafeMutablePointer<Int>.allocate(capacity: workers)
+        defer { metricsSlotOf.deallocate() }
+        for i in 0..<workers { metricsSlotOf[i] = config.freeThreaded ? 0 : i }
+
+        /// Moves slot `slot` to the other half of its metrics pair, so that a
+        /// replacement does not land on the slot its predecessor is still using.
+        func flipMetricsSlot(_ slot: Int) {
+            let base = config.freeThreaded ? 0 : slot
+            metricsSlotOf[slot] = metricsSlotOf[slot] == base ? base + count : base
         }
 
         /// Forks the worker for `slot`, handing it that slot's listener and
         /// letting it drop the handles on every other slot's.
         func spawn(_ slot: Int) -> pid_t {
-            spawnWorker(config, inherited: listeners[slot], index: slot,
-                        otherListeners: listeners, otherCount: workers)
+            spawnWorker(config, listeners: listeners, listenerCount: count,
+                        index: slot, metricsSlot: metricsSlotOf[slot])
         }
 
         for i in 0..<workers {
@@ -340,11 +347,16 @@ public enum Peregrine {
                     continue
                 }
                 let old = pids[i]
+                // The two overlap, so the replacement takes the other half of
+                // the metrics pair; the one it would otherwise land on is still
+                // being written to by the worker it is replacing.
+                flipMetricsSlot(i)
                 let fresh = spawn(i)
                 if fresh < 0 {
                     // Keep the worker that is already serving. A failed fork is
                     // a bad moment to also give up the process that works.
                     Log.error("cannot spawn a replacement worker; keeping the current one")
+                    flipMetricsSlot(i)
                     restartCursor = -1
                     restartPending = false
                     return
@@ -460,7 +472,7 @@ public enum Peregrine {
         // Every worker is gone, so these are the last handles on the listeners.
         // A unix socket is one descriptor repeated across the slots, so each
         // distinct one is closed once.
-        for i in 0..<workers where listeners[i] >= 0 {
+        for i in 0..<count where listeners[i] >= 0 {
             var alreadyClosed = false
             for k in 0..<i where listeners[k] == listeners[i] { alreadyClosed = true }
             if !alreadyClosed { _ = pg_close(listeners[i]) }
@@ -469,10 +481,11 @@ public enum Peregrine {
         return 0
     }
 
-    static func spawnWorker(_ config: ServerConfig, inherited: Int32,
-                            index: Int = 0,
-                            otherListeners: UnsafeMutablePointer<Int32>? = nil,
-                            otherCount: Int = 0) -> pid_t {
+    static func spawnWorker(_ config: ServerConfig,
+                            listeners: UnsafeMutablePointer<Int32>,
+                            listenerCount: Int,
+                            index: Int,
+                            metricsSlot: Int) -> pid_t {
         let pid = pg_fork()
         if pid < 0 {
             Log.error("fork failed")
@@ -484,32 +497,37 @@ public enum Peregrine {
         Log.pid = Int(pg_getpid())
         // A fresh signal pipe: the inherited one belongs to the supervisor.
         pg_signal_pipe_reset()
+
+        // A free-threaded child is every worker at once, so it keeps the whole
+        // set and hands one socket to each of its threads. `metricsSlot` is a
+        // base there rather than a slot.
+        if config.freeThreaded {
+            let ok = runFreeThreaded(config, workers: config.resolvedWorkers,
+                                     listeners: listeners,
+                                     listenerCount: listenerCount,
+                                     metricsSlotBase: metricsSlot)
+            exitProcess(ok ? 0 : 1)
+        }
+
         // fork hands over the whole descriptor table, so this worker starts out
         // holding a listener for every slot. It will only ever poll its own;
         // the rest are the supervisor's to keep, and holding them here would
         // mean a slot's socket outliving the supervisor inside an unrelated
-        // worker. A unix socket is the same descriptor in every slot, so the
-        // comparison against `inherited` is what stops it closing its own.
-        if let otherListeners {
-            for k in 0..<otherCount where otherListeners[k] >= 0 && otherListeners[k] != inherited {
-                _ = pg_close(otherListeners[k])
-            }
+        // worker. A unix socket is the same descriptor in every slot, which is
+        // what the comparison against `mine` is for.
+        let mine = listeners[index]
+        for k in 0..<listenerCount where listeners[k] >= 0 && listeners[k] != mine {
+            _ = pg_close(listeners[k])
         }
-        // A free-threaded child opens one listener per worker thread, so it is
-        // handed the inherited descriptor as-is and works the rest out itself.
-        if config.freeThreaded {
-            let ok = runFreeThreaded(config, workers: config.resolvedWorkers,
-                                     inherited: inherited)
-            exitProcess(ok ? 0 : 1)
-        }
-        var fd = inherited
+
+        var fd = mine
         if fd < 0 {
             guard let opened = openListener(config, reusePort: true, unlinkStale: false) else {
                 exitProcess(1)
             }
             fd = opened
         }
-        let ok = runWorker(config, listenFD: fd, metricsSlot: index)
+        let ok = runWorker(config, listenFD: fd, metricsSlot: metricsSlot)
         exitProcess(ok ? 0 : 1)
     }
 

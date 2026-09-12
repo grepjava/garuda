@@ -169,6 +169,10 @@ final class WorkerThread {
     let controlRead: Int32
     let controlWrite: Int32
     unowned let group: WorkerGroup
+    /// This thread's slot in the shared metrics page. Not the same as `index`:
+    /// the supervisor moves a replacement process onto the other block of slots
+    /// so it does not share any with the process it is replacing.
+    let metricsSlot: Int
     /// Under `.once`, the `state` mapping the one process-wide lifespan
     /// published; under `.perWorker` this stays nil and the thread runs a
     /// lifespan of its own.
@@ -176,7 +180,7 @@ final class WorkerThread {
     private var handle: OpaquePointer? = nil
 
     init?(index: Int, config: ServerConfig, loaded: Peregrine.LoadedApplication,
-          listenFD: Int32, group: WorkerGroup) {
+          listenFD: Int32, group: WorkerGroup, metricsSlot: Int) {
         var fds: (Int32, Int32) = (-1, -1)
         let rc = withUnsafeMutableBytes(of: &fds) { raw in
             pg_pipe(raw.baseAddress!.assumingMemoryBound(to: Int32.self))
@@ -189,6 +193,7 @@ final class WorkerThread {
         self.config = config
         self.loaded = loaded
         self.listenFD = listenFD
+        self.metricsSlot = metricsSlot
         self.controlRead = fds.0
         self.controlWrite = fds.1
         self.group = group
@@ -227,7 +232,7 @@ final class WorkerThread {
         guard let workerPtr = Peregrine.makeWorker(config, listenFD: listenFD,
                                                    controlFD: controlRead,
                                                    loaded: loaded,
-                                                   metricsSlot: index) else {
+                                                   metricsSlot: metricsSlot) else {
             currentWorker = nil
             group.markFailed()
             pg_gil_release(state)
@@ -420,13 +425,25 @@ extension Peregrine {
 
     /// Runs `workers` workers as threads of this process.
     ///
-    /// `inherited` is a listening descriptor created elsewhere -- a unix socket
-    /// bound by the supervisor, which can only be bound once -- or -1, in which
-    /// case each worker opens a TCP listener of its own with `SO_REUSEPORT` and
-    /// gets an independent accept queue, exactly as a worker process does.
+    /// `listeners` are descriptors the supervisor created and keeps open: one
+    /// per worker for TCP, each with `SO_REUSEPORT` and its own accept queue,
+    /// or the same unix socket repeated, since a path can only be bound once.
+    /// A worker thread takes the one at its own index.
+    ///
+    /// They are the supervisor's rather than this process's so that a reload
+    /// can replace this whole process without the sockets closing under it --
+    /// the replacement inherits the same ones. A worker that opened its own
+    /// would take its accept queue down with it on the way out.
+    ///
+    /// `metricsSlotBase` is where this process's block of metrics slots starts;
+    /// thread `i` writes to `metricsSlotBase + i`. The supervisor moves the
+    /// base for a replacement so the two processes do not share slots while
+    /// they overlap.
     static func runFreeThreaded(_ config: ServerConfig,
                                 workers: Int,
-                                inherited: Int32) -> Bool {
+                                listeners: UnsafeMutablePointer<Int32>?,
+                                listenerCount: Int,
+                                metricsSlotBase: Int) -> Bool {
         let count = max(1, workers)
 
         if pg_py_free_threaded() == 0 {
@@ -485,26 +502,33 @@ extension Peregrine {
 
         guard let group = WorkerGroup(count: count) else { return false }
 
-        // A unix path can only be bound once, so it is bound once here and every
-        // worker accepts on the same descriptor. They contend for it, which is
-        // the cost of a listener that cannot be duplicated -- letting each
-        // worker bind for itself would have each one unlink and replace the
-        // socket the last had just published, leaving one worker reachable.
-        var sharedUnixFD = inherited
-        if sharedUnixFD < 0 && config.unixPath != nil {
-            guard let opened = openListener(config, reusePort: false, unlinkStale: true) else {
-                return false
+        // A unix path can only be bound once, so every worker accepts on the
+        // same descriptor. They contend for it, which is the cost of a listener
+        // that cannot be duplicated -- letting each worker bind for itself would
+        // have each one unlink and replace the socket the last had just
+        // published, leaving one worker reachable.
+        var sharedUnixFD: Int32 = -1
+        if config.unixPath != nil {
+            if let listeners, listenerCount > 0, listeners[0] >= 0 {
+                sharedUnixFD = listeners[0]
+            } else {
+                guard let opened = openListener(config, reusePort: false,
+                                                unlinkStale: true) else {
+                    return false
+                }
+                sharedUnixFD = opened
             }
-            sharedUnixFD = opened
         }
 
         for index in 0..<count {
             let fd: Int32
             if sharedUnixFD >= 0 {
                 fd = sharedUnixFD
-            } else {
+            } else if let listeners, index < listenerCount, listeners[index] >= 0 {
                 // TCP: one socket per worker with SO_REUSEPORT, so each gets an
                 // independent accept queue, exactly as a worker process does.
+                fd = listeners[index]
+            } else {
                 guard let opened = openListener(config, reusePort: true,
                                                 unlinkStale: false) else {
                     return false
@@ -512,7 +536,8 @@ extension Peregrine {
                 fd = opened
             }
             guard let member = WorkerThread(index: index, config: config, loaded: loaded,
-                                            listenFD: fd, group: group) else {
+                                            listenFD: fd, group: group,
+                                            metricsSlot: metricsSlotBase + index) else {
                 return false
             }
             member.sharedLifespanState = sharedState

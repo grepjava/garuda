@@ -131,13 +131,19 @@ else
     bad "every worker was replaced" "still serving from before the reload:$OVERLAP"
 fi
 
-# More than `workers` distinct pids over the run is the overlap itself showing
-# up: old and new were both serving.
-if [ "$DISTINCT" -gt "$WORKERS" ]; then
+# More distinct pids over the run than were serving at the start is the overlap
+# itself showing up: old and new were both taking requests.
+#
+# Counted from what was observed rather than from $WORKERS, because the two
+# execution models answer "how many processes" differently: --free-threaded
+# serves every worker from threads of one process, so a generation is one pid
+# there and $WORKERS of them otherwise.
+BEFORE_COUNT=$(echo "$BEFORE" | wc -w)
+if [ "$DISTINCT" -gt "$BEFORE_COUNT" ]; then
     ok "old and new workers both served during the handover ($DISTINCT distinct pids)"
 else
     bad "the reload replaced workers while serving" \
-        "only $DISTINCT distinct pids for $WORKERS workers and $RELOADS reloads"
+        "only $DISTINCT distinct pids, having started with $BEFORE_COUNT"
 fi
 
 if grep -q "reloading workers" "$LOG"; then
