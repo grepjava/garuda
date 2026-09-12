@@ -773,6 +773,9 @@ extension Worker {
         s.pointee.quicRef = nil
         s.pointee.wt = nil
         s.pointee.responseRemaining = -1
+        s.pointee.fileFD = -1
+        s.pointee.fileOffset = 0
+        s.pointee.fileRemaining = 0
         s.pointee.h3FrameType = 0
         s.pointee.h3FrameRemaining = 0
         s.pointee.clientTuple = nil

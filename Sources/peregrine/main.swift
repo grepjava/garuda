@@ -110,6 +110,10 @@ func printUsage() {
       --ws-ping-timeout MS     how long an unanswered ping may go (20000)
       --ws-max-queue N         messages buffered for a slow app (default 32)
       --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
+      --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
+                               without calling the application (repeatable).
+                               A path with no file behind it still reaches
+                               the application
       --health-check-path P    answer P with 200 in the server, without
                                calling the application (e.g. /healthz)
       --access-log             log one line per request
@@ -185,6 +189,11 @@ var config = ServerConfig()
 // pair is the default; the rest are chosen by SNI.
 var tlsCerts: [UnsafePointer<CChar>] = []
 var tlsKeys: [UnsafePointer<CChar>] = []
+
+// Collected in the order given and sorted longest-prefix-first afterwards, so
+// that --static-dir /a=... and --static-dir /a/b=... behave the way the more
+// specific one implies whichever order they were written in.
+var staticRoutes: [(prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>)] = []
 var sawApp = false
 var schemeGiven = false
 var portSet = false
@@ -360,6 +369,25 @@ while i < argc {
             failed = true
             break
         }
+    } else if matches(arg, "--static-dir") {
+        guard let v = next("--static-dir needs PREFIX=DIRECTORY") else { break }
+        // Split on the first '=' in place: the two halves are both NUL
+        // terminated afterwards, because the separator becomes the first
+        // terminator. argv is ours to write to.
+        var at = 0
+        while v[at] != 0 && v[at] != 61 { at += 1 }   // '='
+        if v[at] == 0 || at == 0 {
+            Log.error("--static-dir takes PREFIX=DIRECTORY, as in /static=/var/www/static")
+            failed = true
+            break
+        }
+        if v[0] != 47 {   // '/'
+            Log.error("--static-dir prefix must start with /")
+            failed = true
+            break
+        }
+        UnsafeMutablePointer(mutating: v)[at] = 0
+        staticRoutes.append((prefix: v, directory: v + at + 1))
     } else if matches(arg, "--health-check-path") {
         guard let v = next("--health-check-path needs a path") else { break }
         if v[0] != 47 {   // '/'
@@ -429,6 +457,8 @@ if failed {
 // unequal count is a mistake worth stopping for: pairing what is there and
 // ignoring the remainder would serve the wrong certificate for a name, which
 // shows up as a browser warning rather than as an error here.
+config.staticRoutes = staticRoutes.sorted { strlen($0.prefix) > strlen($1.prefix) }
+
 if tlsCerts.count != tlsKeys.count {
     Log.error("--tls-cert and --tls-key go together, one key per certificate")
     exit(2)

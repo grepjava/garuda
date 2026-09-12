@@ -330,6 +330,9 @@ public struct Worker {
             c.pointee.fd = fd
             c.pointee.state = .readingHead
             c.pointee.flags = []
+            c.pointee.fileFD = -1
+            c.pointee.fileOffset = 0
+            c.pointee.fileRemaining = 0
             c.pointee.interest = 0
             c.pointee.read = pool.take()
             c.pointee.write = ByteBuffer()
@@ -743,6 +746,10 @@ public struct Worker {
             respondHealthy(slot)
             return
         }
+        // --static-dir. Returns false for anything it does not have a file
+        // for, including a path under its own prefix, so a route never takes
+        // a URL away from the application.
+        if serveStatic(slot) { return }
         switch appProtocol {
         case .wsgi:
             // WSGI has no way to express a stream that outlives its response,
@@ -767,31 +774,49 @@ public struct Worker {
         // A multiplexed stream writes into its connection, not into a socket.
         if c.pointee.isH3Stream { return flushH3Stream(slot) }
         if c.pointee.isStream { return flushStream(slot) }
-        while c.pointee.write.readableBytes > 0 {
-            let n = connWrite(slot,
-                              c.pointee.write.readPointer,
-                              c.pointee.write.readableBytes)
-            if n > 0 {
-                c.pointee.write.consume(n)
-                continue
+
+        // Two things can be owed here: bytes already in the buffer, and the
+        // rest of a static file. The file either goes straight out of the page
+        // cache with sendfile or refills this buffer a block at a time, so the
+        // two alternate until both are spent.
+        var moreFromFile = true
+        while moreFromFile {
+            moreFromFile = false
+            while c.pointee.write.readableBytes > 0 {
+                let n = connWrite(slot,
+                                  c.pointee.write.readPointer,
+                                  c.pointee.write.readableBytes)
+                if n > 0 {
+                    c.pointee.write.consume(n)
+                    continue
+                }
+                let e = pg_errno()
+                if pg_err_is_intr(e) != 0 { continue }
+                if pg_err_is_again(e) != 0 {
+                    // Read interest is only safe while something will actually
+                    // consume what arrives: not while a pooled request owns the
+                    // connection, and not while a websocket queue is full. A
+                    // level-triggered poller would otherwise spin on those bytes.
+                    setInterest(slot, readInterestAllowed(slot) ? [.read, .write] : [.write])
+                    // Partially drained still counts: a producer parked at the high
+                    // water mark resumes as soon as the buffer falls below the low
+                    // one, without waiting for the socket to empty completely.
+                    resumeWriterIfDrained(slot)
+                    return true
+                }
+                // EPIPE / ECONNRESET: the client is gone.
+                closeConnection(slot)
+                return false
             }
-            let e = pg_errno()
-            if pg_err_is_intr(e) != 0 { continue }
-            if pg_err_is_again(e) != 0 {
-                // Read interest is only safe while something will actually
-                // consume what arrives: not while a pooled request owns the
-                // connection, and not while a websocket queue is full. A
-                // level-triggered poller would otherwise spin on those bytes.
-                setInterest(slot, readInterestAllowed(slot) ? [.read, .write] : [.write])
-                // Partially drained still counts: a producer parked at the high
-                // water mark resumes as soon as the buffer falls below the low
-                // one, without waiting for the socket to empty completely.
-                resumeWriterIfDrained(slot)
-                return true
+
+            if c.pointee.fileRemaining > 0 {
+                switch pumpFile(slot) {
+                case .again:    return true
+                case .closed:   return false
+                case .buffered: moreFromFile = true
+                case .done:     break
+                }
             }
-            // EPIPE / ECONNRESET: the client is gone.
-            closeConnection(slot)
-            return false
         }
 
         resumeWriterIfDrained(slot)
@@ -1164,6 +1189,11 @@ public struct Worker {
     public mutating func closeConnection(_ slot: Int) {
         let c = table[slot]
         if c.pointee.state == .free { return }
+        // A client that goes away part-way through a static file leaves the
+        // file open otherwise, and a worker serving assets to clients that
+        // navigate away runs out of descriptors rather than misbehaving
+        // visibly.
+        if c.pointee.fileFD >= 0 { finishFile(slot) }
         Metrics.add(PG_M_CONNECTIONS_CLOSED)
         // Written here rather than only when this worker happens to serve a
         // scrape: a gauge nobody updates is a number from whenever it last was

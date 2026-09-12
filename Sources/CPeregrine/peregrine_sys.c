@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -304,6 +305,47 @@ ssize_t pg_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
     if (sbytes > 0) return (ssize_t)sbytes;
     return r < 0 ? -1 : 0;
 #endif
+}
+
+int pg_static_open(const char *root, const char *relative,
+                   long long *size, long long *mtime) {
+    char real_root[PATH_MAX];
+    if (!realpath(root, real_root)) return -1;
+
+    /* A leading slash on the relative part would make snprintf produce "//x",
+     * which resolves the same way, but skipping it keeps the joined path the
+     * obvious one. */
+    while (*relative == '/') relative++;
+
+    char joined[PATH_MAX];
+    int n = snprintf(joined, sizeof joined, "%s/%s", real_root, relative);
+    if (n < 0 || (size_t)n >= sizeof joined) return -1;
+
+    /* realpath resolves `..` and follows symlinks, so the containment check
+     * below is against where the path actually lands rather than how it is
+     * spelled. A path that does not exist fails here, which is the 404. */
+    char real[PATH_MAX];
+    if (!realpath(joined, real)) return -1;
+
+    size_t root_len = strlen(real_root);
+    if (strncmp(real, real_root, root_len) != 0) return -1;
+    /* The next character has to be the separator, or the root is the whole
+     * path: without this, a root of /var/www would also accept /var/www-old.
+     * A root of "/" already ends in the separator. */
+    if (!(root_len == 1 && real_root[0] == '/')) {
+        if (real[root_len] != '/' && real[root_len] != '\0') return -1;
+    }
+
+    int fd = open(real, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+    if (size) *size = (long long)st.st_size;
+    if (mtime) *mtime = (long long)st.st_mtime;
+    return fd;
 }
 
 int pg_poll_single(int fd, int for_write, int timeout_ms) {

@@ -198,8 +198,14 @@ extension Worker {
         guard let h3 = table[parent].pointee.h3 else { return false }
         let streamID = s.pointee.qstreamID
 
-        let pending = s.pointee.write.readableBytes
-        if pending > 0 {
+        // A --static-dir response is fed from a descriptor rather than by the
+        // application, so it refills here. Bounded per call: whatever is left
+        // goes out when this stream is writable again, which is the same
+        // signal that resumes an application parked in send().
+        var sentHere = 0
+        refillStreamFromFile(streamSlot)
+        var pending = s.pointee.write.readableBytes
+        while pending > 0 {
             var frame = ByteBuffer(capacity: pending + 16)
             defer { frame.destroy() }
             frame.writeVarint(HTTP3FrameType.data)
@@ -212,6 +218,10 @@ extension Worker {
             // note in HTTP2.flushStream.
             s.pointee.lastActivity = pg_monotonic_ms()
             s.pointee.write.consume(pending)
+            sentHere += pending
+            if s.pointee.fileRemaining == 0 || sentHere >= config.writeHighWaterMark { break }
+            refillStreamFromFile(streamSlot)
+            pending = s.pointee.write.readableBytes
         }
 
         // A response shorter than what it declared must not be finished

@@ -113,6 +113,16 @@ public struct ConnFlags: OptionSet, Sendable {
 
 public struct Connection {
     public var fd: Int32 = -1
+    /// An open file whose remaining bytes are the rest of this response, or -1.
+    ///
+    /// Set by a `--static-dir` route. The bytes never enter the process on the
+    /// plaintext path: `flush` hands the descriptor to sendfile(2) and the
+    /// kernel moves them. Over TLS, and on a multiplexed stream, they have to
+    /// be read and framed, so the same fields drive a read-and-buffer loop.
+    public var fileFD: Int32 = -1
+    public var fileOffset: Int = 0
+    public var fileRemaining: Int = 0
+
     public var generation: UInt32 = 0
     public var state: ConnState = .free
     public var flags: ConnFlags = []

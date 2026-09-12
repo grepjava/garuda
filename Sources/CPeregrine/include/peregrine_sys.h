@@ -76,6 +76,19 @@ ssize_t pg_writev(int fd, const struct iovec *iov, int iovcnt);
 /* Portable sendfile(); advances *offset. Returns bytes sent or -1. */
 ssize_t pg_sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
 
+/* Opens a regular file under `root` for a static route, reporting its size and
+ * modification time.
+ *
+ * `relative` is the request path with the route prefix removed and already
+ * percent-decoded. Both paths are resolved with realpath(3) and the result must
+ * still lie inside the resolved root, which is what stops `..` and a symlink
+ * pointing out of the tree from reaching anything. Only regular files open:
+ * a directory, a fifo or a device is refused rather than served.
+ *
+ * Returns the descriptor, or -1. */
+int pg_static_open(const char *root, const char *relative,
+                   long long *size, long long *mtime);
+
 /* poll(2) on a single descriptor. Used only by the synchronous WSGI path when
  * a response outgrows the high-water mark and the worker must apply
  * backpressure rather than buffer without bound. */

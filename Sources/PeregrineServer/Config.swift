@@ -204,6 +204,19 @@ public struct ServerConfig {
     public var reloadIntervalMs: UInt64 = 500
 
     // --- diagnostics ---
+    /// URL prefixes served from disk by the server, longest prefix first.
+    ///
+    /// `--static-dir /static=/var/www/static`. A request whose path starts with
+    /// the prefix is answered from the directory without the application being
+    /// called; anything else, including a path that matches but has no file
+    /// behind it, goes to the application as usual. A miss falling through
+    /// rather than 404ing is what lets a route be added in front of an
+    /// application that already serves the same prefix.
+    ///
+    /// Kept longest-first so that a more specific prefix wins over a shorter
+    /// one covering the same paths.
+    public var staticRoutes: [(prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>)] = []
+
     /// A path the server answers itself, with 200 and an empty body, or nil.
     ///
     /// For an orchestrator's liveness probe. It is answered in the worker

@@ -895,6 +895,11 @@ extension Worker {
         s.pointee.poolJob = nil
         s.pointee.h2 = nil
         s.pointee.responseRemaining = -1
+        // A recycled slot must not inherit a static response: the next request
+        // on it would send a file nobody asked for.
+        s.pointee.fileFD = -1
+        s.pointee.fileOffset = 0
+        s.pointee.fileRemaining = 0
         s.pointee.sendWindow = h2.peerInitialWindowSize
         s.pointee.recvWindow = h2.initialWindowSize
         s.pointee.pendingRecvUpdate = 0
@@ -951,13 +956,30 @@ extension Worker {
         }
         guard let h2 = table[parent].pointee.h2 else { return false }
 
+        // A --static-dir response is fed from a descriptor rather than by the
+        // application, so it refills here as the window lets bytes out.
+        refillStreamFromFile(streamSlot)
+
         while true {
             let pending = s.pointee.write.readableBytes
-            if pending == 0 { break }
+            if pending == 0 {
+                refillStreamFromFile(streamSlot)
+                if s.pointee.write.readableBytes == 0 { break }
+                continue
+            }
             // Never let one stream queue an unbounded amount on the socket:
             // the stream buffer is where a slow client applies its pressure,
             // and that is what parks the application in `await send()`.
-            if p.pointee.write.readableBytes > config.writeHighWaterMark { break }
+            if p.pointee.write.readableBytes > config.writeHighWaterMark {
+                // Push what is queued and look again. An application-fed
+                // stream can stop here safely, because the thing that resumes
+                // it is the application being woken on drain -- but a stream
+                // fed from a file has no such producer, and if the socket then
+                // accepts everything there is no writable event coming either.
+                // It would stall with the file half sent.
+                if !flush(parent) { return false }
+                if p.pointee.write.readableBytes > config.writeHighWaterMark { break }
+            }
             var n = min(pending, h2.peerMaxFrameSize)
             n = min(n, max(0, s.pointee.sendWindow))
             n = min(n, max(0, h2.sendWindow))

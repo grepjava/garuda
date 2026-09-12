@@ -17,6 +17,7 @@ import os
 import socket
 import ssl
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -241,6 +242,75 @@ async def basics():
             check("the scope reports https", b'"scheme": "https"' in body, body[:200])
             check("an HTTP/3 request advertises the WebTransport extension",
                   b'"webtransport"' in body, body[:300])
+
+
+async def health_check():
+    print("\nHealth check path")
+    with Server("--health-check-path", "/healthz") as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            status, _, body = await client.request("GET", "/healthz")
+            is_("the probe is answered", status, 200)
+            is_("it carries no body", body, b"")
+            # The probe answers and ends its stream inside the dispatch that
+            # received it, which is a shape no application response has. The
+            # request after it is the one that shows whether the connection
+            # survived that.
+            status, _, body = await client.request("GET", "/")
+            is_("the connection still serves afterwards", status, 200)
+            status, _, _ = await client.request("GET", "/healthz")
+            is_("a second probe is answered", status, 200)
+
+
+async def static_files():
+    print("\nStatic files")
+    root = tempfile.mkdtemp()
+    small = b"body { color: red }\n"
+    # Larger than one QUIC stream window, so the response has to be refilled
+    # from the file as the peer opens the window rather than queued in one go.
+    large = os.urandom(3_000_000)
+    with open(os.path.join(root, "site.css"), "wb") as fh:
+        fh.write(small)
+    with open(os.path.join(root, "big.bin"), "wb") as fh:
+        fh.write(large)
+
+    with Server("--static-dir", "/static=" + root) as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            # HEAD is not checked here, and the reason is the client rather
+            # than the server. A HEAD response declares the length a GET would
+            # have had and sends no body, which RFC 9110 section 8.6 allows
+            # explicitly -- but aioquic's H3Connection is generic over requests
+            # and never learns the method, so a non-zero content-length with an
+            # empty body reads to it as a stream that ended early, and it never
+            # reports the response at all. Covered over HTTP/1.1 and HTTP/2 in
+            # scripts/static-test.sh instead.
+            status, headers, body = await client.request("GET", "/static/site.css")
+            is_("a file is served over HTTP/3", status, 200)
+            is_("its bytes are intact", body, small)
+            is_("its media type is right", headers.get(b"content-type"),
+                b"text/css; charset=utf-8")
+            check("an ETag is sent", b"etag" in headers, headers)
+
+            etag = headers.get(b"etag")
+            status, _, body = await client.request(
+                "GET", "/static/site.css", headers=((b"if-none-match", etag),))
+            is_("a matching ETag is 304", status, 304)
+            is_("the 304 carries no body", body, b"")
+
+            status, _, body = await client.collect(
+                client.start("GET", "/static/big.bin"), timeout=60.0)
+            is_("a 3MB file arrives whole", len(body), len(large))
+            is_("a 3MB file is byte-identical", body, large)
+
+            status, _, _ = await client.request("GET", "/static/../etc/passwd")
+            is_("dot-dot does not escape", status, 404)
+            status, _, _ = await client.request("GET", "/static/missing.css")
+            is_("a missing file reaches the application", status, 404)
+            status, _, body = await client.request("GET", "/")
+            is_("the application still answers", body, b"hello from peregrine asgi\n")
+
+    shutil.rmtree(root, ignore_errors=True)
 
 
 async def request_bodies():
@@ -731,7 +801,7 @@ async def main():
         return 0
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
-    for test in (basics, request_bodies, multiplexing, cancellation, rapid_reset,
+    for test in (basics, health_check, static_files, request_bodies, multiplexing, cancellation, rapid_reset,
                  spoofed_address, large_headers, response_framing, flow_control, long_lived,
                  key_update, wsgi, alt_svc):
         try:
