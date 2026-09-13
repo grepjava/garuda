@@ -246,17 +246,19 @@ The target is `module:attribute`, not a file path — `myapp.wsgi:application`,
 never `myapp/wsgi.py:application`.
 
 The full suites, from a checkout, want a virtualenv with `aioquic`, `h2`,
-`fastapi`, `django`, `websockets` and `channels` in it:
+`fastapi`, `flask` and `websockets` in it:
 
 ```bash
-swift test                                      # 114 unit tests
-bash scripts/integration-test.sh                #  38 end-to-end checks
-python3 scripts/feature-test.py                 # 102 failure-mode checks
-bash scripts/framework-test.sh                  #  30 against FastAPI, Django
-<venv>/bin/python scripts/http2-test.py         # 116 against `h2`
-<venv>/bin/python scripts/http3-test.py         #  74 against `aioquic`
+swift test                                      # 150 unit tests
+bash scripts/integration-test.sh                #  56 end-to-end checks
+python3 scripts/feature-test.py                 # 196 failure-mode checks
+bash scripts/framework-test.sh                  # against real FastAPI and
+                                                #   Flask applications
+<venv>/bin/python scripts/http2-test.py         # 162 against `h2`
+<venv>/bin/python scripts/http3-test.py         # 114 against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only
-<venv>/bin/python scripts/webtransport-test.py  # 115 including FastAPI/Django
+<venv>/bin/python scripts/webtransport-test.py  # including FastAPI over HTTP/3
+                                                #   and WebTransport
 ```
 
 ---
@@ -318,7 +320,7 @@ state. The binary lives in the package directory and goes with it.
 
 ---
 
-Next: [CONFIG.md](CONFIG.md) — configuring FastAPI and Django for every
+Next: [CONFIG.md](CONFIG.md) — configuring FastAPI and Flask for every
 protocol the server speaks. [README.md](README.md) — what it is and what it
 supports. [ARCHITECTURE.md](ARCHITECTURE.md) — how it is built.
 [TRANSPORT.md](TRANSPORT.md) — what each protocol does.

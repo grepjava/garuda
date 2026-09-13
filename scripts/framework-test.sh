@@ -8,7 +8,7 @@
 # managers, response classes that stream, and a framework running its own
 # thread pool inside ours.
 #
-# The virtualenv needs: fastapi starlette django websockets
+# The virtualenv needs: fastapi starlette flask django websockets
 set -u
 
 BIN=${1:-${PEREGRINE:-$HOME/pgbuild/release/peregrine}}
@@ -37,9 +37,9 @@ if [ ! -x "$PY" ]; then
     echo "no interpreter at $PY; create one and install fastapi starlette django websockets"
     exit 2
 fi
-if ! "$PY" -c 'import fastapi, starlette, django, websockets' 2>/dev/null; then
-    echo "the virtualenv at $VENV is missing one of: fastapi starlette django websockets"
-    echo "  $VENV/bin/pip install fastapi starlette django websockets"
+if ! "$PY" -c 'import fastapi, starlette, flask, websockets' 2>/dev/null; then
+    echo "the virtualenv at $VENV is missing one of: fastapi starlette flask websockets"
+    echo "  $VENV/bin/pip install fastapi starlette flask websockets"
     exit 2
 fi
 
@@ -121,7 +121,54 @@ sleep 2
 if [ -f "$MARKER" ]; then ok "the FastAPI lifespan shutdown ran"
 else bad "the FastAPI lifespan shutdown ran" "no marker written" "a marker file"; fi
 
+# --------------------------------------------------------------- Flask ------
+echo
+echo "Flask (WSGI, 8 application threads)"
+start $WSGI_PORT flask_app:app --wsgi-threads 8
+H="http://127.0.0.1:$WSGI_PORT"
+
+has "routing and JSON responses" "$(curl -sS --max-time 10 $H/)" '"hello":"peregrine"'
+has "wsgi.multithread is reported to the application" \
+    "$(curl -sS --max-time 10 $H/)" '"multithread":true'
+has "a trusted proxy makes request.is_secure true" \
+    "$(curl -sS --max-time 10 -H 'X-Forwarded-Proto: https' $H/headers)" '"secure":true'
+has "a trusted proxy sets request.remote_addr" \
+    "$(curl -sS --max-time 10 -H 'X-Forwarded-For: 198.51.100.2' $H/headers)" \
+    '"remote":"198.51.100.2"'
+is "request bodies reach the view" "$(curl -sS --max-time 10 -d 'flask body' $H/echo)" \
+   "flask body"
+is "an unhandled exception is a 500" \
+   "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 $H/boom)" "500"
+is "a streamed Response is chunked" \
+   "$(curl -sS -i --max-time 10 $H/stream | grep -ci '^transfer-encoding: chunked')" "1"
+is "a streamed Response body" "$(curl -sS --max-time 10 $H/stream | tr '\n' ' ')" \
+   "chunk-0 chunk-1 chunk-2 chunk-3 chunk-4 "
+has "the same view served over HTTP/1.1 says so" \
+    "$(curl -sS --max-time 10 $H/proto)" '"http_version":"1.1"'
+has "and over HTTP/2, with nothing changed in the application" \
+    "$(curl -sS --max-time 10 --http2-prior-knowledge $H/proto)" '"http_version":"2"'
+
+start_ms=$(date +%s%N)
+pids=""
+for _ in $(seq 1 8); do
+    curl -sS --max-time 20 -o /dev/null "$H/sleep?s=0.5" &
+    pids="$pids $!"
+done
+for p in $pids; do wait "$p"; done
+elapsed=$(( ($(date +%s%N) - start_ms) / 1000000 ))
+if [ "$elapsed" -lt 2000 ]; then
+    ok "8 blocking Flask views overlap on the pool (${elapsed}ms)"
+else
+    bad "8 blocking Flask views overlap on the pool" "${elapsed}ms" "under 2000ms"
+fi
+
 # -------------------------------------------------------------- Django ------
+# Optional: the Django integration still ships, but FastAPI and Flask are what
+# this suite is about, so Django is checked only where it is installed.
+if ! "$PY" -c 'import django' 2>/dev/null; then
+    echo
+    echo "Django is not installed; its checks are skipped"
+else
 echo
 echo "Django (WSGI, 8 application threads)"
 start $WSGI_PORT django_app:application --wsgi-threads 8
@@ -192,6 +239,8 @@ PYEOF
 else
     echo "  ..   channels is not installed; the websocket check is skipped"
 fi
+
+fi  # django
 
 echo
 echo "FastAPI through WebTransportRouter"

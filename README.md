@@ -28,11 +28,12 @@ peregrine --http3 --tls-cert cert.pem --tls-key key.pem myapp:app
 
 **Further reading:** [INSTALLATION.md](INSTALLATION.md) — what to install and
 what to do when it goes wrong. [CONFIG.md](CONFIG.md) — configuring FastAPI and
-Django for every protocol here. [ARCHITECTURE.md](ARCHITECTURE.md) — how the
+Flask for every protocol here. [ARCHITECTURE.md](ARCHITECTURE.md) — how the
 server is built, and why. [TRANSPORT.md](TRANSPORT.md) — what each protocol
-does and what is implemented of it. [BENCHMARKS.md](BENCHMARKS.md) — hello-world
-throughput, processes against `--free-threaded`. [DEPLOY.md](DEPLOY.md) — how
-a release reaches PyPI.
+does and what is implemented of it. [BENCHMARKS.md](BENCHMARKS.md) — FastAPI
+and Flask against uvicorn, granian and fastpysgi, measured the way
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
+measures. [DEPLOY.md](DEPLOY.md) — how a release reaches PyPI.
 
 ---
 
@@ -84,44 +85,38 @@ to remove.
 
 ## Numbers
 
-One worker, one core, 64 connections, same application, same load generator
-(`oha`), Ubuntu 24.04 on WSL2, CPython 3.12, Swift 6.3.3.
-Reproduce with `bash benchmarks/run.sh`.
+FastAPI and Flask, one worker each, on Peregrine, uvicorn, granian and fastpysgi, measured
+the way [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
+measures: its applications, its server commands and its load (zrk, an
+open-loop ramp to 100,000 requests a second, 15 s per level). Requests per
+second at 64 / 256 / 512 connections, median of three runs, WSL2 on 4 cores,
+CPython 3.12:
 
-| WSGI, 1 worker | req/s | p50 | p99 |
+| FastAPI (ASGI) | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| **peregrine** | **100,603** | 0.49 ms | 3.37 ms |
-| gunicorn (sync) | 4,464 | 12.86 ms | 28.93 ms |
-| gunicorn (gthread ×8) | 2,041 | 30.74 ms | 45.07 ms |
+| **peregrine** | **20,319** | **20,469** | **18,944** |
+| uvicorn | 16,043 | 15,236 | 14,430 |
+| granian | 14,544 | 15,241 | 15,254 |
+| fastpysgi | 11,253 | 11,153 | 10,434 |
 
-| ASGI, 1 worker | req/s | p50 | p99 |
+| Flask (WSGI) | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| **peregrine** | **55,526** | 0.98 ms | 4.61 ms |
-| uvicorn (uvloop + httptools) | 43,361 | 1.34 ms | 5.08 ms |
-| uvicorn (asyncio + h11) | 5,343 | 11.08 ms | 25.60 ms |
+| **peregrine** | **12,196** | **14,042** | **13,256** |
+| uvicorn (`--interface wsgi`) | 6,705 | 6,234 | 5,282 |
+| granian | 6,022 | 5,843 | 6,250 |
+| fastpysgi | 10,532 | 10,057 | 10,056 |
 
-Roughly 22× gunicorn on WSGI and 1.3× uvicorn's fastest configuration on ASGI.
-Run-to-run variance on this box is around ±10%, so treat the ratios rather than
-the absolute figures as the result. Each cell is the median of three runs.
+Method, latencies, where this differs from the published results, and how to
+reproduce it: [BENCHMARKS.md](BENCHMARKS.md). Run-to-run variance on this box is
+around ±10 %, so read the ratios rather than the absolute figures.
 
-Resident memory for the same application (`bash benchmarks/memory.sh`), summed
-over the whole process tree:
+These are hello-world routes, so they measure what a server adds to a request
+rather than what an application can do. A real application doing database work
+will be dominated by that work, and the gaps will narrow accordingly.
 
-| | idle | under 500 connections |
-|---|---:|---:|
-| peregrine (wsgi) | 31.7 MB | 33.8 MB |
-| gunicorn (sync) | 45.4 MB | 45.5 MB |
-| peregrine (asgi) | 31.7 MB | 34.8 MB |
-| uvicorn (uvloop) | 28.3 MB | 33.3 MB |
-
-Nearly all of that is CPython itself: the server binary is ~1.0 MB of text and
-data, and a live connection costs one 16 KiB pooled read buffer plus a
-~200-byte slot.
-
-These are trivial-response benchmarks, so they measure server overhead rather
-than application throughput — which is the point. A real application doing
-database work will be dominated by that work, and the gap will narrow
-accordingly.
+The server binary is about 1.0 MB of text and data, and a live connection costs
+one 16 KiB pooled read buffer plus a slot of about 200 bytes. Nearly all of a
+worker's resident memory is CPython and the application.
 
 ---
 
@@ -197,8 +192,8 @@ peregrine --workers 0 --free-threaded myapp:app
 
 On four cores with a CPU-bound application that is 5,907 req/s in 47 MB against
 5,832 req/s in 143 MB for four worker processes — the throughput of processes
-at a third of the memory, because Django is imported once instead of four
-times. The ASGI lifespan runs once per worker thread, on the event loop that
+at a third of the memory, because the application is imported once instead of
+four times. The ASGI lifespan runs once per worker thread, on the event loop that
 thread serves requests with, so what an application opens in `startup` is
 attached to the loop that will await
 it. [Details.](CONFIG.md#free-threaded-python)
@@ -336,20 +331,19 @@ too.
 Checked against real applications rather than only the specifications
 (`bash scripts/framework-test.sh`):
 
-- **FastAPI / Starlette** — routing, middleware, `lifespan` context managers
+- **FastAPI** (ASGI) — routing, middleware, `lifespan` context managers
   including teardown on `SIGTERM`, `StreamingResponse`, WebSocket endpoints
   driven by the `websockets` client, the generated OpenAPI document, and the
   `anyio` worker threads FastAPI uses for synchronous endpoints.
-- **Django** — the WSGI handler, `StreamingHttpResponse`, `request.is_secure()`
-  and `REMOTE_ADDR` derived from forwarded headers, and blocking views
-  overlapping properly on `--wsgi-threads`; and the ASGI handler with Channels
-  consumers and WebTransport sessions layered over it.
+- **Flask** (WSGI) — routing, request bodies, streamed responses,
+  `request.is_secure` and `request.remote_addr` derived from forwarded headers,
+  and blocking views overlapping properly on `--wsgi-threads`.
 
 Both run over HTTP/3 with no integration at all: a request is the same request
-whatever carried it. WebTransport is the exception, because a session is not a
-request — every ASGI framework asserts on the scope type before it routes — so
-`peregrine.contrib` puts a router in front that answers sessions and passes
-everything else through:
+whatever carried it. WebTransport is the exception for FastAPI, because a
+session is not a request — Starlette's router asserts on the scope type before
+it routes — so `peregrine.contrib` puts a router in front that answers sessions
+and passes everything else through:
 
 ```python
 from fastapi import FastAPI
@@ -365,9 +359,9 @@ async def chat(session):
         await stream.send(b"hello " + await stream.read(), end=True)
 ```
 
-The Django form is the same with `<str:room>` converters and
-`get_asgi_application()` underneath, and composes with Channels: Django serves
-`http`, Channels serves `websocket`, this serves `webtransport`.
+Flask needs nothing at all: as a WSGI application it is served over HTTP/1.1,
+HTTP/2 and HTTP/3, and WebSocket and WebTransport, which PEP 3333 cannot
+express, are refused with a 501.
 [How to configure both, protocol by protocol.](CONFIG.md)
 [What the router does.](TRANSPORT.md#frameworks)
 
@@ -388,28 +382,28 @@ code, because a test written against the same understanding as the code proves
 only that the understanding is consistent.
 
 ```bash
-swift test                                      # 127 unit tests: parser,
+swift test                                      # 150 unit tests: parser,
                                                 #   chunking, buffers, writer,
                                                 #   websocket framing, HPACK,
                                                 #   QUIC packet protection,
                                                 #   and the fuzz corpus
-bash scripts/integration-test.sh                #  47 end-to-end checks
+bash scripts/integration-test.sh                #  56 end-to-end checks
 python3 scripts/feature-test.py                 # 196 checks for the failure
                                                 #   modes a plain request never
                                                 #   reaches: slow consumers,
                                                 #   stuck-request shutdown,
                                                 #   lifespan cleanup, worker
                                                 #   restarts, reload
-bash scripts/framework-test.sh                  #  30 checks against real
-                                                #   FastAPI and Django apps,
+bash scripts/framework-test.sh                  # checks against real FastAPI
+                                                #   and Flask applications,
                                                 #   over HTTP/1.1 and HTTP/2
 <venv>/bin/python scripts/http2-test.py         # 162 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  82 checks against `aioquic`
+<venv>/bin/python scripts/http3-test.py         # 114 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only: routing,
                                                 #   converters, session helper
-<venv>/bin/python scripts/webtransport-test.py  # 117 including the above,
-                                                #   plus FastAPI and Django
-                                                #   over HTTP/3 and WebTransport
+<venv>/bin/python scripts/webtransport-test.py  # sessions, streams, datagrams,
+                                                #   plus FastAPI over HTTP/3
+                                                #   and WebTransport
 swift run -c release pgfuzz                     # mutation fuzzing of every
                                                 #   parser that reads bytes
                                                 #   from the network

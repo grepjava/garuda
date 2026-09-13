@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# GIL (worker processes) vs --free-threaded (worker threads) on the six
+# GIL (worker processes) vs --free-threaded (worker threads) on the
 # the-benchmarker contract apps. Columns are concurrent connections.
 #
 #   bash benchmarks/gil_vs_ft.sh
+#   APPS="fastapi flask asgi wsgi" bash benchmarks/gil_vs_ft.sh
+#
+# APPS picks the applications, FastAPI and Flask by default. Every app in
+# benchmarks/contract/ is available: fastapi flask asgi wsgi django sanic
+# blacksheep.
 #
 # Override binaries / venvs / duration with the environment. Two peregrine
 # builds are required: one linked against a GIL CPython, one against a
@@ -19,6 +24,8 @@ FT_VENV=${FT_VENV:-$HOME/pgvenv-ft}
 PORT=${PORT:-8210}
 DURATION=${DURATION:-15s}
 CONNS="${CONNS:-64 256 512}"
+# fastapi flask asgi wsgi django sanic blacksheep
+APPS="${APPS:-fastapi flask}"
 URL="http://127.0.0.1:$PORT/"
 
 # Only the server this script started is stopped, and as a process group, so
@@ -82,24 +89,23 @@ run_matrix() {
     echo
     printf '%-36s%s\n' "app" "$hdr"
 
-    row "raw ASGI" \
-        "$bin" --port "$PORT" --workers "$workers" --log-level error \
-        $extra --venv "$venv" --python-path "$ROOT/benchmarks/contract" asgi:app
-    row "raw WSGI" \
-        "$bin" --port "$PORT" --workers "$workers" --log-level error \
-        $extra --venv "$venv" --python-path "$ROOT/benchmarks/contract" wsgi:application
-    row "FastAPI" \
-        "$bin" --port "$PORT" --workers "$workers" --log-level error \
-        $extra --venv "$venv" --python-path "$ROOT/benchmarks/contract" fastapi_app:app
-    row "Django" \
-        "$bin" --port "$PORT" --workers "$workers" --log-level error \
-        $extra --venv "$venv" --python-path "$ROOT/benchmarks/contract" django_app:application
-    row "Sanic" \
-        "$bin" --port "$PORT" --workers "$workers" --log-level error \
-        $extra --venv "$venv" --python-path "$ROOT/benchmarks/contract" sanic_app:app
-    row "BlackSheep" \
-        "$bin" --port "$PORT" --workers "$workers" --log-level error \
-        $extra --venv "$venv" --python-path "$ROOT/benchmarks/contract" blacksheep_app:app
+    local app
+    for app in $APPS; do
+        local name target
+        case "$app" in
+        fastapi)    name="FastAPI";    target=fastapi_app:app ;;
+        flask)      name="Flask";      target=flask_app:app ;;
+        asgi)       name="raw ASGI";   target=asgi:app ;;
+        wsgi)       name="raw WSGI";   target=wsgi:application ;;
+        django)     name="Django";     target=django_app:application ;;
+        sanic)      name="Sanic";      target=sanic_app:app ;;
+        blacksheep) name="BlackSheep"; target=blacksheep_app:app ;;
+        *) echo "unknown app: $app"; continue ;;
+        esac
+        row "$name" \
+            "$bin" --port "$PORT" --workers "$workers" --log-level error \
+            $extra --venv "$venv" --python-path "$ROOT/benchmarks/contract" "$target"
+    done
 }
 
 trap stop EXIT

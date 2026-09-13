@@ -2,38 +2,37 @@
   <img src="assets/peregrine-cursive-segoe.png" alt="peregrine" width="480">
 </p>
 
-# Configuring FastAPI and Django
+# Configuring FastAPI and Flask
 
 The governing rule is that **the protocol is a server flag, not an application
 change.** A view is the same view whether HTTP/1.1, HTTP/2 or HTTP/3 carried
-the request to it; none of them alter the scope beyond `http_version`, so there
-is nothing for the framework to do differently and nothing to configure.
+the request to it. Nothing about the request changes except the version it
+reports, so there is nothing for the framework to do differently and nothing
+to configure.
 
 There are exactly two exceptions, and they are exceptions for the same reason:
 a **WebSocket** and a **WebTransport session** are not requests. They outlive a
-response, and every ASGI framework asserts on `scope["type"]` before it looks at
-a path — Starlette allows `http`, `websocket` and `lifespan`; Django's handler
-allows `http` alone. Anything a framework will not admit to its router has to be
-answered in front of it.
+response. FastAPI is ASGI, and its router (Starlette's) admits `http`,
+`websocket` and `lifespan` scopes and nothing else, so a WebTransport session
+has to be answered in front of it. Flask is WSGI, and PEP 3333 has no way to
+express either one, so both are refused with a 501.
 
-| | FastAPI / Starlette | Django | Server flags |
+| | FastAPI (ASGI) | Flask (WSGI) | Server flags |
 |---|---|---|---|
 | **HTTP/1.1** | nothing to do | nothing to do | *(default)* |
 | **HTTP/2**, cleartext | nothing to do | nothing to do | *(default; prior knowledge)* |
 | **HTTP/2**, TLS | nothing to do | nothing to do | `--tls-cert --tls-key` |
 | **HTTP/3 / QUIC** | nothing to do | nothing to do | `--http3 --tls-cert --tls-key` |
-| **WebSocket** | native `@app.websocket` | Channels | *(default)* |
-| **WebTransport** | `contrib.fastapi.WebTransportRouter` | `contrib.django.WebTransportRouter` | `--http3 …` |
+| **WebSocket** | native `@app.websocket` | 501 | *(default)* |
+| **WebTransport** | `contrib.fastapi.WebTransportRouter` | 501 | `--http3 …` |
 
-Django over **WSGI** serves the first four and refuses the last two with a 501,
-which is PEP 3333's doing rather than a shortcut — see
-[the support matrix](README.md#what-is-supported). Everything below the WSGI
-section assumes Django on ASGI.
-
-Working code for every row is in [examples/fastapi_app.py](examples/fastapi_app.py)
-and [examples/django_app.py](examples/django_app.py), and every row is checked
-by [scripts/framework-test.sh](scripts/framework-test.sh) and
-[scripts/webtransport-test.py](scripts/webtransport-test.py).
+Working code is in [examples/fastapi_app.py](examples/fastapi_app.py) and
+[examples/flask_app.py](examples/flask_app.py).
+[scripts/framework-test.sh](scripts/framework-test.sh) runs both over HTTP/1.1
+and HTTP/2, [scripts/webtransport-test.py](scripts/webtransport-test.py) runs
+FastAPI over HTTP/3 and WebTransport, and
+[scripts/http3-test.py](scripts/http3-test.py) runs WSGI over HTTP/3, inline and
+on a thread pool.
 
 ---
 
@@ -180,121 +179,93 @@ without accepting refuses the session with an HTTP status
 
 ---
 
-## Django
+## Flask
 
-### WSGI or ASGI
-
-Django gives you two entry points and they are not equivalent here:
-
-```python
-application = WSGIHandler()                  # HTTP/1.1, HTTP/2, HTTP/3
-asgi_application = WebTransportRouter(...)   # …and WebSocket, and WebTransport
-```
-
-WSGI is the right answer for an ordinary Django site — it is the path Django is
-most heavily used on, it serves every HTTP version, and blocking views overlap
-properly on a thread pool:
+### Serving it
 
 ```bash
-peregrine --port 8000 --workers 4 --wsgi-threads 8 myproject.wsgi:application
+peregrine --port 8000 --workers 0 myapp:app
+```
+
+A Flask `app` is a WSGI application and is detected as one: no adapter, no
+`--protocol`, and no change to the application. The same command with
+`--tls-cert`, `--tls-key` and `--http3` serves it over HTTP/2 and HTTP/3 as
+well.
+
+`app.run()` starts Werkzeug's development server, not this one. Keep it under
+`if __name__ == "__main__":`, point peregrine at `app`, and use `--reload` for
+the edit-and-refresh loop it was giving you.
+
+### Inline or on a thread pool
+
+By default a worker calls the view itself, and concurrency comes from
+`--workers`. That is the fastest arrangement for views that are busy on the
+CPU, and it is what the benchmarks measure.
+
+Views that wait — on a database, on another service — want a pool:
+
+```bash
+peregrine --port 8000 --workers 4 --wsgi-threads 8 myapp:app
 ```
 
 `--wsgi-threads` is what lets eight views that are waiting on a database
 overlap instead of queueing ([the pool](ARCHITECTURE.md#the-wsgi-thread-pool)). It
-does not help views that are busy on the CPU; `--workers` does.
+does not help views that are busy on the CPU; `--workers` does. Flask's request
+context is local to the thread, so ordinary Flask code needs nothing for this;
+module-level state an application mutates does.
 
-It also changes what a streaming response costs. PEP 3333 requires each yielded
+It also changes what a streamed response costs. PEP 3333 requires each yielded
 block to be transmitted before the next one is asked for, so the inline path
-makes one write syscall per block — on a `StreamingHttpResponse` yielding
-hundreds of small rows, that dominates. A pool thread instead hands each block
-to the loop, which writes it while the application produces the next one; the
-spec allows that, and it costs a mutex rather than a syscall. Measured on a view
-yielding two hundred 100-byte rows: **1,516 req/s inline against 9,632 req/s
-with `--wsgi-threads 4`**. Responses that return a list are unaffected either
-way — they are written in one call, and hello-world throughput does not move.
+makes one write syscall per block — on a view streaming hundreds of small rows,
+that dominates. A pool thread instead hands each block to the loop, which
+writes it while the view produces the next one; the spec allows that, and it
+costs a mutex rather than a syscall. Measured on a view yielding two hundred
+100-byte rows (`/rows` in [examples/flask_app.py](examples/flask_app.py)):
+**1,430 req/s inline against 5,123 req/s with `--wsgi-threads 4`**, one
+worker and 64 connections. A view that returns a string or a list is unaffected
+either way: its response is in hand when the view returns, and it goes out in
+one write.
 
-Choose ASGI when you want WebSockets or WebTransport, and compose the entry
-point like this ([examples/django_app.py:85-128](examples/django_app.py#L85-L128)):
-
-```python
-# asgi.py
-import os
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
-
-from django.core.asgi import get_asgi_application
-from channels.routing import ProtocolTypeRouter, URLRouter
-from peregrine.contrib.django import WebTransportRouter
-
-from . import consumers
-
-application = WebTransportRouter(ProtocolTypeRouter({
-    "http": get_asgi_application(),
-    "websocket": URLRouter([path("ws", consumers.Echo.as_asgi())]),
-}))
-```
-
-Read outward: Django serves `http`, Channels serves `websocket`, and the
-peregrine router serves `webtransport` and forwards everything else to the pair
-of them. Each layer owns exactly the scope types the one beneath it refuses.
-
-```bash
-peregrine --port 8443 --tls-cert cert.pem --tls-key key.pem --http3 \
-          --python-path . myproject.asgi:application
-```
-
-### WebSocket, through Channels
-
-Django itself has no WebSocket support; Channels is the framework's own answer
-and works unmodified ([EchoConsumer](examples/django_app.py#L111)):
+### Knowing what carried the request
 
 ```python
-class Echo(AsyncWebsocketConsumer):
-    async def connect(self):
-        await self.accept()
-
-    async def receive(self, text_data=None, bytes_data=None):
-        await self.send(text_data="echo:" + text_data)
+@app.get("/proto")
+def proto():
+    # "HTTP/1.1", "HTTP/2" or "HTTP/3"
+    return {"http_version": request.environ["SERVER_PROTOCOL"].partition("/")[2]}
 ```
 
-`pip install channels`. A channel layer is only needed if consumers talk to
-each other; an echo like this needs none. Nothing about running under peregrine
-changes how Channels is configured.
+The same view answers on every version
+([/proto](examples/flask_app.py)). This is for logging and feature detection —
+routing on it is almost always a mistake.
 
-### WebTransport
+### What a WSGI application cannot have
 
-Routes are written the way `urlpatterns` are, converters included
-([examples/django_app.py:131-160](examples/django_app.py#L131-L160)):
-
-```python
-@application.route("wt/room/<str:name>/")
-async def room(session):
-    await session.accept()
-    name = session.path_params["name"]              # a str
-    ...
-
-@application.route("wt/n/<int:count>/")
-async def count(session):
-    count = session.path_params["count"]            # an int, converted
-```
-
-`<str:>`, `<int:>`, `<slug:>`, `<uuid:>` and `<path:>` are understood, the
-leading slash is optional, `<int:>` and `<uuid:>` convert rather than handing
-you a string, and a missing trailing slash is still matched.
+WebSocket and WebTransport are refused with a 501. Both are streams that outlive
+a response, and PEP 3333 has no way to hand one to the application. The
+WebSocket support in `flask-sock` and Flask-SocketIO depends on a server that
+gives the application the raw socket, which this one does not. Real-time
+traffic belongs in an ASGI application — FastAPI, above — served next to the
+Flask one.
 
 ### Settings worth knowing about
 
-* **`ALLOWED_HOSTS`** applies as usual; peregrine passes the `Host` header
-  through unchanged.
-* **`request.is_secure()`** is true over TLS and over HTTP/3 with no
-  `SECURE_PROXY_SSL_HEADER` needed. Behind a terminating proxy, use
-  `--forwarded-allow-ips` (below) rather than the Django setting — the server
-  resolves the scheme and `REMOTE_ADDR` before Django sees them, and it will
-  only do so for peers you have named.
-* **Static files** are not served by the application server. Use a CDN or a
-  proxy in front, or `whitenoise` in the middleware stack if you want Django to
-  do it.
-* **`DEBUG = True`** is as unsuitable here as anywhere else in production, and
-  its stack-trace pages are unaffected by any of this.
+* **`request.scheme`, `request.is_secure` and `request.remote_addr`** are right
+  over TLS and over HTTP/3 with nothing configured. Behind a terminating proxy,
+  use `--forwarded-allow-ips` (below) rather than Werkzeug's `ProxyFix`: the
+  server resolves the scheme and `REMOTE_ADDR` before Flask sees them, and only
+  for peers you have named. `url_for(..., _external=True)` then builds `https`
+  URLs from what the server resolved.
+* **The `Host` header** reaches Flask unchanged, so `SERVER_NAME` and
+  host-matched routes behave as they do anywhere else.
+* **Static files** go through the application unless something is in front.
+  `--static-dir /static=/srv/app/static` serves Flask's `static` folder with
+  `sendfile(2)` instead, and a path with no file behind it still reaches Flask
+  ([Serving assets](#serving-assets)).
+* **Streamed responses** — a generator, `stream_with_context` — go out block by
+  block as they are yielded, chunked on HTTP/1.1.
+* **`DEBUG`** and the interactive debugger are as unsuitable here as anywhere
+  else in production.
 
 ---
 
@@ -318,21 +289,21 @@ curl -k --http2 https://127.0.0.1:8443/proto
 curl -k --http3 https://127.0.0.1:8443/proto
 ```
 
-The suites do not rely on curl having HTTP/3, and drive both frameworks with
+The suites do not rely on curl having HTTP/3, and drive the server with
 `aioquic` instead:
 
 ```bash
-bash scripts/framework-test.sh                  # 30 checks: HTTP/1.1 and
-                                                #   HTTP/2 against both,
-                                                #   Starlette and Channels
-                                                #   websockets
+bash scripts/framework-test.sh                  # FastAPI and Flask over
+                                                #   HTTP/1.1 and HTTP/2, and
+                                                #   Starlette websockets
 python3 scripts/contrib_test.py                 # 58 Python-only: routing
-<venv>/bin/python scripts/webtransport-test.py  # 115 checks, of which 22 drive
-                                                #   FastAPI and Django over
-                                                #   HTTP/3 and WebTransport
+<venv>/bin/python scripts/webtransport-test.py  # FastAPI over HTTP/3 and
+                                                #   WebTransport
+<venv>/bin/python scripts/http3-test.py         # 114, WSGI and ASGI over
+                                                #   HTTP/3
 ```
 
-The HTTP/3 checks there include fetching `/proto` from each framework over
+The HTTP/3 checks there include fetching `/proto` from the FastAPI example over
 QUIC and reading `"http_version": "3"` back out of the view — the same view
 that answers `1.1` on the line above, with nothing changed in between.
 
@@ -594,7 +565,8 @@ Python.
 path that is a prefix of the route rather than under it, and a directory. A
 route that answered 404 for everything under its prefix would take those URLs
 away from an application that already serves them; this is meant to go in front
-of `whitenoise` or Django's `staticfiles`, not to compete with them for URLs.
+of Flask's own `static` route or FastAPI's `StaticFiles` mount, not to compete
+with them for URLs.
 
 `..`, `%2e%2e` and a symlink pointing out of the tree are all refused by where
 the path lands rather than by how it is spelled: both the root and the result
@@ -658,8 +630,8 @@ term echoed back, lets an attacker who can watch the size of the traffic recover
 the secret a byte at a time (BREACH). Whether an application has pages like
 that is its own knowledge, which is why this is off by default and not
 something the server can decide. The usual answers are to keep secrets out of
-responses that reflect input, to mask tokens per response (Django does), or to
-leave `--compress` off and use only `--compress-static`, which reflects
+responses that reflect input, to mask tokens so they differ in every response,
+or to leave `--compress` off and use only `--compress-static`, which reflects
 nothing.
 
 ---
@@ -931,9 +903,16 @@ the level from the server rather than from a second setting is the point:
 step.
 
 `configure()` replaces the handlers already on the logger, because the case it
-is for is an application whose framework has already called `basicConfig` —
-Django does — and adding to those would duplicate every line. Pass
-`replace=False` to sit alongside them instead.
+is for is an application where something has already called `basicConfig` — a
+library, a settings module, the application's own start-up — and adding to
+those would duplicate every line. Pass `replace=False` to sit alongside them
+instead.
+
+In a Flask application, call `configure()` before anything first uses
+`app.logger`. Flask gives that logger a handler of its own, writing to stderr,
+the first time it is used, unless a handler already sees its records. Configured
+first, the server's log is where `app.logger.info(...)` goes. Configured after,
+every line from `app.logger` is written twice.
 
 For an application that builds its logging configuration by hand, the handler
 is an ordinary one:
@@ -986,12 +965,12 @@ What that buys, measured on a four-core machine with a CPU-bound application:
 
 The same parallelism for a third of the memory, because the application is
 imported once rather than four times. The larger the application, the wider
-that gap gets — it is the whole of Django, not the server, that was being
-copied.
+that gap gets — it is the application and everything it imports, not the
+server, that was being copied.
 
-Hello-world `GET /` is the other way around: four processes still win on
-FastAPI, Django, Sanic and BlackSheep, and threads only tie on raw ASGI.
-That table is in [BENCHMARKS.md](BENCHMARKS.md). `--free-threaded` is the
+Hello-world `GET /` is the other way around: with four workers, threads reach
+81–94 % of what four processes do on FastAPI and 71–82 % on Flask. That table
+is in [BENCHMARKS.md](BENCHMARKS.md#processes-or-free-threaded). `--free-threaded` is the
 memory and shared-state option, not a request-rate upgrade on an empty view.
 
 Sharing one process also changes three things it is worth knowing about:

@@ -523,7 +523,8 @@ async def alongside_requests():
 
 
 async def frameworks():
-    """The FastAPI and Django integrations, against the real frameworks.
+    """The FastAPI integration, and Django's where it is installed, against
+    the real frameworks.
 
     Neither can route a WebTransport session itself -- both assert on the
     scope type before they look at the path -- so what is being checked is
@@ -533,10 +534,15 @@ async def frameworks():
     print("\nFrameworks")
     try:
         import fastapi                                            # noqa: F401
-        import django                                             # noqa: F401
     except ImportError:
-        print("  ..   skipped (needs fastapi and django)")
+        print("  ..   skipped (needs fastapi)")
         return
+    try:
+        import django                                             # noqa: F401
+        have_django = True
+    except ImportError:
+        print("  ..   django is not installed; its checks are skipped")
+        have_django = False
 
     env = dict(os.environ)
     env["PYTHONPATH"] = os.path.join(ROOT, "python") + os.pathsep + \
@@ -544,9 +550,10 @@ async def frameworks():
 
     # Django routes are written with a trailing slash, as urlpatterns are;
     # the router keeps each framework's own spelling rather than imposing one.
-    for label, app, room in (("fastapi", "fastapi_app:wt", "/wt/room/lobby"),
-                             ("django", "django_app:asgi_application",
-                              "/wt/room/lobby/")):
+    targets = [("fastapi", "fastapi_app:wt", "/wt/room/lobby")]
+    if have_django:
+        targets.append(("django", "django_app:asgi_application", "/wt/room/lobby/"))
+    for label, app, room in targets:
         with Server(app=app, env=env) as server:
             async with connect("127.0.0.1", server.port,
                                configuration=configuration(),
@@ -628,6 +635,8 @@ async def frameworks():
             is_("fastapi: a trailing slash still matches",
                 headers.get(b":status"), b"200")
 
+    if not have_django:
+        return
     with Server(app="django_app:asgi_application", env=env) as server:
         async with connect("127.0.0.1", server.port,
                            configuration=configuration(),

@@ -435,11 +435,12 @@ code in 400–599 is used as one, anything else becomes 403.
 That extension is a message protocol, and writing against it directly is fine.
 What no framework can do unaided is *route* to it: a session is not a request,
 so it arrives with `scope["type"] == "webtransport"`, and every ASGI framework
-asserts on that field before it looks at the path. Starlette's router allows
-`http`, `websocket` and `lifespan`; Django's handler allows `http` alone.
+asserts on that field before it looks at the path. Starlette's router, which
+FastAPI is built on, allows `http`, `websocket` and `lifespan`, and nothing
+else.
 
 So `peregrine.contrib` puts a router in front, which answers sessions itself
-and hands everything else to the framework unchanged.
+and hands everything else to FastAPI unchanged.
 
 ```python
 from fastapi import FastAPI
@@ -456,23 +457,9 @@ async def chat(session):
         await stream.send(b"welcome to " + room.encode(), end=True)
 ```
 
-```python
-# Django asgi.py
-from django.core.asgi import get_asgi_application
-from peregrine.contrib.django import WebTransportRouter
-
-application = WebTransportRouter(get_asgi_application())
-
-@application.route("chat/<str:room>/")
-async def chat(session):
-    await session.accept()
-    ...
-```
-
-Paths keep each framework's own spelling — `{room}` and `{count:int}` for
-Starlette, Django's `<str:room>` and `<int:count>` converters for Django. A
-missing or extra trailing slash is tried the other way: a session cannot be
-HTTP-redirected.
+Paths keep Starlette's spelling — `{room}`, and `{count:int}` for a converted
+parameter. A missing or extra trailing slash is tried the other way: a session
+cannot be HTTP-redirected.
 
 `peregrine.webtransport.WebTransportSession` is what those hand the endpoint,
 and it is framework-agnostic: it demultiplexes the one ASGI `receive()` channel
@@ -487,17 +474,18 @@ Starlette's `WebSocketEndpoint`, with `on_connect` / `on_stream` / `on_datagram`
 / `on_disconnect`; streams and datagrams are dispatched concurrently.
 
 **HTTP/3 needs no integration at all.** A request is the same request whatever
-carried it, and `request.is_secure()`, `request.scheme` and `REMOTE_ADDR` are
-right over QUIC without either framework being told. `http_version(request)`
-and `is_http3(request)` are provided for applications that want to know, and
-`AltSvcMiddleware` for the case where HTTP/3 lives somewhere this process
-cannot see — a terminating proxy, or a different port.
+carried it. FastAPI's `request.url.scheme` and `request.client`, and Flask's
+`request.scheme`, `request.is_secure` and `request.remote_addr`, are right over
+QUIC without either framework being told. For FastAPI, `http_version(request)`
+and `is_http3(request)` are provided for applications that want to know; a
+Flask view reads `SERVER_PROTOCOL`, which is `HTTP/3`. `AltSvcMiddleware` covers
+the case where HTTP/3 lives somewhere this process cannot see — a terminating
+proxy, or a different port.
 
-Channels composes with the router rather than competing with it, and for the
-same reason it exists: Django serves `http`, Channels serves `websocket`, this
-serves `webtransport`, each layer owning exactly the scope types the one
-beneath it refuses. [CONFIG.md](CONFIG.md) has that composition in full, and
-what to configure in each framework for every protocol here.
+Flask is a WSGI application, so the router does not apply to it: WebSocket and
+WebTransport are streams that outlive a response, PEP 3333 cannot express one,
+and both are refused with a 501 on WSGI. [CONFIG.md](CONFIG.md) has what to
+configure in each framework for every protocol here.
 
 ---
 
@@ -547,9 +535,9 @@ only that the understanding is consistent.
 
 ```bash
 <venv>/bin/python scripts/http2-test.py         # 162 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         #  82 checks against `aioquic`
+<venv>/bin/python scripts/http3-test.py         # 114 checks against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only
-<venv>/bin/python scripts/webtransport-test.py  # 117 including FastAPI/Django
+<venv>/bin/python scripts/webtransport-test.py  # including FastAPI over HTTP/3
 
 h2spec -h 127.0.0.1 -p 8443 -t -k               # 146/146
 ```
