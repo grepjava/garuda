@@ -77,6 +77,15 @@ extension QUICConnection {
             return buildClose(out, budget, nowMs: nowMs)
         }
 
+        // Congestion control, RFC 9002 section 7: while the window is full,
+        // nothing that counts as in flight goes out. Acknowledgements still do
+        // -- they are not in flight, and holding them back would stall the
+        // peer as well -- and so do the probes a timeout allows. Without this
+        // the sender was bounded by flow control alone and put out many times
+        // what a slow receiver could take, then paid to send it all again.
+        let windowFull = !recovery.canSend
+        let ackOnly = windowFull && recovery.probeAllowance == 0
+
         var planned: [PlannedPacket] = []
         var offset = 0
         var carriesInitial = false
@@ -88,7 +97,8 @@ extension QUICConnection {
             // unauthenticated.
             if level == .application && !handshakeComplete { continue }
             guard let packet = buildPacket(level: level, out: out, start: offset,
-                                           limit: budget, nowMs: nowMs) else { continue }
+                                           limit: budget, ackOnly: ackOnly,
+                                           nowMs: nowMs) else { continue }
             if level == .initial { carriesInitial = true }
             offset = packet.end
             planned.append(packet)
@@ -110,6 +120,7 @@ extension QUICConnection {
             (out + last.end - quicAEADTagLength).update(repeating: 0, count: padding)
             last.payloadLength += padding
             last.end += padding
+            last.padded = true
             offset = last.end
             planned[planned.count - 1] = last
         }
@@ -137,12 +148,24 @@ extension QUICConnection {
                                       sentAtMs: nowMs,
                                       size: sealed,
                                       ackEliciting: packet.ackEliciting,
-                                      inFlight: packet.ackEliciting || packet.hasData,
+                                      // RFC 9002 section 2: in flight means
+                                      // ack-eliciting or padded. A packet of
+                                      // nothing but ACK frames is never
+                                      // acknowledged itself, so counting it
+                                      // would hold the window shut until loss
+                                      // detection happened to clear it.
+                                      inFlight: packet.ackEliciting || packet.padded,
                                       frames: packet.frames,
                                       largestAcked: packet.largestAcked)
             spaces[packet.level.rawValue].record(sent)
             recovery.onPacketSent(sent)
             sent.frames = QUICSentFrames()
+        }
+        if windowFull && !ackOnly {
+            for packet in planned where packet.ackEliciting {
+                recovery.probeAllowance -= 1
+                break
+            }
         }
         bytesSent += total
         return total
@@ -159,13 +182,19 @@ extension QUICConnection {
         var packetNumber: UInt64
         var ackEliciting: Bool
         var hasData: Bool
+        /// Carries PADDING, which makes a packet count against the congestion
+        /// window even when nothing in it asks for an acknowledgement.
+        var padded = false
         var largestAcked: UInt64?
         var frames: QUICSentFrames
     }
 
     /// Lays out one packet's header and frames without sealing it.
+    /// With `ackOnly` the packet carries acknowledgements and nothing else:
+    /// the congestion window is full.
     private func buildPacket(level: QUICLevel, out: UnsafeMutablePointer<UInt8>,
-                             start: Int, limit: Int, nowMs: UInt64) -> PlannedPacket? {
+                             start: Int, limit: Int, ackOnly: Bool,
+                             nowMs: UInt64) -> PlannedPacket? {
         let space = level.rawValue
         // Leave room for the tag, which is added when the packet is sealed.
         let bodyLimit = limit - quicAEADTagLength
@@ -246,18 +275,20 @@ extension QUICConnection {
             scratch.destroy()
         }
 
-        if level == .application {
-            writeApplicationFrames(&writer, &frames, &ackEliciting, nowMs: nowMs)
-        }
+        if !ackOnly {
+            if level == .application {
+                writeApplicationFrames(&writer, &frames, &ackEliciting, nowMs: nowMs)
+            }
 
-        // Handshake bytes, at every level that still has them.
-        writeCrypto(&writer, &frames, &ackEliciting, level: level)
+            // Handshake bytes, at every level that still has them.
+            writeCrypto(&writer, &frames, &ackEliciting, level: level)
 
-        if pingPending && writer.room >= 1 {
-            writer.varint(QUICFrameType.ping)
-            frames.ping = true
-            ackEliciting = true
-            pingPending = false
+            if pingPending && writer.room >= 1 {
+                writer.varint(QUICFrameType.ping)
+                frames.ping = true
+                ackEliciting = true
+                pingPending = false
+            }
         }
 
         let payloadLength = writer.offset - (pnOffset + pnLength)

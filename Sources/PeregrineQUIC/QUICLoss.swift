@@ -164,6 +164,10 @@ public struct QUICRecovery {
     public var recoveryStartMs: UInt64 = 0
 
     public var ptoCount = 0
+    /// Ack-eliciting packets a probe timeout lets through a full window.
+    /// RFC 9002 section 6.2.4: one or two, so that a connection whose window
+    /// is full of packets that were all lost can still find that out.
+    public var probeAllowance = 0
 
     public init() {
         // RFC 9002 section 7.2: ten packets, with a floor and a ceiling.
@@ -253,6 +257,7 @@ public struct QUICRecovery {
     /// backoff grows.
     public mutating func onProbeTimeout() {
         ptoCount += 1
+        probeAllowance = 2
     }
 
     public mutating func onAckReceived() {
