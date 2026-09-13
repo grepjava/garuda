@@ -208,7 +208,7 @@ extension Worker {
         defer { pg_decref(scopeDict) }
 
         let token = PollToken.make(slot: slot, generation: c.pointee.generation)
-        guard let receiveFn = PyTrampoline.make(asgiReceive, context: token),
+        guard let receiveFn = PyTrampoline.make(asgiReceiveWebTransport, context: token),
               let sendFn = PyTrampoline.make(asgiSend, context: token) else {
             PyError.logPending("creating the webtransport channels")
             h3FailRequest(slot, status: 500)

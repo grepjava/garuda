@@ -274,7 +274,11 @@ class WebTransportSession:
                     self._offer_datagram(message.get("data") or b"")
                 elif kind == "webtransport.stream.opened":
                     _put_nowait(self._opened, self._register_opened(message))
-                elif kind == "webtransport.disconnect":
+                elif kind == "webtransport.disconnect" or kind.endswith(".disconnect"):
+                    # Any disconnect ends the session. A server that has already
+                    # let go of the session may answer in another protocol's
+                    # words, and treating that as unknown would ask it again
+                    # forever.
                     self.closed = True
                     self.close_code = message.get("code", 0)
                     self.close_reason = message.get("reason", "")
@@ -283,6 +287,10 @@ class WebTransportSession:
                 else:
                     # An unknown message is a server that knows something this
                     # module does not; ignoring it is what keeps that additive.
+                    # It yields first: a receive() that answers at once, every
+                    # time, would otherwise hold the event loop and nothing else
+                    # in the worker -- signals included -- would ever run.
+                    await asyncio.sleep(0)
                     continue
         except asyncio.CancelledError:
             raise

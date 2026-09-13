@@ -1009,6 +1009,32 @@ func asgiReceive(_ token: UInt64, _ args: PyObj?) -> PyObj? {
     return future
 }
 
+/// `receive()` for a WebTransport session.
+///
+/// A session's slot can go before its task does: when the QUIC connection
+/// underneath closes, the session is released at once, and the endpoint is
+/// still running. Every `receive()` after that reaches no slot. Answering
+/// `http.disconnect` there, as `asgiReceive` does, is a message the session
+/// helper does not know, so it asks again. The answer is an awaitable that has
+/// already completed, so the task never yields, and the worker spins with the
+/// event loop held -- deaf to SIGTERM, so it cannot even be drained. The only
+/// true answer is the session's own: it has ended.
+func asgiReceiveWebTransport(_ token: UInt64, _ args: PyObj?) -> PyObj? {
+    if resolveSlot(token) >= 0 { return asgiReceive(token, args) }
+    guard let msg = ASGIWebTransportMessage.disconnect(code: 0, reason: []) else { return nil }
+    defer { pg_decref(msg) }
+    return PyImmediate.make(msg)
+}
+
+/// `receive()` for a WebSocket, for the same reason: once the slot is gone,
+/// say how the connection ended in the protocol the application is speaking.
+func asgiReceiveWebSocket(_ token: UInt64, _ args: PyObj?) -> PyObj? {
+    if resolveSlot(token) >= 0 { return asgiReceive(token, args) }
+    guard let msg = ASGIWebSocketMessage.disconnect(code: WSCloseCode.abnormal) else { return nil }
+    defer { pg_decref(msg) }
+    return PyImmediate.make(msg)
+}
+
 func asgiTaskDone(_ token: UInt64, _ args: PyObj?) -> PyObj? {
     guard let worker = currentWorker else { return nil }
     var failed = false
