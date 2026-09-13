@@ -226,6 +226,13 @@ public struct Connection {
     /// Declared Content-Length of the response, or -1 for chunked.
     public var responseRemaining: Int = -1
 
+    /// The coding this request's client accepts best among those the server
+    /// can produce, settled at dispatch. Whether the response actually uses it
+    /// is up to the response's own headers.
+    public var acceptedCoding: ContentCoding = .identity
+    /// The compressor for an ASGI response body being compressed.
+    public var encoder = ResponseEncoder()
+
     /// WebSocket framing state; meaningful only in `.websocket` mode.
     public var ws = WebSocketState()
 

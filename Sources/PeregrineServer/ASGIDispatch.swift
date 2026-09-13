@@ -558,6 +558,7 @@ extension Worker {
 
         var seen: ResponseHeaderKind = []
         var declaredLength = -1
+        var eligibility = CompressionEligibility()
 
         if let headerList = pg_dict_get(message, Interned[.headers]),
            pg_is(headerList, Interned.none) == 0 {
@@ -596,6 +597,7 @@ extension Worker {
 
                 let kind = HTTPResponseWriter.classify(name)
                 seen.formUnion(kind)
+                if config.compress { eligibility.observe(name, value) }
                 var failure: StaticString? = nil
                 if kind.contains(.contentLength) {
                     declaredLength = parseDecimal(value.base, value.count)
@@ -626,7 +628,35 @@ extension Worker {
             c.pointee.flags.insert(.suppressBody)
         }
 
-        if declaredLength >= 0 {
+        var coding = ContentCoding.identity
+        if config.compress {
+            coding = eligibility.choose(offered: c.pointee.acceptedCoding, status: status,
+                                        bodyAllowed: !c.pointee.flags.contains(.suppressBody),
+                                        declaredLength: declaredLength,
+                                        minimumLength: config.compressMinimumLength)
+            if coding != .identity && !c.pointee.encoder.start(coding) { coding = .identity }
+            if eligibility.mayVary(status: status) && !eligibility.varyCovered {
+                c.pointee.write.write("Vary: Accept-Encoding\r\n")
+            }
+            if coding != .identity {
+                c.pointee.write.write("Content-Encoding: ")
+                c.pointee.write.write(coding.token)
+                c.pointee.write.writeCRLF()
+            }
+        }
+
+        if coding != .identity {
+            // Nobody knows the compressed length until the last byte, so the
+            // framing is chunked whatever was declared. The declared length is
+            // still enforced, against what the application sends.
+            c.pointee.responseRemaining = declaredLength
+            if c.pointee.head.httpMinor == 1 {
+                c.pointee.flags.insert(.chunkedResponse)
+                HTTPResponseWriter.writeChunkedEncoding(&c.pointee.write)
+            } else {
+                c.pointee.flags.remove(.keepAlive)
+            }
+        } else if declaredLength >= 0 {
             c.pointee.responseRemaining = declaredLength
             HTTPResponseWriter.writeContentLength(&c.pointee.write, declaredLength)
         } else if c.pointee.head.httpMinor == 1 {
@@ -677,7 +707,9 @@ extension Worker {
         // application it has a bug, and close the connection so that nothing
         // is left half-said and no later request reuses it.
         let suppress = c.pointee.flags.contains(.suppressBody)
+        let encoding = c.pointee.encoder.active && !suppress
         var overflow = false
+        var encodeFailed = false
 
         if let bodyObj = pg_dict_get(message, Interned[.body]), !suppress {
             var data: UnsafePointer<CChar>?
@@ -699,7 +731,9 @@ extension Worker {
                 }
                 if take > 0 {
                     let p = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
-                    if c.pointee.flags.contains(.chunkedResponse) {
+                    if encoding {
+                        encodeFailed = !encodeBody(slot, p, take, more: more, finishing: false)
+                    } else if c.pointee.flags.contains(.chunkedResponse) {
                         HTTPResponseWriter.writeChunk(&c.pointee.write, p, take)
                     } else {
                         c.pointee.write.write(p, take)
@@ -711,6 +745,18 @@ extension Worker {
         // The other half of the same promise: a client told to expect N bytes
         // and given fewer waits for the rest until its own timeout.
         let short = !more && !suppress && c.pointee.responseRemaining > 0
+
+        if encoding && !encodeFailed && (!more || overflow || short) {
+            encodeFailed = !encodeBody(slot, nil, 0, more: false, finishing: true)
+        }
+        if encodeFailed {
+            // Half a compressed stream cannot be ended honestly; the close is
+            // what tells the client the body is incomplete.
+            Log.error("compressing the response failed")
+            closeConnection(slot)
+            pg_err_set_str(pg_exc_runtime(), "compressing the response failed")
+            return false
+        }
 
         if !more || overflow || short {
             if c.pointee.flags.contains(.chunkedResponse) && !suppress {

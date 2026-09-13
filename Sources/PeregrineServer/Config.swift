@@ -198,6 +198,24 @@ public struct ServerConfig {
     public var maxWebsocketQueue = 32
     public var maxWebsocketQueueBytes = 4 * 1024 * 1024
 
+    // --- compression ---
+    /// Compress application responses for clients that accept it.
+    ///
+    /// Off by default, and not only because it costs CPU. A response over TLS
+    /// that reflects something the client sent next to a secret -- a CSRF
+    /// token on a page that echoes a search term -- leaks the secret a byte at
+    /// a time to anyone who can watch the compressed length (BREACH). Whether
+    /// an application has such a page is its own knowledge, so turning this
+    /// on is its decision. See CONFIG.md.
+    public var compress = false
+    /// Serve `file.br`, `file.zst` or `file.gz` next to a `--static-dir` file
+    /// to a client that accepts it. A static file reflects nothing, so this is
+    /// safe wherever the files themselves are.
+    public var compressStatic = false
+    /// A response declaring fewer bytes than this is sent as it is. Below
+    /// about a kilobyte the saving is smaller than the framing.
+    public var compressMinimumLength = 1024
+
     // --- development ---
     /// Restart workers when a watched source file changes.
     public var reload = false

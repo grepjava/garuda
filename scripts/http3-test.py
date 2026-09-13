@@ -313,6 +313,48 @@ async def static_files():
     shutil.rmtree(root, ignore_errors=True)
 
 
+async def compression():
+    print("\nCompression")
+    import gzip
+    scripts = os.path.join(ROOT, "scripts")
+    sys.path.insert(0, scripts)
+    from compress_apps import TEXT
+
+    root = tempfile.mkdtemp()
+    with open(os.path.join(root, "site.css"), "wb") as fh:
+        fh.write(TEXT)
+    with open(os.path.join(root, "site.css.gz"), "wb") as fh:
+        fh.write(gzip.compress(TEXT))
+
+    with Server("--compress", "--compress-static", "--static-dir", "/static=" + root,
+                "--python-path", scripts, app="compress_apps:asgi") as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            gz = ((b"accept-encoding", b"gzip"),)
+            status, headers, body = await client.request("GET", "/", headers=gz)
+            is_("a response is compressed over HTTP/3", headers.get(b"content-encoding"), b"gzip")
+            is_("it decodes to what the application sent", gzip.decompress(body), TEXT)
+            check("it has no content-length", b"content-length" not in headers, headers)
+            is_("it says vary", headers.get(b"vary"), b"accept-encoding")
+
+            status, headers, body = await client.request("GET", "/pieces", headers=gz)
+            is_("a body sent in pieces decodes", gzip.decompress(body), TEXT)
+
+            status, headers, body = await client.request("GET", "/small", headers=gz)
+            check("a small body is not compressed", b"content-encoding" not in headers, headers)
+            is_("and keeps its length", headers.get(b"content-length"), b"4")
+
+            status, headers, body = await client.request("GET", "/")
+            is_("no accept-encoding, plain body", body, TEXT)
+
+            status, headers, body = await client.request("GET", "/static/site.css", headers=gz)
+            is_("a pre-compressed file is served", headers.get(b"content-encoding"), b"gzip")
+            is_("and decodes", gzip.decompress(body), TEXT)
+            check("with its own etag", headers.get(b"etag", b"").endswith(b'-gzip"'), headers)
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
 async def request_bodies():
     print("\nRequest bodies")
     with Server() as server:
@@ -801,7 +843,7 @@ async def main():
         return 0
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
-    for test in (basics, health_check, static_files, request_bodies, multiplexing, cancellation, rapid_reset,
+    for test in (basics, health_check, static_files, compression, request_bodies, multiplexing, cancellation, rapid_reset,
                  spoofed_address, large_headers, response_framing, flow_control, long_lived,
                  key_update, wsgi, alt_svc):
         try:

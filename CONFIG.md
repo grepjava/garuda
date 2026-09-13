@@ -532,6 +532,59 @@ front of it for anything that needs either.
 
 ---
 
+## Compression
+
+Two flags, because they carry different risks.
+
+```bash
+peregrine --compress --compress-static \
+          --static-dir /static=/srv/app/static \
+          myapp:app
+```
+
+`--compress-static` serves a copy compressed at build time — `app.js.br`,
+`app.js.zst` or `app.js.gz` beside `app.js` — to a client that accepts it. The
+bytes still go out with `sendfile(2)` on a plaintext connection, the copy gets
+its own `ETag`, and a file with no copy is served as it is. The compressing is
+done once, at whatever level the build can afford:
+
+```bash
+find static -type f \( -name '*.js' -o -name '*.css' -o -name '*.svg' \) \
+    -exec brotli -kq 11 {} \; -exec gzip -k9 {} \;
+```
+
+`--compress` compresses what the application sends, as it sends it: brotli,
+zstd or gzip, whichever the client rates highest, brotli first on a tie. Only
+text-like responses are touched — `text/*` apart from `text/event-stream`,
+JSON, JavaScript, XML, SVG, WebAssembly. Nothing is compressed that already has
+a `Content-Encoding`, says `Cache-Control: no-transform`, is a `206`, answers
+a `HEAD`, or declares a `Content-Length` below `--compress-min-size` (1024 by
+default). A response that could have been compressed says
+`Vary: Accept-Encoding` whether it was or not, so that a cache in front does
+not hand one client's copy to the next.
+
+A compressed response has no `Content-Length`; it is chunked on HTTP/1.1 and
+ended by the stream on HTTP/2 and HTTP/3. The length the application declared
+is still held against what it sends. Each body message is flushed through the
+compressor as it arrives, so a response streamed in pieces reaches the client
+in pieces.
+
+gzip is always available. brotli and zstd are used when `libbrotlienc` and
+`libzstd` are installed, and silently left out when they are not.
+
+**Read this before turning `--compress` on.** Compression over TLS leaks
+through length. A page that puts a secret — a CSRF token, a session-bound
+value — in the same response as text an attacker can choose, such as a search
+term echoed back, lets an attacker who can watch the size of the traffic recover
+the secret a byte at a time (BREACH). Whether an application has pages like
+that is its own knowledge, which is why this is off by default and not
+something the server can decide. The usual answers are to keep secrets out of
+responses that reflect input, to mask tokens per response (Django does), or to
+leave `--compress` off and use only `--compress-static`, which reflects
+nothing.
+
+---
+
 ## Health checks
 
 `--health-check-path /healthz` answers that path in the server, with `200` and

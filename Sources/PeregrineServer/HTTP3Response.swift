@@ -46,6 +46,7 @@ extension Worker {
         var seen: ResponseHeaderKind = []
         var declaredLength = -1
         var failure: StaticString? = nil
+        var eligibility = CompressionEligibility()
 
         if let headerList = pg_dict_get(message, Interned[.headers]),
            pg_is(headerList, Interned.none) == 0 {
@@ -80,6 +81,7 @@ extension Worker {
                 let value = valueView.span
                 let kind = HTTPResponseWriter.classify(name)
                 seen.formUnion(kind)
+                if config.compress { eligibility.observe(name, value) }
 
                 if kind.contains(.contentLength) {
                     declaredLength = parseDecimal(value.base, value.count)
@@ -122,7 +124,21 @@ extension Worker {
             c.pointee.flags.insert(.suppressBody)
         }
         c.pointee.responseRemaining = declaredLength
-        if declaredLength >= 0 {
+        var coding = ContentCoding.identity
+        if config.compress {
+            coding = eligibility.choose(offered: c.pointee.acceptedCoding, status: status,
+                                        bodyAllowed: !c.pointee.flags.contains(.suppressBody),
+                                        declaredLength: declaredLength,
+                                        minimumLength: config.compressMinimumLength)
+            if coding != .identity && !c.pointee.encoder.start(coding) { coding = .identity }
+            if eligibility.mayVary(status: status) && !eligibility.varyCovered {
+                encodeStaticH3(h3, "vary", "accept-encoding", into: &block)
+            }
+            if coding != .identity {
+                encodeStaticH3(h3, "content-encoding", coding.token, into: &block)
+            }
+        }
+        if declaredLength >= 0 && coding == .identity {
             var digits = ByteBuffer()
             defer { digits.destroy() }
             digits.writeDecimal(declaredLength)

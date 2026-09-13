@@ -124,7 +124,10 @@ extension Worker {
                                    // from here.
                                    altSvc: c.pointee.isH3Stream ? nil : config.altSvc,
                                    altSvcLength: config.altSvcLength,
-                                   multiplexed: c.pointee.isStream)
+                                   multiplexed: c.pointee.isStream,
+                                   compress: config.compress,
+                                   offeredCoding: c.pointee.acceptedCoding,
+                                   compressMinimumLength: config.compressMinimumLength)
     }
 
     // MARK: - Inline execution
@@ -148,6 +151,8 @@ extension Worker {
             // it, from inside this frame. This is only the backstop for the
             // paths that return before reaching that point.
             defer { WSGIStartResponse.clearSink(startResponse) }
+            // A compressor for a response that did not reach its end.
+            defer { boxPtr.pointee.encoder.destroy() }
             runInline(slot, environ: environ, startResponse: startResponse,
                       box: boxPtr)
         }
@@ -301,10 +306,12 @@ extension Worker {
                                                  startResponse: startResponse,
                                                  result: result,
                                                  snapshot: snapshot)
-        if !plan.ok {
+        let encoderFailed = plan.ok && plan.coding != .identity
+            && !box.pointee.encoder.start(plan.coding)
+        if !plan.ok || encoderFailed {
             out.clear()
             c.pointee.write = out
-            Log.error(plan.failure)
+            Log.error(plan.ok ? "could not start compressing the response" : plan.failure)
             WSGIStartResponse.clearSink(startResponse)
             failRequest(slot, status: 500)
             return
@@ -355,10 +362,14 @@ extension Worker {
             c.pointee.responseRemaining = limit.remaining
         }
 
-        if plan.chunked && !plan.suppressBody {
-            var tail = c.pointee.write
-            HTTPResponseWriter.writeLastChunk(&tail)
-            c.pointee.write = tail
+        var tail = c.pointee.write
+        let ended = WSGIResponseBuilder.finishBody(&tail, plan: plan,
+                                                   encoder: &box.pointee.encoder)
+        c.pointee.write = tail
+        if !ended {
+            Log.error("compressing the response failed")
+            closeConnection(slot)
+            return
         }
 
         // The application has returned, so the message is whole. On a stream
@@ -393,7 +404,8 @@ extension Worker {
                 guard let part = PySeq.item(result, k) else { break }
                 k += 1
                 if !appendBodyPart(slot, part, chunked: plan.chunked,
-                                   limit: &box.pointee.limit) { return false }
+                                   limit: &box.pointee.limit,
+                                   encoder: &box.pointee.encoder) { return false }
             }
             return true
         }
@@ -406,11 +418,13 @@ extension Worker {
         // writing them together.
         if let first {
             if !appendBodyPart(slot, first, chunked: plan.chunked,
-                               limit: &box.pointee.limit, flushNow: true) { return false }
+                               limit: &box.pointee.limit,
+                               encoder: &box.pointee.encoder, flushNow: true) { return false }
         }
         while !box.pointee.limit.overflowed, let part = pg_iter_next(iterator) {
             let ok = appendBodyPart(slot, part, chunked: plan.chunked,
-                                    limit: &box.pointee.limit, flushNow: true)
+                                    limit: &box.pointee.limit,
+                                    encoder: &box.pointee.encoder, flushNow: true)
             pg_decref(part)
             if !ok { return false }
         }
@@ -449,11 +463,15 @@ extension Worker {
     /// on the client when it does not, which is what backpressure means.
     private mutating func appendBodyPart(_ slot: Int, _ part: PyObj, chunked: Bool,
                                          limit: inout WSGIBodyLimit,
+                                         encoder: inout ResponseEncoder,
                                          flushNow: Bool = false) -> Bool {
         let c = table[slot]
         var out = c.pointee.write
+        // A compressor flushes on the same parts the socket does: those with
+        // someone waiting on the far side of them.
         let ok = WSGIResponseBuilder.writeBodyPart(&out, part, chunked: chunked,
-                                                   limit: &limit)
+                                                   limit: &limit, encoder: &encoder,
+                                                   flush: flushNow)
         c.pointee.write = out
         if !ok {
             PyError.logPending("response body part")
@@ -504,10 +522,12 @@ extension Worker {
                                                      startResponse: startResponse,
                                                      result: nil,
                                                      snapshot: wsgiSnapshot(slot))
-            if !plan.ok {
+            let encoderFailed = plan.ok && plan.coding != .identity
+                && !box.pointee.encoder.start(plan.coding)
+            if !plan.ok || encoderFailed {
                 out.clear()
                 c.pointee.write = out
-                Log.error(plan.failure)
+                Log.error(plan.ok ? "could not start compressing the response" : plan.failure)
                 box.pointee.dead = true
                 failRequest(slot, status: 500)
                 pg_err_set_str(pg_exc_runtime(), "the response head was rejected")
@@ -526,7 +546,8 @@ extension Worker {
         if box.pointee.plan.suppressBody { return 0 }
 
         if !appendBodyPart(slot, part, chunked: box.pointee.plan.chunked,
-                           limit: &box.pointee.limit, flushNow: true) {
+                           limit: &box.pointee.limit,
+                           encoder: &box.pointee.encoder, flushNow: true) {
             box.pointee.dead = true
             if pg_err_check() == 0 {
                 pg_err_set_str(pg_exc_os(), "the client closed the connection")
@@ -564,7 +585,10 @@ extension Worker {
                           date: UnsafePointer(dates.bytes),
                           altSvc: c.pointee.isH3Stream ? nil : config.altSvc,
                           altSvcLength: config.altSvcLength,
-                          multiplexed: c.pointee.isStream)
+                          multiplexed: c.pointee.isStream,
+                          compress: config.compress,
+                          offeredCoding: c.pointee.acceptedCoding,
+                          compressMinimumLength: config.compressMinimumLength)
         c.pointee.poolJob = job
         // The connection belongs to the job now. Read interest has to go: a
         // level-triggered poller would spin on pipelined bytes that nothing is
@@ -658,6 +682,8 @@ struct WSGIInlineWriteContext {
     /// What is left of a declared Content-Length. Shared by `write()` and the
     /// returned iterable, because between them they produce one message.
     var limit = WSGIBodyLimit()
+    /// The body's compressor, likewise shared by `write()` and the iterable.
+    var encoder = ResponseEncoder()
     var headSent = false
     /// The client went away during a write, so the connection is already
     /// closed and the slot must not be touched again.

@@ -160,7 +160,7 @@ extension Worker {
 
             var size: Int64 = 0
             var mtime: Int64 = 0
-            let fd: Int32 = decoded.withUnsafeBufferPointer { buffer in
+            var fd: Int32 = decoded.withUnsafeBufferPointer { buffer in
                 let relative = buffer.baseAddress! + prefixLength
                 return relative.withMemoryRebound(to: CChar.self, capacity: n - prefixLength + 1) {
                     pg_static_open(route.directory, $0, &size, &mtime)
@@ -168,7 +168,41 @@ extension Worker {
             }
             if fd < 0 { continue }
 
-            sendFile(slot, fd: fd, size: Int(size), mtime: Int(mtime),
+            // --compress-static: a copy compressed at build time, beside the
+            // file, in the order the client prefers. The original has to
+            // exist too -- a lone `app.js.br` is not a route to `app.js` --
+            // because a client that accepts nothing still has to be served.
+            var coding = ContentCoding.identity
+            if config.compressStatic {
+                for candidate in requestAcceptEncoding(slot).ranked({ _ in true }) {
+                    let suffix = candidate.fileSuffix
+                    let suffixLength = suffix.utf8CodeUnitCount
+                    var alternate = [UInt8](repeating: 0, count: n + suffixLength + 1)
+                    var k = 0
+                    while k < n { alternate[k] = decoded[k]; k += 1 }
+                    k = 0
+                    while k < suffixLength { alternate[n + k] = suffix.utf8Start[k]; k += 1 }
+                    var altSize: Int64 = 0
+                    var altMtime: Int64 = 0
+                    let altFD: Int32 = alternate.withUnsafeBufferPointer { buffer in
+                        let relative = buffer.baseAddress! + prefixLength
+                        return relative.withMemoryRebound(
+                            to: CChar.self, capacity: n + suffixLength - prefixLength + 1) {
+                            pg_static_open(route.directory, $0, &altSize, &altMtime)
+                        }
+                    }
+                    if altFD >= 0 {
+                        _ = pg_close(fd)
+                        fd = altFD
+                        size = altSize
+                        mtime = altMtime
+                        coding = candidate
+                        break
+                    }
+                }
+            }
+
+            sendFile(slot, fd: fd, size: Int(size), mtime: Int(mtime), coding: coding,
                      nameLength: n, name: &decoded)
             return true
         }
@@ -177,19 +211,41 @@ extension Worker {
 
     /// Writes the response head for an open file, then arms the body.
     private mutating func sendFile(_ slot: Int, fd: Int32, size: Int, mtime: Int,
+                                   coding: ContentCoding,
                                    nameLength: Int, name: inout [UInt8]) {
         let c = table[slot]
+        let type = contentType(nameLength: nameLength, name: &name)
+        // With pre-compressed copies being served, which bytes a URL gets
+        // depends on Accept-Encoding, and a cache has to be told so -- on the
+        // plain response as much as on the compressed one, or the first copy
+        // it stores is the one everybody gets.
+        let vary = config.compressStatic
+            && (coding != .identity
+                || CompressionEligibility.isCompressible(type.utf8Start, type.utf8CodeUnitCount))
 
         // A strong validator built from what the filesystem already knows.
         // Two files with the same size and the same modification time to the
         // second are the same file for this purpose; a deployment that rewrites
         // an asset moves the mtime.
-        var etag = [UInt8](repeating: 0, count: 40)
+        var etag = [UInt8](repeating: 0, count: 48)
         var etagLength = 0
         etag[etagLength] = UInt8(ascii: "\""); etagLength += 1
         etagLength += writeHex(UInt64(bitPattern: Int64(mtime)), into: &etag, at: etagLength)
         etag[etagLength] = UInt8(ascii: "-"); etagLength += 1
         etagLength += writeHex(UInt64(size), into: &etag, at: etagLength)
+        if coding != .identity {
+            // A compressed copy is a different representation, and a strong
+            // validator has to say so even if its size and time happened to
+            // match the original's.
+            etag[etagLength] = UInt8(ascii: "-"); etagLength += 1
+            let token = coding.token
+            var k = 0
+            while k < token.utf8CodeUnitCount {
+                etag[etagLength] = token.utf8Start[k]
+                etagLength += 1
+                k += 1
+            }
+        }
         etag[etagLength] = UInt8(ascii: "\""); etagLength += 1
 
         if requestHasMatchingETag(slot, etag: &etag, length: etagLength) {
@@ -197,7 +253,7 @@ extension Worker {
             logAccess(slot, status: 304)
             dates.refresh()
             if c.pointee.isStream || c.pointee.isH3Stream {
-                sendNotModifiedOnStream(slot, etag: &etag, etagLength: etagLength)
+                sendNotModifiedOnStream(slot, etag: &etag, etagLength: etagLength, vary: vary)
                 return
             }
             HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: 304)
@@ -205,6 +261,7 @@ extension Worker {
             c.pointee.write.write("Server: peregrine\r\nETag: ")
             etag.withUnsafeBufferPointer { c.pointee.write.write($0.baseAddress!, etagLength) }
             c.pointee.write.write("\r\n")
+            if vary { c.pointee.write.write("Vary: Accept-Encoding\r\n") }
             HTTPResponseWriter.writeConnection(&c.pointee.write,
                                                keepAlive: c.pointee.flags.contains(.keepAlive))
             HTTPResponseWriter.endHead(&c.pointee.write)
@@ -220,6 +277,7 @@ extension Worker {
         if c.pointee.isStream || c.pointee.isH3Stream {
             startMultiplexedFile(slot, fd: fd, size: size, head: head,
                                  etag: &etag, etagLength: etagLength,
+                                 coding: coding, vary: vary,
                                  nameLength: nameLength, name: &name)
             return
         }
@@ -227,7 +285,12 @@ extension Worker {
         HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: 200)
         HTTPResponseWriter.writeDate(&c.pointee.write, dates)
         c.pointee.write.write("Server: peregrine\r\nContent-Type: ")
-        c.pointee.write.write(contentType(nameLength: nameLength, name: &name))
+        c.pointee.write.write(type)
+        if coding != .identity {
+            c.pointee.write.write("\r\nContent-Encoding: ")
+            c.pointee.write.write(coding.token)
+        }
+        if vary { c.pointee.write.write("\r\nVary: Accept-Encoding") }
         c.pointee.write.write("\r\nETag: ")
         etag.withUnsafeBufferPointer { c.pointee.write.write($0.baseAddress!, etagLength) }
         c.pointee.write.write("\r\n")
@@ -252,7 +315,7 @@ extension Worker {
     /// No body and no content-length: a 304 carries neither, and the validator
     /// is the whole message.
     private mutating func sendNotModifiedOnStream(_ slot: Int, etag: inout [UInt8],
-                                                  etagLength: Int) {
+                                                  etagLength: Int, vary: Bool) {
         let c = table[slot]
         let parent = Int(c.pointee.parentSlot)
         var block = ByteBuffer()
@@ -268,6 +331,7 @@ extension Worker {
             etag.withUnsafeBufferPointer {
                 encodeStaticH3(h3, "etag", $0.baseAddress!, etagLength, into: &block)
             }
+            if vary { encodeStaticH3(h3, "vary", "accept-encoding", into: &block) }
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "peregrine", into: &block)
             writeH3HeaderBlock(slot, h3, block: &block)
@@ -283,6 +347,7 @@ extension Worker {
         etag.withUnsafeBufferPointer {
             encodeStatic(h2, "etag", $0.baseAddress!, etagLength, into: &block)
         }
+        if vary { encodeStatic(h2, "vary", "accept-encoding", into: &block) }
         encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
         encodeStatic(h2, "server", "peregrine", into: &block)
         writeHeaderBlock(slot, h2, block: &block, endStream: true)
@@ -324,6 +389,7 @@ extension Worker {
     private mutating func startMultiplexedFile(_ slot: Int, fd: Int32, size: Int,
                                                head: Bool,
                                                etag: inout [UInt8], etagLength: Int,
+                                               coding: ContentCoding, vary: Bool,
                                                nameLength: Int, name: inout [UInt8]) {
         let c = table[slot]
         let type = contentType(nameLength: nameLength, name: &name)
@@ -346,6 +412,10 @@ extension Worker {
             h3.encoder.encodeStatus(200, into: &block)
             encodeStaticH3(h3, "content-type", type.utf8Start, type.utf8CodeUnitCount,
                            into: &block)
+            if coding != .identity {
+                encodeStaticH3(h3, "content-encoding", coding.token, into: &block)
+            }
+            if vary { encodeStaticH3(h3, "vary", "accept-encoding", into: &block) }
             etag.withUnsafeBufferPointer {
                 encodeStaticH3(h3, "etag", $0.baseAddress!, etagLength, into: &block)
             }
@@ -365,6 +435,10 @@ extension Worker {
             h2.encoder.encodeStatus(200, into: &block)
             encodeStatic(h2, "content-type", type.utf8Start, type.utf8CodeUnitCount,
                          into: &block)
+            if coding != .identity {
+                encodeStatic(h2, "content-encoding", coding.token, into: &block)
+            }
+            if vary { encodeStatic(h2, "vary", "accept-encoding", into: &block) }
             etag.withUnsafeBufferPointer {
                 encodeStatic(h2, "etag", $0.baseAddress!, etagLength, into: &block)
             }

@@ -750,6 +750,9 @@ public struct Worker {
         // for, including a path under its own prefix, so a route never takes
         // a URL away from the application.
         if serveStatic(slot) { return }
+        // --compress. Read now because the request head is in hand now; the
+        // response it applies to may not start for several loop turns.
+        if config.compress { negotiateCoding(slot) }
         switch appProtocol {
         case .wsgi:
             // WSGI has no way to express a stream that outlives its response,
@@ -1194,6 +1197,8 @@ public struct Worker {
         // navigate away runs out of descriptors rather than misbehaving
         // visibly.
         if c.pointee.fileFD >= 0 { finishFile(slot) }
+        // Likewise a compressor for a response that never finished.
+        c.pointee.encoder.destroy()
         Metrics.add(PG_M_CONNECTIONS_CLOSED)
         // Written here rather than only when this worker happens to serve a
         // scrape: a gauge nobody updates is a number from whenever it last was

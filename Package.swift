@@ -57,6 +57,9 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("ssl"),
                 .linkedLibrary("crypto"),
+                // gzip. brotli and zstd are opened at run time instead, so
+                // a machine without them still runs; see peregrine_compress.c.
+                .linkedLibrary("z"),
             ]
         ),
 

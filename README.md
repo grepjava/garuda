@@ -278,6 +278,11 @@ peregrine [options] MODULE:ATTRIBUTE
   --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
   --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
                            without calling the application (repeatable)
+  --compress               compress text-like application responses with
+                           br, zstd or gzip (see CONFIG.md about BREACH)
+  --compress-min-size N    leave bodies declared smaller than N alone (1024)
+  --compress-static        serve FILE.br / FILE.zst / FILE.gz beside a
+                           --static-dir file to clients that accept it
   --health-check-path P    answer P with 200 in the server, without calling
                            the application (e.g. /healthz)
   --access-log             log one line per request
@@ -420,6 +425,9 @@ schedule, the header protection and the sample packets are the RFC's own bytes.
   does.
 - **Byte ranges and directory indexes for `--static-dir`.** It serves assets
   with an `ETag` and answers `If-None-Match`; it is not a file server.
+- **Compressing `--static-dir` files on the fly.** `--compress-static` serves
+  copies compressed at build time; a file with no copy is sent as it is, which
+  keeps `sendfile(2)` and keeps the CPU for requests.
 - **SNI for HTTP/3.** Several certificates are chosen by name over TCP;
   HTTP/3 serves the first pair whatever the client asks for, because the QUIC
   handshake here is built from the primitives rather than driven by OpenSSL.

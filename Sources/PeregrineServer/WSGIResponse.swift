@@ -41,11 +41,19 @@ public struct WSGIRequestSnapshot {
     /// the head is a compressed header block rather than text, there is no
     /// transfer encoding, and the stream ending is the framing.
     public var multiplexed = false
+    /// --compress, and the coding the client accepts best. Separate because a
+    /// response that could be compressed says `Vary: Accept-Encoding` even to
+    /// a client that accepts nothing.
+    public var compress = false
+    public var offeredCoding: ContentCoding = .identity
+    public var compressMinimumLength = 1024
 
     public init(httpMinor: UInt8, keepAlive: Bool, suppressBody: Bool,
                 date: UnsafePointer<UInt8>,
                 altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0,
-                multiplexed: Bool = false) {
+                multiplexed: Bool = false,
+                compress: Bool = false, offeredCoding: ContentCoding = .identity,
+                compressMinimumLength: Int = 1024) {
         self.httpMinor = httpMinor
         self.keepAlive = keepAlive
         self.suppressBody = suppressBody
@@ -53,6 +61,9 @@ public struct WSGIRequestSnapshot {
         self.altSvc = altSvc
         self.altSvcLength = altSvcLength
         self.multiplexed = multiplexed
+        self.compress = compress
+        self.offeredCoding = offeredCoding
+        self.compressMinimumLength = compressMinimumLength
     }
 }
 
@@ -69,6 +80,10 @@ public struct WSGIHeadPlan {
     /// The Content-Length that went out, or -1 when the framing is the end of
     /// the message rather than a declared length.
     public var declaredLength = -1
+    /// The coding the body is compressed with. When it is not identity, no
+    /// Content-Length went out and `declaredLength` is the application's own,
+    /// enforced against what it produces.
+    public var coding: ContentCoding = .identity
     /// A message for the log when `ok` is false.
     public var failure: StaticString = ""
 }
@@ -264,6 +279,7 @@ public enum WSGIResponseBuilder {
 
         var seen: ResponseHeaderKind = []
         var declaredLength = -1
+        var eligibility = CompressionEligibility()
         let headerCount = PySeq.count(headerList)
 
         var i = 0
@@ -292,6 +308,7 @@ public enum WSGIResponseBuilder {
 
             let kind = HTTPResponseWriter.classify(name)
             seen.formUnion(kind)
+            if snapshot.compress { eligibility.observe(name, value) }
 
             var rejection: StaticString? = nil
             if kind.contains(.contentLength) {
@@ -349,10 +366,45 @@ public enum WSGIResponseBuilder {
             if ok { declaredLength = total }
         }
 
+        if snapshot.compress {
+            plan.coding = eligibility.choose(offered: snapshot.offeredCoding, status: code,
+                                             bodyAllowed: !plan.suppressBody,
+                                             declaredLength: declaredLength,
+                                             minimumLength: snapshot.compressMinimumLength)
+            if eligibility.mayVary(status: code) && !eligibility.varyCovered {
+                if snapshot.multiplexed {
+                    _ = emit("vary", ByteSpan(("accept-encoding" as StaticString).utf8Start, 15))
+                } else {
+                    out.write("Vary: Accept-Encoding\r\n")
+                }
+            }
+            if plan.coding != .identity {
+                let token = plan.coding.token
+                if snapshot.multiplexed {
+                    _ = emit("content-encoding", ByteSpan(token.utf8Start, token.utf8CodeUnitCount))
+                } else {
+                    out.write("Content-Encoding: ")
+                    out.write(token)
+                    out.writeCRLF()
+                }
+            }
+        }
+
         plan.declaredLength = declaredLength
         var digits = ByteBuffer()
         defer { digits.destroy() }
-        if declaredLength >= 0 {
+        if plan.coding != .identity {
+            // The compressed length is unknown until the end, whatever the
+            // application declared; see WSGIHeadPlan.coding.
+            if snapshot.multiplexed {
+                // The stream ending is the framing.
+            } else if snapshot.httpMinor == 1 {
+                plan.chunked = true
+                HTTPResponseWriter.writeChunkedEncoding(&out)
+            } else {
+                plan.keepAlive = false
+            }
+        } else if declaredLength >= 0 {
             if snapshot.multiplexed {
                 digits.writeDecimal(declaredLength)
                 _ = emit("content-length",
@@ -420,7 +472,9 @@ public enum WSGIResponseBuilder {
     public static func writeBodyPart(_ out: inout ByteBuffer,
                                      _ part: PyObj,
                                      chunked: Bool,
-                                     limit: inout WSGIBodyLimit) -> Bool {
+                                     limit: inout WSGIBodyLimit,
+                                     encoder: inout ResponseEncoder,
+                                     flush: Bool = false) -> Bool {
         var data: UnsafePointer<CChar>?
         var len: pg_ssize_t = 0
         var owner: PyObj?
@@ -430,13 +484,34 @@ public enum WSGIResponseBuilder {
             let take = limit.take(Int(len))
             if take > 0 {
                 let p = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
-                if chunked {
+                if encoder.active {
+                    if !encoder.encode(p, take, flush: flush, into: &out, chunked: chunked) {
+                        pg_err_set_str(pg_exc_runtime(), "compressing the response failed")
+                        return false
+                    }
+                } else if chunked {
                     HTTPResponseWriter.writeChunk(&out, p, take)
                 } else {
                     out.write(p, take)
                 }
             }
         }
+        return true
+    }
+
+    /// Ends the body: the compressed stream if there is one, then the chunked
+    /// terminator if there is one. False when the compressor failed, which
+    /// leaves the message with no honest ending.
+    public static func finishBody(_ out: inout ByteBuffer, plan: WSGIHeadPlan,
+                                  encoder: inout ResponseEncoder) -> Bool {
+        if plan.suppressBody {
+            encoder.destroy()
+            return true
+        }
+        if encoder.active && !encoder.finish(into: &out, chunked: plan.chunked) {
+            return false
+        }
+        if plan.chunked { HTTPResponseWriter.writeLastChunk(&out) }
         return true
     }
 }

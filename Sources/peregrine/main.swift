@@ -114,6 +114,13 @@ func printUsage() {
                                without calling the application (repeatable).
                                A path with no file behind it still reaches
                                the application
+      --compress               compress application responses (br, zstd or
+                               gzip, as the client accepts) when their type
+                               is text-like; read CONFIG.md about BREACH first
+      --compress-min-size N    leave bodies declared smaller than this as they
+                               are (default 1024)
+      --compress-static        serve FILE.br, FILE.zst or FILE.gz beside a
+                               --static-dir file to clients that accept it
       --health-check-path P    answer P with 200 in the server, without
                                calling the application (e.g. /healthz)
       --access-log             log one line per request
@@ -388,6 +395,13 @@ while i < argc {
         }
         UnsafeMutablePointer(mutating: v)[at] = 0
         staticRoutes.append((prefix: v, directory: v + at + 1))
+    } else if matches(arg, "--compress") {
+        config.compress = true
+    } else if matches(arg, "--compress-static") {
+        config.compressStatic = true
+    } else if matches(arg, "--compress-min-size") {
+        guard let v = next("--compress-min-size needs a byte count") else { break }
+        config.compressMinimumLength = max(0, parseInt(v))
     } else if matches(arg, "--health-check-path") {
         guard let v = next("--health-check-path needs a path") else { break }
         if v[0] != 47 {   // '/'

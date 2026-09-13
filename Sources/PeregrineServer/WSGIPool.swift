@@ -66,6 +66,9 @@ public final class WSGIJob {
     /// The response is bound for an HTTP/2 or HTTP/3 stream, so its head is
     /// staged rather than written as text.
     let multiplexed: Bool
+    let compress: Bool
+    let offeredCoding: ContentCoding
+    let compressMinimumLength: Int
 
     // --- shared, guarded by the pool mutex ---
     var out = ByteBuffer()
@@ -85,6 +88,9 @@ public final class WSGIJob {
     /// What is left of a declared Content-Length. Written by the thread before
     /// `finished`, read by the loop afterwards, like the rest of the plan.
     var limit = WSGIBodyLimit()
+    /// The body's compressor, when it has one. Only the thread running the
+    /// application touches it.
+    var encoder = ResponseEncoder()
 
     /// The pool running this job, so the legacy `write()` callable can reach
     /// the hand-off from inside the application. Unowned because the pool owns
@@ -100,7 +106,10 @@ public final class WSGIJob {
                             date: UnsafePointer(date),
                             altSvc: altSvc,
                             altSvcLength: altSvcLength,
-                            multiplexed: multiplexed)
+                            multiplexed: multiplexed,
+                            compress: compress,
+                            offeredCoding: offeredCoding,
+                            compressMinimumLength: compressMinimumLength)
     }
 
     init(slot: Int, generation: UInt32,
@@ -108,7 +117,12 @@ public final class WSGIJob {
          httpMinor: UInt8, keepAlive: Bool, suppressBody: Bool,
          date: UnsafePointer<UInt8>,
          altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0,
-         multiplexed: Bool = false) {
+         multiplexed: Bool = false,
+         compress: Bool = false, offeredCoding: ContentCoding = .identity,
+         compressMinimumLength: Int = 1024) {
+        self.compress = compress
+        self.offeredCoding = offeredCoding
+        self.compressMinimumLength = compressMinimumLength
         self.slot = slot
         self.generation = generation
         self.environ = environ
@@ -130,6 +144,7 @@ public final class WSGIJob {
     deinit {
         date.deallocate()
         out.destroy()
+        encoder.destroy()
     }
 }
 
@@ -447,6 +462,11 @@ public final class WSGIPool {
                 job.failed = true
                 return
             }
+            if plan.coding != .identity && !job.encoder.start(plan.coding) {
+                Log.error("could not start compressing the response")
+                job.failed = true
+                return
+            }
             job.status = plan.status
             job.chunked = plan.chunked
             job.keepAlive = plan.keepAlive
@@ -498,8 +518,12 @@ public final class WSGIPool {
             job.keepAlive = false
         }
 
-        if plan.chunked && !plan.suppressBody {
-            HTTPResponseWriter.writeLastChunk(&staged)
+        if !WSGIResponseBuilder.finishBody(&staged, plan: plan, encoder: &job.encoder) {
+            // The head is out; a compressed stream with no end cannot be
+            // finished, so the loop closes the connection.
+            Log.error("compressing the response failed")
+            job.failed = true
+            return
         }
         _ = handoff(job, &staged)
     }
@@ -509,7 +533,8 @@ public final class WSGIPool {
     private func emit(_ job: WSGIJob, _ part: PyObj, _ chunked: Bool,
                       _ staged: inout ByteBuffer, flushNow: Bool = false) -> Bool {
         if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: chunked,
-                                              limit: &job.limit) {
+                                              limit: &job.limit, encoder: &job.encoder,
+                                              flush: flushNow) {
             PyError.logPending("response body part")
             job.failed = true
             return false
@@ -546,6 +571,12 @@ public final class WSGIPool {
                 pg_err_set_str(pg_exc_runtime(), "the response head was rejected")
                 return -1
             }
+            if plan.coding != .identity && !job.encoder.start(plan.coding) {
+                Log.error("could not start compressing the response")
+                job.failed = true
+                pg_err_set_str(pg_exc_runtime(), "could not start compressing the response")
+                return -1
+            }
             job.status = plan.status
             job.chunked = plan.chunked
             job.keepAlive = plan.keepAlive
@@ -557,7 +588,8 @@ public final class WSGIPool {
         // HEAD, 204, 304: the head goes out, the body is dropped.
         if !job.bodySuppressed {
             if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: job.chunked,
-                                                  limit: &job.limit) {
+                                                  limit: &job.limit, encoder: &job.encoder,
+                                                  flush: true) {
                 job.failed = true
                 return -1
             }
