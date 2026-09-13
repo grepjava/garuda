@@ -41,7 +41,7 @@ CONNS=${CONNS:-"64 256 512"}
 RUNS=${RUNS:-3}
 DURATION=${DURATION:-15s}
 FRAMEWORKS=${FRAMEWORKS:-"fastapi flask"}
-SERVERS=${SERVERS:-"peregrine uvicorn granian fastpysgi"}
+SERVERS=${SERVERS:-"peregrine-ext peregrine uvicorn granian fastpysgi"}
 URL="http://127.0.0.1:$PORT/"
 OUT=$(mktemp -d)
 export PYTHONPATH="$ROOT/benchmarks/contract${PYTHONPATH:+:$PYTHONPATH}"
@@ -68,8 +68,8 @@ start() {
             --venv "$VENV" --python-path "$ROOT/benchmarks/contract" "$app" ;;
     peregrine-ext)
         # The same server as an extension module, run by the virtualenv python:
-        # peregrine._native, from scripts/build-extension.sh. Not in the default
-        # SERVERS; it is how the two builds are compared.
+        # peregrine._native, from scripts/build-extension.sh -- what a wheel
+        # installs, measured beside the executable above.
         PYTHONPATH="$ROOT/python:$PYTHONPATH" server_start "$VENV/bin/python" -m peregrine \
             --log-level error --protocol "$interface" \
             --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" \

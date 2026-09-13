@@ -4,21 +4,26 @@
 
 # Installing Peregrine
 
-Peregrine embeds CPython rather than talking to it over a socket, so the server
-binary is linked against one specific `libpython`. That single fact decides
-everything unusual about installing it:
+Peregrine runs your application in CPython directly, with no socket in
+between. A wheel installs the server as `peregrine._native`, an extension
+module that the `peregrine` command loads into the interpreter you installed it
+into. That decides everything unusual about installing it:
 
 * **A wheel is tagged for exactly one interpreter and platform**
-  (`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`). `pip` will refuse it
-  anywhere else, which is the correct answer rather than a limitation: a native
-  executable with a hard `libpython` dependency does not degrade gracefully.
+  (`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`). The server is
+  compiled against one CPython ABI, so `pip` will refuse it anywhere else,
+  which is the correct answer rather than a limitation.
 * **When a wheel matches, Swift is not required.** The Swift runtime travels
-  with the binary; `libpython` comes from the interpreter you install into.
+  with the module; Python is the interpreter you install into.
 * **When no wheel matches, `pip` falls back to the sdist and compiles.** That
-  needs a Swift toolchain and takes a few minutes. The interpreter it links
-  must be the one it will run applications for.
+  needs a Swift toolchain and takes a few minutes, and it builds for the
+  interpreter running `pip`.
 * **Install it into the environment it will serve.** A virtualenv's packages
   are only importable by the interpreter that virtualenv belongs to.
+
+The server can also be built as a standalone executable that embeds `libpython`
+instead. Both take the same options; the extension module is what the wheels
+ship because it is faster — see [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -32,11 +37,11 @@ interpreter that has not been built yet — still needs:
 
 | | |
 |---|---|
-| **Python** | 3.9 or newer, **with its development files** — `pkg-config` must be able to find `python3-embed` |
+| **Python** | 3.9 or newer, **with its development files** — `pkg-config` must be able to find `python3` (`python3-embed` for the standalone executable) |
 | **Swift** | 6.1 or newer, on `PATH`. From [swift.org/install](https://swift.org/install); on Linux, `swiftly` is the least painful route |
 | **OpenSSL** | development files. TLS 1.3, and QUIC's use of it, need `libssl` and `libcrypto` |
 | **pkg-config** | how the build locates all of the above |
-| **patchelf** | Linux only; rewrites the binary so the Swift runtime can travel with it |
+| **patchelf** | Linux only; rewrites the server so the Swift runtime can travel with it |
 | **An OS with epoll or kqueue** | Linux, or macOS 14+. Not Windows — see [below](#windows) |
 
 ### Ubuntu and Debian
@@ -61,8 +66,7 @@ brew install pkg-config openssl@3
 ```
 
 Use a python.org or Homebrew build of Python. The system Python that Apple
-ships has no embeddable development files, and `pkg-config` will not find
-`python3-embed` for it.
+ships has no development files, and `pkg-config` will not find it.
 
 ---
 
@@ -87,32 +91,47 @@ $ peregrine --version
 peregrine 1.0.0 (CPython 3.12.3)
 ```
 
-That second number is read out of the built binary at runtime, not out of the
-headers it was compiled against — it is the interpreter your applications will
+That second number is read from the running interpreter, not from the headers
+the server was compiled against — it is the Python your applications will
 actually run under. If it disagrees with the `python3` on your `PATH`, that is
 worth resolving now rather than after a confusing `ImportError`.
 
+`peregrine` and `python -m peregrine` are the same thing.
+
 ### From source
+
+A checkout builds either form. The extension module is what the wheels carry:
 
 ```bash
 git clone https://github.com/grepjava/peregrine
 cd peregrine
-swift build -c release                # binary at .build/release/peregrine
+bash scripts/build-extension.sh       # python/peregrine/_native.cpython-312-....so
+PYTHONPATH=python python3 -m peregrine --python-path examples --port 8000 asgi_app:app
 ```
 
+`PYTHON=python3.13 bash scripts/build-extension.sh` builds it for another
+interpreter; each gets its own file, named by that interpreter's extension
+suffix, so several can sit side by side.
+
+The standalone executable embeds `libpython` instead:
+
 ```bash
+swift build -c release                # binary at .build/release/peregrine
 .build/release/peregrine --python-path examples --python-path python \
     --port 8000 asgi_app:app
 ```
 
 The second `--python-path` is what makes `peregrine.contrib` importable from a
-source checkout; an installed copy needs neither.
+source checkout; an installed copy needs neither. When both forms are present,
+`python -m peregrine` runs the extension module, and `PEREGRINE_NATIVE=0` makes
+it run the executable instead.
 
 If the checkout lives on a filesystem the toolchain is slow on — a Windows
 drive mounted into WSL, for instance — build somewhere native instead:
 
 ```bash
 swift build -c release --scratch-path ~/pgbuild
+SCRATCH=~/pgbuild-ext bash scripts/build-extension.sh
 ```
 
 ### Building a wheel
@@ -124,9 +143,16 @@ sudo apt install patchelf                 # Linux; rewrites the rpath
 PYTHON=python3.12 bash scripts/build-wheel.sh
 ```
 
-The wheel lands in `dist/` tagged for that interpreter. It vendors the Swift
-runtime and leaves `libpython` to whoever installs it. GitHub Actions builds
-the Linux matrix from [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)
+The wheel lands in `dist/` tagged for that interpreter. It carries
+`peregrine/_native` with the Swift runtime vendored beside it in
+`peregrine/_swift`, and leaves Python to whoever installs it. Before packaging,
+the build imports the module in a fresh interpreter with the library search
+path cleared, so a Swift runtime that is only found on the build machine fails
+there rather than on yours. `PEREGRINE_BUILD=binary` packages the standalone
+executable instead.
+
+GitHub Actions builds the Linux matrix from
+[`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)
 (`gh workflow run Wheels`). Uploading the wheels and the sdist is
 [DEPLOY.md](DEPLOY.md), not the workflow's optional publish input.
 
@@ -137,7 +163,7 @@ the Linux matrix from [`.github/workflows/wheels.yml`](.github/workflows/wheels.
 Started through the `peregrine` entry point, the launcher fills in what it can
 work out and you did not say:
 
-* `--venv` from `sys.prefix`, or from `VIRTUAL_ENV` when the binary was
+* `--venv` from `sys.prefix`, or from `VIRTUAL_ENV` when the server was
   installed outside the environment. Suppress it with `--no-auto-venv`.
 * `--python-path` for the working directory, because that is nearly always
   where the application is.
@@ -153,17 +179,20 @@ Directories you named beat installed packages, which is the same rule
 shadows a release of it you happen to have installed, rather than the other way
 round.
 
-`--python-home` sets `PYTHONHOME` for the embedded interpreter. It is for
-relocated or unusual installations; a virtualenv does not need it.
+`--python-home` sets `PYTHONHOME` for the executable's embedded interpreter. It
+is for relocated or unusual installations; a virtualenv does not need it. The
+extension module runs in the interpreter that started it, which already has a
+home, so there the option only warns.
 
 ---
 
 ## Building against free-threaded CPython
 
 `--free-threaded` needs a CPython built without the GIL (PEP 703). That is a
-different interpreter with a different ABI and a different library name —
-`libpython3.14t.so`, not `libpython3.14.so` — so it is chosen at *build* time,
-by which `python3-embed` the build resolves, not by a flag at runtime.
+different interpreter with a different ABI — `python3.14t`, whose extension
+modules are `*.cpython-314t-*.so` and whose library is `libpython3.14t.so` — so
+it is chosen at *build* time, by the interpreter and headers the build uses,
+not by a flag at runtime.
 
 Install one:
 
@@ -176,21 +205,25 @@ sudo apt install python3.14-nogil python3.14-nogil-dev
 uv python install 3.14t
 ```
 
-Then build with `pkg-config` pointed at it:
+Then build for it:
 
 ```bash
-# a system install already has it on the default search path:
+# a system install already has its headers on the default search path:
 python3.14t -m pip install .
 
 # a uv-managed one has to be named:
-ROOT=$(dirname $(dirname $(uv python find 3.14t)))
-PKG_CONFIG_PATH=$ROOT/lib/pkgconfig swift build -c release
+PY=$(uv python find 3.14t)
+PKG_CONFIG_PATH=$(dirname $(dirname $PY))/lib/pkgconfig PYTHON=$PY \
+    bash scripts/build-extension.sh
 ```
 
-Check what came out, because this is the one thing worth being sure of:
+The build refuses to pair a free-threaded interpreter with GIL headers, or the
+reverse, and a free-threaded build checks that importing the server leaves the
+GIL off: an extension that does not say it is safe without the GIL switches it
+back on for the whole process. Check what came out:
 
 ```console
-$ peregrine --version
+$ python3.14t -m peregrine --version
 peregrine 1.0.0 (CPython 3.14.6 free-threaded)
 ```
 
@@ -261,6 +294,8 @@ python3 scripts/contrib_test.py                 #  58 Python-only
                                                 #   and WebTransport
 ```
 
+The suites drive the executable.
+
 ---
 
 ## When it goes wrong
@@ -270,23 +305,35 @@ no wheel matched this interpreter and platform. Install Swift 6.1+ and make
 sure `swift --version` works in the same shell `pip` runs in. `sudo pip` will
 not see a toolchain installed for your user.
 
-**`patchelf is required to make the binary relocatable`** — Linux source
-builds need `patchelf` so the Swift runtime can travel with the binary.
+**`patchelf is required to make the server relocatable`** — Linux source
+builds need `patchelf` so the Swift runtime can travel with the server.
 `sudo apt install patchelf`.
 
-**`pkg-config cannot find python3-embed`** — the development files for that
+**`pkg-config cannot find python3`** — the development files for that
 interpreter are missing. `python3-dev` on Debian and Ubuntu, `python3-devel` on
-Fedora. On macOS, the system Python cannot supply them at all.
+Fedora. On macOS, the system Python cannot supply them at all. A uv-managed
+interpreter has them, but `pkg-config` has to be pointed at its
+`lib/pkgconfig` with `PKG_CONFIG_PATH`.
 
-**`pkg-config resolves python3-embed to Python 3.11, but this build is running
-under Python 3.12`** — the build would embed one interpreter and be installed
-for another. Install the development files for the version you are installing
-into, or run `pip` from the interpreter you intend to serve with.
+**`pkg-config resolves python3 to Python 3.11, but this build is running under
+Python 3.12`** — the headers belong to another interpreter. Install the
+development files for the version you are installing into, or run `pip` from
+the interpreter you intend to serve with.
+
+**`pkg-config found GIL headers ... but this build is running under
+free-threaded Python`** — the same mistake across the free-threaded divide,
+which a version number cannot catch. Point `PKG_CONFIG_PATH` at the
+free-threaded interpreter's `lib/pkgconfig`.
+
+**`the built extension does not import`** — the module was built but will not
+load in a clean interpreter, most often because the Swift runtime was not
+vendored. The error below it names the library the loader could not find.
 
 **`warning: this binary embeds Python 3.12 but you are running it from 3.13`**
-— the package moved between interpreters after it was built. Reinstall it in
-the environment you are running it from; until you do, the application is
-served by 3.12 and will not see 3.13's packages.
+— only the standalone executable says this: the package moved between
+interpreters after it was built. Reinstall it in the environment you are
+running it from; until you do, the application is served by 3.12 and will not
+see 3.13's packages.
 
 **`ModuleNotFoundError` for your own application** — the server looks in the
 working directory and any `--python-path`. Give it the directory that contains
@@ -316,7 +363,7 @@ pip uninstall peregrine-server
 ```
 
 Nothing is installed outside the environment — no service files, no daemon, no
-state. The binary lives in the package directory and goes with it.
+state. The server lives in the package directory and goes with it.
 
 ---
 

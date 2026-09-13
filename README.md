@@ -12,9 +12,12 @@
 Built around two goals: spend as little time as possible outside the
 application, and spend as little memory as possible per connection.
 
-It embeds CPython directly — there is no socket between Swift and Python, no
-serialisation step, and no second process. Swift owns the accept loop, the HTTP
-parser and the response writer; Python owns the application.
+It runs in the same process as CPython — there is no socket between Swift and
+Python, no serialisation step, and no second process. Swift owns the accept
+loop, the HTTP parser and the response writer; Python owns the application. A
+wheel installs the server as `peregrine._native`, an extension module the
+`peregrine` command loads into your own interpreter, so applications run in
+exactly the `python3` they were installed for.
 
 ```
 pip install peregrine-server                # wheel if one matches; else compiled
@@ -89,22 +92,29 @@ FastAPI and Flask, one worker each, on Peregrine, uvicorn, granian and fastpysgi
 the way [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
 measures: its applications, its server commands and its load (zrk, an
 open-loop ramp to 100,000 requests a second, 15 s per level). Requests per
-second at 64 / 256 / 512 connections, median of three runs, WSL2 on 4 cores,
-CPython 3.12:
+second at 64 / 256 / 512 connections, median of three runs, all in one session,
+WSL2 on 4 cores, CPython 3.12:
 
 | FastAPI (ASGI) | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| **peregrine** | **20,319** | **20,469** | **18,944** |
-| uvicorn | 16,043 | 15,236 | 14,430 |
-| granian | 14,544 | 15,241 | 15,254 |
-| fastpysgi | 11,253 | 11,153 | 10,434 |
+| **peregrine** | **24,672** | **24,117** | **24,320** |
+| peregrine, executable | 21,696 | 21,841 | 21,504 |
+| uvicorn | 17,504 | 15,544 | 15,114 |
+| granian | 15,647 | 15,574 | 15,209 |
+| fastpysgi | 11,337 | 10,843 | 10,264 |
 
 | Flask (WSGI) | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| **peregrine** | **12,196** | **14,042** | **13,256** |
-| uvicorn (`--interface wsgi`) | 6,705 | 6,234 | 5,282 |
-| granian | 6,022 | 5,843 | 6,250 |
-| fastpysgi | 10,532 | 10,057 | 10,056 |
+| **peregrine** | **14,768** | **14,992** | **14,458** |
+| peregrine, executable | 13,084 | 13,029 | 12,488 |
+| fastpysgi | 10,419 | 10,202 | 9,978 |
+| uvicorn (`--interface wsgi`) | 6,554 | 6,545 | 5,722 |
+| granian | 6,427 | 6,152 | 6,257 |
+
+`peregrine` is what a wheel installs: the extension module, running inside
+`python3.12`. The executable is the same server embedding `libpython3.12.so`,
+and a shared libpython runs the framework 10–16 % slower than the statically
+linked interpreter every other server here runs in.
 
 Method, latencies, where this differs from the published results, and how to
 reproduce it: [BENCHMARKS.md](BENCHMARKS.md). Run-to-run variance on this box is
@@ -114,7 +124,8 @@ These are hello-world routes, so they measure what a server adds to a request
 rather than what an application can do. A real application doing database work
 will be dominated by that work, and the gaps will narrow accordingly.
 
-The server binary is about 1.0 MB of text and data, and a live connection costs
+The server is about 1.7 MB of text and data as the extension module (1.3 MB as
+the executable, which needs no position-independent code), and a live connection costs
 one 16 KiB pooled read buffer plus a slot of about 200 bytes. Nearly all of a
 worker's resident memory is CPython and the application.
 
@@ -213,8 +224,12 @@ pip install peregrine-server
 ```bash
 # plus a Swift 6.1+ toolchain from https://swift.org/install
 git clone https://github.com/grepjava/peregrine
-cd peregrine && swift build -c release
+cd peregrine && bash scripts/build-extension.sh    # peregrine._native
+PYTHONPATH=python python3 -m peregrine --port 8000 myapp:app
 ```
+
+`swift build -c release` builds the standalone executable instead, which
+embeds `libpython` and takes the same options.
 
 Requirements, per-platform packages, certificates and the failure modes worth
 recognising: [INSTALLATION.md](INSTALLATION.md).
@@ -251,7 +266,7 @@ peregrine [options] MODULE:ATTRIBUTE
   --venv DIR               virtualenv whose packages the app should import
   --no-auto-venv           ignore VIRTUAL_ENV from the environment
   --python-path DIR        directory to prepend to sys.path (repeatable)
-  --python-home DIR        PYTHONHOME for the embedded interpreter
+  --python-home DIR        PYTHONHOME, for the standalone executable only
   --reload                 restart workers when source files change
   --no-uvloop              do not use uvloop even when installed
   --no-lifespan            skip the ASGI lifespan protocol

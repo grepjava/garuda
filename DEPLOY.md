@@ -26,8 +26,8 @@ Two kinds of file, always the same version as `pyproject.toml`:
 | **Wheels** (`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`) | anyone whose interpreter, ABI and glibc match; Swift is not required |
 | **sdist** (`peregrine_server-X.Y.Z.tar.gz`) | everyone else; `pip` compiles it against the installing interpreter |
 
-A wheel vendors the Swift runtime and leaves `libpython` to the user's
-interpreter. The platform tag is `manylinux_2_N` for the builder's glibc
+A wheel carries `peregrine._native`, the server as an extension module, with
+the Swift runtime vendored beside it; Python is the user's interpreter. The platform tag is `manylinux_2_N` for the builder's glibc
 (Ubuntu 24.04 is `2_39`). PyPI rejects `linux_*`; it will not take a wheel
 that still has that tag. Older glibc compiles from the sdist. macOS wheels
 are not built yet.

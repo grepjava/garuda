@@ -969,7 +969,7 @@ that gap gets — it is the application and everything it imports, not the
 server, that was being copied.
 
 Hello-world `GET /` is the other way around: with four workers, threads reach
-81–94 % of what four processes do on FastAPI and 71–82 % on Flask. That table
+88–91 % of what four processes do on FastAPI and 77–79 % on Flask. That table
 is in [BENCHMARKS.md](BENCHMARKS.md#processes-or-free-threaded). `--free-threaded` is the
 memory and shared-state option, not a request-rate upgrade on an empty view.
 
@@ -1016,7 +1016,7 @@ Sharing one process also changes three things it is worth knowing about:
 
 The option is refused, with an error, on an interpreter that has the GIL:
 running it there would silently be slower than `--workers`, not faster.
-`peregrine --version` says which kind of interpreter is embedded:
+`peregrine --version` says which kind of interpreter the server runs in:
 
 ```
 peregrine 1.0.0 (CPython 3.14.6 free-threaded)

@@ -4,10 +4,20 @@
 
 # Architecture
 
-Peregrine embeds CPython. There is no socket between Swift and Python, no
-serialisation step and no second process: Swift owns the accept loop, the
-parser and the response writer, and calls the application directly. Everything
-below follows from that one decision.
+Peregrine shares a process with CPython. There is no socket between Swift and
+Python, no serialisation step and no second process: Swift owns the accept
+loop, the parser and the response writer, and calls the application directly.
+Everything below follows from that one decision.
+
+It is built in one of two forms from the same source. The wheels carry
+`peregrine._native`, an extension module: `python -m peregrine` imports it and
+the server runs inside that interpreter, whose supervisor forks the workers.
+The standalone executable embeds `libpython` instead and starts an interpreter
+in each worker itself. The only difference at run time is where Python's code
+lives. A distribution `python3` is a statically linked, position-dependent
+executable, and framework code runs 10-15 % faster there than in the shared
+`libpython` an embedding executable has to load — see
+[BENCHMARKS.md](BENCHMARKS.md).
 
 The protocols themselves are in [TRANSPORT.md](TRANSPORT.md).
 
@@ -23,8 +33,10 @@ Sources/
   PeregrineWSGI/     environ building, wsgi.input, start_response
   PeregrineASGI/     scope and message building
   PeregrineServer/   connection table, worker loop, both dispatchers,
-                     HTTP/2, HTTP/3, WebSocket, WebTransport, supervisor
-  peregrine/         command line entry point
+                     HTTP/2, HTTP/3, WebSocket, WebTransport, supervisor,
+                     and the command line parser both forms share
+  PeregrineExtension/ peregrine._native: PyInit and serve(argv)
+  peregrine/         the standalone executable's entry point
 ```
 
 `Python.h`, `openssl/ssl.h` and `openssl/evp.h` never appear in a header Swift
