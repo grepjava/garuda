@@ -122,7 +122,7 @@ public enum PeregrineCLI {
               --venv DIR               virtualenv whose packages the app should import
               --no-auto-venv           ignore VIRTUAL_ENV from the environment
               --python-path DIR        directory to prepend to sys.path (repeatable)
-              --python-home DIR        PYTHONHOME for the embedded interpreter
+              --python-home DIR        PYTHONHOME, for the standalone executable only
               --reload                 restart workers when source files change
               --no-uvloop              do not use uvloop even when installed
               --no-lifespan            skip the ASGI lifespan protocol

@@ -5,8 +5,10 @@
 #
 # The file in dist/ is tagged for this CPython and this glibc
 # (cp312-cp312-manylinux_2_39_x86_64, say). pip will refuse it anywhere else.
-# On Linux, patchelf rewrites the binary so the Swift runtime travels
-# next to it; libpython is left to the installing interpreter.
+# It carries peregrine._native, the server as an extension module;
+# PEREGRINE_BUILD=binary packages the standalone executable instead. On Linux,
+# patchelf rewrites either so the Swift runtime travels with it; libpython is
+# left to the installing interpreter.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

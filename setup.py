@@ -1,24 +1,33 @@
-"""Builds the Swift server and packages the resulting binary.
+"""Builds the Swift server and packages it.
 
-Peregrine embeds CPython rather than talking to it over a socket, so the binary
-is linked against one specific libpython. A prebuilt wheel is therefore tagged
-for the exact CPython and platform it was built against
-(`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`) so pip refuses it anywhere it
-would not actually run. When no wheel matches, pip falls back to the sdist and
-this file compiles the server against the installing interpreter.
+By default the server is built as ``peregrine._native``, a CPython extension
+module. The interpreter that imports it supplies Python -- no libpython is
+linked -- and on a distribution python, which is a statically linked,
+position-dependent executable, framework code runs 10-15 % faster that way than
+in the shared libpython an embedding executable has to use (BENCHMARKS.md).
+
+PEREGRINE_BUILD=binary builds the standalone executable instead, which embeds
+libpython and is started by the launcher with execv. Both take the same command
+line, and ``peregrine`` runs whichever the package carries.
+
+Either way the result is bound to one CPython ABI, so a wheel is tagged for
+exactly the interpreter and platform it was built for
+(`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`) and pip refuses it
+anywhere it would not load. When no wheel matches, pip falls back to the sdist
+and this file compiles the server for the installing interpreter.
 
 The wheel does not vendor libpython -- that would fight the interpreter the
-user already has. It does vendor the Swift runtime next to the binary, with a
-relative rpath, so a machine that has never seen this toolchain can still
-exec the server.
+user already has. It does vendor the Swift runtime, with a relative rpath, so a
+machine that has never seen this toolchain can still load the server.
 
 Requirements when compiling (sdist or `scripts/build-wheel.sh`):
   * a Swift toolchain (swift 6.1 or newer) on PATH
   * the Python development files for the interpreter being installed into,
-    which pkg-config exposes as python3-embed (python3-dev / python3-devel)
-  * patchelf on Linux, so the binary can be made relocatable
+    found by pkg-config as python3 (python3-embed for the binary)
+  * patchelf on Linux, so the Swift runtime can travel with the server
 """
 
+import glob
 import os
 import re
 import shutil
@@ -40,11 +49,20 @@ except ImportError:                     # older setuptools defers to `wheel`
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BINARY = "peregrine"
+EXTENSION_PRODUCT = "PeregrineExtension"
 
 
 def _fail(message):
     sys.stderr.write("\nperegrine: %s\n\n" % message)
     raise SystemExit(1)
+
+
+def _mode():
+    """"extension" (the default) or "binary", from PEREGRINE_BUILD."""
+    mode = os.environ.get("PEREGRINE_BUILD", "").strip().lower() or "extension"
+    if mode not in ("extension", "binary"):
+        _fail("PEREGRINE_BUILD must be extension or binary, not %r" % mode)
+    return mode
 
 
 def _free_threaded():
@@ -53,12 +71,11 @@ def _free_threaded():
 
 
 def _running_version():
-    """The interpreter this build must produce a binary for.
+    """The interpreter this build must produce a server for.
 
     A free-threaded build is "3.14t", not "3.14". The suffix is not cosmetic:
-    it is a different ABI with a different SONAME, so a binary linked against
-    one cannot load the other, and a wheel that claimed otherwise would install
-    happily and then fail at exec time.
+    it is a different ABI, so a server built for one cannot load in the other,
+    and a wheel that claimed otherwise would install happily and then fail.
     """
     return "%d.%d%s" % (sys.version_info[0], sys.version_info[1],
                         "t" if _free_threaded() else "")
@@ -80,7 +97,60 @@ def _same_release(pkg_version, running):
     return left is not None and left == right
 
 
-def _check_toolchain():
+def _pkg_config_name(mode):
+    # python3-embed adds -lpython3.x, which the executable needs and the
+    # extension must not have: a second libpython loaded into a python that
+    # already contains one is two interpreters' worth of globals.
+    return "python3" if mode == "extension" else "python3-embed"
+
+
+def _build_environment(mode):
+    """The environment the Swift build runs in.
+
+    pkg-config is pointed at this interpreter's own .pc files after anything
+    the user set, so the headers found belong to the python running pip rather
+    than to whichever one the system search path lists first. Relocated builds
+    (uv's, for one) report the directory they were built in for LIBPC, which
+    does not exist here, so LIBDIR/pkgconfig is tried as well.
+    """
+    env = os.environ.copy()
+    if mode == "extension":
+        env["PEREGRINE_EXTENSION"] = "1"
+    else:
+        env.pop("PEREGRINE_EXTENSION", None)
+    candidates = [sysconfig.get_config_var("LIBPC"),
+                  os.path.join(sysconfig.get_config_var("LIBDIR") or "", "pkgconfig")]
+    found = [path for path in candidates if path and os.path.isdir(path)]
+    if found:
+        existing = env.get("PKG_CONFIG_PATH")
+        env["PKG_CONFIG_PATH"] = os.pathsep.join(([existing] if existing else []) + found[:1])
+    return env
+
+
+def _headers_free_threaded(package, env):
+    """Whether the headers pkg-config found define Py_GIL_DISABLED, or None.
+
+    Every include directory is read, because Debian's pyconfig.h is a wrapper
+    that includes the real one from an architecture directory.
+    """
+    result = subprocess.run(["pkg-config", "--cflags-only-I", package],
+                            capture_output=True, text=True, env=env)
+    seen = False
+    for flag in result.stdout.split():
+        if not flag.startswith("-I"):
+            continue
+        path = os.path.join(flag[2:], "pyconfig.h")
+        if not os.path.isfile(path):
+            continue
+        seen = True
+        with open(path) as fh:
+            if re.search(r"^\s*#\s*define\s+Py_GIL_DISABLED\s+1", fh.read(), re.M):
+                return True
+    return False if seen else None
+
+
+def _check_toolchain(mode, env):
+    package = _pkg_config_name(mode)
     if shutil.which("swift") is None:
         _fail(
             "no Swift toolchain found on PATH.\n"
@@ -89,35 +159,44 @@ def _check_toolchain():
         )
     if shutil.which("pkg-config") is None:
         _fail("pkg-config is required to locate the Python development files.")
-    probe = subprocess.run(["pkg-config", "--exists", "python3-embed"])
+    probe = subprocess.run(["pkg-config", "--exists", package], env=env)
     if probe.returncode != 0:
         _fail(
-            "pkg-config cannot find python3-embed.\n"
+            "pkg-config cannot find %s.\n"
             "Install the Python development files for this interpreter\n"
             "(python3-dev on Debian and Ubuntu, python3-devel on Fedora,\n"
-            "or a python.org / Homebrew framework build on macOS)."
+            "or a python.org / Homebrew framework build on macOS), or point\n"
+            "PKG_CONFIG_PATH at its lib/pkgconfig." % package
         )
-    # pkg-config decides what Swift links, and it is not obliged to point at
-    # the interpreter running this build. Catching that here gives a clear
-    # message instead of a wheel that fails at import time.
-    version = subprocess.run(["pkg-config", "--modversion", "python3-embed"],
-                             capture_output=True, text=True)
+    # pkg-config decides which headers Swift compiles against, and it is not
+    # obliged to point at the interpreter running this build. Catching that
+    # here gives a clear message instead of a wheel that fails at import time.
+    version = subprocess.run(["pkg-config", "--modversion", package],
+                             capture_output=True, text=True, env=env)
     resolved = version.stdout.strip()
     # Only the numbers are comparable here. A free-threaded interpreter calls
-    # itself "3.14t", because the suffix is a different ABI with a different
-    # SONAME -- but its own python3-embed.pc says "3.14", exactly as the GIL
-    # build's does. Comparing the two strings rejected the very pairing the
-    # check exists to accept: a free-threaded interpreter and its own headers.
-    # Which ABI was actually linked is settled after the build instead, by
-    # asking the binary, which is the one authority that cannot be wrong.
+    # itself "3.14t", but its own .pc file says "3.14", exactly as the GIL
+    # build's does. The ABI is settled separately: for the extension from the
+    # headers below, for the binary by asking the binary once it is built.
     if resolved and not _same_release(resolved, _running_version()):
         _fail(
-            "pkg-config resolves python3-embed to Python %s, but this build is\n"
-            "running under Python %s. The server would embed the wrong\n"
+            "pkg-config resolves %s to Python %s, but this build is\n"
+            "running under Python %s. The server would be built for the wrong\n"
             "interpreter. Install the development files for %s, or run pip\n"
             "from the interpreter you intend to serve with."
-            % (resolved, _running_version(), _running_version())
+            % (package, resolved, _running_version(), _running_version())
         )
+    if mode == "extension":
+        headers = _headers_free_threaded(package, env)
+        if headers is not None and headers != _free_threaded():
+            _fail(
+                "pkg-config found %s headers for Python %s, but this build is\n"
+                "running under %s Python %s. An extension compiled against one\n"
+                "does not load in the other. Point PKG_CONFIG_PATH at the\n"
+                "lib/pkgconfig of the interpreter running pip."
+                % ("free-threaded" if headers else "GIL", resolved,
+                   "free-threaded" if _free_threaded() else "GIL", _running_version())
+            )
 
 
 def _linked_version(binary):
@@ -140,9 +219,38 @@ def _linked_version(binary):
     return "%s.%s%s" % (match.group(1), match.group(2), suffix)
 
 
+def _check_import(build_lib):
+    """Imports the built extension in a fresh interpreter, as a user would.
+
+    The loader search path is cleared first, so a Swift runtime found only
+    through the environment -- rather than through the vendored copy -- fails
+    here instead of on somebody else's machine. On a free-threaded interpreter
+    the import must also leave the GIL off: an extension that does not declare
+    itself safe switches it back on for the whole process.
+    """
+    probe = (
+        "import sys\n"
+        "import peregrine._native as native\n"
+        "gil = getattr(sys, '_is_gil_enabled', lambda: True)()\n"
+        "print(native.__file__)\n"
+        "print('gil' if gil else 'nogil')\n"
+    )
+    env = os.environ.copy()
+    for key in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "PYTHONPATH"):
+        env.pop(key, None)
+    result = subprocess.run([sys.executable, "-c", probe], cwd=build_lib,
+                            capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        _fail("the built extension does not import:\n%s" % result.stderr.strip())
+    if _free_threaded() and "nogil" not in result.stdout.split():
+        _fail("importing peregrine._native turned the GIL back on; the module\n"
+              "must declare Py_MOD_GIL_NOT_USED.")
+    return result.stdout.split()[0]
+
+
 def _manylinux_platform_tag(platform_tag):
     """PyPI rejects the linux_* tag. It accepts manylinux_x_y, which is a
-    glibc floor. That is what this build can honestly claim: the binary
+    glibc floor. That is what this build can honestly claim: the server
     was linked on this glibc, so it will not load on an older one.
 
     It is not a full auditwheel repair. libpython, libssl and libicu stay
@@ -167,7 +275,7 @@ def _manylinux_platform_tag(platform_tag):
     return "manylinux_%s_%s_%s" % (match.group(1), match.group(2), arch)
 
 
-# The Swift runtime travels with the binary. libpython, libssl and the rest of
+# The Swift runtime travels with the server. libpython, libssl and the rest of
 # the OS do not -- they belong to the machine that runs the wheel.
 _BUNDLE_HINTS = ("swift", "dispatch", "blocksruntime")
 _NEVER_BUNDLE = (
@@ -193,13 +301,13 @@ def _should_bundle(name, path):
     return any(token in haystack for token in _BUNDLE_HINTS)
 
 
-def _linux_runtime_paths(binary):
+def _linux_runtime_paths(target):
     """SONAME -> resolved path for every Swift library ldd can see."""
     try:
         output = subprocess.check_output(
-            ["ldd", binary], text=True, stderr=subprocess.STDOUT)
+            ["ldd", target], text=True, stderr=subprocess.STDOUT)
     except (OSError, subprocess.CalledProcessError) as exc:
-        _fail("ldd could not read %s: %s" % (binary, exc))
+        _fail("ldd could not read %s: %s" % (target, exc))
     found = {}
     for line in output.splitlines():
         if "=>" not in line:
@@ -214,13 +322,13 @@ def _linux_runtime_paths(binary):
     return found
 
 
-def _macos_runtime_paths(binary):
+def _macos_runtime_paths(target):
     """install name -> resolved path for every Swift library otool can see."""
     try:
         output = subprocess.check_output(
-            ["otool", "-L", binary], text=True, stderr=subprocess.STDOUT)
+            ["otool", "-L", target], text=True, stderr=subprocess.STDOUT)
     except (OSError, subprocess.CalledProcessError) as exc:
-        _fail("otool could not read %s: %s" % (binary, exc))
+        _fail("otool could not read %s: %s" % (target, exc))
     found = {}
     for line in output.splitlines()[1:]:
         path = line.strip().split()[0]
@@ -234,36 +342,36 @@ def _macos_runtime_paths(binary):
     return found
 
 
-def _copy_runtime(binary, resolved):
-    lib_dir = os.path.join(os.path.dirname(binary), "lib")
+def _copy_runtime(lib_dir, resolved):
     os.makedirs(lib_dir, exist_ok=True)
     copied = []
     for name, path in resolved.items():
         dest = os.path.join(lib_dir, os.path.basename(name))
         shutil.copy2(path, dest)
         copied.append(dest)
-    return lib_dir, copied
+    return copied
 
 
-def _relocate_linux(binary):
+def _relocate_linux(target, lib_dir):
     if shutil.which("patchelf") is None:
         message = (
-            "patchelf is required to make the binary relocatable.\n"
+            "patchelf is required to make the server relocatable.\n"
             "Install it (patchelf on Debian and Ubuntu) and try again."
         )
         if _require_relocate():
             _fail(message)
         sys.stderr.write("peregrine: %s\n" % message)
         return
-    resolved = _linux_runtime_paths(binary)
+    resolved = _linux_runtime_paths(target)
     if not resolved:
-        message = "ldd found no Swift runtime libraries to vendor next to %s" % binary
+        message = "ldd found no Swift runtime libraries to vendor next to %s" % target
         if _require_relocate():
             _fail(message)
         sys.stderr.write("peregrine: %s\n" % message)
         return
-    lib_dir, copied = _copy_runtime(binary, resolved)
-    subprocess.check_call(["patchelf", "--set-rpath", "$ORIGIN/lib", binary])
+    copied = _copy_runtime(lib_dir, resolved)
+    relative = os.path.relpath(lib_dir, os.path.dirname(target))
+    subprocess.check_call(["patchelf", "--set-rpath", "$ORIGIN/" + relative, target])
     for path in copied:
         subprocess.check_call(["patchelf", "--set-rpath", "$ORIGIN", path])
     sys.stderr.write(
@@ -271,18 +379,19 @@ def _relocate_linux(binary):
     )
 
 
-def _relocate_macos(binary):
-    resolved = _macos_runtime_paths(binary)
+def _relocate_macos(target, lib_dir):
+    resolved = _macos_runtime_paths(target)
     if not resolved:
-        message = "otool found no Swift runtime libraries to vendor next to %s" % binary
+        message = "otool found no Swift runtime libraries to vendor next to %s" % target
         if _require_relocate():
             _fail(message)
         sys.stderr.write("peregrine: %s\n" % message)
         return
-    lib_dir, copied = _copy_runtime(binary, resolved)
+    copied = _copy_runtime(lib_dir, resolved)
+    relative = os.path.relpath(lib_dir, os.path.dirname(target))
     # -add_rpath fails if the path is already there; that is not an error.
     add = subprocess.run(
-        ["install_name_tool", "-add_rpath", "@loader_path/lib", binary],
+        ["install_name_tool", "-add_rpath", "@loader_path/" + relative, target],
         capture_output=True, text=True)
     if add.returncode != 0 and "would duplicate" not in (add.stderr or ""):
         _fail("install_name_tool -add_rpath failed: %s" % add.stderr.strip())
@@ -292,32 +401,47 @@ def _relocate_macos(binary):
             ["install_name_tool", "-id", "@rpath/%s" % name, dest])
         subprocess.check_call(
             ["install_name_tool", "-change", original,
-             "@loader_path/lib/%s" % name, binary])
+             "@loader_path/%s/%s" % (relative, name), target])
     sys.stderr.write(
         "peregrine: vendored %d Swift libraries into %s\n" % (len(copied), lib_dir)
     )
 
 
-def _relocate(binary):
-    """Vendors the Swift runtime next to the binary and rewrites its rpath.
+def _relocate(target, lib_dir):
+    """Vendors the Swift runtime into `lib_dir` and points `target` at it.
 
     A wheel has to run on a machine that has never seen this toolchain.
     libpython stays with the user's interpreter -- the tag already promised
     that pairing.
     """
     if sys.platform.startswith("linux"):
-        _relocate_linux(binary)
+        _relocate_linux(target, lib_dir)
     elif sys.platform == "darwin":
-        _relocate_macos(binary)
+        _relocate_macos(target, lib_dir)
     elif _require_relocate():
-        _fail("relocating the binary is not implemented on %s" % sys.platform)
+        _fail("relocating the server is not implemented on %s" % sys.platform)
     else:
         sys.stderr.write("peregrine: skipping relocate on %s\n" % sys.platform)
 
 
+def _remove_earlier_output(package_dir):
+    """Clears whatever a previous build left in the package being assembled.
+
+    setuptools reuses build/lib between builds, so without this a wheel carries
+    the output of every earlier build in the tree: an executable from a
+    PEREGRINE_BUILD=binary build next to the extension, or a module for another
+    interpreter. Only the directories and files this file itself writes are
+    touched.
+    """
+    for stale in glob.glob(os.path.join(package_dir, "_native*")):
+        os.remove(stale)
+    for name in ("_swift", "_bin"):
+        shutil.rmtree(os.path.join(package_dir, name), ignore_errors=True)
+
+
 class BinaryDistribution(Distribution):
-    """Tells setuptools the package is platform-specific despite having no
-    Python extension modules of its own."""
+    """Tells setuptools the package is platform-specific; the extension is
+    built by Swift rather than declared to setuptools as ext_modules."""
 
     def has_ext_modules(self):
         return True
@@ -327,18 +451,52 @@ class BinaryDistribution(Distribution):
 
 
 class BuildWithSwift(build_py):
-    """Compiles the server, then lets setuptools package it like any data file."""
+    """Compiles the server, then puts it into the package being built."""
 
     def run(self):
-        _check_toolchain()
+        mode = _mode()
+        env = _build_environment(mode)
+        _check_toolchain(mode, env)
+        # One scratch directory per kind of build: the two resolve different
+        # pkg-config packages, so sharing one would rebuild everything each time.
+        default_scratch = ".build-install" if mode == "binary" else ".build-install-extension"
         scratch = os.environ.get("PEREGRINE_SCRATCH_PATH",
-                                 os.path.join(HERE, ".build-install"))
+                                 os.path.join(HERE, default_scratch))
         command = ["swift", "build", "-c", "release", "--scratch-path", scratch]
-        sys.stderr.write("peregrine: %s\n" % " ".join(command))
-        result = subprocess.run(command, cwd=HERE)
+        if mode == "extension":
+            command += ["--product", EXTENSION_PRODUCT]
+        sys.stderr.write("peregrine: %s%s\n"
+                         % ("PEREGRINE_EXTENSION=1 " if mode == "extension" else "",
+                            " ".join(command)))
+        result = subprocess.run(command, cwd=HERE, env=env)
         if result.returncode != 0:
             _fail("the Swift build failed; see the output above.")
 
+        super().run()
+
+        package_dir = os.path.join(self.build_lib, "peregrine")
+        if mode == "extension":
+            self._install_extension(scratch, package_dir)
+        else:
+            self._install_binary(scratch, package_dir)
+
+    def _install_extension(self, scratch, package_dir):
+        library = "lib%s%s" % (EXTENSION_PRODUCT,
+                               ".dylib" if sys.platform == "darwin" else ".so")
+        built = os.path.join(scratch, "release", library)
+        if not os.path.exists(built):
+            _fail("the Swift build produced no library at %s" % built)
+
+        os.makedirs(package_dir, exist_ok=True)
+        _remove_earlier_output(package_dir)
+        target = os.path.join(package_dir,
+                              "_native" + sysconfig.get_config_var("EXT_SUFFIX"))
+        shutil.copy2(built, target)
+        _relocate(target, os.path.join(package_dir, "_swift"))
+        loaded = _check_import(self.build_lib)
+        sys.stderr.write("peregrine: %s imports as peregrine._native\n" % loaded)
+
+    def _install_binary(self, scratch, package_dir):
         built = os.path.join(scratch, "release", BINARY)
         if not os.path.exists(built):
             _fail("the Swift build produced no binary at %s" % built)
@@ -356,9 +514,8 @@ class BuildWithSwift(build_py):
                 "for." % (linked, _running_version())
             )
 
-        super().run()
-
-        target_dir = os.path.join(self.build_lib, "peregrine", "_bin")
+        _remove_earlier_output(package_dir)
+        target_dir = os.path.join(package_dir, "_bin")
         os.makedirs(target_dir, exist_ok=True)
         target = os.path.join(target_dir, BINARY)
         shutil.copy2(built, target)
@@ -369,11 +526,7 @@ class BuildWithSwift(build_py):
             fh.write("%s\n" % linked)
             fh.write("%s\n" % (sysconfig.get_config_var("prefix") or ""))
 
-        # A wheel has to run on a machine that has never seen this Swift
-        # toolchain. libpython stays with the user's interpreter -- the tag
-        # already promised that pairing -- and the Swift runtime travels
-        # next to the binary with a relative rpath.
-        _relocate(target)
+        _relocate(target, os.path.join(target_dir, "lib"))
         relocated = _linked_version(target)
         if relocated != linked:
             _fail(
@@ -394,14 +547,14 @@ if bdist_wheel is not None:
 
         def get_tag(self):
             _, _, platform_tag = super().get_tag()
-            # cp312-cp312-<platform>: the bundled executable is dynamically
-            # linked against this exact libpython, so anything else is a
+            # cp312-cp312-<platform>: the server is compiled against this
+            # exact CPython ABI (not the limited API), so anything else is a
             # mis-install rather than a graceful degradation.
             #
             # A free-threaded interpreter takes the same interpreter tag and a
             # distinct ABI tag -- cp314-cp314t -- which is what stops pip from
             # installing a GIL-built wheel into python3.14t, and the other way
-            # round. They really are different binaries.
+            # round. They really are different builds.
             interpreter = "cp%d%d" % sys.version_info[:2]
             abi = interpreter + ("t" if _free_threaded() else "")
             return interpreter, abi, _manylinux_platform_tag(platform_tag)

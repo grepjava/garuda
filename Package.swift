@@ -139,5 +139,11 @@ if hosted {
                 // Calls from the server into its own functions bind at link
                 // time, as they do in the executable, instead of going through
                 // the PLT so that another library could interpose them.
-                linkerSettings: [.unsafeFlags(["-Xlinker", "-Bsymbolic-functions"])]))
+                linkerSettings: [
+                    .unsafeFlags(["-Xlinker", "-Bsymbolic-functions"], .when(platforms: [.linux])),
+                    // Mach-O refuses a library with undefined symbols unless
+                    // told that whoever loads it will supply them.
+                    .unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"],
+                                 .when(platforms: [.macOS])),
+                ]))
 }

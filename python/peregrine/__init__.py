@@ -1,9 +1,11 @@
 """Peregrine -- a Python ASGI/WSGI server written in Swift.
 
-This package is a thin launcher. The server itself is a native binary that
-embeds CPython, so there is no Python-level server loop to import; what lives
-here is the logic for finding that binary and starting it with the right
-interpreter and environment.
+The server is native code, and there is no Python-level server loop here.
+Installed from a wheel it is ``peregrine._native``, an extension module that
+runs inside this interpreter: ``run`` imports it and hands it the command line.
+A package built with PEREGRINE_BUILD=binary carries the standalone executable
+instead, which embeds libpython, and ``run`` replaces this process with it.
+Both take the same command line.
 """
 
 import os
