@@ -19,6 +19,10 @@ __pycache__/
 # peregrine._native, built in place by scripts/build-extension.sh.
 python/peregrine/_native*.so
 
+# What `bun install` fetches for benchmarks/elysia-bun; upstream keeps no lockfile.
+benchmarks/elysia-bun/node_modules/
+benchmarks/elysia-bun/bun.lock
+
 # Inputs pgfuzz writes out when it finds something; keep them in
 # fuzz/corpus/<target>/ under a name, not here under a seed.
 pgfuzz-*.bin

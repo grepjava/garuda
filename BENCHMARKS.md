@@ -15,6 +15,10 @@ comparable with the ones that site publishes; see
 2. **Flask (WSGI):** Peregrine against uvicorn, granian and fastpysgi, one
    worker, at 64, 256 and 512 connections.
 
+[Extension 1.1.2](#extension-112-1-worker) adds the next build under the same
+load: unchanged throughput, the response cache, Elysia on Bun beside it, and
+kernel TLS for static files.
+
 On one worker of this machine Peregrine answers FastAPI 1.41–1.60× as fast as
 the next server at each level, and Flask 1.42–1.47× as fast as the next server
 (fastpysgi) and more than twice as fast as uvicorn and granian. That is
@@ -134,7 +138,8 @@ bash benchmarks/frameworks.sh > results.tsv
 ```
 
 `WORKERS`, `CONNS`, `RUNS`, `DURATION`, `FRAMEWORKS`, `SERVERS`, `VENV`,
-`PEREGRINE` and `ZRK` override the defaults. The virtualenv needs `fastapi`,
+`PEREGRINE`, `ZRK`, `CONTRACT`, `EXT_ROOT`, `PEREGRINE_EXTRA_ARGS` and `BUN`
+override the defaults. The virtualenv needs `fastapi`,
 `flask`, `uvicorn[standard]`, `granian` and `fastpysgi`; `peregrine-ext` needs
 the extension module built for that virtualenv's python, and `peregrine` the
 executable.
@@ -188,6 +193,102 @@ Latency, p50 / p99, in seconds:
 | granian | 3.90 / 9.67 | 4.14 / 9.82 | 4.08 / 9.83 |
 
 No server returned an error or a non-2xx response at any level.
+
+---
+
+## Extension 1.1.2, 1 worker
+
+The build after 1.1.1 adds trace context, a response cache, notified reload and
+kernel TLS. It was measured as the extension module in one session on
+2026-09-13, with the same load, applications and machine as the tables above.
+Elysia on Bun ran in the same session as a non-Python reference. The version in
+the code is still 1.1.1; "1.1.2" names this build.
+
+Requests per second:
+
+| server | application | 64 | 256 | 512 |
+|---|---|---:|---:|---:|
+| Peregrine 1.1.2 | FastAPI | 25,681 | 24,960 | 24,520 |
+| Peregrine 1.1.1, [above](#fastapi-asgi-1-worker) | FastAPI | 24,672 | 24,117 | 24,320 |
+| Peregrine 1.1.2 | Flask | 15,143 | 15,158 | 15,036 |
+| Peregrine 1.1.1, [above](#flask-wsgi-1-worker) | Flask | 14,768 | 14,992 | 14,458 |
+| Peregrine 1.1.2, `--cache-size 64` | FastAPI, responses fresh for 60 s | 96,636 | 96,472 | 96,370 |
+| Peregrine 1.1.2, `--cache-size 64` | Flask, responses fresh for 60 s | 96,642 | 96,521 | 96,390 |
+| Elysia 1.4.30 on Bun 1.4.2 | the suite's `javascript/elysia-bun` | 96,610 | 96,455 | 96,442 |
+
+Latency, p50 / p99, in milliseconds:
+
+| server | application | 64 | 256 | 512 |
+|---|---|---:|---:|---:|
+| Peregrine 1.1.2 | FastAPI | 1,438 / 4,966 | 1,455 / 5,024 | 1,602 / 5,196 |
+| Peregrine 1.1.2 | Flask | 2,481 / 7,051 | 2,422 / 6,961 | 2,532 / 7,039 |
+| Peregrine 1.1.2, `--cache-size 64` | FastAPI | 0.051 / 6.9 | 0.053 / 10.1 | 0.055 / 3.1 |
+| Peregrine 1.1.2, `--cache-size 64` | Flask | 0.052 / 15.1 | 0.052 / 8.2 | 0.055 / 4.5 |
+| Elysia 1.4.30 on Bun 1.4.2 | | 0.057 / 4.8 | 0.069 / 13.5 | 0.061 / 3.7 |
+
+No server returned an error or a non-2xx response at any level.
+
+- **Without the cache, 1.1.2 is 1.1.1.** It is 1–4 % ahead at every level, but
+  the 1.1.1 figures come from an earlier session, and sessions on this machine
+  differ by up to 10 %. Read it as no regression, not as a speed-up. Every new
+  feature is off unless its option is given.
+- **About 96,500 requests a second is the ceiling of this load, not a server's
+  capacity.** The ramp offers requests no faster than that over a 15 s run,
+  and a server that answers everything it is offered reaches it. The
+  sub-millisecond p50 shows these three rows did. Upstream's `fastpysgi-wsgi`
+  publishes 96,673 on sixteen CPUs for the same reason. So cached Peregrine and
+  Elysia both exceed what this benchmark can measure, and the table does not
+  say which is faster. The cache is at least 3.8× uncached FastAPI and 6.4×
+  uncached Flask.
+- **A cache hit never reaches Python.** The response is copied out of memory
+  every worker shares, in Swift, and the framework, which is most of the work,
+  is not run. Only GET responses the application marks fresh with `s-maxage`
+  or `max-age` are kept. Requests with cookies or credentials, and responses
+  that set cookies or are private, never are; see
+  [Caching responses](CONFIG.md#caching-responses). The cached applications,
+  [benchmarks/cached/](benchmarks/cached/), are the contract ones plus
+  `Cache-Control: public, s-maxage=60`.
+- **Elysia runs as one process.** The suite's entry runs `cluster.ts`, which
+  starts one `bun ./app.ts` per CPU. Here `app.ts` runs alone, to match one
+  worker. The sources are the suite's, byte for byte:
+  [benchmarks/elysia-bun/](benchmarks/elysia-bun/).
+
+### Static files over HTTPS, with `--ktls`
+
+With `--ktls` the kernel encrypts TLS, so `--static-dir` files go out with
+`sendfile` over HTTPS, as they already did over plain HTTP. This was measured
+earlier on the same branch with
+[benchmarks/static_files.sh](benchmarks/static_files.sh). That is a different
+load from the tables above: closed-loop `oha`, 16 connections, 10 s per cell,
+one worker, random bytes read into the page cache first.
+
+| file | HTTPS, MiB/s | with `--ktls`, MiB/s | server CPU per GiB | with `--ktls` |
+|---|---:|---:|---:|---:|
+| 1 MiB | 1,485 | 2,172 (+46 %) | 713 ms | 495 ms (−31 %) |
+| 16 MiB | 1,384 | 2,206 (+59 %) | 767 ms | 491 ms (−36 %) |
+
+Plain HTTP costs 64–77 ms of server CPU per GiB on the same machine. Of the
+roughly 420 ms per GiB HTTPS still adds with `--ktls`, about half is the
+AES-256-GCM encryption itself, 218 ms per GiB, which kernel TLS moves into the
+kernel but does not remove.
+
+Reproduce, with the kernel's `tls` module loaded (`sudo modprobe tls`):
+
+```bash
+MODES=https bash benchmarks/static_files.sh
+PEREGRINE_EXTRA_ARGS=--ktls MODES=https bash benchmarks/static_files.sh
+```
+
+The framework rows:
+
+```bash
+SERVERS=peregrine-ext bash benchmarks/frameworks.sh
+CONTRACT=benchmarks/cached PEREGRINE_EXTRA_ARGS="--cache-size 64" SERVERS=peregrine-ext bash benchmarks/frameworks.sh
+FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
+```
+
+The Elysia row needs [Bun](https://bun.sh) and port 3000, since the suite's
+`app.ts` listens there. The script runs `bun install` the first time.
 
 ---
 

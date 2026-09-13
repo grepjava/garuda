@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # FastAPI (ASGI) and Flask (WSGI) on peregrine, uvicorn, granian and
-# fastpysgi, with the load command and applications of
+# fastpysgi, and Elysia on Bun as a reference, with the load command and applications of
 # the-benchmarker/web-frameworks at ac364e9 (master, 2026-09-11). The results
 # are not comparable with the figures that site publishes; BENCHMARKS.md says
 # why.
@@ -50,9 +50,22 @@ RUNS=${RUNS:-3}
 DURATION=${DURATION:-15s}
 FRAMEWORKS=${FRAMEWORKS:-"fastapi flask"}
 SERVERS=${SERVERS:-"peregrine-ext peregrine uvicorn granian fastpysgi"}
+# FRAMEWORKS=elysia SERVERS=elysia-bun measures upstream's javascript/elysia-bun
+# (benchmarks/elysia-bun/, byte for byte) as a non-Python reference. The app
+# listens on 3000 itself, so PORT must be 3000. Needs bun on PATH or in ~/.bun.
+BUN=${BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}
+# The applications. benchmarks/cached is the same pair marking their responses
+# fresh, for measuring --cache-size.
+CONTRACT=${CONTRACT:-$ROOT/benchmarks/contract}
+# Where peregrine-ext loads peregrine._native from: another checkout, built
+# with scripts/build-extension.sh, to compare two versions in one session.
+EXT_ROOT=${EXT_ROOT:-$ROOT}
+# Extra flags for both peregrine servers, e.g. "--cache-size 64".
+# shellcheck disable=SC2206 -- deliberately split into words.
+PEREGRINE_ARGS=(${PEREGRINE_EXTRA_ARGS:-})
 URL="http://127.0.0.1:$PORT/"
 OUT=$(mktemp -d)
-export PYTHONPATH="$ROOT/benchmarks/contract${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$CONTRACT${PYTHONPATH:+:$PYTHONPATH}"
 
 # Only the server this script started is stopped, and as a process group, so
 # the workers it forked go with it and no unrelated server is touched.
@@ -72,16 +85,16 @@ start() {
     case "$server" in
     peregrine)
         server_start "$PEREGRINE" --log-level error --protocol "$interface" \
-            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" \
-            --venv "$VENV" --python-path "$ROOT/benchmarks/contract" "$app" ;;
+            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${PEREGRINE_ARGS[@]}" \
+            --venv "$VENV" --python-path "$CONTRACT" "$app" ;;
     peregrine-ext)
         # The same server as an extension module, run by the virtualenv python:
         # peregrine._native, from scripts/build-extension.sh -- what a wheel
         # installs, measured beside the executable above.
-        PYTHONPATH="$ROOT/python:$PYTHONPATH" server_start "$VENV/bin/python" -m peregrine \
+        PYTHONPATH="$EXT_ROOT/python:$PYTHONPATH" server_start "$VENV/bin/python" -m peregrine \
             --log-level error --protocol "$interface" \
-            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" \
-            --venv "$VENV" --python-path "$ROOT/benchmarks/contract" "$app" ;;
+            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${PEREGRINE_ARGS[@]}" \
+            --venv "$VENV" --python-path "$CONTRACT" "$app" ;;
     uvicorn)
         # uvicorn[standard] picks uvloop and httptools by itself. uvicorn spells
         # ASGI 3 as asgi3. WSGI goes through uvicorn's own --interface wsgi
@@ -104,6 +117,19 @@ module, attr = sys.argv[1].split(":")
 app = getattr(importlib.import_module(module), attr)
 fastpysgi.run(app, sys.argv[2], int(sys.argv[3]), workers=int(sys.argv[4]))' \
             "$app" 127.0.0.1 "$PORT" "$WORKERS" ;;
+    elysia-bun)
+        # Upstream runs cluster.ts, which spawns one `bun ./app.ts` per CPU.
+        # One worker is app.ts itself; cluster.ts only when WORKERS is every CPU.
+        [ "$PORT" = 3000 ] || { echo "elysia-bun listens on 3000; PORT=$PORT"; return 1; }
+        # server_start runs here, not in a subshell, so SERVER_PID survives.
+        cd "$ROOT/benchmarks/elysia-bun" || return 1
+        [ -d node_modules/elysia ] || "$BUN" install --production || { cd "$ROOT"; return 1; }
+        if [ "$WORKERS" = 1 ]; then
+            NODE_ENV=production server_start "$BUN" ./app.ts
+        else
+            NODE_ENV=production PATH="$(dirname "$BUN"):$PATH" server_start "$BUN" run cluster.ts
+        fi
+        cd "$ROOT" ;;
     esac > "$OUT/$server-$framework.log" 2>&1
     for _ in $(seq 1 60); do
         curl -s -o /dev/null --max-time 1 "$URL" && return 0
@@ -136,6 +162,9 @@ PY
 printf 'framework\tserver\tworkers\tconnections\treq/s p50_ms p75_ms p90_ms p99_ms errors\truns\n'
 for framework in $FRAMEWORKS; do
     for server in $SERVERS; do
+        # Elysia is its own server; the Python servers don't run it.
+        [ "$framework" = elysia ] && [ "$server" != elysia-bun ] && continue
+        [ "$framework" != elysia ] && [ "$server" = elysia-bun ] && continue
         server_stop
         if ! start "$server" "$framework"; then
             printf '%s\t%s\t%s\tFAILED TO START\n' "$framework" "$server" "$WORKERS"

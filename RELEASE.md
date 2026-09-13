@@ -44,6 +44,10 @@ version reached PyPI, in UTC.
 ### Documentation
 
 - `RELEASE.md` records what changed in every version, linked from the README.
+- `BENCHMARKS.md` measures this build, with the response cache, Elysia on Bun
+  as a reference, and `--ktls` static files. `benchmarks/frameworks.sh` can run
+  the suite's `javascript/elysia-bun` entry and take another checkout's
+  extension module or extra server flags.
 
 ---
 
