@@ -458,6 +458,28 @@ other worker touches. With no `--metrics-port` there is no page and the
 counters do nothing at all.
 
 
+### Queue time
+
+```bash
+peregrine --request-start-header myapp:app
+```
+
+A tracer inside the application measures from the moment the application is
+called. What happened before that — the worker finishing the request ahead of
+this one, a WSGI thread pool with every thread taken, the event loop behind on
+its callbacks — is invisible to it, and it is usually the first thing to grow
+when a server is short of capacity.
+
+`--request-start-header` hands the application `X-Request-Start:
+t=<microseconds since the epoch>` for when the request arrived, which is what
+New Relic, Datadog and Scout read to report queue time. On a plaintext
+connection the time is the kernel's receive timestamp, so a request that sat in
+the accept queue behind a busy worker is stamped when it arrived, not when it
+was read. Over TLS it is when the decrypted request reached the worker, and on
+HTTP/2 and HTTP/3 when the stream opened.
+
+A proxy that already sends the header is left alone: it saw the request first.
+
 ---
 
 ## Reloading without a restart

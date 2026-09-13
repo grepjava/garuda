@@ -776,6 +776,7 @@ extension Worker {
         s.pointee.fileFD = -1
         s.pointee.fileOffset = 0
         s.pointee.fileRemaining = 0
+        s.pointee.headStartUs = config.requestStartHeader ? pg_realtime_us() : 0
         s.pointee.h3FrameType = 0
         s.pointee.h3FrameRemaining = 0
         s.pointee.clientTuple = nil

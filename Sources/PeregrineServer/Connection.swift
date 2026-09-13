@@ -159,6 +159,10 @@ public struct Connection {
     /// written then either: a clock read per request is small but it is not
     /// nothing, and nobody should pay for a log they are not keeping.
     public var requestStartUs: UInt64 = 0
+    /// Wall-clock microseconds at which this request's first byte arrived, for
+    /// --request-start-header: the kernel's receive timestamp on plaintext, the
+    /// first read otherwise. Written only with the flag on.
+    public var headStartUs: UInt64 = 0
 
     /// The TLS session, when this connection has one. Streams never do: they
     /// travel over their connection.

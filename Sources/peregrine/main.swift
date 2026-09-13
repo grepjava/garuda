@@ -127,6 +127,9 @@ func printUsage() {
                                are (default 1024)
       --compress-static        serve FILE.br, FILE.zst or FILE.gz beside a
                                --static-dir file to clients that accept it
+      --request-start-header   give the application X-Request-Start: t=<usec>
+                               for when the request arrived, for APM agents
+                               that report queue time
       --health-check-path P    answer P with 200 in the server, without
                                calling the application (e.g. /healthz)
       --access-log             log one line per request
@@ -438,6 +441,8 @@ while i < argc {
     } else if matches(arg, "--compress-min-size") {
         guard let v = next("--compress-min-size needs a byte count") else { break }
         config.compressMinimumLength = max(0, parseInt(v))
+    } else if matches(arg, "--request-start-header") {
+        config.requestStartHeader = true
     } else if matches(arg, "--health-check-path") {
         guard let v = next("--health-check-path needs a path") else { break }
         if v[0] != 47 {   // '/'

@@ -395,6 +395,7 @@ extension Worker {
             return
         }
         defer { pg_decref(scopeDict) }
+        stampRequestStart(slot, scope: scopeDict)
 
         let token = PollToken.make(slot: slot, generation: c.pointee.generation)
         guard let receiveFn = PyTrampoline.make(asgiReceive, context: token),

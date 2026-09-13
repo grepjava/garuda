@@ -257,6 +257,17 @@ public struct ServerConfig {
     /// Off unless asked for. Answering a path the application also serves would
     /// shadow it, and the server has no business guessing that /healthz is free.
     public var healthPath: UnsafePointer<CChar>? = nil
+    /// Hand the application `X-Request-Start: t=<microseconds since the
+    /// epoch>` for when the request's first byte arrived, unless a proxy in
+    /// front already sent one.
+    ///
+    /// It is the header APM agents -- New Relic, Datadog, Scout -- read to
+    /// report queue time, and queue time is the one part of a request's
+    /// latency no middleware can measure: it is everything that happened
+    /// before the application was called. A worker busy with the request
+    /// before, a WSGI thread pool with every thread taken, an event loop
+    /// behind on callbacks -- all of it shows up here and nowhere else.
+    public var requestStartHeader = false
     public var logLevel: LogLevel = .info
     public var accessLog = false
     /// Emit the access log as one JSON object per line, for a collector that

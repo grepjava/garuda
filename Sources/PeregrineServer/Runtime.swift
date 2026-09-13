@@ -208,6 +208,10 @@ public enum Peregrine {
         } else {
             fd = pg_listen_tcp(config.host, config.port, config.backlog,
                                reusePort ? 1 : 0, config.ipv6Only ? 1 : 0)
+            // --request-start-header. On the listener so that accepted sockets
+            // inherit it, and so that timestamping is already on when a
+            // request that will queue behind a busy worker arrives.
+            if fd >= 0 && config.requestStartHeader { _ = pg_set_rx_timestamps(fd) }
         }
         if fd < 0 {
             let e = pg_errno()

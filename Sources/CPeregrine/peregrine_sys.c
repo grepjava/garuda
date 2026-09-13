@@ -388,6 +388,61 @@ uint64_t pg_monotonic_us(void) {
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
 }
 
+uint64_t pg_realtime_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+int pg_set_rx_timestamps(int fd) {
+    int on = 1;
+#if defined(SO_TIMESTAMPNS)
+    return setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on);
+#elif defined(SO_TIMESTAMP)
+    return setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof on);
+#else
+    (void)fd; (void)on;
+    return -1;
+#endif
+}
+
+long pg_read_stamped(int fd, void *buf, size_t n, uint64_t *arrived_us) {
+    *arrived_us = 0;
+    struct iovec iov = { .iov_base = buf, .iov_len = n };
+    char control[64];
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = control;
+    mh.msg_controllen = sizeof control;
+    ssize_t got;
+    do { got = recvmsg(fd, &mh, 0); } while (got < 0 && errno == EINTR);
+    if (got <= 0) return (long)got;
+    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+        if (cm->cmsg_level != SOL_SOCKET) continue;
+#if defined(SCM_TIMESTAMPNS)
+        if (cm->cmsg_type == SCM_TIMESTAMPNS) {
+            struct timespec ts;
+            memcpy(&ts, CMSG_DATA(cm), sizeof ts);
+            if (ts.tv_sec > 0) {
+                *arrived_us = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+            }
+        }
+#endif
+#if defined(SCM_TIMESTAMP)
+        if (cm->cmsg_type == SCM_TIMESTAMP) {
+            struct timeval tv;
+            memcpy(&tv, CMSG_DATA(cm), sizeof tv);
+            if (tv.tv_sec > 0) {
+                *arrived_us = (uint64_t)tv.tv_sec * 1000000u + (uint64_t)tv.tv_usec;
+            }
+        }
+#endif
+    }
+    return (long)got;
+}
+
 int64_t pg_unix_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

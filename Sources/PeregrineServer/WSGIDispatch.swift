@@ -73,6 +73,7 @@ extension Worker {
             failRequest(slot, status: 500)
             return
         }
+        stampRequestStart(slot, environ: environ)
         // A multiplexed request carries its scheme as a pseudo-header, which
         // is the only place it appears; a trusted proxy may still override it
         // below, exactly as it does for HTTP/1.

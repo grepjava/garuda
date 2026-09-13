@@ -430,7 +430,30 @@ public struct Worker {
             setInterest(slot, .write)
             return
         case .readingHead:
+            // An empty buffer means these are the first bytes of a request,
+            // which is the moment --request-start-header reports.
+            let fresh = config.requestStartHeader && c.pointee.read.readableBytes == 0
+            if fresh && c.pointee.tls == nil {
+                // The first read goes through recvmsg, which says when the
+                // kernel received the bytes rather than when this worker got
+                // round to reading them. Those differ by exactly the time the
+                // request queued -- behind a busy worker, in the accept queue --
+                // and that difference is what the header is for.
+                c.pointee.read.reserve(config.readBufferSize)
+                var arrived: UInt64 = 0
+                let n = pg_read_stamped(c.pointee.fd, c.pointee.read.writePointer,
+                                        c.pointee.read.writableBytes, &arrived)
+                if n > 0 {
+                    c.pointee.read.advanceWriter(n)
+                    c.pointee.headStartUs = arrived > 0 ? arrived : pg_realtime_us()
+                }
+            }
             if !fill(slot, .read, limit: config.maxHeadSize) { return }
+            // Over TLS the reads are OpenSSL's, so the best available moment is
+            // the one the decrypted request reached this worker.
+            if fresh && c.pointee.tls != nil && c.pointee.read.readableBytes > 0 {
+                c.pointee.headStartUs = pg_realtime_us()
+            }
             processInput(slot)
         case .readingBody:
             let target: FillTarget = c.pointee.bodyRemaining < 0 ? .read : .body
@@ -1021,6 +1044,9 @@ public struct Worker {
         setInterest(slot, .read)
         // A pipelined request may already be sitting in the read buffer.
         if c.pointee.read.readableBytes > 0 {
+            // It arrived no later than now, and when exactly is not
+            // recoverable; now is the honest lower bound on its wait.
+            if config.requestStartHeader { c.pointee.headStartUs = pg_realtime_us() }
             processInput(slot)
         }
     }

@@ -108,6 +108,20 @@ uint64_t pg_monotonic_ms(void);
  * coarse clock: it times a single request, where the coarse clock's few
  * milliseconds of slack would be the whole measurement. */
 uint64_t pg_monotonic_us(void);
+/* Wall-clock microseconds since the Unix epoch. For timestamps another system
+ * compares against its own clock; intervals belong to pg_monotonic_us. */
+uint64_t pg_realtime_us(void);
+
+/* Asks the kernel to timestamp data as it arrives on `fd`. Set on a listening
+ * socket, it is inherited by every connection accepted from it -- and it has
+ * to be set there, before the connection exists, or the first request's
+ * packets arrive with no timestamp to report. 0 on success. */
+int pg_set_rx_timestamps(int fd);
+
+/* read() through recvmsg, also reporting when the kernel received the last
+ * of the bytes returned, as wall-clock microseconds. `*arrived_us` is 0 when
+ * the kernel recorded nothing (no timestamping, or a platform without it). */
+long pg_read_stamped(int fd, void *buf, size_t n, uint64_t *arrived_us);
 /* IMF-fixdate, e.g. "Sun, 06 Nov 1994 08:49:37 GMT". Writes exactly 29 bytes,
  * no NUL. Returns 29. Hand-rolled: strftime() would pull in locale state. */
 int pg_http_date(char *buf29, int64_t unix_seconds);
