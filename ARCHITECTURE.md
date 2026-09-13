@@ -326,8 +326,11 @@ by a fixed limit, and connections by `--max-connections`; a full table answers
 - **Framing decided with full information.** A WSGI response that is a list
   gets an exact `Content-Length`; a generator gets chunked encoding on
   HTTP/1.1, and on a multiplexed stream the end of the stream is the framing.
-- **`writev`, `TCP_NODELAY`, `accept4`, `MSG`-free reads**, and one
-  `epoll_ctl` only when the interest mask actually changes.
+- **One `write()` per flush, `sendfile` for static files, `TCP_NODELAY`,
+  `accept4`, `MSG`-free reads**, and one `epoll_ctl` only when the interest
+  mask actually changes. A response's head and body are copied into the
+  connection's write buffer and leave together; nothing on the request path
+  calls `writev`.
 - **`recvmmsg` for QUIC**, 32 datagrams per syscall.
 
 ---

@@ -296,6 +296,59 @@ FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
 The Elysia row needs [Bun](https://bun.sh) and port 3000, since the suite's
 `app.ts` listens there. The script runs `bun install` the first time.
 
+### BlackSheep on Peregrine, and Elysia on Bun past the ceiling
+
+Measured in one session on 2026-09-13, at 9d1aace:
+- **Applications:** [BlackSheep](https://github.com/Neoteroi/BlackSheep) 2.6.3,
+  run as ASGI in the extension module
+  ([benchmarks/contract/blacksheep_app.py](benchmarks/contract/blacksheep_app.py),
+  the same as the suite's `python/blacksheep`); Elysia 1.4.30 on Bun 1.4.2.
+- **Setup:** one worker or process each, on CPython 3.12.
+
+First the suite's ramp, as in the tables above, which cannot tell the two apart
+at the top:
+
+| server | 64 | 256 | 512 | p50 / p99 ms at 64 |
+|---|---:|---:|---:|---:|
+| BlackSheep on Peregrine | 76,321 | 78,735 | 75,042 | 0.458 / 406.9 |
+| Elysia on Bun | 96,659 | 96,490 | 96,407 | 0.057 / 16.4 |
+
+Then closed-loop capacity. The server is pinned to one CPU and `oha` to the
+other three, and each connection sends its next request as soon as the last is
+answered:
+
+| server | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| BlackSheep on Peregrine | 74,781 | 72,996 | 70,757 |
+| Elysia on Bun | 208,830 | 242,964 | 237,983 |
+
+Latency, p50 / p99, in milliseconds:
+
+| server | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| BlackSheep on Peregrine | 0.790 / 2.5 | 3.159 / 10.1 | 6.593 / 18.6 |
+| Elysia on Bun | 0.271 / 0.8 | 0.951 / 2.8 | 1.934 / 5.7 |
+
+No run returned an error or a non-2xx response. Every figure is the median of
+three runs.
+
+- **On one core, Elysia on Bun serves 2.8–3.4× what BlackSheep on Peregrine
+  does.** The ramp hid this: Elysia answered everything it was offered, and
+  BlackSheep fell behind at about 76,000, which its p99 of hundreds of
+  milliseconds shows.
+- **BlackSheep is the fastest Python framework measured here**, about three
+  times FastAPI's 25,000 on the same server.
+- **The load may be what limits Elysia.** Three CPUs of `oha` against one of
+  Bun, so its figure is a floor rather than its ceiling.
+
+```bash
+FRAMEWORKS=blacksheep SERVERS=peregrine-ext bash benchmarks/frameworks.sh
+LOAD=closed PIN=0:1-3 FRAMEWORKS=blacksheep SERVERS=peregrine-ext bash benchmarks/frameworks.sh
+LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
+```
+
+BlackSheep has to be installed in the benchmark venv: `pip install blacksheep`.
+
 ---
 
 ## The ASGI path, change by change
@@ -363,6 +416,47 @@ Reproduce, with two checkouts each built with `scripts/build-extension.sh`:
 ```bash
 BUILD_A=../peregrine-before BUILD_B=. bash benchmarks/turbo_ab.sh
 python benchmarks/asgi_overhead.py
+```
+
+### Response bodies by size
+
+What a response body costs, as it grows.
+[benchmarks/bodies_app.py](benchmarks/bodies_app.py) answers `GET /<bytes>`
+with a body of that many random bytes, built once and kept, so the
+application's work is the same at every size. It runs on one worker pinned to
+one CPU, with closed-loop `oha -c 64` for 10 s on the other three.
+Measured on 2026-09-13.
+
+| body | req/s | MiB/s | server CPU per request | per KiB |
+|---:|---:|---:|---:|---:|
+| 1 KiB | 105,159 | 103 | 9.99 µs | 9.99 µs |
+| 16 KiB | 67,932 | 1,061 | 16.18 µs | 1.01 µs |
+| 64 KiB | 44,450 | 2,778 | 23.90 µs | 0.37 µs |
+| 256 KiB | 17,433 | 4,358 | 61.03 µs | 0.24 µs |
+| 1 MiB | 4,943 | 4,943 | 220.81 µs | 0.22 µs |
+
+Sampled the same way as above, the server's CPU divides like this:
+
+| body | `write()` | copies and the rest of libc | Python | Peregrine |
+|---:|---:|---:|---:|---:|
+| 1 KiB | 40.5 % | 2.8 % | 30.9 % | 11.4 % |
+| 64 KiB | 52.1 % | 8.8 % | 22.1 % | 7.0 % |
+| 1 MiB | 66.1 % | 23.6 % | 6.0 % | 1.6 % |
+
+- **The body is copied twice, and the kernel's copy is the bigger one.** It is
+  copied once from the application's `bytes` into the connection's write
+  buffer, and once into the socket inside `write()`. Over loopback that second
+  copy also delivers into the load generator's socket.
+- **The copy in userspace is what not copying could save, and it only matters
+  when the body is large.** libc's unnamed functions, which are `memmove`
+  here, are about 3 % of the CPU at 1 KiB, which is the floor, 9 % at 64 KiB
+  and 24 % at 1 MiB. Writing a large body straight from the application's
+  `bytes`, with `writev`, could save at most about 6 % of the CPU at 64 KiB
+  and about 20 % at 1 MiB. It saves nothing on a typical API response of a
+  few KiB, where Python is the cost.
+
+```bash
+bash benchmarks/body_sizes.sh
 ```
 
 ---
