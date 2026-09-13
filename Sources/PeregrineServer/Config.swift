@@ -93,6 +93,17 @@ public struct ServerConfig {
     public var keepAliveTimeoutMs: UInt64 = 5_000
     public var requestHeadTimeoutMs: UInt64 = 30_000
     public var gracefulShutdownMs: UInt64 = 10_000
+    /// How long SIGTERM leaves the server serving normally, with only the
+    /// health check failing, before the drain starts.
+    ///
+    /// A load balancer or a Kubernetes Service keeps sending a pod traffic for
+    /// a few seconds after it is told to stop, because taking an endpoint out
+    /// of rotation has to propagate. A server that stops accepting the moment
+    /// SIGTERM arrives refuses that traffic. This is the gap that closes it:
+    /// the probe says 503, the balancer stops routing, and only then does the
+    /// server stop taking connections. SIGINT and SIGQUIT do not wait, and a
+    /// reload does not either.
+    public var drainDelayMs: UInt64 = 0
 
     // --- application ---
     public var appSpec: UnsafePointer<CChar> = staticCString("app:application")

@@ -248,6 +248,8 @@ peregrine [options] MODULE:ATTRIBUTE
   --keep-alive MS          idle keep-alive timeout (default 5000)
   --request-timeout MS     how long a request may stall mid-message (30000)
   --graceful-timeout MS    time in-flight requests get on shutdown (10000)
+  --drain-delay MS         on SIGTERM, fail the health check and keep serving
+                           for MS before draining, for load balancers
   --wsgi-threads N         WSGI application threads per worker (default 1)
   --forwarded-allow-ips L  proxies whose X-Forwarded-* headers are trusted
   --factory                the target is a factory returning the application

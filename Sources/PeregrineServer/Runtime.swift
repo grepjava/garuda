@@ -493,7 +493,9 @@ public enum Peregrine {
             let old = handoverOld
             clearHandover()
             retiring[slot] = old
-            _ = pg_kill(old, SIGTERM)
+            // SIGQUIT, not SIGTERM: its replacement is already serving, so
+            // there is nothing for --drain-delay to wait for.
+            _ = pg_kill(old, SIGQUIT)
         }
 
         /// Replaces the slot at `restartCursor`, then advances. One slot is in
@@ -607,16 +609,37 @@ public enum Peregrine {
                     let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
                     for i in 0..<n {
                         switch Int32(p[i]) {
-                        case SIGTERM, SIGINT, SIGQUIT:
+                        case SIGTERM:
                             if !shuttingDown {
                                 shuttingDown = true
-                                Log.info("shutting down; signalling workers")
+                                if config.drainDelayMs > 0 {
+                                    Log.info("shutting down after --drain-delay; health check now failing")
+                                } else {
+                                    Log.info("shutting down; signalling workers")
+                                }
+                                // The workers keep the delay themselves: an init
+                                // system that signals the whole group reaches
+                                // them without going through this process.
                                 signalAll(SIGTERM)
                                 if acmePid > 0 { _ = pg_kill(acmePid, SIGTERM) }
                                 // Workers get the same grace period they give
                                 // their own requests, plus a moment to exit.
-                                killDeadline = pg_monotonic_ms()
+                                killDeadline = pg_monotonic_ms() &+ config.drainDelayMs
                                     &+ config.gracefulShutdownMs &+ 2_000
+                            }
+                        case SIGINT, SIGQUIT:
+                            // No delay, and a way to cut one short.
+                            let deadline = pg_monotonic_ms() &+ config.gracefulShutdownMs &+ 2_000
+                            if !shuttingDown {
+                                shuttingDown = true
+                                Log.info("shutting down; signalling workers")
+                                signalAll(SIGQUIT)
+                                if acmePid > 0 { _ = pg_kill(acmePid, SIGTERM) }
+                                killDeadline = deadline
+                            } else if killDeadline > deadline {
+                                Log.info("shutting down now, without waiting out --drain-delay")
+                                signalAll(SIGQUIT)
+                                killDeadline = deadline
                             }
                         case SIGHUP:
                             beginRestart("SIGHUP: reloading workers")

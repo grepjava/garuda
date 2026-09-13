@@ -98,6 +98,11 @@ public struct Worker {
     public var running = true
     /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
     public var draining = false
+    /// Set on SIGTERM under --drain-delay: still serving, but the health check
+    /// answers 503 so that whatever routes traffic here stops doing so.
+    public var unready = false
+    /// When the delay is up and the drain starts, or 0.
+    var drainAt: UInt64 = 0
     /// Whether this worker arms the `SIGALRM` watchdog when it starts draining.
     ///
     /// A worker process is the last word on its own lifetime, so it does. A
@@ -663,7 +668,10 @@ public struct Worker {
            c.pointee.requestCount >= config.maxRequestsPerConnection {
             keepAlive = false
         }
-        if draining { keepAlive = false }
+        // During --drain-delay too: a client holding a connection open would
+        // otherwise keep reaching this server after the balancer has stopped
+        // sending it new ones.
+        if draining || unready { keepAlive = false }
         if keepAlive {
             c.pointee.flags.insert(.keepAlive)
         } else {
@@ -1074,23 +1082,25 @@ public struct Worker {
         return true
     }
 
-    /// Answers the health probe: 200, no body, connection untouched.
+    /// Answers the health probe: 200, no body, connection untouched -- or 503
+    /// once SIGTERM has arrived, so that traffic is routed elsewhere.
     mutating func respondHealthy(_ slot: Int) {
         let c = table[slot]
+        let status = unready ? 503 : 200
         // HTTP/2 and HTTP/3 already have a path that writes a status with an
         // empty body and ends the stream. It was written for error codes, but
         // there is nothing about it that is specific to them.
         if c.pointee.isH3Stream {
-            h3FailRequest(slot, status: 200)
+            h3FailRequest(slot, status: status)
             return
         }
         if c.pointee.isStream {
-            h2FailRequest(slot, status: 200)
+            h2FailRequest(slot, status: status)
             return
         }
-        logAccess(slot, status: 200)
+        logAccess(slot, status: status)
         dates.refresh()
-        HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: 200)
+        HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: status)
         HTTPResponseWriter.writeDate(&c.pointee.write, dates)
         c.pointee.write.write("Server: peregrine\r\n")
         HTTPResponseWriter.writeContentLength(&c.pointee.write, 0)
@@ -1379,6 +1389,8 @@ public struct Worker {
 
     mutating func sweepTimeouts() {
         let now = pg_monotonic_ms()
+        // Ahead of the once-a-second throttle, so a delay ends when it says.
+        if drainAt != 0 && now >= drainAt { beginDraining() }
         if now &- lastSweep < 1000 { return }
         lastSweep = now
         dates.refresh()
@@ -1462,7 +1474,12 @@ public struct Worker {
                 let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
                 for i in 0..<Int(n) {
                     switch Int32(p[i]) {
-                    case SIGTERM, SIGINT, SIGQUIT:
+                    case SIGTERM:
+                        beginDrainDelay()
+                    case SIGINT, SIGQUIT:
+                        // Now: an operator at a terminal, a supervisor that
+                        // was asked to hurry, or a reload retiring this worker
+                        // with its replacement already serving.
                         beginDraining()
                     default:
                         break
@@ -1472,9 +1489,27 @@ public struct Worker {
         }
     }
 
+    /// SIGTERM. With --drain-delay, the worker goes on serving and only the
+    /// health check changes; the drain starts when the delay is up. SIGTERM
+    /// may well arrive twice -- from the supervisor, and from an init system
+    /// that signals the whole process group -- so a second one is not taken as
+    /// a reason to cut the delay short.
+    public mutating func beginDrainDelay() {
+        if draining || drainAt != 0 { return }
+        if config.drainDelayMs == 0 {
+            beginDraining()
+            return
+        }
+        unready = true
+        drainAt = pg_monotonic_ms() &+ config.drainDelayMs
+        Log.info("worker failing its health check; draining when --drain-delay is up")
+    }
+
     public mutating func beginDraining() {
         if draining { return }
         draining = true
+        unready = true
+        drainAt = 0
         drainDeadline = config.gracefulShutdownMs > 0
             ? pg_monotonic_ms() &+ config.gracefulShutdownMs
             : 0

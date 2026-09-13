@@ -150,8 +150,9 @@ final class WorkerGroup {
     /// Asks every worker to drain, by putting a signal number down the pipe it
     /// already polls. A worker cannot be interrupted with a real signal -- its
     /// signal mask is full, deliberately -- so this is how it is told.
-    func requestDrain() {
-        for member in members { member.requestDrain() }
+    /// `SIGTERM` lets each worker keep --drain-delay; `SIGQUIT` drains now.
+    func requestDrain(signal: Int32 = SIGQUIT) {
+        for member in members { member.requestDrain(signal: signal) }
     }
 
     func joinAll() {
@@ -209,8 +210,8 @@ final class WorkerThread {
         return true
     }
 
-    func requestDrain() {
-        var byte = UInt8(SIGTERM)
+    func requestDrain(signal: Int32) {
+        var byte = UInt8(signal)
         _ = withUnsafeBytes(of: &byte) { raw in
             pg_write(controlWrite, raw.baseAddress!, 1)
         }
@@ -360,8 +361,10 @@ final class ThreadSupervisor {
                 let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
                 for i in 0..<Int(n) {
                     switch Int32(p[i]) {
-                    case SIGTERM, SIGINT, SIGQUIT:
-                        beginShutdown()
+                    case SIGTERM:
+                        beginShutdown(signal: SIGTERM)
+                    case SIGINT, SIGQUIT:
+                        beginShutdown(signal: SIGQUIT)
                     default:
                         break
                     }
@@ -370,18 +373,26 @@ final class ThreadSupervisor {
         }
     }
 
-    func beginShutdown() {
-        if shuttingDown { return }
-        shuttingDown = true
-        Log.info("shutting down; draining workers")
-        group.requestDrain()
-        deadline = pg_monotonic_ms() &+ config.gracefulShutdownMs &+ 2_000
+    /// `SIGTERM` passes --drain-delay on to every worker thread; `SIGQUIT`
+    /// drains now, and cuts short a delay already running.
+    func beginShutdown(signal: Int32) {
+        let delay = signal == SIGTERM ? config.drainDelayMs : 0
+        let newDeadline = pg_monotonic_ms() &+ delay &+ config.gracefulShutdownMs &+ 2_000
+        if shuttingDown {
+            // Only a request to stop sooner changes anything.
+            guard deadline > newDeadline else { return }
+        } else {
+            shuttingDown = true
+            Log.info("shutting down; draining workers")
+        }
+        group.requestDrain(signal: signal)
+        deadline = newDeadline
         // Same reasoning as a worker's own watchdog: every deadline below this
         // one is cooperative, and a thread wedged inside a C extension cannot be
         // cancelled at all. This one fires from a signal handler and _exit()s.
-        // The margin has to cover the drain, the join, the lifespan shutdown and
-        // interpreter finalisation.
-        let margin = config.gracefulShutdownMs / 1000 &+ 15
+        // The margin has to cover the delay, the drain, the join, the lifespan
+        // shutdown and interpreter finalisation.
+        let margin = (delay &+ config.gracefulShutdownMs) / 1000 &+ 15
         pg_exit_after(UInt32(truncatingIfNeeded: margin), 0)
     }
 

@@ -91,6 +91,10 @@ func printUsage() {
       --keep-alive MS          idle keep-alive timeout (default 5000)
       --request-timeout MS     how long a request may stall mid-message (30000)
       --graceful-timeout MS    time in-flight requests get on shutdown (10000)
+      --drain-delay MS         on SIGTERM, keep serving for MS with the health
+                               check answering 503, so a load balancer stops
+                               routing here before connections are refused
+                               (default 0; SIGINT and SIGQUIT do not wait)
       --wsgi-threads N         WSGI application threads per worker (default 1)
       --forwarded-allow-ips L  proxies whose X-Forwarded-* headers are trusted:
                                a comma-separated list of addresses or CIDR
@@ -352,6 +356,9 @@ while i < argc {
     } else if matches(arg, "--graceful-timeout") {
         guard let v = next("--graceful-timeout needs milliseconds") else { break }
         config.gracefulShutdownMs = UInt64(max(0, parseInt(v)))
+    } else if matches(arg, "--drain-delay") {
+        guard let v = next("--drain-delay needs milliseconds") else { break }
+        config.drainDelayMs = UInt64(max(0, parseInt(v)))
     } else if matches(arg, "--wsgi-threads") {
         guard let v = next("--wsgi-threads needs a value") else { break }
         config.wsgiThreads = max(1, parseInt(v))

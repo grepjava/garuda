@@ -356,6 +356,7 @@ peregrine \
     --static-dir /static=/srv/app/static \
     --health-check-path /healthz \
     --max-body 8388608 \
+    --drain-delay 10000 \
     --graceful-timeout 30000 \
     --access-log --log-level warning \
     myapp:app
@@ -677,6 +678,42 @@ The match is exact once the query string is split off, and only `GET` and
 `HEAD` are answered, so a `POST` to the same path is still the application's.
 It is off unless asked for — the server has no business assuming `/healthz` is
 free.
+
+### Shutting down behind a load balancer
+
+```bash
+peregrine --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30000 myapp:app
+```
+
+```yaml
+readinessProbe:
+  httpGet: { path: /healthz, port: 8000 }
+  periodSeconds: 2
+terminationGracePeriodSeconds: 45
+```
+
+Kubernetes sends `SIGTERM` and removes the pod from its Service at the same
+moment, and the removal takes a few seconds to reach every node and every
+ingress. Anything that stops accepting connections as soon as `SIGTERM`
+arrives spends those seconds refusing traffic that was still routed to it.
+
+`--drain-delay` fills that gap. When `SIGTERM` arrives, the server keeps
+serving for that many milliseconds, but the health check answers `503`. HTTP/1.1
+responses also say `Connection: close`, so clients that hold a connection open
+reconnect somewhere else. Only after the delay does it stop accepting and start
+the usual drain under `--graceful-timeout`. Set the delay a little longer than
+your readiness probe takes to notice: its period multiplied by its failure
+threshold. Set `terminationGracePeriodSeconds` to cover the delay plus the
+graceful timeout.
+
+The delay is only for `SIGTERM`:
+- `SIGINT` (Ctrl-C) and `SIGQUIT` drain at once. `SIGQUIT` also cuts short a
+  delay that is already running.
+- A `SIGHUP` reload never waits, because each replacement worker is serving
+  before the worker it replaces is retired.
+- Each worker keeps the delay itself, so an init system that signals the whole
+  process group, as systemd does by default, gets the same behaviour as one
+  that signals only the supervisor.
 
 ---
 
