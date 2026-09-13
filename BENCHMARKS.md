@@ -342,6 +342,21 @@ request costs about 43 µs, most of it FastAPI's own code.
   asyncio task each request runs in costs 1.1–1.3 µs of the ~9. Building the
   scope costs 0.6–0.8 µs for 3 headers and about 1.5 µs for 15. Neither is
   the bulk of it.
+- **Where the rest goes, sampled.** One worker's CPU was sampled every
+  millisecond under the same load, about 5,700 samples each. A raw ASGI
+  request divides as follows:
+  - `write()` 42 % and the other system calls 7 %. On loopback, sending a
+    response also delivers it to the load generator's socket, so this share
+    is higher than it would be over a network.
+  - The Python interpreter 32 %: the application and the asyncio work around
+    it. The distribution's `python3.12` carries no symbols to split it further.
+  - Peregrine's own Swift and C 10 %, of which parsing the request is 1.5 %
+    and building the scope 1 %.
+  - uvloop 4 %.
+
+  On FastAPI the interpreter is 80 %, `write()` 9 % and Peregrine 3.5 %. The
+  callable Peregrine's channels are called through is 0.1 %, so nothing left
+  on the server side is large enough for another change like these to show.
 
 Reproduce, with two checkouts each built with `scripts/build-extension.sh`:
 
