@@ -197,8 +197,13 @@ void pg_thread_join(pg_thread *t) {
     free(t);
 }
 
-/* The current thread's Worker. See the comment in peregrine_sys.h. */
-static _Thread_local void *g_current_worker = NULL;
+/* The current thread's Worker. See the comment in peregrine_sys.h.
+ *
+ * initial-exec keeps that a register-relative load when the server is a shared
+ * object loaded into python (peregrine._native). Left to the default, a
+ * dlopen()ed library reads a thread-local through a call to __tls_get_addr; in
+ * an executable the two compile to the same instruction. */
+static _Thread_local void *g_current_worker __attribute__((tls_model("initial-exec"))) = NULL;
 
 void *pg_worker_current(void) { return g_current_worker; }
 void pg_worker_set_current(void *worker) { g_current_worker = worker; }

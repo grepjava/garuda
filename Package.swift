@@ -19,6 +19,14 @@ let sharedSwiftSettings: [SwiftSetting] = [
     .define("PEREGRINE_RELEASE", .when(configuration: .release)),
 ]
 
+// PEREGRINE_EXTENSION=1 builds the server as peregrine._native, a CPython
+// extension module, instead of as an executable embedding libpython (see
+// scripts/build-extension.sh). Python then comes from the interpreter that
+// imports the module, so nothing links libpython: `python3.pc` supplies the
+// headers only, where `python3-embed.pc` adds -lpython3.x. The two cannot share
+// one build, since every target that touches Python would carry the flag.
+let hosted = (Context.environment["PEREGRINE_EXTENSION"] ?? "0") != "0"
+
 let package = Package(
     name: "peregrine",
     platforms: [.macOS(.v14)],
@@ -27,11 +35,12 @@ let package = Package(
         .library(name: "Peregrine", targets: ["PeregrineServer"]),
     ],
     targets: [
-        // libpython, located through `python3-embed.pc`.
+        // libpython, located through `python3-embed.pc` -- or, for the
+        // extension module, only its headers, through `python3.pc`.
         .systemLibrary(
             name: "CPython",
             path: "Sources/CPython",
-            pkgConfig: "python3-embed",
+            pkgConfig: hosted ? "python3" : "python3-embed",
             providers: [
                 .apt(["python3-dev"]),
                 .yum(["python3-devel"]),
@@ -114,3 +123,21 @@ let package = Package(
     ],
     cLanguageStandard: .gnu11
 )
+
+if hosted {
+    // A shared object whose Python symbols stay undefined until python loads
+    // it. Nothing that has to link on its own -- the executables and the test
+    // runner -- can be built from the same flags, so they are left out.
+    package.products = [
+        .library(name: "PeregrineExtension", type: .dynamic, targets: ["PeregrineExtension"]),
+    ]
+    package.targets.removeAll { $0.type == .executable || $0.type == .test }
+    package.targets.append(
+        .target(name: "PeregrineExtension",
+                dependencies: ["CPeregrine", "PeregrineServer"],
+                swiftSettings: sharedSwiftSettings,
+                // Calls from the server into its own functions bind at link
+                // time, as they do in the executable, instead of going through
+                // the PLT so that another library could interpose them.
+                linkerSettings: [.unsafeFlags(["-Xlinker", "-Bsymbolic-functions"])]))
+}

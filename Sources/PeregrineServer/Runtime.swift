@@ -798,7 +798,15 @@ public enum Peregrine {
 
         // Not plain fork: a signal that arrived before the child had a pipe of
         // its own was lost. See pg_fork_worker.
+        //
+        // Inside python (peregrine._native) this process already has an
+        // interpreter, and a fork behind its back hands the child the parent's
+        // locks and thread states mid-flight. The hooks are the ones os.fork()
+        // calls; before an interpreter exists, as in the executable, they do
+        // nothing.
+        pg_py_before_fork()
         let pid = pg_fork_worker()
+        if pid == 0 { pg_py_after_fork_child() } else { pg_py_after_fork_parent() }
         if pid < 0 {
             Log.error("fork failed")
             _ = pg_close(fds.0)

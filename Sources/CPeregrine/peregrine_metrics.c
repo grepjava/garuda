@@ -71,7 +71,8 @@ void pg_metrics_set(int slot, int index, uint64_t v) {
     atomic_store_explicit(c, v, memory_order_relaxed);
 }
 
-static _Thread_local int g_local_slot = 0;
+/* initial-exec for the reason given at g_current_worker in peregrine_extra.c. */
+static _Thread_local int g_local_slot __attribute__((tls_model("initial-exec"))) = 0;
 
 void pg_metrics_bind(int slot) { g_local_slot = slot; }
 

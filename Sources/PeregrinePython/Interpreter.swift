@@ -421,7 +421,13 @@ def activate_venv(path):
     public static func initialize(program: UnsafePointer<CChar>?,
                                   home: UnsafePointer<CChar>?,
                                   isolated: Bool) -> Bool {
-        if pg_py_init(program, home, isolated ? 1 : 0) != 0 {
+        if pg_py_is_initialized() != 0 {
+            // Loaded into python as peregrine._native: the interpreter is the
+            // one that imported the server, configured by its own command line.
+            if home != nil {
+                Log.warn("--python-home has no effect when peregrine runs inside python")
+            }
+        } else if pg_py_init(program, home, isolated ? 1 : 0) != 0 {
             Log.error("failed to initialise the Python interpreter")
             return false
         }

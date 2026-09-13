@@ -16,6 +16,9 @@ __pycache__/
 # anyway.
 .pypi-token
 
+# peregrine._native, built in place by scripts/build-extension.sh.
+python/peregrine/_native*.so
+
 # Inputs pgfuzz writes out when it finds something; keep them in
 # fuzz/corpus/<target>/ under a name, not here under a seed.
 pgfuzz-*.bin

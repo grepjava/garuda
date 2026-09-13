@@ -574,3 +574,46 @@ int pg_py_gil_active(void) {
     return 1;
 #endif
 }
+
+/* ======================================================================== */
+/* Hosted: loaded into python as peregrine._native                          */
+/* ======================================================================== */
+
+/* The supervisor forks its workers. The executable does that before any
+ * interpreter exists, so there is nothing for Python to be told. Hosted, the
+ * supervisor is a running python, and a child forked behind the interpreter's
+ * back keeps the parent's locks and thread states exactly as they were at the
+ * moment of the fork. These are the hooks os.fork() itself calls, and with no
+ * interpreter they do nothing. */
+void pg_py_before_fork(void)       { if (Py_IsInitialized()) PyOS_BeforeFork(); }
+void pg_py_after_fork_parent(void) { if (Py_IsInitialized()) PyOS_AfterFork_Parent(); }
+void pg_py_after_fork_child(void)  { if (Py_IsInitialized()) PyOS_AfterFork_Child(); }
+
+static PyMethodDef g_native_methods[] = {
+    {"serve", NULL, METH_O,
+     "serve(argv) -> int\n\nRuns the server with a command line, program name first, "
+     "and returns its exit status."},
+    {NULL, NULL, 0, NULL},
+};
+
+static struct PyModuleDef g_native_module = {
+    PyModuleDef_HEAD_INIT,
+    "peregrine._native",
+    "The Peregrine server, loaded into this interpreter.",
+    -1,
+    g_native_methods,
+};
+
+PyObject *pg_native_module_create(void *serve) {
+    g_native_methods[0].ml_meth = (PyCFunction)serve;
+    PyObject *module = PyModule_Create(&g_native_module);
+#ifdef Py_GIL_DISABLED
+    /* Undeclared, importing an extension turns the GIL back on for the whole
+     * process -- which would quietly undo --free-threaded before it started. */
+    if (module && PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED) < 0) {
+        Py_DECREF(module);
+        return NULL;
+    }
+#endif
+    return module;
+}

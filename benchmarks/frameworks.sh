@@ -66,6 +66,14 @@ start() {
         server_start "$PEREGRINE" --log-level error --protocol "$interface" \
             --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" \
             --venv "$VENV" --python-path "$ROOT/benchmarks/contract" "$app" ;;
+    peregrine-ext)
+        # The same server as an extension module, run by the virtualenv python:
+        # peregrine._native, from scripts/build-extension.sh. Not in the default
+        # SERVERS; it is how the two builds are compared.
+        PYTHONPATH="$ROOT/python:$PYTHONPATH" server_start "$VENV/bin/python" -m peregrine \
+            --log-level error --protocol "$interface" \
+            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" \
+            --venv "$VENV" --python-path "$ROOT/benchmarks/contract" "$app" ;;
     uvicorn)
         # uvicorn[standard] picks uvloop and httptools by itself. uvicorn spells
         # ASGI 3 as asgi3. WSGI goes through uvicorn's own --interface wsgi

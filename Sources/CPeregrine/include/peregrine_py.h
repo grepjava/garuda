@@ -68,6 +68,14 @@ int   pg_py_version_hex(void);
 const char *pg_py_runtime_version(void);
 int   pg_py_is_initialized(void);
 
+/* Around a fork, for a supervisor that is itself a running python
+ * (peregrine._native). No-ops before an interpreter exists. */
+void  pg_py_before_fork(void);
+void  pg_py_after_fork_parent(void);
+void  pg_py_after_fork_child(void);
+/* The peregrine._native module; `serve` is its METH_O implementation. */
+PyObject *pg_native_module_create(void *serve);
+
 /* --- reference counting -------------------------------------------------- */
 
 void  pg_incref(PyObject *o);

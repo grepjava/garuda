@@ -69,9 +69,38 @@ def _default_arguments(argv):
     return extra
 
 
+def _native_module():
+    """peregrine._native -- the server built as an extension module -- or None.
+
+    Preferred to the binary whenever it is installed, because it serves the
+    application with this interpreter instead of an embedded libpython, which
+    is faster on a distribution python. PEREGRINE_NATIVE=0 forces the binary.
+    A module that is present but fails to load raises: falling back would hide
+    which server is actually running.
+    """
+    if os.environ.get("PEREGRINE_NATIVE", "") == "0":
+        return None
+    import importlib
+    import importlib.util
+
+    name = __name__ + "._native"
+    if importlib.util.find_spec(name) is None:
+        return None
+    return importlib.import_module(name)
+
+
 def run(argv=None):
-    """Replaces this process with the server. Does not return on success."""
+    """Runs the server. Does not return on success.
+
+    With peregrine._native installed the server runs inside this process and
+    its exit status is raised as SystemExit. Otherwise this process is replaced
+    with the binary.
+    """
     argv = list(sys.argv[1:] if argv is None else argv)
+    native = _native_module()
+    if native is not None:
+        raise SystemExit(native.serve(["peregrine"] + _default_arguments(argv) + argv))
+
     binary = binary_path()
     if binary is None:
         raise SystemExit(
