@@ -167,6 +167,10 @@ extension Worker {
         if let hsts = config.hsts, !seen.contains(.hsts) {
             encodeStatic(h2, "strict-transport-security", hsts, config.hstsLength, into: &block)
         }
+        if config.requestID && !seen.contains(.requestID) && c.pointee.requestID.readableBytes > 0 {
+            encodeStatic(h2, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
+                         c.pointee.requestID.readableBytes, into: &block)
+        }
 
         // A response that can have no body at all ends here, with no DATA
         // frame to carry the flag.

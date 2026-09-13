@@ -296,6 +296,8 @@ peregrine [options] MODULE:ATTRIBUTE
   --compress-static        serve FILE.br / FILE.zst / FILE.gz beside a
                            --static-dir file to clients that accept it
   --request-start-header   hand the app X-Request-Start for queue-time APMs
+  --request-id             an X-Request-ID per request, for the app, the
+                           response and the access log
   --health-check-path P    answer P with 200 in the server, without calling
                            the application (e.g. /healthz)
   --access-log             log one line per request

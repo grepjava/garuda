@@ -106,6 +106,10 @@ public struct Worker {
     public var unready = false
     /// When the delay is up and the drain starts, or 0.
     var drainAt: UInt64 = 0
+    /// --request-id: a random key per worker, and how many IDs it has made.
+    /// Seeded on first use, in the process or thread that uses it.
+    var requestIDKey: (UInt64, UInt64) = (0, 0)
+    var requestIDCount: UInt64 = 0
     /// Whether this worker arms the `SIGALRM` watchdog when it starts draining.
     ///
     /// A worker process is the last word on its own lifetime, so it does. A
@@ -663,6 +667,9 @@ public struct Worker {
         c.pointee.requestCount &+= 1
         c.pointee.flags.remove(.perRequest)
         c.pointee.body.clear()
+        // The previous request's ID must not be logged against a request that
+        // fails before it is dispatched.
+        c.pointee.requestID.clear()
         c.pointee.chunked = ChunkedDecoder(maxTrailerBytes: config.maxHeadSize)
         // Response framing belongs to one request; a stale budget here would
         // let the next response on a reused connection overrun or fall short.
@@ -774,6 +781,9 @@ public struct Worker {
         if config.accessLog || Metrics.enabled {
             table[slot].pointee.requestStartUs = pg_monotonic_us()
         }
+        // Before anything can answer the request, so that every answer --
+        // a probe, a 429, a static file -- is logged with its ID.
+        if config.requestID { assignRequestID(slot) }
         // --health-check-path, answered here rather than in the application.
         // This is the only interception on the path to dispatch, and it is
         // opt-in, so an application that wants to answer its own probe simply
@@ -1169,6 +1179,14 @@ public struct Worker {
         // the client's pace rather than the application's.
         let micros = c.pointee.requestStartUs == 0
             ? 0 : Int(pg_monotonic_us() &- c.pointee.requestStartUs)
+        // Checked when it was assigned: visible ASCII with nothing a log line
+        // or a JSON string would need escaped.
+        // An empty buffer may never have been given storage, and has no pointer
+        // to read.
+        let idLength = c.pointee.requestID.readableBytes
+        let requestID = idLength > 0
+            ? ByteSpan(UnsafePointer(c.pointee.requestID.readPointer), idLength)
+            : ByteSpan(base, 0)
 
         if !config.accessLogJSON {
             Log.emit(.info) { line in
@@ -1180,6 +1198,10 @@ public struct Worker {
                 line.str(" ")
                 line.int(micros)
                 line.str("us")
+                if requestID.count > 0 {
+                    line.str(" id=")
+                    line.span(requestID)
+                }
             }
             return
         }
@@ -1217,16 +1239,21 @@ public struct Worker {
             line.str(",\"proto\":\"")
             line.str(proto)
             line.str("\"")
+            if requestID.count > 0 {
+                line.str(",\"request_id\":")
+                line.jsonString(requestID.base, requestID.count)
+            }
             if line.truncated { line.str(",\"truncated\":true") }
             line.str("}")
         }
     }
 
     /// Room the JSON access line keeps for everything after the target:
-    /// `"status"`, `"duration_us"`, `"proto"`, the optional `"truncated"`, and
-    /// the punctuation closing the object. Generous on purpose -- being wrong
-    /// the other way is what this exists to prevent.
-    static let accessLogTail = 128
+    /// `"status"`, `"duration_us"`, `"proto"`, the optional `"request_id"` of
+    /// up to `RequestID.maxLength` bytes, the optional `"truncated"`, and the
+    /// punctuation closing the object. Generous on purpose -- being wrong the
+    /// other way is what this exists to prevent.
+    static let accessLogTail = 128 + 16 + RequestID.maxLength
 
     /// What the client is actually speaking, which the request head alone does
     /// not say: an HTTP/2 or HTTP/3 request was rebuilt as HTTP/1.1 text to be
@@ -1382,6 +1409,7 @@ public struct Worker {
         }
         c.pointee.write.destroy()
         c.pointee.body.destroy()
+        c.pointee.requestID.destroy()
         table.release(slot)
 
         if acceptSuspended && !draining {

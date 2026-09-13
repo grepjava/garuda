@@ -24,6 +24,9 @@ public struct ResponseHeaderKind: OptionSet, Sendable {
     /// Strict-Transport-Security: an application that sets its own keeps it,
     /// and --hsts does not add a second.
     public static let hsts             = ResponseHeaderKind(rawValue: 1 << 6)
+    /// X-Request-ID: an application that sets its own keeps it, and
+    /// --request-id does not add a second.
+    public static let requestID        = ResponseHeaderKind(rawValue: 1 << 7)
 }
 
 public enum HTTPResponseWriter {
@@ -88,6 +91,8 @@ public enum HTTPResponseWriter {
             if equalsLowercased(name.base, 7, "alt-svc") { return .altSvc }
         case 10:
             if equalsLowercased(name.base, 10, "connection") { return .connection }
+        case 12:
+            if equalsLowercased(name.base, 12, "x-request-id") { return .requestID }
         case 14:
             if equalsLowercased(name.base, 14, "content-length") { return .contentLength }
         case 17:

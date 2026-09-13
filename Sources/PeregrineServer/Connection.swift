@@ -234,6 +234,11 @@ public struct Connection {
     /// can produce, settled at dispatch. Whether the response actually uses it
     /// is up to the response's own headers.
     public var acceptedCoding: ContentCoding = .identity
+    /// --request-id: this request's ID, settled at dispatch, and whether it is
+    /// the one a trusted proxy sent -- in which case the application already
+    /// has it among the request headers and nothing needs replacing.
+    public var requestID = ByteBuffer()
+    public var requestIDKept = false
     /// The compressor for an ASGI response body being compressed.
     public var encoder = ResponseEncoder()
 

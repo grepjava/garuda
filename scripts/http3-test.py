@@ -14,6 +14,7 @@ Needs `aioquic` in the interpreter running it:  pip install aioquic
 
 import asyncio
 import os
+import re
 import socket
 import ssl
 import shlex
@@ -252,6 +253,15 @@ async def hsts():
             status, headers, _ = await client.request("GET", "/")
             is_("--hsts reaches an HTTP/3 response", headers.get(b"strict-transport-security"),
                 b"max-age=600")
+    with Server("--request-id") as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            _, headers, body = await client.request("GET", "/scope")
+            rid = headers.get(b"x-request-id") or b""
+            check("--request-id reaches an HTTP/3 response",
+                  re.fullmatch(rb"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                               rid) is not None, rid)
+            check("and the application's scope has the same ID", rid and rid in body, body[:300])
 
 
 async def health_check():

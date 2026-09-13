@@ -41,6 +41,10 @@ public struct WSGIRequestSnapshot {
     /// lives for the process.
     public var hsts: UnsafePointer<UInt8>? = nil
     public var hstsLength = 0
+    /// This request's --request-id, or nil. Borrowed; the caller keeps it
+    /// alive for as long as the snapshot is used.
+    public var requestID: UnsafePointer<UInt8>? = nil
+    public var requestIDLength = 0
     /// The response travels on a multiplexed stream (HTTP/2 or HTTP/3), where
     /// the head is a compressed header block rather than text, there is no
     /// transfer encoding, and the stream ending is the framing.
@@ -56,9 +60,12 @@ public struct WSGIRequestSnapshot {
                 date: UnsafePointer<UInt8>,
                 altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0,
                 hsts: UnsafePointer<UInt8>? = nil, hstsLength: Int = 0,
+                requestID: UnsafePointer<UInt8>? = nil, requestIDLength: Int = 0,
                 multiplexed: Bool = false,
                 compress: Bool = false, offeredCoding: ContentCoding = .identity,
                 compressMinimumLength: Int = 1024) {
+        self.requestID = requestID
+        self.requestIDLength = requestIDLength
         self.httpMinor = httpMinor
         self.keepAlive = keepAlive
         self.suppressBody = suppressBody
@@ -463,6 +470,16 @@ public enum WSGIResponseBuilder {
             } else {
                 out.write("Strict-Transport-Security: ")
                 out.write(hsts, snapshot.hstsLength)
+                out.writeCRLF()
+            }
+        }
+        if let requestID = snapshot.requestID, snapshot.requestIDLength > 0,
+           !seen.contains(.requestID) {
+            if snapshot.multiplexed {
+                _ = emit("x-request-id", ByteSpan(requestID, snapshot.requestIDLength))
+            } else {
+                out.write("X-Request-ID: ")
+                out.write(requestID, snapshot.requestIDLength)
                 out.writeCRLF()
             }
         }

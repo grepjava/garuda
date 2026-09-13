@@ -74,6 +74,7 @@ extension Worker {
             return
         }
         stampRequestStart(slot, environ: environ)
+        stampRequestID(slot, environ: environ)
         // A multiplexed request carries its scheme as a pseudo-header, which
         // is the only place it appears; a trusted proxy may still override it
         // below, exactly as it does for HTTP/1.
@@ -127,6 +128,9 @@ extension Worker {
                                    altSvcLength: config.altSvcLength,
                                    hsts: config.hsts,
                                    hstsLength: config.hstsLength,
+                                   requestID: c.pointee.requestID.readableBytes > 0
+                                       ? UnsafePointer(c.pointee.requestID.readPointer) : nil,
+                                   requestIDLength: c.pointee.requestID.readableBytes,
                                    multiplexed: c.pointee.isStream,
                                    compress: config.compress,
                                    offeredCoding: c.pointee.acceptedCoding,
@@ -590,6 +594,9 @@ extension Worker {
                           altSvcLength: config.altSvcLength,
                           hsts: config.hsts,
                           hstsLength: config.hstsLength,
+                          requestID: c.pointee.requestID.readableBytes > 0
+                              ? UnsafePointer(c.pointee.requestID.readPointer) : nil,
+                          requestIDLength: c.pointee.requestID.readableBytes,
                           multiplexed: c.pointee.isStream,
                           compress: config.compress,
                           offeredCoding: c.pointee.acceptedCoding,

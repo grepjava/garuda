@@ -176,6 +176,9 @@ func printUsage() {
       --request-start-header   give the application X-Request-Start: t=<usec>
                                for when the request arrived, for APM agents
                                that report queue time
+      --request-id             give every request an X-Request-ID, echoed on
+                               the response and in the access log; one from a
+                               --forwarded-allow-ips proxy is kept
       --health-check-path P    answer P with 200 in the server, without
                                calling the application (e.g. /healthz)
       --access-log             log one line per request
@@ -533,6 +536,8 @@ while i < argc {
         config.compressMinimumLength = max(0, parseInt(v))
     } else if matches(arg, "--request-start-header") {
         config.requestStartHeader = true
+    } else if matches(arg, "--request-id") {
+        config.requestID = true
     } else if matches(arg, "--health-check-path") {
         guard let v = next("--health-check-path needs a path") else { break }
         if v[0] != 47 {   // '/'

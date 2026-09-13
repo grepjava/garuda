@@ -305,6 +305,12 @@ public struct ServerConfig {
     /// before, a WSGI thread pool with every thread taken, an event loop
     /// behind on callbacks -- all of it shows up here and nowhere else.
     public var requestStartHeader = false
+    /// Give every request an `X-Request-ID`: hand it to the application, echo
+    /// it on the response and put it in the access log, so that a line in the
+    /// application's own log, a line in the access log and what the client
+    /// was told can be matched up. One a trusted proxy sent is kept; any other
+    /// is replaced, since a client can put anything it likes in a header.
+    public var requestID = false
     public var logLevel: LogLevel = .info
     public var accessLog = false
     /// Emit the access log as one JSON object per line, for a collector that

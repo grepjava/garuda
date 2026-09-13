@@ -396,6 +396,7 @@ extension Worker {
         }
         defer { pg_decref(scopeDict) }
         stampRequestStart(slot, scope: scopeDict)
+        stampRequestID(slot, scope: scopeDict)
 
         let token = PollToken.make(slot: slot, generation: c.pointee.generation)
         guard let receiveFn = PyTrampoline.make(asgiReceive, context: token),
@@ -677,6 +678,7 @@ extension Worker {
             c.pointee.write.writeCRLF()
         }
         if !seen.contains(.hsts) { writeHSTS(&c.pointee.write) }
+        if !seen.contains(.requestID) { writeRequestIDHeader(slot, &c.pointee.write) }
         HTTPResponseWriter.writeConnection(&c.pointee.write,
                                            keepAlive: c.pointee.flags.contains(.keepAlive))
         HTTPResponseWriter.endHead(&c.pointee.write)

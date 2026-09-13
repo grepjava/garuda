@@ -65,6 +65,11 @@ public final class WSGIJob {
     let altSvcLength: Int
     let hsts: UnsafePointer<UInt8>?
     let hstsLength: Int
+    /// This request's --request-id, copied: the connection's own buffer is the
+    /// loop's, and the next request on it may have replaced it by the time the
+    /// application returns.
+    let requestID: UnsafeMutablePointer<UInt8>?
+    let requestIDLength: Int
     /// The response is bound for an HTTP/2 or HTTP/3 stream, so its head is
     /// staged rather than written as text.
     let multiplexed: Bool
@@ -110,6 +115,8 @@ public final class WSGIJob {
                             altSvcLength: altSvcLength,
                             hsts: hsts,
                             hstsLength: hstsLength,
+                            requestID: requestID.map { UnsafePointer($0) },
+                            requestIDLength: requestIDLength,
                             multiplexed: multiplexed,
                             compress: compress,
                             offeredCoding: offeredCoding,
@@ -122,11 +129,21 @@ public final class WSGIJob {
          date: UnsafePointer<UInt8>,
          altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0,
          hsts: UnsafePointer<UInt8>? = nil, hstsLength: Int = 0,
+         requestID: UnsafePointer<UInt8>? = nil, requestIDLength: Int = 0,
          multiplexed: Bool = false,
          compress: Bool = false, offeredCoding: ContentCoding = .identity,
          compressMinimumLength: Int = 1024) {
         self.hsts = hsts
         self.hstsLength = hstsLength
+        if let requestID, requestIDLength > 0 {
+            let copy = UnsafeMutablePointer<UInt8>.allocate(capacity: requestIDLength)
+            copy.update(from: requestID, count: requestIDLength)
+            self.requestID = copy
+            self.requestIDLength = requestIDLength
+        } else {
+            self.requestID = nil
+            self.requestIDLength = 0
+        }
         self.compress = compress
         self.offeredCoding = offeredCoding
         self.compressMinimumLength = compressMinimumLength
@@ -150,6 +167,7 @@ public final class WSGIJob {
 
     deinit {
         date.deallocate()
+        requestID?.deallocate()
         out.destroy()
         encoder.destroy()
     }

@@ -154,6 +154,10 @@ extension Worker {
         if let hsts = config.hsts, !seen.contains(.hsts) {
             encodeStaticH3(h3, "strict-transport-security", hsts, config.hstsLength, into: &block)
         }
+        if config.requestID && !seen.contains(.requestID) && c.pointee.requestID.readableBytes > 0 {
+            encodeStaticH3(h3, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
+                           c.pointee.requestID.readableBytes, into: &block)
+        }
 
         writeH3HeaderBlock(slot, h3, block: &block)
         c.pointee.flags.insert(.responseStarted)

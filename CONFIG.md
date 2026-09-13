@@ -409,6 +409,41 @@ complete object, whatever the peer asked for.
 
 `--access-log` costs a clock read per request; without it there is none.
 
+### Request IDs
+
+```bash
+peregrine --request-id --access-log myapp:app
+```
+
+`--request-id` gives every request an `X-Request-ID`, and puts that one value
+in three places:
+
+- **The application** sees it as a request header: `X-Request-ID` in the ASGI
+  scope's headers, `HTTP_X_REQUEST_ID` in the WSGI environ. Log it, or pass it
+  on to the services the request calls.
+- **The response** carries it, so a client or a support ticket can quote it
+  back. An application that sets its own `X-Request-ID` response header keeps
+  its value.
+- **The access log** records it: ` id=...` at the end of a text line, and
+  `"request_id"` in a JSON one.
+
+```
+GET /cart 200 1843us id=0b6f1c9e-3c1d-4f7a-9a52-6d2e8f41c7b0
+```
+
+A new ID is a random version 4 UUID. When a proxy listed in
+`--forwarded-allow-ips` sends its own `X-Request-ID`, that ID is kept, because
+the proxy saw the request first and may already have logged it. The value must
+be 1 to 128 characters of letters, digits and `-_.:+/=@~`. Any other
+`X-Request-ID`, including one a client sends directly, is replaced before the
+application sees it. A value that anyone can set is not an identifier anyone
+else can rely on.
+
+The server answers a few requests itself, without the application, and logs
+their IDs as well. Static files also carry the ID in a response header. Health
+probes, rate-limit refusals and malformed requests do not, and the
+`--redirect-http` port assigns no IDs.
+
 ### Metrics
 
 `--metrics-port 9100` serves the Prometheus text exposition format:
