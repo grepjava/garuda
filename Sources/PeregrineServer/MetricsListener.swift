@@ -24,9 +24,9 @@
 // cannot reach the request path. There are `metricsPendingCount` places to
 // wait in and no more, each with a deadline and a ceiling on how much it will
 // hold, and the loop is never blocked on any of them: they are poller
-// registrations like anything else. A ninth concurrent scrape is answered on
-// the spot from whatever it has sent, which is the old behaviour, kept for the
-// case where the alternative would be to start queueing.
+// registrations like anything else. When a ninth arrives, the one held longest
+// is answered from whatever it has sent and the newcomer takes its place,
+// rather than anything starting to queue.
 //===----------------------------------------------------------------------===//
 
 import CPeregrine
@@ -88,16 +88,14 @@ extension Worker {
             buf.destroy()
             _ = pg_close(fd)
         case .partial:
-            guard let index = freeScrapeSlot() else {
-                // Nowhere to wait. Answering from a partial request is the
-                // lesser of the two evils: a scrape's response does not depend
-                // on what was asked for, a redirect without its Host is a 400
-                // the client can retry, and the alternative is a client that
-                // silently gets nothing.
-                answerOneShot(fd, redirect: redirect, buf)
-                buf.destroy()
-                return
-            }
+            // Nowhere to wait: the place held longest gives way. Its peer has
+            // had the most time to finish, so it is answered from what it has
+            // sent -- a scrape's response does not depend on what was asked
+            // for, and a redirect without its Host is a 400 the client can
+            // retry. Answering the newcomer instead would close a connection
+            // whose request is usually still in flight, and a close with bytes
+            // still inbound is a reset that can take the answer with it.
+            let index = freeScrapeSlot() ?? evictOldestScrape()
             guard poller.add(fd, .read, token: PollToken.metricsPending(index)) else {
                 answerOneShot(fd, redirect: redirect, buf)
                 buf.destroy()
@@ -178,6 +176,21 @@ extension Worker {
             i += 1
         }
         return nil
+    }
+
+    /// Answers the parked request nearest its deadline, which is the one held
+    /// longest, and returns the place it leaves free.
+    private mutating func evictOldestScrape() -> Int {
+        var oldest = 0
+        var i = 1
+        while i < scrapes.count {
+            if scrapes[i].deadlineMs < scrapes[oldest].deadlineMs { oldest = i }
+            i += 1
+        }
+        var taken = takeOneShot(oldest)
+        answerOneShot(taken.fd, redirect: taken.redirect, taken.buf)
+        taken.buf.destroy()
+        return oldest
     }
 
     private mutating func releaseScrape(_ index: Int, close: Bool) {

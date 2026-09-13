@@ -1379,6 +1379,53 @@ def test_metrics():
         for half in stalled:
             half.close()
 
+    # With every place to wait taken, a scrape whose request has not arrived
+    # yet must still be answered. One worker, so the stalled peers cannot be
+    # spread out; macOS hands every connection on a SO_REUSEPORT port to one
+    # socket anyway.
+    port, metrics_port = free_port(), free_port()
+    with Server("--workers", "1", "--metrics-port", str(metrics_port),
+                port=port, app="wsgi_app:application"):
+        # The server is ready when its service port is; the scrape port is
+        # bound by the worker, a moment later.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                scrape(metrics_port)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.1)
+        stalled = []
+        for _ in range(12):
+            half = socket.create_connection(("127.0.0.1", metrics_port), timeout=10)
+            half.sendall(b"G")
+            stalled.append(half)
+        time.sleep(0.2)
+        # Written a byte at a time, a scrape is one the server has only part
+        # of for as long as it likes. Answering it at once would close under a
+        # peer still writing -- the reset that, racing an ordinary scrape,
+        # can cost it the answer.
+        outcomes = {}
+        for _ in range(3):
+            s = socket.create_connection(("127.0.0.1", metrics_port), timeout=10)
+            try:
+                for byte in b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n":
+                    s.sendall(bytes([byte]))
+                    time.sleep(0.01)
+                status, _, body = read_http_response(s)
+                outcome = status if b"peregrine_requests_total" in body else "short"
+            except OSError as e:
+                outcome = type(e).__name__
+            finally:
+                s.close()
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        is_("a scrape is not cut off when every place to wait is taken",
+            outcomes, {200: 3})
+        for half in stalled:
+            half.close()
+
     # Counting must cost nothing when nobody asked for it.
     port = free_port()
     with Server(port=port, app="wsgi_app:application") as server:
