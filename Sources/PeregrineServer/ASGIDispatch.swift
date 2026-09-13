@@ -213,12 +213,14 @@ public enum ASGIRuntime {
     /// Hands the poller to asyncio and runs until the loop stops.
     public static func runLoop(_ worker: UnsafeMutablePointer<Worker>) {
         guard let drain = PyTrampoline.make(asgiDrain, context: 0),
-              let timer = PyTrampoline.make(asgiTimer, context: 0) else {
+              let timer = PyTrampoline.make(asgiTimer, context: 0),
+              let flushAll = PyTrampoline.make(asgiFlushDeferred, context: 0) else {
             PyError.logPending("creating the loop callbacks")
             return
         }
         worker.pointee.asgiDrainCallback = drain
         worker.pointee.asgiTimerCallback = timer
+        worker.pointee.asgiFlushCallback = flushAll
 
         guard let l = worker.pointee.asgiLoop else { return }
 
@@ -325,6 +327,30 @@ private func asgiTimer(_ context: UInt64, _ args: PyObj?) -> PyObj? {
         pg_err_clear()
     }
     return nil
+}
+
+/// Sends the responses this loop iteration produced. Scheduled by `flushSoon`.
+private func asgiFlushDeferred(_ context: UInt64, _ args: PyObj?) -> PyObj? {
+    currentWorker?.pointee.runDeferredFlushes()
+    return nil
+}
+
+extension Worker {
+
+    /// Asks the event loop for one call to `runDeferredFlushes` after the
+    /// callbacks already queued, which include the application steps still to
+    /// run this iteration. Returns false when that cannot be arranged.
+    mutating func scheduleDeferredFlush() -> Bool {
+        if deferredFlushScheduled { return true }
+        guard let callback = asgiFlushCallback, let l = asgiLoop else { return false }
+        guard let r = pg_call_method1(l, Interned[.nCallSoon], callback) else {
+            pg_err_clear()
+            return false
+        }
+        pg_decref(r)
+        deferredFlushScheduled = true
+        return true
+    }
 }
 
 // MARK: - Dispatch
@@ -772,7 +798,7 @@ extension Worker {
         if overflow || short {
             c.pointee.flags.remove(.keepAlive)
         }
-        _ = flush(slot)
+        flushSoon(slot)
 
         // A task already parked in receive() when the response completed has to
         // be woken and told so, or it waits for a body the server will never

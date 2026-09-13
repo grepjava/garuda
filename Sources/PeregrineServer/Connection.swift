@@ -101,6 +101,11 @@ public struct ConnFlags: OptionSet, Sendable {
     /// open a new connection.
     public static let servedRequest    = ConnFlags(rawValue: 1 << 18)
 
+    /// An ASGI response is waiting in the write buffer for the end of this
+    /// event-loop iteration, when it goes out with every other response the
+    /// iteration produced. See `Worker.flushSoon`.
+    public static let flushQueued      = ConnFlags(rawValue: 1 << 19)
+
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
     /// one of these here would leak state across a pipelined request.

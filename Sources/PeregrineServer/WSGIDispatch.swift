@@ -384,7 +384,11 @@ extension Worker {
         // and no connection close to imply it.
         c.pointee.flags.insert(.responseComplete)
         c.pointee.state = .writing
-        _ = flush(slot)
+        // The application has stopped producing, so holding what is left for
+        // the batch delays nobody's next block; PEP 3333's rule against
+        // delaying transmission is about blocks with more to come, and those
+        // were written as they were yielded.
+        flushSoon(slot)
     }
 
     /// Walks the application's output onto the connection.

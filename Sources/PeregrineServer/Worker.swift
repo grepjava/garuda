@@ -97,6 +97,18 @@ public struct Worker {
     public var asgiDrainCallback: PyObj? = nil
     /// The periodic housekeeping callback.
     public var asgiTimerCallback: PyObj? = nil
+    /// The `call_soon` callback that sends every response in `deferredFlush`.
+    public var asgiFlushCallback: PyObj? = nil
+    /// Tokens of the HTTP/1 connections whose ASGI responses go out at the end
+    /// of this loop iteration. A slot is queued at most once, so the table's
+    /// capacity bounds it.
+    var deferredFlush: UnsafeMutablePointer<UInt64>
+    var deferredFlushCount = 0
+    var deferredFlushScheduled = false
+    /// Set while `runDeferredFlushes` walks the queue, which a flush can add
+    /// to by finishing a response and dispatching the request pipelined
+    /// behind it. The walk picks those up itself rather than starting another.
+    var runningDeferredFlushes = false
 
     public var running = true
     /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
@@ -148,12 +160,15 @@ public struct Worker {
                                maxRetained: min(config.maxConnections, 1024))
         self.dates = DateCache()
         self.headers = UnsafeMutablePointer<HTTPHeaderRef>.allocate(capacity: config.maxHeaders)
+        self.deferredFlush = UnsafeMutablePointer<UInt64>.allocate(
+            capacity: max(config.maxConnections, 1))
     }
 
     public mutating func destroy() {
         closeScrapes()
         quic?.destroy()
         headers.deallocate()
+        deferredFlush.deallocate()
         pool.destroy()
         dates.destroy()
         table.destroy()
@@ -243,6 +258,10 @@ public struct Worker {
                 handleConnectionEvent(slot, mask)
             }
         }
+        // The WSGI responses this batch finished go out together. ASGI ones
+        // wait for the end of the loop iteration instead, which comes after the
+        // application steps this batch has only just scheduled.
+        if appProtocol == .wsgi && deferredFlushCount > 0 { runDeferredFlushes() }
     }
 
     mutating func handleConnectionEvent(_ slot: Int, _ mask: PollMask) {
@@ -441,7 +460,9 @@ public struct Worker {
         case .writing, .closing:
             // Pipelined bytes arriving while the previous response drains: they
             // wait in the socket buffer until we are ready to look at them.
-            setInterest(slot, .write)
+            // Whatever write interest the response has stays; with its bytes
+            // already sent and only its task left to finish, that is none.
+            setInterest(slot, PollMask(rawValue: c.pointee.interest).subtracting(.read))
             return
         case .readingHead:
             // An empty buffer means these are the first bytes of a request,
@@ -487,6 +508,15 @@ public struct Worker {
             // arriving now is the next pipelined request, and it waits in the
             // socket buffer until this one is answered.
             if c.pointee.poolJob != nil { return }
+            // The body is complete, so read interest was only lingering (see
+            // `lingeringRead`) and has now fired: a pipelined request, or the
+            // peer closing. Either way the bytes can wait in the socket. A
+            // hangup is still reported on its own on the next turn, because
+            // EPOLLRDHUP does not depend on read interest.
+            if c.pointee.bodyRemaining == 0 {
+                setInterest(slot, PollMask(rawValue: c.pointee.interest).subtracting(.read))
+                return
+            }
             // ASGI keeps streaming the body while the application runs, but no
             // further ahead than the high water mark: bytes an application has
             // not asked for yet are better left in the socket than in memory.
@@ -825,6 +855,76 @@ public struct Worker {
 
     // MARK: - Writing
 
+    /// How many finished WSGI responses wait for the end of an event batch
+    /// before going out anyway. Holding a response costs its client the time
+    /// the ones after it take to run, so the batch is kept small.
+    static let wsgiFlushBatch = 16
+
+    /// Sends a finished HTTP/1 response together with the others finishing
+    /// around it, rather than on its own.
+    ///
+    /// ASGI responses go out at the end of the event-loop iteration, which is
+    /// what uvloop does with transport writes. WSGI responses go out at the end
+    /// of the event batch, or every `wsgiFlushBatch` of them. It matters more
+    /// than it looks. A write wakes whoever reads the other end. Written one at
+    /// a time between applications taking tens of microseconds each, the
+    /// readers have gone back to sleep before every write, and every write pays
+    /// for a full cross-CPU wakeup: 18us of a FastAPI or a Flask request,
+    /// against 3.5us for uvicorn making the same single write.
+    mutating func flushSoon(_ slot: Int) {
+        let c = table[slot]
+        // A stream writes into its connection, which has its own pacing.
+        if c.pointee.isStream || c.pointee.fd < 0 {
+            _ = flush(slot)
+            return
+        }
+        if c.pointee.flags.contains(.flushQueued) {
+            // Already going out with the batch, unless it has grown too big to
+            // be worth holding back.
+            if c.pointee.write.readableBytes >= config.readBufferSize { _ = flush(slot) }
+            return
+        }
+        let scheduled = appProtocol == .asgi ? scheduleDeferredFlush() : true
+        if !scheduled
+            || c.pointee.write.readableBytes >= config.readBufferSize
+            || deferredFlushCount >= table.capacity {
+            _ = flush(slot)
+            return
+        }
+        deferredFlush[deferredFlushCount] = PollToken.make(slot: slot,
+                                                           generation: c.pointee.generation)
+        deferredFlushCount += 1
+        c.pointee.flags.insert(.flushQueued)
+        if appProtocol == .wsgi && deferredFlushCount >= Worker.wsgiFlushBatch
+            && !runningDeferredFlushes {
+            runDeferredFlushes()
+        }
+    }
+
+    /// Sends every response `flushSoon` is holding.
+    mutating func runDeferredFlushes() {
+        if runningDeferredFlushes { return }
+        runningDeferredFlushes = true
+        // Finishing a response can dispatch the request pipelined behind it,
+        // which can queue again, so the count is re-read on every pass.
+        var i = 0
+        while i < deferredFlushCount {
+            let token = deferredFlush[i]
+            i += 1
+            let slot = PollToken.slot(token)
+            let c = table[slot]
+            if c.pointee.state == .free || c.pointee.generation != PollToken.generation(token)
+                || !c.pointee.flags.contains(.flushQueued) {
+                continue
+            }
+            c.pointee.flags.remove(.flushQueued)
+            _ = flush(slot)
+        }
+        deferredFlushCount = 0
+        deferredFlushScheduled = false
+        runningDeferredFlushes = false
+    }
+
     /// Pushes buffered bytes to the socket. Returns false if the connection
     /// was closed.
     @discardableResult
@@ -856,7 +956,8 @@ public struct Worker {
                     // consume what arrives: not while a pooled request owns the
                     // connection, and not while a websocket queue is full. A
                     // level-triggered poller would otherwise spin on those bytes.
-                    setInterest(slot, readInterestAllowed(slot) ? [.read, .write] : [.write])
+                    setInterest(slot, readInterestAllowed(slot)
+                                ? [.read, .write] : lingeringRead(slot).union(.write))
                     // Partially drained still counts: a producer parked at the high
                     // water mark resumes as soon as the buffer falls below the low
                     // one, without waiting for the socket to empty completely.
@@ -894,14 +995,31 @@ public struct Worker {
             // is still finishing. Recycling the slot now would let a pipelined
             // request overwrite state the task still refers to.
             if appProtocol == .asgi && c.pointee.task != nil {
-                setInterest(slot, [])
+                setInterest(slot, lingeringRead(slot))
                 return true
             }
             finishResponse(slot)
         } else if c.pointee.state != .free {
-            setInterest(slot, readInterestAllowed(slot) ? .read : [])
+            setInterest(slot, readInterestAllowed(slot) ? .read : lingeringRead(slot))
         }
         return table[slot].pointee.state != .free
+    }
+
+    /// Read interest a request no longer needs, kept when it is already armed.
+    ///
+    /// Once an ASGI request's body is complete nothing more is read from the
+    /// connection until its response is done, and on a level-triggered poller
+    /// read interest would fire every turn for a request pipelined behind it.
+    /// But almost no client pipelines, and switching the interest off and back
+    /// on costs two epoll_ctl calls per request. So it is left armed until it
+    /// actually fires, and `handleReadable` switches it off then.
+    @inline(__always)
+    func lingeringRead(_ slot: Int) -> PollMask {
+        let c = table[slot]
+        guard appProtocol == .asgi, c.pointee.poolJob == nil, c.pointee.bodyRemaining == 0,
+              c.pointee.state == .dispatching || c.pointee.state == .writing,
+              c.pointee.interest & PollMask.read.rawValue != 0 else { return [] }
+        return .read
     }
 
     /// Whether more bytes from this peer would have anywhere to go.
@@ -932,7 +1050,7 @@ public struct Worker {
         if c.pointee.isStream { return }
         guard appProtocol == .asgi, c.pointee.state == .dispatching,
               c.pointee.poolJob == nil else { return }
-        var mask: PollMask = readInterestAllowed(slot) ? .read : []
+        var mask: PollMask = readInterestAllowed(slot) ? .read : lingeringRead(slot)
         // A producer parked on backpressure is waiting for the socket, and the
         // write side of this connection is not ours to switch off here.
         if !c.pointee.write.isEmpty || c.pointee.drainWaiter != nil {
