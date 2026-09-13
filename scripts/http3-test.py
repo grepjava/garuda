@@ -313,6 +313,47 @@ async def static_files():
     shutil.rmtree(root, ignore_errors=True)
 
 
+def udp_receive_drops():
+    """Datagrams the kernel dropped because a receive buffer was full, across
+    the whole host, or None where there is no /proc/net/snmp to ask."""
+    try:
+        with open("/proc/net/snmp") as fh:
+            rows = [line.split() for line in fh if line.startswith("Udp:")]
+        return int(rows[1][rows[0].index("RcvbufErrors")])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+async def congestion():
+    print("\nCongestion control")
+    # aioquic in Python is far slower than the server, which is exactly what
+    # makes this a test: a sender that ignores its congestion window fills the
+    # client's socket buffer and the kernel throws the overflow away. Before
+    # the window was enforced a 20MB download here lost a quarter of a million
+    # datagrams; with it, a few dozen.
+    root = tempfile.mkdtemp()
+    large = os.urandom(20_000_000)
+    with open(os.path.join(root, "big.bin"), "wb") as fh:
+        fh.write(large)
+
+    with Server("--static-dir", "/static=" + root) as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            before = udp_receive_drops()
+            status, _, body = await client.collect(
+                client.start("GET", "/static/big.bin"), timeout=120.0)
+            after = udp_receive_drops()
+            is_("a 20MB file arrives whole", (status, len(body)), (200, len(large)))
+            is_("and byte-identical", body == large, True)
+            if before is None or after is None:
+                print("  skip the sender does not overrun a slow receiver: no /proc/net/snmp")
+            else:
+                check("the sender does not overrun a slow receiver", after - before < 5000,
+                      "%d datagrams dropped for want of buffer" % (after - before))
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
 async def compression():
     print("\nCompression")
     import gzip
@@ -843,7 +884,7 @@ async def main():
         return 0
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
-    for test in (basics, health_check, static_files, compression, request_bodies, multiplexing, cancellation, rapid_reset,
+    for test in (basics, health_check, static_files, congestion, compression, request_bodies, multiplexing, cancellation, rapid_reset,
                  spoofed_address, large_headers, response_framing, flow_control, long_lived,
                  key_update, wsgi, alt_svc):
         try:

@@ -279,6 +279,23 @@ keeps its connection; a client that migrates to an address hashing to a
 *different worker* reaches one that has never heard of it, and recovers by
 making a new connection.
 
+### Sending
+
+A connection sends only while its congestion window has room; past that,
+only acknowledgements go out, plus the one or two probes a timeout allows.
+A receiver slower than the server is the normal case, not an edge case, and
+a sender that ignored the window would fill the receiver's socket buffer.
+It would then retransmit everything the kernel threw away.
+`scripts/http3-test.py` downloads 20 MB with a Python client and checks that
+the kernel dropped next to nothing.
+
+On Linux, full-size datagrams to the same client go out in runs of up to 32
+per `sendmsg`, using UDP GSO (`UDP_SEGMENT`), so a burst costs one syscall
+instead of one per datagram. If the kernel or the network device refuses
+segmentation, the worker falls back to one datagram per call for the rest
+of its life. `PEREGRINE_UDP_GSO=0` forces that fallback, for comparison or
+for a path that misbehaves with it.
+
 ### Alt-Svc
 
 A client cannot discover HTTP/3 by trying. There is no upgrade, no well-known
