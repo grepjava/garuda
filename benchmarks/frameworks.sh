@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# FastAPI (ASGI) and Flask (WSGI) on peregrine, uvicorn, granian and
-# fastpysgi, and Elysia on Bun as a reference, with the load command and applications of
-# the-benchmarker/web-frameworks at ac364e9 (master, 2026-09-11). The results
-# are not comparable with the figures that site publishes; BENCHMARKS.md says
-# why.
+# FastAPI (ASGI), Flask (WSGI) and BlackSheep (ASGI) on peregrine, uvicorn,
+# granian and fastpysgi, and Elysia on Bun as a reference, with the load command
+# and applications of the-benchmarker/web-frameworks at ac364e9 (master,
+# 2026-09-11). The results are not comparable with the figures that site
+# publishes; BENCHMARKS.md says why.
 #
 #   bash benchmarks/frameworks.sh > results.tsv
+#   FRAMEWORKS=blacksheep SERVERS=peregrine-ext bash benchmarks/frameworks.sh
+#   LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
 #
 # The load is the upstream collect command, flag for flag (.tasks/config.rake
 # line 152 at that revision; the --closed in the comment above it is not in the
@@ -18,8 +20,15 @@
 # That is an open-loop ramp from 1,000 to 100,000 requests a second over the
 # run, keep-alive on, latency corrected for coordinated omission, and the
 # figure reported is zrk's achieved_rate -- the number the results site
-# ranks by. The applications are the upstream python/fastapi and python/flask
-# sources, byte for byte (benchmarks/contract/).
+# ranks by. The applications are the upstream python/fastapi, python/flask and
+# python/blacksheep sources, byte for byte (benchmarks/contract/).
+#
+# LOAD=closed replaces the ramp with closed-loop oha, `oha -c N -z DURATION`,
+# which measures capacity instead. The ramp offers at most about 96,500 req/s
+# over a run, so a server that keeps up with it -- Elysia on Bun, or a cached
+# response -- shows that ceiling and nothing more. PIN="0:1-3" runs the server
+# on CPU 0 and the load generator on CPUs 1-3, so the two do not take turns on
+# a core; it applies to either load.
 #
 # Differences from upstream; BENCHMARKS.md lists them all:
 #   WORKERS=1  upstream starts every server with $(nproc) workers. One worker
@@ -30,19 +39,22 @@
 #              benchmark host.
 #   the rest   Python, host and some servers are whatever VENV and this machine
 #              provide; upstream is Python 3.14 on 16 CPUs, with gunicorn for
-#              Flask and raw applications, not frameworks, for fastpysgi.
+#              Flask, uvicorn for BlackSheep, and raw applications, not
+#              frameworks, for fastpysgi.
 #
 # Output, one TSV line per cell:
 #   framework server workers connections req/s p50_ms p75_ms p90_ms p99_ms errors [every run]
 #
-# Needs zrk >= 2.4 (github.com/zoxy-io/zrk) and a virtualenv with
-# fastapi flask uvicorn[standard] granian fastpysgi.
+# Needs zrk >= 2.4 (github.com/zoxy-io/zrk), or oha for LOAD=closed, and a
+# virtualenv with fastapi flask blacksheep uvicorn[standard] granian fastpysgi.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VENV=${VENV:-$HOME/fastapi-bench-venv}
 PEREGRINE=${PEREGRINE:-$HOME/pgbuild/release/peregrine}
 ZRK=${ZRK:-zrk}
+OHA=${OHA:-oha}
+LOAD=${LOAD:-ramp}
 PORT=${PORT:-3000}
 WORKERS=${WORKERS:-1}
 CONNS=${CONNS:-"64 256 512"}
@@ -54,6 +66,14 @@ SERVERS=${SERVERS:-"peregrine-ext peregrine uvicorn granian fastpysgi"}
 # (benchmarks/elysia-bun/, byte for byte) as a non-Python reference. The app
 # listens on 3000 itself, so PORT must be 3000. Needs bun on PATH or in ~/.bun.
 BUN=${BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}
+# "server_cpus:load_cpus" for taskset, e.g. 0:1-3; empty runs both unpinned.
+PIN=${PIN:-}
+PIN_SERVER=()
+PIN_LOAD=()
+if [ -n "$PIN" ]; then
+    PIN_SERVER=(taskset -c "${PIN%%:*}")
+    PIN_LOAD=(taskset -c "${PIN#*:}")
+fi
 # The applications. benchmarks/cached is the same pair marking their responses
 # fresh, for measuring --cache-size.
 CONTRACT=${CONTRACT:-$ROOT/benchmarks/contract}
@@ -79,19 +99,20 @@ server_require_port_free "$PORT" || exit 1
 start() {
     local server=$1 framework=$2 app interface
     case "$framework" in
-    fastapi) app=fastapi_app:app; interface=asgi ;;
-    flask)   app=flask_app:app;   interface=wsgi ;;
+    fastapi)    app=fastapi_app:app;    interface=asgi ;;
+    flask)      app=flask_app:app;      interface=wsgi ;;
+    blacksheep) app=blacksheep_app:app; interface=asgi ;;
     esac
     case "$server" in
     peregrine)
-        server_start "$PEREGRINE" --log-level error --protocol "$interface" \
+        server_start "${PIN_SERVER[@]}" "$PEREGRINE" --log-level error --protocol "$interface" \
             --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${PEREGRINE_ARGS[@]}" \
             --venv "$VENV" --python-path "$CONTRACT" "$app" ;;
     peregrine-ext)
         # The same server as an extension module, run by the virtualenv python:
         # peregrine._native, from scripts/build-extension.sh -- what a wheel
         # installs, measured beside the executable above.
-        PYTHONPATH="$EXT_ROOT/python:$PYTHONPATH" server_start "$VENV/bin/python" -m peregrine \
+        PYTHONPATH="$EXT_ROOT/python:$PYTHONPATH" server_start "${PIN_SERVER[@]}" "$VENV/bin/python" -m peregrine \
             --log-level error --protocol "$interface" \
             --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${PEREGRINE_ARGS[@]}" \
             --venv "$VENV" --python-path "$CONTRACT" "$app" ;;
@@ -101,17 +122,17 @@ start() {
         # adapter, since upstream has no uvicorn engine for Flask.
         local uv_interface=$interface
         [ "$interface" = asgi ] && uv_interface=asgi3
-        server_start "$VENV/bin/uvicorn" --log-level critical --interface "$uv_interface" \
+        server_start "${PIN_SERVER[@]}" "$VENV/bin/uvicorn" --log-level critical --interface "$uv_interface" \
             --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "$app" ;;
     granian)
-        server_start "$VENV/bin/granian" --log-level critical --interface "$interface" \
+        server_start "${PIN_SERVER[@]}" "$VENV/bin/granian" --log-level critical --interface "$interface" \
             --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "$app" ;;
     fastpysgi)
         # The suite's fastpysgi-asgi and fastpysgi-wsgi entries start the server
         # from server.py with fastpysgi.run(app, host, port, workers=N), which
         # tells ASGI from WSGI by itself. The same call serves the FastAPI and
         # Flask applications here.
-        server_start "$VENV/bin/python" -c \
+        server_start "${PIN_SERVER[@]}" "$VENV/bin/python" -c \
             'import importlib, sys, fastpysgi
 module, attr = sys.argv[1].split(":")
 app = getattr(importlib.import_module(module), attr)
@@ -125,9 +146,9 @@ fastpysgi.run(app, sys.argv[2], int(sys.argv[3]), workers=int(sys.argv[4]))' \
         cd "$ROOT/benchmarks/elysia-bun" || return 1
         [ -d node_modules/elysia ] || "$BUN" install --production || { cd "$ROOT"; return 1; }
         if [ "$WORKERS" = 1 ]; then
-            NODE_ENV=production server_start "$BUN" ./app.ts
+            NODE_ENV=production server_start "${PIN_SERVER[@]}" "$BUN" ./app.ts
         else
-            NODE_ENV=production PATH="$(dirname "$BUN"):$PATH" server_start "$BUN" run cluster.ts
+            NODE_ENV=production PATH="$(dirname "$BUN"):$PATH" server_start "${PIN_SERVER[@]}" "$BUN" run cluster.ts
         fi
         cd "$ROOT" ;;
     esac > "$OUT/$server-$framework.log" 2>&1
@@ -138,11 +159,42 @@ fastpysgi.run(app, sys.argv[2], int(sys.argv[3]), workers=int(sys.argv[4]))' \
     return 1
 }
 
+warm_up() {
+    if [ "$LOAD" = closed ]; then
+        "${PIN_LOAD[@]}" "$OHA" -z 5s -c 50 --no-tui "$URL" > /dev/null 2>&1
+    else
+        "${PIN_LOAD[@]}" "$ZRK" -c 50 -d 5s --plain "$URL" > /dev/null 2>&1
+    fi
+}
+
 # One run at $1 connections: "req/s p50 p75 p90 p99 errors", latencies in ms.
 one_run() {
     local json="$OUT/run.json"
     rm -f "$json"
-    "$ZRK" --plain -c "$1" -d "$DURATION" -m GET --format json --output "$json" \
+    if [ "$LOAD" = closed ]; then
+        "${PIN_LOAD[@]}" "$OHA" -z "$DURATION" -c "$1" --no-tui --output-format json \
+            -o "$json" "$URL" > /dev/null 2>&1
+        python3 - "$json" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("0 0 0 0 0 -1")
+    raise SystemExit
+pct = d.get("latencyPercentiles") or {}
+codes = d.get("statusCodeDistribution") or {}
+errors = sum(int(v) for k, v in codes.items() if not k.startswith("2"))
+# oha stops a timed run with one request in flight per connection and counts
+# those as "aborted due to deadline"; they are the run ending, not the server.
+errors += sum(int(v) for k, v in (d.get("errorDistribution") or {}).items()
+              if k != "aborted due to deadline")
+ms = lambda key: (pct.get(key) or 0) * 1000.0
+print("%.0f %.3f %.3f %.3f %.3f %d" % (d["summary"]["requestsPerSec"], ms("p50"), ms("p75"),
+                                       ms("p90"), ms("p99"), errors))
+PY
+        return
+    fi
+    "${PIN_LOAD[@]}" "$ZRK" --plain -c "$1" -d "$DURATION" -m GET --format json --output "$json" \
         -R1000:100000 --interval 1s --timeout 8s --latency "$URL" > /dev/null 2>&1
     python3 - "$json" <<'PY'
 import json, sys
@@ -171,7 +223,7 @@ for framework in $FRAMEWORKS; do
             tail -5 "$OUT/$server-$framework.log"
             continue
         fi
-        "$ZRK" -c 50 -d 5s --plain "$URL" > /dev/null 2>&1
+        warm_up
         for c in $CONNS; do
             runs=""
             for _ in $(seq 1 "$RUNS"); do
