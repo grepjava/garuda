@@ -9,7 +9,8 @@
 // interoperability or security failure if it is not:
 //   * a client frame must be masked, and a server frame must not be;
 //   * a control frame is at most 125 bytes and is never fragmented;
-//   * reserved bits must be clear, since no extension has been negotiated;
+//   * RSV2 and RSV3 must be clear, and RSV1 too unless permessage-deflate was
+//     negotiated -- and even then only on the first frame of a data message;
 //   * an unknown opcode is a protocol error rather than something to skip;
 //   * a continuation frame without a message in progress, or a new data frame
 //     while one is in progress, is a protocol error.
@@ -60,6 +61,8 @@ public enum WSCloseCode {
 
 public struct WSFrameHeader {
     public var fin = false
+    /// permessage-deflate: this message is compressed.
+    public var rsv1 = false
     public var opcode: WSOpcode = .continuation
     public var masked = false
     public var payloadLength = 0
@@ -88,15 +91,24 @@ public enum WebSocketCodec {
     /// Parses a frame header. The payload is not required to be present yet:
     /// the caller compares `totalLength` against what it has buffered.
     public static func parseHeader(_ base: UnsafePointer<UInt8>, _ count: Int,
-                                   maxPayload: Int) -> WSDecodeResult {
+                                   maxPayload: Int,
+                                   allowRSV1: Bool = false) -> WSDecodeResult {
         if count < 2 { return .needMore }
         var head = WSFrameHeader()
         let b0 = base[0]
         let b1 = base[1]
 
-        // No extension has been negotiated, so RSV1..3 must be zero.
-        if b0 & 0x70 != 0 { return .failure(.protocolError) }
+        // Nothing this server negotiates uses RSV2 or RSV3.
+        if b0 & 0x30 != 0 { return .failure(.protocolError) }
+        let rsv1 = b0 & 0x40 != 0
+        if rsv1 && !allowRSV1 { return .failure(.protocolError) }
         guard let opcode = WSOpcode(b0 & 0x0F) else { return .failure(.protocolError) }
+        // permessage-deflate marks a message on its first frame, so RSV1 on a
+        // control frame or a continuation means nothing and is refused.
+        if rsv1 && (opcode.isControl || opcode == .continuation) {
+            return .failure(.protocolError)
+        }
+        head.rsv1 = rsv1
         head.fin = (b0 & 0x80) != 0
         head.opcode = opcode
         head.masked = (b1 & 0x80) != 0
@@ -164,10 +176,11 @@ public enum WebSocketCodec {
     public static func writeFrame(_ buf: inout ByteBuffer,
                                   opcode: WSOpcode,
                                   fin: Bool,
+                                  rsv1: Bool = false,
                                   payload: UnsafePointer<UInt8>?,
                                   length: Int) {
         buf.reserve(length &+ 10)
-        buf.writeByte((fin ? 0x80 : 0x00) | opcode.rawValue)
+        buf.writeByte((fin ? 0x80 : 0x00) | (rsv1 ? 0x40 : 0x00) | opcode.rawValue)
         if length < 126 {
             buf.writeByte(UInt8(length))
         } else if length <= 0xFFFF {

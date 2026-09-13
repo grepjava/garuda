@@ -113,6 +113,27 @@ that has gone away silently), `--ws-max-queue` and `--ws-max-queue-bytes` for
 how much a slow application may buffer. `--no-websockets` refuses upgrades
 with 501.
 
+`--ws-compress` negotiates permessage-deflate (RFC 7692) with any client that
+offers it, which every browser does. Messages are compressed and decompressed
+in the server, and the application still sends and receives plain `str` and
+`bytes`. Chat, tickers and dashboards send many small messages that look alike,
+and they compress well because the compression context carries from one
+message to the next.
+
+- **What it costs:** memory for each connection that actually uses it. The
+  server compresses with a 4 KiB window and a small zlib memory level, about
+  40 KiB per connection. It also asks the browser to use a 4 KiB window for the
+  messages it sends. Nothing is allocated until the first compressed message.
+  Messages under 64 bytes are sent as they are.
+- **What it refuses:** a message is decompressed only up to `--ws-max-message`.
+  A few kilobytes that would inflate past it close the connection with 1009,
+  and data that is not deflate at all closes it with 1007. A client may still
+  send uncompressed messages, and those work as before.
+- **What to watch for:** as with `--compress` for HTTP, compressing over TLS a
+  message that mixes a secret with text the other side controls lets an
+  attacker who can watch message sizes learn the secret. It is off by default
+  for that reason, and because it costs CPU.
+
 WebSocket runs over HTTP/1.1 here. It is not carried over HTTP/2 or HTTP/3 —
 see [what is not](README.md#what-is-not).
 

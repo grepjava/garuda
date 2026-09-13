@@ -278,6 +278,7 @@ peregrine [options] MODULE:ATTRIBUTE
   --ws-ping-timeout MS     how long an unanswered ping may go (20000)
   --ws-max-queue N         messages buffered for a slow app (default 32)
   --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
+  --ws-compress            permessage-deflate for clients that offer it
   --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
                            without calling the application (repeatable)
   --acme-domain NAME       get and renew a certificate from Let's Encrypt,

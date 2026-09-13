@@ -215,6 +215,11 @@ public struct ServerConfig {
     /// promptly, so data messages need somewhere to wait; when the queue fills,
     /// the read side is switched off and the peer feels it as TCP backpressure.
     public var maxWebsocketQueue = 32
+    /// Negotiate permessage-deflate (RFC 7692) with clients that offer it.
+    /// Off by default: it costs memory per connection and CPU per message,
+    /// and like any compression over TLS it can leak a secret that shares a
+    /// message with something the peer controls.
+    public var wsCompress = false
     public var maxWebsocketQueueBytes = 4 * 1024 * 1024
 
     // --- compression ---

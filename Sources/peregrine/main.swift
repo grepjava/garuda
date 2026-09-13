@@ -156,6 +156,8 @@ func printUsage() {
       --ws-ping-timeout MS     how long an unanswered ping may go (20000)
       --ws-max-queue N         messages buffered for a slow app (default 32)
       --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
+      --ws-compress            negotiate permessage-deflate with WebSocket
+                               clients that offer it
       --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
                                without calling the application (repeatable).
                                A path with no file behind it still reaches
@@ -459,6 +461,8 @@ while i < argc {
     } else if matches(arg, "--ws-max-queue-bytes") {
         guard let v = next("--ws-max-queue-bytes needs a byte count") else { break }
         config.maxWebsocketQueueBytes = max(1024, parseInt(v))
+    } else if matches(arg, "--ws-compress") {
+        config.wsCompress = true
     } else if matches(arg, "--python-path") {
         guard let v = next("--python-path needs a directory") else { break }
         config.pythonPaths.append(v)

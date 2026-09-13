@@ -228,6 +228,12 @@ public struct ByteBuffer {
     @inlinable
     public mutating func advanceWriter(_ n: Int) { writerIndex &+= n }
 
+    /// Keeps only the first `length` readable bytes.
+    @inlinable
+    public mutating func truncate(to length: Int) {
+        writerIndex = readerIndex &+ max(0, min(length, readableBytes))
+    }
+
     /// Reserves `n` bytes and hands back the destination so a caller can write
     /// straight into the buffer (read(2), memcpy from Python) with no staging.
     @inlinable

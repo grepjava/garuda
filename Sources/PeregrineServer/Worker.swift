@@ -1388,6 +1388,9 @@ public struct Worker {
         if let p = c.pointee.remotePortObj { pg_decref(p); c.pointee.remotePortObj = nil }
         if let t = c.pointee.clientTuple { pg_decref(t); c.pointee.clientTuple = nil }
         if let k = c.pointee.ws.acceptKey { k.deallocate(); c.pointee.ws.acceptKey = nil }
+        if let z = c.pointee.ws.deflater { pg_ws_deflate_free(z); c.pointee.ws.deflater = nil }
+        if let z = c.pointee.ws.inflater { pg_ws_inflate_free(z); c.pointee.ws.inflater = nil }
+        c.pointee.ws.deflate = nil
         if !c.pointee.ws.queue.isEmpty {
             for message in c.pointee.ws.queue { pg_decref(message) }
             c.pointee.ws.queue.removeAll(keepingCapacity: false)

@@ -68,6 +68,16 @@ public struct WebSocketState {
     /// not guaranteed to still be intact by then.
     public var acceptKey: UnsafeMutablePointer<UInt8>? = nil
 
+    /// --ws-compress: what was agreed, or nil when nothing was. Settled from
+    /// the request head at dispatch, answered in the 101.
+    public var deflate: WSDeflateAgreement? = nil
+    /// zlib contexts, made on first use rather than at the handshake: a
+    /// connection that never sends a compressed message never pays for one.
+    public var deflater: UnsafeMutableRawPointer? = nil
+    public var inflater: UnsafeMutableRawPointer? = nil
+    /// The message being assembled arrived compressed.
+    public var messageCompressed = false
+
     public init() {}
 }
 
@@ -166,6 +176,22 @@ extension Worker {
         return list
     }
 
+    /// The permessage-deflate offer this server accepts, if any.
+    func websocketDeflateOffer(_ slot: Int, base: UnsafePointer<UInt8>) -> WSDeflateAgreement? {
+        let head = table[slot].pointee.head
+        var values: [ByteSpan] = []
+        var i = 0
+        while i < head.headerCount {
+            let h = headers[i]
+            i += 1
+            guard h.name.length == 24,
+                  equalsLowercased(base + Int(h.name.offset), 24, "sec-websocket-extensions")
+            else { continue }
+            values.append(h.value.span(in: base))
+        }
+        return values.isEmpty ? nil : WSDeflate.negotiate(values)
+    }
+
     /// Computes the 28-character Sec-WebSocket-Accept value.
     func computeAcceptKey(_ key: ByteSpan, into out: UnsafeMutablePointer<UInt8>) {
         // key (24 for a well-formed client) + the 36-byte GUID.
@@ -218,6 +244,7 @@ extension Worker {
         let accept = UnsafeMutablePointer<UInt8>.allocate(capacity: 28)
         computeAcceptKey(key, into: accept)
         c.pointee.ws.acceptKey = accept
+        if config.wsCompress { c.pointee.ws.deflate = websocketDeflateOffer(slot, base: base) }
         c.pointee.flags.insert(.websocketMode)
         // A websocket is never keep-alive in the HTTP sense: the connection
         // either becomes a websocket or ends.
@@ -377,7 +404,8 @@ extension Worker {
             if available == 0 { break }
             let base = UnsafePointer(c.pointee.read.readPointer)
 
-            let parsed = WebSocketCodec.parseHeader(base, available, maxPayload: limit)
+            let parsed = WebSocketCodec.parseHeader(base, available, maxPayload: limit,
+                                                    allowRSV1: c.pointee.ws.deflate != nil)
             let header: WSFrameHeader
             switch parsed {
             case .needMore:
@@ -438,10 +466,13 @@ extension Worker {
             }
             c.pointee.ws.assembling = true
             c.pointee.ws.messageOpcode = header.opcode.rawValue
+            c.pointee.ws.messageCompressed = header.rsv1
             c.pointee.ws.validator = UTF8Validator()
             c.pointee.body.clear()
         }
 
+        // For a compressed message this bounds the compressed bytes; what they
+        // inflate to is bounded again, against the same limit, as they inflate.
         if c.pointee.body.readableBytes + n > limit {
             failWebSocket(slot, code: WSCloseCode.messageTooBig)
             return false
@@ -450,7 +481,10 @@ extension Worker {
         if n > 0 {
             c.pointee.body.reserve(n)
             WebSocketCodec.unmask(c.pointee.body.writePointer, payload, n, header.mask)
-            if c.pointee.ws.messageOpcode == WSOpcode.text.rawValue {
+            // Compressed bytes are not text; the message is checked once
+            // inflated.
+            if c.pointee.ws.messageOpcode == WSOpcode.text.rawValue
+                && !c.pointee.ws.messageCompressed {
                 if !c.pointee.ws.validator.feed(UnsafePointer(c.pointee.body.writePointer), n) {
                     failWebSocket(slot, code: WSCloseCode.invalidPayload)
                     return false
@@ -464,20 +498,100 @@ extension Worker {
 
         c.pointee.ws.assembling = false
         let isText = c.pointee.ws.messageOpcode == WSOpcode.text.rawValue
+
+        if c.pointee.ws.messageCompressed {
+            var inflated = ByteBuffer()
+            defer { inflated.destroy() }
+            let status = inflateMessage(slot, into: &inflated, limit: limit)
+            if status != 0 {
+                failWebSocket(slot, code: status)
+                return false
+            }
+            if isText {
+                var validator = UTF8Validator()
+                let n = inflated.readableBytes
+                if n > 0 && (!validator.feed(UnsafePointer(inflated.readPointer), n)
+                             || !validator.isComplete) {
+                    failWebSocket(slot, code: WSCloseCode.invalidPayload)
+                    return false
+                }
+            }
+            queueWebSocketMessage(slot, inflated, text: isText)
+            c.pointee.body.clear()
+            return true
+        }
+
         if isText && !c.pointee.ws.validator.isComplete {
             failWebSocket(slot, code: WSCloseCode.invalidPayload)
             return false
         }
-        let count = c.pointee.body.readableBytes
-        let bodyPtr = count > 0 ? UnsafePointer(c.pointee.body.readPointer) : nil
-        if let message = ASGIWebSocketMessage.receive(bytes: bodyPtr, count: count, text: isText) {
+        queueWebSocketMessage(slot, c.pointee.body, text: isText)
+        c.pointee.body.clear()
+        return true
+    }
+
+    private mutating func queueWebSocketMessage(_ slot: Int, _ payload: ByteBuffer, text: Bool) {
+        let c = table[slot]
+        let count = payload.readableBytes
+        let bytes = count > 0 ? UnsafePointer(payload.readPointer) : nil
+        if let message = ASGIWebSocketMessage.receive(bytes: bytes, count: count, text: text) {
             c.pointee.ws.queue.append(message)
             c.pointee.ws.queuedBytes += count + 64
         } else {
             PyError.logPending("building a websocket message")
         }
-        c.pointee.body.clear()
-        return true
+    }
+
+    /// Inflates the compressed message in `body` into `out`. Returns 0, or the
+    /// close code to fail the connection with: 1009 when it inflates past the
+    /// message limit -- a few kilobytes of zeros can claim gigabytes -- 1007
+    /// when it is not deflate at all, 1011 when there is no memory for zlib.
+    private mutating func inflateMessage(_ slot: Int, into out: inout ByteBuffer,
+                                         limit: Int) -> UInt16 {
+        let c = table[slot]
+        guard let agreement = c.pointee.ws.deflate else { return WSCloseCode.protocolError }
+        if c.pointee.ws.inflater == nil {
+            c.pointee.ws.inflater = pg_ws_inflate_new(agreement.inflateWindowBits)
+        }
+        guard let z = c.pointee.ws.inflater else { return WSCloseCode.internalError }
+
+        // The sender strips the empty block that ends a sync flush.
+        c.pointee.body.reserve(4)
+        let tail: (UInt8, UInt8, UInt8, UInt8) = (0x00, 0x00, 0xFF, 0xFF)
+        var tailCopy = tail
+        withUnsafeBytes(of: &tailCopy) { raw in
+            c.pointee.body.write(raw.baseAddress!.assumingMemoryBound(to: UInt8.self), 4)
+        }
+
+        var input = UnsafePointer(c.pointee.body.readPointer)
+        var remaining = c.pointee.body.readableBytes
+        var ended = false
+        while true {
+            if out.readableBytes > limit { return WSCloseCode.messageTooBig }
+            out.reserve(min(max(remaining * 4, 4096), 1 << 20))
+            let room = min(out.writableBytes, limit + 1 - out.readableBytes)
+            var consumed = 0
+            var produced = 0
+            let rc = pg_ws_inflate_run(z, input, remaining, out.writePointer, room,
+                                       &consumed, &produced)
+            input += consumed
+            remaining -= consumed
+            out.advanceWriter(produced)
+            if rc < 0 { return WSCloseCode.invalidPayload }
+            if out.readableBytes > limit { return WSCloseCode.messageTooBig }
+            if rc == 2 {
+                // The client ended its deflate stream; what follows is at most
+                // the tail put back above.
+                ended = true
+                break
+            }
+            if remaining == 0 && rc == 0 { break }
+            if consumed == 0 && produced == 0 && rc == 0 { return WSCloseCode.invalidPayload }
+        }
+        if ended || agreement.clientNoContextTakeover {
+            if pg_ws_inflate_reset(z) != 0 { return WSCloseCode.internalError }
+        }
+        return 0
     }
 
     /// Stops reading while the application is behind, and resumes when it
@@ -639,6 +753,12 @@ extension Worker {
             }
         }
 
+        if let agreement = c.pointee.ws.deflate {
+            out.write("Sec-WebSocket-Extensions: ")
+            agreement.writeResponse(into: &out)
+            out.writeCRLF()
+        }
+
         // Extra headers are allowed on the handshake response and are the only
         // way an application can set a cookie on a websocket.
         if let extra = pg_dict_get(message, Interned[.headers]),
@@ -656,8 +776,11 @@ extension Worker {
                     continue
                 }
                 let kind = HTTPResponseWriter.classify(nameView.span)
-                // The server owns the handshake headers themselves.
-                if kind.isEmpty {
+                // The server owns the handshake headers themselves, extensions
+                // included: only it knows what it agreed to.
+                let isExtensions = nameView.count == 24
+                    && equalsLowercased(nameView.base, 24, "sec-websocket-extensions")
+                if kind.isEmpty && !isExtensions {
                     _ = HTTPResponseWriter.writeHeader(&out,
                                                        name: nameView.span,
                                                        value: valueView.span)
@@ -710,12 +833,67 @@ extension Worker {
         }
         defer { view.release() }
 
+        if let agreement = c.pointee.ws.deflate, view.count >= WSDeflate.minimumMessage {
+            if c.pointee.ws.deflater == nil {
+                c.pointee.ws.deflater = pg_ws_deflate_new(agreement.deflateWindowBits,
+                                                          WSDeflate.memoryLevel)
+            }
+            // Without a compressor the message simply goes out as it is: the
+            // extension lets any message be sent uncompressed.
+            if let z = c.pointee.ws.deflater {
+                var compressed = ByteBuffer()
+                defer { compressed.destroy() }
+                if deflateMessage(z, view.base, view.count, into: &compressed) {
+                    var out = c.pointee.write
+                    WebSocketCodec.writeFrame(&out, opcode: opcode, fin: true, rsv1: true,
+                                              payload: UnsafePointer(compressed.readPointer),
+                                              length: compressed.readableBytes)
+                    c.pointee.write = out
+                    if agreement.serverNoContextTakeover { _ = pg_ws_deflate_reset(z) }
+                    _ = flush(slot)
+                    return true
+                }
+                // The context is in an unknown state now, and the client's
+                // copy of it would no longer match: nothing more can be sent
+                // compressed or uncompressed that it would read correctly.
+                failWebSocket(slot, code: WSCloseCode.internalError)
+                return true
+            }
+        }
+
         var out = c.pointee.write
         WebSocketCodec.writeFrame(&out, opcode: opcode, fin: true,
                                   payload: view.count > 0 ? view.base : nil,
                                   length: view.count)
         c.pointee.write = out
         _ = flush(slot)
+        return true
+    }
+
+    /// One message, compressed with a sync flush and without the empty block
+    /// that ends it, which the receiver puts back.
+    private func deflateMessage(_ z: UnsafeMutableRawPointer, _ p: UnsafePointer<UInt8>, _ n: Int,
+                                into out: inout ByteBuffer) -> Bool {
+        var input = p
+        var remaining = n
+        while true {
+            out.reserve(max(1024, remaining / 2 + 64))
+            var consumed = 0
+            var produced = 0
+            let rc = pg_ws_deflate_run(z, input, remaining, out.writePointer, out.writableBytes,
+                                       &consumed, &produced)
+            input += consumed
+            remaining -= consumed
+            out.advanceWriter(produced)
+            if rc < 0 { return false }
+            if rc == 0 && remaining == 0 { break }
+            if rc == 0 && consumed == 0 && produced == 0 { return false }
+        }
+        let length = out.readableBytes
+        guard length >= 4 else { return false }
+        let tail = out.readPointer + length - 4
+        guard tail[0] == 0x00, tail[1] == 0x00, tail[2] == 0xFF, tail[3] == 0xFF else { return false }
+        out.truncate(to: length - 4)
         return true
     }
 
