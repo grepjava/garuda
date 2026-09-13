@@ -355,7 +355,7 @@ peregrine \
 ```
 
 Add `--wsgi-threads 8` for a WSGI application that waits on I/O. Leave
-`--reload` for development only — it polls the source tree.
+`--reload` for development only — it watches and rescans the source tree.
 
 `SIGHUP` reloads the certificate without dropping a connection, so this wants a
 certbot deploy hook rather than a restart; see
@@ -566,6 +566,12 @@ them.
 
 `--reload` uses the same mechanism when it sees a source file change, so a save
 during development costs no more than a certificate renewal does in production.
+
+It watches the source tree with inotify on Linux and kqueue on macOS, so a save
+is noticed within a few tens of milliseconds. It also rescans every
+`--reload-interval` milliseconds (500 by default), which catches the changes the
+kernel does not report: files on a bind mount, a network filesystem or a Windows
+drive under WSL, and on macOS a file written in place rather than replaced.
 
 A reload restarts workers; it does not re-read the command line. Changing a
 flag still means restarting the server.

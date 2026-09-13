@@ -26,6 +26,13 @@ version reached PyPI, in UTC.
   span ID, recorded in the access log. Never generated, and never changed on
   its way to the application.
 
+### Changed
+
+- `--reload` notices a save within a few tens of milliseconds, woken by
+  inotify on Linux and kqueue on macOS instead of waiting for the next scan.
+  The scan every `--reload-interval` stays, for filesystems that send no
+  notification.
+
 ### Documentation
 
 - `RELEASE.md` records what changed in every version, linked from the README.

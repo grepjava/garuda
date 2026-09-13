@@ -23,6 +23,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import signal
 import socket
 import ssl
@@ -1842,6 +1843,47 @@ def test_reload():
             os.unlink(scratch)
 
 
+def test_reload_notified():
+    print("\nDevelopment reload, woken by the kernel")
+    # A tree on a local filesystem, because a bind mount or a Windows drive
+    # under WSL may never send a notification, and an interval long enough
+    # that a reload arriving quickly can only have been woken, not polled.
+    project = tempfile.mkdtemp(prefix="pg-reload-", dir=os.path.expanduser("~"))
+    module = os.path.join(project, "reload_probe.py")
+    with open(module, "w") as fh:
+        fh.write("MARK = 1\n")
+    port = free_port()
+    server = Server("--reload", "--reload-interval", "10000", "--python-path", project,
+                    port=port)
+    try:
+        before = server.get("/pid")[2].decode().strip()
+        time.sleep(0.5)
+        # Saved the way most editors save: a new file renamed over the old one.
+        temporary = module + ".swp"
+        with open(temporary, "w") as fh:
+            fh.write("MARK = 2\n")
+        os.replace(temporary, module)
+        began = time.monotonic()
+        after = before
+        while time.monotonic() - began < 8.0:
+            time.sleep(0.1)
+            try:
+                status, _, body = server.get("/pid", timeout=5)
+            except OSError:
+                continue
+            if status == 200:
+                after = body.decode().strip()
+                if after != before:
+                    break
+        elapsed = time.monotonic() - began
+        check("a save reloads well inside a 10 s --reload-interval",
+              after != before and elapsed < 5.0,
+              "pid %s -> %s after %.1fs" % (before, after, elapsed))
+    finally:
+        server.stop()
+        shutil.rmtree(project, ignore_errors=True)
+
+
 def free_threaded_build():
     """True when this binary is linked against a CPython without the GIL."""
     out = subprocess.run([BIN, "--version"], stdout=subprocess.PIPE,
@@ -2026,7 +2068,8 @@ def main():
                  test_wsgi_declared_length, test_wsgi_lazy_start_response,
                  test_metrics, test_body_limit,
                  test_forwarded, test_multiworker_unix,
-                 test_worker_restart, test_reload, test_graceful_shutdown,
+                 test_worker_restart, test_reload, test_reload_notified,
+                 test_graceful_shutdown,
                  test_shutdown_is_bounded, test_free_threaded):
         try:
             test()

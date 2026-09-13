@@ -571,12 +571,17 @@ public enum Peregrine {
             // A pending handover is the one thing this loop waits on that is
             // not a signal, and the wait is measured in the tens of
             // milliseconds an interpreter takes to boot, so the idle quarter
-            // second would be most of the delay it exists to remove.
-            let waitMs: Int32 = handoverReadyFD >= 0 ? 5 : 250
+            // second would be most of the delay it exists to remove. The same
+            // goes for a --reload notification waiting for a save to settle.
+            let waitMs: Int32 = handoverReadyFD >= 0 || watcher?.checkSoon == true ? 5 : 250
+            // The reload watcher's descriptor wakes the loop the moment a
+            // source file changes. Not while shutting down: nothing drains it
+            // then, and a readable descriptor nobody reads would spin here.
+            let watchFD: Int32 = shuttingDown ? -1 : (watcher?.notifyFD ?? -1)
             var buf = (UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0))
             let n = withUnsafeMutableBytes(of: &buf) { raw -> Int in
-                let r = pg_poll_single(signalFD, 0, waitMs)
-                if r <= 0 { return 0 }
+                let r = pg_poll_either(signalFD, watchFD, waitMs)
+                if r <= 0 || r & 1 == 0 { return 0 }
                 return pg_read(signalFD, raw.baseAddress!, 8)
             }
 
