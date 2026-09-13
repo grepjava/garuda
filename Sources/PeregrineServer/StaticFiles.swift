@@ -11,8 +11,11 @@
 // Two transports cannot take that path and fall back to reading the file into
 // the write buffer:
 //
-//   * TLS, because the bytes have to be encrypted, and the kernel has no idea
-//     how. (Linux kTLS could, and is not worth the configuration surface.)
+//   * TLS, because the bytes have to be encrypted -- unless --ktls has the
+//     Linux kernel do it, and then SSL_sendfile hands the file to the kernel
+//     the same way. Measured on one worker (benchmarks/static_files.sh), that
+//     took HTTPS from 1485 to 2172 MiB/s on 1 MiB files and from 1384 to
+//     2206 on 16 MiB, at about a third less CPU per GiB.
 //   * HTTP/2 and HTTP/3, because the bytes have to be framed and multiplexed
 //     with everything else on the connection.
 //
@@ -58,8 +61,33 @@ extension Worker {
     mutating func pumpFile(_ slot: Int) -> FilePump {
         let c = table[slot]
 
-        // Over TLS the bytes have to be encrypted, which the kernel cannot do
-        // for us, so they come through the buffer a block at a time.
+        // Over kernel TLS the kernel encrypts, so the file can go from the
+        // page cache to the socket just as it does in the clear.
+        if let tls = c.pointee.tls, pg_tls_ktls_send(tls) != 0 {
+            while c.pointee.fileRemaining > 0 {
+                let n = pg_tls_sendfile(tls, c.pointee.fileFD, c.pointee.fileOffset,
+                                        c.pointee.fileRemaining)
+                if n > 0 {
+                    c.pointee.fileOffset += n
+                    c.pointee.fileRemaining -= n
+                    continue
+                }
+                let e = pg_errno()
+                if pg_err_is_intr(e) != 0 { continue }
+                if pg_err_is_again(e) != 0 {
+                    setInterest(slot, readInterestAllowed(slot) ? [.read, .write] : [.write])
+                    return .again
+                }
+                finishFile(slot)
+                closeConnection(slot)
+                return .closed
+            }
+            finishFile(slot)
+            return .done
+        }
+
+        // Over TLS otherwise the bytes have to be encrypted here, so they come
+        // through the buffer a block at a time.
         if c.pointee.tls != nil {
             let want = min(c.pointee.fileRemaining, config.readBufferSize)
             c.pointee.write.reserve(want)

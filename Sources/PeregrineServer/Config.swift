@@ -327,6 +327,9 @@ public struct ServerConfig {
     /// to and the span that sent it -- in the access log. Never generated, and
     /// never changed on its way to the application.
     public var traceContext = false
+    /// --ktls: have the kernel encrypt TLS where it can, so a --static-dir file
+    /// goes out with sendfile over HTTPS as it does in the clear.
+    public var ktls = false
     public var logLevel: LogLevel = .info
     public var accessLog = false
     /// Emit the access log as one JSON object per line, for a collector that

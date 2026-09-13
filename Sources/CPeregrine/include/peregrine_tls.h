@@ -59,6 +59,23 @@ int pg_tls_handshake(pg_tls *tls, char *err, size_t err_len);
 long pg_tls_read(pg_tls *tls, void *buf, long n);
 long pg_tls_write(pg_tls *tls, const void *buf, long n);
 
+/* --ktls: ask for kernel TLS on every context built after this call. Returns
+ * 1 when this OpenSSL can do it at all, 0 when the request is ignored. */
+int pg_tls_enable_ktls(int on);
+
+/* 1 when the kernel's tls module is loaded, without which no session gets
+ * kernel TLS whatever OpenSSL is asked. */
+int pg_tls_kernel_ready(void);
+
+/* 1 when the kernel encrypts what this session sends (kernel TLS), which is
+ * what lets a file go from the page cache to the socket without being copied
+ * through here. */
+int pg_tls_ktls_send(pg_tls *tls);
+
+/* SSL_sendfile: `n` bytes of `fd` starting at `offset`, encrypted by the
+ * kernel. Shaped like pg_tls_write. Only when pg_tls_ktls_send says 1. */
+long pg_tls_sendfile(pg_tls *tls, int fd, long offset, long n);
+
 /* Decrypted bytes OpenSSL is holding that the socket no longer has. A
  * level-triggered poller will not mention these, so anything that reads has to
  * keep asking until this is zero. */

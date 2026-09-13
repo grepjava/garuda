@@ -99,6 +99,17 @@ public enum Peregrine {
                 Log.error("this build has no TLS support; rebuild against OpenSSL")
                 return 1
             }
+            // --ktls, before any context is built: the option is read when each
+            // one is, here and in every worker after the fork.
+            if config.ktls {
+                if pg_tls_enable_ktls(1) == 0 {
+                    Log.warn("--ktls: this OpenSSL has no kernel TLS; encrypting in the process")
+                } else if pg_tls_kernel_ready() == 0 {
+                    Log.warn("--ktls: the kernel tls module is not loaded (modprobe tls); encrypting in the process")
+                } else {
+                    Log.info("kernel TLS requested (--ktls)")
+                }
+            }
             guard let context = makeTLSContext(config) else { return 1 }
             context.logCertificateNames()
         }

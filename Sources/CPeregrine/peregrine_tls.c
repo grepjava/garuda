@@ -64,6 +64,12 @@ long pg_tls_read(pg_tls *tls, void *buf, long n) {
 long pg_tls_write(pg_tls *tls, const void *buf, long n) {
     (void)tls; (void)buf; (void)n; errno = EPIPE; return -1;
 }
+int pg_tls_enable_ktls(int on) { (void)on; return 0; }
+int pg_tls_kernel_ready(void) { return 0; }
+int pg_tls_ktls_send(pg_tls *tls) { (void)tls; return 0; }
+long pg_tls_sendfile(pg_tls *tls, int fd, long offset, long n) {
+    (void)tls; (void)fd; (void)offset; (void)n; errno = EPIPE; return -1;
+}
 int pg_tls_pending(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_wants_write(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_is_h2(pg_tls *tls) { (void)tls; return 0; }
@@ -122,6 +128,34 @@ struct pg_tls {
 /* Marks a connection that is being served a challenge certificate, so that the
  * SNI and ALPN callbacks leave it alone. Allocated once per process. */
 static int acme_ex_index = -1;
+
+#if defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+/* --ktls. Set by the supervisor before any context exists, and inherited by
+ * every worker. */
+static int g_ktls = 0;
+#endif
+
+int pg_tls_enable_ktls(int on) {
+#if defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+    g_ktls = on ? 1 : 0;
+    return 1;
+#else
+    (void)on;
+    return 0;
+#endif
+}
+
+int pg_tls_kernel_ready(void) {
+#if defined(__linux__)
+    /* The module creates this when it loads. */
+    FILE *f = fopen("/proc/net/tls_stat", "r");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+#else
+    return 0;
+#endif
+}
 
 static void last_error(char *err, size_t err_len, const char *what) {
     if (!err || err_len == 0) return;
@@ -285,6 +319,11 @@ static int configure_common(SSL_CTX *ctx, struct pg_tls_ctx *wrapper,
     SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION
                              | SSL_OP_CIPHER_SERVER_PREFERENCE
                              | SSL_OP_NO_RENEGOTIATION);
+#if defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+    /* --ktls: kernel TLS, wherever the kernel and the negotiated cipher allow
+     * it. OpenSSL falls back to encrypting in-process on its own when not. */
+    if (g_ktls) SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+#endif
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE
                           | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
                           | SSL_MODE_RELEASE_BUFFERS);
@@ -614,6 +653,57 @@ long pg_tls_write(pg_tls *tls, const void *buf, long n) {
         errno = EPIPE;
         return -1;
     }
+}
+
+int pg_tls_ktls_send(pg_tls *tls) {
+#if defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+    if (!tls || !tls->ssl) return 0;
+    BIO *wbio = SSL_get_wbio(tls->ssl);
+    return wbio && BIO_get_ktls_send(wbio) ? 1 : 0;
+#else
+    (void)tls;
+    return 0;
+#endif
+}
+
+long pg_tls_sendfile(pg_tls *tls, int fd, long offset, long n) {
+#if defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+    if (!tls || !tls->ssl) { errno = EPIPE; return -1; }
+    if (n <= 0) return 0;
+    ERR_clear_error();
+    ossl_ssize_t rc = SSL_sendfile(tls->ssl, fd, (off_t)offset, (size_t)n, 0);
+    if (rc > 0) {
+        tls->wants_write = 0;
+        return (long)rc;
+    }
+    if (rc == 0) {
+        /* Nothing left at that offset: the file shrank after its length was
+         * promised. */
+        errno = EPIPE;
+        return -1;
+    }
+    switch (SSL_get_error(tls->ssl, (int)rc)) {
+    case SSL_ERROR_WANT_WRITE:
+        tls->wants_write = 1;
+        errno = EAGAIN;
+        return -1;
+    case SSL_ERROR_WANT_READ:
+        tls->wants_write = 0;
+        errno = EAGAIN;
+        return -1;
+    case SSL_ERROR_SYSCALL:
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return -1;
+        errno = EPIPE;
+        return -1;
+    default:
+        errno = EPIPE;
+        return -1;
+    }
+#else
+    (void)tls; (void)fd; (void)offset; (void)n;
+    errno = EPIPE;
+    return -1;
+#endif
 }
 
 int pg_tls_pending(pg_tls *tls) {

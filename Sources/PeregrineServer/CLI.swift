@@ -138,6 +138,9 @@ public enum PeregrineCLI {
                                        SNI, using the names inside each certificate
               --tls-key PATH           PEM private key for the preceding --tls-cert
               --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
+              --ktls                   let the Linux kernel encrypt TLS, so --static-dir
+                                       files go out with sendfile over HTTPS too
+                                       (needs the tls module: modprobe tls)
               --acme-domain NAME       get and renew a certificate for NAME from an
                                        ACME CA (Let's Encrypt by default), answering
                                        tls-alpn-01 on this port (repeatable)
@@ -565,6 +568,8 @@ public enum PeregrineCLI {
                 config.requestID = true
             } else if matches(arg, "--trace-context") {
                 config.traceContext = true
+            } else if matches(arg, "--ktls") {
+                config.ktls = true
             } else if matches(arg, "--health-check-path") {
                 guard let v = next("--health-check-path needs a path") else { break }
                 if v[0] != 47 {   // '/'

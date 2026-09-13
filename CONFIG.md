@@ -657,11 +657,29 @@ peregrine --static-dir /static=/srv/app/static \
 
 On a plaintext HTTP/1.1 connection the bytes never enter the process: the file
 descriptor goes to `sendfile(2)` and the kernel moves them from the page cache
-to the socket. Over TLS, and on an HTTP/2 or HTTP/3 stream, they are read and
-framed like any other response — the bytes have to be encrypted or multiplexed,
-and the kernel cannot do either — which is still an interpreter, a `dict` of CGI
-variables and a list of byte strings per asset less than serving them from
-Python.
+to the socket. On an HTTP/2 or HTTP/3 stream, and over TLS, they are read and
+framed like any other response — the bytes have to be multiplexed or encrypted
+— which is still an interpreter, a `dict` of CGI variables and a list of byte
+strings per asset less than serving them from Python.
+
+`--ktls` takes TLS off that list on Linux. The kernel encrypts instead of
+OpenSSL, so an HTTPS/1.1 response gets the same `sendfile(2)` as a plaintext
+one:
+
+```bash
+sudo modprobe tls        # once per boot, or list tls in /etc/modules-load.d
+peregrine --ktls --tls-cert cert.pem --tls-key key.pem \
+          --static-dir /static=/srv/app/static myapp:app
+```
+
+On one worker, files of 1 MiB went out at 2172 MiB/s instead of 1485, and of
+16 MiB at 2206 instead of 1384, at about a third less CPU per gibibyte
+(`benchmarks/static_files.sh`). Everything else on the connection works as
+before, since OpenSSL still does the handshake and hands the kernel the keys.
+Where kernel TLS cannot be had — the module is not loaded, the cipher is one the
+kernel does not implement, the OpenSSL was built without it — OpenSSL encrypts
+as it always did, and the server says at start-up when the module is missing.
+HTTP/2 still reads its files: its bytes have to be framed first.
 
 **A path with no file behind it reaches the application.** So does a `POST`, a
 path that is a prefix of the route rather than under it, and a directory. A

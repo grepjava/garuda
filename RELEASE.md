@@ -29,6 +29,10 @@ version reached PyPI, in UTC.
   shared by every worker, for GET responses the application marks fresh with
   `s-maxage` or `max-age`. Requests with credentials or cookies, and responses
   that set cookies or are private, are never cached.
+- `--ktls`: the Linux kernel encrypts TLS, so `--static-dir` files go out with
+  sendfile over HTTPS as they do in the clear. On one worker, HTTPS static
+  files went from 1485 to 2172 MiB/s (1 MiB) and 1384 to 2206 MiB/s (16 MiB),
+  at about a third less CPU per GiB. Needs the kernel's `tls` module.
 
 ### Changed
 
