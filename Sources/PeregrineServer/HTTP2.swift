@@ -446,7 +446,22 @@ extension Worker {
             decodeBlock(h2) { _ in } onError: { ok = false }
             if !ok { connectionError(slot, .compressionError); return }
             if let streamSlot = h2.streams[streamID].map(Int.init) {
-                table[streamSlot].pointee.bodyRemaining = 0
+                let s = table[streamSlot]
+                s.pointee.bodyRemaining = 0
+                // A trailer section ends the body as surely as END_STREAM on a
+                // DATA frame, and RFC 9113 section 8.1.1 holds it to the same
+                // declared length.
+                if s.pointee.head.flags.contains(.hasContentLength)
+                    && s.pointee.head.contentLength != s.pointee.bodyReceived {
+                    streamError(slot, h2, streamID, .protocolError)
+                    return
+                }
+                if s.pointee.state == .closing {
+                    // The request has caught up with a response that was
+                    // finished already; nothing is waiting for it.
+                    closeStream(streamSlot, resetWith: nil)
+                    return
+                }
                 onBodyProgress(streamSlot)
             }
             return

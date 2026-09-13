@@ -314,6 +314,35 @@ def test_request_bodies():
         stream = c.request(method="POST", path="/reject", body=b"x" * 100, end=False)
         status, _, body, _ = c.collect([stream], deadline=10.0)
         is_("an early rejection does not wait for the body", status.get(stream), 403)
+
+        # A trailer section ends a body as surely as END_STREAM on DATA does,
+        # and is held to the same declared length (RFC 9113 section 8.1.1).
+        # Before, trailers ended it unchecked, and a body three bytes into a
+        # declared ten reached the application as if it were whole.
+        s = c.request(method="POST", path="/echo",
+                      extra=[("content-length", "3")], end=False)
+        c.send_body(s, b"abc", end=False)
+        c.conn.send_headers(s, [("x-checksum", "1")], end_stream=True)
+        c.flush()
+        status, _, body, _ = c.collect([s])
+        is_("a body of its declared length ends with trailers",
+            (status.get(s), body.get(s)), (200, b"abc"))
+
+        s = c.request(method="POST", path="/echo",
+                      extra=[("content-length", "10")], end=False)
+        c.send_body(s, b"abc", end=False)
+        c.conn.send_headers(s, [("x-checksum", "1")], end_stream=True)
+        c.flush()
+        c.collect([s])
+        is_("a body short of its declared length is refused at the trailers",
+            c.reset.get(s), h2.errors.ErrorCodes.PROTOCOL_ERROR)
+        check("and never reaches the application as a whole body",
+              c.status.get(s) is None, "answered %r" % c.status.get(s))
+
+        s = c.request(path="/")
+        status, _, body, _ = c.collect([s])
+        is_("the connection survives that reset",
+            (status.get(s), body.get(s)), (200, b"hello from peregrine asgi\n"))
         c.close()
 
 

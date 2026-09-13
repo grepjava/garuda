@@ -260,9 +260,11 @@ extension Worker {
                 || CompressionEligibility.isCompressible(type.utf8Start, type.utf8CodeUnitCount))
 
         // A strong validator built from what the filesystem already knows.
-        // Two files with the same size and the same modification time to the
-        // second are the same file for this purpose; a deployment that rewrites
-        // an asset moves the mtime.
+        // Two files with the same size and the same modification time, to the
+        // nanosecond, are the same file for this purpose. Whole seconds were
+        // not enough: a build that rewrites an asset at the same size within
+        // one second left the old tag matching, and a client with it got 304
+        // for bytes it had never seen.
         var etag = [UInt8](repeating: 0, count: 48)
         var etagLength = 0
         etag[etagLength] = UInt8(ascii: "\""); etagLength += 1

@@ -355,6 +355,17 @@ static int static_open_beneath(const char *root, const char *relative) {
 }
 #endif
 
+/* Nanoseconds, not seconds: the static ETag is built from this and the size,
+ * and a file rewritten at the same size within one second has to get a new
+ * one. */
+static long long stat_mtime_ns(const struct stat *st) {
+#if defined(__APPLE__)
+    return (long long)st->st_mtimespec.tv_sec * 1000000000LL + st->st_mtimespec.tv_nsec;
+#else
+    return (long long)st->st_mtim.tv_sec * 1000000000LL + st->st_mtim.tv_nsec;
+#endif
+}
+
 int pg_static_open(const char *root, const char *relative,
                    long long *size, long long *mtime) {
     while (*relative == '/') relative++;
@@ -369,7 +380,7 @@ int pg_static_open(const char *root, const char *relative,
             return -1;
         }
         if (size) *size = (long long)st.st_size;
-        if (mtime) *mtime = (long long)st.st_mtime;
+        if (mtime) *mtime = stat_mtime_ns(&st);
         return beneath;
     }
 #endif
@@ -412,7 +423,7 @@ int pg_static_open(const char *root, const char *relative,
         return -1;
     }
     if (size) *size = (long long)st.st_size;
-    if (mtime) *mtime = (long long)st.st_mtime;
+    if (mtime) *mtime = stat_mtime_ns(&st);
     return fd;
 }
 

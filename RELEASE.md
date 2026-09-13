@@ -30,6 +30,19 @@ version reached PyPI, in UTC.
   as it already did before another request had started, and returns quietly
   once the connection has closed. A late `receive` says `http.disconnect`.
   uvicorn behaves the same way.
+- An HTTP/2 request that ends with a trailer section is held to its
+  `content-length`, as one ending on a DATA frame already was. A body shorter
+  or longer than declared reached the application as if it were whole; the
+  stream is now reset with `PROTOCOL_ERROR` (RFC 9113 section 8.1.1). HTTP/3
+  already checked this. A request whose trailers arrive after its response
+  has finished also closes its stream at once, rather than holding it open
+  until the request timeout.
+- The ETag of a static file changes when the file is rewritten at the same
+  size within one second. It was built from the modification time in whole
+  seconds, so a client holding the old tag could be told 304 Not Modified for
+  content it had never received. It now uses nanoseconds, which also means
+  every static ETag changes once on upgrading: clients revalidate each file
+  one time.
 
 ### Changed
 

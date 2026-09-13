@@ -90,6 +90,26 @@ is "a wildcard ETag is 304"       "$(code -H 'If-None-Match: *' $H/static/site.c
 is "a stale ETag is 200"          "$(code -H 'If-None-Match: \"nope\"' $H/static/site.css)" "200"
 is "a 304 carries no body"        "$(curl -sS -o /dev/null -w '%{size_download}' -H "If-None-Match: $ETAG" $H/static/site.css)" "0"
 
+# A file rewritten in place at the same size, within the same second, is a
+# different file. With the tag built from whole seconds it kept the old tag,
+# and a client holding that tag was told 304 for bytes it had never seen.
+# The times are set explicitly (python, since touch's fractional -d is GNU's).
+etag_of() { curl -sS -I --max-time 10 "$1" | tr -d '\r' | awk '/^[Ee][Tt][Aa][Gg]:/ {print $2}'; }
+set_mtime_ns() { python3 -c 'import os, sys; os.utime(sys.argv[1], ns=(int(sys.argv[2]),) * 2)' "$1" "$2"; }
+printf 'aaaa' > "$WORK/assets/rewritten.txt"
+set_mtime_ns "$WORK/assets/rewritten.txt" 1700000000100000000
+ETAG_BEFORE=$(etag_of $H/static/rewritten.txt)
+printf 'bbbb' > "$WORK/assets/rewritten.txt"
+set_mtime_ns "$WORK/assets/rewritten.txt" 1700000000600000000
+ETAG_AFTER=$(etag_of $H/static/rewritten.txt)
+if [ -n "$ETAG_BEFORE" ] && [ "$ETAG_BEFORE" != "$ETAG_AFTER" ]; then
+    ok "a same-size rewrite within a second gets a new ETag"
+else
+    bad "a same-size rewrite within a second gets a new ETag" "two different tags" "$ETAG_BEFORE then $ETAG_AFTER"
+fi
+is "and the old ETag no longer matches" \
+   "$(code -H "If-None-Match: $ETAG_BEFORE" $H/static/rewritten.txt)" "200"
+
 # --- refusals ------------------------------------------------------------
 # Each of these must reach the application, which answers 404, rather than
 # being served from disk.

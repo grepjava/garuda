@@ -77,7 +77,7 @@ ssize_t pg_writev(int fd, const struct iovec *iov, int iovcnt);
 ssize_t pg_sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
 
 /* Opens a regular file under `root` for a static route, reporting its size and
- * modification time.
+ * modification time in nanoseconds since the epoch.
  *
  * `relative` is the request path with the route prefix removed and already
  * percent-decoded. Both paths are resolved with realpath(3) and the result must
