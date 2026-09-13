@@ -113,7 +113,9 @@ PYTHONPATH=python python3 -m peregrine --python-path examples --port 8000 asgi_a
 interpreter; each gets its own file, named by that interpreter's extension
 suffix, so several can sit side by side.
 
-The standalone executable embeds `libpython` instead:
+`swift build` produces the standalone executable, which embeds `libpython`
+instead. It is for working on Peregrine itself and for the Docker image; the
+extension module is what installing from source gives you:
 
 ```bash
 swift build -c release                # binary at .build/release/peregrine
@@ -279,22 +281,31 @@ The target is `module:attribute`, not a file path — `myapp.wsgi:application`,
 never `myapp/wsgi.py:application`.
 
 The full suites, from a checkout, want a virtualenv with `aioquic`, `h2`,
-`fastapi`, `flask` and `websockets` in it:
+`fastapi`, `flask` and `websockets` in it. They test the server a wheel
+installs, so build the extension module first:
 
 ```bash
+bash scripts/build-extension.sh                 # the server under test
+S=scripts/peregrine-ext
+
 swift test                                      # 150 unit tests
-bash scripts/integration-test.sh                #  56 end-to-end checks
-python3 scripts/feature-test.py                 # 196 failure-mode checks
-bash scripts/framework-test.sh                  # against real FastAPI and
+bash scripts/integration-test.sh $S             #  56 end-to-end checks
+python3 scripts/feature-test.py $S              # 196 failure-mode checks
+bash scripts/framework-test.sh $S               # against real FastAPI and
                                                 #   Flask applications
-<venv>/bin/python scripts/http2-test.py         # 162 against `h2`
-<venv>/bin/python scripts/http3-test.py         # 114 against `aioquic`
+<venv>/bin/python scripts/http2-test.py $S      # 162 against `h2`
+<venv>/bin/python scripts/http3-test.py $S      # 114 against `aioquic`
 python3 scripts/contrib_test.py                 #  58 Python-only
-<venv>/bin/python scripts/webtransport-test.py  # including FastAPI over HTTP/3
+<venv>/bin/python scripts/webtransport-test.py $S  # FastAPI over HTTP/3
                                                 #   and WebTransport
 ```
 
-The suites drive the executable.
+Every suite takes the server's path as its first argument.
+`scripts/peregrine-ext` runs `peregrine._native` in `PEREGRINE_PYTHON`
+(`python3` unless set) and accepts exactly the executable's arguments, so a
+suite cannot tell the two apart; pass `.build/release/peregrine` instead to
+test the standalone executable. CI runs the extension on every interpreter it
+supports and the executable on one.
 
 ---
 

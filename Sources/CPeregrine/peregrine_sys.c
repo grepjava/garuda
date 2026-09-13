@@ -676,6 +676,23 @@ pid_t pg_waitpid(pid_t pid, int *status, int nohang) {
 int pg_kill(pid_t pid, int sig) { return kill(pid, sig); }
 pid_t pg_getpid(void) { return getpid(); }
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
+/* The name top, ps -e, pgrep -x and pkill match on. The executable already has
+ * it; peregrine._native runs in a process the kernel calls "python", which
+ * leaves `pkill peregrine` matching nothing. Only the short kernel name
+ * changes -- the command line still says which interpreter is running. It is
+ * inherited across fork and by threads created afterwards. */
+void pg_set_process_name(const char *name) {
+#ifdef __linux__
+    prctl(PR_SET_NAME, name, 0, 0, 0);
+#else
+    (void)name;
+#endif
+}
+
 int pg_cpu_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;

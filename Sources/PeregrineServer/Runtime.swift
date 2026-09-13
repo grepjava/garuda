@@ -54,6 +54,9 @@ public enum Peregrine {
     public static func run(config: ServerConfig) -> Int32 {
         Log.level = config.logLevel
         Log.pid = Int(pg_getpid())
+        // Inside python (peregrine._native) the process is named "python" until
+        // told otherwise, and every worker forked from here inherits the name.
+        pg_set_process_name("peregrine")
         pg_ignore_sigpipe()
         let limit = pg_raise_nofile_limit()
         if limit > 0 && limit < Int(config.maxConnections) + 32 {

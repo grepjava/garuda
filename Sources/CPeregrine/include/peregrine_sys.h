@@ -141,6 +141,8 @@ pid_t pg_fork_worker(void);
 /* In a child that is not a worker: default signal dispositions, no pipe. */
 void pg_signals_default(void);
 pid_t pg_fork(void);
+/* Sets the kernel's short process name (Linux; a no-op elsewhere). */
+void pg_set_process_name(const char *name);
 pid_t pg_waitpid(pid_t pid, int *status, int nohang);
 int  pg_kill(pid_t pid, int sig);
 pid_t pg_getpid(void);

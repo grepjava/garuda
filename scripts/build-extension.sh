@@ -37,8 +37,14 @@ if [ "$have" != "$want" ]; then
     exit 1
 fi
 
-swift build -c release --product PeregrineExtension --scratch-path "$SCRATCH"
+# Anything after the script's name goes to swift build, for the flags a platform
+# needs -- on macOS, where Homebrew's OpenSSL is: -Xcc -I... -Xlinker -L...
+swift build -c release --product PeregrineExtension --scratch-path "$SCRATCH" "$@"
 
+# SwiftPM names the library for the platform; Python wants the interpreter's
+# suffix, which is .so on macOS too.
+library="$SCRATCH/release/libPeregrineExtension.so"
+[ "$(uname -s)" = Darwin ] && library="$SCRATCH/release/libPeregrineExtension.dylib"
 target="$ROOT/python/peregrine/_native$suffix"
-cp "$SCRATCH/release/libPeregrineExtension.so" "$target"
+cp "$library" "$target"
 echo "built $target"

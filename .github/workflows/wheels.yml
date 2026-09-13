@@ -1,13 +1,13 @@
 # Prebuilt wheels for the interpreters the project claims to support.
 #
-# Each wheel embeds one libpython and the Swift runtime that binary was
-# linked against. The tag (cp312-cp312-manylinux_2_39_x86_64,
-# cp314-cp314t-...) is the pairing; pip will not install it anywhere else.
-# The manylinux_2_N platform is this image's glibc -- PyPI rejects linux_*.
-# libpython itself is not vendored -- the user's matching interpreter
-# supplies it.
+# Each wheel carries peregrine._native, the server as an extension module,
+# with the Swift runtime vendored beside it. The module is compiled against one
+# CPython ABI, and the tag (cp312-cp312-manylinux_2_39_x86_64, cp314-cp314t-...)
+# is that pairing; pip will not install it anywhere else. The manylinux_2_N
+# platform is this image's glibc -- PyPI rejects linux_*. Python itself is the
+# installing interpreter; nothing of it is vendored.
 #
-# Started by hand, like CI. Building five release binaries is a bill, and
+# Started by hand, like CI. Building five release modules is a bill, and
 # publishing is a separate input so a dry run cannot reach PyPI.
 
 name: Wheels
@@ -76,13 +76,14 @@ jobs:
           echo "PKG_CONFIG_PATH=${pythonLocation}/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=${pythonLocation}/lib" >> "$GITHUB_ENV"
 
-      - name: Which interpreter is being embedded
+      - name: Which interpreter the module is built for
         run: |
           swift --version
           python --version
-          pkg-config --modversion python3-embed
-          pkg-config --libs python3-embed
+          pkg-config --modversion python3
 
+      # setup.py imports the module in a clean interpreter before packaging,
+      # and on 3.14t checks that the import leaves the GIL off.
       - name: Build the wheel
         run: |
           python -m pip install --quiet --disable-pip-version-check build
@@ -93,9 +94,10 @@ jobs:
           wheel=$(ls dist/peregrine_server-*.whl)
           python -m venv /tmp/smoke
           /tmp/smoke/bin/pip install --quiet --disable-pip-version-check "$wheel"
-          # The launcher must find libpython from the venv's interpreter and
-          # the Swift runtime from the wheel. The toolchain's LD_LIBRARY_PATH
-          # is the thing a real user will not have.
+          # The module has to find the Swift runtime inside the wheel. The
+          # toolchain's LD_LIBRARY_PATH is the thing a real user will not have.
+          cd /tmp
+          env -u LD_LIBRARY_PATH /tmp/smoke/bin/python -c "import peregrine._native as n; print(n.__file__)"
           env -u LD_LIBRARY_PATH /tmp/smoke/bin/peregrine --version
 
       - uses: actions/upload-artifact@v4
