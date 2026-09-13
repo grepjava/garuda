@@ -38,6 +38,7 @@ public enum ASGIRuntime {
     // --- process-wide, written once at start-up and only read afterwards ---
     nonisolated(unsafe) static var app: PyObj! = nil
     nonisolated(unsafe) static var fnSpawn: PyObj! = nil
+    nonisolated(unsafe) static var fnSpawnRequest: PyObj! = nil
     nonisolated(unsafe) static var fnResolve: PyObj! = nil
     nonisolated(unsafe) static var fnRunUntil: PyObj! = nil
     nonisolated(unsafe) static var fnRunLoop: PyObj! = nil
@@ -83,6 +84,7 @@ public enum ASGIRuntime {
         app = application
 
         guard let spawn = Interpreter.glueFunction("spawn"),
+              let spawnRequest = Interpreter.glueFunction("spawn_request"),
               let resolve = Interpreter.glueFunction("resolve"),
               let runUntil = Interpreter.glueFunction("run_until"),
               let runLoop = Interpreter.glueFunction("run_loop"),
@@ -94,6 +96,7 @@ public enum ASGIRuntime {
             return false
         }
         fnSpawn = spawn
+        fnSpawnRequest = spawnRequest
         fnResolve = resolve
         fnRunUntil = runUntil
         fnRunLoop = runLoop
@@ -454,17 +457,53 @@ extension Worker {
         }
         defer { pg_decref(doneCb) }
 
-        guard let task = pg_call3(ASGIRuntime.fnSpawn, ASGIRuntime.loop, coro, doneCb) else {
-            PyError.logPending("scheduling the application task")
-            failRequest(slot, status: 500)
+        // The task starts eagerly where the interpreter can, so the application
+        // may run -- and the request finish -- inside this call. Whatever that
+        // sets off, a flush that drains or a stream that ends, has to find a
+        // task still running, or it recycles the slot under the request. A
+        // placeholder stands in until the task exists; closeConnection cancels
+        // whatever is there and shrugs off a refusal, so None will do.
+        let placeholder = Interned.none!
+        pg_incref(placeholder)
+        c.pointee.task = placeholder
+        eagerStarts += 1
+        let spawned = pg_call3(ASGIRuntime.fnSpawnRequest, ASGIRuntime.loop, coro, doneCb)
+        eagerStarts -= 1
+
+        // The connection may have closed meanwhile, or a finished request may
+        // already have handed it to the next one, so the slot is found again.
+        let now = resolveChannel(token, request)
+        guard let task = spawned else {
+            PyError.logPending("starting the application task")
+            if now >= 0, table[now].pointee.task == placeholder {
+                pg_decref(placeholder)
+                table[now].pointee.task = nil
+                asgiTaskFinished(now, error: true)
+            }
             return
         }
-        c.pointee.task = task
+        if now < 0 {
+            // Closed while the application ran. A task still waiting is
+            // cancelled, as closing would have cancelled it had it been stored.
+            if let r = pg_call_method0(task, Interned[.nCancel]) { pg_decref(r) } else { pg_err_clear() }
+            pg_decref(task)
+            return
+        }
+        let s = table[now]
+        if s.pointee.task == placeholder {
+            // Suspended: from here it is an ordinary task, with its done
+            // callback added.
+            pg_decref(placeholder)
+            s.pointee.task = task
+        } else {
+            // Finished inside the call and already reported.
+            pg_decref(task)
+        }
 
         // With the body already complete there is nothing more to read for this
         // request, and leaving READ armed on a level-triggered poller would spin
         // on any pipelined bytes. EPOLLRDHUP still reports a disconnect.
-        updateBodyReadInterest(slot)
+        updateBodyReadInterest(now)
     }
 
     /// New body bytes arrived while the application is running.
@@ -863,7 +902,17 @@ extension Worker {
             return
         }
         if c.pointee.state == .writing && c.pointee.write.isEmpty {
-            finishResponse(slot)
+            // Finished while dispatch was starting it eagerly, with the response
+            // already out. Recycling here would dispatch the request pipelined
+            // behind it from inside this one, and a long pipeline would nest as
+            // deep as it is long. The deferred flush recycles it at the end of
+            // the loop iteration instead, one request after another. A stream
+            // has no pipeline behind it.
+            if eagerStarts > 0 && !c.pointee.isStream && c.pointee.fd >= 0 {
+                flushSoon(slot)
+            } else {
+                finishResponse(slot)
+            }
         }
     }
 
