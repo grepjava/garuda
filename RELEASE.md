@@ -20,6 +20,17 @@ version reached PyPI, in UTC.
 
 ## Unreleased
 
+### Fixed
+
+- An ASGI application's `send` or `receive` used after its request had ended,
+  by a task the request started, no longer reaches the next request on the
+  same keep-alive connection. A late `send` could deliver its response in
+  place of the next request's, and a late `receive` could take that request's
+  body. A late `send` now raises `RuntimeError` while the connection is open,
+  as it already did before another request had started, and returns quietly
+  once the connection has closed. A late `receive` says `http.disconnect`.
+  uvicorn behaves the same way.
+
 ---
 
 ## 1.1.2 — 2026-09-13

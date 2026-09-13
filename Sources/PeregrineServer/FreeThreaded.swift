@@ -408,13 +408,13 @@ final class ThreadSupervisor {
     }
 }
 
-private func supervisorSignalCallback(_ context: UInt64, _ args: PyObj?) -> PyObj? {
+private func supervisorSignalCallback(_ context: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
     guard let p = UnsafeRawPointer(bitPattern: UInt(context)) else { return nil }
     Unmanaged<ThreadSupervisor>.fromOpaque(p).takeUnretainedValue().readSignals()
     return nil
 }
 
-private func supervisorTimerCallback(_ context: UInt64, _ args: PyObj?) -> PyObj? {
+private func supervisorTimerCallback(_ context: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
     guard let p = UnsafeRawPointer(bitPattern: UInt(context)) else { return nil }
     let sup = Unmanaged<ThreadSupervisor>.fromOpaque(p).takeUnretainedValue()
     guard let loop = sup.loop else { return nil }

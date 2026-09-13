@@ -19,7 +19,9 @@
 // now per worker, reached through the thread-local `currentWorker`.
 //
 // `send` and `receive` are C-level callables (PyTrampoline) carrying a packed
-// (generation, slot) token rather than a Python closure over server state. A
+// (generation, slot) token and the request count they were made for, rather
+// than a Python closure over server state -- the count because a keep-alive
+// connection, and so its slot and generation, outlives each request. A
 // send that completes immediately -- the common case, since the bytes just go
 // into the write buffer -- returns a pre-completed awaitable that raises
 // StopIteration on its first step, so `await send(...)` never round-trips
@@ -296,7 +298,7 @@ public enum ASGIRuntime {
 // MARK: - Loop callbacks
 
 /// asyncio calls this whenever the poller descriptor becomes readable.
-private func asgiDrain(_ context: UInt64, _ args: PyObj?) -> PyObj? {
+private func asgiDrain(_ context: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
     guard let worker = currentWorker else { return nil }
     // Timeout 0: asyncio already told us there is something to collect.
     worker.pointee.drain(timeoutMillis: 0)
@@ -305,7 +307,7 @@ private func asgiDrain(_ context: UInt64, _ args: PyObj?) -> PyObj? {
 }
 
 /// Periodic housekeeping: idle timeouts and shutdown completion.
-private func asgiTimer(_ context: UInt64, _ args: PyObj?) -> PyObj? {
+private func asgiTimer(_ context: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
     guard let worker = currentWorker else { return nil }
     worker.pointee.quicTick()
     worker.pointee.sweepTimeouts()
@@ -330,7 +332,7 @@ private func asgiTimer(_ context: UInt64, _ args: PyObj?) -> PyObj? {
 }
 
 /// Sends the responses this loop iteration produced. Scheduled by `flushSoon`.
-private func asgiFlushDeferred(_ context: UInt64, _ args: PyObj?) -> PyObj? {
+private func asgiFlushDeferred(_ context: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
     currentWorker?.pointee.runDeferredFlushes()
     return nil
 }
@@ -424,9 +426,13 @@ extension Worker {
         stampRequestStart(slot, scope: scopeDict)
         stampRequestID(slot, scope: scopeDict)
 
+        // The slot and its generation name the connection, which on keep-alive
+        // outlives this request; the request count is what tells a late call
+        // from a task this request started apart from the next request's.
         let token = PollToken.make(slot: slot, generation: c.pointee.generation)
-        guard let receiveFn = PyTrampoline.make(asgiReceive, context: token),
-              let sendFn = PyTrampoline.make(asgiSend, context: token) else {
+        let request = UInt64(c.pointee.requestCount)
+        guard let receiveFn = PyTrampoline.make(asgiReceive, context: token, tag: request),
+              let sendFn = PyTrampoline.make(asgiSend, context: token, tag: request) else {
             PyError.logPending("creating the ASGI channels")
             failRequest(slot, status: 500)
             return
@@ -441,7 +447,7 @@ extension Worker {
         }
         defer { pg_decref(coro) }
 
-        guard let doneCb = PyTrampoline.make(asgiTaskDone, context: token) else {
+        guard let doneCb = PyTrampoline.make(asgiTaskDone, context: token, tag: request) else {
             PyError.logPending("creating the completion callback")
             failRequest(slot, status: 500)
             return
@@ -927,7 +933,22 @@ func resolveSlot(_ token: UInt64) -> Int {
     return slot
 }
 
-func asgiSend(_ token: UInt64, _ args: PyObj?) -> PyObj? {
+/// The slot a channel's request still owns, or -1.
+///
+/// The token's generation names the connection, and a keep-alive connection
+/// outlives each of its requests. A task that kept `send` or `receive` past its
+/// request would otherwise write into the next request's response or take its
+/// body. The request count the channel was made with has to be the
+/// connection's current one as well.
+@inline(__always)
+func resolveChannel(_ token: UInt64, _ request: UInt64) -> Int {
+    let slot = resolveSlot(token)
+    if slot < 0 { return -1 }
+    if UInt64(currentWorker!.pointee.table[slot].pointee.requestCount) != request { return -1 }
+    return slot
+}
+
+func asgiSend(_ token: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
     guard let args, pg_tuple_size(args) == 1, let message = pg_tuple_get(args, 0) else {
         pg_err_set_str(pg_exc_type(), "send() takes exactly one message")
         return nil
@@ -944,6 +965,14 @@ func asgiSend(_ token: UInt64, _ args: PyObj?) -> PyObj? {
         return PyImmediate.make(nil)
     }
     guard let worker = currentWorker else { return PyImmediate.make(nil) }
+    if UInt64(worker.pointee.table[slot].pointee.requestCount) != tag {
+        // The connection is open, but this send's request is over and another
+        // has begun on it: a task the request started kept `send`. Its response
+        // was complete, so this is the error sending after completion always is
+        // -- and it must not become part of the next response.
+        pg_err_set_str(pg_exc_runtime(), "send() after its request had ended")
+        return nil
+    }
 
     guard let typeObj = pg_dict_get(message, Interned[.type]) else {
         pg_err_set_str(pg_exc_value(), "an ASGI message needs a type")
@@ -976,7 +1005,7 @@ func asgiSend(_ token: UInt64, _ args: PyObj?) -> PyObj? {
 
     // Writing may have closed the connection, so the slot is re-checked rather
     // than reused.
-    let after = resolveSlot(token)
+    let after = resolveChannel(token, tag)
     if after >= 0, worker.pointee.writerShouldPause(after) {
         if let waiter = worker.pointee.drainWaiter(after) { return waiter }
     }
@@ -984,8 +1013,8 @@ func asgiSend(_ token: UInt64, _ args: PyObj?) -> PyObj? {
     return PyImmediate.make(nil)
 }
 
-func asgiReceive(_ token: UInt64, _ args: PyObj?) -> PyObj? {
-    let slot = resolveSlot(token)
+func asgiReceive(_ token: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
+    let slot = resolveChannel(token, tag)
     if slot < 0 {
         guard let msg = ASGIMessage.httpDisconnect() else { return nil }
         defer { pg_decref(msg) }
@@ -1027,8 +1056,8 @@ func asgiReceive(_ token: UInt64, _ args: PyObj?) -> PyObj? {
 /// already completed, so the task never yields, and the worker spins with the
 /// event loop held -- deaf to SIGTERM, so it cannot even be drained. The only
 /// true answer is the session's own: it has ended.
-func asgiReceiveWebTransport(_ token: UInt64, _ args: PyObj?) -> PyObj? {
-    if resolveSlot(token) >= 0 { return asgiReceive(token, args) }
+func asgiReceiveWebTransport(_ token: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
+    if resolveChannel(token, tag) >= 0 { return asgiReceive(token, tag, args) }
     guard let msg = ASGIWebTransportMessage.disconnect(code: 0, reason: []) else { return nil }
     defer { pg_decref(msg) }
     return PyImmediate.make(msg)
@@ -1036,14 +1065,14 @@ func asgiReceiveWebTransport(_ token: UInt64, _ args: PyObj?) -> PyObj? {
 
 /// `receive()` for a WebSocket, for the same reason: once the slot is gone,
 /// say how the connection ended in the protocol the application is speaking.
-func asgiReceiveWebSocket(_ token: UInt64, _ args: PyObj?) -> PyObj? {
-    if resolveSlot(token) >= 0 { return asgiReceive(token, args) }
+func asgiReceiveWebSocket(_ token: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
+    if resolveChannel(token, tag) >= 0 { return asgiReceive(token, tag, args) }
     guard let msg = ASGIWebSocketMessage.disconnect(code: WSCloseCode.abnormal) else { return nil }
     defer { pg_decref(msg) }
     return PyImmediate.make(msg)
 }
 
-func asgiTaskDone(_ token: UInt64, _ args: PyObj?) -> PyObj? {
+func asgiTaskDone(_ token: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
     guard let worker = currentWorker else { return nil }
     var failed = false
     if let args, pg_tuple_size(args) == 1, let task = pg_tuple_get(args, 0) {
@@ -1061,7 +1090,7 @@ func asgiTaskDone(_ token: UInt64, _ args: PyObj?) -> PyObj? {
             pg_err_clear()
         }
     }
-    let slot = resolveSlot(token)
+    let slot = resolveChannel(token, tag)
     if slot >= 0 {
         worker.pointee.asgiTaskFinished(slot, error: failed)
     }

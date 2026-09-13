@@ -4,7 +4,8 @@
 // asyncio needs real Python callables for add_reader, call_later and
 // add_done_callback. Creating those with a Python-level lambda would mean a
 // Python frame on every event-loop wakeup. This type is a C-level callable:
-// invoking it runs one Swift function with a context word, and nothing else.
+// invoking it runs one Swift function with two context words, and nothing
+// else.
 //
 // One type serves every internal callback in the server, so it is registered
 // once and costs a single heap type for the process.
@@ -14,9 +15,14 @@ import CPeregrine
 import PeregrineCore
 
 public enum PyTrampoline {
-    /// `(context, argsTuple) -> result`. Returning nil with a Python error set
-    /// propagates the exception; returning nil without one is treated as None.
-    public typealias Fn = @convention(c) (UInt64, PyObj?) -> PyObj?
+    /// `(context, tag, argsTuple) -> result`. Returning nil with a Python error
+    /// set propagates the exception; returning nil without one is treated as
+    /// None.
+    ///
+    /// `context` usually names a connection; `tag` narrows it further when the
+    /// callable belongs to something shorter-lived than the connection -- the
+    /// ASGI channels carry the request they were made for.
+    public typealias Fn = @convention(c) (UInt64, UInt64, PyObj?) -> PyObj?
 
     nonisolated(unsafe) public private(set) static var type: PyObj! = nil
 
@@ -31,10 +37,11 @@ public enum PyTrampoline {
 
     /// Creates a callable. Returns an owned reference.
     @inlinable
-    public static func make(_ fn: Fn, context: UInt64) -> PyObj? {
+    public static func make(_ fn: Fn, context: UInt64, tag: UInt64 = 0) -> PyObj? {
         guard let obj = pg_obj_alloc(type) else { return nil }
         pg_obj_set_ctx(obj, unsafeBitCast(fn, to: UnsafeMutableRawPointer.self))
         pg_obj_set_i0(obj, Int64(bitPattern: context))
+        pg_obj_set_i1(obj, Int64(bitPattern: tag))
         return obj
     }
 }
@@ -47,7 +54,8 @@ private func trampolineCall(_ selfObj: PyObj?, _ args: PyObj?, _ kwargs: PyObj?)
     let raw = pg_obj_ctx(selfObj)
     let fn = unsafeBitCast(raw, to: PyTrampoline.Fn.self)
     let context = UInt64(bitPattern: pg_obj_i0(selfObj))
-    if let result = fn(context, args) { return result }
+    let tag = UInt64(bitPattern: pg_obj_i1(selfObj))
+    if let result = fn(context, tag, args) { return result }
     if pg_err_check() != 0 { return nil }
     let none = Interned.none!
     pg_incref(none)

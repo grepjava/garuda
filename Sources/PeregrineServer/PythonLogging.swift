@@ -54,7 +54,7 @@ extension Peregrine {
 /// The level is clamped rather than validated: this is called from a logging
 /// handler, and a bad level is not worth turning into an exception that hides
 /// the message somebody was trying to record.
-private func pythonLogSink(_ context: UInt64, _ args: PyObj?) -> PyObj? {
+private func pythonLogSink(_ context: UInt64, _ tag: UInt64, _ args: PyObj?) -> PyObj? {
     guard let args, pg_tuple_size(args) >= 2 else { return nil }
     guard let levelObj = pg_tuple_get(args, 0), let messageObj = pg_tuple_get(args, 1) else {
         return nil

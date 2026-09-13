@@ -291,8 +291,9 @@ extension Worker {
         defer { pg_decref(scopeDict) }
 
         let token = PollToken.make(slot: slot, generation: c.pointee.generation)
-        guard let receiveFn = PyTrampoline.make(asgiReceiveWebSocket, context: token),
-              let sendFn = PyTrampoline.make(asgiSend, context: token) else {
+        let request = UInt64(c.pointee.requestCount)
+        guard let receiveFn = PyTrampoline.make(asgiReceiveWebSocket, context: token, tag: request),
+              let sendFn = PyTrampoline.make(asgiSend, context: token, tag: request) else {
             PyError.logPending("creating the websocket channels")
             rejectWebSocket(slot, status: 500)
             return
@@ -307,7 +308,7 @@ extension Worker {
         }
         defer { pg_decref(coro) }
 
-        guard let doneCb = PyTrampoline.make(asgiTaskDone, context: token) else {
+        guard let doneCb = PyTrampoline.make(asgiTaskDone, context: token, tag: request) else {
             PyError.logPending("creating the completion callback")
             rejectWebSocket(slot, status: 500)
             return
