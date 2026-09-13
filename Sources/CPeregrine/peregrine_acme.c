@@ -573,8 +573,14 @@ pg_acme_resp *pg_acme_https(const char *method, const char *url,
     }
     int fd = -1;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+#ifdef SOCK_CLOEXEC
         fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
         if (fd < 0) continue;
+#else
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
         struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
