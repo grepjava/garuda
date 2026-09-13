@@ -211,18 +211,27 @@ def case_deep_pipeline():
     # dispatched that next request from inside the one before would nest as
     # deep as the pipeline is long, and 20,000 levels do not survive: the
     # interpreter's recursion limit or the stack gives out long before.
+    #
+    # Surviving is not proof on its own: a response the socket has not taken
+    # yet is recycled from the event loop anyway, so nesting can be rare. The
+    # application also records the most request starts it ever found on the
+    # stack beneath it, and /depth, last in the pipeline and so on the same
+    # worker, reports it. Anything above one is a request dispatched from
+    # inside another.
     print("A pipeline far longer than nesting could survive")
     n = 20_000
     sock = socket.create_connection(("127.0.0.1", PORT), timeout=30)
     payload = b"".join(Conn.encode("GET", f"/mid/{i}") for i in range(n))
+    payload += Conn.encode("GET", "/depth")
     sender = threading.Thread(target=sock.sendall, args=(payload,), daemon=True)
     sender.start()
     buf = bytearray()
     pos = 0
     answered = 0
     wrong = []
+    depth = None
     try:
-        while answered < n:
+        while answered <= n:
             end = buf.find(b"\r\n\r\n", pos)
             if end >= 0:
                 head = bytes(buf[pos:end]).split(b"\r\n")
@@ -233,11 +242,15 @@ def case_deep_pipeline():
                         length = int(value)
                 if len(buf) >= end + 4 + length:
                     status = int(head[0].split()[1])
-                    tag = f"{answered}.".encode()
-                    if status != 200 or length != MID or buf[end + 4:end + 4 + len(tag)] != tag:
-                        wrong.append(answered)
-                        if len(wrong) > 3:
-                            break
+                    if answered == n:
+                        depth = bytes(buf[end + 4:end + 4 + length])
+                    else:
+                        tag = f"{answered}.".encode()
+                        if (status != 200 or length != MID
+                                or buf[end + 4:end + 4 + len(tag)] != tag):
+                            wrong.append(answered)
+                            if len(wrong) > 3:
+                                break
                     pos = end + 4 + length
                     answered += 1
                     if pos > (1 << 22):
@@ -252,7 +265,9 @@ def case_deep_pipeline():
         sock.close()
         sender.join(timeout=5)
     check(f"{n} pipelined 64 KiB responses arrive whole and in order",
-          answered == n and not wrong, f"answered {answered}, first wrong {wrong[:3]}")
+          answered > n and not wrong, f"answered {answered}, first wrong {wrong[:3]}")
+    check("none of them was dispatched from inside another request",
+          depth == b"1", f"most request starts on the stack: {depth!r}")
 
 
 def case_waits():

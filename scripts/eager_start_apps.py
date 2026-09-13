@@ -22,6 +22,21 @@ async def respond(send, body, status=200):
     await send({"type": "http.response.body", "body": body})
 
 
+_deepest = 0
+
+
+def starts_on_stack():
+    # How many request starts are beneath this application on the stack. One
+    # is its own; more means it was dispatched from inside another request.
+    depth = 0
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_name == "spawn_request":
+            depth += 1
+        frame = frame.f_back
+    return depth
+
+
 def started_eagerly():
     # Started eagerly, the application runs inside the glue that created its
     # task; scheduled, it runs from the event loop instead.
@@ -50,8 +65,14 @@ async def app(scope, receive, send):
         tag = path[5:].encode()
         await respond(send, tag + b"." * (BIG - len(tag)))
     elif path.startswith("/mid/"):
+        global _deepest
+        _deepest = max(_deepest, starts_on_stack())
         tag = path[5:].encode()
         await respond(send, tag + b"." * (MID - len(tag)))
+    elif path == "/depth":
+        body = str(_deepest).encode()
+        _deepest = 0
+        await respond(send, body)
     elif path.startswith("/sleep/"):
         await asyncio.sleep(0)
         await respond(send, path[7:].encode())

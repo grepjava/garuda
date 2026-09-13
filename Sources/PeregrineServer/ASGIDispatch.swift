@@ -466,9 +466,15 @@ extension Worker {
         let placeholder = Interned.none!
         pg_incref(placeholder)
         c.pointee.task = placeholder
-        eagerStarts += 1
+        // What `asgiTaskFinished` checks, when the application finishes before
+        // this call returns. It is a flag on the connection rather than a
+        // count on the worker. A count kept here, in a mutating method, and
+        // read there, through `currentWorker` after a trip through Python, was
+        // measured to read zero: a 20,000-request pipeline still dispatched
+        // each request from inside the last, 767 deep.
+        c.pointee.flags.insert(.eagerStarting)
         let spawned = pg_call3(ASGIRuntime.fnSpawnRequest, ASGIRuntime.loop, coro, doneCb)
-        eagerStarts -= 1
+        c.pointee.flags.remove(.eagerStarting)
 
         // The connection may have closed meanwhile, or a finished request may
         // already have handed it to the next one, so the slot is found again.
@@ -908,7 +914,7 @@ extension Worker {
             // deep as it is long. The deferred flush recycles it at the end of
             // the loop iteration instead, one request after another. A stream
             // has no pipeline behind it.
-            if eagerStarts > 0 && !c.pointee.isStream && c.pointee.fd >= 0 {
+            if c.pointee.flags.contains(.eagerStarting) && !c.pointee.isStream && c.pointee.fd >= 0 {
                 flushSoon(slot)
             } else {
                 finishResponse(slot)

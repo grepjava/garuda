@@ -106,6 +106,10 @@ public struct ConnFlags: OptionSet, Sendable {
     /// iteration produced. See `Worker.flushSoon`.
     public static let flushQueued      = ConnFlags(rawValue: 1 << 19)
 
+    /// Dispatch is inside the call that starts this request's application
+    /// eagerly, so the request can finish before that call returns.
+    public static let eagerStarting    = ConnFlags(rawValue: 1 << 20)
+
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
     /// one of these here would leak state across a pipelined request.

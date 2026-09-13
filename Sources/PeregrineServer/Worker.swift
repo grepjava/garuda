@@ -109,10 +109,10 @@ public struct Worker {
     /// to by finishing a response and dispatching the request pipelined
     /// behind it. The walk picks those up itself rather than starting another.
     var runningDeferredFlushes = false
-    /// Nonzero while dispatch is starting an ASGI application eagerly, when
-    /// the whole request can finish before dispatch returns.
-    var eagerStarts = 0
-
+    /// How far that walk has got. Entries before it are done with, which is
+    /// what lets a queue the walk keeps adding to be compacted instead of
+    /// overflowing.
+    var deferredFlushWalked = 0
     public var running = true
     /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
     public var draining = false
@@ -914,9 +914,18 @@ public struct Worker {
             return
         }
         let scheduled = appProtocol == .asgi ? scheduleDeferredFlush() : true
-        if !scheduled
-            || c.pointee.write.readableBytes >= config.readBufferSize
-            || deferredFlushCount >= table.capacity {
+        if !scheduled || c.pointee.write.readableBytes >= config.readBufferSize {
+            _ = flush(slot)
+            return
+        }
+        // A walk that keeps finding work -- each response in a pipeline
+        // dispatching the next request, whose application runs and queues
+        // again -- fills the queue with entries it has already passed. Those
+        // are dropped first. Flushing here instead would finish the response
+        // and dispatch the next request from inside this one, as deep as the
+        // pipeline goes.
+        if deferredFlushCount >= table.capacity { compactDeferredFlushes() }
+        if deferredFlushCount >= table.capacity {
             _ = flush(slot)
             return
         }
@@ -936,10 +945,10 @@ public struct Worker {
         runningDeferredFlushes = true
         // Finishing a response can dispatch the request pipelined behind it,
         // which can queue again, so the count is re-read on every pass.
-        var i = 0
-        while i < deferredFlushCount {
-            let token = deferredFlush[i]
-            i += 1
+        deferredFlushWalked = 0
+        while deferredFlushWalked < deferredFlushCount {
+            let token = deferredFlush[deferredFlushWalked]
+            deferredFlushWalked += 1
             let slot = PollToken.slot(token)
             let c = table[slot]
             if c.pointee.state == .free || c.pointee.generation != PollToken.generation(token)
@@ -950,8 +959,26 @@ public struct Worker {
             _ = flush(slot)
         }
         deferredFlushCount = 0
+        deferredFlushWalked = 0
         deferredFlushScheduled = false
         runningDeferredFlushes = false
+    }
+
+    /// Drops the entries a running walk has already passed. What is left is
+    /// one entry per slot still queued, plus any for a connection that closed
+    /// since it was queued; `flushSoon` flushes directly on the rare occasion
+    /// that still does not fit.
+    mutating func compactDeferredFlushes() {
+        let walked = deferredFlushWalked
+        if walked == 0 { return }
+        let pending = deferredFlushCount - walked
+        var i = 0
+        while i < pending {
+            deferredFlush[i] = deferredFlush[walked + i]
+            i += 1
+        }
+        deferredFlushCount = pending
+        deferredFlushWalked = 0
     }
 
     /// Pushes buffered bytes to the socket. Returns false if the connection
