@@ -23,9 +23,9 @@
 // than a Python closure over server state -- the count because a keep-alive
 // connection, and so its slot and generation, outlives each request. A
 // send that completes immediately -- the common case, since the bytes just go
-// into the write buffer -- returns a pre-completed awaitable that raises
-// StopIteration on its first step, so `await send(...)` never round-trips
-// through the event loop.
+// into the write buffer -- returns a pre-completed awaitable that finishes on
+// its first step without raising anything, so `await send(...)` never
+// round-trips through the event loop and never creates an exception object.
 //===----------------------------------------------------------------------===//
 
 import CPeregrine

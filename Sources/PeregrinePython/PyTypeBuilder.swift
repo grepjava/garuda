@@ -138,9 +138,10 @@ public func slotFn(_ f: PyFastCallFn) -> UnsafeMutableRawPointer {
 /// `await send(message)` normally has nothing to wait for -- the bytes go
 /// straight into the connection write buffer. Returning an `asyncio.Future`
 /// there would allocate a Future, schedule a callback and take a full trip
-/// through the event loop. This type instead raises `StopIteration(value)` on
-/// the first `__next__`, so the coroutine resumes immediately without ever
-/// yielding to the loop.
+/// through the event loop. This type instead finishes on the first
+/// `__next__`, so the coroutine resumes immediately without ever yielding to
+/// the loop: with `StopIteration(value)` when it carries a value, and with no
+/// exception at all when the result is `None`.
 public enum PyImmediate {
     nonisolated(unsafe) public private(set) static var type: PyObj! = nil
 
@@ -179,7 +180,14 @@ private func immediateAwait(_ selfObj: PyObj?) -> PyObj? {
 }
 
 private func immediateNext(_ selfObj: PyObj?) -> PyObj? {
-    // Raising StopIteration(value) is how a coroutine receives an await result.
-    pg_err_set_stop_iteration(pg_obj_ref(selfObj))
+    // Finishing is how a coroutine receives an await result. A value has to
+    // travel in StopIteration(value). None does not: returning NULL with no
+    // exception set says the same thing, because CPython's SEND (3.12-3.14,
+    // and PyIter_Send under it in 3.11) reads a missing exception through
+    // _PyGen_FetchStopIterationValue as a return of None. Every `await send()`
+    // then finishes without creating an exception object; `next()` on the
+    // awaitable still raises StopIteration, which it sets itself.
+    guard let value = pg_obj_ref(selfObj) else { return nil }
+    pg_err_set_stop_iteration(value)
     return nil
 }

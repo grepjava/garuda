@@ -31,6 +31,14 @@ version reached PyPI, in UTC.
   once the connection has closed. A late `receive` says `http.disconnect`.
   uvicorn behaves the same way.
 
+### Changed
+
+- `await send()` in an ASGI application finishes without creating a
+  `StopIteration` exception. On one worker, a raw ASGI application went from
+  116,099 to 118,728 req/s at 2.4 % less server CPU per request (six
+  interleaved rounds, `benchmarks/turbo_ab.sh`); FastAPI, whose own code is
+  most of each request, was unchanged within noise.
+
 ---
 
 ## 1.1.2 — 2026-09-13
