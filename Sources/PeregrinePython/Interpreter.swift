@@ -137,6 +137,30 @@ def spawn(loop, coro, done_cb):
     return task
 
 
+if sys.version_info >= (3, 12):
+    _Task = asyncio.Task
+
+    def spawn_request(loop, coro, done_cb):
+        # An HTTP application often never truly waits: send() completes at
+        # once, and so does receive() when the body is already here. Started
+        # eagerly, such a coroutine runs to its end inside this call and is
+        # reported finished here, rather than stepped and reported through two
+        # more trips round the loop. One that does wait becomes an ordinary
+        # task from its first suspension. An application that installed a
+        # task factory gets its tasks from it, and none of them start early.
+        if loop.get_task_factory() is None:
+            task = _Task(coro, loop=loop, eager_start=True)
+            if task.done():
+                done_cb(task)
+                return task
+        else:
+            task = loop.create_task(coro)
+        task.add_done_callback(done_cb)
+        return task
+else:
+    spawn_request = spawn
+
+
 def resolve(fut, value):
     if not fut.done():
         fut.set_result(value)
