@@ -70,6 +70,11 @@ The same string, everywhere people or packaging will read it:
 PyPI classifiers stay at Production/Stable unless the release is a
 deliberate step backwards.
 
+In the same commit, rename the **Unreleased** section of
+[RELEASE.md](RELEASE.md) to `X.Y.Z — YYYY-MM-DD` and put a new, empty
+Unreleased section above it. Anything a user would notice that is missing
+from it goes in now; the commit log since the last tag is the list to check.
+
 ### 2. Commit and push, then build on that commit
 
 ```bash
@@ -90,8 +95,11 @@ not a tag moved after GitHub has already announced it.
 ```bash
 git tag v1.1.1 <commit>
 git push origin v1.1.1
-gh release create v1.1.1 --title "1.1.1" --notes "..."
+gh release create v1.1.1 --title "1.1.1" --notes-file notes.md
 ```
+
+`notes.md` is that version's section of [RELEASE.md](RELEASE.md), so the
+release notes and the file in the repository say the same thing.
 
 The tag is what GitHub shows. It is not what `pip` installs.
 

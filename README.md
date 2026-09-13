@@ -38,6 +38,7 @@ and Flask against uvicorn, granian and fastpysgi on one worker, with the load
 and applications of
 [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
 and how that differs from what the site publishes. [DEPLOY.md](https://github.com/grepjava/peregrine/blob/main/DEPLOY.md) — how a release reaches PyPI.
+[RELEASE.md](https://github.com/grepjava/peregrine/blob/main/RELEASE.md) — what changed in each version.
 
 ---
 
