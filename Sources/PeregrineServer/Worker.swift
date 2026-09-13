@@ -109,9 +109,6 @@ public struct Worker {
     /// to by finishing a response and dispatching the request pipelined
     /// behind it. The walk picks those up itself rather than starting another.
     var runningDeferredFlushes = false
-    /// Nonzero while dispatch is starting an ASGI application eagerly, when
-    /// the whole request can finish before dispatch returns.
-    var eagerStarts = 0
 
     public var running = true
     /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
