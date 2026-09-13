@@ -36,9 +36,26 @@ public final class QUICListener {
     /// once.
     var live: [QUICConnection] = []
 
+    /// The most datagrams sent in one GSO call. The kernel takes up to 64 and
+    /// 64 KiB; 32 full-size datagrams stay inside both.
+    static let maxSegments = 32
+
     var receiveBuffer: UnsafeMutablePointer<UInt8>
     var messages: UnsafeMutablePointer<pg_udp_msg>
+    /// Outgoing datagrams, back to back, waiting to go out as one send.
     var sendBuffer: UnsafeMutablePointer<UInt8>
+    /// For version negotiation, which is written while receiving and must not
+    /// land on top of a batch the socket has not taken yet.
+    var negotiationBuffer: UnsafeMutablePointer<UInt8>
+    /// Whether datagrams to one peer go out as one send (UDP GSO).
+    var gso: Bool
+    /// The batch in `sendBuffer`: its length, its datagram size (every one but
+    /// the last is exactly this), how many it holds, and where it goes.
+    var pendingLength = 0
+    var pendingSegment = 0
+    var pendingCount = 0
+    var pendingPeer = pg_udp_addr()
+    var pendingLocal = pg_udp_addr()
     /// Set when the socket refused a datagram; cleared when it takes one.
     public private(set) var blocked = false
     /// Connections that saw traffic in the last batch, in arrival order and
@@ -58,13 +75,16 @@ public final class QUICListener {
         receiveBuffer = UnsafeMutablePointer<UInt8>.allocate(
             capacity: stride * QUICListener.batchSize)
         messages = UnsafeMutablePointer<pg_udp_msg>.allocate(capacity: QUICListener.batchSize)
-        sendBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: stride)
+        sendBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: stride * QUICListener.maxSegments)
+        negotiationBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: stride)
+        gso = pg_udp_gso_supported(fd) != 0
     }
 
     deinit {
         receiveBuffer.deallocate()
         messages.deallocate()
         sendBuffer.deallocate()
+        negotiationBuffer.deallocate()
     }
 
     public func destroy() {
@@ -177,27 +197,28 @@ public final class QUICListener {
         var offset = 0
         // The first byte's low bits are arbitrary, but the high bit must be
         // set so the packet reads as a long header.
-        sendBuffer[0] = 0x80 | 0x40
+        let out = negotiationBuffer
+        out[0] = 0x80 | 0x40
         offset = 1
-        quicWriteUInt32BE(QUICVersion.negotiation, sendBuffer + offset)
+        quicWriteUInt32BE(QUICVersion.negotiation, out + offset)
         offset += 4
         // The identifiers are swapped: what the client used as destination
         // comes back as source.
         scid.withBytes { q, n in
-            sendBuffer[offset] = UInt8(n); offset += 1
-            if n > 0 { (sendBuffer + offset).update(from: q, count: n) }
+            out[offset] = UInt8(n); offset += 1
+            if n > 0 { (out + offset).update(from: q, count: n) }
             offset += n
         }
         dcid.withBytes { q, n in
-            sendBuffer[offset] = UInt8(n); offset += 1
-            if n > 0 { (sendBuffer + offset).update(from: q, count: n) }
+            out[offset] = UInt8(n); offset += 1
+            if n > 0 { (out + offset).update(from: q, count: n) }
             offset += n
         }
-        quicWriteUInt32BE(QUICVersion.v1, sendBuffer + offset)
+        quicWriteUInt32BE(QUICVersion.v1, out + offset)
         offset += 4
         var peer = message.peer
         var local = message.local
-        _ = pg_udp_send(fd, sendBuffer, offset, &peer, &local, 0)
+        _ = pg_udp_send(fd, out, offset, &peer, &local, 0)
     }
 
     // MARK: - Sending
@@ -226,27 +247,107 @@ public final class QUICListener {
     /// it always has something to send must not be able to hold the worker.
     private static let datagramsPerTurn = 4096
 
+    /// Builds a connection's datagrams straight into `sendBuffer`, back to
+    /// back, and sends each run of equal-sized ones with a single GSO call.
+    ///
+    /// A connection moving data produces full-size datagrams, one after
+    /// another, all to the same address, and one syscall apiece was half the
+    /// worker's CPU: each also paid for its own route lookup and its own
+    /// wakeup of the receiver. A run ends at a datagram shorter than the ones
+    /// before it (the kernel allows the last to be short), at one longer (it
+    /// cannot join, so it starts the next run), or at `maxSegments`.
     private func writeAll(_ connection: QUICConnection, nowMs: UInt64) -> Bool {
+        if !sendPending() { return false }
+        let perSend = gso ? QUICListener.maxSegments : 1
         var remaining = QUICListener.datagramsPerTurn
         while remaining > 0 {
             remaining -= 1
-            let n = connection.nextDatagram(sendBuffer, QUICListener.datagramSize, nowMs: nowMs)
-            if n == 0 { return true }
-            var peer = connection.peerAddress
-            var local = connection.localAddress
-            let sent = pg_udp_send(fd, sendBuffer, n, &peer, &local, 0)
-            if sent < 0 {
-                let error = pg_errno()
-                if pg_err_is_again(error) != 0 {
-                    blocked = true
+            // There is always room: a run is sent before it reaches perSend.
+            let at = sendBuffer + pendingLength
+            let n = connection.nextDatagram(at, QUICListener.datagramSize, nowMs: nowMs)
+            if n == 0 { break }
+            if pendingLength == 0 {
+                pendingPeer = connection.peerAddress
+                pendingLocal = connection.localAddress
+                pendingSegment = n
+            } else if n > pendingSegment {
+                let held = pendingLength
+                if !sendPending() {
+                    // The socket is full with a run still waiting. The new
+                    // datagram is dropped, as a datagram the socket refused
+                    // always was; loss recovery sends its contents again.
                     return false
                 }
-                // A hard error on one datagram says nothing about the socket:
-                // an ICMP unreachable for one peer surfaces here.
-                return true
+                (sendBuffer).update(from: sendBuffer + held, count: n)
+                pendingPeer = connection.peerAddress
+                pendingLocal = connection.localAddress
+                pendingSegment = n
+            }
+            pendingLength += n
+            pendingCount += 1
+            if n < pendingSegment || pendingCount == perSend {
+                if !sendPending() { return false }
             }
         }
+        return sendPending()
+    }
+
+    /// Sends the run in `sendBuffer`. False only when the socket is full, and
+    /// then the run is kept for the next flush rather than thrown away: the
+    /// worker watches for writability and calls back as soon as there is room.
+    private func sendPending() -> Bool {
+        if pendingLength == 0 { return true }
+        // A run built before GSO turned out to be refused.
+        if !gso && pendingCount > 1 { return sendPendingOneByOne() }
+        let segment = pendingCount > 1 ? UInt16(pendingSegment) : 0
+        let sent = pg_udp_send_segments(fd, sendBuffer, pendingLength, segment,
+                                        &pendingPeer, &pendingLocal, 0)
+        if sent >= 0 {
+            clearPending()
+            return true
+        }
+        let error = pg_errno()
+        if pg_err_is_again(error) != 0 {
+            blocked = true
+            return false
+        }
+        if segment > 0 && pg_udp_gso_refused(error) != 0 {
+            // The kernel or the device will not segment. Nothing was wrong
+            // with the datagrams, so they go out one at a time, and so does
+            // everything after them.
+            gso = false
+            return sendPendingOneByOne()
+        }
+        // A hard error says nothing about the socket: an ICMP unreachable for
+        // one peer surfaces here. The run is lost, and recovered as loss.
+        clearPending()
         return true
+    }
+
+    private func sendPendingOneByOne() -> Bool {
+        var offset = 0
+        while offset < pendingLength {
+            let n = min(pendingSegment, pendingLength - offset)
+            let sent = pg_udp_send(fd, sendBuffer + offset, n, &pendingPeer, &pendingLocal, 0)
+            if sent < 0 && pg_err_is_again(pg_errno()) != 0 {
+                // Keep what has not gone, at the front, for the next flush.
+                let rest = pendingLength - offset
+                sendBuffer.update(from: sendBuffer + offset, count: rest)
+                pendingLength = rest
+                pendingCount = (rest + pendingSegment - 1) / pendingSegment
+                blocked = true
+                return false
+            }
+            offset += n
+        }
+        clearPending()
+        return true
+    }
+
+    @inline(__always)
+    private func clearPending() {
+        pendingLength = 0
+        pendingCount = 0
     }
 
     // MARK: - Timers

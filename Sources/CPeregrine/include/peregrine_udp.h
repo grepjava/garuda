@@ -56,6 +56,22 @@ long pg_udp_send(int fd, const void *buf, size_t len,
                  const pg_udp_addr *peer, const pg_udp_addr *local,
                  uint8_t ecn);
 
+/* Sends a run of datagrams in one call with UDP GSO: `buf` holds datagrams of
+ * `segment` bytes each, back to back, the last allowed to be shorter. With
+ * `segment` 0, or `len` no more than it, this is pg_udp_send. The run is
+ * accepted or refused whole. */
+long pg_udp_send_segments(int fd, const void *buf, size_t len, uint16_t segment,
+                          const pg_udp_addr *peer, const pg_udp_addr *local,
+                          uint8_t ecn);
+
+/* Whether this socket can take pg_udp_send_segments with a segment size: 1 on
+ * a Linux kernel with UDP_SEGMENT unless PEREGRINE_UDP_GSO=0, else 0. */
+int pg_udp_gso_supported(int fd);
+
+/* Whether an errno from pg_udp_send_segments means segmentation itself was
+ * refused, so the same datagrams should go out one at a time. */
+int pg_udp_gso_refused(int err);
+
 /* Printable form, for logging and the ASGI `client` field. */
 int pg_udp_addr_text(const pg_udp_addr *addr, char *host, size_t host_len,
                      uint16_t *port);

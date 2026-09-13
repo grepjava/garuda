@@ -17,6 +17,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -24,6 +25,10 @@
 
 #if defined(__linux__)
 #  include <linux/in6.h>
+#  include <netinet/udp.h>
+#  ifndef SOL_UDP
+#    define SOL_UDP IPPROTO_UDP
+#  endif
 #endif
 
 /* pg_set_nonblock / pg_set_cloexec live in peregrine_sys.c. */
@@ -260,9 +265,36 @@ int pg_udp_recv_batch(int fd, void *buf, size_t stride,
 #endif
 }
 
+int pg_udp_gso_supported(int fd) {
+#if defined(__linux__) && defined(UDP_SEGMENT)
+    /* PEREGRINE_UDP_GSO=0 turns it off, so the one-datagram-per-send path the
+     * tests would otherwise never reach on Linux can still be exercised. */
+    const char *env = getenv("PEREGRINE_UDP_GSO");
+    if (env && env[0] == '0') return 0;
+    int size = 0;
+    socklen_t len = sizeof size;
+    return getsockopt(fd, SOL_UDP, UDP_SEGMENT, &size, &len) == 0;
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
+int pg_udp_gso_refused(int err) {
+    /* What sendmsg says when the kernel or the device cannot segment: the
+     * datagrams themselves were fine and go out one by one instead. */
+    return err == EIO || err == EINVAL || err == ENOPROTOOPT || err == EOPNOTSUPP;
+}
+
 long pg_udp_send(int fd, const void *buf, size_t len,
                  const pg_udp_addr *peer, const pg_udp_addr *local,
                  uint8_t ecn) {
+    return pg_udp_send_segments(fd, buf, len, 0, peer, local, ecn);
+}
+
+long pg_udp_send_segments(int fd, const void *buf, size_t len, uint16_t segment,
+                          const pg_udp_addr *peer, const pg_udp_addr *local,
+                          uint8_t ecn) {
     if (!peer || peer->len == 0) { errno = EINVAL; return -1; }
 
     struct iovec iov;
@@ -353,6 +385,25 @@ long pg_udp_send(int fd, const void *buf, size_t len,
             }
         }
     }
+
+#if defined(__linux__) && defined(UDP_SEGMENT)
+    /* Several datagrams of `segment` bytes in one buffer, the last possibly
+     * shorter: the kernel cuts them apart below the socket, so a burst costs
+     * one syscall, one route lookup and one wakeup of the receiver instead of
+     * one of each per datagram. */
+    if (segment > 0 && len > segment) {
+        if (used + CMSG_SPACE(sizeof(uint16_t)) > sizeof control) { errno = EINVAL; return -1; }
+        mh.msg_controllen = (socklen_t)(sizeof control);
+        struct cmsghdr *seg = (struct cmsghdr *)(control + used);
+        seg->cmsg_level = SOL_UDP;
+        seg->cmsg_type = UDP_SEGMENT;
+        seg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+        memcpy(CMSG_DATA(seg), &segment, sizeof segment);
+        used += CMSG_SPACE(sizeof(uint16_t));
+    }
+#else
+    (void)segment;
+#endif
     mh.msg_controllen = (socklen_t)used;
     if (used == 0) mh.msg_control = NULL;
 
