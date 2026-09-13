@@ -298,6 +298,58 @@ The Elysia row needs [Bun](https://bun.sh) and port 3000, since the suite's
 
 ---
 
+## The ASGI path, change by change
+
+Changes to the per-request ASGI path since 1.1.2, unreleased. Each was
+measured on its own against the build before it, and kept only if it helped.
+
+[benchmarks/turbo_ab.sh](benchmarks/turbo_ab.sh) runs two builds of the
+extension module in one session:
+- **Server:** one worker pinned to one CPU.
+- **Load:** closed-loop `oha -c 64` for 15 s on the other three CPUs.
+- **Rounds:** six, interleaved A B then B A, after an A/A calibration run
+  whose spread is that session's noise.
+- **Second measure:** alongside requests per second, the server's own CPU
+  time per request, read from `/proc/<pid>/task/*/schedstat`. It moves less
+  than req/s when the load generator is what is short of CPU.
+
+The applications are the raw ASGI app,
+[benchmarks/contract/asgi.py](benchmarks/contract/asgi.py), and the FastAPI
+app above. Figures are medians of the six rounds.
+
+On this build a raw ASGI request costs the server about 9 µs of CPU, at about
+116,000 requests a second on one worker. That replaces an older 60,000 from
+before responses were batched and before the extension module. A FastAPI
+request costs about 43 µs, most of it FastAPI's own code.
+
+| change | application | req/s | server CPU per request | rounds B faster, cheaper | A/A spread, req/s and CPU | kept |
+|---|---|---:|---:|:---:|:---:|:---:|
+| `await send()` finishes without creating a `StopIteration` | raw ASGI | 116,099 → 118,728 (+2.3 %) | 9.21 → 9.00 µs (−2.4 %) | 5/6, 6/6 | 0.7 %, 1.0 % | yes |
+| | FastAPI | 25,098 → 24,984 (−0.5 %) | 42.97 → 42.65 µs (−0.7 %) | 3/6, 2/6 | 2.7 %, 2.1 % | |
+| a finished task checked with `task.exception()` from Swift, not a Python function | raw ASGI | 115,556 → 114,261 (−1.1 %) | 9.22 → 9.46 µs (+2.5 %) | 2/6, 2/6 | 4.5 %, 3.2 % | no |
+| | FastAPI | 25,033 → 24,912 (−0.5 %) | 42.65 → 42.98 µs (+0.8 %) | 3/6, 2/6 | 0.1 %, 0.3 % | |
+
+- **A change within noise on FastAPI is expected.** The framework is most of
+  a FastAPI request, so a saving of a fraction of a microsecond on the server
+  side is a percent of a raw ASGI request and a fraction of one on FastAPI.
+- **The second change is why every change goes through the server.**
+  [benchmarks/asgi_overhead.py](benchmarks/asgi_overhead.py), which times the
+  same asyncio work in-process, predicted it would save 0.23–0.29 µs a
+  request. Measured end to end, it saved nothing.
+- **The in-process benchmark does size what is left.** With uvloop, the
+  asyncio task each request runs in costs 1.1–1.3 µs of the ~9. Building the
+  scope costs 0.6–0.8 µs for 3 headers and about 1.5 µs for 15. Neither is
+  the bulk of it.
+
+Reproduce, with two checkouts each built with `scripts/build-extension.sh`:
+
+```bash
+BUILD_A=../peregrine-before BUILD_B=. bash benchmarks/turbo_ab.sh
+python benchmarks/asgi_overhead.py
+```
+
+---
+
 ## What the gap is made of
 
 On a hello-world route the framework is most of the work, so the difference

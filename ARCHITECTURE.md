@@ -315,6 +315,12 @@ by a fixed limit, and connections by `--max-connections`; a full table answers
 - **A cached `Date` header**, reformatted at most once a second by a
   no-allocation, no-locale civil-from-days conversion.
 - **Vectorcall everywhere** — no intermediate argument tuples.
+- **`await send()` never waits and never raises.** A send whose bytes went
+  straight into the write buffer returns an awaitable that is already
+  complete, so the coroutine resumes without a trip through the event loop.
+  It completes by returning with no exception set rather than by raising
+  `StopIteration`, which CPython reads as a return of `None`, so no exception
+  object is created per `await`.
 - **Pooled read buffers** recycled LIFO, so the block handed out next is the
   one still in cache.
 - **Framing decided with full information.** A WSGI response that is a list
