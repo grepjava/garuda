@@ -205,6 +205,34 @@ def case_probe():
           "probe start=None next=StopIteration(None)" in seen, repr(seen))
 
 
+def server_output():
+    try:
+        with open(os.path.join(WORK, "server.log")) as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def case_task_outcome():
+    # The same end of a request's task, from the other side: what the server
+    # makes of how it finished.
+    print("How a finished application task is reported")
+    reset_log()
+    before = len(server_output())
+    c = Conn()
+    c.request("GET", "/raise")
+    status, _ = c.response()
+    check("an application that raises gets a 500", status == 500, str(status))
+    c.close()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and "deliberate failure" not in server_output()[before:]:
+        time.sleep(0.05)
+    text = server_output()[before:]
+    check("its failure is logged", "application task failed" in text, repr(text[-400:]))
+    check("with its traceback",
+          "ValueError: deliberate failure in the application" in text, repr(text[-400:]))
+
+
 def main():
     try:
         socket.create_connection(("127.0.0.1", PORT), timeout=0.5).close()
@@ -235,7 +263,8 @@ def main():
             return 1
 
         for name, fn in (("next request", case_next_request), ("idle", case_idle),
-                         ("closed", case_closed), ("probe", case_probe)):
+                         ("closed", case_closed), ("probe", case_probe),
+                         ("task outcome", case_task_outcome)):
             attempt(name, fn)
         alive = server.poll() is None
         check("the server is still running", alive)

@@ -88,5 +88,7 @@ async def app(scope, receive, send):
         except StopIteration as stop:
             outcome = f"StopIteration({stop.value!r})"
         log(f"probe start={started!r} next={outcome}")
+    elif path == "/raise":
+        raise ValueError("deliberate failure in the application")
     else:
         await respond(send, b"ok")
