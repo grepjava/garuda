@@ -29,15 +29,15 @@ peregrine --reload myapp:app                # restart on source changes
 peregrine --http3 --tls-cert cert.pem --tls-key key.pem myapp:app
 ```
 
-**Further reading:** [INSTALLATION.md](INSTALLATION.md) — what to install and
-what to do when it goes wrong. [CONFIG.md](CONFIG.md) — configuring FastAPI and
-Flask for every protocol here. [ARCHITECTURE.md](ARCHITECTURE.md) — how the
-server is built, and why. [TRANSPORT.md](TRANSPORT.md) — what each protocol
-does and what is implemented of it. [BENCHMARKS.md](BENCHMARKS.md) — FastAPI
+**Further reading:** [INSTALLATION.md](https://github.com/grepjava/peregrine/blob/main/INSTALLATION.md) — what to install and
+what to do when it goes wrong. [CONFIG.md](https://github.com/grepjava/peregrine/blob/main/CONFIG.md) — configuring FastAPI and
+Flask for every protocol here. [ARCHITECTURE.md](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md) — how the
+server is built, and why. [TRANSPORT.md](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md) — what each protocol
+does and what is implemented of it. [BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md) — FastAPI
 and Flask against uvicorn, granian and fastpysgi on one worker, with the load
 and applications of
 [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
-and how that differs from what the site publishes. [DEPLOY.md](DEPLOY.md) — how a release reaches PyPI.
+and how that differs from what the site publishes. [DEPLOY.md](https://github.com/grepjava/peregrine/blob/main/DEPLOY.md) — how a release reaches PyPI.
 
 ---
 
@@ -53,7 +53,7 @@ loop and the syscall — a garbage collector that stops the world, a green-threa
 runtime that decides when a read happens — buys concurrency this design does
 not need and costs latency it cannot recover. Swift has neither. Reference
 counting is deterministic, and where it would cost anything it can be removed,
-which is a large part of [what the server does](ARCHITECTURE.md#minimising-arc).
+which is a large part of [what the server does](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md#minimising-arc).
 
 **It talks to C without a binding layer.** Embedding CPython means calling a C
 API constantly: `PyDict_SetItem`, `PyObject_Vectorcall`, `Py_DECREF`, a few
@@ -124,7 +124,7 @@ not listed there. What these tables show is how the servers compare with each
 other on one worker of this machine.
 
 Method, latencies, where this differs from the published results, and how to
-reproduce it: [BENCHMARKS.md](BENCHMARKS.md). Run-to-run variance on this box is
+reproduce it: [BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md). Run-to-run variance on this box is
 around ±10 %, so read the ratios rather than the absolute figures.
 
 These are hello-world routes, so they measure what a server adds to a request
@@ -148,7 +148,7 @@ worker's resident memory is CPython and the application.
 WebSockets and WebTransport are refused for WSGI rather than half-served: both
 are streams that outlive their response, and PEP 3333 has no way to express
 one. Everything else is the same code for both — see
-[one request path](TRANSPORT.md#one-request-path).
+[one request path](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#one-request-path).
 
 **WSGI (PEP 3333):** full environ, `wsgi.input` as a C-level stream (`read`,
 `readline`, `readlines`, iteration), `start_response` including `exc_info`
@@ -157,7 +157,7 @@ semantics and the legacy `write` callable, `wsgi.file_wrapper`, iterable
 `Content-Length`/chunked framing. `start_response` may be called from inside
 the first iteration of the returned iterable, as the spec requires a server to
 allow, and a `Content-Length` the application declares is
-[enforced](TRANSPORT.md#framing-is-enforced-not-trusted) rather than trusted.
+[enforced](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#framing-is-enforced-not-trusted) rather than trusted.
 
 Output is unbuffered in the sense PEP 3333 means. A block yielded by an
 iterator goes to the socket before the next one is asked for, and a block
@@ -193,11 +193,11 @@ task waiting on a body nobody will read holds the connection with it.
 **ASGI 3.0 (WebSocket):** the full connect / accept / receive / send / close
 cycle, subprotocol negotiation, extra handshake headers, fragmented messages,
 text and binary, keepalive ping/pong with a dead-peer timeout, and a message
-size limit. [Details.](TRANSPORT.md#websocket)
+size limit. [Details.](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#websocket)
 
 **WebTransport:** sessions, streams in both directions, unreliable datagrams
 and the close capsule, through a documented
-[ASGI extension](TRANSPORT.md#the-asgi-extension) — ASGI has no WebTransport
+[ASGI extension](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#the-asgi-extension) — ASGI has no WebTransport
 specification, so this one is Peregrine's.
 
 **Free-threaded CPython (PEP 703):** `--free-threaded` runs the workers as
@@ -214,7 +214,7 @@ at a third of the memory, because the application is imported once instead of
 four times. The ASGI lifespan runs once per worker thread, on the event loop that
 thread serves requests with, so what an application opens in `startup` is
 attached to the loop that will await
-it. [Details.](CONFIG.md#free-threaded-python)
+it. [Details.](https://github.com/grepjava/peregrine/blob/main/CONFIG.md#free-threaded-python)
 
 ---
 
@@ -241,7 +241,7 @@ embeds `libpython` and takes the same options; it is for working on Peregrine
 itself.
 
 Requirements, per-platform packages, certificates and the failure modes worth
-recognising: [INSTALLATION.md](INSTALLATION.md).
+recognising: [INSTALLATION.md](https://github.com/grepjava/peregrine/blob/main/INSTALLATION.md).
 
 ---
 
@@ -336,8 +336,8 @@ every worker one at a time, each replacement accepting on the socket its
 predecessor had before that one is asked to stop, so nothing is refused and
 nothing is reset -- which also makes it the certbot deploy hook, because the
 replacements read the certificate off disk again. See
-[reloading without a restart](CONFIG.md#reloading-without-a-restart), and the
-[shutdown sequence](ARCHITECTURE.md#shutdown), which is more careful than it
+[reloading without a restart](https://github.com/grepjava/peregrine/blob/main/CONFIG.md#reloading-without-a-restart), and the
+[shutdown sequence](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md#shutdown), which is more careful than it
 looks and deliberately so.
 
 ### Behind a reverse proxy
@@ -386,8 +386,8 @@ async def chat(session):
 Flask needs nothing at all: as a WSGI application it is served over HTTP/1.1,
 HTTP/2 and HTTP/3, and WebSocket and WebTransport, which PEP 3333 cannot
 express, are refused with a 501.
-[How to configure both, protocol by protocol.](CONFIG.md)
-[What the router does.](TRANSPORT.md#frameworks)
+[How to configure both, protocol by protocol.](https://github.com/grepjava/peregrine/blob/main/CONFIG.md)
+[What the router does.](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#frameworks)
 
 ---
 
@@ -399,7 +399,7 @@ disagreeing lengths, any `Transfer-Encoding` that is not a bare `chunked`,
 `obs-fold`, a missing or repeated `Host`.
 Response headers containing CR or LF are refused outright. Request header names
 containing underscores are dropped, and a `Proxy:` header is dropped entirely.
-[The full list.](TRANSPORT.md#strictness-that-prevents-smuggling)
+[The full list.](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#strictness-that-prevents-smuggling)
 
 Every transport is checked against an implementation that shares none of its
 code, because a test written against the same understanding as the code proves
@@ -433,11 +433,11 @@ swift run -c release pgfuzz                     # mutation fuzzing of every
                                                 #   from the network
 ```
 
-[CI](.github/workflows/ci.yml) runs all of it on every push, against CPython
+[CI](https://github.com/grepjava/peregrine/blob/main/.github/workflows/ci.yml) runs all of it on every push, against CPython
 3.11 through 3.14 and a free-threaded 3.14, on Linux and macOS, plus the
 fuzzer under AddressSanitizer. The suites are the ones above — there is no
 CI-only test path, so a green run there means what a green run here means.
-[More on the fuzzing.](fuzz/README.md)
+[More on the fuzzing.](https://github.com/grepjava/peregrine/blob/main/fuzz/README.md)
 
 HTTP/2 conformance is checked with
 [h2spec](https://github.com/summerwind/h2spec), which is not vendored here:
