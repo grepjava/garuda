@@ -38,6 +38,20 @@ func makeCString(_ value: Int) -> UnsafePointer<CChar> {
     return UnsafePointer(buf)
 }
 
+/// `dir` followed by `suffix`, in permanently allocated memory. Once per
+/// process, for the paths --acme-cache implies.
+func joinPath(_ dir: UnsafePointer<CChar>, _ suffix: StaticString) -> UnsafePointer<CChar> {
+    let head = Int(strlen(dir))
+    let tail = suffix.utf8CodeUnitCount
+    let out = UnsafeMutablePointer<CChar>.allocate(capacity: head + tail + 1)
+    out.update(from: dir, count: head)
+    UnsafeRawPointer(suffix.utf8Start).withMemoryRebound(to: CChar.self, capacity: tail) {
+        (out + head).update(from: $0, count: tail)
+    }
+    out[head + tail] = 0
+    return UnsafePointer(out)
+}
+
 /// `h3=":443"; ma=86400` -- the Alt-Svc value advertising HTTP/3 on the UDP
 /// port. The lifetime is a day, long enough to be worth caching and short
 /// enough that turning HTTP/3 off is not a decision clients keep honouring.
@@ -100,6 +114,15 @@ func printUsage() {
                                SNI, using the names inside each certificate
       --tls-key PATH           PEM private key for the preceding --tls-cert
       --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
+      --acme-domain NAME       get and renew a certificate for NAME from an
+                               ACME CA (Let's Encrypt by default), answering
+                               tls-alpn-01 on this port (repeatable)
+      --acme-email ADDR        contact address for the ACME account
+      --acme-cache DIR         where the account key and certificate live
+                               (default ./acme)
+      --acme-staging           use Let's Encrypt's staging CA
+      --acme-directory URL     use another ACME CA
+      --acme-ca-bundle PATH    roots to trust for the CA's own HTTPS
       --no-http2               refuse HTTP/2 and answer HTTP/1.1 only
       --http2-only             serve only HTTP/2 (h2c), with no HTTP/1 fallback
       --http3                  also serve HTTP/3 over QUIC (needs TLS)
@@ -288,6 +311,23 @@ while i < argc {
     } else if matches(arg, "--tls-key") {
         guard let v = next("--tls-key needs a path") else { break }
         tlsKeys.append(v)
+    } else if matches(arg, "--acme-domain") {
+        guard let v = next("--acme-domain needs a name") else { break }
+        config.acmeDomains.append(v)
+    } else if matches(arg, "--acme-email") {
+        guard let v = next("--acme-email needs an address") else { break }
+        config.acmeEmail = v
+    } else if matches(arg, "--acme-cache") {
+        guard let v = next("--acme-cache needs a directory") else { break }
+        config.acmeCacheDir = v
+    } else if matches(arg, "--acme-directory") {
+        guard let v = next("--acme-directory needs a URL") else { break }
+        config.acmeDirectory = v
+    } else if matches(arg, "--acme-staging") {
+        config.acmeDirectory = staticCString("https://acme-staging-v02.api.letsencrypt.org/directory")
+    } else if matches(arg, "--acme-ca-bundle") {
+        guard let v = next("--acme-ca-bundle needs a path") else { break }
+        config.acmeCABundle = v
     } else if matches(arg, "--tls-ciphers") {
         guard let v = next("--tls-ciphers needs an OpenSSL cipher list") else { break }
         config.tlsCiphers = v
@@ -523,6 +563,47 @@ if let cert = tlsCerts.first, let key = tlsKeys.first {
     config.tlsKeyPath = key
     config.tlsExtraCerts = Array(zip(tlsCerts.dropFirst(), tlsKeys.dropFirst()))
         .map { (cert: $0.0, key: $0.1) }
+}
+
+// --acme-domain: the certificate comes from the CA, into the cache directory,
+// and the TLS paths are simply where it will be.
+if config.acmeEnabled {
+    if config.tlsCertPath != nil {
+        Log.error("--acme-domain gets its own certificate; leave out --tls-cert and --tls-key")
+        exit(2)
+    }
+    for domain in config.acmeDomains {
+        // tls-alpn-01 validates one name on one connection, so there are no
+        // wildcards here: a wildcard certificate needs dns-01, which needs a
+        // DNS provider this server knows nothing about.
+        var length = 0
+        var valid = domain[0] != 0 && domain[0] != 46 && domain[0] != 45
+        while domain[length] != 0 {
+            let c = UInt8(bitPattern: domain[length])
+            let allowed = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+                || (c >= 48 && c <= 57) || c == 45 || c == 46
+            if !allowed { valid = false }
+            length += 1
+        }
+        if !valid || length > 253 {
+            Log.error { line in
+                line.str("--acme-domain takes a DNS name, not ")
+                line.cstr(domain)
+            }
+            exit(2)
+        }
+    }
+    let dir = config.acmeCacheDir ?? staticCString("acme")
+    config.acmeCacheDir = dir
+    config.tlsCertPath = joinPath(dir, "/cert.pem")
+    config.tlsKeyPath = joinPath(dir, "/key.pem")
+    if config.port != 443 {
+        // Allowed, because a test CA validates wherever it is told to and a
+        // port-forward may put 443 somewhere else -- but a public CA connects
+        // to 443 and nowhere else, and saying so here beats a failed
+        // validation an hour from now.
+        Log.warn("--acme-domain: public CAs validate on port 443; make sure it reaches this port")
+    }
 }
 
 // Workers as threads only mean anything on an interpreter that can run them in

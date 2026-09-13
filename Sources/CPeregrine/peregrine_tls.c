@@ -17,6 +17,8 @@
 #include "peregrine_tls.h"
 
 #include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -65,6 +67,8 @@ long pg_tls_write(pg_tls *tls, const void *buf, long n) {
 int pg_tls_pending(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_wants_write(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_is_h2(pg_tls *tls) { (void)tls; return 0; }
+int pg_tls_is_acme(pg_tls *tls) { (void)tls; return 0; }
+int pg_tls_ctx_set_acme_dir(pg_tls_ctx *ctx, const char *dir) { (void)ctx; (void)dir; return -1; }
 void pg_tls_shutdown(pg_tls *tls) { (void)tls; }
 
 #else
@@ -101,13 +105,23 @@ struct pg_tls_ctx {
      * first. Held here because the callback runs per connection. */
     unsigned char *alpn;
     unsigned int alpn_len;
+    /* Where --acme-domain keeps its files, when it is on. A tls-alpn-01
+     * challenge certificate for NAME is at <acme_dir>/alpn/NAME.crt. */
+    char *acme_dir;
 };
 
 struct pg_tls {
     SSL *ssl;
     int wants_write;
     int h2;
+    /* The connection negotiated acme-tls/1: a CA validating a challenge, to
+     * be closed as soon as the handshake is done. */
+    int acme;
 };
+
+/* Marks a connection that is being served a challenge certificate, so that the
+ * SNI and ALPN callbacks leave it alone. Allocated once per process. */
+static int acme_ex_index = -1;
 
 static void last_error(char *err, size_t err_len, const char *what) {
     if (!err || err_len == 0) return;
@@ -151,8 +165,21 @@ static unsigned char *encode_alpn(const char *list, unsigned int *out_len) {
  * a server that would rather speak HTTP/2 wants. */
 static int alpn_select(SSL *ssl, const unsigned char **out, unsigned char *out_len,
                        const unsigned char *in, unsigned int in_len, void *arg) {
-    (void)ssl;
     struct pg_tls_ctx *ctx = (struct pg_tls_ctx *)arg;
+    /* A challenge connection speaks acme-tls/1 and nothing else (RFC 8737). */
+    if (acme_ex_index >= 0 && SSL_get_ex_data(ssl, acme_ex_index)) {
+        for (unsigned int j = 0; j + 1 <= in_len && in[j];) {
+            unsigned char have_len = in[j];
+            if (have_len == 10 && j + 1u + 10u <= in_len
+                && memcmp(in + j + 1, "acme-tls/1", 10) == 0) {
+                *out = in + j + 1;
+                *out_len = 10;
+                return SSL_TLSEXT_ERR_OK;
+            }
+            j += 1u + have_len;
+        }
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
     for (unsigned int i = 0; i + 1 <= ctx->alpn_len && ctx->alpn[i];) {
         unsigned char want_len = ctx->alpn[i];
         const unsigned char *want = ctx->alpn + i + 1;
@@ -232,6 +259,8 @@ static int host_matches(const char *pattern, const char *host) {
 static int sni_select(SSL *ssl, int *unused_alert, void *arg) {
     (void)unused_alert;
     struct pg_tls_ctx *wrapper = (struct pg_tls_ctx *)arg;
+    /* Swapping the context would swap out the challenge certificate. */
+    if (acme_ex_index >= 0 && SSL_get_ex_data(ssl, acme_ex_index)) return SSL_TLSEXT_ERR_OK;
     const char *asked = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
     if (!asked || !*asked) return SSL_TLSEXT_ERR_OK;
 
@@ -310,6 +339,105 @@ static int add_host(struct pg_tls_ctx *wrapper, const char *cert_path,
     return 1;
 }
 
+/* --- tls-alpn-01 (RFC 8737) ------------------------------------------------
+ *
+ * A CA validating a challenge opens a TLS connection offering exactly one
+ * protocol, acme-tls/1, and expects a self-signed certificate carrying the
+ * digest of the key authorization. The ACME helper process writes that
+ * certificate into the cache directory; any worker the connection lands on
+ * finds it there by the name in the SNI.
+ *
+ * It has to be decided in the ClientHello callback. The SNI callback runs
+ * before ALPN is known, and the ALPN callback runs after the certificate has
+ * been chosen, so neither alone can serve a certificate that depends on both. */
+
+static pthread_once_t acme_index_once = PTHREAD_ONCE_INIT;
+
+static void make_acme_index(void) {
+    acme_ex_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+}
+
+static int offers_acme(const unsigned char *ext, size_t len) {
+    if (len < 2) return 0;
+    size_t list = (size_t)ext[0] << 8 | ext[1];
+    if (list + 2 > len) return 0;
+    size_t i = 2;
+    while (i < 2 + list) {
+        size_t n = ext[i];
+        if (i + 1 + n > 2 + list) return 0;
+        if (n == 10 && memcmp(ext + i + 1, "acme-tls/1", 10) == 0) return 1;
+        i += 1 + n;
+    }
+    return 0;
+}
+
+/* The host name from a raw server_name extension, lower-cased, restricted to
+ * the characters a DNS name has -- it becomes part of a file path. */
+static int sni_host(const unsigned char *ext, size_t len, char *out, size_t cap) {
+    if (len < 5) return 0;
+    size_t list = (size_t)ext[0] << 8 | ext[1];
+    if (list + 2 > len || list < 3 || ext[2] != 0) return 0;
+    size_t n = (size_t)ext[3] << 8 | ext[4];
+    if (n == 0 || n + 5 > len || n >= cap) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = ext[5 + i];
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+        int allowed = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.';
+        if (!allowed) return 0;
+        out[i] = (char)c;
+    }
+    out[n] = 0;
+    return out[0] != '.';
+}
+
+static int acme_client_hello(SSL *ssl, int *alert, void *arg) {
+    (void)alert;
+    struct pg_tls_ctx *wrapper = (struct pg_tls_ctx *)arg;
+    if (!wrapper->acme_dir) return SSL_CLIENT_HELLO_SUCCESS;
+
+    const unsigned char *ext;
+    size_t len;
+    if (!SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_application_layer_protocol_negotiation,
+                                   &ext, &len)
+        || !offers_acme(ext, len)) {
+        return SSL_CLIENT_HELLO_SUCCESS;
+    }
+    char host[256];
+    if (!SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_server_name, &ext, &len)
+        || !sni_host(ext, len, host, sizeof host)) {
+        return SSL_CLIENT_HELLO_SUCCESS;
+    }
+    char cert[4200], key[4200];
+    if (snprintf(cert, sizeof cert, "%s/alpn/%s.crt", wrapper->acme_dir, host) >= (int)sizeof cert
+        || snprintf(key, sizeof key, "%s/alpn/%s.key", wrapper->acme_dir, host) >= (int)sizeof key) {
+        return SSL_CLIENT_HELLO_SUCCESS;
+    }
+    /* No challenge pending for that name is not an error here: the handshake
+     * carries on as usual, and a client that offered nothing but acme-tls/1
+     * is refused by the ALPN callback for want of a protocol in common. */
+    if (SSL_use_certificate_file(ssl, cert, SSL_FILETYPE_PEM) != 1
+        || SSL_use_PrivateKey_file(ssl, key, SSL_FILETYPE_PEM) != 1) {
+        ERR_clear_error();
+        return SSL_CLIENT_HELLO_SUCCESS;
+    }
+    SSL_set_ex_data(ssl, acme_ex_index, (void *)1);
+    return SSL_CLIENT_HELLO_SUCCESS;
+}
+
+int pg_tls_ctx_set_acme_dir(pg_tls_ctx *wrapper, const char *dir) {
+    if (!wrapper || !dir) return -1;
+    pthread_once(&acme_index_once, make_acme_index);
+    if (acme_ex_index < 0) return -1;
+    char *copy = strdup(dir);
+    if (!copy) return -1;
+    free(wrapper->acme_dir);
+    wrapper->acme_dir = copy;
+    /* On the context every connection starts on: the ClientHello callback
+     * runs before SNI could move a connection to another one. */
+    SSL_CTX_set_client_hello_cb(wrapper->ctx, acme_client_hello, wrapper);
+    return 0;
+}
+
 int pg_tls_available(void) { return 1; }
 
 int pg_tls_ctx_add(pg_tls_ctx *wrapper, const char *cert_path, const char *key_path,
@@ -376,6 +504,7 @@ void pg_tls_ctx_free(pg_tls_ctx *wrapper) {
         if (wrapper->hosts[i].ctx) SSL_CTX_free(wrapper->hosts[i].ctx);
     }
     free(wrapper->alpn);
+    free(wrapper->acme_dir);
     free(wrapper);
 }
 
@@ -409,6 +538,7 @@ int pg_tls_handshake(pg_tls *tls, char *err, size_t err_len) {
         unsigned int len = 0;
         SSL_get0_alpn_selected(tls->ssl, &proto, &len);
         tls->h2 = (len == 2 && proto && proto[0] == 'h' && proto[1] == '2');
+        tls->acme = (len == 10 && proto && memcmp(proto, "acme-tls/1", 10) == 0);
         tls->wants_write = 0;
         return 1;
     }
@@ -494,6 +624,8 @@ int pg_tls_pending(pg_tls *tls) {
 int pg_tls_wants_write(pg_tls *tls) { return tls ? tls->wants_write : 0; }
 
 int pg_tls_is_h2(pg_tls *tls) { return tls ? tls->h2 : 0; }
+
+int pg_tls_is_acme(pg_tls *tls) { return tls ? tls->acme : 0; }
 
 void pg_tls_shutdown(pg_tls *tls) {
     if (!tls || !tls->ssl) return;

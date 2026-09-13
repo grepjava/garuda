@@ -35,6 +35,12 @@
 // company. See FreeThreaded.swift.
 //===----------------------------------------------------------------------===//
 
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
 import CPeregrine
 import PeregrineCore
 import PeregrineHTTP
@@ -55,6 +61,31 @@ public enum Peregrine {
                 line.str("file descriptor limit ")
                 line.int(Int(limit))
                 line.str(" is below max-connections; lower --max-connections or raise ulimit -n")
+            }
+        }
+
+        // --acme-domain. Workers need a certificate to start, and the challenge
+        // that gets a real one is answered by those same workers, so a server
+        // with nothing cached yet starts on a self-signed placeholder and
+        // reloads off it once the CA has issued.
+        if config.acmeEnabled, let dir = config.acmeCacheDir,
+           let cert = config.tlsCertPath, let key = config.tlsKeyPath {
+            if pg_acme_mkdirs(dir) != 0 {
+                Log.error("cannot create the --acme-cache directory")
+                return 1
+            }
+            if access(cert, R_OK) != 0 {
+                let names = ACME.settings(config).names
+                var error = [CChar](repeating: 0, count: 256)
+                let made = names.withCString { pg_acme_placeholder($0, cert, key, &error, 256) }
+                if made != 0 {
+                    Log.error { line in
+                        line.str("acme: ")
+                        error.withUnsafeBufferPointer { line.cstr($0.baseAddress!) }
+                    }
+                    return 1
+                }
+                Log.info("acme: nothing cached yet; serving a placeholder until the CA issues")
             }
         }
 
@@ -146,6 +177,12 @@ public enum Peregrine {
         for extra in config.tlsExtraCerts {
             guard context.add(certPath: extra.cert, keyPath: extra.key,
                               ciphers: config.tlsCiphers) else { return nil }
+        }
+        if config.acmeEnabled, let dir = config.acmeCacheDir {
+            if pg_tls_ctx_set_acme_dir(context.raw, dir) != 0 {
+                Log.error("cannot turn on tls-alpn-01 answering for --acme-domain")
+                return nil
+            }
         }
         return context
     }
@@ -326,6 +363,54 @@ public enum Peregrine {
         var shuttingDown = false
         var killDeadline: UInt64 = 0
         var alive = workers
+
+        // --acme-domain. The client runs in a helper process forked from here,
+        // one at a time, and its exit status is the whole of its report: 0
+        // means a new certificate is on disk and the workers should reload
+        // onto it, which they do the way a SIGHUP has them do.
+        //
+        // A process rather than a thread because this process forks workers,
+        // and forking while another thread holds the allocator's lock leaves
+        // the child with a lock nobody will ever release.
+        let acmeSettings: ACME.Settings? = config.acmeEnabled ? ACME.settings(config) : nil
+        var acmePid: pid_t = 0
+        var acmeNextCheck: UInt64 = 0
+        var acmeFailures = 0
+
+        /// Starts the helper when the certificate is missing, is the
+        /// placeholder, lacks a name, or is inside its renewal window.
+        func checkCertificate() {
+            guard let settings = acmeSettings, acmePid == 0, !shuttingDown else { return }
+            let now = pg_monotonic_ms()
+            if now < acmeNextCheck { return }
+            // A month to spare. Let's Encrypt certificates last ninety days
+            // and it asks for renewal once two thirds have gone, which leaves
+            // the retries below a month to succeed in.
+            let needed = settings.certPath.withCString { cert in
+                settings.names.withCString { names in
+                    pg_acme_needs_certificate(cert, names, 30 * 86_400)
+                }
+            }
+            if needed == 0 {
+                acmeNextCheck = now &+ 12 * 3_600_000
+                return
+            }
+            let pid = pg_fork()
+            if pid == 0 {
+                // The helper serves nothing, so it lets go of the sockets: a
+                // helper still waiting on a slow CA after the server has gone
+                // must not be what keeps the port bound.
+                for i in 0..<count where listeners[i] >= 0 { _ = pg_close(listeners[i]) }
+                _ = pg_close(signalFD)
+                _exit(ACME.obtain(settings) ? 0 : 1)
+            }
+            if pid < 0 {
+                Log.error("cannot fork the ACME helper")
+                acmeNextCheck = now &+ 60_000
+                return
+            }
+            acmePid = pid
+        }
 
         // A restart replaces the workers one slot at a time, and the
         // replacement is spawned and accepting *before* the worker it replaces
@@ -527,6 +612,7 @@ public enum Peregrine {
                                 shuttingDown = true
                                 Log.info("shutting down; signalling workers")
                                 signalAll(SIGTERM)
+                                if acmePid > 0 { _ = pg_kill(acmePid, SIGTERM) }
                                 // Workers get the same grace period they give
                                 // their own requests, plus a moment to exit.
                                 killDeadline = pg_monotonic_ms()
@@ -553,11 +639,40 @@ public enum Peregrine {
                 beginRestart("source change detected; reloading workers")
             }
 
+            checkCertificate()
+
             // Reap whatever has exited.
             while true {
                 var status: Int32 = 0
                 let pid = pg_waitpid(-1, &status, 1)
                 if pid <= 0 { break }
+
+                // The ACME helper is not a worker and never counted as one.
+                if acmePid > 0 && pid == acmePid {
+                    acmePid = 0
+                    let now = pg_monotonic_ms()
+                    if pg_acme_exit_ok(status) != 0 {
+                        acmeFailures = 0
+                        acmeNextCheck = now &+ 12 * 3_600_000
+                        beginRestart("certificate installed; reloading workers")
+                    } else {
+                        // A minute, doubling to six hours. A CA that is briefly
+                        // down is asked again soon; one that keeps refusing is
+                        // not hammered, and Let's Encrypt counts failed
+                        // validations against a rate limit.
+                        acmeFailures += 1
+                        let backoff = min(UInt64(60_000) << UInt64(min(acmeFailures - 1, 9)),
+                                          UInt64(6 * 3_600_000))
+                        acmeNextCheck = now &+ backoff
+                        Log.warn { line in
+                            line.str("no certificate this time; asking again in ")
+                            line.int(Int(backoff / 1000))
+                            line.str("s")
+                        }
+                    }
+                    continue
+                }
+
                 alive -= 1
 
                 // A replacement that died before it ever served. The worker it

@@ -216,6 +216,24 @@ public struct ServerConfig {
     /// about a kilobyte the saving is smaller than the framing.
     public var compressMinimumLength = 1024
 
+    // --- acme ---
+    /// Names to get a certificate for from an ACME CA, or empty for none.
+    ///
+    /// With any name here the server gets its own certificate: a helper
+    /// process registers an account, answers tls-alpn-01 on the port being
+    /// served, installs what the CA issues in `acmeCacheDir`, and reloads the
+    /// workers onto it -- then renews it a month before it expires, the same
+    /// way. `tlsCertPath` and `tlsKeyPath` point into the cache.
+    public var acmeDomains: [UnsafePointer<CChar>] = []
+    public var acmeEmail: UnsafePointer<CChar>? = nil
+    public var acmeDirectory: UnsafePointer<CChar> =
+        staticCString("https://acme-v02.api.letsencrypt.org/directory")
+    public var acmeCacheDir: UnsafePointer<CChar>? = nil
+    /// Trusted roots for the CA's own HTTPS, for a private or test CA. nil
+    /// uses the system's.
+    public var acmeCABundle: UnsafePointer<CChar>? = nil
+    public var acmeEnabled: Bool { !acmeDomains.isEmpty }
+
     // --- rate limiting ---
     /// Requests each client may make per `rateLimitPeriodMs`, or 0 for no
     /// limit. Counted across every worker, not per worker; see

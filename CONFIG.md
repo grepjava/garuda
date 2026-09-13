@@ -711,6 +711,47 @@ reading it, where a dropped handshake is not.
 
 `SIGHUP` reloads all of them.
 
+### Certificates from Let's Encrypt
+
+```bash
+peregrine --port 443 --acme-domain example.com --acme-domain www.example.com \
+          --acme-email ops@example.com --acme-cache /var/lib/peregrine/acme \
+          myapp:app
+```
+
+The server gets its own certificate. With nothing cached it starts on a
+self-signed placeholder, registers an account, answers the CA's `tls-alpn-01`
+challenge on the port it is already serving, installs the certificate in the
+cache directory, and reloads its workers onto it the way `SIGHUP` does — no
+connection is dropped. It checks twice a day and renews with thirty days left.
+A restart finds the certificate in the cache and does not ask again.
+
+`tls-alpn-01` rather than `http-01`, because it needs nothing but the port
+being served: no port 80, no web root, no route kept free for the CA. The CA
+connects offering only the `acme-tls/1` protocol; whichever worker accepts the
+connection serves the challenge certificate and closes it.
+
+The client runs in a helper process the supervisor forks, not in a worker. A CA
+that is slow or down costs one waiting process and nothing that serves
+requests. A failed attempt is retried after a minute, then two, doubling up to
+six hours, which stays well inside Let's Encrypt's rate limits.
+
+- `--acme-staging` uses Let's Encrypt's staging CA, which issues untrusted
+  certificates without production rate limits. Try a new setup there first.
+- `--acme-directory URL` uses another ACME CA, and `--acme-ca-bundle PATH`
+  trusts a private one's HTTPS.
+- The cache holds `account.key`, `cert.pem` and `key.pem`, keys at mode 0600.
+  Keep it on persistent storage: a server that loses it registers a new account
+  and asks for a new certificate, which counts against the rate limits.
+
+A public CA validates on port 443, so the server has to be reachable there,
+directly or through a TCP forward. A proxy that terminates TLS in front of it
+sees the challenge instead of passing it on, and needs to do ACME itself.
+
+Wildcards are not possible here: a wildcard certificate needs `dns-01`, which
+needs credentials for a DNS provider. HTTP/3 serves the certificate from the
+same files and picks it up on the same reload.
+
 HTTP/3 serves the default pair whatever the client asks for. The QUIC handshake
 here is built from the primitives rather than driven by OpenSSL, and it has no
 SNI selection of its own yet.

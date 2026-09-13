@@ -71,6 +71,14 @@ int pg_tls_wants_write(pg_tls *tls);
 /* 1 when ALPN settled on HTTP/2. */
 int pg_tls_is_h2(pg_tls *tls);
 
+/* The connection negotiated acme-tls/1: an ACME CA validating a tls-alpn-01
+ * challenge, which wants the handshake and nothing after it. */
+int pg_tls_is_acme(pg_tls *tls);
+
+/* Turns on tls-alpn-01 answering, with challenge certificates read from
+ * <dir>/alpn/NAME.crt and .key as connections ask for them. 0 on success. */
+int pg_tls_ctx_set_acme_dir(pg_tls_ctx *ctx, const char *dir);
+
 /* Best-effort close_notify. Never blocks. */
 void pg_tls_shutdown(pg_tls *tls);
 

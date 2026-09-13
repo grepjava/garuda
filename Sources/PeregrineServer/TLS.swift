@@ -180,6 +180,12 @@ extension Worker {
             c.pointee.flags.remove(.tlsHandshake)
             // ALPN has already decided which protocol this connection speaks.
             if pg_tls_is_h2(session) != 0 { c.pointee.flags.insert(.alpnH2) }
+            // tls-alpn-01: the CA has seen the challenge certificate, which is
+            // all it came for. RFC 8737 has the server close here.
+            if pg_tls_is_acme(session) != 0 {
+                closeConnection(slot)
+                return false
+            }
             setInterest(slot, .read)
             return true
         case 0:

@@ -278,6 +278,11 @@ peregrine [options] MODULE:ATTRIBUTE
   --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
   --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
                            without calling the application (repeatable)
+  --acme-domain NAME       get and renew a certificate from Let's Encrypt,
+                           answering tls-alpn-01 on this port (repeatable)
+  --acme-email ADDR        contact address for the ACME account
+  --acme-cache DIR         account key and certificate (default ./acme)
+  --acme-staging           use Let's Encrypt's staging CA
   --rate-limit RATE        429 past RATE requests per client (100/s, 600/m),
                            counted across all workers
   --rate-limit-burst N     requests allowed at once before RATE applies
