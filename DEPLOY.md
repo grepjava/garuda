@@ -8,9 +8,9 @@ How a version reaches PyPI. The engine is built here; `pip` only sees what
 this file describes.
 
 PyPI does not watch GitHub. A tag on `main` is a source snapshot. Until
-someone uploads, `pip install peregrine-server` is the last sdist that was
-published — today that still compiles, because no wheel has been uploaded
-yet.
+someone uploads, `pip install peregrine-server` is whatever was published
+last: a wheel where one matches the interpreter, and the sdist, which
+compiles, everywhere else.
 
 A version, once accepted, cannot be replaced. Yanking hides it; it does not
 free the number. Get the artifacts right before `--upload`.
@@ -64,32 +64,36 @@ The same string, everywhere people or packaging will read it:
 
 * `pyproject.toml` — `version`
 * `python/peregrine/__init__.py` — `__version__`
-* `Sources/peregrine/main.swift` — the `peregrine X.Y.Z` `StaticString`
+* `Sources/PeregrineServer/CLI.swift` — the `peregrine X.Y.Z` `StaticString`
 * the `--version` examples in `INSTALLATION.md` and `CONFIG.md`
 
 PyPI classifiers stay at Production/Stable unless the release is a
 deliberate step backwards.
 
-### 2. Commit, tag, push
+### 2. Commit and push, then build on that commit
 
 ```bash
-git tag v1.0.1
-git push origin HEAD
-git push origin v1.0.1
-gh release create v1.0.1 --title "1.0.1" --notes "..."
-```
-
-The tag is what GitHub shows. It is not what `pip` installs.
-
-### 3. Build the Linux wheels
-
-```bash
-gh workflow run Wheels --ref v1.0.1
+git push origin main
+gh workflow run Wheels --ref main
+gh workflow run CI --ref main
 gh run watch
 ```
 
-Five jobs: 3.11, 3.12, 3.13, 3.14, 3.14t on Ubuntu 24.04. Each artifact is
-one wheel. Leave `publish` off — that input skips the sdist.
+Wheels is five jobs: 3.11, 3.12, 3.13, 3.14, 3.14t on Ubuntu 24.04. Each
+artifact is one wheel. Leave `publish` off — that input skips the sdist.
+
+The wheels come before the tag. A build that fails then needs another commit,
+not a tag moved after GitHub has already announced it.
+
+### 3. Tag and release the commit the wheels were built from
+
+```bash
+git tag v1.1.0 <commit>
+git push origin v1.1.0
+gh release create v1.1.0 --title "1.1.0" --notes "..."
+```
+
+The tag is what GitHub shows. It is not what `pip` installs.
 
 A single interpreter, locally:
 
@@ -154,9 +158,11 @@ refuses a token that does not start with `pypi-`.
 **`--from-latest` found no run** — the Wheels workflow has not succeeded on
 this branch. `gh run list --workflow=Wheels` is the authority.
 
-**A wheel is tagged for the wrong interpreter** — `setup.py` asks the
-binary, not the headers. Rebuild with `pkg-config` pointed at the
-interpreter you intend to serve; do not retag the file.
+**A wheel is tagged for the wrong interpreter** — `setup.py` refuses headers
+from another release or the other side of the free-threaded divide, and
+imports the module in the interpreter doing the build before packaging it.
+Rebuild with `pkg-config` pointed at the interpreter you intend to serve; do
+not retag the file.
 
 **You uploaded wheels and forgot the sdist** — run the script again against
 the same version. `--skip-existing` leaves the wheels alone and sends the

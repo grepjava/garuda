@@ -1019,7 +1019,7 @@ running it there would silently be slower than `--workers`, not faster.
 `peregrine --version` says which kind of interpreter the server runs in:
 
 ```
-peregrine 1.0.0 (CPython 3.14.6 free-threaded)
+peregrine 1.1.0 (CPython 3.14.6 free-threaded)
 ```
 
 One caveat that is not peregrine's to fix: importing an extension module that
