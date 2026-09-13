@@ -22,12 +22,12 @@
  * enough that a lookup stays in one or two cache lines. */
 #define PROBES 8
 
-struct entry {
+struct pg_rl_entry {
     _Atomic uint64_t key;   /* 0 = never used */
     _Atomic uint64_t tat;   /* GCRA theoretical arrival time, microseconds */
 };
 
-static struct entry *g_table = NULL;
+static struct pg_rl_entry *g_table = NULL;
 static uint64_t g_mask = 0;
 static uint64_t g_emission = 0;
 static uint64_t g_tolerance = 0;
@@ -60,10 +60,10 @@ int pg_ratelimit_init(uint64_t emission_us, uint64_t tolerance_us, int log2_entr
     if (log2_entries < 8) log2_entries = 8;
     if (log2_entries > 24) log2_entries = 24;
     size_t count = (size_t)1 << log2_entries;
-    void *p = mmap(NULL, count * sizeof(struct entry), PROT_READ | PROT_WRITE,
+    void *p = mmap(NULL, count * sizeof(struct pg_rl_entry), PROT_READ | PROT_WRITE,
                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return -1;
-    memset(p, 0, count * sizeof(struct entry));
+    memset(p, 0, count * sizeof(struct pg_rl_entry));
 
     uint64_t seed = 0;
 #ifdef __linux__
@@ -81,7 +81,7 @@ int pg_ratelimit_init(uint64_t emission_us, uint64_t tolerance_us, int log2_entr
     g_mask = count - 1;
     g_emission = emission_us;
     g_tolerance = tolerance_us;
-    g_table = (struct entry *)p;
+    g_table = (struct pg_rl_entry *)p;
     return 0;
 }
 
@@ -127,12 +127,12 @@ static int key_of(const uint8_t *addr, size_t len, uint64_t *out) {
     return 0;
 }
 
-static struct entry *find(uint64_t key, uint64_t now) {
+static struct pg_rl_entry *find(uint64_t key, uint64_t now) {
     uint64_t home = key & g_mask;
     /* An entry is never emptied again once used, so a client's entry is
      * always before the first empty one in its probe sequence. */
     for (int p = 0; p < PROBES; p++) {
-        struct entry *e = &g_table[(home + (uint64_t)p) & g_mask];
+        struct pg_rl_entry *e = &g_table[(home + (uint64_t)p) & g_mask];
         uint64_t k = atomic_load_explicit(&e->key, memory_order_relaxed);
         if (k == key) return e;
         if (k == 0) {
@@ -144,7 +144,7 @@ static struct entry *find(uint64_t key, uint64_t now) {
     /* Nothing free. Take over an entry whose client is back at a full burst,
      * which is exactly the state a new entry would start in. */
     for (int p = 0; p < PROBES; p++) {
-        struct entry *e = &g_table[(home + (uint64_t)p) & g_mask];
+        struct pg_rl_entry *e = &g_table[(home + (uint64_t)p) & g_mask];
         uint64_t k = atomic_load_explicit(&e->key, memory_order_relaxed);
         if (k == key) return e;
         if (atomic_load_explicit(&e->tat, memory_order_relaxed) <= now
@@ -159,7 +159,7 @@ uint64_t pg_ratelimit_check(const uint8_t *addr, size_t len, uint64_t now_us) {
     if (!g_table || !addr) return 0;
     uint64_t key;
     if (key_of(addr, len, &key) != 0) return 0;
-    struct entry *e = find(key, now_us);
+    struct pg_rl_entry *e = find(key, now_us);
     if (!e) return 0;
 
     for (;;) {
