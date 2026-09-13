@@ -383,6 +383,8 @@ request costs about 43 µs, most of it FastAPI's own code.
 | | FastAPI | 25,033 → 24,912 (−0.5 %) | 42.65 → 42.98 µs (+0.8 %) | 3/6, 2/6 | 0.1 %, 0.3 % | |
 | one completed awaitable per worker for every `send`, not one allocated per call | raw ASGI | 117,640 → 119,136 (+1.3 %) | 9.03 → 8.93 µs (−1.1 %) | 3/6, 4/6 | 4.0 %, 3.9 % | no |
 | | FastAPI | 25,175 → 25,165 (−0.0 %) | 42.58 → 42.52 µs (−0.1 %) | 3/6, 4/6 | 0.9 %, 0.0 % | |
+| each request's task started eagerly, so an application that never waits finishes before dispatch returns | raw ASGI | 96,693 → 105,157 (+8.8 %) | 10.48 → 9.42 µs (−10.2 %) | 6/6, 6/6 | 4.3 %, 5.3 % | no |
+| | FastAPI | 20,906 → 20,466 (−2.1 %) | 48.74 → 49.82 µs (+2.2 %) | 2/6, 2/6 | 0.3 %, 1.2 % | |
 
 - **A change within noise on FastAPI is expected.** The framework is most of
   a FastAPI request, so a saving of a fraction of a microsecond on the server
@@ -391,6 +393,20 @@ request costs about 43 µs, most of it FastAPI's own code.
   [benchmarks/asgi_overhead.py](benchmarks/asgi_overhead.py), which times the
   same asyncio work in-process, predicted it would save 0.23–0.29 µs a
   request. Measured end to end, it saved nothing.
+- **Eager start helped raw ASGI and hurt everything else.** From Python 3.12 a
+  task can run its coroutine's first step as it is created, and every request
+  in both applications finished inside that step. In-process it saved
+  0.8–1.0 µs of the task's cost. The row above is the second of two sessions.
+  The first gave raw ASGI +10.7 % and −10.4 % and FastAPI −1.0 % and +1.0 %,
+  inside an A/A spread of 5.7 % and 6.6 %. In every round of both, latency
+  was worse:
+  - FastAPI p99 8.33–9.05 ms against 6.50–7.09 ms, and p50 2.69–2.77 ms
+    against 2.57–2.64 ms.
+  - Raw ASGI p99 2.35–2.55 ms against 2.19–2.37 ms.
+
+  Nothing found explains the latency. It is not a longer drain taking in
+  more requests, because the poller is read once per wakeup. So it was
+  reverted.
 - **The in-process benchmark does size what is left.** With uvloop, the
   asyncio task each request runs in costs 1.1–1.3 µs of the ~9. Building the
   scope costs 0.6–0.8 µs for 3 headers and about 1.5 µs for 15. Neither is
