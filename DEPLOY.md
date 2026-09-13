@@ -93,9 +93,9 @@ not a tag moved after GitHub has already announced it.
 ### 3. Tag and release the commit the wheels were built from
 
 ```bash
-git tag v1.1.1 <commit>
-git push origin v1.1.1
-gh release create v1.1.1 --title "1.1.1" --notes-file notes.md
+git tag v1.1.2 <commit>
+git push origin v1.1.2
+gh release create v1.1.2 --title "1.1.2" --notes-file notes.md
 ```
 
 `notes.md` is that version's section of [RELEASE.md](RELEASE.md), so the

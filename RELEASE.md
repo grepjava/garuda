@@ -20,6 +20,13 @@ version reached PyPI, in UTC.
 
 ## Unreleased
 
+---
+
+## 1.1.2 — 2026-09-13
+
+Tagged and released on GitHub only; not uploaded to PyPI yet, so
+`pip install peregrine-server` still installs 1.1.1.
+
 ### New options
 
 - `--trace-context`: a request's W3C `traceparent`, its trace ID and parent

@@ -240,6 +240,12 @@ No server returned an error or a non-2xx response at any level.
   Elysia both exceed what this benchmark can measure, and the table does not
   say which is faster. The cache is at least 3.8× uncached FastAPI and 6.4×
   uncached Flask.
+- **The cached rows are a best case, not a production figure.** Every request
+  is the same GET with no cookie, for a response marked fresh, so every
+  request after the first is a hit. Real traffic has cookies and credentials,
+  which are never cached, many URLs, and responses the application does not
+  mark fresh. It lands between the cached and uncached rows, according to its
+  hit rate.
 - **A cache hit never reaches Python.** The response is copied out of memory
   every worker shares, in Swift, and the framework, which is most of the work,
   is not run. Only GET responses the application marks fresh with `s-maxage`
