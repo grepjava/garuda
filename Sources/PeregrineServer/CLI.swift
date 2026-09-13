@@ -187,6 +187,8 @@ public enum PeregrineCLI {
               --request-id             give every request an X-Request-ID, echoed on
                                        the response and in the access log; one from a
                                        --forwarded-allow-ips proxy is kept
+              --trace-context          record a request's W3C traceparent, its trace
+                                       and parent span IDs, in the access log
               --health-check-path P    answer P with 200 in the server, without
                                        calling the application (e.g. /healthz)
               --access-log             log one line per request
@@ -546,6 +548,8 @@ public enum PeregrineCLI {
                 config.requestStartHeader = true
             } else if matches(arg, "--request-id") {
                 config.requestID = true
+            } else if matches(arg, "--trace-context") {
+                config.traceContext = true
             } else if matches(arg, "--health-check-path") {
                 guard let v = next("--health-check-path needs a path") else { break }
                 if v[0] != 47 {   // '/'

@@ -20,6 +20,12 @@ version reached PyPI, in UTC.
 
 ## Unreleased
 
+### New options
+
+- `--trace-context`: a request's W3C `traceparent`, its trace ID and parent
+  span ID, recorded in the access log. Never generated, and never changed on
+  its way to the application.
+
 ### Documentation
 
 - `RELEASE.md` records what changed in every version, linked from the README.

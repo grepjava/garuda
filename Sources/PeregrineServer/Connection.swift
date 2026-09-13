@@ -244,6 +244,10 @@ public struct Connection {
     /// has it among the request headers and nothing needs replacing.
     public var requestID = ByteBuffer()
     public var requestIDKept = false
+    /// --trace-context: the trace ID and parent span ID of a valid W3C
+    /// traceparent, 48 hex characters in that order, or empty. Settled at
+    /// dispatch.
+    public var traceContext = ByteBuffer()
     /// The compressor for an ASGI response body being compressed.
     public var encoder = ResponseEncoder()
 

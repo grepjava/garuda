@@ -436,6 +436,36 @@ their IDs as well. Static files also carry the ID in a response header. Health
 probes, rate-limit refusals and malformed requests do not, and the
 `--redirect-http` port assigns no IDs.
 
+### Trace context
+
+```bash
+peregrine --trace-context --access-log myapp:app
+```
+
+A request sent from inside a distributed trace carries a W3C `traceparent`
+header naming the trace and the span that sent the request. `--trace-context`
+records both on the access line, so the line can be found from the trace and
+the trace from the line:
+
+```
+GET /cart 200 1843us trace=4bf92f3577b34da6a3ce929d0e0e4736 span=00f067aa0ba902b7
+```
+
+A JSON line has `"trace_id"` and `"parent_id"`. With `--request-id` as well,
+the request ID comes first.
+
+The server only records a traceparent. It never generates one and never
+changes the header on its way to the application, where an OpenTelemetry
+propagator reads it as usual. An invented traceparent would name a parent
+span that nothing ever recorded, and the application's spans would hang from
+a gap in the trace.
+
+A traceparent is recorded only when it follows the specification: version
+`00` exactly as `00-<32 hex>-<16 hex>-<2 hex>`, in lowercase; a later version
+with any extra fields after a dash; neither ID all zeros, and not version
+`ff`. Anything else is ignored, and so is a request carrying two. The
+application still receives what the client sent.
+
 ### Metrics
 
 `--metrics-port 9100` serves the Prometheus text exposition format:

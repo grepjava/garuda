@@ -700,6 +700,7 @@ public struct Worker {
         // The previous request's ID must not be logged against a request that
         // fails before it is dispatched.
         c.pointee.requestID.clear()
+        c.pointee.traceContext.clear()
         c.pointee.chunked = ChunkedDecoder(maxTrailerBytes: config.maxHeadSize)
         // Response framing belongs to one request; a stale budget here would
         // let the next response on a reused connection overrun or fall short.
@@ -814,6 +815,7 @@ public struct Worker {
         // Before anything can answer the request, so that every answer --
         // a probe, a 429, a static file -- is logged with its ID.
         if config.requestID { assignRequestID(slot) }
+        if config.traceContext { assignTraceContext(slot) }
         // --health-check-path, answered here rather than in the application.
         // This is the only interception on the path to dispatch, and it is
         // opt-in, so an application that wants to answer its own probe simply
@@ -1305,6 +1307,14 @@ public struct Worker {
         let requestID = idLength > 0
             ? ByteSpan(UnsafePointer(c.pointee.requestID.readPointer), idLength)
             : ByteSpan(base, 0)
+        // Lowercase hex, checked when it was read; the trace ID first, then
+        // the parent span.
+        let hasTrace = c.pointee.traceContext.readableBytes
+            == TraceContext.traceIDLength + TraceContext.parentIDLength
+        let traceBase = hasTrace ? UnsafePointer(c.pointee.traceContext.readPointer) : base
+        let traceID = ByteSpan(traceBase, hasTrace ? TraceContext.traceIDLength : 0)
+        let parentID = ByteSpan(traceBase + (hasTrace ? TraceContext.traceIDLength : 0),
+                                hasTrace ? TraceContext.parentIDLength : 0)
 
         if !config.accessLogJSON {
             Log.emit(.info) { line in
@@ -1319,6 +1329,12 @@ public struct Worker {
                 if requestID.count > 0 {
                     line.str(" id=")
                     line.span(requestID)
+                }
+                if hasTrace {
+                    line.str(" trace=")
+                    line.span(traceID)
+                    line.str(" span=")
+                    line.span(parentID)
                 }
             }
             return
@@ -1361,6 +1377,12 @@ public struct Worker {
                 line.str(",\"request_id\":")
                 line.jsonString(requestID.base, requestID.count)
             }
+            if hasTrace {
+                line.str(",\"trace_id\":")
+                line.jsonString(traceID.base, traceID.count)
+                line.str(",\"parent_id\":")
+                line.jsonString(parentID.base, parentID.count)
+            }
             if line.truncated { line.str(",\"truncated\":true") }
             line.str("}")
         }
@@ -1368,10 +1390,12 @@ public struct Worker {
 
     /// Room the JSON access line keeps for everything after the target:
     /// `"status"`, `"duration_us"`, `"proto"`, the optional `"request_id"` of
-    /// up to `RequestID.maxLength` bytes, the optional `"truncated"`, and the
-    /// punctuation closing the object. Generous on purpose -- being wrong the
-    /// other way is what this exists to prevent.
+    /// up to `RequestID.maxLength` bytes, the optional `"trace_id"` and
+    /// `"parent_id"`, the optional `"truncated"`, and the punctuation closing
+    /// the object. Generous on purpose -- being wrong the other way is what
+    /// this exists to prevent.
     static let accessLogTail = 128 + 16 + RequestID.maxLength
+        + 32 + TraceContext.traceIDLength + TraceContext.parentIDLength
 
     /// What the client is actually speaking, which the request head alone does
     /// not say: an HTTP/2 or HTTP/3 request was rebuilt as HTTP/1.1 text to be
@@ -1531,6 +1555,7 @@ public struct Worker {
         c.pointee.write.destroy()
         c.pointee.body.destroy()
         c.pointee.requestID.destroy()
+        c.pointee.traceContext.destroy()
         table.release(slot)
 
         if acceptSuspended && !draining {

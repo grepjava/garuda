@@ -316,6 +316,10 @@ public struct ServerConfig {
     /// was told can be matched up. One a trusted proxy sent is kept; any other
     /// is replaced, since a client can put anything it likes in a header.
     public var requestID = false
+    /// Record the W3C `traceparent` a request carries -- the trace it belongs
+    /// to and the span that sent it -- in the access log. Never generated, and
+    /// never changed on its way to the application.
+    public var traceContext = false
     public var logLevel: LogLevel = .info
     public var accessLog = false
     /// Emit the access log as one JSON object per line, for a collector that
