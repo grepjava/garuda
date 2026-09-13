@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/peregrine-cursive-segoe.png" alt="peregrine" width="480">
+  <img src="assets/peregrine-fiery-roaring.png" alt="peregrine" width="480">
 </p>
 
 # Deploying Peregrine
