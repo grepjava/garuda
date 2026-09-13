@@ -134,7 +134,12 @@ int64_t pg_unix_seconds(void);
  * place the server ever blocks.
  * ------------------------------------------------------------------------- */
 int  pg_signal_pipe_init(void);   /* returns readable fd, -1 on failure */
-void pg_signal_pipe_reset(void);  /* after fork(): child gets a fresh pipe */
+/* fork() for a worker: signals are held across it, and the child gets a signal
+ * pipe of its own before they are released, so none sent during start-up is
+ * lost. */
+pid_t pg_fork_worker(void);
+/* In a child that is not a worker: default signal dispositions, no pipe. */
+void pg_signals_default(void);
 pid_t pg_fork(void);
 pid_t pg_waitpid(pid_t pid, int *status, int nohang);
 int  pg_kill(pid_t pid, int sig);

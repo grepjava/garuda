@@ -143,6 +143,24 @@ fi
 is "and the new workers pass their health check" "$(all_probes 200)" 200
 server_stop
 
+echo "a signal that arrives while the workers are still starting"
+for sig in TERM INT; do
+    server_start "$BIN" --port "$PORT" --workers 2 --log-level warning "${EXTRA[@]}" \
+        --python-path "$HERE" slow_import_app:app > "$WORK/boot.log" 2>&1
+    # Well inside the import's 1.5s sleep: the workers have forked and have not
+    # reached their poll loops.
+    sleep 0.5
+    t0=$(ms)
+    kill -"$sig" "$SERVER_PID"
+    took=$(exit_after "$t0")
+    if [ "$took" -lt 5000 ]; then
+        ok "SIG$sig during start-up is not lost (${took}ms)"
+    else
+        bad "SIG$sig during start-up is not lost" "under 5000ms, not the kill deadline" "${took}ms"
+    fi
+    server_stop
+done
+
 echo "without --drain-delay nothing changes"
 start "$WORK/plain.log"
 t0=$(ms)

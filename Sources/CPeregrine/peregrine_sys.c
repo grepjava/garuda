@@ -537,7 +537,63 @@ int pg_signal_pipe_init(void) {
     return g_sigpipe[0];
 }
 
-void pg_signal_pipe_reset(void) {
+/* The signals the pipe carries. */
+static void piped_signals(sigset_t *set) {
+    sigemptyset(set);
+    sigaddset(set, SIGINT);
+    sigaddset(set, SIGTERM);
+    sigaddset(set, SIGQUIT);
+    sigaddset(set, SIGHUP);
+    sigaddset(set, SIGUSR1);
+}
+
+/* fork(), for a worker: the child comes back with a signal pipe of its own.
+ *
+ * A child inherits the supervisor's handlers along with its pipe, and the pipe
+ * is the supervisor's to read. Closing it in the child and making a new one
+ * only once the worker is ready to poll -- which is after the interpreter has
+ * booted and the application imported, seconds on a large application --
+ * left a window in which a SIGTERM ran the handler, wrote to a descriptor that
+ * was gone, and vanished. The worker then served on until the supervisor's
+ * grace period ran out and it was killed.
+ *
+ * So the signals are blocked across the fork and the child's pipe is made
+ * before they are unblocked. One sent at any point after fork waits, blocked,
+ * and is then written to the pipe the worker will read. */
+pid_t pg_fork_worker(void) {
+    sigset_t set, previous;
+    piped_signals(&set);
+    sigprocmask(SIG_BLOCK, &set, &previous);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (g_sigpipe[0] >= 0) { close(g_sigpipe[0]); close(g_sigpipe[1]); }
+        g_sigpipe[0] = -1;
+        g_sigpipe[1] = -1;
+        if (pipe(g_sigpipe) == 0) {
+            pg_set_nonblock(g_sigpipe[0]);
+            pg_set_nonblock(g_sigpipe[1]);
+            pg_set_cloexec(g_sigpipe[0]);
+            pg_set_cloexec(g_sigpipe[1]);
+        } else {
+            g_sigpipe[0] = -1;
+            g_sigpipe[1] = -1;
+        }
+    }
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return pid;
+}
+
+/* For a child that is not a worker: the ordinary dispositions back, and no
+ * pipe. Without this a SIGTERM to such a child ran the inherited handler,
+ * which wrote the signal into the supervisor's pipe -- so the helper ignored
+ * it, and the supervisor took it as addressed to itself. */
+void pg_signals_default(void) {
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGCHLD, SIG_DFL);
     if (g_sigpipe[0] >= 0) { close(g_sigpipe[0]); close(g_sigpipe[1]); }
     g_sigpipe[0] = -1;
     g_sigpipe[1] = -1;

@@ -397,6 +397,9 @@ public enum Peregrine {
             }
             let pid = pg_fork()
             if pid == 0 {
+                // SIGTERM at shutdown has to end the helper, not be written
+                // into the supervisor's pipe by the handler it inherited.
+                pg_signals_default()
                 // The helper serves nothing, so it lets go of the sockets: a
                 // helper still waiting on a slow CA after the server has gone
                 // must not be what keeps the port bound.
@@ -793,7 +796,9 @@ public enum Peregrine {
             return (-1, -1)
         }
 
-        let pid = pg_fork()
+        // Not plain fork: a signal that arrived before the child had a pipe of
+        // its own was lost. See pg_fork_worker.
+        let pid = pg_fork_worker()
         if pid < 0 {
             Log.error("fork failed")
             _ = pg_close(fds.0)
@@ -812,8 +817,6 @@ public enum Peregrine {
         _ = pg_close(fds.0)
         readyPipeFD = fds.1
         Log.pid = Int(pg_getpid())
-        // A fresh signal pipe: the inherited one belongs to the supervisor.
-        pg_signal_pipe_reset()
 
         // A free-threaded child is every worker at once, so it keeps the whole
         // set and hands one socket to each of its threads. `metricsSlot` is a
