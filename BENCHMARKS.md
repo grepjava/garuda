@@ -410,12 +410,37 @@ request costs about 43 µs, most of it FastAPI's own code.
   On FastAPI the interpreter is 80 %, `write()` 9 % and Peregrine 3.5 %. The
   callable Peregrine's channels are called through is 0.1 %, so nothing left
   on the server side is large enough for another change like these to show.
+- **How many system calls, counted.** The same worker was run under
+  `strace -c`, with a run that answers one request subtracted from each:
+
+  | load | `read` | `write` | Peregrine's `epoll_wait` | uvloop's `epoll_pwait` | `epoll_ctl` | total |
+  |---|---:|---:|---:|---:|---:|---:|
+  | raw ASGI, 64 connections | 1.00 | 1.00 | 0.03 | 0.03 | 0.001 | 2.07 |
+  | raw ASGI, 1 connection | 1.00 | 1.00 | 1.00 | 2.00 | 0 | 5.00 |
+  | FastAPI, 64 connections | 1.00 | 1.00 | 0.03 | 0.03 | 0.003 | 2.07 |
+
+  - **Under load a request is one `read` and one `write`.** Each wait
+    collects about 30 events, and read interest stays armed across a request,
+    so it costs no `epoll_ctl`. strace slows every call, which batches more
+    than an untraced worker would; one connection is the case with no
+    batching at all.
+  - **A system call's round trip costs about 100 ns on this kernel**
+    (`getppid` in a loop; a write to `/dev/null` is 114 ns). Batching the
+    calls that are left into shared rings, which is what io_uring offers,
+    would save about 0.2 µs a request: about 2 % of a raw ASGI request and
+    0.5 % of a FastAPI one, inside this machine's noise. With one connection
+    it is 0.2–0.4 µs, because uvloop's own wait stays.
+  - **The 42 % in `write()` is the work, not the call.** It is TCP sending the
+    response and, on loopback, delivering it to the load generator. That
+    happens the same way when the send is submitted through a ring, so an
+    io_uring backend was not built.
 
 Reproduce, with two checkouts each built with `scripts/build-extension.sh`:
 
 ```bash
 BUILD_A=../peregrine-before BUILD_B=. bash benchmarks/turbo_ab.sh
 python benchmarks/asgi_overhead.py
+bash benchmarks/syscalls.sh
 ```
 
 ### Response bodies by size
