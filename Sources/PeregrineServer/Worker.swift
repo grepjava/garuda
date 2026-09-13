@@ -52,6 +52,9 @@ public struct Worker {
     /// waiting for one can never become a way to use up this worker.
     public var scrapes = [PendingScrape](repeating: PendingScrape(),
                                          count: PollToken.metricsPendingCount)
+    /// The --redirect-http listener, or -1. Like `metricsFD`: its own port,
+    /// its own handler, no connection slot.
+    public var redirectFD: Int32 = -1
     public var signalFD: Int32 = -1
 
     /// One shared header table: parsing and environ/scope construction happen
@@ -221,6 +224,8 @@ public struct Worker {
                 handleQUICEvent(mask)
             case PollToken.metrics:
                 acceptMetricsScrapes()
+            case PollToken.redirect:
+                acceptRedirects()
             default:
                 if let pending = PollToken.metricsPendingIndex(token) {
                     handleScrapeReadable(pending)
@@ -1394,7 +1399,7 @@ public struct Worker {
         if now &- lastSweep < 1000 { return }
         lastSweep = now
         dates.refresh()
-        if metricsFD >= 0 { sweepScrapes(now: now) }
+        if metricsFD >= 0 || redirectFD >= 0 { sweepScrapes(now: now) }
 
         // Past the grace period, whatever is still in flight is not going to
         // finish. Dropping it is what turns "shut down when convenient" into a
@@ -1557,6 +1562,9 @@ public struct Worker {
             _ = pg_close(listenFD)
             listenFD = -1
         }
+        // The redirect port too: this worker's socket leaves the SO_REUSEPORT
+        // group, so the kernel stops handing it connections nobody will serve.
+        closeRedirectListener()
 
         if quiescent { running = false }
     }

@@ -981,6 +981,20 @@ public enum Peregrine {
             }
             workerPtr.pointee.metricsFD = fd
         }
+        // --redirect-http, bound the same way.
+        if config.redirectHTTPPort != 0 {
+            let fd = pg_listen_tcp(config.host, config.redirectHTTPPort, config.backlog, 1,
+                                   config.ipv6Only ? 1 : 0)
+            if fd < 0 {
+                let e = pg_errno()
+                Log.error { line in
+                    line.str("cannot listen on the --redirect-http port: ")
+                    line.cstr(pg_strerror(e))
+                }
+                return nil
+            }
+            workerPtr.pointee.redirectFD = fd
+        }
         if config.http3Enabled {
             guard let listener = makeQUICListener(config) else { return nil }
             workerPtr.pointee.quic = listener
@@ -1016,6 +1030,7 @@ public enum Peregrine {
 
         guard workerPtr.pointee.registerListener() else { return nil }
         guard workerPtr.pointee.registerMetricsListener() else { return nil }
+        guard workerPtr.pointee.registerRedirectListener() else { return nil }
         guard workerPtr.pointee.registerQUIC() else { return nil }
         return workerPtr
     }

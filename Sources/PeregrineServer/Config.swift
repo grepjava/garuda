@@ -167,6 +167,14 @@ public struct ServerConfig {
     /// here and do not need to be.
     public var tlsCiphers: UnsafePointer<CChar>? = nil
     public var tlsEnabled: Bool { tlsCertPath != nil && tlsKeyPath != nil }
+    /// A plain-HTTP port that answers everything with a redirect to https on
+    /// `port`, or 0 for none. Bound by every worker with SO_REUSEPORT, like
+    /// the metrics port, and never handed to the application.
+    public var redirectHTTPPort: UInt16 = 0
+    /// The `Strict-Transport-Security` value for every TLS response, or nil.
+    /// Built once at start-up, like `altSvc`.
+    public var hsts: UnsafePointer<UInt8>? = nil
+    public var hstsLength = 0
 
     // --- http/2 ---
     /// Serve HTTP/2 to clients that ask for it. Over cleartext that means the

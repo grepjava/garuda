@@ -67,6 +67,20 @@ func makeAltSvc(port: UInt16) -> (UnsafePointer<UInt8>, Int) {
     return (UnsafePointer(out), n)
 }
 
+/// `max-age=N`, the Strict-Transport-Security value --hsts asks for.
+/// includeSubDomains and preload are left out: they commit other hosts to
+/// https, which is a decision for whoever owns them, not a server flag.
+func makeHSTS(seconds: Int) -> (UnsafePointer<UInt8>, Int) {
+    var buf = ByteBuffer(capacity: 32)
+    defer { buf.destroy() }
+    buf.write("max-age=")
+    buf.writeDecimal(seconds)
+    let n = buf.readableBytes
+    let out = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
+    out.update(from: buf.readPointer, count: n)
+    return (UnsafePointer(out), n)
+}
+
 func printUsage() {
     let usage: StaticString = """
     peregrine -- a Python ASGI/WSGI server written in Swift
@@ -127,6 +141,11 @@ func printUsage() {
       --acme-staging           use Let's Encrypt's staging CA
       --acme-directory URL     use another ACME CA
       --acme-ca-bundle PATH    roots to trust for the CA's own HTTPS
+      --redirect-http PORT     answer plain HTTP on PORT with a redirect to
+                               https on the TLS port (301, or 308 for methods
+                               other than GET and HEAD)
+      --hsts SECONDS           send Strict-Transport-Security: max-age=SECONDS
+                               on every TLS response
       --no-http2               refuse HTTP/2 and answer HTTP/1.1 only
       --http2-only             serve only HTTP/2 (h2c), with no HTTP/1 fallback
       --http3                  also serve HTTP/3 over QUIC (needs TLS)
@@ -239,6 +258,7 @@ var tlsKeys: [UnsafePointer<CChar>] = []
 var staticRoutes: [(prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>)] = []
 var sawApp = false
 var schemeGiven = false
+var hstsSeconds = -1
 var portSet = false
 
 let argc = Int(CommandLine.argc)
@@ -335,6 +355,29 @@ while i < argc {
     } else if matches(arg, "--tls-ciphers") {
         guard let v = next("--tls-ciphers needs an OpenSSL cipher list") else { break }
         config.tlsCiphers = v
+    } else if matches(arg, "--redirect-http") {
+        guard let v = next("--redirect-http needs a port") else { break }
+        let p = parseInt(v)
+        if p <= 0 || p > 65535 {
+            Log.error("--redirect-http must be a port between 1 and 65535")
+            failed = true
+            break
+        }
+        config.redirectHTTPPort = UInt16(p)
+    } else if matches(arg, "--hsts") {
+        guard let v = next("--hsts needs a max-age in seconds") else { break }
+        var seconds = 0
+        var at = 0
+        while v[at] >= 48 && v[at] <= 57 && seconds < 1_000_000_000 {   // digits
+            seconds = seconds * 10 + Int(v[at] - 48)
+            at += 1
+        }
+        if at == 0 || v[at] != 0 {
+            Log.error("--hsts takes a number of seconds, as in 31536000 for a year")
+            failed = true
+            break
+        }
+        hstsSeconds = seconds
     } else if matches(arg, "--backlog") {
         guard let v = next("--backlog needs a value") else { break }
         config.backlog = Int32(max(1, parseInt(v)))
@@ -641,6 +684,29 @@ if config.http3Enabled && config.tlsCertPath == nil {
 if config.http3Enabled && config.unixPath != nil {
     Log.error("--http3 cannot be served over a unix socket")
     exit(2)
+}
+// Both of these are about sending browsers to the TLS port, so without one
+// they are a mistake rather than a no-op.
+if config.redirectHTTPPort != 0 {
+    if !config.tlsEnabled {
+        Log.error("--redirect-http sends clients to https; it needs --tls-cert or --acme-domain")
+        exit(2)
+    }
+    if config.unixPath != nil {
+        Log.error("--redirect-http has no https port to send clients to on a unix socket")
+        exit(2)
+    }
+    if config.redirectHTTPPort == config.port {
+        Log.error("--redirect-http needs a port of its own, not the TLS port")
+        exit(2)
+    }
+}
+if hstsSeconds >= 0 {
+    if !config.tlsEnabled {
+        Log.error("--hsts is only ever sent over TLS; it needs --tls-cert or --acme-domain")
+        exit(2)
+    }
+    (config.hsts, config.hstsLength) = makeHSTS(seconds: hstsSeconds)
 }
 // A client cannot discover HTTP/3 by trying: there is no upgrade and no
 // well-known port. It has to be told, on a connection it already has, which

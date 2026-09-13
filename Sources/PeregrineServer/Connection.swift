@@ -273,9 +273,11 @@ public enum PollToken {
     public static let quic: UInt64 = .max - 3
     /// The metrics listener, when one is bound.
     public static let metrics: UInt64 = .max - 4
-    /// Scrapes whose request has not finished arriving. One token per pending
-    /// slot, so an event names its slot without a search. Kept clear of the
-    /// singletons above and far below any slot token.
+    /// The --redirect-http listener, when one is bound.
+    public static let redirect: UInt64 = .max - 5
+    /// Scrapes and redirects whose request has not finished arriving. One token
+    /// per pending slot, so an event names its slot without a search. Kept
+    /// clear of the singletons above and far below any slot token.
     public static let metricsPendingCount = 8
     public static let metricsPendingBase: UInt64 = .max - 16
 

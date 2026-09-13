@@ -32,11 +32,15 @@
 import CPeregrine
 import PeregrineCore
 
-/// A scrape whose request is still on its way.
+/// A scrape, or a --redirect-http request, whose request is still on its way.
+/// The two share these places: both are one request, one response and a
+/// close, and neither ever reaches the application.
 public struct PendingScrape {
     public var fd: Int32 = -1
     public var deadlineMs: UInt64 = 0
     public var buf = ByteBuffer()
+    /// Answered with a redirect rather than with metrics.
+    public var redirect = false
 }
 
 /// How long a half-written scrape may stay half-written.
@@ -69,39 +73,58 @@ extension Worker {
                 pg_accept(metricsFD, raw.baseAddress!, 48, &port)
             }
             if fd < 0 { return }
-            beginScrape(fd)
+            beginOneShot(fd, redirect: false)
         }
     }
 
     /// Reads what has arrived and decides whether the request is all there.
-    private mutating func beginScrape(_ fd: Int32) {
+    mutating func beginOneShot(_ fd: Int32, redirect: Bool) {
         var buf = ByteBuffer()
         switch readScrape(fd, &buf) {
         case .complete:
+            answerOneShot(fd, redirect: redirect, buf)
             buf.destroy()
-            serveScrape(fd)
         case .gone:
             buf.destroy()
             _ = pg_close(fd)
         case .partial:
             guard let index = freeScrapeSlot() else {
                 // Nowhere to wait. Answering from a partial request is the
-                // lesser of the two evils: the response does not depend on
-                // what was asked for, and the alternative is a scrape that
+                // lesser of the two evils: a scrape's response does not depend
+                // on what was asked for, a redirect without its Host is a 400
+                // the client can retry, and the alternative is a client that
                 // silently gets nothing.
+                answerOneShot(fd, redirect: redirect, buf)
                 buf.destroy()
-                serveScrape(fd)
                 return
             }
             guard poller.add(fd, .read, token: PollToken.metricsPending(index)) else {
+                answerOneShot(fd, redirect: redirect, buf)
                 buf.destroy()
-                serveScrape(fd)
                 return
             }
             scrapes[index].fd = fd
             scrapes[index].deadlineMs = pg_monotonic_ms() &+ scrapeDeadlineMs
             scrapes[index].buf = buf
+            scrapes[index].redirect = redirect
         }
+    }
+
+    private mutating func answerOneShot(_ fd: Int32, redirect: Bool, _ request: ByteBuffer) {
+        if redirect {
+            serveRedirect(fd, request)
+        } else {
+            serveScrape(fd)
+        }
+    }
+
+    /// Takes a parked request out of its place, keeping what it had sent.
+    private mutating func takeOneShot(_ index: Int) -> (fd: Int32, redirect: Bool, buf: ByteBuffer) {
+        let taken = (fd: scrapes[index].fd, redirect: scrapes[index].redirect,
+                     buf: scrapes[index].buf)
+        scrapes[index].buf = ByteBuffer()
+        releaseScrape(index, close: false)
+        return taken
     }
 
     /// More of a parked scrape's request arrived.
@@ -115,8 +138,9 @@ extension Worker {
         case .partial:
             return
         case .complete:
-            releaseScrape(index, close: false)
-            serveScrape(fd)
+            var taken = takeOneShot(index)
+            answerOneShot(taken.fd, redirect: taken.redirect, taken.buf)
+            taken.buf.destroy()
         case .gone:
             releaseScrape(index, close: true)
         }
@@ -130,11 +154,12 @@ extension Worker {
             defer { i += 1 }
             if scrapes[i].fd < 0 { continue }
             if now < scrapes[i].deadlineMs { continue }
-            // Long enough. Answer from what there is rather than hang up on a
-            // monitoring agent: the response never depended on the request.
-            let fd = scrapes[i].fd
-            releaseScrape(i, close: false)
-            serveScrape(fd)
+            // Long enough. Answer from what there is rather than hang up: a
+            // scrape's response never depended on the request, and a redirect
+            // that never got its Host is a 400.
+            var taken = takeOneShot(i)
+            answerOneShot(taken.fd, redirect: taken.redirect, taken.buf)
+            taken.buf.destroy()
         }
     }
 
@@ -161,6 +186,7 @@ extension Worker {
         scrapes[index].buf.destroy()
         scrapes[index].fd = -1
         scrapes[index].deadlineMs = 0
+        scrapes[index].redirect = false
         if close && fd >= 0 { _ = pg_close(fd) }
     }
 
@@ -237,16 +263,17 @@ extension Worker {
         head.writeDecimal(body.readableBytes)
         head.write("\r\n\r\n")
 
-        writeAll(fd, UnsafePointer(head.readPointer), head.readableBytes)
+        writeOneShot(fd, UnsafePointer(head.readPointer), head.readableBytes)
         if body.readableBytes > 0 {
-            writeAll(fd, UnsafePointer(body.readPointer), body.readableBytes)
+            writeOneShot(fd, UnsafePointer(body.readPointer), body.readableBytes)
         }
     }
 
     /// Writes until the socket takes it or refuses to. A scrape that cannot be
     /// delivered is dropped rather than waited for: the next one is 15 seconds
-    /// away and the request path is not.
-    private func writeAll(_ fd: Int32, _ p: UnsafePointer<UInt8>, _ n: Int) {
+    /// away and the request path is not. A redirect is a few hundred bytes,
+    /// which a fresh socket always takes.
+    func writeOneShot(_ fd: Int32, _ p: UnsafePointer<UInt8>, _ n: Int) {
         var sent = 0
         var attempts = 16
         while sent < n && attempts > 0 {

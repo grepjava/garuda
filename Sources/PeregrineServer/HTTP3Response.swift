@@ -151,6 +151,9 @@ extension Worker {
         if !seen.contains(.server) {
             encodeStaticH3(h3, "server", "peregrine", into: &block)
         }
+        if let hsts = config.hsts, !seen.contains(.hsts) {
+            encodeStaticH3(h3, "strict-transport-security", hsts, config.hstsLength, into: &block)
+        }
 
         writeH3HeaderBlock(slot, h3, block: &block)
         c.pointee.flags.insert(.responseStarted)

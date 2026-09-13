@@ -164,6 +164,9 @@ extension Worker {
         if let altSvc = config.altSvc, !seen.contains(.altSvc) {
             encodeStatic(h2, "alt-svc", altSvc, config.altSvcLength, into: &block)
         }
+        if let hsts = config.hsts, !seen.contains(.hsts) {
+            encodeStatic(h2, "strict-transport-security", hsts, config.hstsLength, into: &block)
+        }
 
         // A response that can have no body at all ends here, with no DATA
         // frame to carry the flag.

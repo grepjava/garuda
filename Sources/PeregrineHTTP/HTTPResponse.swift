@@ -21,6 +21,9 @@ public struct ResponseHeaderKind: OptionSet, Sendable {
     public static let date             = ResponseHeaderKind(rawValue: 1 << 3)
     public static let server           = ResponseHeaderKind(rawValue: 1 << 4)
     public static let altSvc           = ResponseHeaderKind(rawValue: 1 << 5)
+    /// Strict-Transport-Security: an application that sets its own keeps it,
+    /// and --hsts does not add a second.
+    public static let hsts             = ResponseHeaderKind(rawValue: 1 << 6)
 }
 
 public enum HTTPResponseWriter {
@@ -89,6 +92,8 @@ public enum HTTPResponseWriter {
             if equalsLowercased(name.base, 14, "content-length") { return .contentLength }
         case 17:
             if equalsLowercased(name.base, 17, "transfer-encoding") { return .transferEncoding }
+        case 25:
+            if equalsLowercased(name.base, 25, "strict-transport-security") { return .hsts }
         default:
             return []
         }

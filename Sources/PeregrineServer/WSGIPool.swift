@@ -63,6 +63,8 @@ public final class WSGIJob {
     /// Borrowed; both live for the process.
     let altSvc: UnsafePointer<UInt8>?
     let altSvcLength: Int
+    let hsts: UnsafePointer<UInt8>?
+    let hstsLength: Int
     /// The response is bound for an HTTP/2 or HTTP/3 stream, so its head is
     /// staged rather than written as text.
     let multiplexed: Bool
@@ -106,6 +108,8 @@ public final class WSGIJob {
                             date: UnsafePointer(date),
                             altSvc: altSvc,
                             altSvcLength: altSvcLength,
+                            hsts: hsts,
+                            hstsLength: hstsLength,
                             multiplexed: multiplexed,
                             compress: compress,
                             offeredCoding: offeredCoding,
@@ -117,9 +121,12 @@ public final class WSGIJob {
          httpMinor: UInt8, keepAlive: Bool, suppressBody: Bool,
          date: UnsafePointer<UInt8>,
          altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0,
+         hsts: UnsafePointer<UInt8>? = nil, hstsLength: Int = 0,
          multiplexed: Bool = false,
          compress: Bool = false, offeredCoding: ContentCoding = .identity,
          compressMinimumLength: Int = 1024) {
+        self.hsts = hsts
+        self.hstsLength = hstsLength
         self.compress = compress
         self.offeredCoding = offeredCoding
         self.compressMinimumLength = compressMinimumLength

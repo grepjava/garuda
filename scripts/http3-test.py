@@ -244,6 +244,16 @@ async def basics():
                   b'"webtransport"' in body, body[:300])
 
 
+async def hsts():
+    print("\nStrict-Transport-Security")
+    with Server("--hsts", "600") as server:
+        async with connect("127.0.0.1", server.port, configuration=configuration(),
+                           create_protocol=Client) as client:
+            status, headers, _ = await client.request("GET", "/")
+            is_("--hsts reaches an HTTP/3 response", headers.get(b"strict-transport-security"),
+                b"max-age=600")
+
+
 async def health_check():
     print("\nHealth check path")
     with Server("--health-check-path", "/healthz") as server:
@@ -884,7 +894,7 @@ async def main():
         return 0
     print("peregrine HTTP/3 tests (%s)" % BIN)
 
-    for test in (basics, health_check, static_files, congestion, compression, request_bodies, multiplexing, cancellation, rapid_reset,
+    for test in (basics, hsts, health_check, static_files, congestion, compression, request_bodies, multiplexing, cancellation, rapid_reset,
                  spoofed_address, large_headers, response_framing, flow_control, long_lived,
                  key_update, wsgi, alt_svc):
         try:

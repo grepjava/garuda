@@ -37,6 +37,10 @@ public struct WSGIRequestSnapshot {
     /// process.
     public var altSvc: UnsafePointer<UInt8>? = nil
     public var altSvcLength = 0
+    /// The Strict-Transport-Security value --hsts asked for, or nil. Borrowed;
+    /// lives for the process.
+    public var hsts: UnsafePointer<UInt8>? = nil
+    public var hstsLength = 0
     /// The response travels on a multiplexed stream (HTTP/2 or HTTP/3), where
     /// the head is a compressed header block rather than text, there is no
     /// transfer encoding, and the stream ending is the framing.
@@ -51,6 +55,7 @@ public struct WSGIRequestSnapshot {
     public init(httpMinor: UInt8, keepAlive: Bool, suppressBody: Bool,
                 date: UnsafePointer<UInt8>,
                 altSvc: UnsafePointer<UInt8>? = nil, altSvcLength: Int = 0,
+                hsts: UnsafePointer<UInt8>? = nil, hstsLength: Int = 0,
                 multiplexed: Bool = false,
                 compress: Bool = false, offeredCoding: ContentCoding = .identity,
                 compressMinimumLength: Int = 1024) {
@@ -60,6 +65,8 @@ public struct WSGIRequestSnapshot {
         self.date = date
         self.altSvc = altSvc
         self.altSvcLength = altSvcLength
+        self.hsts = hsts
+        self.hstsLength = hstsLength
         self.multiplexed = multiplexed
         self.compress = compress
         self.offeredCoding = offeredCoding
@@ -447,6 +454,15 @@ public enum WSGIResponseBuilder {
             } else {
                 out.write("Alt-Svc: ")
                 out.write(altSvc, snapshot.altSvcLength)
+                out.writeCRLF()
+            }
+        }
+        if let hsts = snapshot.hsts, !seen.contains(.hsts) {
+            if snapshot.multiplexed {
+                _ = emit("strict-transport-security", ByteSpan(hsts, snapshot.hstsLength))
+            } else {
+                out.write("Strict-Transport-Security: ")
+                out.write(hsts, snapshot.hstsLength)
                 out.writeCRLF()
             }
         }

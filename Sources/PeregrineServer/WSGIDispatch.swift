@@ -125,6 +125,8 @@ extension Worker {
                                    // from here.
                                    altSvc: c.pointee.isH3Stream ? nil : config.altSvc,
                                    altSvcLength: config.altSvcLength,
+                                   hsts: config.hsts,
+                                   hstsLength: config.hstsLength,
                                    multiplexed: c.pointee.isStream,
                                    compress: config.compress,
                                    offeredCoding: c.pointee.acceptedCoding,
@@ -586,6 +588,8 @@ extension Worker {
                           date: UnsafePointer(dates.bytes),
                           altSvc: c.pointee.isH3Stream ? nil : config.altSvc,
                           altSvcLength: config.altSvcLength,
+                          hsts: config.hsts,
+                          hstsLength: config.hstsLength,
                           multiplexed: c.pointee.isStream,
                           compress: config.compress,
                           offeredCoding: c.pointee.acceptedCoding,

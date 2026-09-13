@@ -795,6 +795,61 @@ SNI selection of its own yet.
 
 ---
 
+## Redirecting HTTP to HTTPS
+
+```bash
+peregrine --port 443 --acme-domain example.com \
+    --redirect-http 80 --hsts 31536000 myapp:app
+```
+
+`--redirect-http 80` listens for plain HTTP on port 80 and answers every
+request with a redirect to the same host and path on the TLS port:
+
+```
+GET /cart?id=7 HTTP/1.1
+Host: example.com
+
+HTTP/1.1 301 Moved Permanently
+Location: https://example.com/cart?id=7
+```
+
+- **Status.** `GET` and `HEAD` get `301`. Every other method gets `308`, which
+  keeps the method and the body; a `301` would let the client repeat a `POST`
+  as a `GET`.
+- **Location.** The host comes from `Host`, or from the request target when a
+  client sends an absolute URL. Its port is replaced with the TLS port, which
+  is left out when it is 443.
+- **Refusals.** A request with no `Host`, or with a `Host` that is not a host
+  name or address, gets `400`. The redirect target comes from the client, so
+  it is checked before it goes into a header.
+- **Nothing else.** The application never sees these requests, and every
+  response closes the connection.
+
+Certificates from `--acme-domain` do not need port 80: they are validated on
+the TLS port with tls-alpn-01. Behind a proxy that terminates TLS, redirect at
+the proxy instead. Ports below 1024 need the same privilege as port 443, root
+or `CAP_NET_BIND_SERVICE`.
+
+### Strict-Transport-Security
+
+`--hsts SECONDS` adds `Strict-Transport-Security: max-age=SECONDS` to every
+TLS response: application responses and static files, over HTTP/1.1, HTTP/2
+and HTTP/3. A browser that has seen it goes straight to https for that long,
+so its first request no longer travels as plain HTTP where it could be
+intercepted before the redirect. The header is never sent over plain HTTP,
+because browsers ignore it there.
+
+An application that sets the header itself keeps its own value, and the server
+adds no second one. `includeSubDomains` and `preload` are not added. They
+commit other host names to https, which is for whoever owns those names to
+decide; an application that wants them sets the header itself.
+
+Start with a short `max-age`, such as `300`. A browser that has seen a long one
+refuses plain HTTP to the site until it expires, even after the certificate is
+gone.
+
+---
+
 ## Application logging
 
 Peregrine writes its own lines with a level and a pid. Python's `logging`

@@ -676,6 +676,7 @@ extension Worker {
             c.pointee.write.write(altSvc, config.altSvcLength)
             c.pointee.write.writeCRLF()
         }
+        if !seen.contains(.hsts) { writeHSTS(&c.pointee.write) }
         HTTPResponseWriter.writeConnection(&c.pointee.write,
                                            keepAlive: c.pointee.flags.contains(.keepAlive))
         HTTPResponseWriter.endHead(&c.pointee.write)

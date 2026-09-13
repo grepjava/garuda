@@ -285,6 +285,8 @@ peregrine [options] MODULE:ATTRIBUTE
   --acme-email ADDR        contact address for the ACME account
   --acme-cache DIR         account key and certificate (default ./acme)
   --acme-staging           use Let's Encrypt's staging CA
+  --redirect-http PORT     answer plain HTTP on PORT with a redirect to https
+  --hsts SECONDS           Strict-Transport-Security on every TLS response
   --rate-limit RATE        429 past RATE requests per client (100/s, 600/m),
                            counted across all workers
   --rate-limit-burst N     requests allowed at once before RATE applies

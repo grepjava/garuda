@@ -258,7 +258,9 @@ extension Worker {
             }
             HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: 304)
             HTTPResponseWriter.writeDate(&c.pointee.write, dates)
-            c.pointee.write.write("Server: peregrine\r\nETag: ")
+            c.pointee.write.write("Server: peregrine\r\n")
+            writeHSTS(&c.pointee.write)
+            c.pointee.write.write("ETag: ")
             etag.withUnsafeBufferPointer { c.pointee.write.write($0.baseAddress!, etagLength) }
             c.pointee.write.write("\r\n")
             if vary { c.pointee.write.write("Vary: Accept-Encoding\r\n") }
@@ -284,7 +286,9 @@ extension Worker {
 
         HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: 200)
         HTTPResponseWriter.writeDate(&c.pointee.write, dates)
-        c.pointee.write.write("Server: peregrine\r\nContent-Type: ")
+        c.pointee.write.write("Server: peregrine\r\n")
+        writeHSTS(&c.pointee.write)
+        c.pointee.write.write("Content-Type: ")
         c.pointee.write.write(type)
         if coding != .identity {
             c.pointee.write.write("\r\nContent-Encoding: ")
@@ -334,6 +338,9 @@ extension Worker {
             if vary { encodeStaticH3(h3, "vary", "accept-encoding", into: &block) }
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "peregrine", into: &block)
+            if let hsts = config.hsts {
+                encodeStaticH3(h3, "strict-transport-security", hsts, config.hstsLength, into: &block)
+            }
             writeH3HeaderBlock(slot, h3, block: &block)
             endEmptyH3Response(slot, h3, parent: parent)
             return
@@ -350,6 +357,9 @@ extension Worker {
         if vary { encodeStatic(h2, "vary", "accept-encoding", into: &block) }
         encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
         encodeStatic(h2, "server", "peregrine", into: &block)
+        if let hsts = config.hsts {
+            encodeStatic(h2, "strict-transport-security", hsts, config.hstsLength, into: &block)
+        }
         writeHeaderBlock(slot, h2, block: &block, endStream: true)
         c.pointee.flags.insert(.responseStarted)
         c.pointee.flags.insert(.responseComplete)
@@ -424,6 +434,9 @@ extension Worker {
             }
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "peregrine", into: &block)
+            if let hsts = config.hsts {
+                encodeStaticH3(h3, "strict-transport-security", hsts, config.hstsLength, into: &block)
+            }
             writeH3HeaderBlock(slot, h3, block: &block)
         } else {
             let parent = Int(c.pointee.parentSlot)
@@ -447,6 +460,9 @@ extension Worker {
             }
             encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStatic(h2, "server", "peregrine", into: &block)
+        if let hsts = config.hsts {
+            encodeStatic(h2, "strict-transport-security", hsts, config.hstsLength, into: &block)
+        }
             writeHeaderBlock(slot, h2, block: &block, endStream: empty)
         }
 
