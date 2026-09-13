@@ -278,6 +278,9 @@ peregrine [options] MODULE:ATTRIBUTE
   --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
   --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
                            without calling the application (repeatable)
+  --rate-limit RATE        429 past RATE requests per client (100/s, 600/m),
+                           counted across all workers
+  --rate-limit-burst N     requests allowed at once before RATE applies
   --compress               compress text-like application responses with
                            br, zstd or gzip (see CONFIG.md about BREACH)
   --compress-min-size N    leave bodies declared smaller than N alone (1024)

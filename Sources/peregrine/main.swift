@@ -114,6 +114,12 @@ func printUsage() {
                                without calling the application (repeatable).
                                A path with no file behind it still reaches
                                the application
+      --rate-limit RATE        refuse a client with 429 past RATE requests, as
+                               in 100/s, 600/m or 5000/h; counted across all
+                               workers, by the forwarded address behind a
+                               trusted proxy and by /64 for IPv6
+      --rate-limit-burst N     requests allowed at once before the rate
+                               applies (default: the count in RATE)
       --compress               compress application responses (br, zstd or
                                gzip, as the client accepts) when their type
                                is text-like; read CONFIG.md about BREACH first
@@ -395,6 +401,36 @@ while i < argc {
         }
         UnsafeMutablePointer(mutating: v)[at] = 0
         staticRoutes.append((prefix: v, directory: v + at + 1))
+    } else if matches(arg, "--rate-limit") {
+        guard let v = next("--rate-limit needs a rate, as in 100/s") else { break }
+        var count = 0
+        var at = 0
+        while v[at] >= 48 && v[at] <= 57 && count < 100_000_000 {   // digits
+            count = count * 10 + Int(v[at] - 48)
+            at += 1
+        }
+        var period: UInt64 = 1000
+        if v[at] == 47 {   // '/'
+            switch v[at + 1] {
+            case 115: period = 1000          // s
+            case 109: period = 60_000        // m
+            case 104: period = 3_600_000     // h
+            default: period = 0
+            }
+            if period != 0 && v[at + 2] != 0 { period = 0 }
+        } else if v[at] != 0 {
+            period = 0
+        }
+        if count <= 0 || period == 0 || period * 1000 / UInt64(count) == 0 {
+            Log.error("--rate-limit takes requests per second, minute or hour, as in 100/s or 600/m")
+            failed = true
+            break
+        }
+        config.rateLimitCount = count
+        config.rateLimitPeriodMs = period
+    } else if matches(arg, "--rate-limit-burst") {
+        guard let v = next("--rate-limit-burst needs a count") else { break }
+        config.rateLimitBurst = max(1, parseInt(v))
     } else if matches(arg, "--compress") {
         config.compress = true
     } else if matches(arg, "--compress-static") {

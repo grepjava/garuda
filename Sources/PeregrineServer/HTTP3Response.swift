@@ -285,7 +285,7 @@ extension Worker {
     }
 
     /// The HTTP/3 form of a server-generated error: a status and nothing else.
-    mutating func h3FailRequest(_ slot: Int, status: Int) {
+    mutating func h3FailRequest(_ slot: Int, status: Int, retryAfter: Int = 0) {
         let c = table[slot]
         let parent = Int(c.pointee.parentSlot)
         guard parent >= 0, let h3 = table[parent].pointee.h3 else {
@@ -301,6 +301,13 @@ extension Worker {
             encodeStaticH3(h3, "content-length", "0", into: &block)
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "peregrine", into: &block)
+            if retryAfter > 0 {
+                var digits = ByteBuffer()
+                defer { digits.destroy() }
+                digits.writeDecimal(retryAfter)
+                encodeStaticH3(h3, "retry-after", UnsafePointer(digits.readPointer),
+                               digits.readableBytes, into: &block)
+            }
             writeH3HeaderBlock(slot, h3, block: &block)
             c.pointee.flags.insert(.responseStarted)
             c.pointee.flags.insert(.responseComplete)

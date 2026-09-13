@@ -227,7 +227,7 @@ extension Worker {
     ///
     /// The HTTP/1 path writes a small text response, which on a stream would
     /// arrive as DATA and be neither an error nor a body anyone asked for.
-    mutating func h2FailRequest(_ slot: Int, status: Int) {
+    mutating func h2FailRequest(_ slot: Int, status: Int, retryAfter: Int = 0) {
         let c = table[slot]
         let parent = Int(c.pointee.parentSlot)
         guard parent >= 0, let h2 = table[parent].pointee.h2 else {
@@ -242,6 +242,13 @@ extension Worker {
             encodeStatic(h2, "content-length", "0", into: &block)
             encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStatic(h2, "server", "peregrine", into: &block)
+            if retryAfter > 0 {
+                var digits = ByteBuffer()
+                defer { digits.destroy() }
+                digits.writeDecimal(retryAfter)
+                encodeStatic(h2, "retry-after", UnsafePointer(digits.readPointer),
+                             digits.readableBytes, into: &block)
+            }
             writeHeaderBlock(slot, h2, block: &block, endStream: true)
             c.pointee.flags.insert(.responseStarted)
             c.pointee.flags.insert(.responseComplete)

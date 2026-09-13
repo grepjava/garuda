@@ -73,13 +73,27 @@ public struct QUICPacketSpace {
     public var ackElicitingPending = false
     public var ackDeadlineMs: UInt64 = 0
 
-    public var sent: [QUICSentPacket] = []
+    /// Packets still waiting for an outcome are `sent[sentHead...]`, in the
+    /// order they were sent -- which is packet number order and time order
+    /// both, and everything below relies on that.
+    ///
+    /// Settled packets leave from the front by moving the head, not by
+    /// building a new array. The array used to be rebuilt on every ACK, which
+    /// made each acknowledgement cost every packet in flight, each one copied
+    /// with its frame lists retained and released. On a path with a large
+    /// window that is thousands of packets per ACK, and it was the single
+    /// largest cost of serving a download over HTTP/3.
+    public internal(set) var sent: [QUICSentPacket] = []
+    public internal(set) var sentHead = 0
     public var largestAckedPacket: UInt64?
     public var lossTimeMs: UInt64 = 0
     public var timeOfLastAckElicitingMs: UInt64 = 0
     public var ackElicitingInFlight = 0
 
     public init() {}
+
+    /// Packets sent and not yet acknowledged or declared lost.
+    @inlinable public var outstanding: Int { sent.count - sentHead }
 
     public mutating func record(_ packet: QUICSentPacket) {
         sent.append(packet)
@@ -88,6 +102,38 @@ public struct QUICPacketSpace {
             timeOfLastAckElicitingMs = packet.sentAtMs
         }
         nextPacketNumber = packet.packetNumber &+ 1
+    }
+
+    /// One past the last outstanding packet numbered `number` or lower.
+    func endOfPackets(through number: UInt64) -> Int {
+        var low = sentHead
+        var high = sent.count
+        while low < high {
+            let mid = (low + high) >> 1
+            if sent[mid].packetNumber <= number { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+
+    /// Forgets everything before `index`, whose outcome has been settled.
+    mutating func advanceHead(to index: Int) {
+        // Release what the settled slots still hold, which after packing is
+        // stale copies of packets that now live further up.
+        var i = sentHead
+        while i < index {
+            sent[i].frames = QUICSentFrames()
+            i += 1
+        }
+        sentHead = index
+        if sentHead == sent.count {
+            sent.removeAll(keepingCapacity: true)
+            sentHead = 0
+        } else if sentHead >= 1024 && sentHead * 2 >= sent.count {
+            // Once the dead front is at least as large as what is alive, one
+            // move of the live part pays for itself.
+            sent.removeFirst(sentHead)
+            sentHead = 0
+        }
     }
 }
 
@@ -230,33 +276,47 @@ public enum QUICLossDetection {
                              ackDelayMs: UInt64,
                              nowMs: UInt64) -> Result {
         var result = Result()
-        if space.sent.isEmpty { return result }
+        if space.outstanding == 0 { return result }
 
-        var remaining: [QUICSentPacket] = []
-        remaining.reserveCapacity(space.sent.count)
-        for packet in space.sent {
+        // Nothing numbered above the largest acknowledged packet can be
+        // covered by this ACK, and nothing above the threshold can be old
+        // enough in ordering to call lost. So only the outstanding packets up
+        // to the threshold are looked at, and the rest -- on a fast path, most
+        // of what is in flight -- are not touched at all.
+        let threshold = max(space.largestAckedPacket ?? largestAcked, largestAcked)
+        let head = space.sentHead
+        let end = space.endOfPackets(through: threshold)
+        if end == head { return result }
+
+        // Acknowledged packets are taken out walking downward, so the ones
+        // that stay can be packed against `end` without overwriting a slot
+        // not yet looked at.
+        var keep = end
+        var i = end
+        while i > head {
+            i -= 1
+            let number = space.sent[i].packetNumber
             var isAcked = false
-            for range in ranges where packet.packetNumber >= range.low
-                                   && packet.packetNumber <= range.high {
-                isAcked = true
-                break
+            if number <= largestAcked {
+                for range in ranges where number >= range.low && number <= range.high {
+                    isAcked = true
+                    break
+                }
             }
             if isAcked {
-                if packet.packetNumber == largestAcked { result.largestNewlyAcked = packet }
-                result.acked.append(packet)
+                if number == largestAcked { result.largestNewlyAcked = space.sent[i] }
+                result.acked.append(space.sent[i])
             } else {
-                remaining.append(packet)
+                keep -= 1
+                if keep != i { space.sent[keep] = space.sent[i] }
             }
         }
         if result.acked.isEmpty {
             return result
         }
+        result.acked.reverse()
 
-        if let previous = space.largestAckedPacket {
-            space.largestAckedPacket = max(previous, largestAcked)
-        } else {
-            space.largestAckedPacket = largestAcked
-        }
+        space.largestAckedPacket = threshold
 
         // The round-trip sample is only taken from the largest acknowledged
         // packet, and only when that packet is newly acknowledged: an older
@@ -276,30 +336,39 @@ public enum QUICLossDetection {
             if let covered = packet.largestAcked { space.acks.removeUpTo(covered) }
         }
 
-        // Loss: by ordering first, then by time.
-        let threshold = space.largestAckedPacket ?? largestAcked
+        // Loss: by ordering first, then by time -- over what survived above,
+        // which is every outstanding packet below the threshold. The delay is
+        // read now, after the round-trip sample this ACK may have given.
         let delay = recovery.lossDelayMs
-        var stillPending: [QUICSentPacket] = []
-        stillPending.reserveCapacity(remaining.count)
+        let survivors = keep
+        keep = end
         var earliestLossTime: UInt64 = 0
-        for packet in remaining {
-            if packet.packetNumber >= threshold {
-                stillPending.append(packet)
-                continue
+        i = end
+        while i > survivors {
+            i -= 1
+            let number = space.sent[i].packetNumber
+            let sentAt = space.sent[i].sentAtMs
+            var isLost = false
+            if number < threshold {
+                let gap = threshold - number
+                let age = nowMs >= sentAt ? nowMs - sentAt : 0
+                isLost = gap >= UInt64(QUICRecovery.packetThreshold) || age >= delay
             }
-            let gap = threshold - packet.packetNumber
-            let age = nowMs >= packet.sentAtMs ? nowMs - packet.sentAtMs : 0
-            if gap >= UInt64(QUICRecovery.packetThreshold) || age >= delay {
-                result.lost.append(packet)
-                if packet.ackEliciting { space.ackElicitingInFlight -= 1 }
+            if isLost {
+                if space.sent[i].ackEliciting { space.ackElicitingInFlight -= 1 }
+                result.lost.append(space.sent[i])
             } else {
-                stillPending.append(packet)
-                // When this packet would age out, if nothing else settles it.
-                let at = packet.sentAtMs + delay
-                if earliestLossTime == 0 || at < earliestLossTime { earliestLossTime = at }
+                if number < threshold {
+                    // When this packet would age out, if nothing else settles it.
+                    let at = sentAt + delay
+                    if earliestLossTime == 0 || at < earliestLossTime { earliestLossTime = at }
+                }
+                keep -= 1
+                if keep != i { space.sent[keep] = space.sent[i] }
             }
         }
-        space.sent = stillPending
+        result.lost.reverse()
+        space.advanceHead(to: keep)
         space.lossTimeMs = earliestLossTime
 
         recovery.onPacketsAcked(result.acked, nowMs: nowMs)
@@ -311,8 +380,9 @@ public enum QUICLossDetection {
     /// timeout fired too many times or the connection is closing.
     public static func abandon(space: inout QUICPacketSpace,
                                recovery: inout QUICRecovery) -> [QUICSentPacket] {
-        let lost = space.sent
+        let lost = Array(space.sent[space.sentHead...])
         space.sent = []
+        space.sentHead = 0
         space.ackElicitingInFlight = 0
         for packet in lost where packet.inFlight {
             recovery.bytesInFlight -= packet.size

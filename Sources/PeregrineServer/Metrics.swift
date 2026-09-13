@@ -108,6 +108,8 @@ public enum Metrics {
         simple(&out, "peregrine_buffer_pool_misses_total", "counter",
                "Read buffers that had to be allocated.",
                sum(PG_M_POOL_MISSES))
+        simple(&out, "peregrine_requests_rate_limited_total", "counter",
+               "Requests refused with 429 by --rate-limit.", sum(PG_M_RATE_LIMITED))
         simple(&out, "peregrine_workers", "gauge",
                "Workers sharing these counters.", UInt64(pg_metrics_slots()))
 

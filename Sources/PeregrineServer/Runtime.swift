@@ -88,6 +88,30 @@ public enum Peregrine {
             }
         }
 
+        // --rate-limit. Mapped here for the same reason as the metrics page:
+        // it has to exist before the first fork for every worker to share it.
+        if config.rateLimitCount > 0 {
+            let emission = config.rateLimitPeriodMs * 1000 / UInt64(config.rateLimitCount)
+            let burst = config.rateLimitBurst > 0 ? config.rateLimitBurst : config.rateLimitCount
+            // 2^16 entries, a megabyte: room for tens of thousands of clients
+            // active at once before entries have to be reused.
+            if pg_ratelimit_init(emission, emission * UInt64(burst - 1), 16) != 0 {
+                Log.error("cannot map the shared rate-limit table")
+                return 1
+            }
+            let unit: StaticString = config.rateLimitPeriodMs == 1000 ? " per second"
+                : config.rateLimitPeriodMs == 60_000 ? " per minute" : " per hour"
+            let count = config.rateLimitCount
+            Log.info { line in
+                line.str("rate limit: ")
+                line.int(count)
+                line.str(unit)
+                line.str(", burst ")
+                line.int(burst)
+                line.str(", shared by every worker")
+            }
+        }
+
         // Everything runs under a supervisor, including a single worker and
         // including --free-threaded, where the supervisor has one child that
         // holds every worker as a thread of itself.

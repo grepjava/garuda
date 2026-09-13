@@ -216,6 +216,16 @@ public struct ServerConfig {
     /// about a kilobyte the saving is smaller than the framing.
     public var compressMinimumLength = 1024
 
+    // --- rate limiting ---
+    /// Requests each client may make per `rateLimitPeriodMs`, or 0 for no
+    /// limit. Counted across every worker, not per worker; see
+    /// peregrine_ratelimit.h.
+    public var rateLimitCount = 0
+    public var rateLimitPeriodMs: UInt64 = 1000
+    /// Requests a client may make at once before the rate applies. 0 means
+    /// one period's worth, the count itself.
+    public var rateLimitBurst = 0
+
     // --- development ---
     /// Restart workers when a watched source file changes.
     public var reload = false

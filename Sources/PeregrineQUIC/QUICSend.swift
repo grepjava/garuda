@@ -795,24 +795,27 @@ extension QUICLossDetection {
         let delay = recovery.lossDelayMs
         let threshold = space.largestAckedPacket ?? UInt64.max
         var lost: [QUICSentPacket] = []
-        var kept: [QUICSentPacket] = []
-        var earliest: UInt64 = 0
 
-        for packet in space.sent {
-            let age = nowMs >= packet.sentAtMs ? nowMs - packet.sentAtMs : 0
-            let ordered = threshold != UInt64.max && packet.packetNumber < threshold
-                        && threshold - packet.packetNumber >= UInt64(QUICRecovery.packetThreshold)
-            if age >= delay || ordered {
-                lost.append(packet)
-                if packet.ackEliciting { space.ackElicitingInFlight -= 1 }
-            } else {
-                kept.append(packet)
-                let at = packet.sentAtMs + delay
-                if earliest == 0 || at < earliest { earliest = at }
-            }
+        // Outstanding packets are in the order they were sent, so both tests --
+        // old enough, and far enough behind the largest acknowledged -- pick
+        // out a prefix, and so does either of them. The first packet that
+        // passes neither ends the search.
+        var index = space.sentHead
+        while index < space.sent.count {
+            let number = space.sent[index].packetNumber
+            let sentAt = space.sent[index].sentAtMs
+            let age = nowMs >= sentAt ? nowMs - sentAt : 0
+            let ordered = threshold != UInt64.max && number < threshold
+                        && threshold - number >= UInt64(QUICRecovery.packetThreshold)
+            if !(age >= delay || ordered) { break }
+            if space.sent[index].ackEliciting { space.ackElicitingInFlight -= 1 }
+            lost.append(space.sent[index])
+            index += 1
         }
-        space.sent = kept
-        space.lossTimeMs = earliest
+        space.advanceHead(to: index)
+        // The oldest packet left is the first to age out.
+        space.lossTimeMs = space.outstanding > 0
+            ? space.sent[space.sentHead].sentAtMs + delay : 0
         recovery.onPacketsLost(lost, nowMs: nowMs)
         return lost
     }

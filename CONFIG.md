@@ -585,6 +585,51 @@ nothing.
 
 ---
 
+## Rate limiting
+
+```bash
+peregrine --rate-limit 100/s --rate-limit-burst 200 myapp:app
+```
+
+A client past its allowance gets `429 Too Many Requests` with a `Retry-After`
+in whole seconds, before the application is called. The rate is `N/s`, `N/m`
+or `N/h`; the burst is how many requests may arrive at once before the rate
+applies, and defaults to `N`.
+
+The count is the server's, not each worker's. With `--workers 8` a client's
+connections are spread over eight accept queues by the kernel, and a limit kept
+per worker would let it through up to eight times over, unevenly. The state
+lives in a table mapped before the workers start, and every worker charges the
+same entry for the same client with a compare-and-swap, so two workers
+admitting the same client at the same moment cannot both spend its last
+request.
+
+Who counts as a client:
+
+- **Behind a proxy on `--forwarded-allow-ips`**, the address the proxy
+  reports. Keying by the peer there would put every user in one bucket.
+- **Otherwise the peer address**, and `X-Forwarded-For` is ignored — believing
+  it would give any client a fresh allowance per request.
+- **IPv6 by `/64`**, which is what one subscriber is normally given. Keyed by
+  the full address, each of them would have 2⁶⁴ allowances.
+- **Unix socket peers** are not limited unless a trusted proxy names the
+  client.
+
+The health probe on `--health-check-path` is never refused, and refusals are
+counted in `peregrine_requests_rate_limited_total` on the metrics port.
+
+The table holds 65,536 clients. An entry whose client has gone quiet long
+enough to have its whole burst back is reused, so the limit covers the clients
+active *now*, not everyone ever seen. If a new client finds no entry to take,
+its request is allowed: a limiter that refuses traffic because its own table is
+full is a denial of service against everyone.
+
+This is a guard against a single client overwhelming the server, not a quota
+system. There is no per-route limit and no key other than the address; an
+application that needs either wants a limiter that knows its users.
+
+---
+
 ## Health checks
 
 `--health-check-path /healthz` answers that path in the server, with `200` and

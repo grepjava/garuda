@@ -746,6 +746,16 @@ public struct Worker {
             respondHealthy(slot)
             return
         }
+        // --rate-limit. After the probe, which an orchestrator sends from one
+        // address on a schedule and must never be refused, and before
+        // anything that costs work -- a static file included.
+        if config.rateLimitCount > 0 {
+            let wait = rateLimitWait(slot)
+            if wait > 0 {
+                respondRateLimited(slot, waitUs: wait)
+                return
+            }
+        }
         // --static-dir. Returns false for anything it does not have a file
         // for, including a path under its own prefix, so a route never takes
         // a URL away from the application.

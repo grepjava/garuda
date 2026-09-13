@@ -39,6 +39,7 @@ enum {
     PG_M_SLOTS_CAPACITY,          /* gauge: this worker's connection table */
     PG_M_POOL_HITS,               /* buffer pool: a block came off the free list */
     PG_M_POOL_MISSES,             /* buffer pool: a block had to be allocated */
+    PG_M_RATE_LIMITED,            /* refused with 429 by --rate-limit */
     PG_M_DURATION_COUNT,
     PG_M_DURATION_SUM_US,
     PG_M_BUCKET0,
