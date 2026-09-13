@@ -13,6 +13,7 @@ import asyncio
 import sys
 
 BIG = 200_000
+MID = 64 * 1024
 
 
 async def respond(send, body, status=200):
@@ -48,6 +49,9 @@ async def app(scope, receive, send):
     elif path.startswith("/big/"):
         tag = path[5:].encode()
         await respond(send, tag + b"." * (BIG - len(tag)))
+    elif path.startswith("/mid/"):
+        tag = path[5:].encode()
+        await respond(send, tag + b"." * (MID - len(tag)))
     elif path.startswith("/sleep/"):
         await asyncio.sleep(0)
         await respond(send, path[7:].encode())

@@ -262,6 +262,16 @@ public struct Worker {
                 // A stale event for a slot that has already been recycled.
                 if c.pointee.state == .free || c.pointee.generation != generation { continue }
                 handleConnectionEvent(slot, mask)
+                // An ASGI application started eagerly has run by now, and its
+                // response waits in the deferred queue. Past `flushBatch` of
+                // them the batch goes out here, between events, where no
+                // application is running: a pipelined request the flush
+                // recycles a connection for is dispatched from the walk, one
+                // after another, not from inside another request.
+                if appProtocol == .asgi && deferredFlushCount >= Worker.flushBatch
+                    && !runningDeferredFlushes {
+                    runDeferredFlushes()
+                }
             }
         }
         // The WSGI responses this batch finished go out together. ASGI ones
@@ -869,17 +879,22 @@ public struct Worker {
 
     // MARK: - Writing
 
-    /// How many finished WSGI responses wait for the end of an event batch
+    /// How many responses finished inside one event batch wait for its end
     /// before going out anyway. Holding a response costs its client the time
     /// the ones after it take to run, so the batch is kept small.
-    static let wsgiFlushBatch = 16
+    ///
+    /// WSGI applications always run inside the batch. ASGI ones do when their
+    /// task starts eagerly, and then an uncapped batch is the whole connection
+    /// set: the last of 64 responses waits for the 63 applications before it.
+    static let flushBatch = 16
 
     /// Sends a finished HTTP/1 response together with the others finishing
     /// around it, rather than on its own.
     ///
     /// ASGI responses go out at the end of the event-loop iteration, which is
-    /// what uvloop does with transport writes. WSGI responses go out at the end
-    /// of the event batch, or every `wsgiFlushBatch` of them. It matters more
+    /// what uvloop does with transport writes, or every `flushBatch` of them
+    /// finished inside an event batch. WSGI responses go out at the end of the
+    /// event batch, or every `flushBatch` of them. It matters more
     /// than it looks. A write wakes whoever reads the other end. Written one at
     /// a time between applications taking tens of microseconds each, the
     /// readers have gone back to sleep before every write, and every write pays
@@ -909,7 +924,7 @@ public struct Worker {
                                                            generation: c.pointee.generation)
         deferredFlushCount += 1
         c.pointee.flags.insert(.flushQueued)
-        if appProtocol == .wsgi && deferredFlushCount >= Worker.wsgiFlushBatch
+        if appProtocol == .wsgi && deferredFlushCount >= Worker.flushBatch
             && !runningDeferredFlushes {
             runDeferredFlushes()
         }

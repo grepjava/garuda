@@ -25,6 +25,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +35,7 @@ PORT = int(os.environ.get("PORT", "8262"))
 EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
 WORK = tempfile.mkdtemp(prefix="eager-start-")
 BIG = 200_000
+MID = 64 * 1024
 
 passed = failed = 0
 
@@ -202,6 +204,57 @@ def case_pipelined():
     c.close()
 
 
+def case_deep_pipeline():
+    # Each response is 64 KiB, larger than the write buffer holds back, so it
+    # is written while its application runs, and the connection is recycled
+    # for the next request only when the application returns. A design that
+    # dispatched that next request from inside the one before would nest as
+    # deep as the pipeline is long, and 20,000 levels do not survive: the
+    # interpreter's recursion limit or the stack gives out long before.
+    print("A pipeline far longer than nesting could survive")
+    n = 20_000
+    sock = socket.create_connection(("127.0.0.1", PORT), timeout=30)
+    payload = b"".join(Conn.encode("GET", f"/mid/{i}") for i in range(n))
+    sender = threading.Thread(target=sock.sendall, args=(payload,), daemon=True)
+    sender.start()
+    buf = bytearray()
+    pos = 0
+    answered = 0
+    wrong = []
+    try:
+        while answered < n:
+            end = buf.find(b"\r\n\r\n", pos)
+            if end >= 0:
+                head = bytes(buf[pos:end]).split(b"\r\n")
+                length = 0
+                for line in head[1:]:
+                    name, _, value = line.partition(b":")
+                    if name.strip().lower() == b"content-length":
+                        length = int(value)
+                if len(buf) >= end + 4 + length:
+                    status = int(head[0].split()[1])
+                    tag = f"{answered}.".encode()
+                    if status != 200 or length != MID or buf[end + 4:end + 4 + len(tag)] != tag:
+                        wrong.append(answered)
+                        if len(wrong) > 3:
+                            break
+                    pos = end + 4 + length
+                    answered += 1
+                    if pos > (1 << 22):
+                        del buf[:pos]
+                        pos = 0
+                    continue
+            chunk = sock.recv(1 << 20)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+        sender.join(timeout=5)
+    check(f"{n} pipelined 64 KiB responses arrive whole and in order",
+          answered == n and not wrong, f"answered {answered}, first wrong {wrong[:3]}")
+
+
 def case_waits():
     print("An application that waits")
     c = Conn()
@@ -344,7 +397,8 @@ def main():
             return 1
 
         for name, fn in (("how", case_how), ("keep-alive", case_keep_alive),
-                         ("pipelined", case_pipelined), ("waits", case_waits),
+                         ("pipelined", case_pipelined),
+                         ("deep pipeline", case_deep_pipeline), ("waits", case_waits),
                          ("body", case_body), ("failures", case_failures),
                          ("http2", case_http2)):
             attempt(name, fn)
