@@ -84,6 +84,69 @@ func lossAfterAckOwesNothing() {
     send.destroy()
 }
 
+/// Checks a range set against one flag per byte, and that it is kept in the
+/// shape its binary search depends on: ascending, disjoint, never touching.
+private func expectMatches(_ set: QUICByteRanges, _ model: [Bool], _ step: Int) -> Bool {
+    var bits = [Bool](repeating: false, count: model.count)
+    for (i, range) in set.ranges.enumerated() {
+        if range.low >= range.high { return false }
+        if i > 0 && set.ranges[i - 1].high >= range.low { return false }
+        for b in range.low..<range.high { bits[Int(b)] = true }
+    }
+    return bits == model
+}
+
+@Test("acknowledgements, losses and retransmissions agree with a byte-by-byte model")
+func sendStreamAgreesWithModel() {
+    // Random, but the same every run.
+    var seed: UInt64 = 0x9E37_79B9_7F4A_7C15
+    func next(_ bound: Int) -> Int {
+        seed = seed &* 6364136223846793005 &+ 1442695040888963407
+        return Int((seed >> 33) % UInt64(bound))
+    }
+    let size = 600
+    for _ in 0..<20 {
+        var plain = QUICByteRanges()
+        var plainModel = [Bool](repeating: false, count: size)
+        var send = QUICSendStream()
+        let bytes = [UInt8](repeating: 1, count: size)
+        bytes.withUnsafeBufferPointer { send.write($0.baseAddress!, size) }
+        send.sent = UInt64(size)
+        var acked = [Bool](repeating: false, count: size)
+        var lost = [Bool](repeating: false, count: size)
+
+        for step in 0..<400 {
+            let low = next(size)
+            let high = min(size, low + 1 + next(40))
+            switch next(4) {
+            case 0:
+                plain.add(UInt64(low), UInt64(high))
+                for b in low..<high { plainModel[b] = true }
+                send.acknowledge(UInt64(low), UInt64(high))
+                for b in low..<high { acked[b] = true; lost[b] = false }
+            case 1:
+                plain.subtract(UInt64(low), UInt64(high))
+                for b in low..<high { plainModel[b] = false }
+                send.declareLost(UInt64(low), UInt64(high))
+                for b in low..<high where !acked[b] { lost[b] = true }
+            default:
+                // What the sender does: take the first range owed, send part.
+                if let first = send.lost.ranges.first {
+                    let end = min(first.high, first.low + UInt64(1 + next(30)))
+                    send.lost.subtract(first.low, end)
+                    for b in Int(first.low)..<Int(end) { lost[b] = false }
+                }
+            }
+            #expect(expectMatches(plain, plainModel, step))
+            #expect(expectMatches(send.lost, lost, step))
+            #expect(expectMatches(send.acked, acked, step))
+            // Everything below the base has been acknowledged.
+            #expect(acked[0..<Int(send.base)].allSatisfy { $0 })
+        }
+        send.destroy()
+    }
+}
+
 // MARK: - Reassembly
 
 @Test("overlapping fragments are held once, inside the window")

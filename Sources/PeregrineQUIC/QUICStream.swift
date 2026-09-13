@@ -29,10 +29,26 @@ public struct QUICByteRanges {
     @inlinable public var isEmpty: Bool { ranges.isEmpty }
     @inlinable public var count: Int { ranges.count }
 
+    /// The first range ending after `offset`, or at it when `touching`.
+    ///
+    /// The ranges are disjoint and ascending, so their ends ascend too, and a
+    /// binary search finds where an operation starts. A linear walk from the
+    /// front made every operation on a fragmented set pay for all of it --
+    /// and a lossy transfer fragments exactly the sets it touches most.
+    public func firstIndex(endingAfter offset: UInt64, touching: Bool = false) -> Int {
+        var lo = 0
+        var hi = ranges.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            let end = ranges[mid].high
+            if end < offset || (!touching && end == offset) { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
+    }
+
     public mutating func add(_ low: UInt64, _ high: UInt64) {
         if high <= low { return }
-        var i = 0
-        while i < ranges.count && ranges[i].high < low { i += 1 }
+        let i = firstIndex(endingAfter: low, touching: true)
         if i == ranges.count {
             ranges.append((low, high))
             return
@@ -68,10 +84,9 @@ public struct QUICByteRanges {
     /// waiting to be sent again.
     public mutating func subtract(_ low: UInt64, _ high: UInt64) {
         if high <= low { return }
-        var i = 0
+        var i = firstIndex(endingAfter: low)
         while i < ranges.count {
             let range = ranges[i]
-            if range.high <= low { i += 1; continue }
             if range.low >= high { return }
             if range.low < low && range.high > high {
                 // Removed from the middle: what is left is two ranges.
@@ -304,12 +319,25 @@ public struct QUICSendStream {
     }
 
     public mutating func declareLost(_ low: UInt64, _ high: UInt64) {
-        if high <= base { return }
-        lost.add(max(low, base), high)
+        let from = max(low, base)
+        if high <= from { return }
+        lost.add(from, high)
         // A packet can be declared lost after part of what it carried was
         // acknowledged in another one. Those bytes have arrived; sending them
         // again would be a packet spent on nothing.
-        for range in acked.ranges { lost.subtract(range.low, range.high) }
+        //
+        // Only the range just added can overlap `acked`: `acknowledge` clears
+        // what it acknowledges from `lost`, so the rest already does not. So
+        // only the acknowledged ranges inside [from, high) are visited, not
+        // every one -- on a lossy transfer, walking them all for each lost
+        // packet was half the server's CPU.
+        var i = acked.firstIndex(endingAfter: from)
+        while i < acked.count {
+            let range = acked.ranges[i]
+            if range.low >= high { break }
+            lost.subtract(max(range.low, from), min(range.high, high))
+            i += 1
+        }
     }
 
     public mutating func destroy() {
