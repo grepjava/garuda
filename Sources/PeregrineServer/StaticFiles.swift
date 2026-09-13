@@ -20,6 +20,14 @@
 // framework would have done anyway, minus the interpreter -- so a route is not
 // refused on a connection that cannot sendfile.
 //
+// Mapping the file rather than reading it was tried for HTTP/2 and measured
+// (benchmarks/static_files.sh, one worker): DATA frames copied straight from
+// the mapping served 1 MiB files at 1430 MiB/s against 1431 read, and 16 MiB
+// at 1408 against 1369, within noise, with no less CPU per GiB. Encryption and
+// framing are the cost; the copy a mapping saves is not. It would also turn a
+// file truncated mid-response from a short body into a SIGBUS that takes the
+// worker down, so the files are read.
+//
 // Not served: byte ranges, directory indexes, and Last-Modified. Ranges and
 // indexes are absent because they are a real amount of behaviour and this is
 // an asset route, not a file server. Last-Modified is absent because ETag is
