@@ -231,7 +231,7 @@ PYTHONPATH=python python3 -m peregrine --port 8000 myapp:app
 The extension module is the default wherever Peregrine is installed or built
 from source. `swift build -c release` builds the standalone executable, which
 embeds `libpython` and takes the same options; it is for working on Peregrine
-itself and for the Docker image.
+itself.
 
 Requirements, per-platform packages, certificates and the failure modes worth
 recognising: [INSTALLATION.md](INSTALLATION.md).

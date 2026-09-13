@@ -114,8 +114,8 @@ interpreter; each gets its own file, named by that interpreter's extension
 suffix, so several can sit side by side.
 
 `swift build` produces the standalone executable, which embeds `libpython`
-instead. It is for working on Peregrine itself and for the Docker image; the
-extension module is what installing from source gives you:
+instead. It is for working on Peregrine itself; the extension module is what
+installing from source, and the Dockerfile, give you:
 
 ```bash
 swift build -c release                # binary at .build/release/peregrine

@@ -5,7 +5,7 @@
 # again. That is what the matrix is for. The suites run against
 # peregrine._native, the extension module the wheels install, through
 # scripts/peregrine-ext; one job keeps the standalone executable honest, since
-# PEREGRINE_BUILD=binary and the Docker image still ship it. The suites
+# PEREGRINE_BUILD=binary still ships it. The suites
 # themselves are the ones a developer runs by hand -- there is no CI-only test
 # path, so a green run here means the same thing as a green run locally.
 #
