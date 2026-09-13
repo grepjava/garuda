@@ -34,8 +34,16 @@ echo "TOP SECRET"            > "$WORK/secret/passwd"
 echo "sibling"               > "$WORK/assets-sibling/leak.txt"
 printf 'binary\0data'        > "$WORK/assets/blob.bin"
 ln -s "$WORK/secret/passwd"  "$WORK/assets/escape.txt"
+# Symlinks that stay inside the tree are served, whether they are written
+# relative or absolute; one to a directory outside it is not.
+ln -s deep/nested.txt        "$WORK/assets/inside-relative.txt"
+ln -s "$WORK/assets/site.css" "$WORK/assets/inside-absolute.css"
+ln -s ../secret              "$WORK/assets/up"
 # A file big enough that sendfile has to loop and the socket buffer fills.
 head -c 3000000 /dev/urandom > "$WORK/assets/big.bin"
+# Either side of the size below which a file goes out with its head.
+head -c 16384 /dev/urandom   > "$WORK/assets/inline.bin"
+head -c 16385 /dev/urandom   > "$WORK/assets/sendfile.bin"
 
 server_require_port_free "$PORT" || exit 1
 server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
@@ -66,6 +74,13 @@ is "HEAD gets the headers only"   "$(curl -sS -I -o /dev/null -w '%{http_code}:%
 is "a 3MB file arrives whole"     "$(curl -sS --max-time 30 $H/static/big.bin | wc -c)" "3000000"
 is "a 3MB file is byte-identical" \
    "$(curl -sS --max-time 30 $H/static/big.bin | cmp -s - "$WORK/assets/big.bin" && echo same)" "same"
+is "a file sent with its head is byte-identical" \
+   "$(curl -sS --max-time 10 $H/static/inline.bin | cmp -s - "$WORK/assets/inline.bin" && echo same)" "same"
+is "a file one byte too big for that is too" \
+   "$(curl -sS --max-time 10 $H/static/sendfile.bin | cmp -s - "$WORK/assets/sendfile.bin" && echo same)" "same"
+is "a relative symlink inside the tree is served" "$(body $H/static/inside-relative.txt)" "deep"
+is "an absolute symlink inside the tree is served" \
+   "$(body $H/static/inside-absolute.css)" "body { color: red }"
 
 # --- conditional requests ------------------------------------------------
 ETAG=$(curl -sS -I --max-time 10 $H/static/site.css | tr -d '\r' | awk '/^[Ee][Tt][Aa][Gg]:/ {print $2}')
@@ -81,6 +96,7 @@ is "a 304 carries no body"        "$(curl -sS -o /dev/null -w '%{size_download}'
 is "dot-dot does not escape"         "$(code --path-as-is $H/static/../secret/passwd)" "404"
 is "encoded dot-dot does not escape" "$(code --path-as-is $H/static/%2e%2e/secret/passwd)" "404"
 is "a symlink out of the tree is refused" "$(code $H/static/escape.txt)" "404"
+is "a symlinked directory out of the tree is refused" "$(code $H/static/up/passwd)" "404"
 is "a sibling sharing the prefix is refused" "$(code $H/staticky/leak.txt)" "404"
 is "a directory is not served"       "$(code $H/static/deep)"        "404"
 is "the route root is not served"    "$(code $H/static/)"            "404"

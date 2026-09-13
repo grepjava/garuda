@@ -24,6 +24,10 @@
 #if defined(__linux__)
 #  include <sys/epoll.h>
 #  include <sys/sendfile.h>
+#  include <sys/syscall.h>
+#  if defined(SYS_openat2)
+#    include <linux/openat2.h>
+#  endif
 #else
 #  include <sys/event.h>
 #endif
@@ -307,8 +311,72 @@ ssize_t pg_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
 #endif
 }
 
+#if defined(__linux__) && defined(SYS_openat2)
+/* 1 once openat2 has been refused as a system call: an old kernel, or a
+ * container whose seccomp profile predates it. Checked once, not per request. */
+static int g_openat2_unavailable = -1;
+
+/* The file under `root`, opened so that nothing about the path can take it
+ * outside: RESOLVE_BENEATH has the kernel refuse `..` above the root and any
+ * absolute symlink, during the one walk that also opens it. Returns the
+ * descriptor, -1 for a path that does not lead to a regular file inside the
+ * root, or -2 when openat2 itself is unavailable. */
+static int static_open_beneath(const char *root, const char *relative) {
+    if (g_openat2_unavailable < 0) {
+        const char *env = getenv("PEREGRINE_NO_OPENAT2");
+        g_openat2_unavailable = (env && env[0] == '1') ? 1 : 0;
+    }
+    if (g_openat2_unavailable) return -2;
+
+    /* The root is opened per request rather than kept: a deployment that
+     * switches a symlink to a new release directory has to be served from the
+     * new one at once, as it was when every request resolved the root. */
+    int dir = open(root, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (dir < 0) return -1;
+    struct open_how how;
+    memset(&how, 0, sizeof how);
+    how.flags = O_RDONLY | O_CLOEXEC;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+    long fd = syscall(SYS_openat2, dir, relative, &how, sizeof how);
+    int saved = errno;
+    close(dir);
+    if (fd < 0) {
+        if (saved == ENOSYS || saved == EPERM) {
+            g_openat2_unavailable = 1;
+            return -2;
+        }
+        /* EXDEV is also what an absolute symlink gets, even one that lands
+         * inside the root. Those have always been served, so this one request
+         * is decided the old way; the old way still refuses real escapes. */
+        if (saved == EXDEV) return -2;
+        return -1;
+    }
+    return (int)fd;
+}
+#endif
+
 int pg_static_open(const char *root, const char *relative,
                    long long *size, long long *mtime) {
+    while (*relative == '/') relative++;
+
+#if defined(__linux__) && defined(SYS_openat2)
+    int beneath = static_open_beneath(root, *relative ? relative : ".");
+    if (beneath != -2) {
+        if (beneath < 0) return -1;
+        struct stat st;
+        if (fstat(beneath, &st) != 0 || !S_ISREG(st.st_mode)) {
+            close(beneath);
+            return -1;
+        }
+        if (size) *size = (long long)st.st_size;
+        if (mtime) *mtime = (long long)st.st_mtime;
+        return beneath;
+    }
+#endif
+
+    /* Without openat2: resolve both paths and compare. Two walks where the
+     * one above takes one, and a window between the check and the open that
+     * the kernel closes above. */
     char real_root[PATH_MAX];
     if (!realpath(root, real_root)) return -1;
 

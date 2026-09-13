@@ -305,6 +305,26 @@ extension Worker {
 
         if head || size == 0 {
             _ = pg_close(fd)
+        } else if size <= Worker.inlineFileBytes {
+            // Small enough to go out with its head in one write. Handing a
+            // kilobyte of CSS to sendfile costs a second system call for the
+            // body -- measured at a seventh of the worker's time on small
+            // assets -- to save a copy the size of a page.
+            c.pointee.write.reserve(size)
+            var got = 0
+            while got < size {
+                let r = pg_read(fd, c.pointee.write.writePointer + got, size - got)
+                if r <= 0 { break }
+                got += r
+            }
+            _ = pg_close(fd)
+            if got < size {
+                // Truncated since it was opened, after a Content-Length was
+                // promised: there is no honest way to finish the message.
+                closeConnection(slot)
+                return
+            }
+            c.pointee.write.advanceWriter(size)
         } else {
             c.pointee.fileFD = fd
             c.pointee.fileOffset = 0
@@ -313,6 +333,10 @@ extension Worker {
         c.pointee.state = .writing
         _ = flush(slot)
     }
+
+    /// Files up to this size are read into the response buffer rather than
+    /// sent with sendfile after the head.
+    static let inlineFileBytes = 16 * 1024
 
     /// `304 Not Modified` on a multiplexed stream.
     ///
