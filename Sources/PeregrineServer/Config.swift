@@ -267,6 +267,13 @@ public struct ServerConfig {
     /// Requests a client may make at once before the rate applies. 0 means
     /// one period's worth, the count itself.
     public var rateLimitBurst = 0
+    /// --cache-size: mebibytes of memory, shared by every worker, for
+    /// responses the application marks fresh; 0 for no cache.
+    public var cacheSizeMiB = 0
+    /// The largest response body the cache keeps, in bytes.
+    public var cacheMaxObject = 1024 * 1024
+    /// The longest a response is kept, whatever it says, in seconds.
+    public var cacheTTLMaxSeconds = 300
 
     // --- development ---
     /// Restart workers when a watched source file changes.

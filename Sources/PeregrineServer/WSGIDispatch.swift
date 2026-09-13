@@ -312,7 +312,9 @@ extension Worker {
                                                  headerList: headerList,
                                                  startResponse: startResponse,
                                                  result: result,
-                                                 snapshot: snapshot)
+                                                 snapshot: snapshot,
+                                                 capture: c.pointee.capture.active
+                                                     ? capturePointer(slot) : nil)
         let encoderFailed = plan.ok && plan.coding != .identity
             && !box.pointee.encoder.start(plan.coding)
         if !plan.ok || encoderFailed {
@@ -377,6 +379,15 @@ extension Worker {
             Log.error("compressing the response failed")
             closeConnection(slot)
             return
+        }
+
+        // --cache-size: kept only when the message is the length it declared.
+        if c.pointee.capture.active {
+            if !limit.mismatched && c.pointee.capture.store(key: c.pointee.cacheKey)
+                && Metrics.enabled {
+                Metrics.add(PG_M_CACHE_STORES)
+            }
+            c.pointee.capture.abandon()
         }
 
         // The application has returned, so the message is whole. On a stream
@@ -482,7 +493,9 @@ extension Worker {
         // someone waiting on the far side of them.
         let ok = WSGIResponseBuilder.writeBodyPart(&out, part, chunked: chunked,
                                                    limit: &limit, encoder: &encoder,
-                                                   flush: flushNow)
+                                                   flush: flushNow,
+                                                   capture: c.pointee.capture.active
+                                                       ? capturePointer(slot) : nil)
         c.pointee.write = out
         if !ok {
             PyError.logPending("response body part")
@@ -516,6 +529,9 @@ extension Worker {
             return -1
         }
         let slot = box.pointee.slot
+        // A response sent through write() is not cached: its head is out before
+        // the body it will have is known.
+        table[slot].pointee.capture.abandon()
 
         if !box.pointee.headSent {
             guard let statusObj = WSGIStartResponse.status(startResponse),
@@ -605,6 +621,12 @@ extension Worker {
                           compress: config.compress,
                           offeredCoding: c.pointee.acceptedCoding,
                           compressMinimumLength: config.compressMinimumLength)
+        if c.pointee.capture.active {
+            // The copy is taken on the thread that runs the application, so
+            // it moves to the job; the key stays here for the loop to store it.
+            job.capture.arm(ttlLimit: config.cacheTTLMaxSeconds)
+            c.pointee.capture.abandon()
+        }
         c.pointee.poolJob = job
         // The connection belongs to the job now. Read interest has to go: a
         // level-triggered poller would spin on pipelined bytes that nothing is
@@ -675,6 +697,14 @@ extension Worker {
         // connection to close, so this is what ends a short one as a reset
         // rather than as a clean end of stream.
         if job.limit.mismatched { c.pointee.responseRemaining = job.limit.remaining }
+        // --cache-size: the thread copied the response; the key is the loop's.
+        if job.capture.active {
+            if !job.limit.mismatched && job.capture.store(key: c.pointee.cacheKey)
+                && Metrics.enabled {
+                Metrics.add(PG_M_CACHE_STORES)
+            }
+            job.capture.abandon()
+        }
         logAccess(slot, status: job.status)
         c.pointee.flags.insert(.responseComplete)
         c.pointee.state = .writing

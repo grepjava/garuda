@@ -122,6 +122,9 @@ public struct Worker {
     /// Seeded on first use, in the process or thread that uses it.
     var requestIDKey: (UInt64, UInt64) = (0, 0)
     var requestIDCount: UInt64 = 0
+    /// --cache-size: where a cached response is copied out of the shared
+    /// table to be sent, grown once to the largest entry the table holds.
+    var cacheScratch = ByteBuffer()
     /// Whether this worker arms the `SIGALRM` watchdog when it starts draining.
     ///
     /// A worker process is the last word on its own lifetime, so it does. A
@@ -701,6 +704,8 @@ public struct Worker {
         // fails before it is dispatched.
         c.pointee.requestID.clear()
         c.pointee.traceContext.clear()
+        // An inactive capture holds nothing: whatever deactivates one frees it.
+        if c.pointee.capture.active { c.pointee.capture.abandon() }
         c.pointee.chunked = ChunkedDecoder(maxTrailerBytes: config.maxHeadSize)
         // Response framing belongs to one request; a stale budget here would
         // let the next response on a reused connection overrun or fall short.
@@ -841,6 +846,10 @@ public struct Worker {
         // --compress. Read now because the request head is in hand now; the
         // response it applies to may not start for several loop turns.
         if config.compress { negotiateCoding(slot) }
+        // --cache-size. After the coding is settled, because a copy is
+        // compressed for the client it is sent to, and after everything that
+        // answers without the application, because a copy stands in for it.
+        if config.cacheSizeMiB > 0 && cacheDispatch(slot) { return }
         switch appProtocol {
         case .wsgi:
             // WSGI has no way to express a stream that outlives its response,
@@ -1556,6 +1565,8 @@ public struct Worker {
         c.pointee.body.destroy()
         c.pointee.requestID.destroy()
         c.pointee.traceContext.destroy()
+        c.pointee.capture.abandon()
+        c.pointee.cacheKey.destroy()
         table.release(slot)
 
         if acceptSuspended && !draining {

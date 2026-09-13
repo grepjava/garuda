@@ -227,7 +227,8 @@ public enum WSGIResponseBuilder {
                                  headerList: PyObj,
                                  startResponse: PyObj,
                                  result: PyObj?,
-                                 snapshot: WSGIRequestSnapshot) -> WSGIHeadPlan {
+                                 snapshot: WSGIRequestSnapshot,
+                                 capture: UnsafeMutablePointer<ResponseCapture>? = nil) -> WSGIHeadPlan {
         var plan = WSGIHeadPlan()
         plan.keepAlive = snapshot.keepAlive
 
@@ -323,6 +324,7 @@ public enum WSGIResponseBuilder {
             let kind = HTTPResponseWriter.classify(name)
             seen.formUnion(kind)
             if snapshot.compress { eligibility.observe(name, value) }
+            if let capture, capture.pointee.active { capture.pointee.observe(name, value) }
 
             var rejection: StaticString? = nil
             if kind.contains(.contentLength) {
@@ -491,6 +493,9 @@ public enum WSGIResponseBuilder {
             HTTPResponseWriter.writeConnection(&out, keepAlive: plan.keepAlive)
             HTTPResponseWriter.endHead(&out)
         }
+        // --cache-size: every header has been seen, so whether this response
+        // is kept is settled; the body decides only whether it arrives whole.
+        if let capture, capture.pointee.active { capture.pointee.settle(status: code) }
         WSGIStartResponse.markHeadersSent(startResponse)
         plan.ok = true
         return plan
@@ -507,7 +512,8 @@ public enum WSGIResponseBuilder {
                                      chunked: Bool,
                                      limit: inout WSGIBodyLimit,
                                      encoder: inout ResponseEncoder,
-                                     flush: Bool = false) -> Bool {
+                                     flush: Bool = false,
+                                     capture: UnsafeMutablePointer<ResponseCapture>? = nil) -> Bool {
         var data: UnsafePointer<CChar>?
         var len: pg_ssize_t = 0
         var owner: PyObj?
@@ -517,6 +523,9 @@ public enum WSGIResponseBuilder {
             let take = limit.take(Int(len))
             if take > 0 {
                 let p = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
+                // What the application produced, before any compression: a
+                // cached copy is encoded afresh for each client.
+                if let capture, capture.pointee.active { capture.pointee.append(p, take) }
                 if encoder.active {
                     if !encoder.encode(p, take, flush: flush, into: &out, chunked: chunked) {
                         pg_err_set_str(pg_exc_runtime(), "compressing the response failed")

@@ -248,6 +248,10 @@ public struct Connection {
     /// traceparent, 48 hex characters in that order, or empty. Settled at
     /// dispatch.
     public var traceContext = ByteBuffer()
+    /// --cache-size: the key this request's response would be stored under,
+    /// and the response as it is copied.
+    public var cacheKey = ByteBuffer()
+    public var capture = ResponseCapture()
     /// The compressor for an ASGI response body being compressed.
     public var encoder = ResponseEncoder()
 

@@ -761,6 +761,9 @@ extension Worker {
                 }
                 if take > 0 {
                     let p = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
+                    // What the application sent, before any compression: a
+                    // cached copy is encoded afresh for each client.
+                    if c.pointee.capture.active { c.pointee.capture.append(p, take) }
                     if encoding {
                         encodeFailed = !encodeBody(slot, p, take, more: more, finishing: false)
                     } else if c.pointee.flags.contains(.chunkedResponse) {
@@ -789,6 +792,8 @@ extension Worker {
         }
 
         if !more || overflow || short {
+            // Only a response that kept its promises is worth repeating.
+            if c.pointee.capture.active { cacheCaptureFinish(slot, complete: !overflow && !short) }
             if c.pointee.flags.contains(.chunkedResponse) && !suppress {
                 HTTPResponseWriter.writeLastChunk(&c.pointee.write)
             }
@@ -958,6 +963,9 @@ func asgiSend(_ token: UInt64, _ args: PyObj?) -> PyObj? {
             return nil
         }
     } else if n == 19 && equalsExact(t, 19, "http.response.start") {
+        if worker.pointee.table[slot].pointee.capture.active {
+            worker.pointee.cacheCaptureStart(slot, message: message)
+        }
         if !worker.pointee.asgiResponseStart(slot, message: message) { return nil }
     } else if n == 18 && equalsExact(t, 18, "http.response.body") {
         if !worker.pointee.asgiResponseBody(slot, message: message) { return nil }

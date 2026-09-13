@@ -578,6 +578,72 @@ flag still means restarting the server.
 
 ---
 
+## Caching responses
+
+```bash
+peregrine --cache-size 64 myapp:app
+```
+
+`--cache-size` keeps copies of the responses an application marks as fresh, in
+64 MiB of memory every worker shares, and answers repeated requests from them
+without calling the application. Nothing is cached unless the application
+asks: a response is kept only when its `Cache-Control` has `s-maxage` or
+`max-age`, for that long, and never longer than `--cache-ttl-max` (300 seconds
+by default).
+
+```python
+@app.get("/prices")
+def prices(response: Response):
+    response.headers["Cache-Control"] = "public, s-maxage=10"
+    return load_prices()
+```
+
+`s-maxage` is the one to use. It applies to shared caches like this one and to
+CDNs, and leaves what a browser keeps to `max-age`.
+
+The failure this has to avoid is one user's response sent to another, so these
+are never cached:
+
+- **A request with `Authorization`, `Cookie` or `Range`**, or one asking for a
+  fresh copy (`Cache-Control: no-cache` or `max-age=0`, `Pragma: no-cache`). It
+  goes to the application, and its response is not stored.
+- **A response with `Set-Cookie`**, `private`, `no-store` or `no-cache`, a
+  `Vary` naming anything but `Accept-Encoding`, or a `Content-Encoding` of its
+  own.
+- **Anything but GET and HEAD**, and any status but 200, 203, 204, 300, 301,
+  308, 404, 405, 410, 414 and 501.
+- **A body larger than `--cache-max-object`** (1024 KiB by default), or one
+  that did not match its own Content-Length.
+
+An application that personalises a page by cookie is covered by the first
+rule. One that personalises it by anything else — a header an authenticating
+proxy adds, a client certificate — must not mark that page `s-maxage`.
+
+The key is the scheme, the host and the whole request target, query string
+included. Behind a proxy listed in `--forwarded-allow-ips`, the forwarded host
+and protocol are part of it as well.
+
+A copy is served over HTTP/1.1, HTTP/2 and HTTP/3 alike, and compressed for
+each client that accepts it when `--compress` is on. Every response gets its
+own `Date`, `X-Request-ID` and `Strict-Transport-Security`, plus `Age` and
+`Cache-Status: peregrine; hit; ttl=N`.
+
+Entries expire on their own lifetimes; there is no purge. A reload — `SIGHUP`,
+`--reload`, a renewed certificate — discards everything cached, since the new
+workers may run new code. The memory is split evenly between entries of four
+sizes — 8 KiB, 64 KiB, 512 KiB, and big enough for `--cache-max-object` — and a
+response goes in the smallest that holds it; when the ones a URL can go in are
+all taken, the one nearest to expiring is replaced. The server logs how many
+responses the size given has room for. With `--metrics-port`,
+`peregrine_cache_hits_total`, `peregrine_cache_misses_total` and
+`peregrine_cache_stores_total` show how it is doing.
+
+ASGI and WSGI responses are cached alike, inline or under `--wsgi-threads`. A
+WSGI response sent through the `write()` callable is not: its head goes out
+before the application has finished deciding what the body is.
+
+---
+
 ## Serving assets
 
 `--static-dir` answers a URL prefix from a directory, without the application

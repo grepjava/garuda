@@ -98,6 +98,10 @@ public final class WSGIJob {
     /// The body's compressor, when it has one. Only the thread running the
     /// application touches it.
     var encoder = ResponseEncoder()
+    /// --cache-size: the response being copied for the cache. Armed by the
+    /// loop at submit, filled by the thread, stored by the loop once the job
+    /// is finished -- never touched by both at once.
+    var capture = ResponseCapture()
 
     /// The pool running this job, so the legacy `write()` callable can reach
     /// the hand-off from inside the application. Unowned because the pool owns
@@ -170,6 +174,7 @@ public final class WSGIJob {
         requestID?.deallocate()
         out.destroy()
         encoder.destroy()
+        capture.abandon()
     }
 }
 
@@ -476,12 +481,16 @@ public final class WSGIPool {
             plan.keepAlive = job.keepAlive
             plan.suppressBody = job.bodySuppressed
         } else {
-            plan = WSGIResponseBuilder.writeHead(&staged,
-                                                 statusObj: statusObj,
-                                                 headerList: headerList,
-                                                 startResponse: startResponse,
-                                                 result: result,
-                                                 snapshot: job.snapshot)
+            let capturing = job.capture.active
+            plan = withUnsafeMutablePointer(to: &job.capture) { capture in
+                WSGIResponseBuilder.writeHead(&staged,
+                                              statusObj: statusObj,
+                                              headerList: headerList,
+                                              startResponse: startResponse,
+                                              result: result,
+                                              snapshot: job.snapshot,
+                                              capture: capturing ? capture : nil)
+            }
             if !plan.ok {
                 Log.error(plan.failure)
                 job.failed = true
@@ -557,9 +566,14 @@ public final class WSGIPool {
     /// or immediately, when something is waiting on the far side of this block.
     private func emit(_ job: WSGIJob, _ part: PyObj, _ chunked: Bool,
                       _ staged: inout ByteBuffer, flushNow: Bool = false) -> Bool {
-        if !WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: chunked,
+        let capturing = job.capture.active
+        let written = withUnsafeMutablePointer(to: &job.capture) { capture in
+            WSGIResponseBuilder.writeBodyPart(&staged, part, chunked: chunked,
                                               limit: &job.limit, encoder: &job.encoder,
-                                              flush: flushNow) {
+                                              flush: flushNow,
+                                              capture: capturing ? capture : nil)
+        }
+        if !written {
             PyError.logPending("response body part")
             job.failed = true
             return false
@@ -575,6 +589,9 @@ public final class WSGIPool {
     fileprivate func legacyWrite(_ job: WSGIJob, startResponse: PyObj, part: PyObj) -> Int32 {
         var staged = ByteBuffer()
         defer { staged.destroy() }
+        // A response sent through write() is not cached: its head is out before
+        // the body it will have is known.
+        job.capture.abandon()
 
         if !job.headersWritten {
             guard let statusObj = WSGIStartResponse.status(startResponse),

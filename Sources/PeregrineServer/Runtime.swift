@@ -122,6 +122,30 @@ public enum Peregrine {
             }
         }
 
+        // --cache-size. Mapped here for the same reason again: a response one
+        // worker stored is only worth keeping if every other worker can read it.
+        if config.cacheSizeMiB > 0 {
+            let slots = pg_cache_init(UInt64(config.cacheSizeMiB) * 1024 * 1024,
+                                      UInt32(responseCacheMaxHead),
+                                      UInt32(config.cacheMaxObject))
+            if slots < 0 {
+                Log.error("--cache-size is too small to hold even one response of --cache-max-object")
+                return 1
+            }
+            let entries = slots
+            let largest = config.cacheMaxObject / 1024
+            let size = config.cacheSizeMiB
+            Log.info { line in
+                line.str("response cache: ")
+                line.int(size)
+                line.str(" MiB, room for ")
+                line.int(entries)
+                line.str(" responses, bodies up to ")
+                line.int(largest)
+                line.str(" KiB")
+            }
+        }
+
         // --rate-limit. Mapped here for the same reason as the metrics page:
         // it has to exist before the first fork for every worker to share it.
         if config.rateLimitCount > 0 {
@@ -559,6 +583,9 @@ public enum Peregrine {
         func beginRestart(_ why: StaticString) {
             if shuttingDown { return }
             Log.info(why)
+            // New workers may run new code, which may answer the same request
+            // differently; nothing the old ones cached is served again.
+            pg_cache_flush()
             if restartCursor >= 0 {
                 restartPending = true
                 return

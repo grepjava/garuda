@@ -110,6 +110,15 @@ public enum Metrics {
                sum(PG_M_POOL_MISSES))
         simple(&out, "peregrine_requests_rate_limited_total", "counter",
                "Requests refused with 429 by --rate-limit.", sum(PG_M_RATE_LIMITED))
+        if pg_cache_enabled() != 0 {
+            simple(&out, "peregrine_cache_hits_total", "counter",
+                   "Requests answered from the response cache.", sum(PG_M_CACHE_HITS))
+            simple(&out, "peregrine_cache_misses_total", "counter",
+                   "Requests looked up in the response cache and not found.",
+                   sum(PG_M_CACHE_MISSES))
+            simple(&out, "peregrine_cache_stores_total", "counter",
+                   "Responses stored in the response cache.", sum(PG_M_CACHE_STORES))
+        }
         // Half the slots: they come in pairs, one for a worker and one for the
         // replacement that overlaps it during a reload.
         simple(&out, "peregrine_workers", "gauge",

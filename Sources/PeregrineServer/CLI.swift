@@ -174,6 +174,12 @@ public enum PeregrineCLI {
                                        trusted proxy and by /64 for IPv6
               --rate-limit-burst N     requests allowed at once before the rate
                                        applies (default: the count in RATE)
+              --cache-size MIB         answer repeated GETs from a cache shared by
+                                       every worker, for responses the application
+                                       marks fresh with Cache-Control s-maxage or
+                                       max-age; read CONFIG.md first
+              --cache-max-object KIB   largest body the cache keeps (default 1024)
+              --cache-ttl-max SECONDS  longest a response is kept (default 300)
               --compress               compress application responses (br, zstd or
                                        gzip, as the client accepts) when their type
                                        is text-like; read CONFIG.md about BREACH first
@@ -537,6 +543,15 @@ public enum PeregrineCLI {
             } else if matches(arg, "--rate-limit-burst") {
                 guard let v = next("--rate-limit-burst needs a count") else { break }
                 config.rateLimitBurst = max(1, parseInt(v))
+            } else if matches(arg, "--cache-size") {
+                guard let v = next("--cache-size needs mebibytes") else { break }
+                config.cacheSizeMiB = max(0, parseInt(v))
+            } else if matches(arg, "--cache-max-object") {
+                guard let v = next("--cache-max-object needs kibibytes") else { break }
+                config.cacheMaxObject = max(1, min(64 * 1024, parseInt(v))) * 1024
+            } else if matches(arg, "--cache-ttl-max") {
+                guard let v = next("--cache-ttl-max needs seconds") else { break }
+                config.cacheTTLMaxSeconds = max(1, parseInt(v))
             } else if matches(arg, "--compress") {
                 config.compress = true
             } else if matches(arg, "--compress-static") {

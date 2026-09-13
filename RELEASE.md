@@ -25,6 +25,10 @@ version reached PyPI, in UTC.
 - `--trace-context`: a request's W3C `traceparent`, its trace ID and parent
   span ID, recorded in the access log. Never generated, and never changed on
   its way to the application.
+- `--cache-size`, `--cache-max-object`, `--cache-ttl-max`: a response cache
+  shared by every worker, for GET responses the application marks fresh with
+  `s-maxage` or `max-age`. Requests with credentials or cookies, and responses
+  that set cookies or are private, are never cached.
 
 ### Changed
 

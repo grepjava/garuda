@@ -40,6 +40,9 @@ enum {
     PG_M_POOL_HITS,               /* buffer pool: a block came off the free list */
     PG_M_POOL_MISSES,             /* buffer pool: a block had to be allocated */
     PG_M_RATE_LIMITED,            /* refused with 429 by --rate-limit */
+    PG_M_CACHE_HITS,              /* answered from --cache-size */
+    PG_M_CACHE_MISSES,            /* looked up in the cache and not found */
+    PG_M_CACHE_STORES,            /* responses stored in the cache */
     PG_M_DURATION_COUNT,
     PG_M_DURATION_SUM_US,
     PG_M_BUCKET0,
