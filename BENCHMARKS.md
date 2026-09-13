@@ -328,6 +328,8 @@ request costs about 43 µs, most of it FastAPI's own code.
 | | FastAPI | 25,098 → 24,984 (−0.5 %) | 42.97 → 42.65 µs (−0.7 %) | 3/6, 2/6 | 2.7 %, 2.1 % | |
 | a finished task checked with `task.exception()` from Swift, not a Python function | raw ASGI | 115,556 → 114,261 (−1.1 %) | 9.22 → 9.46 µs (+2.5 %) | 2/6, 2/6 | 4.5 %, 3.2 % | no |
 | | FastAPI | 25,033 → 24,912 (−0.5 %) | 42.65 → 42.98 µs (+0.8 %) | 3/6, 2/6 | 0.1 %, 0.3 % | |
+| one completed awaitable per worker for every `send`, not one allocated per call | raw ASGI | 117,640 → 119,136 (+1.3 %) | 9.03 → 8.93 µs (−1.1 %) | 3/6, 4/6 | 4.0 %, 3.9 % | no |
+| | FastAPI | 25,175 → 25,165 (−0.0 %) | 42.58 → 42.52 µs (−0.1 %) | 3/6, 4/6 | 0.9 %, 0.0 % | |
 
 - **A change within noise on FastAPI is expected.** The framework is most of
   a FastAPI request, so a saving of a fraction of a microsecond on the server
