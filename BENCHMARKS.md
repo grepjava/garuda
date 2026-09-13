@@ -4,28 +4,32 @@
 
 # Benchmarks
 
-Two questions, answered the way
-[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
-answers them:
+Two questions, answered with the load command and the applications of
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
+but on one worker and on a different machine. The figures here are **not**
+comparable with the ones that site publishes; see
+[Relation to the published results](#relation-to-the-published-results).
 
 1. **FastAPI (ASGI):** Peregrine against uvicorn, granian and fastpysgi, one
    worker, at 64, 256 and 512 connections.
 2. **Flask (WSGI):** Peregrine against uvicorn, granian and fastpysgi, one
    worker, at 64, 256 and 512 connections.
 
-On one worker Peregrine answers FastAPI 1.41–1.60× as fast as the next server
-at each level, and Flask 1.42–1.47× as fast as the next server (fastpysgi) and
-more than twice as fast as uvicorn and granian. That is Peregrine as a wheel
-installs it, the `peregrine._native` extension module; the standalone
-executable, which embeds `libpython`, is 10–16 % behind it.
+On one worker of this machine Peregrine answers FastAPI 1.41–1.60× as fast as
+the next server at each level, and Flask 1.42–1.47× as fast as the next server
+(fastpysgi) and more than twice as fast as uvicorn and granian. That is
+Peregrine as a wheel installs it, the `peregrine._native` extension module; the
+standalone executable, which embeds `libpython`, is 10–16 % behind it.
 
 ---
 
 ## Method
 
-The load, the applications and the server commands are the benchmark suite's
-own. Only the worker count and the number of runs differ, and both are stated
-below.
+The load command and the applications are the benchmark suite's own, taken from
+[the-benchmarker/web-frameworks at ac364e9](https://github.com/the-benchmarker/web-frameworks/tree/ac364e9b1674c9f9edd184afc9a876a75fbcdf10)
+(`master`, 2026-09-11), the revision whose results the site showed when these
+were measured. The machine, the worker count, the Python version and some of
+the servers are not, and every difference is listed below.
 
 | | |
 |---|---|
@@ -33,36 +37,53 @@ below.
 | Warm-up | `zrk -c 50 -d 5s --plain URL` |
 | Each level | `zrk --plain -c N -d 15s -m GET --format json -R1000:100000 --interval 1s --timeout 8s --latency URL` |
 | Levels | 64, 256 and 512 connections, `GET /` |
-| Figure | zrk's `achieved_rate`, in requests per second — the number the results site ranks by |
+| Figure | zrk's `achieved_rate`, in requests per second |
 | Latency | p50 and p99, corrected for coordinated omission |
 | Applications | the suite's `python/fastapi` and `python/flask` sources, byte for byte: [benchmarks/contract/](benchmarks/contract/) |
-| Servers | the suite's engine commands, with `--workers 1`; Peregrine as `python -m peregrine` and as the executable |
+| Servers | uvicorn and granian with the suite's engine commands and `--workers 1`; Peregrine as `python -m peregrine` and as the executable; fastpysgi and uvicorn's WSGI adapter as described below |
 | Host | WSL2 on 4 cores, Ubuntu 24.04, CPython 3.12.3, load generator on the same machine |
 
 Versions: FastAPI 0.141.1 (Starlette 1.6.0, Pydantic 2.13.5), Flask 3.1.3
 (Werkzeug 3.1.8), uvicorn 0.52.4 with uvloop 0.22.1 and httptools 0.8.0, granian 2.8.2,
 fastpysgi 0.6.
 
-The command is taken from the suite's `.tasks/config.rake`, which is what its
-`collect` targets run. Its README and some comments still describe an older
-setup (oha, keep-alive disabled). The command itself is an open-loop ramp from
-1,000 to 100,000 requests a second over the run, with keep-alive on.
+The load command is the suite's `collect` command, `.tasks/config.rake` line 152
+at that revision: an open-loop ramp from 1,000 to 100,000 requests a second over
+the run, with keep-alive on. Two things in the suite say otherwise and are out
+of date. Its README describes oha with keep-alive disabled, and the comment just
+above the command describes `--closed`, a closed loop in which each response
+triggers the next request — but the command does not pass `--closed`. The
+repository does not record which command produced a published dataset. The
+site's latencies, a p99 of about 5 s for FastAPI on uvicorn, are what this ramp
+produces and a closed loop would not.
 
 Every figure below comes from one session, one server after another. Separate
 sessions on this machine differ by up to 10 %, which is more than some of the
 gaps being measured.
 
-**Where this differs from the published results, and why:**
+**Where this differs from upstream:**
 
-- **One worker.** The suite starts every server with `--workers $(nproc)`. One
-  worker compares what each server does with a core, and keeps the load
-  generator from competing with the servers for the same four cores.
-- **Median of three runs.** The suite takes one run per level. A developer
-  machine is noisier than a dedicated benchmark host, so each level runs three
-  times and the median run by `achieved_rate` is reported.
+| | upstream at ac364e9, published 2026-09-11 | here |
+|---|---|---|
+| Host | 16 CPUs, 7.7 GB, Linux 7.1 (Fedora) | WSL2 on 4 cores, 31 GB, Ubuntu 24.04 |
+| Workers | `--workers $(nproc)`, one per CPU | 1 |
+| Python | 3.14 | 3.12.3 |
+| FastAPI entry | uvicorn (hypercorn, daphne and granian are also configured) | Peregrine, uvicorn, granian, fastpysgi |
+| Flask entry | gunicorn with sync workers (uwsgi, waitress and granian are also configured) | Peregrine, uvicorn's WSGI adapter, granian, fastpysgi |
+| fastpysgi | raw ASGI and WSGI applications, no framework | the FastAPI and Flask applications |
+| Runs | request counts are published in thirds, so each figure is a mean of three runs | three runs, the median by `achieved_rate` |
+
+- **One worker.** It compares what each server does with a core, and keeps the
+  load generator from competing with the servers for the same four cores. It is
+  also the main reason these figures cannot be set beside the site's: a server's
+  throughput on sixteen workers is not sixteen times its throughput on one, and
+  dividing the site's figures by sixteen does not give a single-worker result.
+- **Median rather than mean.** A developer machine is noisier than a dedicated
+  benchmark host, and one disturbed run moves a mean of three more than a median.
 - **Peregrine is measured in both forms.** `peregrine` is `python -m peregrine`
   with the extension module, which is what a wheel installs. The executable
   row is the same server built as a standalone binary embedding `libpython`.
+  Peregrine is not on the site.
 - **uvicorn serves Flask through `--interface wsgi`.** The suite has no uvicorn
   engine for Flask; its Flask engines are gunicorn, uwsgi, waitress and granian.
   uvicorn's WSGI adapter is included here because the comparison asked for is
@@ -73,12 +94,36 @@ gaps being measured.
   `fastpysgi.run(app, host, port, workers=N)`, is given the FastAPI and Flask
   applications every other server runs, so the framework is the same for all.
 
+### Relation to the published results
+
+The site shows one entry per framework, each on its default server with a
+worker per CPU. At ac364e9 the entries these benchmarks touch are, in requests
+per second at 64 / 256 / 512 connections:
+
+| site entry | what it runs | 64 | 256 | 512 |
+|---|---|---:|---:|---:|
+| `fastapi` | FastAPI on uvicorn | 41,461 | 44,182 | 43,226 |
+| `flask` | Flask on gunicorn, sync workers | 1,413 | 8,866 | 6,376 |
+| `fastpysgi-asgi` | a raw ASGI application, no framework | 92,108 | 89,267 | 88,817 |
+| `fastpysgi-wsgi` | a raw WSGI application, no framework | 96,673 | 96,557 | 96,483 |
+
+None of them measures what the tables below measure. They use every one of
+sixteen CPUs rather than one worker, Python 3.14 rather than 3.12, a different
+server for Flask, and for fastpysgi no framework at all. The tables below show
+how these servers compare with each other on one worker of this machine —
+Peregrine 1.4–1.6× uvicorn and granian on FastAPI, for instance — and the
+published results neither confirm nor contradict that.
+
+Source: [`data.min.json` at ac364e9](https://github.com/the-benchmarker/web-frameworks/blob/ac364e9b1674c9f9edd184afc9a876a75fbcdf10/data.min.json),
+the file the site's frontend loads.
+
 **Reading the latencies.** The ramp ends far above what any of these servers
 can do on one core, so for most of each run requests are offered faster than
 they are answered. Latency corrected for coordinated omission counts the time a
 request waited to be sent, so it measures how fast that queue grows: seconds,
-not milliseconds. Compare the servers with each other, not with a closed-loop
-benchmark.
+not milliseconds. Compare the servers here with each other — not with a
+closed-loop benchmark, and not with the site's latencies, which come from the
+same ramp on a machine with four times the cores and sixteen workers.
 
 Reproduce:
 
@@ -106,7 +151,7 @@ Requests per second:
 | Peregrine, executable | 21,696 | 21,841 | 21,504 |
 | uvicorn | 17,504 | 15,544 | 15,114 |
 | granian | 15,647 | 15,574 | 15,209 |
-| fastpysgi | 11,337 | 10,843 | 10,264 |
+| fastpysgi, running FastAPI | 11,337 | 10,843 | 10,264 |
 
 Latency, p50 / p99, in seconds:
 
@@ -116,7 +161,7 @@ Latency, p50 / p99, in seconds:
 | Peregrine, executable | 1.82 / 5.75 | 1.79 / 5.65 | 1.63 / 5.65 |
 | uvicorn | 2.46 / 7.03 | 2.52 / 7.01 | 2.55 / 7.23 |
 | granian | 2.41 / 6.97 | 2.46 / 6.98 | 2.43 / 6.96 |
-| fastpysgi | 3.10 / 8.03 | 3.09 / 8.23 | 3.25 / 8.35 |
+| fastpysgi, running FastAPI | 3.10 / 8.03 | 3.09 / 8.23 | 3.25 / 8.35 |
 
 No server returned an error or a non-2xx response at any level.
 
@@ -128,7 +173,7 @@ Requests per second:
 |---|---:|---:|---:|
 | **Peregrine** | **14,768** | **14,992** | **14,458** |
 | Peregrine, executable | 13,084 | 13,029 | 12,488 |
-| fastpysgi | 10,419 | 10,202 | 9,978 |
+| fastpysgi, running Flask | 10,419 | 10,202 | 9,978 |
 | uvicorn (`--interface wsgi`) | 6,554 | 6,545 | 5,722 |
 | granian | 6,427 | 6,152 | 6,257 |
 
@@ -138,7 +183,7 @@ Latency, p50 / p99, in seconds:
 |---|---:|---:|---:|
 | **Peregrine** | 2.51 / 7.11 | 2.52 / 7.06 | 2.53 / 7.24 |
 | Peregrine, executable | 2.52 / 7.57 | 2.77 / 7.55 | 2.50 / 7.49 |
-| fastpysgi | 3.27 / 8.34 | 3.27 / 8.37 | 3.28 / 8.41 |
+| fastpysgi, running Flask | 3.27 / 8.34 | 3.27 / 8.37 | 3.28 / 8.41 |
 | uvicorn (`--interface wsgi`) | 3.97 / 9.68 | 3.91 / 9.55 | 4.11 / 9.75 |
 | granian | 3.90 / 9.67 | 4.14 / 9.82 | 4.08 / 9.83 |
 
@@ -176,7 +221,8 @@ parsing, calling into Python, and writing the response.
 The same two applications with `--workers N` (processes, CPython 3.12) and with
 `--workers N --free-threaded` (threads of one process, CPython 3.14t), both
 through the extension module. Closed-loop `oha`, 15 s per cell, requests per
-second:
+second — a different load from the tables above, so the two are not comparable
+either:
 
 | application | workers | model | 64 | 256 | 512 |
 |---|---:|---|---:|---:|---:|

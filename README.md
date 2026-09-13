@@ -34,9 +34,10 @@ what to do when it goes wrong. [CONFIG.md](CONFIG.md) — configuring FastAPI an
 Flask for every protocol here. [ARCHITECTURE.md](ARCHITECTURE.md) — how the
 server is built, and why. [TRANSPORT.md](TRANSPORT.md) — what each protocol
 does and what is implemented of it. [BENCHMARKS.md](BENCHMARKS.md) — FastAPI
-and Flask against uvicorn, granian and fastpysgi, measured the way
-[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
-measures. [DEPLOY.md](DEPLOY.md) — how a release reaches PyPI.
+and Flask against uvicorn, granian and fastpysgi on one worker, with the load
+and applications of
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
+and how that differs from what the site publishes. [DEPLOY.md](DEPLOY.md) — how a release reaches PyPI.
 
 ---
 
@@ -88,12 +89,12 @@ to remove.
 
 ## Numbers
 
-FastAPI and Flask, one worker each, on Peregrine, uvicorn, granian and fastpysgi, measured
-the way [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
-measures: its applications, its server commands and its load (zrk, an
-open-loop ramp to 100,000 requests a second, 15 s per level). Requests per
-second at 64 / 256 / 512 connections, median of three runs, all in one session,
-WSL2 on 4 cores, CPython 3.12:
+FastAPI and Flask, one worker each, on Peregrine, uvicorn, granian and
+fastpysgi, with the applications and load command of
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
+at a pinned revision (zrk, an open-loop ramp to 100,000 requests a second, 15 s
+per level). Requests per second at 64 / 256 / 512 connections, median of three
+runs, all in one session, WSL2 on 4 cores, CPython 3.12:
 
 | FastAPI (ASGI) | 64 | 256 | 512 |
 |---|---:|---:|---:|
@@ -101,13 +102,13 @@ WSL2 on 4 cores, CPython 3.12:
 | peregrine, executable | 21,696 | 21,841 | 21,504 |
 | uvicorn | 17,504 | 15,544 | 15,114 |
 | granian | 15,647 | 15,574 | 15,209 |
-| fastpysgi | 11,337 | 10,843 | 10,264 |
+| fastpysgi, running FastAPI | 11,337 | 10,843 | 10,264 |
 
 | Flask (WSGI) | 64 | 256 | 512 |
 |---|---:|---:|---:|
 | **peregrine** | **14,768** | **14,992** | **14,458** |
 | peregrine, executable | 13,084 | 13,029 | 12,488 |
-| fastpysgi | 10,419 | 10,202 | 9,978 |
+| fastpysgi, running Flask | 10,419 | 10,202 | 9,978 |
 | uvicorn (`--interface wsgi`) | 6,554 | 6,545 | 5,722 |
 | granian | 6,427 | 6,152 | 6,257 |
 
@@ -115,6 +116,12 @@ WSL2 on 4 cores, CPython 3.12:
 `python3.12`. The executable is the same server embedding `libpython3.12.so`,
 and a shared libpython runs the framework 10–16 % slower than the statically
 linked interpreter every other server here runs in.
+
+These are not the site's figures and cannot be set beside them. The site runs
+every server with a worker per CPU on 16 CPUs, under Python 3.14, with gunicorn
+for Flask and fastpysgi on a raw application with no framework; Peregrine is
+not listed there. What these tables show is how the servers compare with each
+other on one worker of this machine.
 
 Method, latencies, where this differs from the published results, and how to
 reproduce it: [BENCHMARKS.md](BENCHMARKS.md). Run-to-run variance on this box is

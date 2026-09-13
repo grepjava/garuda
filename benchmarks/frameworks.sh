@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # FastAPI (ASGI) and Flask (WSGI) on peregrine, uvicorn, granian and
-# fastpysgi, measured the way the-benchmarker/web-frameworks measures them.
+# fastpysgi, with the load command and applications of
+# the-benchmarker/web-frameworks at ac364e9 (master, 2026-09-11). The results
+# are not comparable with the figures that site publishes; BENCHMARKS.md says
+# why.
 #
 #   bash benchmarks/frameworks.sh > results.tsv
 #
 # The load is the upstream collect command, flag for flag (.tasks/config.rake
-# in the-benchmarker/web-frameworks):
+# line 152 at that revision; the --closed in the comment above it is not in the
+# command):
 #
 #   warm-up    zrk -c 50 -d 5s --plain URL
 #   per level  zrk --plain -c N -d 15s -m GET --format json -R1000:100000
@@ -17,12 +21,16 @@
 # ranks by. The applications are the upstream python/fastapi and python/flask
 # sources, byte for byte (benchmarks/contract/).
 #
-# Two deliberate differences, both overridable:
+# Differences from upstream; BENCHMARKS.md lists them all:
 #   WORKERS=1  upstream starts every server with $(nproc) workers. One worker
 #              compares what each server does with a core.
-#   RUNS=3     upstream takes one run per level. Each level here is run three
-#              times and the median by achieved_rate is kept, because a shared
-#              developer machine is noisier than a dedicated benchmark host.
+#   RUNS=3     upstream's published figures are means of three runs. Each level
+#              here runs three times and the median by achieved_rate is kept,
+#              because a shared developer machine is noisier than a dedicated
+#              benchmark host.
+#   the rest   Python, host and some servers are whatever VENV and this machine
+#              provide; upstream is Python 3.14 on 16 CPUs, with gunicorn for
+#              Flask and raw applications, not frameworks, for fastpysgi.
 #
 # Output, one TSV line per cell:
 #   framework server workers connections req/s p50_ms p75_ms p90_ms p99_ms errors [every run]
