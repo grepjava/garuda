@@ -88,9 +88,9 @@ not a tag moved after GitHub has already announced it.
 ### 3. Tag and release the commit the wheels were built from
 
 ```bash
-git tag v1.1.0 <commit>
-git push origin v1.1.0
-gh release create v1.1.0 --title "1.1.0" --notes "..."
+git tag v1.1.1 <commit>
+git push origin v1.1.1
+gh release create v1.1.1 --title "1.1.1" --notes "..."
 ```
 
 The tag is what GitHub shows. It is not what `pip` installs.

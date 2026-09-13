@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peregrine-server"
-version = "1.1.0"
+version = "1.1.1"
 description = "A Python ASGI/WSGI server written in Swift"
 readme = "README.md"
 requires-python = ">=3.9"
