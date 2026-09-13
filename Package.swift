@@ -27,6 +27,15 @@ let sharedSwiftSettings: [SwiftSetting] = [
 // one build, since every target that touches Python would carry the flag.
 let hosted = (Context.environment["PEREGRINE_EXTENSION"] ?? "0") != "0"
 
+// PEREGRINE_PYTHON_PC names the pkg-config package exactly. python3.pc and
+// python3-embed.pc are only aliases, and an installation is not obliged to
+// carry them: a versioned Homebrew keg ships python-3.13.pc alone, and
+// pkg-config then answers `python3` with whichever other Python on the search
+// path has one. setup.py and scripts/build-extension.sh pass the interpreter's
+// versioned name, python-<LDVERSION>, whenever it exists.
+let pythonPackage = Context.environment["PEREGRINE_PYTHON_PC"]
+    ?? (hosted ? "python3" : "python3-embed")
+
 let package = Package(
     name: "peregrine",
     platforms: [.macOS(.v14)],
@@ -40,7 +49,7 @@ let package = Package(
         .systemLibrary(
             name: "CPython",
             path: "Sources/CPython",
-            pkgConfig: hosted ? "python3" : "python3-embed",
+            pkgConfig: pythonPackage,
             providers: [
                 .apt(["python3-dev"]),
                 .yum(["python3-devel"]),

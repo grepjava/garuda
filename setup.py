@@ -97,11 +97,26 @@ def _same_release(pkg_version, running):
     return left is not None and left == right
 
 
-def _pkg_config_name(mode):
-    # python3-embed adds -lpython3.x, which the executable needs and the
-    # extension must not have: a second libpython loaded into a python that
-    # already contains one is two interpreters' worth of globals.
-    return "python3" if mode == "extension" else "python3-embed"
+def _pkg_config_name(mode, env):
+    """The pkg-config package for this interpreter.
+
+    python3-embed adds -lpython3.x, which the executable needs and the
+    extension must not have: a second libpython loaded into a python that
+    already contains one is two interpreters' worth of globals.
+
+    The versioned name is preferred. python3.pc is only an alias, and an
+    installation is not obliged to carry it: a versioned Homebrew keg ships
+    python-3.13.pc alone, and pkg-config then answers `python3` with whichever
+    other Python on the search path has one.
+    """
+    suffix = "" if mode == "extension" else "-embed"
+    ldversion = sysconfig.get_config_var("LDVERSION")
+    if ldversion and shutil.which("pkg-config"):
+        versioned = "python-%s%s" % (ldversion, suffix)
+        probe = subprocess.run(["pkg-config", "--exists", versioned], env=env)
+        if probe.returncode == 0:
+            return versioned
+    return "python3" + suffix
 
 
 def _build_environment(mode):
@@ -124,6 +139,8 @@ def _build_environment(mode):
     if found:
         existing = env.get("PKG_CONFIG_PATH")
         env["PKG_CONFIG_PATH"] = os.pathsep.join(([existing] if existing else []) + found[:1])
+    # Package.swift reads the package name from here.
+    env["PEREGRINE_PYTHON_PC"] = _pkg_config_name(mode, env)
     return env
 
 
@@ -150,7 +167,7 @@ def _headers_free_threaded(package, env):
 
 
 def _check_toolchain(mode, env):
-    package = _pkg_config_name(mode)
+    package = env["PEREGRINE_PYTHON_PC"]
     if shutil.which("swift") is None:
         _fail(
             "no Swift toolchain found on PATH.\n"

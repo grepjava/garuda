@@ -221,10 +221,12 @@ jobs:
           echo "PEREGRINE=${GITHUB_WORKSPACE}/scripts/peregrine-ext" >> "$GITHUB_ENV"
           echo "PEREGRINE_PYTHON=$(brew --prefix python@3.13)/bin/python3.13" >> "$GITHUB_ENV"
 
+      # python-3.13, not python3: the keg ships only the versioned file, and
+      # python3 is answered by whichever other Homebrew Python has one.
       - name: Which interpreter the server is built for
         run: |
           swift --version
-          pkg-config --modversion python3
+          pkg-config --modversion python-3.13
 
       - name: Build the extension module
         run: |

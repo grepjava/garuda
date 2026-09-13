@@ -26,13 +26,23 @@ SCRATCH=${SCRATCH:-$HOME/pgbuild-ext}
 suffix=$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
 pcdir=$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBPC") or "")')
 want=$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+ldversion=$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LDVERSION") or "")')
 
 export PEREGRINE_EXTENSION=1
 export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$pcdir"
 
-have=$(pkg-config --modversion python3 2>/dev/null || true)
+# The versioned package when there is one: python3.pc is an alias that a
+# versioned Homebrew keg does not ship, and then pkg-config answers with
+# another Python's. Package.swift reads the name from PEREGRINE_PYTHON_PC.
+package=python3
+if [ -n "$ldversion" ] && pkg-config --exists "python-$ldversion" 2>/dev/null; then
+    package="python-$ldversion"
+fi
+export PEREGRINE_PYTHON_PC=$package
+
+have=$(pkg-config --modversion "$package" 2>/dev/null || true)
 if [ "$have" != "$want" ]; then
-    echo "pkg-config finds Python headers for '$have', but $PYTHON is $want;" >&2
+    echo "pkg-config finds Python headers for '$have' as $package, but $PYTHON is $want;" >&2
     echo "point PKG_CONFIG_PATH at the lib/pkgconfig of $PYTHON" >&2
     exit 1
 fi

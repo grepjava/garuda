@@ -1860,29 +1860,42 @@ def test_free_threaded():
     # By default that is one lifespan per worker thread. Running it once for the
     # whole process reads better until you ask which loop the pool it opened is
     # attached to: the supervising thread's, which serves nothing.
-    def startup_count(*extra):
+    def startup_count(expected, *extra):
         marker = os.path.join(tempfile.gettempdir(),
                               "peregrine-ft-boot-%d" % os.getpid())
         if os.path.exists(marker):
             os.unlink(marker)
+
+        def recorded():
+            if not os.path.exists(marker):
+                return 0
+            with open(marker) as fh:
+                return len(fh.read().split())
+
         port = free_port()
         server = Server("--workers", "4", "--free-threaded", *extra, port=port,
                         env={"PEREGRINE_STARTUP_COUNTER": marker})
         try:
             server.get("/")
-            if not os.path.exists(marker):
-                return 0
-            with open(marker) as fh:
-                return len(fh.read().split())
+            # The first answer proves one worker has started, not all of them:
+            # the kernel accepts on the listening sockets before any worker
+            # thread exists, and per-worker startups run one at a time. Wait for
+            # the count, then a little longer, so one too many is caught as
+            # surely as one too few.
+            deadline = time.monotonic() + 15
+            while recorded() < expected and time.monotonic() < deadline:
+                time.sleep(0.1)
+            time.sleep(0.5)
+            return recorded()
         finally:
             server.stop()
             if os.path.exists(marker):
                 os.unlink(marker)
 
-    count = startup_count()
+    count = startup_count(4)
     check("lifespan startup runs once per worker thread",
           count == 4, "ran %d times" % count)
-    count = startup_count("--lifespan-scope", "process")
+    count = startup_count(1, "--lifespan-scope", "process")
     check("--lifespan-scope process runs it once for the whole process",
           count == 1, "ran %d times" % count)
 
