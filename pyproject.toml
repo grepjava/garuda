@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peregrine-server"
-version = "1.1.4"
+version = "1.1.5"
 description = "A fast ASGI and WSGI server for FastAPI, Flask and Django, written in Swift, with HTTP/2, HTTP/3 and WebTransport"
 readme = "README.md"
 requires-python = ">=3.9"

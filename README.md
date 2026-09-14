@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>A drop-in ASGI and WSGI server for Python, written in Swift.</b><br>
-  FastAPI at 1.4–1.6× and Flask at 2.3–2.5× the throughput of uvicorn, on one worker.<br>
+  Up to 302,000 requests a second on four CPUs, and FastAPI at 1.2–1.3× uvicorn in the-benchmarker's results.<br>
   HTTP/1.1, HTTP/2, HTTP/3, WebSocket and WebTransport.
 </p>
 
@@ -22,13 +22,14 @@ peregrine --host 0.0.0.0 --workers 0 main:app    # where you ran: uvicorn main:a
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/benchmark-256.png" alt="Requests per second on one worker at 256 connections. FastAPI: peregrine 24,117, granian 15,574, uvicorn 15,544, fastpysgi 10,843. Flask: peregrine 14,992, fastpysgi 10,202, uvicorn 6,545, granian 6,152." width="760">
+  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/benchmark-workers-256.png" alt="Requests per second with a worker per CPU at 256 connections, on four CPUs. On Peregrine: raw WSGI 302,417, raw ASGI 271,396, BlackSheep 202,141, FastAPI 72,306, Flask 50,423, Django 47,806. Reference: Elysia on Bun 350,622." width="760">
 </p>
 
-- **Faster with the framework you already use.** The same FastAPI application
-  answers 24,100 requests a second on one worker against uvicorn's 15,500, and
-  the same Flask application 15,000 against 6,500.
-  [How that was measured.](https://github.com/grepjava/peregrine#numbers)
+- **Faster with the framework you already use.** In the published results of
+  the-benchmarker/web-frameworks, the same FastAPI application answers 1.2–1.3×
+  as many requests on Peregrine as on uvicorn, and Django 7–34× as many as on
+  gunicorn. On four CPUs here, BlackSheep reaches 202,000 requests a second and
+  FastAPI 77,000. [How that was measured.](https://github.com/grepjava/peregrine#numbers)
 - **Nothing to change in the application.** ASGI 3 and PEP 3333 in full, for
   FastAPI, Starlette, Django and Flask, with lifespan and WebSockets. The
   protocol is detected, and the options are the ones you know:
@@ -80,50 +81,42 @@ and how that differs from what the site publishes. [DEPLOY.md](https://github.co
 
 ## Numbers
 
-FastAPI and Flask, one worker each, on Peregrine, uvicorn, granian and
-fastpysgi, with the applications and load command of
-[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
-at a pinned revision (zrk, an open-loop ramp to 100,000 requests a second, 15 s
-per level). Requests per second at 64 / 256 / 512 connections, median of three
-runs, all in one session, WSL2 on 4 cores, CPython 3.12:
+The suite's own applications and load command, from
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/):
+zrk, an open-loop ramp to 500,000 requests a second, 15 s per level, with
+`--workers $(nproc)`. Requests per second at 64 / 256 / 512 connections, the
+mean of three runs, all in one session, WSL2 on 4 CPUs with the load generator
+on the same machine, CPython 3.14, Peregrine 1.1.5:
 
-| FastAPI (ASGI) | 64 | 256 | 512 |
+| on Peregrine | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| **peregrine** | **24,672** | **24,117** | **24,320** |
-| peregrine, executable | 21,696 | 21,841 | 21,504 |
-| uvicorn | 17,504 | 15,544 | 15,114 |
-| granian | 15,647 | 15,574 | 15,209 |
-| fastpysgi, running FastAPI | 11,337 | 10,843 | 10,264 |
+| raw WSGI | **293,025** | **302,417** | 256,660 |
+| raw ASGI | 221,826 | 271,396 | **260,155** |
+| BlackSheep | 179,208 | 202,141 | 197,687 |
+| FastAPI | 57,553 | 72,306 | 76,818 |
+| Flask | 49,933 | 50,423 | 50,964 |
+| Django | 46,058 | 47,806 | 45,806 |
+| *Elysia on Bun, for reference* | *346,465* | *350,622* | *356,547* |
 
-| Flask (WSGI) | 64 | 256 | 512 |
+No run returned an error. The raw entries vary most between runs, by up to a
+quarter, so their order at 512 connections means nothing.
+
+The site measures on its own machine, 16 CPUs, so its figures cannot be set
+beside these. What it shows is the same frameworks on different servers.
+Peregrine was
+[added to the suite](https://github.com/the-benchmarker/web-frameworks/pull/9776)
+in September 2026; in its dataset of 2026-09-13, on Peregrine 1.0:
+
+| site entry | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| **peregrine** | **14,768** | **14,992** | **14,458** |
-| peregrine, executable | 13,084 | 13,029 | 12,488 |
-| fastpysgi, running Flask | 10,419 | 10,202 | 9,978 |
-| uvicorn (`--interface wsgi`) | 6,554 | 6,545 | 5,722 |
-| granian | 6,427 | 6,152 | 6,257 |
+| FastAPI on **peregrine** | **54,338** | **59,273** | **60,201** |
+| FastAPI on uvicorn | 41,891 | 47,335 | 48,552 |
+| Django on **peregrine** | **39,840** | **39,718** | **39,654** |
+| Django on gunicorn | 1,165 | 5,727 | 4,699 |
 
-`peregrine` is what a wheel installs: the extension module, running inside
-`python3.12`. The executable is the same server embedding `libpython3.12.so`,
-and a shared libpython runs the framework 10–16 % slower than the statically
-linked interpreter every other server here runs in.
-
-These are not the site's figures and cannot be set beside them. The site runs
-every server with a worker per CPU on 16 CPUs, under Python 3.14, with gunicorn
-for Flask and fastpysgi on a raw application with no framework. Peregrine was
-[added to that suite](https://github.com/the-benchmarker/web-frameworks/pull/9776)
-in September 2026, and its figures there come from that hardware and those
-settings, not these. What these tables show is how the servers compare with each
-other on one worker of this machine.
-
-These tables were measured on 1.1.1 on 2026-09-13, with the suite's earlier
-ramp. [benchmarks/frameworks.sh](https://github.com/grepjava/peregrine/blob/main/benchmarks/frameworks.sh) repeats them with
-`WORKERS=1 RATE=1000:100000`. Run-to-run variance on this box is around ±10 %,
-so read the ratios rather than the absolute figures.
-[BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md) has the suite's own entries under its current
-command, a worker per CPU: raw WSGI up to 302,417 requests a second, BlackSheep
-up to 202,141, FastAPI up to 76,818, Flask about 50,000 and Django about
-46,000.
+[BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md)
+has the latency, every run, the versions, where this machine differs from the
+suite's, and the commands that repeat it.
 
 These are hello-world routes, so they measure what a server adds to a request
 rather than what an application can do. A real application doing database work

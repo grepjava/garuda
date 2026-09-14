@@ -91,7 +91,7 @@ finishes:
 
 ```bash
 $ peregrine --version
-peregrine 1.1.4 (CPython 3.12.3)
+peregrine 1.1.5 (CPython 3.12.3)
 ```
 
 That second number is read from the running interpreter, not from the headers
@@ -229,7 +229,7 @@ back on for the whole process. Check what came out:
 
 ```console
 $ python3.14t -m peregrine --version
-peregrine 1.1.4 (CPython 3.14.6 free-threaded)
+peregrine 1.1.5 (CPython 3.14.6 free-threaded)
 ```
 
 Without `free-threaded` on that line, `--free-threaded` will refuse to start —

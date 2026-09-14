@@ -20,6 +20,10 @@ version reached PyPI, in UTC.
 
 ## Unreleased
 
+---
+
+## 1.1.5 — 2026-09-14
+
 ### Fixed
 
 - `--cache-size`: a worker that stalled for more than two seconds part way
@@ -91,6 +95,10 @@ version reached PyPI, in UTC.
   `benchmarks/frameworks.sh` gains `SOURCES=upstream`, `AGG=mean`, `RATE` and
   the `asgi`, `wsgi` and `django` frameworks; the suite's sources are in
   `benchmarks/web-frameworks/`.
+- The README leads with those results: its headline, chart and Numbers section
+  show the suite's entries on Peregrine with a worker per CPU, and FastAPI and
+  Django on Peregrine beside uvicorn and gunicorn in the suite's published
+  results, in place of the one-worker comparison measured on 1.1.1.
 
 ---
 
