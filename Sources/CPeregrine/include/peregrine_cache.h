@@ -28,13 +28,16 @@
  * request's number, and wherever copies of the same response are -- two size
  * classes, after the response changed size -- the one with the highest number
  * is the only one a lookup will serve; if that one has expired, the lookup is
- * a miss rather than a return to an older copy. Storing a copy retires the
- * older ones it can see, and a copy older than one already kept is not stored.
+ * a miss rather than a return to an older copy.
  *
- * Invalidation uses the same numbers. A table of marks, indexed by a hash of
- * the request target, holds the number of the last change made to a target
- * through it. A copy numbered below its target's mark answers a request that
- * was dispatched before the change, and is neither stored nor served. Two
+ * A table of marks, indexed by a hash of the request target, holds for each
+ * target the number at or below which its copies are out of date, and a copy
+ * at or below its mark is neither stored nor served. A change to the target
+ * raises the mark to a new number, which retires every response to a request
+ * dispatched before the change. Replacing a copy raises its mark to just below
+ * that copy's number, which keeps an older copy of the same response from
+ * taking its place: one in another size class, or one whose writer was paused
+ * part way through and publishes after the newer copy has already gone. Two
  * targets sharing a mark cost each other a miss now and then, never a stale
  * response.
  *
@@ -57,8 +60,9 @@
 #define PG_CACHE_MAX_KEY 2048
 
 /* Maps `total_bytes` of shared memory, divided into slots each able to hold a
- * key, `max_head` bytes of headers and `max_body` bytes of body. Call once,
- * before any fork. Returns the number of slots, or -1. */
+ * key, `max_head` bytes of headers and `max_body` bytes of body, plus a mark
+ * table of a few percent of that. Call once, before any fork. Returns the
+ * number of slots, or -1. */
 long pg_cache_init(uint64_t total_bytes, uint32_t max_head, uint32_t max_body);
 
 int pg_cache_enabled(void);
@@ -93,9 +97,10 @@ int pg_cache_get(const uint8_t *key, size_t key_len, uint64_t now_ms,
 
 /* Stores the response to the request numbered `sequence` (pg_cache_begin),
  * whose target hashes to `target_hash`. It is `age_ms` old now and fresh for
- * `ttl_ms` more. Returns 1 when it was stored; 0 when it was too large, its
- * target changed after the request was dispatched, a more recent copy is
- * already kept, or every slot it could go in was being written. */
+ * `ttl_ms` more. Returns 1 when it was stored and may be served; 0 when it was
+ * too large, every slot it could go in was being written, or it is out of
+ * date: its target changed after the request was dispatched, or a more recent
+ * copy is kept or was kept while this one was being written. */
 int pg_cache_put(const uint8_t *key, size_t key_len, uint64_t target_hash,
                  uint64_t sequence, uint64_t now_ms, uint64_t age_ms, uint64_t ttl_ms,
                  uint16_t status,

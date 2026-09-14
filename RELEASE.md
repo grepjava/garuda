@@ -29,7 +29,9 @@ version reached PyPI, in UTC.
   exists.
 - `--cache-size`: a response that changed size could be answered with an older
   copy kept in a slot of another size, or have that older copy come back after
-  the newer one expired. Only the copy of the most recent response is served.
+  the newer one expired or was evicted, including one that finished being
+  written only after the newer copy had gone. Once a newer response has been
+  stored, an older one is not served again.
 - `--cache-size`: a successful POST, PUT, PATCH or DELETE retires what is cached
   for its URL, as RFC 9111 requires, and a GET that was still being answered
   when the change was made is not stored. Until now a GET was answered with the

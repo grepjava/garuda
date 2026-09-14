@@ -35,8 +35,11 @@ static const size_t CLASS_SIZES[] = { 8 * 1024, 64 * 1024, 512 * 1024 };
 #define COUNT_SHIFT (OWNER_SHIFT + OWNER_BITS)
 #define OWNER_MASK ((UINT64_C(1) << OWNER_BITS) - 1)
 
-/* Marks per slot, at the least: enough that two targets rarely share one. */
-#define MARKS_PER_SLOT 4
+/* Marks per slot, at the least. A mark rises whenever a copy is replaced, and
+ * two targets sharing one cost each other their older copies; with this many,
+ * a replacement in a full table costs another target's copy about one time in
+ * sixteen, for 128 bytes a slot. */
+#define MARKS_PER_SLOT 16
 #define MIN_MARKS 4096
 
 #ifdef PG_CACHE_TESTING
@@ -57,7 +60,7 @@ struct pg_cache_table {
 struct pg_cache_slot {
     _Atomic uint64_t version;       /* see OWNER_SHIFT */
     uint64_t hash;
-    uint64_t mark;                  /* the target's hash, for its invalidation mark */
+    uint64_t mark;                  /* the target's hash, for its mark */
     uint64_t generation;
     uint64_t sequence;              /* the number of the request it answers */
     uint64_t stored_ms;
@@ -142,6 +145,19 @@ static int owner_gone(uint64_t owner, uint64_t self) {
     return kill((pid_t)owner, 0) != 0 && errno == ESRCH;
 }
 
+/* The mark for a target: every copy for it numbered at or below this is out of
+ * date. */
+static _Atomic uint64_t *mark_for(uint64_t target_hash) {
+    return &g_marks[target_hash & g_mark_mask];
+}
+
+/* Marks only ever rise. */
+static void raise_mark(uint64_t target_hash, uint64_t to) {
+    _Atomic uint64_t *mark = mark_for(target_hash);
+    uint64_t current = atomic_load(mark);
+    while (current < to && !atomic_compare_exchange_weak(mark, &current, to)) {}
+}
+
 long pg_cache_init(uint64_t total_bytes, uint32_t max_head, uint32_t max_body) {
     if (g_table) {
         long slots = 0;
@@ -195,6 +211,10 @@ long pg_cache_init(uint64_t total_bytes, uint32_t max_head, uint32_t max_body) {
         clock_gettime(CLOCK_REALTIME, &ts);
         seed = mix((uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)getpid());
     }
+#ifdef PG_CACHE_TESTING
+    /* Which targets share a mark has to be the same on every run. */
+    seed = UINT64_C(0x9e3779b97f4a7c15);
+#endif
 
     g_table = (struct pg_cache_table *)p;
     atomic_store(&g_table->generation, 1);
@@ -239,10 +259,7 @@ uint64_t pg_cache_target_hash(const uint8_t *target, size_t target_len) {
 
 void pg_cache_invalidate(uint64_t target_hash) {
     if (!g_table) return;
-    uint64_t now = pg_cache_begin();
-    _Atomic uint64_t *mark = &g_marks[target_hash & g_mark_mask];
-    uint64_t current = atomic_load(mark);
-    while (current < now && !atomic_compare_exchange_weak(mark, &current, now)) {}
+    raise_mark(target_hash, pg_cache_begin());
 }
 
 /* Whether a slot holds `key` under `generation`, read without owning it: the
@@ -274,9 +291,9 @@ static int holds_newer(uint64_t h, const uint8_t *key, size_t key_len,
 }
 
 /* Retires every copy of `key` answering a request numbered before `sequence`,
- * other than `keep`. A copy still being written is passed over: if it is the
- * older, a lookup already prefers this one to it, and whoever retires this
- * one retires it too. */
+ * other than `keep`, so that its slot can be used again. Lookups already pass
+ * such a copy over; this only gives the space back. A copy still being
+ * written is left to the mark, which a replacement of the newer copy raises. */
 static void retire_older(uint64_t h, const uint8_t *key, size_t key_len,
                          uint64_t generation, uint64_t sequence,
                          const struct pg_cache_slot *keep, uint64_t self) {
@@ -348,7 +365,7 @@ int pg_cache_get(const uint8_t *key, size_t key_len, uint64_t now_ms,
     if ((size_t)hlen + blen > out_capacity) return 0;
     memcpy(out, slot_data(best) + key_len, (size_t)hlen + blen);
     if (atomic_load(&best->version) != best_version) return 0;
-    if (best_sequence <= atomic_load(&g_marks[mark & g_mark_mask])) return 0;
+    if (best_sequence <= atomic_load(mark_for(mark))) return 0;
     *head_len = hlen;
     *body_len = blen;
     *status = st;
@@ -378,9 +395,10 @@ int pg_cache_put(const uint8_t *key, size_t key_len, uint64_t target_hash,
     uint64_t h = hash_key(key, key_len);
     uint64_t generation = atomic_load(&g_table->generation);
 
-    /* Dispatched before its target last changed, it describes what the target
-     * was. And older than a copy already kept, it has nothing to add. */
-    if (sequence <= atomic_load(&g_marks[target_hash & g_mark_mask])) return 0;
+    /* Dispatched before its target last changed, or before a newer copy of it
+     * was replaced, it describes what the target was. And older than a copy
+     * still kept, it has nothing to add. */
+    if (sequence <= atomic_load(mark_for(target_hash))) return 0;
     if (holds_newer(h, key, key_len, generation, sequence)) return 0;
 
     /* The best slot to overwrite: this key's own, else one that holds nothing
@@ -400,7 +418,8 @@ int pg_cache_put(const uint8_t *key, size_t key_len, uint64_t target_hash,
             rank = 1;
         } else if (holds(cls, s, h, key, key_len, generation)) {
             rank = 0;
-        } else if (s->generation != generation || s->expires_ms <= now_ms) {
+        } else if (s->generation != generation || s->expires_ms <= now_ms
+                   || s->sequence <= atomic_load(mark_for(s->mark))) {
             rank = 1;
         } else {
             rank = 2;
@@ -415,29 +434,37 @@ int pg_cache_put(const uint8_t *key, size_t key_len, uint64_t target_hash,
     }
     if (!choice) return 0;
 
+    /* A copy about to be replaced -- this response's own or another's -- may
+     * be the newest of its response, standing in front of older ones: a copy
+     * in a slot of another size, or one whose writer is paused part way and
+     * will publish later. Its target's mark is raised to just below it first,
+     * so that none of those is served once it has gone. First, so that there
+     * is no moment when neither it nor the mark is in their way. Its key is
+     * kept, so the older copies' slots can be given back afterwards. */
+    uint8_t evicted_key[PG_CACHE_MAX_KEY];
+    size_t evicted_len = 0;
+    uint64_t evicted_hash = 0;
+    uint64_t evicted_sequence = 0;
+    if (!(choice_version & 1) && choice->generation == generation) {
+        uint32_t klen = choice->key_len;
+        uint64_t ehash = choice->hash;
+        uint64_t emark = choice->mark;
+        uint64_t eseq = choice->sequence;
+        if (klen == 0 || klen > PG_CACHE_MAX_KEY || klen > cls->capacity) klen = 0;
+        if (klen > 0) memcpy(evicted_key, slot_data(choice), klen);
+        /* Read without owning the slot, so it counts only if nothing moved. */
+        if (atomic_load(&choice->version) != choice_version) return 0;
+        if (eseq > 0) raise_mark(emark, eseq - 1);
+        evicted_len = klen;
+        evicted_hash = ehash;
+        evicted_sequence = eseq;
+    }
+
     /* Claim: stable to odd, or a gone writer's odd to this process's, so that
      * two writers taking over the same slot cannot both win. */
     uint64_t claimed = claim_word(choice_version, self);
     uint64_t expected = choice_version;
     if (!atomic_compare_exchange_strong(&choice->version, &expected, claimed)) return 0;
-
-    /* The entry being replaced, when it is another response's: an older copy
-     * of that response elsewhere would otherwise be what its lookups found
-     * next. Read now, before it is overwritten, from a slot this process owns;
-     * a gone writer's half-written entry describes nothing. */
-    uint8_t evicted_key[PG_CACHE_MAX_KEY];
-    size_t evicted_len = 0;
-    uint64_t evicted_hash = 0;
-    uint64_t evicted_sequence = 0;
-    if (!(choice_version & 1) && choice->generation == generation
-        && !holds(cls, choice, h, key, key_len, generation)
-        && choice->key_len > 0 && choice->key_len <= PG_CACHE_MAX_KEY
-        && choice->key_len <= cls->capacity) {
-        evicted_len = choice->key_len;
-        evicted_hash = choice->hash;
-        evicted_sequence = choice->sequence;
-        memcpy(evicted_key, slot_data(choice), evicted_len);
-    }
 
     choice->hash = h;
     choice->mark = target_hash;
@@ -466,5 +493,8 @@ int pg_cache_put(const uint8_t *key, size_t key_len, uint64_t target_hash,
         retire_older(evicted_hash, evicted_key, evicted_len, generation, evicted_sequence,
                      choice, self);
     }
-    return 1;
+    /* While this was being written, a newer copy of the response may have been
+     * stored and replaced again, raising the mark past it. Then it is in the
+     * table but nothing will serve it, which is not a store. */
+    return sequence > atomic_load(mark_for(target_hash));
 }

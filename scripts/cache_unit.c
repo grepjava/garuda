@@ -278,31 +278,99 @@ static void store_newer_small_while_large_writes(void) {
     CHECK(put_sized("/evicted", pg_cache_begin(), 0, 30000, 200, small_body, 100) == 1);
 }
 
+/* Stores longer-lived small entries until the small copy of `key`, the nearest
+ * to expiring, has been replaced by one of them. Whether it was. */
+static int replace_small_copy(const char *key) {
+    static int next = 0;
+    for (int i = 0; i < 500; i++) {
+        char filler[32];
+        snprintf(filler, sizeof filler, "/fill%d", next++);
+        put_sized(filler, pg_cache_begin(), 0, 60000, 200, small_body, 100);
+        if (get(key, 1).body_len != 100) return 1;
+    }
+    return 0;
+}
+
+static void store_newer_and_replace_it(void) {
+    if (hook_calls++ > 0) return;
+    CHECK(put_sized("/gone", pg_cache_begin(), 0, 30000, 200, small_body, 100) == 1);
+    CHECK(get("/gone", 1).body_len == 100);
+    CHECK(replace_small_copy("/gone"));
+}
+
 static void test_eviction(void) {
     /* A class of eight slots for small entries, and one of two for bodies up
      * to 16 KiB. */
     CHECK(pg_cache_init(2 * 8 * (8 * KIB + 200), 1 * KIB, 16 * KIB) > 0);
 
     /* A newer small copy stored while an older large one is being written:
-     * both are kept, and the newer is the one served. */
+     * both are kept, and the newer is the one served. When the newer is
+     * replaced, the older does not come back in its place. */
     uint64_t older = pg_cache_begin();
+    hook_calls = 0;
     pg_cache_test_after_claim = store_newer_small_while_large_writes;
     CHECK(put_sized("/evicted", older, 0, 60000, 200, large_body, 10 * KIB) == 1);
     pg_cache_test_after_claim = NULL;
     CHECK(get("/evicted", 1).body_len == 100);
-
-    /* Longer-lived entries fill the small class until one replaces the newer
-     * copy, the nearest to expiring. */
-    int replaced = 0;
-    for (int i = 0; i < 500 && !replaced; i++) {
-        char key[32];
-        snprintf(key, sizeof key, "/fill%d", i);
-        put_sized(key, pg_cache_begin(), 0, 60000, 200, small_body, 100);
-        replaced = get("/evicted", 1).body_len != 100;
-    }
-    CHECK(replaced);
-    /* The older, larger copy did not come back in its place. */
+    CHECK(replace_small_copy("/evicted"));
     CHECK(!get("/evicted", 1).found);
+
+    /* The same, but the newer copy is stored and replaced while the older is
+     * still being written: the older publishes after the newer is gone, and
+     * is still not served. */
+    hook_calls = 0;
+    pg_cache_test_after_claim = store_newer_and_replace_it;
+    CHECK(put_sized("/gone", pg_cache_begin(), 0, 60000, 200, large_body, 10 * KIB) == 0);
+    pg_cache_test_after_claim = NULL;
+    CHECK(hook_calls >= 2);
+    CHECK(!get("/gone", 1).found);
+
+    /* And a response to an earlier request that only arrives after a newer
+     * copy has come and gone is not stored at all. */
+    uint64_t earlier = pg_cache_begin();
+    CHECK(put_sized("/late", pg_cache_begin(), 0, 30000, 200, small_body, 100) == 1);
+    CHECK(replace_small_copy("/late"));
+    CHECK(put_sized("/late", earlier, 0, 60000, 200, large_body, 10 * KIB) == 0);
+    CHECK(!get("/late", 1).found);
+
+    /* A response to a later request is stored and served as usual. */
+    CHECK(put_sized("/late", pg_cache_begin(), 0, 60000, 200, large_body, 10 * KIB) == 1);
+    CHECK(get("/late", 1).body_len == 10 * KIB);
+}
+
+/* --- what is out of date takes no slot from what is not -------------------- */
+
+static void test_space(void) {
+    /* A class of four small slots, every one in every entry's reach, and one
+     * slot for bodies up to 16 KiB. */
+    CHECK(pg_cache_init(2 * 4 * (8 * KIB + 200), 1 * KIB, 16 * KIB) > 0);
+
+    /* The small copy of /k outlives everything else, so nothing would replace
+     * it for being near its end. */
+    CHECK(put_sized("/k", pg_cache_begin(), 0, 120000, 200, small_body, 100) == 1);
+    CHECK(put_sized("/s1", pg_cache_begin(), 0, 60000, 200, small_body, 100) == 1);
+    CHECK(put_sized("/s2", pg_cache_begin(), 0, 60000, 200, small_body, 100) == 1);
+    CHECK(put_sized("/s3", pg_cache_begin(), 0, 60000, 200, small_body, 100) == 1);
+
+    /* A newer, large /k retires the small one, and the next small entry takes
+     * that slot rather than a live entry's. */
+    CHECK(put_sized("/k", pg_cache_begin(), 0, 60000, 200, large_body, 10 * KIB) == 1);
+    CHECK(put_sized("/s4", pg_cache_begin(), 0, 90000, 200, small_body, 100) == 1);
+    CHECK(get("/k", 1).body_len == 10 * KIB);
+    CHECK(get("/s1", 1).found);
+    CHECK(get("/s2", 1).found);
+    CHECK(get("/s3", 1).found);
+    CHECK(get("/s4", 1).found);
+
+    /* A response to a request dispatched before its target changed is turned
+     * away before it can push anything out. */
+    uint64_t before = pg_cache_begin();
+    pg_cache_invalidate(pg_cache_target_hash((const uint8_t *)"/x", 2));
+    CHECK(put_sized("/x", before, 0, 60000, 200, small_body, 100) == 0);
+    CHECK(get("/s1", 1).found);
+    CHECK(get("/s2", 1).found);
+    CHECK(get("/s3", 1).found);
+    CHECK(get("/s4", 1).found);
 }
 
 static int run(const char *name, void (*test)(void)) {
@@ -330,6 +398,8 @@ int main(void) {
                            test_size_classes);
     total++; passed += run("a replaced copy takes the older copies of its response with it",
                            test_eviction);
+    total++; passed += run("out-of-date copies take no slot from live ones",
+                           test_space);
     total++; passed += run("a change retires a target's copies and refuses older responses",
                            test_invalidation);
     total++; passed += run("a stored response keeps its age, and a flush retires it",
