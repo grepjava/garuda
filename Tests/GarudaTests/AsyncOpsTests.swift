@@ -186,6 +186,26 @@ struct AsyncOpsTests {
         }
     }
 
+    @Test("a delay never resumes before its duration")
+    func delayNeverEarly() {
+        var worker = makeWorker(connections: 4)
+        defer { worker.destroy() }
+        let slot = openRequest(&worker)
+        let clock = SuspendingClock()
+        // 4 ms is one coarse clock tick on common kernels, the most a deadline
+        // taken from that clock could expire early by.
+        for _ in 0..<10 {
+            let start = clock.now
+            worker.armDelay(slot, ms: 4, kind: .none)
+            while worker.table[slot].pointee.contState != .ready {
+                worker.fireDueTimers()
+            }
+            let elapsed = clock.now - start
+            #expect(elapsed >= .milliseconds(4))
+            worker.clearContinuation(slot)
+        }
+    }
+
     @Test("the loop does not block until a backlog drains across budgets")
     func pollTimeoutWithReadyBacklog() {
         let budget = Worker.readyDrainBudget
@@ -267,15 +287,15 @@ struct AsyncOpsTests {
     func allocateFree() {
         var pool = AsyncOpPool(capacity: 4)
         defer { pool.destroy() }
-        let a = pool.allocate(slot: 1, requestId: 1, kind: .timer, deadlineMs: 10)
-        let b = pool.allocate(slot: 2, requestId: 2, kind: .timer, deadlineMs: 20)
+        let a = pool.allocate(slot: 1, requestId: 1, kind: .timer, deadlineUs: 10)
+        let b = pool.allocate(slot: 2, requestId: 2, kind: .timer, deadlineUs: 20)
         #expect(a != nil)
         #expect(b != nil)
         #expect(a!.index != b!.index)
         #expect(pool.liveCount == 2)
         pool.free(a!.index)
         #expect(pool.liveCount == 1)
-        let c = pool.allocate(slot: 3, requestId: 3, kind: .timer, deadlineMs: 30)
+        let c = pool.allocate(slot: 3, requestId: 3, kind: .timer, deadlineUs: 30)
         #expect(c != nil)
         #expect(c!.index == a!.index)
         #expect(c!.generation == a!.generation &+ 1)
@@ -288,9 +308,9 @@ struct AsyncOpsTests {
     func poolFull() {
         var pool = AsyncOpPool(capacity: 2)
         defer { pool.destroy() }
-        #expect(pool.allocate(slot: 0, requestId: 1, kind: .timer, deadlineMs: 1) != nil)
-        #expect(pool.allocate(slot: 1, requestId: 1, kind: .timer, deadlineMs: 1) != nil)
-        #expect(pool.allocate(slot: 2, requestId: 1, kind: .timer, deadlineMs: 1) == nil)
+        #expect(pool.allocate(slot: 0, requestId: 1, kind: .timer, deadlineUs: 1) != nil)
+        #expect(pool.allocate(slot: 1, requestId: 1, kind: .timer, deadlineUs: 1) != nil)
+        #expect(pool.allocate(slot: 2, requestId: 1, kind: .timer, deadlineUs: 1) == nil)
     }
 
     @Test("timer heap pops in deadline order")
@@ -301,22 +321,22 @@ struct AsyncOpsTests {
             heap.destroy()
             pool.destroy()
         }
-        let late = pool.allocate(slot: 0, requestId: 1, kind: .timer, deadlineMs: 300)!
-        let early = pool.allocate(slot: 1, requestId: 1, kind: .timer, deadlineMs: 100)!
-        let mid = pool.allocate(slot: 2, requestId: 1, kind: .timer, deadlineMs: 200)!
-        heap.push(TimerHeap.Entry(deadlineMs: 300, opIndex: Int32(late.index),
+        let late = pool.allocate(slot: 0, requestId: 1, kind: .timer, deadlineUs: 300)!
+        let early = pool.allocate(slot: 1, requestId: 1, kind: .timer, deadlineUs: 100)!
+        let mid = pool.allocate(slot: 2, requestId: 1, kind: .timer, deadlineUs: 200)!
+        heap.push(TimerHeap.Entry(deadlineUs: 300, opIndex: Int32(late.index),
                                   opGeneration: late.generation), into: &pool)
-        heap.push(TimerHeap.Entry(deadlineMs: 100, opIndex: Int32(early.index),
+        heap.push(TimerHeap.Entry(deadlineUs: 100, opIndex: Int32(early.index),
                                   opGeneration: early.generation), into: &pool)
-        heap.push(TimerHeap.Entry(deadlineMs: 200, opIndex: Int32(mid.index),
+        heap.push(TimerHeap.Entry(deadlineUs: 200, opIndex: Int32(mid.index),
                                   opGeneration: mid.generation), into: &pool)
-        #expect(heap.nextDeadlineMs == 100)
-        let first = heap.popDue(nowMs: 150, from: &pool)!
+        #expect(heap.nextDeadlineUs == 100)
+        let first = heap.popDue(nowUs: 150, from: &pool)!
         #expect(Int(first.opIndex) == early.index)
-        let second = heap.popDue(nowMs: 250, from: &pool)!
+        let second = heap.popDue(nowUs: 250, from: &pool)!
         #expect(Int(second.opIndex) == mid.index)
-        #expect(heap.popDue(nowMs: 250, from: &pool) == nil)
-        let third = heap.popDue(nowMs: 400, from: &pool)!
+        #expect(heap.popDue(nowUs: 250, from: &pool) == nil)
+        let third = heap.popDue(nowUs: 400, from: &pool)!
         #expect(Int(third.opIndex) == late.index)
     }
 
@@ -324,7 +344,7 @@ struct AsyncOpsTests {
     func cancelGeneration() {
         var pool = AsyncOpPool(capacity: 2)
         defer { pool.destroy() }
-        let a = pool.allocate(slot: 0, requestId: 7, kind: .timer, deadlineMs: 1)!
+        let a = pool.allocate(slot: 0, requestId: 7, kind: .timer, deadlineUs: 1)!
         let bad = pool.cancel(index: a.index, generation: a.generation &+ 1)
         #expect(bad == false)
         #expect(pool[a.index].pointee.cancelled == false)
@@ -342,20 +362,20 @@ struct AsyncOpsTests {
             pool.destroy()
         }
         // Request A arms a timer.
-        let a = pool.allocate(slot: 0, requestId: 1, kind: .timer, deadlineMs: 50)!
-        heap.push(TimerHeap.Entry(deadlineMs: 50, opIndex: Int32(a.index),
+        let a = pool.allocate(slot: 0, requestId: 1, kind: .timer, deadlineUs: 50)!
+        heap.push(TimerHeap.Entry(deadlineUs: 50, opIndex: Int32(a.index),
                                   opGeneration: a.generation), into: &pool)
         // Request A finishes: cancel and free before keep-alive request B.
         heap.remove(opIndex: a.index, from: &pool)
         pool.free(a.index)
         // Request B arms its own timer on the recycled op slot.
-        let b = pool.allocate(slot: 0, requestId: 2, kind: .timer, deadlineMs: 50)!
+        let b = pool.allocate(slot: 0, requestId: 2, kind: .timer, deadlineUs: 50)!
         #expect(b.index == a.index)
         #expect(b.generation != a.generation)
-        heap.push(TimerHeap.Entry(deadlineMs: 50, opIndex: Int32(b.index),
+        heap.push(TimerHeap.Entry(deadlineUs: 50, opIndex: Int32(b.index),
                                   opGeneration: b.generation), into: &pool)
         // A stale pop with A's generation must not match B.
-        let due = heap.popDue(nowMs: 100, from: &pool)!
+        let due = heap.popDue(nowUs: 100, from: &pool)!
         #expect(due.opGeneration == b.generation)
         #expect(pool[Int(due.opIndex)].pointee.requestId == 2)
     }

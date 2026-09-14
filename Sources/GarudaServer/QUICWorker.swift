@@ -37,10 +37,11 @@ extension Worker {
                 if q < UInt64(wait) { wait = Int32(q) }
             }
         }
-        if let at = timerHeap.nextDeadlineMs {
-            let now = pg_monotonic_ms()
+        if let at = timerHeap.nextDeadlineUs {
+            let now = pg_monotonic_us()
             if at <= now { return 0 }
-            let t = at - now
+            // Rounded up: waking before the deadline would only spin the loop.
+            let t = (at - now + 999) / 1000
             if t < UInt64(wait) { wait = Int32(t) }
         }
         return wait

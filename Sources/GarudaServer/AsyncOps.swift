@@ -33,7 +33,9 @@ public struct AsyncOp {
     public var slot: Int32 = -1
     public var requestId: UInt32 = 0
     public var kind: OpKind = .timer
-    public var deadlineMs: UInt64 = 0
+    /// `pg_monotonic_us`. Not the coarse millisecond clock: a deadline taken
+    /// from a reading up to a tick stale can expire up to a tick early.
+    public var deadlineUs: UInt64 = 0
     public var cancelled = false
     /// Index in the timer heap, or -1 when not armed as a timer.
     public var heapIndex: Int32 = -1
@@ -67,7 +69,7 @@ public struct AsyncOpPool {
     }
 
     public mutating func allocate(slot: Int, requestId: UInt32, kind: OpKind,
-                                  deadlineMs: UInt64) -> (index: Int, generation: UInt32)? {
+                                  deadlineUs: UInt64) -> (index: Int, generation: UInt32)? {
         let index = Int(firstFree)
         if index < 0 { return nil }
         firstFree = slots[index].nextFree
@@ -76,7 +78,7 @@ public struct AsyncOpPool {
         slots[index].slot = Int32(slot)
         slots[index].requestId = requestId
         slots[index].kind = kind
-        slots[index].deadlineMs = deadlineMs
+        slots[index].deadlineUs = deadlineUs
         slots[index].cancelled = false
         slots[index].heapIndex = -1
         liveCount += 1
@@ -89,7 +91,7 @@ public struct AsyncOpPool {
         slots[index].requestId = 0
         slots[index].cancelled = true
         slots[index].heapIndex = -1
-        slots[index].deadlineMs = 0
+        slots[index].deadlineUs = 0
         slots[index].nextFree = firstFree
         firstFree = Int32(index)
         liveCount -= 1
@@ -115,7 +117,7 @@ public struct AsyncOpPool {
 /// recycled op cannot be fired from a stale heap node.
 public struct TimerHeap {
     public struct Entry {
-        public var deadlineMs: UInt64
+        public var deadlineUs: UInt64
         public var opIndex: Int32
         public var opGeneration: UInt32
     }
@@ -132,8 +134,8 @@ public struct TimerHeap {
 
     public var isEmpty: Bool { count == 0 }
 
-    public var nextDeadlineMs: UInt64? {
-        count > 0 ? storage[0].deadlineMs : nil
+    public var nextDeadlineUs: UInt64? {
+        count > 0 ? storage[0].deadlineUs : nil
     }
 
     public mutating func push(_ entry: Entry, into pool: inout AsyncOpPool) {
@@ -142,7 +144,7 @@ public struct TimerHeap {
         count += 1
         while i > 0 {
             let parent = (i - 1) / 2
-            if storage[parent].deadlineMs <= entry.deadlineMs { break }
+            if storage[parent].deadlineUs <= entry.deadlineUs { break }
             storage[i] = storage[parent]
             pool[Int(storage[i].opIndex)].pointee.heapIndex = Int32(i)
             i = parent
@@ -166,10 +168,10 @@ public struct TimerHeap {
         siftUp(hi, pool: &pool)
     }
 
-    public mutating func popDue(nowMs: UInt64, from pool: inout AsyncOpPool) -> Entry? {
+    public mutating func popDue(nowUs: UInt64, from pool: inout AsyncOpPool) -> Entry? {
         while count > 0 {
             let top = storage[0]
-            if top.deadlineMs > nowMs { return nil }
+            if top.deadlineUs > nowUs { return nil }
             let op = pool[Int(top.opIndex)]
             // Stale heap node: op was recycled or unlinked.
             if op.pointee.heapIndex != 0
@@ -198,7 +200,7 @@ public struct TimerHeap {
         let entry = storage[i]
         while i > 0 {
             let parent = (i - 1) / 2
-            if storage[parent].deadlineMs <= entry.deadlineMs { break }
+            if storage[parent].deadlineUs <= entry.deadlineUs { break }
             storage[i] = storage[parent]
             pool[Int(storage[i].opIndex)].pointee.heapIndex = Int32(i)
             i = parent
@@ -215,10 +217,10 @@ public struct TimerHeap {
             if left >= count { break }
             var child = left
             let right = left + 1
-            if right < count && storage[right].deadlineMs < storage[left].deadlineMs {
+            if right < count && storage[right].deadlineUs < storage[left].deadlineUs {
                 child = right
             }
-            if storage[child].deadlineMs >= entry.deadlineMs { break }
+            if storage[child].deadlineUs >= entry.deadlineUs { break }
             storage[i] = storage[child]
             pool[Int(storage[i].opIndex)].pointee.heapIndex = Int32(i)
             i = child
@@ -360,14 +362,16 @@ extension Worker {
     mutating func armDelay(_ slot: Int, ms: UInt64, kind: ContKind = .delay) -> Bool {
         let c = table[slot]
         clearContinuation(slot)
-        let deadline = pg_monotonic_ms() &+ max(1, ms)
+        // The clock reads truncated microseconds; one more keeps the deadline
+        // from landing before the full duration.
+        let deadline = pg_monotonic_us() &+ 1 &+ max(1, ms) &* 1000
         guard let (index, generation) = asyncOps.allocate(
             slot: slot, requestId: c.pointee.requestId, kind: .timer,
-            deadlineMs: deadline) else {
+            deadlineUs: deadline) else {
             return false
         }
         timerHeap.push(
-            TimerHeap.Entry(deadlineMs: deadline, opIndex: Int32(index),
+            TimerHeap.Entry(deadlineUs: deadline, opIndex: Int32(index),
                             opGeneration: generation),
             into: &asyncOps)
         c.pointee.contState = .waiting
@@ -378,8 +382,8 @@ extension Worker {
     }
 
     mutating func fireDueTimers() {
-        let now = pg_monotonic_ms()
-        while let entry = timerHeap.popDue(nowMs: now, from: &asyncOps) {
+        let now = pg_monotonic_us()
+        while let entry = timerHeap.popDue(nowUs: now, from: &asyncOps) {
             completeTimerOp(index: Int(entry.opIndex), generation: entry.opGeneration)
         }
     }
