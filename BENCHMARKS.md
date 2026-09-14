@@ -298,7 +298,7 @@ The Elysia row needs [Bun](https://bun.sh) and port 3000, since the suite's
 
 ### BlackSheep on Peregrine, and Elysia on Bun past the ceiling
 
-Measured in one session on 2026-09-13, at 9d1aace:
+Measured in one session on 2026-09-13, at 1954e93:
 - **Applications:** [BlackSheep](https://github.com/Neoteroi/BlackSheep) 2.6.3,
   run as ASGI in the extension module
   ([benchmarks/contract/blacksheep_app.py](benchmarks/contract/blacksheep_app.py),

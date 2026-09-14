@@ -129,7 +129,7 @@ reached PyPI in 1.1.3.
 
 ## 1.1.1 — 2026-09-13
 
-Tag `v1.1.1` on `c00bf07`. The server is unchanged from 1.1.0.
+Tag `v1.1.1` on `e2d49f6`. The server is unchanged from 1.1.0.
 
 ### Fixed
 
@@ -145,7 +145,7 @@ Tag `v1.1.1` on `c00bf07`. The server is unchanged from 1.1.0.
 
 ## 1.1.0 — 2026-09-13
 
-Tag `v1.1.0` on `575597b`.
+Tag `v1.1.0` on `a99b35e`.
 
 ### The server runs inside your Python
 
@@ -218,7 +218,7 @@ Tag `v1.1.0` on `575597b`.
 
 ## 1.0.0 — 2026-09-11
 
-Tag `v1.0.0` on `9ce817e`.
+Tag `v1.0.0` on `38b4fd7`.
 
 - Relocatable Linux wheels: the server executable with the Swift runtime
   vendored beside it, using the `libpython` of the interpreter that installs
