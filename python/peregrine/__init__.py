@@ -12,7 +12,7 @@ import os
 import sys
 import sysconfig
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 __all__ = ["binary_path", "run", "main"]
 
 _BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bin")

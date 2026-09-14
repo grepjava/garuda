@@ -20,6 +20,10 @@ version reached PyPI, in UTC.
 
 ## Unreleased
 
+---
+
+## 1.1.3 — 2026-09-14
+
 ### Fixed
 
 - An ASGI application's `send` or `receive` used after its request had ended,
@@ -52,12 +56,23 @@ version reached PyPI, in UTC.
   interleaved rounds, `benchmarks/turbo_ab.sh`); FastAPI, whose own code is
   most of each request, was unchanged within noise.
 
+### Documentation
+
+- `BENCHMARKS.md` adds BlackSheep and a closed-loop capacity run past the
+  ramp's ceiling, what a response body costs by size, where a request's server
+  CPU goes, how many system calls a request makes (and why an io_uring backend
+  was not built), and eager task start, measured twice and not kept.
+- New harnesses in `benchmarks/`: `turbo_ab.sh` (two builds A/B, server CPU
+  per request), `asgi_overhead.py`, `body_sizes.sh`, `syscalls.sh` and
+  `eagercmp.sh` (two builds by connection count). `frameworks.sh` can run a
+  closed loop.
+
 ---
 
 ## 1.1.2 — 2026-09-13
 
-Tagged and released on GitHub only; not uploaded to PyPI yet, so
-`pip install peregrine-server` still installs 1.1.1.
+Tagged and released on GitHub only. It never went to PyPI; its changes
+reached PyPI in 1.1.3.
 
 ### New options
 
