@@ -472,8 +472,16 @@ extension Worker {
         // read there, through `currentWorker` after a trip through Python, was
         // measured to read zero: a 20,000-request pipeline still dispatched
         // each request from inside the last, 767 deep.
+        // Only the first `flushBatch` requests of an event batch start eagerly.
+        // The rest are scheduled, and run in the loop's next phase, after the
+        // flush that sends the eager ones' responses: past the cap the batch
+        // splits the way it does with no eager start at all, instead of one
+        // flush holding every response the batch produced.
+        let eager = eagerStartsThisBatch < Worker.flushBatch
+        if eager { eagerStartsThisBatch += 1 }
         c.pointee.flags.insert(.eagerStarting)
-        let spawned = pg_call3(ASGIRuntime.fnSpawnRequest, ASGIRuntime.loop, coro, doneCb)
+        let spawned = pg_call3(eager ? ASGIRuntime.fnSpawnRequest : ASGIRuntime.fnSpawn,
+                               ASGIRuntime.loop, coro, doneCb)
         c.pointee.flags.remove(.eagerStarting)
 
         // The connection may have closed meanwhile, or a finished request may

@@ -113,6 +113,9 @@ public struct Worker {
     /// what lets a queue the walk keeps adding to be compacted instead of
     /// overflowing.
     var deferredFlushWalked = 0
+    /// ASGI requests this event batch has started eagerly. Past `flushBatch`
+    /// the rest are scheduled instead.
+    var eagerStartsThisBatch = 0
     public var running = true
     /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
     public var draining = false
@@ -234,6 +237,7 @@ public struct Worker {
 
     /// Dispatches `n` events already collected by the poller.
     public mutating func processEvents(_ n: Int) {
+        eagerStartsThisBatch = 0
         var i = 0
         while i < n {
             let (token, mask) = poller.event(i)
@@ -262,16 +266,6 @@ public struct Worker {
                 // A stale event for a slot that has already been recycled.
                 if c.pointee.state == .free || c.pointee.generation != generation { continue }
                 handleConnectionEvent(slot, mask)
-                // An ASGI application started eagerly has run by now, and its
-                // response waits in the deferred queue. Past `flushBatch` of
-                // them the batch goes out here, between events, where no
-                // application is running: a pipelined request the flush
-                // recycles a connection for is dispatched from the walk, one
-                // after another, not from inside another request.
-                if appProtocol == .asgi && deferredFlushCount >= Worker.flushBatch
-                    && !runningDeferredFlushes {
-                    runDeferredFlushes()
-                }
             }
         }
         // The WSGI responses this batch finished go out together. ASGI ones
@@ -883,18 +877,19 @@ public struct Worker {
     /// before going out anyway. Holding a response costs its client the time
     /// the ones after it take to run, so the batch is kept small.
     ///
-    /// WSGI applications always run inside the batch. ASGI ones do when their
-    /// task starts eagerly, and then an uncapped batch is the whole connection
-    /// set: the last of 64 responses waits for the 63 applications before it.
+    /// WSGI applications always run inside the batch, so their responses go
+    /// out every `flushBatch`. ASGI ones run inside it when their task starts
+    /// eagerly, and uncapped that is the whole connection set, with the last
+    /// of 64 responses waiting for the 63 applications before it; so only the
+    /// first `flushBatch` of a batch start eagerly.
     static let flushBatch = 16
 
     /// Sends a finished HTTP/1 response together with the others finishing
     /// around it, rather than on its own.
     ///
     /// ASGI responses go out at the end of the event-loop iteration, which is
-    /// what uvloop does with transport writes, or every `flushBatch` of them
-    /// finished inside an event batch. WSGI responses go out at the end of the
-    /// event batch, or every `flushBatch` of them. It matters more
+    /// what uvloop does with transport writes. WSGI responses go out at the end
+    /// of the event batch, or every `flushBatch` of them. It matters more
     /// than it looks. A write wakes whoever reads the other end. Written one at
     /// a time between applications taking tens of microseconds each, the
     /// readers have gone back to sleep before every write, and every write pays
