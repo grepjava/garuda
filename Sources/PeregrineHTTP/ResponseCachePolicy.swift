@@ -206,6 +206,110 @@ public enum RequestCacheability {
                 return control.noCache || control.noStore || control.maxAge == 0
             }
             return false
+        case 8:
+            // Preconditions only the application can evaluate (RFC 9111
+            // section 4.3.2): the answer may be a 412 or a part of the
+            // representation, and neither is the stored response.
+            return equalsLowercased(name.base, 8, "if-match")
+                || equalsLowercased(name.base, 8, "if-range")
+        case 19:
+            return equalsLowercased(name.base, 19, "if-unmodified-since")
+        default:
+            return false
+        }
+    }
+}
+
+/// A conditional GET or HEAD against a stored response (RFC 9110 section 13.1,
+/// RFC 9111 section 4.3.2): whether the client already has what the cache
+/// would send, so that a 304 answers it.
+public enum CacheValidation {
+    /// If-None-Match, when the request has one, decides alone: it matches when
+    /// it is `*` or lists the stored ETag, compared weakly. Otherwise
+    /// If-Modified-Since matches when the stored Last-Modified is no later.
+    /// What cannot be evaluated -- no validator stored, a date that does not
+    /// parse -- is not a match, and the whole response is sent.
+    public static func notModified(ifNoneMatch: ByteSpan?, ifModifiedSince: ByteSpan?,
+                                   storedHead p: UnsafePointer<UInt8>, _ n: Int) -> Bool {
+        var etag: ByteSpan? = nil
+        var lastModified: ByteSpan? = nil
+        CachedHead.forEach(p, n) { name, value in
+            if name.count == 4 && equalsLowercased(name.base, 4, "etag") {
+                if etag == nil { etag = value }
+            } else if name.count == 13 && equalsLowercased(name.base, 13, "last-modified") {
+                if lastModified == nil { lastModified = value }
+            }
+        }
+        if let ifNoneMatch { return listsTag(ifNoneMatch, etag) }
+        guard let ifModifiedSince, let lastModified,
+              let since = HTTPDate.parse(ifModifiedSince.base, ifModifiedSince.count),
+              let modified = HTTPDate.parse(lastModified.base, lastModified.count) else {
+            return false
+        }
+        return modified <= since
+    }
+
+    /// Whether an If-None-Match value is `*` or lists `stored`, with any `W/`
+    /// ignored on both sides.
+    public static func listsTag(_ list: ByteSpan, _ stored: ByteSpan?) -> Bool {
+        let p = list.base
+        let n = list.count
+        var i = 0
+        while i < n && (p[i] == 0x20 || p[i] == 0x09) { i += 1 }
+        // A stored response is a current representation, which is all `*` asks.
+        if i < n && p[i] == 0x2A { return true }
+        guard let stored, let want = opaqueTag(stored.base, stored.count) else { return false }
+        while i < n {
+            while i < n && (p[i] == 0x20 || p[i] == 0x09 || p[i] == 0x2C) { i += 1 }
+            if i >= n { break }
+            if i + 1 < n && p[i] == 0x57 && p[i + 1] == 0x2F { i += 2 }
+            // Past something that is not an entity-tag nothing can be trusted.
+            guard i < n && p[i] == 0x22 else { return false }
+            let start = i
+            i += 1
+            while i < n && p[i] != 0x22 { i += 1 }
+            guard i < n else { return false }
+            i += 1
+            if sameBytes(ByteSpan(p + start, i - start), want) { return true }
+        }
+        return false
+    }
+
+    /// The quoted part of an entity-tag, without `W/`, or nil.
+    private static func opaqueTag(_ p: UnsafePointer<UInt8>, _ n: Int) -> ByteSpan? {
+        var start = 0
+        var end = n
+        while start < end && (p[start] == 0x20 || p[start] == 0x09) { start += 1 }
+        while end > start && (p[end - 1] == 0x20 || p[end - 1] == 0x09) { end -= 1 }
+        if end - start >= 2 && p[start] == 0x57 && p[start + 1] == 0x2F { start += 2 }
+        guard end - start >= 2, p[start] == 0x22, p[end - 1] == 0x22 else { return nil }
+        return ByteSpan(p + start, end - start)
+    }
+
+    private static func sameBytes(_ a: ByteSpan, _ b: ByteSpan) -> Bool {
+        guard a.count == b.count else { return false }
+        var i = 0
+        while i < a.count {
+            if a.base[i] != b.base[i] { return false }
+            i += 1
+        }
+        return true
+    }
+
+    /// The stored headers a 304 carries: those RFC 9110 section 15.4.5 says a
+    /// 304 must repeat, and Last-Modified, which a client with no ETag
+    /// revalidates with.
+    public static func keptInNotModified(_ name: ByteSpan) -> Bool {
+        switch name.count {
+        case 4:
+            return equalsLowercased(name.base, 4, "etag") || equalsLowercased(name.base, 4, "vary")
+        case 7:
+            return equalsLowercased(name.base, 7, "expires")
+        case 13:
+            return equalsLowercased(name.base, 13, "cache-control")
+                || equalsLowercased(name.base, 13, "last-modified")
+        case 16:
+            return equalsLowercased(name.base, 16, "content-location")
         default:
             return false
         }

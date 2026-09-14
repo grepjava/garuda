@@ -169,3 +169,58 @@ func cachedHeadRoundTrip() {
     }
     #expect(withSpan("Cache-Control") { CachedHead.keeps($0) })
 }
+
+private func notModified(_ ifNoneMatch: String?, _ ifModifiedSince: String?,
+                         stored: [(String, String)]) -> Bool {
+    var block = ByteBuffer()
+    defer { block.destroy() }
+    for (name, value) in stored {
+        withSpan(name) { n in withSpan(value) { v in
+            _ = CachedHead.append(name: n, value: v, into: &block)
+        } }
+    }
+    let inm = Array((ifNoneMatch ?? "").utf8) + [0]
+    let ims = Array((ifModifiedSince ?? "").utf8) + [0]
+    return inm.withUnsafeBufferPointer { a in
+        ims.withUnsafeBufferPointer { b in
+            CacheValidation.notModified(
+                ifNoneMatch: ifNoneMatch == nil ? nil : ByteSpan(a.baseAddress!, a.count - 1),
+                ifModifiedSince: ifModifiedSince == nil ? nil : ByteSpan(b.baseAddress!, b.count - 1),
+                storedHead: block.readableBytes > 0 ? UnsafePointer(block.readPointer) : a.baseAddress!,
+                block.readableBytes)
+        }
+    }
+}
+
+@Test("a conditional request is answered 304 only when the stored validators satisfy it")
+func conditionalRequests() {
+    let stored = [("ETag", "\"v1\""), ("Last-Modified", "Sun, 06 Nov 1994 08:49:37 GMT")]
+    #expect(notModified("\"v1\"", nil, stored: stored))
+    #expect(notModified("W/\"v1\"", nil, stored: stored))
+    #expect(notModified("\"v0\", \"v1\"", nil, stored: stored))
+    #expect(notModified("*", nil, stored: stored))
+    #expect(!notModified("\"v0\"", nil, stored: stored))
+    #expect(!notModified("\"v1", nil, stored: stored))
+    // If-None-Match decides alone when it is there.
+    #expect(!notModified("\"v0\"", "Sun, 06 Nov 1994 08:49:37 GMT", stored: stored))
+    #expect(notModified(nil, "Sun, 06 Nov 1994 08:49:37 GMT", stored: stored))
+    #expect(notModified(nil, "Mon, 07 Nov 1994 00:00:00 GMT", stored: stored))
+    #expect(!notModified(nil, "Sat, 05 Nov 1994 00:00:00 GMT", stored: stored))
+    #expect(!notModified(nil, "yesterday", stored: stored))
+    // Nothing stored to compare with is not a match.
+    #expect(!notModified("\"v1\"", nil, stored: []))
+    #expect(!notModified(nil, "Sun, 06 Nov 1994 08:49:37 GMT", stored: [("ETag", "\"v1\"")]))
+    #expect(notModified("\"v1\"", nil, stored: [("ETag", "W/\"v1\"")]))
+    // A comma inside an entity-tag is part of it.
+    #expect(notModified("\"a,b\"", nil, stored: [("ETag", "\"a,b\"")]))
+    #expect(!notModified("\"a\"", nil, stored: [("ETag", "\"a,b\"")]))
+}
+
+@Test("preconditions only the application can evaluate keep a request out of the cache")
+func originPreconditions() {
+    #expect(excludes("If-Match", "\"v1\""))
+    #expect(excludes("if-unmodified-since", "Sun, 06 Nov 1994 08:49:37 GMT"))
+    #expect(excludes("If-Range", "\"v1\""))
+    #expect(!excludes("If-None-Match", "\"v1\""))
+    #expect(!excludes("If-Modified-Since", "Sun, 06 Nov 1994 08:49:37 GMT"))
+}

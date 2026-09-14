@@ -39,6 +39,15 @@ version reached PyPI, in UTC.
 - `--cache-size`: a response's `Age`, its `Date` and the time the application
   took to produce it count against its lifetime. A response already two minutes
   old with `max-age=60` was kept for a minute and served with `Age: 0`.
+- `--cache-size`: a request with `If-Match`, `If-Unmodified-Since` or `If-Range`
+  goes to the application, the only one that can evaluate it, instead of being
+  answered with a cached 200. One with `If-None-Match` or `If-Modified-Since`
+  that the cached copy satisfies is answered `304 Not Modified` from the cache
+  instead of 200.
+- A 204, or any 1xx, no longer gets `Content-Length: 0`, which RFC 9110 forbids,
+  and a 304's `Content-Length` is no longer rewritten to 0: the application's
+  is kept, or none is sent. This applies with or without `--cache-size`, to
+  ASGI and WSGI over HTTP/1.1, HTTP/2 and HTTP/3.
 
 ---
 

@@ -171,6 +171,37 @@ ttl=$(header cache-status | sed -n 's/.*ttl=\([0-9]*\).*/\1/p')
 if [ -n "$ttl" ] && [ "$ttl" -le 30 ]; then ok "and only what is left of its lifetime"
 else bad "and only what is left of its lifetime" "a ttl of 30 or less" "${ttl:-none}"; fi
 
+echo "conditional requests"
+fetch /etag --http1.1
+fetch /etag --http1.1
+is "a copy with validators is cached" "$(calls GET /etag)" "1"
+fetch /etag --http1.1 -H 'If-Match: "other"'
+is "If-Match goes to the application, which refuses it" "$(status)" "412"
+is "and is called for it" "$(calls GET /etag)" "2"
+fetch /etag --http1.1
+is "the next plain request still gets the copy" "$(status):$(calls GET /etag)" "200:2"
+fetch /etag --http1.1 -H 'If-None-Match: "v1"'
+is "a matching If-None-Match is answered 304" "$(status)" "304"
+like "from the copy" "$(header cache-status)" '^peregrine; hit'
+is "with its ETag" "$(header etag)" '"v1"'
+is "no Content-Length" "$(header content-length)" ""
+# curl leaves its output file alone when no body arrives, so the size is what
+# it counted, not what that file still holds from the request before.
+is "and no body" \
+    "$(curl -sk --http1.1 -o /dev/null -w '%{size_download}' -H 'If-None-Match: "v1"' "$S/etag")" "0"
+fetch /etag --http2 -H 'If-None-Match: W/"v1"'
+is "a weak one matches, over HTTP/2 too" "$(status)" "304"
+fetch /etag --http1.1 -H 'If-None-Match: "v0"'
+like "a different ETag gets the whole copy" "$(status):$(header cache-status)" '^200:peregrine; hit'
+fetch /etag --http1.1 -H 'If-Modified-Since: Mon, 07 Nov 1994 00:00:00 GMT'
+is "If-Modified-Since no earlier than Last-Modified is 304" "$(status)" "304"
+fetch /etag --http1.1 -H 'If-Modified-Since: Sat, 05 Nov 1994 00:00:00 GMT'
+is "and earlier is 200" "$(status)" "200"
+fetch /etag --http1.1 -H 'If-Unmodified-Since: Sat, 05 Nov 1994 00:00:00 GMT'
+is "If-Unmodified-Since goes to the application" "$(calls GET /etag)" "3"
+fetch /etag --http1.1 -H 'If-Range: "v1"'
+is "and so does If-Range" "$(calls GET /etag)" "4"
+
 echo "requests that keep out of the cache"
 fetch "/fresh?auth" --http1.1 -H "Authorization: Bearer secret"
 fetch "/fresh?auth" --http1.1

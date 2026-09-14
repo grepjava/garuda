@@ -604,9 +604,11 @@ CDNs, and leaves what a browser keeps to `max-age`.
 The failure this has to avoid is one user's response sent to another, so these
 are never cached:
 
-- **A request with `Authorization`, `Cookie` or `Range`**, or one asking for a
-  fresh copy (`Cache-Control: no-cache` or `max-age=0`, `Pragma: no-cache`). It
-  goes to the application, and its response is not stored.
+- **A request with `Authorization`, `Cookie` or `Range`**, one asking for a
+  fresh copy (`Cache-Control: no-cache` or `max-age=0`, `Pragma: no-cache`), or
+  one with a precondition only the application can check (`If-Match`,
+  `If-Unmodified-Since`, `If-Range`). It goes to the application, and its
+  response is not stored.
 - **A response with `Set-Cookie`**, `private`, `no-store` or `no-cache`, a
   `Vary` naming anything but `Accept-Encoding`, or a `Content-Encoding` of its
   own.

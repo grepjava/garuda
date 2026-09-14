@@ -213,6 +213,16 @@ async def app(scope, receive, send):
         # server must not add a second header of its own.
         await reply(b"mine\n", headers=[(b"alt-svc", b'h3=":9999"')])
 
+    elif path == "/nocontent":
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    elif path == "/notmodified":
+        # A 304 may say how long the representation it stands for is.
+        await send({"type": "http.response.start", "status": 304,
+                    "headers": [(b"etag", b'"v1"'), (b"content-length", b"5")]})
+        await send({"type": "http.response.body", "body": b""})
+
     elif path == "/fixed":
         body = b"fixed length\n"
         await send({"type": "http.response.start", "status": 200,

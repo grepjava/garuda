@@ -119,11 +119,15 @@ extension Worker {
             return false
         }
 
-        if HTTPResponseWriter.statusForbidsBody(status) {
-            declaredLength = 0
+        // No body for 1xx, 204 and 304, and no Content-Length for 1xx and 204;
+        // a 304 keeps the application's, which describes the representation
+        // (RFC 9110 section 8.6).
+        let forbidsBody = HTTPResponseWriter.statusForbidsBody(status)
+        if forbidsBody {
+            if status != 304 { declaredLength = -1 }
             c.pointee.flags.insert(.suppressBody)
         }
-        c.pointee.responseRemaining = declaredLength
+        c.pointee.responseRemaining = forbidsBody ? 0 : declaredLength
         var coding = ContentCoding.identity
         if config.compress {
             coding = eligibility.choose(offered: c.pointee.acceptedCoding, status: status,
@@ -162,7 +166,8 @@ extension Worker {
         writeH3HeaderBlock(slot, h3, block: &block)
         c.pointee.flags.insert(.responseStarted)
 
-        let empty = c.pointee.flags.contains(.suppressBody) && declaredLength == 0
+        let empty = forbidsBody
+            || (c.pointee.flags.contains(.suppressBody) && declaredLength == 0)
         if empty {
             c.pointee.flags.insert(.responseComplete)
             c.pointee.state = .writing

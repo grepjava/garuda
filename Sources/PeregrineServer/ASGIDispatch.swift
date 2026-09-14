@@ -657,8 +657,13 @@ extension Worker {
             }
         }
 
-        if HTTPResponseWriter.statusForbidsBody(status) {
-            declaredLength = 0
+        // 1xx and 204 have no body and no Content-Length at all (RFC 9110
+        // section 8.6). A 304 has no body either, but a Content-Length on one
+        // describes the representation it stands for, so the application's is
+        // kept; none is made up.
+        let forbidsBody = HTTPResponseWriter.statusForbidsBody(status)
+        if forbidsBody {
+            if status != 304 { declaredLength = -1 }
             c.pointee.flags.insert(.suppressBody)
         }
 
@@ -679,7 +684,13 @@ extension Worker {
             }
         }
 
-        if coding != .identity {
+        if forbidsBody {
+            // Nothing follows the head, so there is nothing to frame.
+            c.pointee.responseRemaining = 0
+            if declaredLength >= 0 {
+                HTTPResponseWriter.writeContentLength(&c.pointee.write, declaredLength)
+            }
+        } else if coding != .identity {
             // Nobody knows the compressed length until the last byte, so the
             // framing is chunked whatever was declared. The declared length is
             // still enforced, against what the application sends.

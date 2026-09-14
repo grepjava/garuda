@@ -137,6 +137,15 @@ def application(environ, start_response):
                                   ("Content-Length", str(len(outcome)))])
         return [outcome]
 
+    if path == "/nocontent":
+        start_response("204 No Content", [])
+        return [b""]
+
+    if path == "/notmodified":
+        # A 304 may say how long the representation it stands for is.
+        start_response("304 Not Modified", [("ETag", '"v1"'), ("Content-Length", "5")])
+        return [b""]
+
     if path == "/lazystart":
         # PEP 3333: "servers must not assume that start_response() has been
         # called before they begin iterating over the iterable" -- a generator

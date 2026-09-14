@@ -363,7 +363,10 @@ public enum WSGIResponseBuilder {
         let isSequence = result.map { PySeq.isSequence($0) } ?? false
 
         if forbidsBody {
-            declaredLength = 0
+            // No body, and no Content-Length for 1xx and 204 (RFC 9110
+            // section 8.6); a 304 keeps the application's, which describes the
+            // representation it stands for.
+            if code != 304 { declaredLength = -1 }
         } else if declaredLength >= 0 {
             // Application knows its own length.
         } else if let result, isSequence {
@@ -428,9 +431,9 @@ public enum WSGIResponseBuilder {
             } else {
                 HTTPResponseWriter.writeContentLength(&out, declaredLength)
             }
-        } else if snapshot.multiplexed {
-            // Nothing to declare and nothing to chunk: on a multiplexed
-            // stream the ending of the stream is the framing.
+        } else if forbidsBody || snapshot.multiplexed {
+            // A 1xx or 204 has nothing to frame, and on a multiplexed stream
+            // the ending of the stream is the framing.
         } else if snapshot.httpMinor == 1 {
             plan.chunked = true
             HTTPResponseWriter.writeChunkedEncoding(&out)

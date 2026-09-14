@@ -602,6 +602,14 @@ def test_response_framing():
               c.reset.get(s2) is not None,
               "the stream ended cleanly, which would pass off a truncated "
               "body as the whole message")
+
+        s3 = c.request(path="/nocontent")
+        s4 = c.request(path="/notmodified")
+        _, headers, body, _ = c.collect([s3, s4], deadline=10.0)
+        is_("a 204 has no content-length", headers[s3].get(b"content-length"), None)
+        is_("a 304 keeps the content-length the application gave",
+            headers[s4].get(b"content-length"), b"5")
+        is_("and neither has a body", (body.get(s3, b""), body.get(s4, b"")), (b"", b""))
         c.close()
 
 

@@ -7,7 +7,8 @@ which call and which process produced it, so a copy served from the cache is
 byte for byte the response that was stored.
 
 Any method but GET and HEAD is a change to the target: answered 200, or 403
-when the request carries X-Deny.
+when the request carries X-Deny. /etag evaluates If-Match itself, as an
+application would.
 """
 
 import asyncio
@@ -51,6 +52,8 @@ ROUTES = {
     "/aged": [(b"cache-control", b"max-age=60"), (b"age", b"120")],
     "/half-aged": [(b"cache-control", b"max-age=60"), (b"age", b"30")],
     "/dated": [(b"cache-control", b"max-age=60")],
+    "/etag": [(b"cache-control", b"s-maxage=60"), (b"etag", b'"v1"'),
+              (b"last-modified", b"Sun, 06 Nov 1994 08:49:37 GMT")],
 }
 
 
@@ -74,6 +77,13 @@ async def asgi_app(scope, receive, send):
                     "headers": [(b"content-type", b"text/plain")]})
         await send({"type": "http.response.body", "body": b"denied\n" if denied else b"changed\n"})
         return
+    if path == "/etag":
+        if_match = dict(scope["headers"]).get(b"if-match")
+        if if_match is not None and if_match != b'"v1"':
+            await send({"type": "http.response.start", "status": 412,
+                        "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b""})
+            return
     body = b"call=%d pid=%d target=%s\n" % (CALLS[target], os.getpid(), target.encode())
     status = 200
     headers = ([(b"content-type", b"text/plain")] + ROUTES.get(path, ROUTES["/fresh"])

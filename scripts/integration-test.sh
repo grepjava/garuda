@@ -84,6 +84,13 @@ is "legacy write() streams both blocks" \
    "$(curl -sS --max-time 8 $H/slowwrite?0.2 | tr -d '\n')" "firstsecond"
 is "exactly one Content-Length" \
    "$(curl -sS -i --max-time 5 $H/ | grep -ci '^content-length')" "1"
+is "a 204 has no Content-Length" \
+   "$(curl -sS -i --max-time 5 $H/nocontent | grep -ci '^content-length')" "0"
+is "a 304 keeps the Content-Length the application gave" \
+   "$(curl -sS -i --max-time 5 $H/notmodified | grep -i '^content-length' | tr -d '\r' | awk '{print $2}')" "5"
+is "and the connection carries on after both" \
+   "$(curl -sS --max-time 5 -o /dev/null -o /dev/null -o /dev/null -w '%{http_code}:%{num_connects} ' $H/nocontent $H/notmodified $H/)" \
+   "204:1 304:0 200:0 "
 is "chunked response for a generator" \
    "$(curl -sS -i --max-time 5 $H/stream | grep -ci '^transfer-encoding: chunked')" "1"
 is "generator body" "$(curl -sS --max-time 5 $H/stream | tr '\n' ' ')" \
@@ -181,6 +188,13 @@ is "scope headers are lowercased bytes" \
    "True"
 is "explicit content-length is not duplicated" \
    "$(curl -sS -i --max-time 5 $H/fixed | grep -ci '^content-length')" "1"
+is "a 204 has no Content-Length" \
+   "$(curl -sS -i --max-time 5 $H/nocontent | grep -ci '^content-length')" "0"
+is "a 304 keeps the Content-Length the application gave" \
+   "$(curl -sS -i --max-time 5 $H/notmodified | grep -i '^content-length' | tr -d '\r' | awk '{print $2}')" "5"
+is "and the connection carries on after both" \
+   "$(curl -sS --max-time 5 -o /dev/null -o /dev/null -o /dev/null -w '%{http_code}:%{num_connects} ' $H/nocontent $H/notmodified $H/)" \
+   "204:1 304:0 200:0 "
 is "streaming response" "$(curl -sS --max-time 5 $H/stream | tr '\n' ' ')" \
    "chunk-0 chunk-1 chunk-2 chunk-3 chunk-4 "
 is "large response size" \

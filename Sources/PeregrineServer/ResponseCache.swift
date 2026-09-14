@@ -218,6 +218,8 @@ extension Worker {
         var forwardedProto = ByteSpan(base, 0)
         var forwardedHost = ByteSpan(base, 0)
         var forwarded = ByteSpan(base, 0)
+        var ifNoneMatch: ByteSpan? = nil
+        var ifModifiedSince: ByteSpan? = nil
         var i = 0
         while i < c.pointee.head.headerCount {
             let h = headers[i]
@@ -228,8 +230,12 @@ extension Worker {
             switch name.count {
             case 4 where equalsLowercased(name.base, 4, "host"): host = value
             case 9 where equalsLowercased(name.base, 9, "forwarded"): forwarded = value
+            case 13 where equalsLowercased(name.base, 13, "if-none-match"):
+                if ifNoneMatch == nil { ifNoneMatch = value }
             case 16 where equalsLowercased(name.base, 16, "x-forwarded-host"): forwardedHost = value
             case 17 where equalsLowercased(name.base, 17, "x-forwarded-proto"): forwardedProto = value
+            case 17 where equalsLowercased(name.base, 17, "if-modified-since"):
+                if ifModifiedSince == nil { ifModifiedSince = value }
             default: break
             }
         }
@@ -280,11 +286,31 @@ extension Worker {
         if hit == 1 {
             if Metrics.enabled { Metrics.add(PG_M_CACHE_HITS) }
             let p = UnsafePointer(cacheScratch.writePointer)
-            let entry = CachedEntry(status: Int(status),
+            var entry = CachedEntry(status: Int(status),
                                     head: ByteSpan(p, Int(headLength)),
                                     body: ByteSpan(p + Int(headLength), Int(bodyLength)),
                                     ageSeconds: Int(ageMs / 1000),
                                     ttlSeconds: Int((ttlMs + 999) / 1000))
+            // A conditional request the stored 200 satisfies is answered 304,
+            // with the stored validators and caching headers and no body
+            // (RFC 9110 section 15.4.5).
+            var validators = ByteBuffer()
+            defer { validators.destroy() }
+            if (ifNoneMatch != nil || ifModifiedSince != nil) && entry.status == 200
+                && CacheValidation.notModified(ifNoneMatch: ifNoneMatch,
+                                               ifModifiedSince: ifModifiedSince,
+                                               storedHead: entry.head.base, entry.head.count) {
+                CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
+                    if CacheValidation.keptInNotModified(name) {
+                        _ = CachedHead.append(name: name, value: value, into: &validators)
+                    }
+                }
+                entry.status = 304
+                entry.head = validators.readableBytes > 0
+                    ? ByteSpan(UnsafePointer(validators.readPointer), validators.readableBytes)
+                    : ByteSpan(p, 0)
+                entry.body = ByteSpan(p, 0)
+            }
             if c.pointee.isH3Stream {
                 serveCachedH3(slot, entry)
             } else if c.pointee.isStream {
