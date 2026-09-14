@@ -20,6 +20,10 @@ version reached PyPI, in UTC.
 
 ## Unreleased
 
+---
+
+## 1.1.4 — 2026-09-14
+
 ### Changed
 
 - Wheels are built for Linux aarch64 as well as x86_64, and tagged
