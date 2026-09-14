@@ -59,7 +59,15 @@ The realistic target stays the top tier, level with Bun, and clearly ahead of to
    - `GET /` → 200, empty body
    - `GET /user/:id` → 200, the id bytes as the body
    - `POST /user` → 200, empty body
-   Still to do: benchmark that contract against Hummingbird and Vapor with suite zrk.
+   Measured against Hummingbird and Vapor, 2026-09-15: suite zrk at 4bb9eaa (`-c N -d 15s -R1000:500000`, `GET /`), mean of three runs, WSL2, the load generator sharing the server's 4 CPUs, zero errors. Garuda ran four workers at 09eb178. Hummingbird 2.26.0 and Vapor 4.122.1 are the suite's `swift/*-framework` entries, byte for byte, built as its Dockerfile builds them (Swift 6.3.3, `-c release -Xswiftc -enforce-exclusivity=unchecked`), each one process with SwiftNIO 2.102.0's default of an event loop per CPU. `FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 AGG=mean bash benchmarks/frameworks.sh`:
+
+   | entry | 64 | 256 | 512 |
+   |---|---:|---:|---:|
+   | Garuda router | **414,234** | **389,445** | **370,945** |
+   | Hummingbird | 88,864 | 102,399 | 99,706 |
+   | Vapor | 60,411 | 58,946 | 60,837 |
+
+   About 4× Hummingbird and 6–7× Vapor at every level. Latencies are not in the table: the ramp offers far more than Hummingbird and Vapor can serve, so their corrected p50s are seconds of queueing, not per-request cost. There is no pinned one-core pass: SwiftNIO sizes its loop group from cgroup limits or the online CPU count, not from affinity, so under `taskset` both would run four loops on one core. Figures from different sessions here move by tens of percent; compare rows within one table.
 3. **Decouple CPython from the engine targets.** Done. `Package.swift` has no CPython; ASGI/WSGI and the Python package are gone. A Garuda binary links OpenSSL, zlib, and the Swift runtime — not libpython.
 4. **Async without a scheduling hop per request.** Done as the first substrate; the public API still grows on top of it.
 

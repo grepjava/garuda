@@ -9,6 +9,7 @@
 #   bash benchmarks/frameworks.sh > results.tsv
 #   FRAMEWORKS=blacksheep SERVERS=garuda-ext bash benchmarks/frameworks.sh
 #   LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
+#   FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 bash benchmarks/frameworks.sh
 #
 # The load is the upstream collect command, flag for flag (.tasks/config.rake
 # line 149 at that revision; the --closed in the comment above it is not in the
@@ -53,7 +54,14 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VENV=${VENV:-$HOME/fastapi-bench-venv}
-GARUDA=${GARUDA:-$HOME/pgbuild/release/garuda}
+GARUDA=${GARUDA:-$ROOT/.build/release/garuda}
+# FRAMEWORKS=swift serves the contract natively: garuda's own router, and the
+# suite's swift/hummingbird-framework and swift/vapor-framework entries built
+# as its Dockerfile builds them (swift build -c release
+# -Xswiftc -enforce-exclusivity=unchecked). Those two run as one process with
+# SwiftNIO's default of an event loop per CPU they may use; WORKERS is garuda's.
+HUMMINGBIRD=${HUMMINGBIRD:-$HOME/swiftbench/hummingbird-framework/.build/release/server}
+VAPOR=${VAPOR:-$HOME/swiftbench/vapor-framework/.build/release/server}
 ZRK=${ZRK:-zrk}
 OHA=${OHA:-oha}
 LOAD=${LOAD:-ramp}
@@ -131,9 +139,15 @@ start() {
     export PYTHONPATH="$appdir${BASE_PYTHONPATH:+:$BASE_PYTHONPATH}"
     case "$server" in
     garuda)
-        server_start "${PIN_SERVER[@]}" "$GARUDA" --log-level error --protocol "$interface" \
-            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}" \
-            --venv "$VENV" --python-path "$appdir" "$app" ;;
+        if [ "$framework" = swift ]; then
+            # The router answers the contract itself; there is no application.
+            server_start "${PIN_SERVER[@]}" "$GARUDA" --log-level error \
+                --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}"
+        else
+            server_start "${PIN_SERVER[@]}" "$GARUDA" --log-level error --protocol "$interface" \
+                --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}" \
+                --venv "$VENV" --python-path "$appdir" "$app"
+        fi ;;
     garuda-ext)
         # The same server as an extension module, run by the virtualenv python:
         # garuda._native, from scripts/build-extension.sh -- what a wheel
@@ -164,6 +178,12 @@ module, attr = sys.argv[1].split(":")
 app = getattr(importlib.import_module(module), attr)
 fastpysgi.run(app, sys.argv[2], int(sys.argv[3]), workers=int(sys.argv[4]))' \
             "$app" 127.0.0.1 "$PORT" "$WORKERS" ;;
+    hummingbird)
+        # The suite's config.yaml passes host and port through the environment.
+        SERVER_HOSTNAME=127.0.0.1 SERVER_PORT=$PORT server_start "${PIN_SERVER[@]}" "$HUMMINGBIRD" ;;
+    vapor)
+        SERVER_HOSTNAME=127.0.0.1 SERVER_PORT=$PORT VAPOR_ENV=production \
+            server_start "${PIN_SERVER[@]}" "$VAPOR" serve ;;
     elysia-bun)
         # Upstream runs cluster.ts, which spawns one `bun ./app.ts` per CPU.
         # One worker is app.ts itself; cluster.ts only when WORKERS is every CPU.
@@ -243,6 +263,11 @@ for framework in $FRAMEWORKS; do
         # Elysia is its own server; the Python servers don't run it.
         [ "$framework" = elysia ] && [ "$server" != elysia-bun ] && continue
         [ "$framework" != elysia ] && [ "$server" = elysia-bun ] && continue
+        # Likewise the Swift contract: garuda's router, Hummingbird and Vapor.
+        if [ "$framework" = swift ]; then
+            case "$server" in garuda|hummingbird|vapor) ;; *) continue ;; esac
+        fi
+        case "$server" in hummingbird|vapor) [ "$framework" = swift ] || continue ;; esac
         server_stop
         if ! start "$server" "$framework"; then
             printf '%s\t%s\t%s\tFAILED TO START\n' "$framework" "$server" "$WORKERS"
