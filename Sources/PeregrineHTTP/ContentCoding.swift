@@ -165,6 +165,87 @@ public struct AcceptEncoding: Sendable, Equatable {
     }
 }
 
+/// Entity-tags on a response the server compresses.
+///
+/// A strong entity-tag stands for one exact sequence of bytes, and a body the
+/// server compressed is not the sequence the application tagged: two
+/// representations in different content codings must not share one (RFC 9110
+/// section 8.8.3.3). A strong tag on a compressed response is sent weak
+/// instead, `W/"v1"` for `"v1"`, as nginx and Django's GZipMiddleware do.
+/// If-None-Match compares weakly, so revalidation still works; If-Match and
+/// If-Range compare strongly, and no longer accept a tag that never named the
+/// bytes the client holds.
+public enum EntityTag {
+    @inlinable
+    public static func isName(_ name: ByteSpan) -> Bool {
+        name.count == 4 && equalsLowercased(name.base, 4, "etag")
+    }
+
+    /// A quoted entity-tag with no `W/`. A value that is not an entity-tag at
+    /// all is not strong, and goes out as the application wrote it.
+    @inlinable
+    public static func isStrong(_ value: ByteSpan) -> Bool {
+        value.count >= 2 && value.base[0] == 0x22 && value.base[value.count - 1] == 0x22
+    }
+
+    /// `value` as a response in `coding` sends it. A weakened copy is written
+    /// into `scratch`, which is left alone otherwise.
+    public static func sent(_ value: ByteSpan, coding: ContentCoding,
+                            scratch: inout ByteBuffer) -> ByteSpan {
+        guard coding != .identity, isStrong(value) else { return value }
+        scratch.clear()
+        scratch.reserve(value.count &+ 2)
+        scratch.write("W/")
+        scratch.write(value)
+        return ByteSpan(UnsafePointer(scratch.readPointer), scratch.readableBytes)
+    }
+}
+
+/// ETag values held back from a response head until its coding is chosen,
+/// which is only once every header has been seen. Each is copied, because the
+/// application's bytes are lent only for the header being read.
+public struct HeldETags {
+    // Each entry is a four-byte length, `W/`, then the value, so that the weak
+    // form is the same bytes starting two earlier.
+    private var buffer = ByteBuffer()
+
+    public init() {}
+
+    /// Holds one value, or refuses one no header may carry.
+    public mutating func hold(_ value: ByteSpan) -> Bool {
+        var i = 0
+        while i < value.count {
+            if !isFieldValueChar(value.base[i]) { return false }
+            i &+= 1
+        }
+        let n = value.count
+        buffer.reserve(n &+ 6)
+        buffer.writeByte(UInt8(truncatingIfNeeded: n >> 24))
+        buffer.writeByte(UInt8(truncatingIfNeeded: n >> 16))
+        buffer.writeByte(UInt8(truncatingIfNeeded: n >> 8))
+        buffer.writeByte(UInt8(truncatingIfNeeded: n))
+        buffer.write("W/")
+        buffer.write(value)
+        return true
+    }
+
+    /// Every held value, as a response in `coding` sends it.
+    public func forEach(coding: ContentCoding, _ body: (ByteSpan) -> Void) {
+        guard buffer.readableBytes > 0 else { return }
+        var p = UnsafePointer(buffer.readPointer)
+        var left = buffer.readableBytes
+        while left >= 6 {
+            let n = Int(p[0]) << 24 | Int(p[1]) << 16 | Int(p[2]) << 8 | Int(p[3])
+            let value = ByteSpan(p + 6, n)
+            body(coding != .identity && EntityTag.isStrong(value) ? ByteSpan(p + 4, n + 2) : value)
+            p += 6 + n
+            left -= 6 + n
+        }
+    }
+
+    public mutating func destroy() { buffer.destroy() }
+}
+
 /// What a response's own headers say about compressing it, gathered as they
 /// are written.
 public struct CompressionEligibility: Sendable {

@@ -295,6 +295,8 @@ public enum WSGIResponseBuilder {
         var seen: ResponseHeaderKind = []
         var declaredLength = -1
         var eligibility = CompressionEligibility()
+        var etags = HeldETags()
+        defer { etags.destroy() }
         let headerCount = PySeq.count(headerList)
 
         var i = 0
@@ -343,6 +345,11 @@ public enum WSGIResponseBuilder {
                 }
             } else if name.count == 0 {
                 rejection = "rejected an empty response header name"
+            } else if snapshot.compress && EntityTag.isName(name) {
+                // Emitted once the coding is known; see EntityTag.
+                if !etags.hold(value) {
+                    rejection = "rejected a response header containing control characters"
+                }
             } else if !emit(name, value) {
                 // A CR or LF in an application-supplied header is a response
                 // splitting attempt; refuse the whole response rather than
@@ -407,6 +414,7 @@ public enum WSGIResponseBuilder {
                     out.writeCRLF()
                 }
             }
+            etags.forEach(coding: plan.coding) { tag in _ = emit("etag", tag) }
         }
 
         plan.declaredLength = declaredLength

@@ -48,6 +48,14 @@ version reached PyPI, in UTC.
   and a 304's `Content-Length` is no longer rewritten to 0: the application's
   is kept, or none is sent. This applies with or without `--cache-size`, to
   ASGI and WSGI over HTTP/1.1, HTTP/2 and HTTP/3.
+- `--compress`: a strong `ETag` on a response the server compresses is sent
+  weak (`W/"v1"`), with or without `--cache-size`, over HTTP/1.1, HTTP/2 and
+  HTTP/3. The plain and compressed bodies were both sent with the
+  application's strong tag, which RFC 9110 says must tell different bytes
+  apart. `If-None-Match` still matches the weak tag.
+- `--cache-size` with `--compress`: a `304` answered from the cache carries
+  the `Vary: Accept-Encoding` its `200` has. The server added that `Vary` when
+  sending the `200`, and dropped it from the `304`.
 - `--free-threaded` with more than one worker no longer hangs at start-up when
   the GIL is enabled (`PYTHON_GIL=1`, or an extension module that turns it back
   on) and the application's lifespan `startup` awaits anything. A worker waiting

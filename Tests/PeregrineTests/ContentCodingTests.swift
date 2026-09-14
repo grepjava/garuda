@@ -109,4 +109,47 @@ private func observe(_ e: inout CompressionEligibility, _ name: String, _ value:
 
         #expect(!e.mayVary(status: 206))
     }
+
+    @Test func compressedResponsesSendStrongETagsWeak() {
+        func sent(_ tag: String, _ coding: ContentCoding) -> String {
+            var scratch = ByteBuffer()
+            defer { scratch.destroy() }
+            let bytes = Array(tag.utf8)
+            return bytes.withUnsafeBufferPointer { bp in
+                let out = EntityTag.sent(ByteSpan(bp.baseAddress!, bp.count), coding: coding,
+                                         scratch: &scratch)
+                return String(decoding: UnsafeBufferPointer(start: out.base, count: out.count),
+                              as: UTF8.self)
+            }
+        }
+        #expect(sent("\"v1\"", .gzip) == "W/\"v1\"")
+        #expect(sent("\"v1\"", .identity) == "\"v1\"")
+        #expect(sent("W/\"v1\"", .br) == "W/\"v1\"")
+        // Not an entity-tag at all: left for the application to answer for.
+        #expect(sent("v1", .gzip) == "v1")
+    }
+
+    @Test func heldETagsComeOutInTheChosenCoding() {
+        var held = HeldETags()
+        defer { held.destroy() }
+        for tag in ["\"a\"", "W/\"b\""] {
+            let bytes = Array(tag.utf8)
+            let kept = bytes.withUnsafeBufferPointer { held.hold(ByteSpan($0.baseAddress!, $0.count)) }
+            #expect(kept)
+        }
+        let split = Array("\"x\r\nSet-Cookie: y\"".utf8)
+        let refused = !split.withUnsafeBufferPointer { held.hold(ByteSpan($0.baseAddress!, $0.count)) }
+        #expect(refused)
+
+        func collect(_ coding: ContentCoding) -> [String] {
+            var out: [String] = []
+            held.forEach(coding: coding) {
+                out.append(String(decoding: UnsafeBufferPointer(start: $0.base, count: $0.count),
+                                  as: UTF8.self))
+            }
+            return out
+        }
+        #expect(collect(.gzip) == ["W/\"a\"", "W/\"b\""])
+        #expect(collect(.identity) == ["\"a\"", "W/\"b\""])
+    }
 }

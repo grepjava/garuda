@@ -64,6 +64,10 @@ async def asgi(scope, receive, send):
         headers.append((b"content-length", str(len(TEXT)).encode()))
     elif path == "/events":
         headers = [(b"content-type", b"text/event-stream")]
+    elif path == "/etag":
+        headers.append((b"etag", b'"v1"'))
+    elif path == "/weak-etag":
+        headers.append((b"etag", b'W/"v1"'))
 
     await send({"type": "http.response.start", "status": 200, "headers": headers})
     await send({"type": "http.response.body", "body": body})
@@ -89,6 +93,9 @@ def wsgi(environ, start_response):
         return [b"tiny"]
     if path == "/png":
         start_response("200 OK", [("Content-Type", "image/png")])
+        return [TEXT]
+    if path == "/etag":
+        start_response("200 OK", headers + [("ETag", '"v1"')])
         return [TEXT]
     start_response("200 OK", headers)
     return [TEXT]

@@ -125,6 +125,15 @@ is "an event stream is not compressed" "$(header $WORK/h content-encoding)" ""
 fetch $H/vary $WORK/h --compressed -o /dev/null > /dev/null
 is "the application's own Vary is not repeated" "$(count_header $WORK/h vary)" "1"
 
+# A strong ETag names the application's bytes, and compressed bytes are others.
+fetch $H/etag $WORK/h -H 'Accept-Encoding: gzip' -o /dev/null > /dev/null
+is "a compressed body's strong ETag is sent weak" "$(header $WORK/h etag)" 'W/"v1"'
+is "once" "$(count_header $WORK/h etag)" "1"
+fetch $H/etag $WORK/h -o /dev/null > /dev/null
+is "a body sent plain keeps it strong" "$(header $WORK/h etag)" '"v1"'
+fetch $H/weak-etag $WORK/h -H 'Accept-Encoding: gzip' -o /dev/null > /dev/null
+is "a weak ETag is left as it is" "$(header $WORK/h etag)" 'W/"v1"'
+
 curl -sS --max-time 10 -I --compressed $H/ > $WORK/h
 is "HEAD is not encoded" "$(header $WORK/h content-encoding)" ""
 
@@ -181,6 +190,8 @@ for mode in inline pool; do
     is "$mode: a short list keeps its computed length" "$(header $WORK/h content-length)" "4"
     fetch $H/png $WORK/h --compressed -o /dev/null > /dev/null
     is "$mode: an image is left alone" "$(header $WORK/h content-encoding)" ""
+    fetch $H/etag $WORK/h -H 'Accept-Encoding: gzip' -o /dev/null > /dev/null
+    is "$mode: a compressed body's strong ETag is sent weak" "$(header $WORK/h etag)" 'W/"v1"'
     is "$mode: keep-alive carries compressed responses" \
        "$(curl -sS --max-time 20 --compressed \
             -o /dev/null -w '%{http_code}' $H/list \
@@ -207,6 +218,8 @@ for app in asgi wsgi; do
     is "$app h2: it went over HTTP/2" "$(head -1 $WORK/h | tr -d '\r' | cut -d' ' -f1)" "HTTP/2"
     is "$app h2: and is brotli" "$(header $WORK/h content-encoding)" "br"
     is "$app h2: with no content-length" "$(header $WORK/h content-length)" ""
+    fetch $HS/etag $WORK/h --http2 -H 'Accept-Encoding: gzip' -o /dev/null > /dev/null
+    is "$app h2: a compressed body's strong ETag is sent weak" "$(header $WORK/h etag)" 'W/"v1"'
     if [ "$app" = asgi ]; then
         is "asgi h2: pieces decode" "$(fetch $HS/pieces $WORK/h --http2 --compressed | digest)" "$EXPECTED"
     fi

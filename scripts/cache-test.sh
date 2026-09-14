@@ -201,6 +201,20 @@ fetch /etag --http1.1 -H 'If-Unmodified-Since: Sat, 05 Nov 1994 00:00:00 GMT'
 is "If-Unmodified-Since goes to the application" "$(calls GET /etag)" "3"
 fetch /etag --http1.1 -H 'If-Range: "v1"'
 is "and so does If-Range" "$(calls GET /etag)" "4"
+fetch /etag --http1.1 -H 'Accept-Encoding: gzip'
+like "a copy compressed for the client" "$(header content-encoding):$(header cache-status)" '^gzip:peregrine; hit'
+is "sends its strong ETag weak" "$(header etag)" 'W/"v1"'
+fetch /etag --http1.1 -H 'Accept-Encoding: gzip' -H 'If-None-Match: W/"v1"'
+is "which revalidates" "$(status)" "304"
+is "a 304 repeats the Vary its 200 has" "$(header vary)" "Accept-Encoding"
+is "and the ETag" "$(header etag)" 'W/"v1"'
+is "with no Content-Encoding" "$(header content-encoding)" ""
+fetch /etag --http1.1 -H 'If-None-Match: "v1"'
+is "a 304 for a client that takes the body plain says Vary too" "$(header vary)" "Accept-Encoding"
+is "with the strong ETag" "$(header etag)" '"v1"'
+fetch /etag --http2 -H 'Accept-Encoding: gzip' -H 'If-None-Match: W/"v1"'
+is "and so does a 304 over HTTP/2" "$(status):$(header vary):$(header etag)" '304:accept-encoding:W/"v1"'
+is "all without calling the application" "$(calls GET /etag)" "4"
 
 echo "requests that keep out of the cache"
 fetch "/fresh?auth" --http1.1 -H "Authorization: Bearer secret"

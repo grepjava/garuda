@@ -593,6 +593,8 @@ extension Worker {
         var seen: ResponseHeaderKind = []
         var declaredLength = -1
         var eligibility = CompressionEligibility()
+        var etags = HeldETags()
+        defer { etags.destroy() }
 
         if let headerList = pg_dict_get(message, Interned[.headers]),
            pg_is(headerList, Interned.none) == 0 {
@@ -644,6 +646,9 @@ extension Worker {
                     if containsTokenLowercased(value.base, value.count, "close") {
                         c.pointee.flags.remove(.keepAlive)
                     }
+                } else if config.compress && EntityTag.isName(name) {
+                    // Written once the coding is known; see EntityTag.
+                    if !etags.hold(value) { failure = "header contains a control character" }
                 } else if !HTTPResponseWriter.writeHeader(&c.pointee.write,
                                                           name: name, value: value) {
                     failure = "header contains a control character"
@@ -680,6 +685,11 @@ extension Worker {
             if coding != .identity {
                 c.pointee.write.write("Content-Encoding: ")
                 c.pointee.write.write(coding.token)
+                c.pointee.write.writeCRLF()
+            }
+            etags.forEach(coding: coding) { tag in
+                c.pointee.write.write("ETag: ")
+                c.pointee.write.write(tag)
                 c.pointee.write.writeCRLF()
             }
         }

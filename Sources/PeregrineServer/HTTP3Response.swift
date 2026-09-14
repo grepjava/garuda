@@ -47,6 +47,8 @@ extension Worker {
         var declaredLength = -1
         var failure: StaticString? = nil
         var eligibility = CompressionEligibility()
+        var etags = HeldETags()
+        defer { etags.destroy() }
 
         if let headerList = pg_dict_get(message, Interned[.headers]),
            pg_is(headerList, Interned.none) == 0 {
@@ -104,6 +106,9 @@ extension Worker {
                     let lowered = UnsafePointer(lower.readPointer)
                     if !HTTP2.validFieldName(lowered, name.count) {
                         failure = "header name is not a token"
+                    } else if config.compress && EntityTag.isName(name) {
+                        // Encoded once the coding is known; see EntityTag.
+                        _ = etags.hold(value)
                     } else {
                         h3.encoder.encode(name: lowered, nameLength: name.count,
                                           value: value.count > 0 ? value.base : emptyH3Byte,
@@ -140,6 +145,9 @@ extension Worker {
             }
             if coding != .identity {
                 encodeStaticH3(h3, "content-encoding", coding.token, into: &block)
+            }
+            etags.forEach(coding: coding) { tag in
+                encodeStaticH3(h3, "etag", tag.base, tag.count, into: &block)
             }
         }
         if declaredLength >= 0 && coding == .identity {

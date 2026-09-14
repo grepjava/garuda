@@ -628,7 +628,8 @@ and protocol are part of it as well.
 A copy is served over HTTP/1.1, HTTP/2 and HTTP/3 alike, and compressed for
 each client that accepts it when `--compress` is on. Every response gets its
 own `Date`, `X-Request-ID` and `Strict-Transport-Security`, plus `Age` and
-`Cache-Status: peregrine; hit; ttl=N`.
+`Cache-Status: peregrine; hit; ttl=N`. A `304` answered from a copy carries the
+`Vary` and `ETag` its `200` would have carried for that client.
 
 A copy is kept for what is left of the response's lifetime. A response that
 arrives with an `Age`, or with a `Date` in the past, has used some of its
@@ -751,7 +752,10 @@ a `Content-Encoding`, says `Cache-Control: no-transform`, is a `206`, answers
 a `HEAD`, or declares a `Content-Length` below `--compress-min-size` (1024 by
 default). A response that could have been compressed says
 `Vary: Accept-Encoding` whether it was or not, so that a cache in front does
-not hand one client's copy to the next.
+not hand one client's copy to the next. A strong `ETag` on a compressed
+response is sent weak, `W/"v1"` for `"v1"`: the tag named the application's
+bytes, and the compressed ones are different bytes. `If-None-Match` still
+matches the weak tag; `If-Match` and `If-Range` do not.
 
 A compressed response has no `Content-Length`; it is chunked on HTTP/1.1 and
 ended by the stream on HTTP/2 and HTTP/3. The length the application declared

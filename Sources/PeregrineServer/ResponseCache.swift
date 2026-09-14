@@ -290,26 +290,18 @@ extension Worker {
                                     head: ByteSpan(p, Int(headLength)),
                                     body: ByteSpan(p + Int(headLength), Int(bodyLength)),
                                     ageSeconds: Int(ageMs / 1000),
-                                    ttlSeconds: Int((ttlMs + 999) / 1000))
+                                    ttlSeconds: Int((ttlMs + 999) / 1000),
+                                    notModified: false)
             // A conditional request the stored 200 satisfies is answered 304,
-            // with the stored validators and caching headers and no body
-            // (RFC 9110 section 15.4.5).
-            var validators = ByteBuffer()
-            defer { validators.destroy() }
+            // with no body (RFC 9110 section 15.4.5). The entry keeps the whole
+            // 200 all the same: the Vary and the ETag a 304 repeats are the
+            // ones the 200 would have had, and both turn on how the 200 would
+            // be encoded for this client.
             if (ifNoneMatch != nil || ifModifiedSince != nil) && entry.status == 200
                 && CacheValidation.notModified(ifNoneMatch: ifNoneMatch,
                                                ifModifiedSince: ifModifiedSince,
                                                storedHead: entry.head.base, entry.head.count) {
-                CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
-                    if CacheValidation.keptInNotModified(name) {
-                        _ = CachedHead.append(name: name, value: value, into: &validators)
-                    }
-                }
-                entry.status = 304
-                entry.head = validators.readableBytes > 0
-                    ? ByteSpan(UnsafePointer(validators.readPointer), validators.readableBytes)
-                    : ByteSpan(p, 0)
-                entry.body = ByteSpan(p, 0)
+                entry.notModified = true
             }
             if c.pointee.isH3Stream {
                 serveCachedH3(slot, entry)
@@ -338,19 +330,45 @@ extension Worker {
         var body: ByteSpan
         var ageSeconds: Int
         var ttlSeconds: Int
+        /// Answered 304 in place of the stored 200.
+        var notModified: Bool
+
+        /// The status the response goes out with.
+        var sentStatus: Int { notModified ? 304 : status }
+
+        /// Whether a stored header goes out with the response: all of them,
+        /// or for a 304 the ones it repeats.
+        func sends(_ name: ByteSpan) -> Bool {
+            !notModified || CacheValidation.keptInNotModified(name)
+        }
+    }
+
+    /// Compression's view of the stored response, a 304's included.
+    private func cachedEligibility(_ entry: CachedEntry) -> CompressionEligibility {
+        var eligibility = CompressionEligibility()
+        if config.compress {
+            CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
+                eligibility.observe(name, value)
+            }
+        }
+        return eligibility
     }
 
     /// The body as this client gets it: compressed when the copy may be and
     /// the client accepts a coding, in which case `scratch` holds the result.
+    /// A 304 gets no body, and the coding the 200 would have had, which is
+    /// what decides the ETag it repeats.
     private func cachedPayload(_ slot: Int, _ entry: CachedEntry,
                                eligibility: CompressionEligibility,
                                into scratch: inout ByteBuffer) -> (ByteSpan, ContentCoding) {
         let c = table[slot]
-        guard config.compress else { return (entry.body, .identity) }
+        let nothing = ByteSpan(entry.body.base, 0)
+        guard config.compress else { return (entry.notModified ? nothing : entry.body, .identity) }
         let coding = eligibility.choose(offered: c.pointee.acceptedCoding, status: entry.status,
                                         bodyAllowed: !HTTPResponseWriter.statusForbidsBody(entry.status),
                                         declaredLength: entry.body.count,
                                         minimumLength: config.compressMinimumLength)
+        if entry.notModified { return (nothing, coding) }
         guard coding != .identity else { return (entry.body, .identity) }
         var encoder = ResponseEncoder()
         defer { encoder.destroy() }
@@ -373,29 +391,34 @@ extension Worker {
     private mutating func serveCachedH1(_ slot: Int, _ entry: CachedEntry) {
         let c = table[slot]
         dates.refresh()
-        var seen: ResponseHeaderKind = []
-        var eligibility = CompressionEligibility()
         let compress = config.compress
-        c.pointee.write.reserve(entry.head.count + 512)
-        HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: entry.status)
-        CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
-            seen.formUnion(HTTPResponseWriter.classify(name))
-            if compress { eligibility.observe(name, value) }
-            _ = HTTPResponseWriter.writeHeader(&c.pointee.write, name: name, value: value)
-        }
-
+        let eligibility = cachedEligibility(entry)
         var scratch = ByteBuffer()
         defer { scratch.destroy() }
         let (payload, coding) = cachedPayload(slot, entry, eligibility: eligibility, into: &scratch)
+
+        var seen: ResponseHeaderKind = []
+        var weak = ByteBuffer()
+        defer { weak.destroy() }
+        c.pointee.write.reserve(entry.head.count + 512)
+        HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: entry.sentStatus)
+        CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
+            guard entry.sends(name) else { return }
+            seen.formUnion(HTTPResponseWriter.classify(name))
+            let sent = EntityTag.isName(name)
+                ? EntityTag.sent(value, coding: coding, scratch: &weak) : value
+            _ = HTTPResponseWriter.writeHeader(&c.pointee.write, name: name, value: sent)
+        }
+        // A 304 says Vary exactly when its 200 would.
         if compress && eligibility.mayVary(status: entry.status) && !eligibility.varyCovered {
             c.pointee.write.write("Vary: Accept-Encoding\r\n")
         }
-        if coding != .identity {
+        if coding != .identity && !entry.notModified {
             c.pointee.write.write("Content-Encoding: ")
             c.pointee.write.write(coding.token)
             c.pointee.write.writeCRLF()
         }
-        let forbids = HTTPResponseWriter.statusForbidsBody(entry.status)
+        let forbids = HTTPResponseWriter.statusForbidsBody(entry.sentStatus)
         if !forbids { HTTPResponseWriter.writeContentLength(&c.pointee.write, payload.count) }
         if !seen.contains(.date) { HTTPResponseWriter.writeDate(&c.pointee.write, dates) }
         if !seen.contains(.server) { c.pointee.write.write("Server: peregrine\r\n") }
@@ -417,7 +440,7 @@ extension Worker {
         if !forbids && !c.pointee.flags.contains(.suppressBody) && payload.count > 0 {
             c.pointee.write.write(payload.base, payload.count)
         }
-        logAccess(slot, status: entry.status)
+        logAccess(slot, status: entry.sentStatus)
         c.pointee.state = .writing
         // As for a health probe: `flush` finishes the response once the
         // buffer drains, and a keep-alive connection reads its next head.
@@ -432,29 +455,35 @@ extension Worker {
             return
         }
         dates.refresh()
-        var block = ByteBuffer()
-        defer { block.destroy() }
-        var seen: ResponseHeaderKind = []
-        var eligibility = CompressionEligibility()
         let compress = config.compress
-        h2.encoder.encodeStatus(entry.status, into: &block)
-        CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
-            seen.formUnion(HTTPResponseWriter.classify(name))
-            if compress { eligibility.observe(name, value) }
-            // Stored lowercase, and checked when the application first sent it.
-            h2.encoder.encode(name: name.base, nameLength: name.count,
-                              value: value.count > 0 ? value.base : emptyH2Byte,
-                              valueLength: value.count, into: &block)
-        }
-
+        let eligibility = cachedEligibility(entry)
         var scratch = ByteBuffer()
         defer { scratch.destroy() }
         let (payload, coding) = cachedPayload(slot, entry, eligibility: eligibility, into: &scratch)
+
+        var block = ByteBuffer()
+        defer { block.destroy() }
+        var seen: ResponseHeaderKind = []
+        var weak = ByteBuffer()
+        defer { weak.destroy() }
+        h2.encoder.encodeStatus(entry.sentStatus, into: &block)
+        CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
+            guard entry.sends(name) else { return }
+            seen.formUnion(HTTPResponseWriter.classify(name))
+            let sent = EntityTag.isName(name)
+                ? EntityTag.sent(value, coding: coding, scratch: &weak) : value
+            // Stored lowercase, and checked when the application first sent it.
+            h2.encoder.encode(name: name.base, nameLength: name.count,
+                              value: sent.count > 0 ? sent.base : emptyH2Byte,
+                              valueLength: sent.count, into: &block)
+        }
         if compress && eligibility.mayVary(status: entry.status) && !eligibility.varyCovered {
             encodeStatic(h2, "vary", "accept-encoding", into: &block)
         }
-        if coding != .identity { encodeStatic(h2, "content-encoding", coding.token, into: &block) }
-        let forbids = HTTPResponseWriter.statusForbidsBody(entry.status)
+        if coding != .identity && !entry.notModified {
+            encodeStatic(h2, "content-encoding", coding.token, into: &block)
+        }
+        let forbids = HTTPResponseWriter.statusForbidsBody(entry.sentStatus)
         var digits = ByteBuffer()
         defer { digits.destroy() }
         if !forbids {
@@ -487,7 +516,7 @@ extension Worker {
         let sendBody = !forbids && !c.pointee.flags.contains(.suppressBody) && payload.count > 0
         writeHeaderBlock(slot, h2, block: &block, endStream: !sendBody)
         c.pointee.flags.insert(.responseStarted)
-        logAccess(slot, status: entry.status)
+        logAccess(slot, status: entry.sentStatus)
         if !sendBody {
             c.pointee.flags.insert(.responseComplete)
             _ = flush(parent)
@@ -509,29 +538,35 @@ extension Worker {
             return
         }
         dates.refresh()
-        var block = ByteBuffer()
-        defer { block.destroy() }
-        var seen: ResponseHeaderKind = []
-        var eligibility = CompressionEligibility()
         let compress = config.compress
-        h3.encoder.begin(into: &block)
-        h3.encoder.encodeStatus(entry.status, into: &block)
-        CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
-            seen.formUnion(HTTPResponseWriter.classify(name))
-            if compress { eligibility.observe(name, value) }
-            h3.encoder.encode(name: name.base, nameLength: name.count,
-                              value: value.count > 0 ? value.base : emptyH3Byte,
-                              valueLength: value.count, into: &block)
-        }
-
+        let eligibility = cachedEligibility(entry)
         var scratch = ByteBuffer()
         defer { scratch.destroy() }
         let (payload, coding) = cachedPayload(slot, entry, eligibility: eligibility, into: &scratch)
+
+        var block = ByteBuffer()
+        defer { block.destroy() }
+        var seen: ResponseHeaderKind = []
+        var weak = ByteBuffer()
+        defer { weak.destroy() }
+        h3.encoder.begin(into: &block)
+        h3.encoder.encodeStatus(entry.sentStatus, into: &block)
+        CachedHead.forEach(entry.head.base, entry.head.count) { name, value in
+            guard entry.sends(name) else { return }
+            seen.formUnion(HTTPResponseWriter.classify(name))
+            let sent = EntityTag.isName(name)
+                ? EntityTag.sent(value, coding: coding, scratch: &weak) : value
+            h3.encoder.encode(name: name.base, nameLength: name.count,
+                              value: sent.count > 0 ? sent.base : emptyH3Byte,
+                              valueLength: sent.count, into: &block)
+        }
         if compress && eligibility.mayVary(status: entry.status) && !eligibility.varyCovered {
             encodeStaticH3(h3, "vary", "accept-encoding", into: &block)
         }
-        if coding != .identity { encodeStaticH3(h3, "content-encoding", coding.token, into: &block) }
-        let forbids = HTTPResponseWriter.statusForbidsBody(entry.status)
+        if coding != .identity && !entry.notModified {
+            encodeStaticH3(h3, "content-encoding", coding.token, into: &block)
+        }
+        let forbids = HTTPResponseWriter.statusForbidsBody(entry.sentStatus)
         var digits = ByteBuffer()
         defer { digits.destroy() }
         if !forbids {
@@ -560,7 +595,7 @@ extension Worker {
 
         writeH3HeaderBlock(slot, h3, block: &block)
         c.pointee.flags.insert(.responseStarted)
-        logAccess(slot, status: entry.status)
+        logAccess(slot, status: entry.sentStatus)
         let sendBody = !forbids && !c.pointee.flags.contains(.suppressBody) && payload.count > 0
         if !sendBody {
             // Finished and retired here, inside dispatch: see endEmptyH3Response.
