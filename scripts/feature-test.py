@@ -1988,6 +1988,26 @@ def test_free_threaded():
     check("--lifespan-scope process runs it once for the whole process",
           count == 1, "ran %d times" % count)
 
+    # Per-worker startups take turns, and a worker waiting for its turn must not
+    # hold the GIL while it waits: with the GIL back on -- PYTHON_GIL=1 here, an
+    # extension that is not free-threading-safe in the wild -- the worker inside
+    # `startup` needs it back after every await, and would never get it.
+    port = free_port()
+    server = Server("--workers", "2", "--free-threaded", port=port,
+                    env={"PYTHON_GIL": "1", "PEREGRINE_STARTUP_DELAY": "0.1"})
+    try:
+        code = 0
+        deadline = time.monotonic() + 10
+        while code != 200 and time.monotonic() < deadline:
+            try:
+                code = server.get("/", timeout=2)[0]
+            except Exception:                               # noqa: BLE001
+                time.sleep(0.1)
+        is_("start-up with the GIL enabled and an awaiting lifespan answers", code, 200)
+    finally:
+        stopped, _elapsed = server.stop(timeout=10)
+    check("and stops without being killed", stopped is not None, "had to be SIGKILLed")
+
     # The point of the per-worker default: what `startup` binds to its loop is
     # awaited on that same loop. /looptest asks the application to await a Future
     # its lifespan created, which raises "attached to a different loop" when the

@@ -28,6 +28,11 @@ STUBBORN_LIFESPAN = os.environ.get("PEREGRINE_STUBBORN_LIFESPAN")
 # once for the process under --lifespan-scope process.
 STARTUP_COUNTER = os.environ.get("PEREGRINE_STARTUP_COUNTER")
 
+# Seconds `startup` spends awaiting, the way one opening a pool would. Under
+# --free-threaded that await is where a worker lets go of the GIL and later
+# needs it back.
+STARTUP_DELAY = os.environ.get("PEREGRINE_STARTUP_DELAY")
+
 
 async def app(scope, receive, send):
     global startup_ran, late_receive, was_cancelled
@@ -46,6 +51,8 @@ async def app(scope, receive, send):
                 if STARTUP_COUNTER:
                     with open(STARTUP_COUNTER, "a") as fh:
                         fh.write("%d\n" % os.getpid())
+                if STARTUP_DELAY:
+                    await asyncio.sleep(float(STARTUP_DELAY))
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 if SHUTDOWN_MARKER:

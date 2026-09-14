@@ -103,8 +103,16 @@ final class WorkerGroup {
     /// start-up code has never had to be thread-safe -- it ran once per process
     /// everywhere else -- so it is serialised here. This is start-up; the
     /// serialisation costs nothing that matters.
+    ///
+    /// The wait for the mutex happens detached from the interpreter. The worker
+    /// inside `startup` releases the GIL whenever its loop waits on I/O and has
+    /// to take it back to carry on; if the GIL has been turned back on and the
+    /// worker blocked here still held it, the two would wait on each other for
+    /// ever.
     func withStartupLock<T>(_ body: () -> T) -> T {
+        let saved = pg_gil_save()
         pg_mutex_lock(startupMutex)
+        pg_gil_restore(saved)
         defer { pg_mutex_unlock(startupMutex) }
         return body()
     }

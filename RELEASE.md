@@ -48,6 +48,11 @@ version reached PyPI, in UTC.
   and a 304's `Content-Length` is no longer rewritten to 0: the application's
   is kept, or none is sent. This applies with or without `--cache-size`, to
   ASGI and WSGI over HTTP/1.1, HTTP/2 and HTTP/3.
+- `--free-threaded` with more than one worker no longer hangs at start-up when
+  the GIL is enabled (`PYTHON_GIL=1`, or an extension module that turns it back
+  on) and the application's lifespan `startup` awaits anything. A worker waiting
+  its turn to run `startup` held the GIL, which the worker already inside
+  `startup` needed back to finish.
 
 ---
 
