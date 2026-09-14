@@ -109,13 +109,7 @@ public struct Worker {
     /// to by finishing a response and dispatching the request pipelined
     /// behind it. The walk picks those up itself rather than starting another.
     var runningDeferredFlushes = false
-    /// How far that walk has got. Entries before it are done with, which is
-    /// what lets a queue the walk keeps adding to be compacted instead of
-    /// overflowing.
-    var deferredFlushWalked = 0
-    /// ASGI requests this event batch has started eagerly. Past `flushBatch`
-    /// the rest are scheduled instead.
-    var eagerStartsThisBatch = 0
+
     public var running = true
     /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
     public var draining = false
@@ -237,7 +231,6 @@ public struct Worker {
 
     /// Dispatches `n` events already collected by the poller.
     public mutating func processEvents(_ n: Int) {
-        eagerStartsThisBatch = 0
         var i = 0
         while i < n {
             let (token, mask) = poller.event(i)
@@ -873,23 +866,17 @@ public struct Worker {
 
     // MARK: - Writing
 
-    /// How many responses finished inside one event batch wait for its end
+    /// How many finished WSGI responses wait for the end of an event batch
     /// before going out anyway. Holding a response costs its client the time
     /// the ones after it take to run, so the batch is kept small.
-    ///
-    /// WSGI applications always run inside the batch, so their responses go
-    /// out every `flushBatch`. ASGI ones run inside it when their task starts
-    /// eagerly, and uncapped that is the whole connection set, with the last
-    /// of 64 responses waiting for the 63 applications before it; so only the
-    /// first `flushBatch` of a batch start eagerly.
-    static let flushBatch = 16
+    static let wsgiFlushBatch = 16
 
     /// Sends a finished HTTP/1 response together with the others finishing
     /// around it, rather than on its own.
     ///
     /// ASGI responses go out at the end of the event-loop iteration, which is
     /// what uvloop does with transport writes. WSGI responses go out at the end
-    /// of the event batch, or every `flushBatch` of them. It matters more
+    /// of the event batch, or every `wsgiFlushBatch` of them. It matters more
     /// than it looks. A write wakes whoever reads the other end. Written one at
     /// a time between applications taking tens of microseconds each, the
     /// readers have gone back to sleep before every write, and every write pays
@@ -909,18 +896,9 @@ public struct Worker {
             return
         }
         let scheduled = appProtocol == .asgi ? scheduleDeferredFlush() : true
-        if !scheduled || c.pointee.write.readableBytes >= config.readBufferSize {
-            _ = flush(slot)
-            return
-        }
-        // A walk that keeps finding work -- each response in a pipeline
-        // dispatching the next request, whose application runs and queues
-        // again -- fills the queue with entries it has already passed. Those
-        // are dropped first. Flushing here instead would finish the response
-        // and dispatch the next request from inside this one, as deep as the
-        // pipeline goes.
-        if deferredFlushCount >= table.capacity { compactDeferredFlushes() }
-        if deferredFlushCount >= table.capacity {
+        if !scheduled
+            || c.pointee.write.readableBytes >= config.readBufferSize
+            || deferredFlushCount >= table.capacity {
             _ = flush(slot)
             return
         }
@@ -928,7 +906,7 @@ public struct Worker {
                                                            generation: c.pointee.generation)
         deferredFlushCount += 1
         c.pointee.flags.insert(.flushQueued)
-        if appProtocol == .wsgi && deferredFlushCount >= Worker.flushBatch
+        if appProtocol == .wsgi && deferredFlushCount >= Worker.wsgiFlushBatch
             && !runningDeferredFlushes {
             runDeferredFlushes()
         }
@@ -940,10 +918,10 @@ public struct Worker {
         runningDeferredFlushes = true
         // Finishing a response can dispatch the request pipelined behind it,
         // which can queue again, so the count is re-read on every pass.
-        deferredFlushWalked = 0
-        while deferredFlushWalked < deferredFlushCount {
-            let token = deferredFlush[deferredFlushWalked]
-            deferredFlushWalked += 1
+        var i = 0
+        while i < deferredFlushCount {
+            let token = deferredFlush[i]
+            i += 1
             let slot = PollToken.slot(token)
             let c = table[slot]
             if c.pointee.state == .free || c.pointee.generation != PollToken.generation(token)
@@ -954,26 +932,8 @@ public struct Worker {
             _ = flush(slot)
         }
         deferredFlushCount = 0
-        deferredFlushWalked = 0
         deferredFlushScheduled = false
         runningDeferredFlushes = false
-    }
-
-    /// Drops the entries a running walk has already passed. What is left is
-    /// one entry per slot still queued, plus any for a connection that closed
-    /// since it was queued; `flushSoon` flushes directly on the rare occasion
-    /// that still does not fit.
-    mutating func compactDeferredFlushes() {
-        let walked = deferredFlushWalked
-        if walked == 0 { return }
-        let pending = deferredFlushCount - walked
-        var i = 0
-        while i < pending {
-            deferredFlush[i] = deferredFlush[walked + i]
-            i += 1
-        }
-        deferredFlushCount = pending
-        deferredFlushWalked = 0
     }
 
     /// Pushes buffered bytes to the socket. Returns false if the connection
