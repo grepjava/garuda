@@ -10,7 +10,7 @@ module that the `peregrine` command loads into the interpreter you installed it
 into. That decides everything unusual about installing it:
 
 * **A wheel is tagged for exactly one interpreter and platform**
-  (`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`). The server is
+  (`cp312-cp312-manylinux_2_35_x86_64`, `cp314-cp314t-manylinux_2_35_aarch64`). The server is
   compiled against one CPython ABI, so `pip` will refuse it anywhere else,
   which is the correct answer rather than a limitation.
 * **When a wheel matches, Swift is not required.** The Swift runtime travels
@@ -81,10 +81,13 @@ pip install peregrine-server
 
 If PyPI has a wheel for this interpreter and platform, `pip` installs it in
 seconds and Swift is not required. Otherwise it falls back to the sdist, the
-Swift build runs, and that takes a few minutes. The first published wheels are
-tagged `manylinux_2_N` for the builder's glibc (Ubuntu 24.04 is `2_39`) —
-recent Linux, not every Linux. Older distros compile from the sdist. When
-it finishes:
+Swift build runs, and that takes a few minutes.
+
+The wheels cover CPython 3.11, 3.12, 3.13, 3.14 and free-threaded 3.14t, on
+Linux x86_64 and aarch64 with glibc 2.35 or newer (`manylinux_2_35`): Debian 12,
+Ubuntu 22.04, what came after them, Fedora, and the official `python:*-slim`
+images. Older glibc, Alpine's musl and macOS compile from the sdist. When it
+finishes:
 
 ```bash
 $ peregrine --version

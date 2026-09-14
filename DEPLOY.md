@@ -23,14 +23,17 @@ Two kinds of file, always the same version as `pyproject.toml`:
 
 | Artifact | Who needs it |
 |---|---|
-| **Wheels** (`cp312-cp312-manylinux_2_39_x86_64`, `cp314-cp314t-...`) | anyone whose interpreter, ABI and glibc match; Swift is not required |
+| **Wheels** (`cp312-cp312-manylinux_2_35_x86_64`, `cp314-cp314t-manylinux_2_35_aarch64`, ...) | anyone whose interpreter, ABI, architecture and glibc match; Swift is not required |
 | **sdist** (`peregrine_server-X.Y.Z.tar.gz`) | everyone else; `pip` compiles it against the installing interpreter |
 
 A wheel carries `peregrine._native`, the server as an extension module, with
-the Swift runtime vendored beside it; Python is the user's interpreter. The platform tag is `manylinux_2_N` for the builder's glibc
-(Ubuntu 24.04 is `2_39`). PyPI rejects `linux_*`; it will not take a wheel
-that still has that tag. Older glibc compiles from the sdist. macOS wheels
-are not built yet.
+the Swift runtime vendored beside it; Python is the user's interpreter. The platform tag is `manylinux_2_N` for the builder's glibc.
+The wheels are built on Ubuntu 22.04, which is `2_35`: that covers Debian 12
+and the `python:*-slim` images, which a 24.04 build (`2_39`) did not. PyPI
+rejects `linux_*`; it will not take a wheel that still has that tag. Older
+glibc, musl and macOS compile from the sdist. macOS wheels would have to
+vendor OpenSSL, which makes every OpenSSL fix a Peregrine release, so they are
+not built.
 
 The GitHub Actions publish job uploads **wheels only**. The script below
 uploads the sdist as well. Use the script.
@@ -84,8 +87,11 @@ gh workflow run CI --ref main
 gh run watch
 ```
 
-Wheels is five jobs: 3.11, 3.12, 3.13, 3.14, 3.14t on Ubuntu 24.04. Each
-artifact is one wheel. Leave `publish` off — that input skips the sdist.
+Wheels is ten build jobs: 3.11, 3.12, 3.13, 3.14 and 3.14t on Ubuntu 22.04,
+for x86_64 and for aarch64. Each artifact is one wheel. Eight `slim` jobs then
+install each GIL wheel into `python:X.Y-slim-bookworm` with nothing but pip and
+serve a request from it. A release is ten wheels and the sdist, eleven files.
+Leave `publish` off — that input skips the sdist.
 
 The wheels come before the tag. A build that fails then needs another commit,
 not a tag moved after GitHub has already announced it.

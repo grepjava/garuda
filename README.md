@@ -3,9 +3,45 @@
 </p>
 
 <p align="center">
-  A Python <b>ASGI and WSGI</b> server written in Swift 6.<br>
+  <b>A drop-in ASGI and WSGI server for Python, written in Swift.</b><br>
+  FastAPI at 1.4–1.6× and Flask at 2.3–2.5× the throughput of uvicorn, on one worker.<br>
   HTTP/1.1, HTTP/2, HTTP/3, WebSocket and WebTransport.
 </p>
+
+<p align="center">
+  <a href="https://pypi.org/project/peregrine-server/"><img src="https://img.shields.io/pypi/v/peregrine-server" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/peregrine-server/"><img src="https://img.shields.io/pypi/pyversions/peregrine-server" alt="Python versions"></a>
+  <a href="https://github.com/grepjava/peregrine/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/peregrine-server" alt="MIT license"></a>
+</p>
+
+---
+
+```bash
+pip install peregrine-server
+peregrine --host 0.0.0.0 --workers 0 main:app    # where you ran: uvicorn main:app
+```
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/benchmark-256.png" alt="Requests per second on one worker at 256 connections. FastAPI: peregrine 24,117, granian 15,574, uvicorn 15,544, fastpysgi 10,843. Flask: peregrine 14,992, fastpysgi 10,202, uvicorn 6,545, granian 6,152." width="760">
+</p>
+
+- **Faster with the framework you already use.** The same FastAPI application
+  answers 24,100 requests a second on one worker against uvicorn's 15,500, and
+  the same Flask application 15,000 against 6,500.
+  [How that was measured.](https://github.com/grepjava/peregrine#numbers)
+- **Nothing to change in the application.** ASGI 3 and PEP 3333 in full, for
+  FastAPI, Starlette, Django and Flask, with lifespan and WebSockets. The
+  protocol is detected, and the options are the ones you know:
+  [coming from uvicorn or gunicorn](https://github.com/grepjava/peregrine#coming-from-uvicorn-or-gunicorn).
+- **What usually needs a proxy in front, built in.** HTTP/2 and HTTP/3, TLS
+  with Let's Encrypt certificates, static files with `sendfile`, compression,
+  rate limiting, a response cache, Prometheus metrics, and a `SIGHUP` that
+  replaces every worker without refusing a connection.
+- **Free-threaded Python.** On CPython 3.14t, `--free-threaded` runs the
+  workers as threads of one process: the throughput of processes at a third
+  of the memory.
+- **Wheels for Linux x86_64 and aarch64**, CPython 3.11 to 3.14 and 3.14t,
+  including the official `python:*-slim` images. No Swift toolchain needed.
 
 ---
 
@@ -42,52 +78,6 @@ and how that differs from what the site publishes. [DEPLOY.md](https://github.co
 
 ---
 
-## Why Swift
-
-The interesting question is not "why not C" but "why not Python, or Rust, or
-Go", since all four can host an application server and three of them are more
-usual choices for one.
-
-**It compiles to a native binary with no runtime to schedule around.** A server
-is a loop over a poller; anything that inserts its own scheduler between the
-loop and the syscall — a garbage collector that stops the world, a green-thread
-runtime that decides when a read happens — buys concurrency this design does
-not need and costs latency it cannot recover. Swift has neither. Reference
-counting is deterministic, and where it would cost anything it can be removed,
-which is a large part of [what the server does](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md#minimising-arc).
-
-**It talks to C without a binding layer.** Embedding CPython means calling a C
-API constantly: `PyDict_SetItem`, `PyObject_Vectorcall`, `Py_DECREF`, a few
-hundred times per request. In Swift those are direct calls through a thin shim
-for the parts that are macros. There is no FFI marshalling, no
-`unsafe` boundary to justify per call site, and no second object model to keep
-in step with CPython's — a `PyObject *` is an `OpaquePointer`, and a
-`~Copyable` struct makes the compiler prove the decref happens exactly once.
-The same is true of OpenSSL, epoll and `recvmmsg`.
-
-**It is memory-safe by default and unsafe on request.** Almost all of this
-server is ordinary safe Swift: bounds-checked, ownership-checked, no null. The
-hot path opts out deliberately and locally — raw pointers into a read buffer, a
-slab of connection structs — and those opt-outs are visible in the source
-because they have to be spelled `Unsafe`. That is a better default for a
-network-facing parser than a language where everything is unsafe and discipline
-is the only guard, and a better ceiling than one where the escape hatch is
-awkward enough that you write the slow thing instead.
-
-**Generics and value types make the fast version the readable one.** `ByteBuffer`
-is a struct passed in registers; the HTTP parser returns offsets into it; the
-QUIC packet builder writes through a `~Copyable` writer that cannot be aliased.
-None of that needs a comment explaining what the pointer arithmetic is for,
-because there is no pointer arithmetic in it.
-
-The honest costs: the ecosystem for this kind of work is small, so the QUIC
-stack, the TLS 1.3 handshake, HPACK and QPACK are all written here rather than
-pulled in; Linux tooling is thinner than C's; and Foundation is avoided
-entirely because it would bring back the allocation behaviour the design exists
-to remove.
-
----
-
 ## Numbers
 
 FastAPI and Flask, one worker each, on Peregrine, uvicorn, granian and
@@ -120,8 +110,10 @@ linked interpreter every other server here runs in.
 
 These are not the site's figures and cannot be set beside them. The site runs
 every server with a worker per CPU on 16 CPUs, under Python 3.14, with gunicorn
-for Flask and fastpysgi on a raw application with no framework; Peregrine is
-not listed there. What these tables show is how the servers compare with each
+for Flask and fastpysgi on a raw application with no framework. Peregrine was
+[added to that suite](https://github.com/the-benchmarker/web-frameworks/pull/9776)
+in September 2026, and its figures there come from that hardware and those
+settings, not these. What these tables show is how the servers compare with each
 other on one worker of this machine.
 
 Method, latencies, where this differs from the published results, and how to
@@ -136,6 +128,39 @@ The server is about 1.7 MB of text and data as the extension module (1.3 MB as
 the executable, which needs no position-independent code), and a live connection costs
 one 16 KiB pooled read buffer plus a slot of about 200 bytes. Nearly all of a
 worker's resident memory is CPython and the application.
+
+---
+
+## Coming from uvicorn or gunicorn
+
+Point Peregrine at the same application object. The protocol is detected, so
+there is no worker class to name, and most options keep their names. What
+differs is mostly units, because Peregrine's timeouts are in milliseconds:
+
+| uvicorn | gunicorn | peregrine |
+|---|---|---|
+| `uvicorn main:app` | `gunicorn -k uvicorn.workers.UvicornWorker main:app` | `peregrine main:app` |
+| | `gunicorn myproject.wsgi` | `peregrine myproject.wsgi:application` |
+| `--host 0.0.0.0 --port 8000` | `-b 0.0.0.0:8000` | `--host 0.0.0.0 --port 8000` |
+| `--uds /run/app.sock` | `-b unix:/run/app.sock` | `--unix /run/app.sock` |
+| `--workers 4` | `-w 4` | `--workers 4`, or `0` for one per CPU |
+| | `--threads 8` | `--wsgi-threads 8` |
+| `--reload` | `--reload` | `--reload` |
+| `--ssl-certfile c.pem --ssl-keyfile k.pem` | `--certfile c.pem --keyfile k.pem` | `--tls-cert c.pem --tls-key k.pem` |
+| `--forwarded-allow-ips '*'` | `--forwarded-allow-ips '*'` | `--forwarded-allow-ips '*'` |
+| `--root-path /api` | | `--root-path /api` |
+| `--timeout-keep-alive 5` | `--keep-alive 5` | `--keep-alive 5000` |
+| `--timeout-graceful-shutdown 30` | `--graceful-timeout 30` | `--graceful-timeout 30000` |
+| `--lifespan off` | | `--no-lifespan` |
+| `--ws-max-size 16777216` | | `--ws-max-message 16777216` |
+| `--ws-ping-interval 20` | | `--ws-ping-interval 20000` |
+| `--factory` | | `--factory` |
+| access log on by default | `--access-logfile -` | `--access-log` |
+| `--log-level info` | `--log-level info` | `--log-level info` |
+
+uvloop is used when it is installed (`pip install "peregrine-server[uvloop]"`),
+as with uvicorn. `SIGTERM` drains the workers, and `SIGHUP` replaces them one
+at a time without refusing a connection.
 
 ---
 
@@ -221,12 +246,24 @@ it. [Details.](https://github.com/grepjava/peregrine/blob/main/CONFIG.md#free-th
 
 ## Installing
 
-A wheel is tagged for one CPython and one platform. When one matches, `pip`
-installs it and Swift is not required. When none does, `pip` compiles the
-sdist against the interpreter you are installing into:
+A wheel is tagged for one CPython and one platform. PyPI has them for CPython
+3.11 to 3.14 and free-threaded 3.14t, on Linux x86_64 and aarch64 with glibc
+2.35 or newer: Debian 12, Ubuntu 22.04, what came after them, and the official
+`python:*-slim` images. When one matches, `pip` installs it and Swift is not
+required. When none does, as on macOS, Alpine or an older distribution, `pip`
+compiles the sdist against the interpreter you are installing into:
 
 ```bash
 pip install peregrine-server
+```
+
+In a container nothing else is needed:
+
+```dockerfile
+FROM python:3.13-slim
+RUN pip install --no-cache-dir "peregrine-server[uvloop]" fastapi
+COPY main.py .
+CMD ["peregrine", "--host", "0.0.0.0", "--workers", "0", "main:app"]
 ```
 
 ```bash
@@ -288,6 +325,8 @@ peregrine [options] MODULE:ATTRIBUTE
                            is the default and the rest are chosen by SNI
   --tls-key PATH           PEM private key for the preceding --tls-cert
   --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
+  --ktls                   let the kernel encrypt TLS, so --static-dir files
+                           go out with sendfile over HTTPS too
   --no-http2               refuse HTTP/2 and answer HTTP/1.1 only
   --http2-only             serve only HTTP/2 (h2c), with no HTTP/1 fallback
   --http3                  also serve HTTP/3 over QUIC (needs TLS)
@@ -306,11 +345,18 @@ peregrine [options] MODULE:ATTRIBUTE
   --acme-email ADDR        contact address for the ACME account
   --acme-cache DIR         account key and certificate (default ./acme)
   --acme-staging           use Let's Encrypt's staging CA
+  --acme-directory URL     use another ACME CA
+  --acme-ca-bundle PATH    roots to trust for the CA's own HTTPS
   --redirect-http PORT     answer plain HTTP on PORT with a redirect to https
   --hsts SECONDS           Strict-Transport-Security on every TLS response
   --rate-limit RATE        429 past RATE requests per client (100/s, 600/m),
                            counted across all workers
   --rate-limit-burst N     requests allowed at once before RATE applies
+  --cache-size MIB         answer repeated GETs from a cache shared by every
+                           worker, for responses the application marks fresh
+                           (read CONFIG.md first)
+  --cache-max-object KIB   largest body the cache keeps (default 1024)
+  --cache-ttl-max SECONDS  longest a response is kept (default 300)
   --compress               compress text-like application responses with
                            br, zstd or gzip (see CONFIG.md about BREACH)
   --compress-min-size N    leave bodies declared smaller than N alone (1024)
@@ -319,6 +365,7 @@ peregrine [options] MODULE:ATTRIBUTE
   --request-start-header   hand the app X-Request-Start for queue-time APMs
   --request-id             an X-Request-ID per request, for the app, the
                            response and the access log
+  --trace-context          log a request's W3C trace and parent span IDs
   --health-check-path P    answer P with 200 in the server, without calling
                            the application (e.g. /healthz)
   --access-log             log one line per request
@@ -326,6 +373,7 @@ peregrine [options] MODULE:ATTRIBUTE
   --metrics-port PORT      serve Prometheus metrics on this port
   --metrics-host HOST      what the metrics port binds (default --host)
   --log-level LEVEL        debug, info, warning, error, silent
+  --version                print the version and exit
 ```
 
 The protocol is detected by inspecting the callable: a coroutine function, or
@@ -389,6 +437,52 @@ HTTP/2 and HTTP/3, and WebSocket and WebTransport, which PEP 3333 cannot
 express, are refused with a 501.
 [How to configure both, protocol by protocol.](https://github.com/grepjava/peregrine/blob/main/CONFIG.md)
 [What the router does.](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#frameworks)
+
+---
+
+## Why Swift
+
+The interesting question is not "why not C" but "why not Python, or Rust, or
+Go", since all four can host an application server and three of them are more
+usual choices for one.
+
+**It compiles to a native binary with no runtime to schedule around.** A server
+is a loop over a poller; anything that inserts its own scheduler between the
+loop and the syscall — a garbage collector that stops the world, a green-thread
+runtime that decides when a read happens — buys concurrency this design does
+not need and costs latency it cannot recover. Swift has neither. Reference
+counting is deterministic, and where it would cost anything it can be removed,
+which is a large part of [what the server does](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md#minimising-arc).
+
+**It talks to C without a binding layer.** Embedding CPython means calling a C
+API constantly: `PyDict_SetItem`, `PyObject_Vectorcall`, `Py_DECREF`, a few
+hundred times per request. In Swift those are direct calls through a thin shim
+for the parts that are macros. There is no FFI marshalling, no
+`unsafe` boundary to justify per call site, and no second object model to keep
+in step with CPython's — a `PyObject *` is an `OpaquePointer`, and a
+`~Copyable` struct makes the compiler prove the decref happens exactly once.
+The same is true of OpenSSL, epoll and `recvmmsg`.
+
+**It is memory-safe by default and unsafe on request.** Almost all of this
+server is ordinary safe Swift: bounds-checked, ownership-checked, no null. The
+hot path opts out deliberately and locally — raw pointers into a read buffer, a
+slab of connection structs — and those opt-outs are visible in the source
+because they have to be spelled `Unsafe`. That is a better default for a
+network-facing parser than a language where everything is unsafe and discipline
+is the only guard, and a better ceiling than one where the escape hatch is
+awkward enough that you write the slow thing instead.
+
+**Generics and value types make the fast version the readable one.** `ByteBuffer`
+is a struct passed in registers; the HTTP parser returns offsets into it; the
+QUIC packet builder writes through a `~Copyable` writer that cannot be aliased.
+None of that needs a comment explaining what the pointer arithmetic is for,
+because there is no pointer arithmetic in it.
+
+The honest costs: the ecosystem for this kind of work is small, so the QUIC
+stack, the TLS 1.3 handshake, HPACK and QPACK are all written here rather than
+pulled in; Linux tooling is thinner than C's; and Foundation is avoided
+entirely because it would bring back the allocation behaviour the design exists
+to remove.
 
 ---
 
@@ -473,10 +567,11 @@ schedule, the header protection and the sample packets are the RFC's own bytes.
   advertises extended `CONNECT` because that is how WebTransport arrives;
   `webtransport` is the only `:protocol` served. HTTP/2 does not advertise it.
 - **Windows.** The I/O layer is epoll/kqueue.
-- **Tracing.** There are Prometheus metrics on `--metrics-port` and a JSON
-  access log, but no OpenTelemetry spans and nothing that follows a request
-  into the application. An ASGI middleware is the right place for that, and
-  there are good ones.
+- **Spans.** `--trace-context` puts an incoming W3C trace on the access-log
+  line and hands the header to the application untouched, and there are
+  Prometheus metrics on `--metrics-port`, but the server records no
+  OpenTelemetry spans of its own. The application's instrumentation is the
+  right place for those, and there are good ones.
 
 By default a synchronous WSGI application occupies its worker for the duration
 of the call. Scale with `--workers`, and with `--wsgi-threads` when the

@@ -20,6 +20,24 @@ version reached PyPI, in UTC.
 
 ## Unreleased
 
+### Changed
+
+- Wheels are built for Linux aarch64 as well as x86_64, and tagged
+  `manylinux_2_35` rather than `manylinux_2_39`. `pip install` now takes a
+  wheel instead of compiling on Debian 12, Ubuntu 22.04, the official
+  `python:*-slim` images and ARM machines. Before a release, each wheel is
+  installed into `python:*-slim-bookworm` and has to serve a request.
+
+### Documentation
+
+- The README opens with the results, a chart of them and a table translating
+  uvicorn and gunicorn options. Its usage block lists `--ktls`,
+  `--acme-directory`, `--acme-ca-bundle`, `--cache-size`,
+  `--cache-max-object`, `--cache-ttl-max`, `--trace-context` and `--version`,
+  which it had been missing.
+- A LICENSE file, for the MIT license `pyproject.toml` already declared, and
+  PyPI classifiers, keywords and project links.
+
 ---
 
 ## 1.1.3 — 2026-09-14
