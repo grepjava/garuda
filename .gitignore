@@ -30,3 +30,6 @@ pgfuzz-*.bin
 # A local knowledge-graph index of this tree, rebuilt from the source it
 # describes. Machine-written, large, and stale the moment anything is edited.
 graphify-out/
+# The rule and workflow that point an editor's agent at that index.
+.agents/rules/graphify.md
+.agents/workflows/graphify.md
