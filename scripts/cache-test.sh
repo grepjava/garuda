@@ -129,6 +129,48 @@ curl -sk -o /dev/null -X POST "$S/fresh?post"
 curl -sk -o /dev/null -X POST "$S/fresh?post"
 is "a POST is never answered from the cache" "$(calls POST /fresh?post)" "2"
 
+echo "a change to a URL retires what was cached for it"
+fetch /item --http1.1
+fetch /item --http1.1
+is "a GET for it is answered from the cache" "$(calls GET /item)" "1"
+curl -sk -o /dev/null -X POST "$S/item"
+fetch /item --http1.1
+is "until a POST to it succeeds" "$(calls GET /item)" "2"
+fetch /item --http1.1
+is "and the response after that is cached in its place" "$(calls GET /item)" "2"
+curl -sk -o /dev/null -X POST -H "X-Deny: 1" "$S/item"
+fetch /item --http1.1
+is "a POST the application refuses changes nothing" "$(calls GET /item)" "2"
+curl -sk -o /dev/null --http2 -X DELETE "$S/item"
+fetch /item --http1.1
+is "a DELETE over HTTP/2 retires it too" "$(calls GET /item)" "3"
+fetch "/item?other" --http1.1
+curl -sk -o /dev/null -X PUT "$S/item"
+fetch "/item?other" --http1.1
+is "a different query string is a different URL" "$(calls GET /item?other)" "1"
+curl -sk -o /dev/null "$S/slow-item" &
+slow=$!
+sleep 0.3
+curl -sk -o /dev/null -X PUT "$S/slow-item"
+wait "$slow"
+fetch /slow-item --http1.1
+is "a GET still being answered when a PUT succeeds is not cached" "$(calls GET /slow-item)" "2"
+
+echo "what a response's age uses up"
+fetch /aged --http1.1
+fetch /aged --http1.1
+is "one already older than its max-age is not kept" "$(calls GET /aged)" "2"
+fetch /dated --http1.1
+fetch /dated --http1.1
+is "nor one whose Date is" "$(calls GET /dated)" "2"
+fetch /half-aged --http1.1
+fetch /half-aged --http1.1
+is "one with some of its lifetime left is" "$(calls GET /half-aged)" "1"
+like "served with the age it arrived with" "$(header age)" '^3[0-9]$'
+ttl=$(header cache-status | sed -n 's/.*ttl=\([0-9]*\).*/\1/p')
+if [ -n "$ttl" ] && [ "$ttl" -le 30 ]; then ok "and only what is left of its lifetime"
+else bad "and only what is left of its lifetime" "a ttl of 30 or less" "${ttl:-none}"; fi
+
 echo "requests that keep out of the cache"
 fetch "/fresh?auth" --http1.1 -H "Authorization: Bearer secret"
 fetch "/fresh?auth" --http1.1
@@ -186,6 +228,11 @@ for model in inline pooled; do
     fetch /stream --http1.1
     fetch /stream --http1.1
     is "an iterator's blocks are kept whole" "$(calls GET /stream)" "1"
+    fetch /item --http1.1
+    fetch /item --http1.1
+    curl -sk -o /dev/null -X POST "$S/item"
+    fetch /item --http1.1
+    is "a POST retires the cached GET" "$(calls GET /item)" "2"
     for route in /write /short-length /cookie /big; do
         fetch "$route" --http1.1
         fetch "$route" --http1.1

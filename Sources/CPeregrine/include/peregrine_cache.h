@@ -11,13 +11,32 @@
  * between 8 KiB, 64 KiB and 512 KiB slots and slots big enough for the largest
  * entry allowed, and an entry goes in the smallest that holds it, so a cache
  * of small JSON responses is not a few dozen megabyte-sized holes. Each slot
- * is guarded by a version number used as a sequence lock. A writer claims a
- * slot by moving its version
- * from even to odd with a compare-and-swap, writes, and makes it even again. A
- * reader copies the entry out and checks the version did not move while it
- * did; if it did, the lookup is a miss, never a wait. A writer that dies part
- * way leaves an odd version behind, and after a couple of seconds any other
- * writer may take the slot over, so a crash costs one entry for a moment.
+ * is guarded by a version word used as a sequence lock. A writer claims a slot
+ * by a compare-and-swap that makes the word odd and puts its process ID in
+ * it, writes, and makes it even again. A reader copies the entry out and
+ * checks the word did not move while it did; if it did, the lookup is a miss,
+ * never a wait.
+ *
+ * A claim ends only when its writer does. One that is merely slow --
+ * descheduled, stopped, swapping -- keeps its slot however long it takes, and
+ * another writer takes a slot over only once the process named in the claim
+ * no longer exists, so a crash costs one slot until then and a pause costs
+ * nothing.
+ *
+ * Every request whose response may be kept is given a number when it is
+ * dispatched, from one counter every worker shares. A copy carries its
+ * request's number, and wherever copies of the same response are -- two size
+ * classes, after the response changed size -- the one with the highest number
+ * is the only one a lookup will serve; if that one has expired, the lookup is
+ * a miss rather than a return to an older copy. Storing a copy retires the
+ * older ones it can see, and a copy older than one already kept is not stored.
+ *
+ * Invalidation uses the same numbers. A table of marks, indexed by a hash of
+ * the request target, holds the number of the last change made to a target
+ * through it. A copy numbered below its target's mark answers a request that
+ * was dispatched before the change, and is neither stored nor served. Two
+ * targets sharing a mark cost each other a miss now and then, never a stale
+ * response.
  *
  * Entries are found by a keyed hash and confirmed by comparing the whole key.
  * A generation number in the table's header is bumped whenever workers are
@@ -49,19 +68,36 @@ uint32_t pg_cache_max_body(void);
 /* Retires every entry at once. */
 void pg_cache_flush(void);
 
+/* A number greater than that of every request dispatched and every change
+ * made so far. Take one when a request whose response may be stored is
+ * dispatched, before the application is called. 0 when there is no cache. */
+uint64_t pg_cache_begin(void);
+
+/* The mark a request target is invalidated through: a hash of the target,
+ * query string included. */
+uint64_t pg_cache_target_hash(const uint8_t *target, size_t target_len);
+
+/* The target changed: every copy of a response to a request dispatched before
+ * now, and every one still to be stored, is out of date. */
+void pg_cache_invalidate(uint64_t target_hash);
+
 /* Looks `key` up at monotonic time `now_ms`. On a hit, copies the header block
- * and then the body into `out`, sets the lengths, the status, how long ago the
- * entry was stored and how long it has left, and returns 1. Returns 0 on a
- * miss, including an entry that changed while it was being read. `out` needs
- * room for max_head + max_body bytes. */
+ * and then the body into `out`, sets the lengths, the status, how old the
+ * response is and how long it has left, and returns 1. Returns 0 on a miss,
+ * including an entry that changed while it was being read. `out` needs room
+ * for max_head + max_body bytes. */
 int pg_cache_get(const uint8_t *key, size_t key_len, uint64_t now_ms,
                  uint8_t *out, size_t out_capacity,
                  uint32_t *head_len, uint32_t *body_len, uint16_t *status,
                  uint64_t *age_ms, uint64_t *ttl_ms);
 
-/* Stores an entry fresh for `ttl_ms`. Returns 1 when it was stored, 0 when it
- * was too large or every slot it could go in was being written. */
-int pg_cache_put(const uint8_t *key, size_t key_len, uint64_t now_ms, uint64_t ttl_ms,
+/* Stores the response to the request numbered `sequence` (pg_cache_begin),
+ * whose target hashes to `target_hash`. It is `age_ms` old now and fresh for
+ * `ttl_ms` more. Returns 1 when it was stored; 0 when it was too large, its
+ * target changed after the request was dispatched, a more recent copy is
+ * already kept, or every slot it could go in was being written. */
+int pg_cache_put(const uint8_t *key, size_t key_len, uint64_t target_hash,
+                 uint64_t sequence, uint64_t now_ms, uint64_t age_ms, uint64_t ttl_ms,
                  uint16_t status,
                  const uint8_t *head, size_t head_len,
                  const uint8_t *body, size_t body_len);

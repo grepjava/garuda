@@ -1293,6 +1293,9 @@ public struct Worker {
     /// nothing has overwritten the request line.
     mutating func logAccess(_ slot: Int, status: Int) {
         let c = table[slot]
+        // Every response with a status passes through here, on every
+        // protocol and interface, which is where a change to a target shows.
+        if c.pointee.flags.contains(.invalidatesCache) { cacheResponded(slot, status: status) }
         if Metrics.enabled {
             let started = c.pointee.requestStartUs
             Metrics.requestFinished(status: status,

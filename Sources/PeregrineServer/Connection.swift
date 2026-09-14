@@ -106,13 +106,18 @@ public struct ConnFlags: OptionSet, Sendable {
     /// iteration produced. See `Worker.flushSoon`.
     public static let flushQueued      = ConnFlags(rawValue: 1 << 19)
 
+    /// --cache-size: the request changes its target -- any method but GET,
+    /// HEAD, OPTIONS, TRACE and CONNECT -- and a successful response retires
+    /// what is cached for it. `Connection.cacheMark` says which target.
+    public static let invalidatesCache = ConnFlags(rawValue: 1 << 20)
+
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
     /// one of these here would leak state across a pipelined request.
     public static let perRequest: ConnFlags = [
         .owesContinue, .chunkedResponse, .responseStarted, .responseComplete,
         .suppressBody, .disconnected, .disconnectSent, .bodyDelivered,
-        .endStreamSent,
+        .endStreamSent, .invalidatesCache,
     ]
 }
 
@@ -252,6 +257,9 @@ public struct Connection {
     /// and the response as it is copied.
     public var cacheKey = ByteBuffer()
     public var capture = ResponseCapture()
+    /// The hash of the target of a request that changes it, which a
+    /// successful response invalidates. See `ConnFlags.invalidatesCache`.
+    public var cacheMark: UInt64 = 0
     /// The compressor for an ASGI response body being compressed.
     public var encoder = ResponseEncoder()
 

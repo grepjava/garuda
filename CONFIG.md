@@ -628,15 +628,32 @@ each client that accepts it when `--compress` is on. Every response gets its
 own `Date`, `X-Request-ID` and `Strict-Transport-Security`, plus `Age` and
 `Cache-Status: peregrine; hit; ttl=N`.
 
-Entries expire on their own lifetimes; there is no purge. A reload — `SIGHUP`,
-`--reload`, a renewed certificate — discards everything cached, since the new
-workers may run new code. The memory is split evenly between entries of four
-sizes — 8 KiB, 64 KiB, 512 KiB, and big enough for `--cache-max-object` — and a
-response goes in the smallest that holds it; when the ones a URL can go in are
-all taken, the one nearest to expiring is replaced. The server logs how many
-responses the size given has room for. With `--metrics-port`,
-`peregrine_cache_hits_total`, `peregrine_cache_misses_total` and
-`peregrine_cache_stores_total` show how it is doing.
+A copy is kept for what is left of the response's lifetime. A response that
+arrives with an `Age`, or with a `Date` in the past, has used some of its
+`max-age` already, and so has one the application took seconds to produce. The
+cache counts all of that, as RFC 9111 says, serves the copy with the age it
+has, and does not keep a response that is already stale.
+
+A successful change to a URL retires what is cached for it. When a request
+with any method but GET, HEAD, OPTIONS and TRACE is answered with a 2xx or 3xx,
+every copy cached for its path and query string is dropped, on every worker.
+So is the response to a GET that was still being answered when the change was
+made, because it describes the URL as it was. A request the application refuses
+changes nothing, so a client without permission to make the change cannot
+empty the cache of it either. Host and scheme are ignored here: a change made
+over HTTP retires the copy served over HTTPS. `Location` and
+`Content-Location` are not followed, so a change that affects other URLs waits
+for their copies to expire; give those a short `s-maxage`.
+
+A reload — `SIGHUP`, `--reload`, a renewed certificate — discards everything
+cached, since the new workers may run new code. The memory is split evenly
+between entries of four sizes — 8 KiB, 64 KiB, 512 KiB, and big enough for
+`--cache-max-object` — and a response goes in the smallest that holds it; when
+the ones a URL can go in are all taken, the one nearest to expiring is
+replaced. The server logs how many responses the size given has room for.
+With `--metrics-port`, `peregrine_cache_hits_total`,
+`peregrine_cache_misses_total` and `peregrine_cache_stores_total` show how it
+is doing.
 
 ASGI and WSGI responses are cached alike, inline or under `--wsgi-threads`. A
 WSGI response sent through the `write()` callable is not: its head goes out

@@ -108,6 +108,11 @@ jobs:
       - name: Feature tests
         run: python3 scripts/feature-test.py "$PEREGRINE"
 
+      - name: Response cache
+        run: |
+          bash scripts/cache-unit-test.sh
+          bash scripts/cache-test.sh "$PEREGRINE"
+
       - name: HTTP/2
         run: |
           python3 -m pip install --quiet --disable-pip-version-check h2

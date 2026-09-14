@@ -19,12 +19,74 @@ private func control(_ value: String) -> CacheControl {
     return c
 }
 
-private func fresh(_ headers: [(String, String)], status: Int = 200, limit: Int = 300) -> Int {
+/// Sun, 09 Sep 2001 01:46:40 GMT.
+private let now = 1_000_000_000
+
+private func policy(_ headers: [(String, String)]) -> ResponseCacheability {
     var policy = ResponseCacheability()
     for (name, value) in headers {
         withSpan(name) { n in withSpan(value) { v in policy.observe(n, v) } }
     }
-    return policy.freshSeconds(status: status, limit: limit)
+    return policy
+}
+
+private func fresh(_ headers: [(String, String)], status: Int = 200, limit: Int = 300) -> Int {
+    policy(headers).storage(status: status, limitSeconds: limit, responseDelayMs: 0,
+                            nowSeconds: now).map { $0.keepMs / 1000 } ?? 0
+}
+
+/// How old a response is and how long it may be kept, in milliseconds.
+private func aging(_ headers: [(String, String)], delayMs: Int = 0, limit: Int = 300) -> [Int]? {
+    policy(headers).storage(status: 200, limitSeconds: limit, responseDelayMs: delayMs,
+                            nowSeconds: now).map { [$0.ageMs, $0.keepMs] }
+}
+
+private func date(_ s: String) -> Int? {
+    withSpan(s) { HTTPDate.parse($0.base, $0.count) }
+}
+
+@Test("a response's Age, Date and time taken are its age, and count against its lifetime")
+func responseAge() {
+    let cc = ("Cache-Control", "max-age=60")
+    #expect(aging([cc]) == [0, 60_000])
+    #expect(aging([cc, ("Age", "30")]) == [30_000, 30_000])
+    #expect(aging([cc, ("Age", "60")]) == nil)
+    #expect(aging([cc, ("Age", "120")]) == nil)
+    #expect(aging([cc], delayMs: 2_500) == [2_500, 57_500])
+    #expect(aging([cc, ("Age", "10")], delayMs: 500) == [10_500, 49_500])
+    #expect(aging([cc, ("Date", "Sun, 09 Sep 2001 01:46:30 GMT")]) == [10_000, 50_000])
+    #expect(aging([cc, ("Date", "Sun, 09 Sep 2001 01:45:00 GMT")]) == nil)
+    // A Date in the future is not a negative age.
+    #expect(aging([cc, ("Date", "Sun, 09 Sep 2001 01:46:50 GMT")]) == [0, 60_000])
+    // The larger of the two ages counts.
+    #expect(aging([cc, ("Date", "Sun, 09 Sep 2001 01:46:30 GMT"), ("Age", "20")]) == [20_000, 40_000])
+    #expect(aging([cc, ("Date", "Sun, 09 Sep 2001 01:46:30 GMT"), ("Age", "5")]) == [10_000, 50_000])
+    // Only the first member of an Age list, and nothing from one that is not a number.
+    #expect(aging([cc, ("Age", "30, 90")]) == [30_000, 30_000])
+    #expect(aging([cc, ("Age", "30"), ("Age", "90")]) == [30_000, 30_000])
+    #expect(aging([cc, ("Age", "soon"), ("Age", "90")]) == [0, 60_000])
+    #expect(aging([cc, ("Date", "yesterday")]) == [0, 60_000])
+    // The limit caps what is left, not the lifetime.
+    #expect(aging([("Cache-Control", "max-age=600"), ("Age", "100")]) == [100_000, 300_000])
+    #expect(aging([("Cache-Control", "max-age=600"), ("Age", "550")]) == [550_000, 50_000])
+}
+
+@Test("HTTP-dates are read in all three forms, and nothing else is one")
+func httpDates() {
+    #expect(date("Sun, 06 Nov 1994 08:49:37 GMT") == 784_111_777)
+    #expect(date("Sunday, 06-Nov-94 08:49:37 GMT") == 784_111_777)
+    #expect(date("Sun Nov  6 08:49:37 1994") == 784_111_777)
+    #expect(date(" Sun, 06 Nov 1994 08:49:37 GMT ") == 784_111_777)
+    #expect(date("Wednesday, 16-Nov-94 08:49:37 GMT") == 784_111_777 + 10 * 86_400)
+    #expect(date("Wed Nov 16 08:49:37 1994") == 784_111_777 + 10 * 86_400)
+    #expect(date("Thu, 01 Jan 1970 00:00:00 GMT") == 0)
+    #expect(date("Tue, 29 Feb 2028 23:59:59 GMT") == 1_835_481_599)
+    #expect(date("Sun, 06 Nov 1994 08:49:37 UTC") == nil)
+    #expect(date("Sun, 06 Nov 1994 24:00:00 GMT") == nil)
+    #expect(date("Sun, 06 nov 1994 08:49:37 GMT") == nil)
+    #expect(date("Sun, 00 Nov 1994 08:49:37 GMT") == nil)
+    #expect(date("1994-11-06T08:49:37Z") == nil)
+    #expect(date("") == nil)
 }
 
 private func excludes(_ name: String, _ value: String) -> Bool {

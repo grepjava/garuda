@@ -5,9 +5,15 @@ CACHE_LOG, one "METHOD target" line each, so the test can count how many
 requests reached it and how many were answered from the cache. The body says
 which call and which process produced it, so a copy served from the cache is
 byte for byte the response that was stored.
+
+Any method but GET and HEAD is a change to the target: answered 200, or 403
+when the request carries X-Deny.
 """
 
+import asyncio
+import email.utils
 import os
+import time
 
 CALLS = {}
 PADDING = b"cacheable text, repeated so that compression has something to do. " * 40
@@ -39,7 +45,20 @@ ROUTES = {
     "/missing": [(b"cache-control", b"s-maxage=60")],
     "/broken": [(b"cache-control", b"s-maxage=60")],
     "/nothing": [(b"cache-control", b"s-maxage=60")],
+    "/item": [(b"cache-control", b"s-maxage=60")],
+    "/slow-item": [(b"cache-control", b"s-maxage=60")],
+    # Two minutes old by its own account, with a minute's lifetime.
+    "/aged": [(b"cache-control", b"max-age=60"), (b"age", b"120")],
+    "/half-aged": [(b"cache-control", b"max-age=60"), (b"age", b"30")],
+    "/dated": [(b"cache-control", b"max-age=60")],
 }
+
+
+def extra_headers(path):
+    if path == "/dated":
+        # Dated an hour ago, with a minute's lifetime.
+        return [(b"date", email.utils.formatdate(time.time() - 3600, usegmt=True).encode())]
+    return []
 
 
 async def asgi_app(scope, receive, send):
@@ -49,9 +68,16 @@ async def asgi_app(scope, receive, send):
     target = path + ("?" + scope["query_string"].decode() if scope["query_string"] else "")
     record(scope["method"], target)
     CALLS[target] = CALLS.get(target, 0) + 1
+    if scope["method"] not in ("GET", "HEAD"):
+        denied = any(name.lower() == b"x-deny" for name, _ in scope["headers"])
+        await send({"type": "http.response.start", "status": 403 if denied else 200,
+                    "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"denied\n" if denied else b"changed\n"})
+        return
     body = b"call=%d pid=%d target=%s\n" % (CALLS[target], os.getpid(), target.encode())
     status = 200
-    headers = [(b"content-type", b"text/plain")] + ROUTES.get(path, ROUTES["/fresh"])
+    headers = ([(b"content-type", b"text/plain")] + ROUTES.get(path, ROUTES["/fresh"])
+               + extra_headers(path))
     if path == "/big":
         body += b"x" * (2 * 1024 * 1024)
     elif path == "/missing":
@@ -62,6 +88,9 @@ async def asgi_app(scope, receive, send):
         status = 204
     else:
         body += PADDING
+    if path == "/slow-item":
+        # Still answering when the test changes the target.
+        await asyncio.sleep(1)
 
     if path == "/stream":
         await send({"type": "http.response.start", "status": status, "headers": headers})
@@ -80,9 +109,14 @@ def wsgi_app(environ, start_response):
     target = path + ("?" + query if query else "")
     record(environ["REQUEST_METHOD"], target)
     CALLS[target] = CALLS.get(target, 0) + 1
+    if environ["REQUEST_METHOD"] not in ("GET", "HEAD"):
+        denied = "HTTP_X_DENY" in environ
+        start_response("403 Forbidden" if denied else "200 OK", [("Content-Type", "text/plain")])
+        return [b"denied\n" if denied else b"changed\n"]
     body = b"call=%d pid=%d target=%s\n" % (CALLS[target], os.getpid(), target.encode())
     headers = [("Content-Type", "text/plain")] + [
-        (name.decode(), value.decode()) for name, value in ROUTES.get(path, ROUTES["/fresh"])]
+        (name.decode(), value.decode())
+        for name, value in ROUTES.get(path, ROUTES["/fresh"]) + extra_headers(path)]
     if path == "/big":
         body += b"x" * (2 * 1024 * 1024)
     else:

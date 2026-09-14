@@ -13,6 +13,15 @@
 // what the application thinks it was asked. HEAD is answered from a GET's
 // copy and never stores one.
 //
+// A request that changes its target -- any method but GET, HEAD, OPTIONS,
+// TRACE and CONNECT -- is marked at dispatch. When its response has a 2xx or
+// 3xx status, the target is invalidated in the table (RFC 9111 section 4.4):
+// its copies, and the response to any GET for it dispatched before then that
+// has yet to be stored.
+//
+// A copy is kept for what is left of the response's freshness lifetime once
+// its age -- Age, Date, and the time the application took -- is taken off.
+//
 // A copy holds the application's own headers and body, not the bytes that
 // went on the wire, so one copy serves HTTP/1.1, HTTP/2 and HTTP/3 alike and
 // is compressed afresh for each client that accepts it. Date, Age,
@@ -43,17 +52,43 @@ public struct ResponseCapture {
     public private(set) var active = false
     var ttlLimit = 0
     var status = 0
-    var ttlSeconds = 0
+    /// The request's number in the cache's order of events, the hash its
+    /// target is invalidated through, and when it was dispatched.
+    var sequence: UInt64 = 0
+    var mark: UInt64 = 0
+    var dispatchedMs: UInt64 = 0
+    /// When the head settled, how old the response was then, and how long
+    /// from then it may be kept.
+    var settledMs: UInt64 = 0
+    var ageMs = 0
+    var keepMs = 0
     var head = ByteBuffer()
     var body = ByteBuffer()
     var policy = ResponseCacheability()
 
     public init() {}
 
-    mutating func arm(ttlLimit: Int) {
+    /// Starts copying the response to a request dispatched now, whose target
+    /// hashes to `mark`. The number is taken before the application runs, so
+    /// a change to the target made while it is still answering keeps this
+    /// response out of the cache.
+    mutating func arm(ttlLimit: Int, mark: UInt64) {
         abandon()
         active = true
         self.ttlLimit = ttlLimit
+        self.mark = mark
+        sequence = pg_cache_begin()
+        dispatchedMs = pg_monotonic_ms()
+    }
+
+    /// Carries an armed capture over to the WSGI pool job that fills it.
+    mutating func arm(continuing other: ResponseCapture) {
+        abandon()
+        active = other.active
+        ttlLimit = other.ttlLimit
+        mark = other.mark
+        sequence = other.sequence
+        dispatchedMs = other.dispatchedMs
     }
 
     /// One response header, as the application gave it.
@@ -64,15 +99,22 @@ public struct ResponseCapture {
         }
     }
 
-    /// Every header has been seen: the response is kept or it is not.
+    /// Every header has been seen: the response is kept or it is not, and how
+    /// old it already is decides for how long.
     public mutating func settle(status: Int) {
-        let fresh = policy.freshSeconds(status: status, limit: ttlLimit)
-        guard fresh > 0, head.readableBytes <= Int(pg_cache_max_head()) else {
+        let now = pg_monotonic_ms()
+        let delay = now > dispatchedMs ? Int(now - dispatchedMs) : 0
+        guard head.readableBytes <= Int(pg_cache_max_head()),
+              let kept = policy.storage(status: status, limitSeconds: ttlLimit,
+                                        responseDelayMs: delay,
+                                        nowSeconds: Int(pg_unix_seconds())) else {
             abandon()
             return
         }
         self.status = status
-        ttlSeconds = fresh
+        settledMs = now
+        ageMs = kept.ageMs
+        keepMs = kept.keepMs
     }
 
     /// Body bytes as the application produced them, before any compression.
@@ -89,13 +131,18 @@ public struct ResponseCapture {
         defer { abandon() }
         let keyLength = key.readableBytes
         guard active, status > 0, keyLength > 0 else { return false }
+        // Sending the body took time, and that time is part of the copy's age
+        // as it would be for a copy a client kept.
+        let now = pg_monotonic_ms()
+        let sent = now > settledMs ? Int(now - settledMs) : 0
+        guard sent < keepMs else { return false }
         let keyPointer = UnsafePointer(key.readPointer)
         let headLength = head.readableBytes
         let bodyLength = body.readableBytes
         // An empty buffer may never have been given storage; any valid pointer
         // does for a length of zero.
-        let stored = pg_cache_put(keyPointer, keyLength, pg_monotonic_ms(),
-                                  UInt64(ttlSeconds) * 1000, UInt16(status),
+        let stored = pg_cache_put(keyPointer, keyLength, mark, sequence, now,
+                                  UInt64(ageMs + sent), UInt64(keepMs - sent), UInt16(status),
                                   headLength > 0 ? UnsafePointer(head.readPointer) : keyPointer,
                                   headLength,
                                   bodyLength > 0 ? UnsafePointer(body.readPointer) : keyPointer,
@@ -108,7 +155,12 @@ public struct ResponseCapture {
     public mutating func abandon() {
         active = false
         status = 0
-        ttlSeconds = 0
+        sequence = 0
+        mark = 0
+        dispatchedMs = 0
+        settledMs = 0
+        ageMs = 0
+        keepMs = 0
         policy = ResponseCacheability()
         head.destroy()
         body.destroy()
@@ -126,18 +178,42 @@ extension Worker {
             .assumingMemoryBound(to: ResponseCapture.self)
     }
 
+    // MARK: - Invalidation
+
+    /// A request that changes its target has been answered with `status`. A
+    /// success means the application changed what the target is, so every
+    /// copy of it, and the response to any GET for it still being produced,
+    /// describes what it was (RFC 9111 section 4.4). A refusal changed
+    /// nothing, and letting one purge would let anyone without permission to
+    /// make the change empty the cache of it.
+    mutating func cacheResponded(_ slot: Int, status: Int) {
+        let c = table[slot]
+        c.pointee.flags.remove(.invalidatesCache)
+        if status >= 200 && status < 400 { pg_cache_invalidate(c.pointee.cacheMark) }
+    }
+
     // MARK: - Lookup
 
     /// At dispatch: answers the request from the cache and returns true, or
-    /// arms the capture of the application's response and returns false.
+    /// arms the capture of the application's response and returns false. A
+    /// request that changes its target is marked to invalidate it instead.
     mutating func cacheDispatch(_ slot: Int) -> Bool {
         let c = table[slot]
         c.pointee.capture.abandon()
         let method = c.pointee.head.method
-        guard method == .get || method == .head,
-              !c.pointee.head.flags.contains(.upgrade), !c.pointee.head.hasBody else { return false }
-
         let base = c.pointee.headBase()
+        guard method == .get || method == .head else {
+            // The safe methods change nothing, and CONNECT opens a tunnel or
+            // a session rather than changing what its path names.
+            if method != .options && method != .trace && method != .connect {
+                let target = c.pointee.head.target.span(in: base)
+                c.pointee.cacheMark = pg_cache_target_hash(target.base, target.count)
+                c.pointee.flags.insert(.invalidatesCache)
+            }
+            return false
+        }
+        guard !c.pointee.head.flags.contains(.upgrade), !c.pointee.head.hasBody else { return false }
+
         var host = ByteSpan(base, 0)
         var forwardedProto = ByteSpan(base, 0)
         var forwardedHost = ByteSpan(base, 0)
@@ -220,7 +296,11 @@ extension Worker {
         }
         if Metrics.enabled { Metrics.add(PG_M_CACHE_MISSES) }
         // Only a GET has a body worth keeping.
-        if method == .get { c.pointee.capture.arm(ttlLimit: config.cacheTTLMaxSeconds) }
+        if method == .get {
+            let target = c.pointee.head.target.span(in: base)
+            c.pointee.capture.arm(ttlLimit: config.cacheTTLMaxSeconds,
+                                  mark: pg_cache_target_hash(target.base, target.count))
+        }
         return false
     }
 

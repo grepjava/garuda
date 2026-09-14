@@ -20,6 +20,24 @@ version reached PyPI, in UTC.
 
 ## Unreleased
 
+### Fixed
+
+- `--cache-size`: a worker that stalled for more than two seconds part way
+  through storing a response could have its slot taken over, then finish
+  writing over the entry that replaced it: one response's status served with
+  another's body. A slot now stays with its writer for as long as that process
+  exists.
+- `--cache-size`: a response that changed size could be answered with an older
+  copy kept in a slot of another size, or have that older copy come back after
+  the newer one expired. Only the copy of the most recent response is served.
+- `--cache-size`: a successful POST, PUT, PATCH or DELETE retires what is cached
+  for its URL, as RFC 9111 requires, and a GET that was still being answered
+  when the change was made is not stored. Until now a GET was answered with the
+  response from before the change until that copy expired.
+- `--cache-size`: a response's `Age`, its `Date` and the time the application
+  took to produce it count against its lifetime. A response already two minutes
+  old with `max-age=60` was kept for a minute and served with `Age: 0`.
+
 ---
 
 ## 1.1.4 — 2026-09-14

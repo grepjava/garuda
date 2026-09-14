@@ -624,7 +624,7 @@ extension Worker {
         if c.pointee.capture.active {
             // The copy is taken on the thread that runs the application, so
             // it moves to the job; the key stays here for the loop to store it.
-            job.capture.arm(ttlLimit: config.cacheTTLMaxSeconds)
+            job.capture.arm(continuing: c.pointee.capture)
             c.pointee.capture.abandon()
         }
         c.pointee.poolJob = job
