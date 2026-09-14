@@ -385,6 +385,10 @@ request costs about 43 µs, most of it FastAPI's own code.
 | | FastAPI | 25,175 → 25,165 (−0.0 %) | 42.58 → 42.52 µs (−0.1 %) | 3/6, 4/6 | 0.9 %, 0.0 % | |
 | each request's task started eagerly, so an application that never waits finishes before dispatch returns | raw ASGI | 96,693 → 105,157 (+8.8 %) | 10.48 → 9.42 µs (−10.2 %) | 6/6, 6/6 | 4.3 %, 5.3 % | no |
 | | FastAPI | 20,906 → 20,466 (−2.1 %) | 48.74 → 49.82 µs (+2.2 %) | 2/6, 2/6 | 0.3 %, 1.2 % | |
+| the same, with the responses a drain holds flushed every 16 | raw ASGI | 90,667 → 91,284 (+0.7 %) | 11.23 → 11.07 µs (−1.4 %) | 1/6, 2/6 | 3.1 %, 3.4 % | no |
+| | FastAPI | 22,536 → 20,762 (−7.9 %) | 45.38 → 49.19 µs (+8.4 %) | 0/6, 0/6 | 3.3 %, 2.8 % | |
+| the same, with only the first 16 requests of an event batch started eagerly | raw ASGI | 98,979 → 102,306 (+3.4 %) | 10.32 → 9.96 µs (−3.5 %) | 3/6, 5/6 | 1.0 %, 0.6 % | no |
+| | FastAPI | 23,086 → 22,708 (−1.6 %) | 44.30 → 44.86 µs (+1.3 %) | 3/6, 2/6 | 1.0 %, 0.9 % | |
 
 - **A change within noise on FastAPI is expected.** The framework is most of
   a FastAPI request, so a saving of a fraction of a microsecond on the server
@@ -404,9 +408,36 @@ request costs about 43 µs, most of it FastAPI's own code.
     against 2.57–2.64 ms.
   - Raw ASGI p99 2.35–2.55 ms against 2.19–2.37 ms.
 
-  Nothing found explains the latency. It is not a longer drain taking in
-  more requests, because the poller is read once per wakeup. So it was
-  reverted.
+  It was reverted.
+- **Why the latency rose: the batch doubled.** Without eager start, an
+  application runs in the loop's idle phase and the poll phase runs in
+  between, so 64 connections settle into two overlapping halves. Started
+  eagerly, it runs inside the drain, so one wakeup takes every connection,
+  and the deferred flush holds all 64 responses until the drain ends. Under
+  `strace` at 64 connections, `epoll_wait` per request fell from 0.031 to
+  0.016 on both applications. The request itself got cheaper, not dearer: at
+  one connection, where nothing batches, raw ASGI cost 41–44 µs against
+  45–56 µs.
+- **Two caps were tried, and neither was kept.** Flushing every 16 held
+  responses between events, the way WSGI does, did not split the batch:
+  `epoll_wait` per request stayed at 0.016. It only added writes, and FastAPI
+  got 8 % dearer. Starting only the first 16 requests of an event batch
+  eagerly, and scheduling the rest, split it partly, to 0.025. That kept
+  raw ASGI 3.5 % cheaper. FastAPI still lost 1.6 %. Median p99 rose 9.6 % on
+  raw ASGI and 20 % on FastAPI, and FastAPI's p50 rose 21 %. By connection
+  count, against main, with
+  [benchmarks/eagercmp.sh](benchmarks/eagercmp.sh), two runs each:
+
+  | connections | application | main, µs per request | capped, µs per request | main p99 | capped p99 |
+  |---:|---|---:|---:|---:|---:|
+  | 1 | raw ASGI | 45.4–46.4 | 41.8–41.9 | 0.21–0.22 ms | 0.20–0.21 ms |
+  | 8 | raw ASGI | 22.4–25.1 | 20.3–20.7 | 0.53–0.57 ms | 0.62 ms |
+  | 64 | raw ASGI | 10.0–10.3 | 9.8–10.1 | 2.46–2.57 ms | 2.60–2.97 ms |
+  | 1 | FastAPI | 109.8–110.1 | 102.4–105.8 | 0.37–0.38 ms | 0.36–0.39 ms |
+  | 8 | FastAPI | 58.8–59.6 | 57.3–58.4 | 1.10–1.12 ms | 1.19–1.29 ms |
+  | 64 | FastAPI | 43.7–44.8 | 43.8–44.4 | 6.01–6.08 ms | 6.04–7.51 ms |
+
+  The saving holds at one connection. From eight up, the tail is worse.
 - **The in-process benchmark does size what is left.** With uvloop, the
   asyncio task each request runs in costs 1.1–1.3 µs of the ~9. Building the
   scope costs 0.6–0.8 µs for 3 headers and about 1.5 µs for 15. Neither is
