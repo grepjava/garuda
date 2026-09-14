@@ -95,11 +95,21 @@ def make_certs():
 
 
 def free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    # The server listens on the port for TCP as well as QUIC, so a port free
+    # only for UDP can still fail its start-up with "Address already in use".
+    while True:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tcp = socket.socket()
+        try:
+            udp.bind(("127.0.0.1", 0))
+            port = udp.getsockname()[1]
+            tcp.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            pass
+        finally:
+            tcp.close()
+            udp.close()
 
 
 class Server:
