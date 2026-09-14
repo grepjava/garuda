@@ -22,7 +22,7 @@ public struct ASGIScopeBuilder {
     @usableFromInline var headerNames: PyStringCache
     @usableFromInline var scratch: UnsafeMutablePointer<UInt8>
     @usableFromInline let scratchCapacity: Int
-    @usableFromInline let rootPathLength: Int
+    @usableFromInline let root: RootPath
     /// Shared lifespan state, shallow-copied into each request scope.
     @usableFromInline var lifespanState: PyObj?
     /// `{"webtransport": {}}` as a mappingproxy, interned for the worker.
@@ -42,9 +42,7 @@ public struct ASGIScopeBuilder {
         self.lifespanState = nil
         self.webtransportExtensions = nil
 
-        var rootLen = 0
-        while rootPath[rootLen] != 0 { rootLen += 1 }
-        self.rootPathLength = rootLen
+        self.root = RootPath(rootPath)
 
         guard let proto = pg_dict_new() else { return nil }
         self.prototype = proto
@@ -201,10 +199,7 @@ public struct ASGIScopeBuilder {
         guard put(Interned[.rawPath], bytes(pathPtr, pathLen)) else {
             pg_decref(scope); return nil
         }
-        if rootPathLength > 0 && pathLen >= rootPathLength {
-            pathPtr += rootPathLength
-            pathLen -= rootPathLength
-        }
+        (pathPtr, pathLen) = root.strip(pathPtr, pathLen)
         if head.flags.contains(.escapedPath) && pathLen <= scratchCapacity {
             let decoded = percentDecode(pathPtr, pathLen, into: scratch)
             guard put(Interned[.path], utf8(scratch, decoded)) else {

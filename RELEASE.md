@@ -48,6 +48,12 @@ version reached PyPI, in UTC.
   and a 304's `Content-Length` is no longer rewritten to 0: the application's
   is kept, or none is sent. This applies with or without `--cache-size`, to
   ASGI and WSGI over HTTP/1.1, HTTP/2 and HTTP/3.
+- `--root-path` comes off a request's path only when the path is under it:
+  the prefix itself, or the prefix followed by `/`. As many characters as the
+  prefix had were cut from every path, so under `--root-path /api` a request
+  for `/users` (behind a proxy that had already removed the prefix) reached the
+  application as `rs`, and `/apis` as `s`. This applies to ASGI `path` and
+  WSGI `PATH_INFO` alike.
 - `--compress`: a strong `ETag` on a response the server compresses is sent
   weak (`W/"v1"`), with or without `--cache-size`, over HTTP/1.1, HTTP/2 and
   HTTP/3. The plain and compressed bodies were both sent with the

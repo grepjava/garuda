@@ -1884,6 +1884,32 @@ def test_reload_notified():
         shutil.rmtree(project, ignore_errors=True)
 
 
+def test_root_path():
+    print("\n--root-path")
+    import json
+    # Behind a proxy mounting the application under /api, a request may arrive
+    # with the prefix or, when the proxy took it off, without. Either way the
+    # application's path is the part within it, and nothing is cut from a
+    # path the prefix is not on.
+    port = free_port()
+    with Server("--root-path", "/api", port=port) as server:
+        for target in ("/api/scope", "/scope"):
+            code, _hdrs, body = server.get(target)
+            scope = json.loads(body) if code == 200 else {}
+            is_("ASGI %s is answered" % target, code, 200)
+            is_("with path /scope", scope.get("path"), "/scope")
+            is_("and root_path /api", scope.get("root_path"), "/api")
+
+    port = free_port()
+    with Server("--root-path", "/api", port=port, app="wsgi_app:application") as server:
+        for target in ("/api/env", "/env"):
+            code, _hdrs, body = server.get(target)
+            text = body.decode() if isinstance(body, bytes) else body
+            is_("WSGI %s is answered" % target, code, 200)
+            check("with PATH_INFO /env", "PATH_INFO='/env'" in text, text[:300])
+            check("and SCRIPT_NAME /api", "SCRIPT_NAME='/api'" in text, text[:300])
+
+
 def free_threaded_build():
     """True when this binary is linked against a CPython without the GIL."""
     out = subprocess.run([BIN, "--version"], stdout=subprocess.PIPE,
@@ -2087,7 +2113,7 @@ def main():
                  test_wsgi_threads, test_wsgi_streaming, test_access_log,
                  test_wsgi_declared_length, test_wsgi_lazy_start_response,
                  test_metrics, test_body_limit,
-                 test_forwarded, test_multiworker_unix,
+                 test_forwarded, test_root_path, test_multiworker_unix,
                  test_worker_restart, test_reload, test_reload_notified,
                  test_graceful_shutdown,
                  test_shutdown_is_bounded, test_free_threaded):

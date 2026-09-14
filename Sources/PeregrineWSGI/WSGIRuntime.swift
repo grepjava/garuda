@@ -37,8 +37,8 @@ public struct WSGIRuntime {
     @usableFromInline var protocol3: PyObj
     @usableFromInline var scratch: UnsafeMutablePointer<UInt8>
     @usableFromInline let scratchCapacity: Int
-    /// Interned SCRIPT_NAME prefix length, so PATH_INFO can be trimmed.
-    @usableFromInline let rootPathLength: Int
+    /// The SCRIPT_NAME prefix, which comes off PATH_INFO when it is there.
+    @usableFromInline let root: RootPath
 
     public init?(app: PyObj,
                  serverName: UnsafePointer<CChar>,
@@ -65,9 +65,7 @@ public struct WSGIRuntime {
         self.protocol2 = p2
         self.protocol3 = p3
 
-        var rootLen = 0
-        while rootPath[rootLen] != 0 { rootLen += 1 }
-        self.rootPathLength = rootLen
+        self.root = RootPath(rootPath)
 
         // --- constant environ entries ---
         func setStr(_ key: PyKey, _ cstr: UnsafePointer<CChar>) -> Bool {
@@ -152,10 +150,7 @@ public struct WSGIRuntime {
         // PATH_INFO -- percent-decoded, then latin-1 as PEP 3333 requires.
         var pathPtr = base + Int(head.path.offset)
         var pathLen = Int(head.path.length)
-        if rootPathLength > 0 && pathLen >= rootPathLength {
-            pathPtr += rootPathLength
-            pathLen -= rootPathLength
-        }
+        (pathPtr, pathLen) = root.strip(pathPtr, pathLen)
         if head.flags.contains(.escapedPath) && pathLen <= scratchCapacity {
             let decoded = percentDecode(pathPtr, pathLen, into: scratch)
             guard put(Interned[.pathInfo], latin1(scratch, decoded)) else {
