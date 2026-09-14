@@ -215,6 +215,13 @@ async def app(scope, receive, send):
         n = int(scope["query_string"] or 100000)
         await reply(b"x" * n, content_type=b"application/octet-stream")
 
+    elif path == "/late":
+        # /big after a pause, so that frames a client sent right behind the
+        # request are read before the response starts.
+        await asyncio.sleep(0.2)
+        n = int(scope["query_string"] or 100)
+        await reply(b"x" * n, content_type=b"application/octet-stream")
+
     elif path == "/altsvc":
         # An application that advertises its own alternative services; the
         # server must not add a second header of its own.

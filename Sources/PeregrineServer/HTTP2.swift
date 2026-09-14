@@ -722,7 +722,6 @@ extension Worker {
         if header.length % 6 != 0 { connectionError(slot, .frameSizeError); return }
 
         var i = 0
-        var windowDelta = 0
         var windowChanged = false
         while i < header.length {
             let id = (UInt16(payload[i]) << 8) | UInt16(payload[i + 1])
@@ -742,9 +741,22 @@ extension Worker {
                 if value > UInt32(H2FrameHeader.maxWindowSize) {
                     connectionError(slot, .flowControlError); return
                 }
-                windowDelta = Int(value) - h2.peerInitialWindowSize
+                // A changed initial window applies to every stream already
+                // open, and each value in a frame is applied in turn (RFC
+                // 9113 section 6.5): the last one does not stand for the rest.
+                let delta = Int(value) - h2.peerInitialWindowSize
                 windowChanged = true
                 h2.peerInitialWindowSize = Int(value)
+                if delta != 0 {
+                    for (_, raw) in h2.streams {
+                        let s = table[Int(raw)]
+                        s.pointee.sendWindow += delta
+                        if s.pointee.sendWindow > H2FrameHeader.maxWindowSize {
+                            connectionError(slot, .flowControlError)
+                            return
+                        }
+                    }
+                }
             case .maxFrameSize:
                 if value < UInt32(H2FrameHeader.defaultMaxFrameSize) || value > 0xFF_FFFF {
                     connectionError(slot, .protocolError); return
@@ -754,18 +766,6 @@ extension Worker {
                 h2.peerMaxHeaderListSize = Int(value)
             case .enableConnectProtocol:
                 if value > 1 { connectionError(slot, .protocolError); return }
-            }
-        }
-
-        // A changed initial window applies to every stream already open.
-        if windowChanged && windowDelta != 0 {
-            for (_, raw) in h2.streams {
-                let s = table[Int(raw)]
-                s.pointee.sendWindow += windowDelta
-                if s.pointee.sendWindow > H2FrameHeader.maxWindowSize {
-                    connectionError(slot, .flowControlError)
-                    return
-                }
             }
         }
 

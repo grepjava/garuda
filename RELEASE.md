@@ -56,6 +56,10 @@ version reached PyPI, in UTC.
 - `--cache-size` with `--compress`: a `304` answered from the cache carries
   the `Vary: Accept-Encoding` its `200` has. The server added that `Vary` when
   sending the `200`, and dropped it from the `304`.
+- HTTP/2: a SETTINGS frame that changes `INITIAL_WINDOW_SIZE` more than once
+  applies every change to the streams already open, in order. Only the last
+  change was applied, so a response could stall with window to spare, or be
+  sent past the window the client had set.
 - `--free-threaded` with more than one worker no longer hangs at start-up when
   the GIL is enabled (`PYTHON_GIL=1`, or an extension module that turns it back
   on) and the application's lifespan `startup` awaits anything. A worker waiting

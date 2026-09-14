@@ -16,6 +16,7 @@ import os
 import socket
 import ssl
 import shlex
+import struct
 import subprocess
 import sys
 import tempfile
@@ -365,6 +366,63 @@ def test_flow_control():
         is_("an upload larger than the initial window completes",
             len(body.get(s2, b"")), len(payload))
         c.close()
+
+        # One SETTINGS frame may change INITIAL_WINDOW_SIZE more than once, and
+        # each value applies in turn to the streams already open, not just the
+        # last. The h2 library never sends that, so these frames are made here.
+        def frame(kind, flags, stream, payload=b""):
+            return len(payload).to_bytes(3, "big") + bytes([kind, flags]) \
+                + struct.pack("!I", stream) + payload
+
+        def settings(*windows):
+            return frame(4, 0, 0, b"".join(struct.pack("!HI", 4, w) for w in windows))
+
+        def data_received(initial, updates):
+            """DATA bytes a 100-byte response gets, or all it gets before stalling."""
+            sock = socket.create_connection(("127.0.0.1", server.port), 5)
+            if USE_TLS:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                context.set_alpn_protocols(["h2"])
+                sock = context.wrap_socket(sock, server_hostname="localhost")
+            path = b"/late?100"
+            # GET, :scheme http, then :path and :authority as literals.
+            block = b"\x82\x86\x04" + bytes([len(path)]) + path + b"\x01\x09localhost"
+            sock.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + settings(initial)
+                         + frame(1, 0x5, 1, block) + settings(*updates))
+            received = 0
+            pending = b""
+            sock.settimeout(1.0)
+            try:
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        return received
+                    pending += chunk
+                    while len(pending) >= 9:
+                        n = int.from_bytes(pending[:3], "big")
+                        if len(pending) < 9 + n:
+                            break
+                        kind, flags = pending[3], pending[4]
+                        pending = pending[9 + n:]
+                        if kind == 4 and not flags & 1:
+                            sock.sendall(frame(4, 1, 0))
+                        elif kind == 0:
+                            received += n
+                            if flags & 1:
+                                return received
+            except socket.timeout:
+                return received
+            finally:
+                sock.close()
+
+        is_("INITIAL_WINDOW_SIZE given twice counts both (0, then 100 and 100)",
+            data_received(0, [100, 100]), 100)
+        is_("the second of two is what the window ends at (0, then 100 and 50)",
+            data_received(0, [100, 50]), 50)
+        is_("and no more is sent than the last allows (100, then 0 and 50)",
+            data_received(100, [0, 50]), 50)
 
 
 def test_cancellation():
