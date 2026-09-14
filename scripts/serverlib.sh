@@ -1,8 +1,8 @@
 # Starting and stopping the server a script owns.
 #
 # Sourced by the test and benchmark harnesses. It exists because they used to
-# clean up with `pkill -9 -x peregrine`, which matches by name: that takes down
-# every peregrine on the machine, including a second copy being compared against
+# clean up with `pkill -9 -x garuda`, which matches by name: that takes down
+# every garuda on the machine, including a second copy being compared against
 # and whatever somebody else happens to be running. `pkill -9 -f uvicorn` and
 # friends are wider still, since -f matches any command line containing the
 # word -- a text editor with the file open, or the invoking shell.

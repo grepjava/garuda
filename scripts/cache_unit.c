@@ -1,4 +1,4 @@
-/* The shared response cache, tested against peregrine_cache.c directly:
+/* The shared response cache, tested against garuda_cache.c directly:
  *
  *   bash scripts/cache-unit-test.sh
  *
@@ -11,7 +11,7 @@
  * particular shape, so every test runs in a process of its own. */
 #define _GNU_SOURCE
 
-#include "peregrine_cache.h"
+#include "garuda_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>

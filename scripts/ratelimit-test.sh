@@ -2,7 +2,7 @@
 # --rate-limit: who counts as a client, and that the count is the server's
 # rather than each worker's.
 #
-#   bash scripts/ratelimit-test.sh [path-to-peregrine]
+#   bash scripts/ratelimit-test.sh [path-to-garuda]
 #
 # The check that matters most is the multi-worker one. Each worker has its own
 # accept queue and a client's connections are spread across them by the
@@ -11,7 +11,7 @@
 # the counts come out exact.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8381}
 TLS_PORT=${TLS_PORT:-8382}
 METRICS_PORT=${METRICS_PORT:-8383}
@@ -127,7 +127,7 @@ else
     bad "HTTP/2: with retry-after" "a retry-after header" "$(tr -d '\r' < "$WORK/h2" | tr '\n' '|')"
 fi
 is "the refusals are counted" \
-   "$(curl -sS --max-time 5 "http://127.0.0.1:$METRICS_PORT/metrics" | awk '$1=="peregrine_requests_rate_limited_total" {print $2}')" "1"
+   "$(curl -sS --max-time 5 "http://127.0.0.1:$METRICS_PORT/metrics" | awk '$1=="garuda_requests_rate_limited_total" {print $2}')" "1"
 server_stop
 
 echo

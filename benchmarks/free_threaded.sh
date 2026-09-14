@@ -13,10 +13,10 @@
 # On a free-threaded interpreter (2) and (3) should land close together and well
 # above (1). On a standard interpreter (3) refuses to start, which is the point.
 #
-# usage: benchmarks/free_threaded.sh [/path/to/peregrine] [workers]
+# usage: benchmarks/free_threaded.sh [/path/to/garuda] [workers]
 set -u
 
-BIN="${1:-${PEREGRINE:-$HOME/pgbuild/release/peregrine}}"
+BIN="${1:-${GARUDA:-$HOME/pgbuild/release/garuda}}"
 WORKERS="${2:-$(nproc)}"
 PORT=8231
 APP_DIR="$(cd "$(dirname "$0")/contract" && pwd)"

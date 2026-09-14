@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="assets/peregrine-fiery-roaring.png" alt="peregrine" width="480">
+  <img src="assets/garuda-fiery-roaring.png" alt="garuda" width="480">
 </p>
 
 # Transports
 
-Peregrine speaks HTTP/1.1, HTTP/2, HTTP/3, WebSocket and WebTransport. This
-document is about what each of those is, what Peregrine implements of it, and
+Garuda speaks HTTP/1.1, HTTP/2, HTTP/3, WebSocket and WebTransport. This
+document is about what each of those is, what Garuda implements of it, and
 where the implementations disagree with the obvious approach and why.
 
 The architecture underneath — the connection table, the process model, the
@@ -27,7 +27,7 @@ next section.
 
 HTTP/2 and HTTP/3 do not change what a request is. They change how it is
 framed, how many can share a connection, and how the head is encoded. So
-Peregrine keeps one request path and makes the transports agree with it rather
+Garuda keeps one request path and makes the transports agree with it rather
 than the other way round.
 
 **A connection is a slot in the connection table.** For HTTP/1.1 that slot owns
@@ -124,7 +124,7 @@ dash-to-underscore environ mapping and let a client forge `X-Real-IP`), and a
 ## TLS
 
 ```bash
-peregrine --tls-cert fullchain.pem --tls-key privkey.pem myapp:app
+garuda --tls-cert fullchain.pem --tls-key privkey.pem myapp:app
 ```
 
 OpenSSL is handed the descriptor directly, so a TLS connection is the same
@@ -236,10 +236,10 @@ Conformance is checked with [h2spec](https://github.com/summerwind/h2spec):
 ## HTTP/3 and QUIC
 
 ```bash
-peregrine --http3 --tls-cert fullchain.pem --tls-key privkey.pem myapp:app
+garuda --http3 --tls-cert fullchain.pem --tls-key privkey.pem myapp:app
 ```
 
-The QUIC stack is Peregrine's own: packets, loss recovery, congestion control,
+The QUIC stack is Garuda's own: packets, loss recovery, congestion control,
 streams, flow control, key update, and a TLS 1.3 handshake. OpenSSL supplies
 primitives and nothing else — hash, HKDF, AEAD, key agreement, signature —
 because QUIC replaces the TLS record layer outright and `SSL_*` has no way to
@@ -293,7 +293,7 @@ On Linux, full-size datagrams to the same client go out in runs of up to 32
 per `sendmsg`, using UDP GSO (`UDP_SEGMENT`), so a burst costs one syscall
 instead of one per datagram. If the kernel or the network device refuses
 segmentation, the worker falls back to one datagram per call for the rest
-of its life. `PEREGRINE_UDP_GSO=0` forces that fallback, for comparison or
+of its life. `GARUDA_UDP_GSO=0` forces that fallback, for comparison or
 for a path that misbehaves with it.
 
 ### Alt-Svc
@@ -370,7 +370,7 @@ data is copied once into a Python `bytes` and not before.
 
 ### The ASGI extension
 
-ASGI has no WebTransport specification, so this one is Peregrine's. It is
+ASGI has no WebTransport specification, so this one is Garuda's. It is
 announced the way the specification says a server extension should be, in
 `scope["extensions"]["webtransport"]`, and `scope["type"]` is `"webtransport"`.
 
@@ -439,12 +439,12 @@ asserts on that field before it looks at the path. Starlette's router, which
 FastAPI is built on, allows `http`, `websocket` and `lifespan`, and nothing
 else.
 
-So `peregrine.contrib` puts a router in front, which answers sessions itself
+So `garuda.contrib` puts a router in front, which answers sessions itself
 and hands everything else to FastAPI unchanged.
 
 ```python
 from fastapi import FastAPI
-from peregrine.contrib.fastapi import WebTransportRouter
+from garuda.contrib.fastapi import WebTransportRouter
 
 api = FastAPI()
 app = WebTransportRouter(api)            # serve this one
@@ -461,7 +461,7 @@ Paths keep Starlette's spelling — `{room}`, and `{count:int}` for a converted
 parameter. A missing or extra trailing slash is tried the other way: a session
 cannot be HTTP-redirected.
 
-`peregrine.webtransport.WebTransportSession` is what those hand the endpoint,
+`garuda.webtransport.WebTransportSession` is what those hand the endpoint,
 and it is framework-agnostic: it demultiplexes the one ASGI `receive()` channel
 into streams, datagrams and the answers to stream-open requests, so an endpoint
 reads a stream as an async iterator rather than running its own state machine.

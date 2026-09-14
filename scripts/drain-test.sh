@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # --drain-delay: SIGTERM fails the health check and keeps serving, then drains.
 #
-#   bash scripts/drain-test.sh [path-to-peregrine]
+#   bash scripts/drain-test.sh [path-to-garuda]
 #
-# PEREGRINE_EXTRA_ARGS adds flags, e.g. "--free-threaded".
+# GARUDA_EXTRA_ARGS adds flags, e.g. "--free-threaded".
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8231}
 # shellcheck disable=SC2206 -- deliberately split into words.
-EXTRA=(${PEREGRINE_EXTRA_ARGS:-})
+EXTRA=(${GARUDA_EXTRA_ARGS:-})
 WORK=$(mktemp -d)
 PASS=0
 FAIL=0

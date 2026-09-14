@@ -21,15 +21,15 @@
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-PEREGRINE=${PEREGRINE:-$ROOT/scripts/peregrine-ext}
-export PEREGRINE_PYTHON=${PEREGRINE_PYTHON:-python3}
+GARUDA=${GARUDA:-$ROOT/scripts/garuda-ext}
+export GARUDA_PYTHON=${GARUDA_PYTHON:-python3}
 OHA=${OHA:-oha}
 PORT=${PORT:-8460}
 DURATION=${DURATION:-10s}
 CONNS=${CONNS:-16}
 SIZES=${SIZES:-"65536 1048576 16777216"}
 MODES=${MODES:-"http https h2"}
-EXTRA=${PEREGRINE_EXTRA_ARGS:-}
+EXTRA=${GARUDA_EXTRA_ARGS:-}
 WORK=${WORK:-$HOME/pgbench-static}
 
 rm -rf "$WORK"
@@ -70,7 +70,7 @@ start() {
     local tls=()
     [ "$1" != http ] && tls=(--tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem")
     # shellcheck disable=SC2086 -- EXTRA is deliberately split into words.
-    setsid "$PEREGRINE" --host 127.0.0.1 --port "$PORT" --workers 1 --log-level error \
+    setsid "$GARUDA" --host 127.0.0.1 --port "$PORT" --workers 1 --log-level error \
         "${tls[@]}" --static-dir "/f=$WORK/files" $EXTRA \
         --python-path "$ROOT/scripts" request_id_apps:asgi_app > "$WORK/server.log" 2>&1 &
     SID=$!

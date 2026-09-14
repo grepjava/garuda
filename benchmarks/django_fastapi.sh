@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # the-benchmarker contract: FastAPI (ASGI) and Django (WSGI, Granian's engine)
-# on Peregrine vs Granian. Columns match the dashboard: 64 / 256 / 512.
+# on Garuda vs Granian. Columns match the dashboard: 64 / 256 / 512.
 #
 #   bash benchmarks/django_fastapi.sh
 
@@ -8,7 +8,7 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export PYTHONPATH="$ROOT/benchmarks/contract${PYTHONPATH:+:$PYTHONPATH}"
-PEREGRINE=${PEREGRINE:-$HOME/pgbuild/release/peregrine}
+GARUDA=${GARUDA:-$HOME/pgbuild/release/garuda}
 VENV=${VENV:-$HOME/pgvenv}
 PORT=${PORT:-8210}
 DURATION=${DURATION:-15s}
@@ -79,14 +79,14 @@ echo "=== GET /  ${WORKERS} worker(s)  ${DURATION}  columns = connections ==="
 echo
 printf '%-28s%s\n' "server + framework" "$hdr"
 
-row "peregrine + fastapi" \
-    "$PEREGRINE" --port "$PORT" --workers "$WORKERS" --log-level error \
+row "garuda + fastapi" \
+    "$GARUDA" --port "$PORT" --workers "$WORKERS" --log-level error \
     --venv "$VENV" --python-path "$ROOT/benchmarks/contract" fastapi_app:app
 row "granian + fastapi" \
     "$VENV/bin/granian" --log-level critical --interface asgi \
     --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" fastapi_app:app
-row "peregrine + django" \
-    "$PEREGRINE" --port "$PORT" --workers "$WORKERS" --log-level error \
+row "garuda + django" \
+    "$GARUDA" --port "$PORT" --workers "$WORKERS" --log-level error \
     --venv "$VENV" --python-path "$ROOT/benchmarks/contract" django_app:application
 row "granian + django" \
     "$VENV/bin/granian" --log-level critical --interface wsgi \

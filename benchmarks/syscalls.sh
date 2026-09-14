@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# System calls per request for one Peregrine worker, counted with strace.
+# System calls per request for one Garuda worker, counted with strace.
 #
 #   bash benchmarks/syscalls.sh
 #   RUNS="asgi:64 fastapi:256" N=200000 bash benchmarks/syscalls.sh
@@ -16,7 +16,7 @@
 # concurrency are a floor. One connection shows the case with no batching at
 # all. read, write and epoll_ctl per request do not depend on timing.
 #
-# BUILD is a checkout whose python/peregrine holds a built _native
+# BUILD is a checkout whose python/garuda holds a built _native
 # (scripts/build-extension.sh). EXTRA adds server flags.
 #
 # Output, per run: system calls per request by name, then the total.
@@ -50,7 +50,7 @@ traced() {
     # shellcheck disable=SC2086 -- extra is deliberately split into flags.
     PYTHONPATH="$BUILD/python:$ROOT/benchmarks/contract" server_start \
         taskset -c "$SERVER_CPU" strace -f -c -o "$OUT/$tag.strace" \
-        "$VENV/bin/python" -m peregrine --host 127.0.0.1 --port "$PORT" \
+        "$VENV/bin/python" -m garuda --host 127.0.0.1 --port "$PORT" \
         --workers 1 --log-level error $EXTRA --venv "$VENV" \
         --python-path "$ROOT/benchmarks/contract" "$target" \
         > "$OUT/server.log" 2>&1

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SNI: the certificate served must follow the name the client asked for.
 #
-#   bash scripts/sni-test.sh [path-to-peregrine]
+#   bash scripts/sni-test.sh [path-to-garuda]
 #
 # Three certificates on one port -- two exact names and one wildcard -- plus the
 # rule for a name nothing claims, which is to answer with the first certificate
@@ -9,7 +9,7 @@
 # browser warning the user can read with a failure they cannot.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8341}
 WORK=$(mktemp -d)
 PASS=0
@@ -78,7 +78,7 @@ is "matching is case-insensitive"             "$(served_for BETA.Example)"      
 
 # The point of all this is that the server still serves.
 is "requests are still answered" \
-   "$(curl -sS -k --max-time 5 "https://127.0.0.1:$PORT/")" "hello from peregrine"
+   "$(curl -sS -k --max-time 5 "https://127.0.0.1:$PORT/")" "hello from garuda"
 
 # ALPN has to survive the context swap: SSL_set_SSL_CTX carries almost nothing
 # over, so a certificate chosen by SNI must still negotiate HTTP/2.

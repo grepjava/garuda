@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # The Python logging bridge: application records in the server's own log.
 #
-#   bash scripts/logging-test.sh [path-to-peregrine]
+#   bash scripts/logging-test.sh [path-to-garuda]
 #
 # What matters is that the two logs become one: same format, same level filter,
-# same stream. So the checks are about shape (a peregrine line, not a logging
+# same stream. So the checks are about shape (a garuda line, not a logging
 # one), about the level mapping, and about --log-level actually silencing the
 # application -- which is the thing two separate log configurations get wrong.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8371}
 WORK=$(mktemp -d)
 PASS=0
@@ -29,7 +29,7 @@ trap 'server_stop; rm -rf "$WORK"' EXIT
 
 cat > "$WORK/logapp.py" <<'PY'
 import logging
-from peregrine.logging import configure, server_level
+from garuda.logging import configure, server_level
 
 configure()
 logging.getLogger("boot").info("imported at module level")
@@ -115,12 +115,12 @@ hasnt "info is silenced with the server" "$WARN_LOG" "an info record"
 has   "warnings still come through"      "$WARN_LOG" "shop: a warning record"
 is    "the level the application sees follows" "$LEVEL" "30"
 
-# --- outside peregrine -----------------------------------------------------
+# --- outside garuda -----------------------------------------------------
 # A dictConfig naming the handler should not have to be conditional.
 OUT=$(cd "$WORK" && PYTHONPATH="$ROOT/python" python3 -c '
 import logging
-from peregrine.logging import PeregrineHandler, server_level
-h = PeregrineHandler()
+from garuda.logging import GarudaHandler, server_level
+h = GarudaHandler()
 h.setFormatter(logging.Formatter("%(name)s: %(message)s"))
 log = logging.getLogger("outside")
 log.addHandler(h)
@@ -128,7 +128,7 @@ log.setLevel(logging.INFO)
 log.info("still works")
 print("level", server_level())
 ' 2>&1)
-has "the handler works outside peregrine" "$OUT" "outside: still works"
+has "the handler works outside garuda" "$OUT" "outside: still works"
 has "and reports a usable level"          "$OUT" "level 10"
 
 echo

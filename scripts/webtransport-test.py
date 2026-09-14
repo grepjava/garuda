@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """WebTransport checks against an independent implementation.
 
-    <venv>/bin/python scripts/webtransport-test.py [path-to-peregrine]
+    <venv>/bin/python scripts/webtransport-test.py [path-to-garuda]
 
-Peregrine's QUIC, HTTP/3 and WebTransport are all its own code, so a test that
+Garuda's QUIC, HTTP/3 and WebTransport are all its own code, so a test that
 drives them with that same code would mostly be checking that it agrees with
 itself. aioquic shares none of it: it opens the session, prefixes the streams,
 frames the datagrams and reads the capsules by its own reading of the drafts.
@@ -35,7 +35,7 @@ except ImportError:
     raise SystemExit(2)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/garuda")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 CLOSE_WEBTRANSPORT_SESSION = 0x2843
@@ -77,7 +77,7 @@ def make_certs():
     global CERTS
     if CERTS is not None:
         return CERTS
-    directory = tempfile.mkdtemp(prefix="peregrine-wt-")
+    directory = tempfile.mkdtemp(prefix="garuda-wt-")
     cert = os.path.join(directory, "cert.pem")
     key = os.path.join(directory, "key.pem")
     try:
@@ -120,7 +120,7 @@ class Server:
                "--http3", "--tls-cert", cert, "--tls-key", key,
                "--python-path", os.path.join(ROOT, "examples"),
                # Ahead of the virtualenv deliberately: an installed release of
-               # peregrine would otherwise shadow the checkout being tested.
+               # garuda would otherwise shadow the checkout being tested.
                "--python-path", os.path.join(ROOT, "python")]
         # The framework examples import fastapi and django, which live in
         # whatever interpreter is running this script. Naming that virtualenv
@@ -693,11 +693,11 @@ SCOPE = {"type": "webtransport", "path": "/probe", "headers": []}
 
 
 async def session_helper():
-    """peregrine.webtransport, driven directly."""
+    """garuda.webtransport, driven directly."""
     print("\nThe session helper")
     sys.path.insert(0, os.path.join(ROOT, "python"))
-    from peregrine.webtransport import WebTransportSession
-    from peregrine.contrib.fastapi import WebTransportEndpoint
+    from garuda.webtransport import WebTransportSession
+    from garuda.contrib.fastapi import WebTransportEndpoint
 
     # A stream this endpoint opened, answered before create_stream() is
     # scheduled again. The reply belongs to the stream create_stream()
@@ -782,7 +782,7 @@ def main():
     run(session_helper())
 
     if not os.path.exists(BIN):
-        sys.stderr.write("no peregrine binary at %s\n" % BIN)
+        sys.stderr.write("no garuda binary at %s\n" % BIN)
         print("\n%d passed, %d failed (server tests skipped)" % (PASS, FAIL))
         return 2
     if make_certs() == (None, None):

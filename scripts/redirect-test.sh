@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # --redirect-http and --hsts.
 #
-#   bash scripts/redirect-test.sh [path-to-peregrine]
+#   bash scripts/redirect-test.sh [path-to-garuda]
 #
-# PEREGRINE_EXTRA_ARGS adds flags, e.g. "--free-threaded".
+# GARUDA_EXTRA_ARGS adds flags, e.g. "--free-threaded".
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8243}
 RPORT=${RPORT:-8280}
 # shellcheck disable=SC2206 -- deliberately split into words.
-EXTRA=(${PEREGRINE_EXTRA_ARGS:-})
+EXTRA=(${GARUDA_EXTRA_ARGS:-})
 WORK=$(mktemp -d)
 PASS=0
 FAIL=0

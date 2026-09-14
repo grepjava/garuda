@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """HTTP/3 checks against an independent implementation.
 
-    <venv>/bin/python scripts/http3-test.py [path-to-peregrine]
+    <venv>/bin/python scripts/http3-test.py [path-to-garuda]
 
-Peregrine's QUIC, TLS 1.3 and QPACK are its own; the packet protection is
+Garuda's QUIC, TLS 1.3 and QPACK are its own; the packet protection is
 checked against RFC 9001's vectors by the unit tests. What this adds is a peer
 that shares none of that code: aioquic drives the handshake, the transport and
 the HTTP/3 layer, so anything the two implementations disagree about shows up
@@ -36,11 +36,11 @@ except ImportError:
     raise SystemExit(2)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/garuda")
 
 # Extra server flags, so the same suite can be pointed at a different
-# execution model:  PEREGRINE_EXTRA_ARGS="--workers 4 --free-threaded"
-EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
+# execution model:  GARUDA_EXTRA_ARGS="--workers 4 --free-threaded"
+EXTRA = shlex.split(os.environ.get("GARUDA_EXTRA_ARGS", ""))
 
 PASS = 0
 FAIL = 0
@@ -79,7 +79,7 @@ def make_certs():
     global CERTS
     if CERTS is not None:
         return CERTS
-    directory = tempfile.mkdtemp(prefix="peregrine-h3-")
+    directory = tempfile.mkdtemp(prefix="garuda-h3-")
     cert = os.path.join(directory, "cert.pem")
     key = os.path.join(directory, "key.pem")
     try:
@@ -237,8 +237,8 @@ async def basics():
                            create_protocol=Client) as client:
             status, headers, body = await client.request("GET", "/")
             is_("a GET is answered", status, 200)
-            is_("the body arrives whole", body, b"hello from peregrine asgi\n")
-            is_("the server names itself", headers.get(b"server"), b"peregrine")
+            is_("the body arrives whole", body, b"hello from garuda asgi\n")
+            is_("the server names itself", headers.get(b"server"), b"garuda")
             check("a date is present", b"date" in headers, headers)
 
             status, headers, body = await client.request("HEAD", "/")
@@ -338,7 +338,7 @@ async def static_files():
             status, _, _ = await client.request("GET", "/static/missing.css")
             is_("a missing file reaches the application", status, 404)
             status, _, body = await client.request("GET", "/")
-            is_("the application still answers", body, b"hello from peregrine asgi\n")
+            is_("the application still answers", body, b"hello from garuda asgi\n")
 
     shutil.rmtree(root, ignore_errors=True)
 
@@ -449,7 +449,7 @@ async def request_bodies():
 
             status, _, body = await client.request("GET", "/")
             is_("the connection still works afterwards", (status, body),
-                (200, b"hello from peregrine asgi\n"))
+                (200, b"hello from garuda asgi\n"))
 
 
 async def multiplexing():
@@ -491,7 +491,7 @@ async def cancellation():
 
             status, _, body = await client.request("GET", "/")
             is_("a cancelled request does not disturb the connection",
-                (status, body), (200, b"hello from peregrine asgi\n"))
+                (status, body), (200, b"hello from garuda asgi\n"))
 
             # A reset stream is an unambiguous end, unlike a FIN on a socket,
             # which may only mean the peer has finished talking. /abandonable
@@ -588,7 +588,7 @@ async def spoofed_address():
                 status, body = None, b""
             is_("a forged packet does not redirect the connection", status, 200)
             is_("and the answer still reaches the client that asked",
-                body, b"hello from peregrine asgi\n")
+                body, b"hello from garuda asgi\n")
 
             leaked = b""
             try:
@@ -615,9 +615,9 @@ async def large_headers():
 
             # A header whose name is not in the static table at all.
             status, _, body = await client.request(
-                "GET", "/scope", headers=[(b"x-peregrine-probe", b"1")])
+                "GET", "/scope", headers=[(b"x-garuda-probe", b"1")])
             check("an unknown header name round trips",
-                  b"x-peregrine-probe" in body, body[:200])
+                  b"x-garuda-probe" in body, body[:200])
 
             # A value that is worse under Huffman than as bytes, so the
             # encoder has to choose the plain form.
@@ -702,7 +702,7 @@ async def wsgi():
                 status, headers, body = await client.request("GET", "/")
                 is_("a WSGI GET is answered (%s)" % label, status, 200)
                 is_("the body arrives intact (%s)" % label, body,
-                    b"hello from peregrine\n")
+                    b"hello from garuda\n")
                 is_("a length is declared (%s)" % label,
                     headers.get(b"content-length"), b"21")
                 check("no HTTP/1 framing survives (%s)" % label,
@@ -912,7 +912,7 @@ async def main():
     if cert is None:
         print("skipped: no openssl to make a certificate")
         return 0
-    print("peregrine HTTP/3 tests (%s)" % BIN)
+    print("garuda HTTP/3 tests (%s)" % BIN)
 
     for test in (basics, hsts, health_check, static_files, congestion, compression, request_bodies, multiplexing, cancellation, rapid_reset,
                  spoofed_address, large_headers, response_framing, flow_control, long_lived,

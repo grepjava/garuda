@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A reload must not cost a client anything.
 #
-#   bash scripts/reload-test.sh [path-to-peregrine]
+#   bash scripts/reload-test.sh [path-to-garuda]
 #
 # Hammers the server with short-lived connections, sends SIGHUP underneath the
 # load, and fails if a single connection was refused, reset, truncated or timed
@@ -20,8 +20,8 @@
 # the replacement is spawned before the worker it replaces is asked to stop.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
-EXTRA=${PEREGRINE_EXTRA_ARGS:-}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
+EXTRA=${GARUDA_EXTRA_ARGS:-}
 PORT=${PORT:-8311}
 WORKERS=${WORKERS:-4}
 SECONDS_OF_LOAD=${SECONDS_OF_LOAD:-12}
@@ -30,7 +30,7 @@ RELOADS=${RELOADS:-3}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
-LOG=${TMPDIR:-/tmp}/peregrine-reload-$PORT.log
+LOG=${TMPDIR:-/tmp}/garuda-reload-$PORT.log
 PASS=0
 FAIL=0
 
@@ -73,7 +73,7 @@ BEFORE=$(sample_pids $((WORKERS * 8)))
 echo "  workers before: $BEFORE"
 
 # Load first, reloads underneath it.
-RESULT=${TMPDIR:-/tmp}/peregrine-reload-result-$PORT.json
+RESULT=${TMPDIR:-/tmp}/garuda-reload-result-$PORT.json
 python3 "$HERE/reload_load.py" 127.0.0.1 "$PORT" "$SECONDS_OF_LOAD" "$CLIENTS" \
     > "$RESULT" &
 LOAD_PID=$!

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end checks for the behaviour a curl-based script cannot reach.
 
-    python3 scripts/feature-test.py [path-to-peregrine]
+    python3 scripts/feature-test.py [path-to-garuda]
 
 Everything here exists because it is a failure mode that only shows up under
 conditions an ordinary request never creates: a client that reads slowly, a
@@ -36,12 +36,12 @@ import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/garuda")
 
 # Extra server flags, so most of the suite can be pointed at a different
-# execution model:  PEREGRINE_EXTRA_ARGS="--workers 4 --free-threaded"
+# execution model:  GARUDA_EXTRA_ARGS="--workers 4 --free-threaded"
 # The free-threaded section below sets its own flags and ignores this.
-EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
+EXTRA = shlex.split(os.environ.get("GARUDA_EXTRA_ARGS", ""))
 
 PASS = 0
 FAIL = 0
@@ -235,7 +235,7 @@ def make_certs():
     """A throwaway self-signed certificate for the TLS checks."""
     global CERTS
     if CERTS is None:
-        directory = tempfile.mkdtemp(prefix="peregrine-tls-")
+        directory = tempfile.mkdtemp(prefix="garuda-tls-")
         cert = os.path.join(directory, "cert.pem")
         key = os.path.join(directory, "key.pem")
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
@@ -633,12 +633,12 @@ def test_graceful_shutdown():
     s.close()
 
     # Lifespan shutdown runs, and runs after the request tasks.
-    marker = os.path.join(tempfile.gettempdir(), "peregrine-shutdown-%d" % os.getpid())
+    marker = os.path.join(tempfile.gettempdir(), "garuda-shutdown-%d" % os.getpid())
     if os.path.exists(marker):
         os.unlink(marker)
     port = free_port()
     server = Server("--graceful-timeout", "5000", port=port,
-                    env={"PEREGRINE_SHUTDOWN_MARKER": marker})
+                    env={"GARUDA_SHUTDOWN_MARKER": marker})
     server.get("/")
     server.stop(timeout=20)
     check("lifespan shutdown runs on SIGTERM", os.path.exists(marker),
@@ -649,7 +649,7 @@ def test_graceful_shutdown():
 
 def test_multiworker_unix():
     print("\nMultiworker unix socket")
-    path = os.path.join(tempfile.gettempdir(), "peregrine-mw-%d.sock" % os.getpid())
+    path = os.path.join(tempfile.gettempdir(), "garuda-mw-%d.sock" % os.getpid())
     if os.path.exists(path):
         os.unlink(path)
     server = Server("--workers", "4", unix=path)
@@ -821,7 +821,7 @@ def test_wsgi_threads():
     # Correctness must not depend on the execution model.
     port = free_port()
     with Server("--wsgi-threads", "4", port=port, app="wsgi_app:application") as server:
-        is_("pooled GET /", server.get("/")[2], b"hello from peregrine\n")
+        is_("pooled GET /", server.get("/")[2], b"hello from garuda\n")
         is_("pooled 404", server.get("/nope")[0], 404)
         is_("pooled 500", server.get("/boom")[0], 500)
         status, headers, body = server.get("/stream")
@@ -1332,24 +1332,24 @@ def test_metrics():
 
         v = values(body)
         is_("requests are counted by status class, across every worker",
-            (v.get('peregrine_requests_total{status="2xx"}'),
-             v.get('peregrine_requests_total{status="4xx"}')),
+            (v.get('garuda_requests_total{status="2xx"}'),
+             v.get('garuda_requests_total{status="4xx"}')),
             (7.0, 1.0))
         is_("the scrape reports every worker's counters",
-            v.get("peregrine_workers"), 2.0)
+            v.get("garuda_workers"), 2.0)
         check("connections are counted",
-              v.get("peregrine_connections_accepted_total", 0) >= 8,
-              "accepted %r" % v.get("peregrine_connections_accepted_total"))
+              v.get("garuda_connections_accepted_total", 0) >= 8,
+              "accepted %r" % v.get("garuda_connections_accepted_total"))
         check("the duration histogram counts every request",
-              v.get("peregrine_request_duration_seconds_count") == 8.0,
-              "count was %r" % v.get("peregrine_request_duration_seconds_count"))
+              v.get("garuda_request_duration_seconds_count") == 8.0,
+              "count was %r" % v.get("garuda_request_duration_seconds_count"))
         check("and its buckets are cumulative",
-              v.get('peregrine_request_duration_seconds_bucket{le="+Inf"}') == 8.0,
+              v.get('garuda_request_duration_seconds_bucket{le="+Inf"}') == 8.0,
               "+Inf was %r"
-              % v.get('peregrine_request_duration_seconds_bucket{le="+Inf"}'))
+              % v.get('garuda_request_duration_seconds_bucket{le="+Inf"}'))
         check("the buffer pool reports hits and misses",
-              "peregrine_buffer_pool_hits_total" in v
-              and "peregrine_buffer_pool_misses_total" in v,
+              "garuda_buffer_pool_hits_total" in v
+              and "garuda_buffer_pool_misses_total" in v,
               str(sorted(k for k in v if "pool" in k)))
 
         # The scrape port is not a way into the application, and the service
@@ -1379,7 +1379,7 @@ def test_metrics():
         status, _, body = read_http_response(s)
         s.close()
         is_("and it is answered in full", status, 200)
-        check("with the whole exposition", b"peregrine_requests_total" in body,
+        check("with the whole exposition", b"garuda_requests_total" in body,
               body[:80])
 
         # Places to wait in are finite, and a peer that stops writing must not
@@ -1435,7 +1435,7 @@ def test_metrics():
                     s.sendall(bytes([byte]))
                     time.sleep(0.01)
                 status, _, body = read_http_response(s)
-                outcome = status if b"peregrine_requests_total" in body else "short"
+                outcome = status if b"garuda_requests_total" in body else "short"
             except OSError as e:
                 outcome = type(e).__name__
             finally:
@@ -1457,7 +1457,7 @@ def test_factory():
     port = free_port()
     with Server("--factory", port=port, app="wsgi_app:make_application") as server:
         is_("--factory calls the target to get the application",
-            server.get("/")[2], b"hello from peregrine\n")
+            server.get("/")[2], b"hello from garuda\n")
 
 
 def test_worker_restart():
@@ -1647,7 +1647,7 @@ def test_tls():
     with Server(port=port, tls=True, alpn=["http/1.1"]) as server:
         status, headers, body = server.get("/")
         is_("a request over TLS is answered", status, 200)
-        is_("the body survives the record layer", body, b"hello from peregrine asgi\n")
+        is_("the body survives the record layer", body, b"hello from garuda asgi\n")
 
         # A TLS listener is https, and the application should be told so
         # rather than having to guess from a port number.
@@ -1818,7 +1818,7 @@ def test_shutdown_is_bounded():
     # that reports itself finished and then ignores its own cancellation.
     port = free_port()
     server = Server("--graceful-timeout", "200", port=port,
-                    env={"PEREGRINE_STUBBORN_LIFESPAN": "1"})
+                    env={"GARUDA_STUBBORN_LIFESPAN": "1"})
     is_("the server runs with a stubborn lifespan handler",
         server.get("/")[0], 200)
     code, elapsed = server.stop(timeout=30)
@@ -1996,7 +1996,7 @@ def test_free_threaded():
     # attached to: the supervising thread's, which serves nothing.
     def startup_count(expected, *extra):
         marker = os.path.join(tempfile.gettempdir(),
-                              "peregrine-ft-boot-%d" % os.getpid())
+                              "garuda-ft-boot-%d" % os.getpid())
         if os.path.exists(marker):
             os.unlink(marker)
 
@@ -2008,7 +2008,7 @@ def test_free_threaded():
 
         port = free_port()
         server = Server("--workers", "4", "--free-threaded", *extra, port=port,
-                        env={"PEREGRINE_STARTUP_COUNTER": marker})
+                        env={"GARUDA_STARTUP_COUNTER": marker})
         try:
             server.get("/")
             # The first answer proves one worker has started, not all of them:
@@ -2039,7 +2039,7 @@ def test_free_threaded():
     # `startup` needs it back after every await, and would never get it.
     port = free_port()
     server = Server("--workers", "2", "--free-threaded", port=port,
-                    env={"PYTHON_GIL": "1", "PEREGRINE_STARTUP_DELAY": "0.1"})
+                    env={"PYTHON_GIL": "1", "GARUDA_STARTUP_DELAY": "0.1"})
     try:
         code = 0
         deadline = time.monotonic() + 10
@@ -2072,13 +2072,13 @@ def test_free_threaded():
 
     # --- shutdown: in-flight requests on worker threads are waited for, and
     #     the lifespan shuts down only afterwards ---
-    marker = os.path.join(tempfile.gettempdir(), "peregrine-ft-shutdown-%d" % os.getpid())
+    marker = os.path.join(tempfile.gettempdir(), "garuda-ft-shutdown-%d" % os.getpid())
     if os.path.exists(marker):
         os.unlink(marker)
     port = free_port()
     server = Server("--workers", "4", "--free-threaded",
                     "--graceful-timeout", "10000", port=port,
-                    env={"PEREGRINE_SHUTDOWN_MARKER": marker})
+                    env={"GARUDA_SHUTDOWN_MARKER": marker})
     s = server.connect(timeout=20)
     s.sendall(b"GET /slow?1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     time.sleep(0.3)
@@ -2124,7 +2124,7 @@ def main():
     if not os.path.exists(BIN):
         print("no such binary: %s" % BIN)
         return 2
-    print("peregrine feature tests (%s)" % BIN)
+    print("garuda feature tests (%s)" % BIN)
     for test in (test_header_shapes, test_factory, test_websockets, test_backpressure,
                  test_tls, test_response_length, test_streaming_request_bodies,
                  test_request_backpressure, test_receive_after_response,

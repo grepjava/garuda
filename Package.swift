@@ -1,158 +1,63 @@
 // swift-tools-version: 6.1
 import PackageDescription
 
-// Peregrine — a Python ASGI/WSGI server written in Swift.
-//
-// Design constraints baked into this manifest:
-//  * No Foundation anywhere. Foundation drags in ARC-heavy bridging types
-//    (NSString, NSData, DispatchQueue) that we cannot afford on the hot path.
-//  * All platform syscalls and every CPython macro live in the C target so the
-//    Swift side never has to import packed structs, unions or varargs.
-//  * Whole-module optimisation + cross-module optimisation so the many tiny
-//    `@inlinable` byte-pushing helpers actually collapse.
+// Garuda — a pure-Swift web framework. No Foundation, no CPython.
 
 let sharedSwiftSettings: [SwiftSetting] = [
     .swiftLanguageMode(.v6),
-    // Exclusivity checking on a struct-of-pointers connection table costs real
-    // time and buys nothing: none of these structs are ever shared.
     .unsafeFlags(["-enforce-exclusivity=unchecked"], .when(configuration: .release)),
-    .define("PEREGRINE_RELEASE", .when(configuration: .release)),
+    .define("GARUDA_RELEASE", .when(configuration: .release)),
 ]
 
-// PEREGRINE_EXTENSION=1 builds the server as peregrine._native, a CPython
-// extension module, instead of as an executable embedding libpython (see
-// scripts/build-extension.sh). Python then comes from the interpreter that
-// imports the module, so nothing links libpython: `python3.pc` supplies the
-// headers only, where `python3-embed.pc` adds -lpython3.x. The two cannot share
-// one build, since every target that touches Python would carry the flag.
-let hosted = (Context.environment["PEREGRINE_EXTENSION"] ?? "0") != "0"
-
-// PEREGRINE_PYTHON_PC names the pkg-config package exactly. python3.pc and
-// python3-embed.pc are only aliases, and an installation is not obliged to
-// carry them: a versioned Homebrew keg ships python-3.13.pc alone, and
-// pkg-config then answers `python3` with whichever other Python on the search
-// path has one. setup.py and scripts/build-extension.sh pass the interpreter's
-// versioned name, python-<LDVERSION>, whenever it exists.
-let pythonPackage = Context.environment["PEREGRINE_PYTHON_PC"]
-    ?? (hosted ? "python3" : "python3-embed")
-
 let package = Package(
-    name: "peregrine",
+    name: "garuda",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "peregrine", targets: ["peregrine"]),
-        .library(name: "Peregrine", targets: ["PeregrineServer"]),
+        .executable(name: "garuda", targets: ["garuda"]),
+        .library(name: "Garuda", targets: ["GarudaServer"]),
     ],
     targets: [
-        // libpython, located through `python3-embed.pc` -- or, for the
-        // extension module, only its headers, through `python3.pc`.
-        .systemLibrary(
-            name: "CPython",
-            path: "Sources/CPython",
-            pkgConfig: pythonPackage,
-            providers: [
-                .apt(["python3-dev"]),
-                .yum(["python3-devel"]),
-                .brew(["python@3.13"]),
-            ]
-        ),
-
-        // Syscall wrappers (epoll/kqueue, sockets, sendfile, clock) plus every
-        // CPython construct that is a macro, a union, or variadic.
         .target(
-            name: "CPeregrine",
-            dependencies: ["CPython"],
-            path: "Sources/CPeregrine",
+            name: "CGaruda",
+            path: "Sources/CGaruda",
             cSettings: [
-                // Feature-test macros are set inside the .c files, never here:
-                // a define that reaches the module build would change glibc
-                // struct layouts relative to SwiftGlibc.
                 .headerSearchPath("include"),
             ],
-            // TLS. OpenSSL supplies the primitives and the handshake; the
-            // protocol state above it is ours. Headers are reached only from
-            // peregrine_tls.c, never from anything Swift imports.
             linkerSettings: [
                 .linkedLibrary("ssl"),
                 .linkedLibrary("crypto"),
-                // gzip. brotli and zstd are opened at run time instead, so
-                // a machine without them still runs; see peregrine_compress.c.
                 .linkedLibrary("z"),
             ]
         ),
 
-        .target(name: "PeregrineCore", dependencies: ["CPeregrine"],
+        .target(name: "GarudaCore", dependencies: ["CGaruda"],
                 swiftSettings: sharedSwiftSettings),
 
-        .target(name: "PeregrineHTTP", dependencies: ["PeregrineCore"],
+        .target(name: "GarudaHTTP", dependencies: ["GarudaCore"],
                 swiftSettings: sharedSwiftSettings),
 
-        // QUIC and its TLS 1.3 handshake. QUIC replaces the TLS record layer,
-        // so OpenSSL is used here only for primitives -- hash, HKDF, AEAD, key
-        // agreement, signature -- and the protocol above them is ours.
-        .target(name: "PeregrineQUIC", dependencies: ["PeregrineCore", "PeregrineHTTP"],
+        .target(name: "GarudaQUIC", dependencies: ["GarudaCore", "GarudaHTTP"],
                 swiftSettings: sharedSwiftSettings),
 
-        .target(name: "PeregrinePython", dependencies: ["CPython", "CPeregrine", "PeregrineCore"],
+        .target(name: "GarudaServer",
+                dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC"],
                 swiftSettings: sharedSwiftSettings),
 
-        .target(name: "PeregrineWSGI",
-                dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrinePython"],
-                swiftSettings: sharedSwiftSettings),
-
-        .target(name: "PeregrineASGI",
-                dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrinePython"],
-                swiftSettings: sharedSwiftSettings),
-
-        .target(name: "PeregrineServer",
-                dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrinePython",
-                               "PeregrineWSGI", "PeregrineASGI", "PeregrineQUIC"],
-                swiftSettings: sharedSwiftSettings),
-
-        .executableTarget(name: "peregrine", dependencies: ["PeregrineServer"],
+        .executableTarget(name: "garuda", dependencies: ["GarudaServer"],
                           swiftSettings: sharedSwiftSettings),
 
-        // The parsers that read bytes chosen by the peer, with the invariants
-        // that have to survive them. A library rather than part of `pgfuzz`
-        // because the test suite replays the same corpus through it.
-        .target(name: "PeregrineFuzzTargets",
-                dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrineQUIC"],
+        .target(name: "GarudaFuzzTargets",
+                dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC"],
                 swiftSettings: sharedSwiftSettings),
 
-        // Not a product: a development tool, built by `swift build` and run by
-        // `swift run pgfuzz`, that nobody has to install.
         .executableTarget(name: "pgfuzz",
-                          dependencies: ["CPeregrine", "PeregrineFuzzTargets"],
+                          dependencies: ["CGaruda", "GarudaFuzzTargets"],
                           swiftSettings: sharedSwiftSettings),
 
-        .testTarget(name: "PeregrineTests",
-                    dependencies: ["PeregrineCore", "PeregrineHTTP", "PeregrineQUIC",
-                                   "PeregrineFuzzTargets"],
+        .testTarget(name: "GarudaTests",
+                    dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC",
+                                   "GarudaServer", "GarudaFuzzTargets"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
     ],
     cLanguageStandard: .gnu11
 )
-
-if hosted {
-    // A shared object whose Python symbols stay undefined until python loads
-    // it. Nothing that has to link on its own -- the executables and the test
-    // runner -- can be built from the same flags, so they are left out.
-    package.products = [
-        .library(name: "PeregrineExtension", type: .dynamic, targets: ["PeregrineExtension"]),
-    ]
-    package.targets.removeAll { $0.type == .executable || $0.type == .test }
-    package.targets.append(
-        .target(name: "PeregrineExtension",
-                dependencies: ["CPeregrine", "PeregrineServer"],
-                swiftSettings: sharedSwiftSettings,
-                // Calls from the server into its own functions bind at link
-                // time, as they do in the executable, instead of going through
-                // the PLT so that another library could interpose them.
-                linkerSettings: [
-                    .unsafeFlags(["-Xlinker", "-Bsymbolic-functions"], .when(platforms: [.linux])),
-                    // Mach-O refuses a library with undefined symbols unless
-                    // told that whoever loads it will supply them.
-                    .unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"],
-                                 .when(platforms: [.macOS])),
-                ]))
-}

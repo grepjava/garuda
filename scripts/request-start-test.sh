@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # --request-start-header: the application is told when its request arrived.
 #
-#   bash scripts/request-start-test.sh [path-to-peregrine]
+#   bash scripts/request-start-test.sh [path-to-garuda]
 #
 # The value that matters is the one for a request that waited. With one worker
 # and no threads, a request sent while another is being served sits unread
@@ -10,7 +10,7 @@
 # time the header exists to report.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8391}
 TLS_PORT=${TLS_PORT:-8392}
 WORK=$(mktemp -d)

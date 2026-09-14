@@ -16,8 +16,8 @@ __pycache__/
 # anyway.
 .pypi-token
 
-# peregrine._native, built in place by scripts/build-extension.sh.
-python/peregrine/_native*.so
+# garuda._native, built in place by scripts/build-extension.sh.
+python/garuda/_native*.so
 
 # What `bun install` fetches for benchmarks/elysia-bun; upstream keeps no lockfile.
 benchmarks/elysia-bun/node_modules/

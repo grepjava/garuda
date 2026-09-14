@@ -1,9 +1,9 @@
 # The image builds the server from source for its own interpreter, so nothing
 # built on the host may reach it: a module for another python would be
 # harmless only until something imported it.
-python/peregrine/_native*
-python/peregrine/_bin
-python/peregrine/_swift
+python/garuda/_native*
+python/garuda/_bin
+python/garuda/_swift
 **/__pycache__
 **/*.egg-info
 .build*

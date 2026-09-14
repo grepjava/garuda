@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Raw ASGI and WSGI applications, FastAPI, Django, Flask and BlackSheep on
-# peregrine, uvicorn, granian and fastpysgi, and Elysia on Bun as a reference,
+# garuda, uvicorn, granian and fastpysgi, and Elysia on Bun as a reference,
 # with the load command
 # and applications of the-benchmarker/web-frameworks at 4bb9eaa (develop,
 # 2026-09-13). The results are not comparable with the figures that site
 # publishes; BENCHMARKS.md says why.
 #
 #   bash benchmarks/frameworks.sh > results.tsv
-#   FRAMEWORKS=blacksheep SERVERS=peregrine-ext bash benchmarks/frameworks.sh
+#   FRAMEWORKS=blacksheep SERVERS=garuda-ext bash benchmarks/frameworks.sh
 #   LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
 #
 # The load is the upstream collect command, flag for flag (.tasks/config.rake
@@ -23,7 +23,7 @@
 # figure reported is zrk's achieved_rate -- the number the results site
 # ranks by. The applications are the upstream python/fastapi, python/flask and
 # python/blacksheep sources, byte for byte (benchmarks/contract/), or with
-# SOURCES=upstream the suite's peregrine-* entries (benchmarks/web-frameworks/).
+# SOURCES=upstream the suite's garuda-* entries (benchmarks/web-frameworks/).
 #
 # LOAD=closed replaces the ramp with closed-loop oha, `oha -c N -z DURATION`,
 # which measures capacity instead. The ramp offers its average rate at most,
@@ -53,7 +53,7 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VENV=${VENV:-$HOME/fastapi-bench-venv}
-PEREGRINE=${PEREGRINE:-$HOME/pgbuild/release/peregrine}
+GARUDA=${GARUDA:-$HOME/pgbuild/release/garuda}
 ZRK=${ZRK:-zrk}
 OHA=${OHA:-oha}
 LOAD=${LOAD:-ramp}
@@ -71,7 +71,7 @@ DURATION=${DURATION:-15s}
 # old figure capped a run at about 96,500 req/s.
 RATE=${RATE:-1000:500000}
 FRAMEWORKS=${FRAMEWORKS:-"fastapi flask"}
-SERVERS=${SERVERS:-"peregrine-ext peregrine uvicorn granian fastpysgi"}
+SERVERS=${SERVERS:-"garuda-ext garuda uvicorn granian fastpysgi"}
 # FRAMEWORKS=elysia SERVERS=elysia-bun measures upstream's javascript/elysia-bun
 # (benchmarks/elysia-bun/, byte for byte) as a non-Python reference. The app
 # listens on 3000 itself, so PORT must be 3000. Needs bun on PATH or in ~/.bun.
@@ -88,16 +88,16 @@ fi
 # fresh, for measuring --cache-size.
 CONTRACT=${CONTRACT:-$ROOT/benchmarks/contract}
 # SOURCES=upstream runs each Python framework from benchmarks/web-frameworks/,
-# the suite's peregrine-* entries (Flask and BlackSheep from its flask and
+# the suite's garuda-* entries (Flask and BlackSheep from its flask and
 # blacksheep entries) copied as they are, instead of from CONTRACT.
 SOURCES=${SOURCES:-contract}
 BASE_PYTHONPATH=${PYTHONPATH:-}
-# Where peregrine-ext loads peregrine._native from: another checkout, built
+# Where garuda-ext loads garuda._native from: another checkout, built
 # with scripts/build-extension.sh, to compare two versions in one session.
 EXT_ROOT=${EXT_ROOT:-$ROOT}
-# Extra flags for both peregrine servers, e.g. "--cache-size 64".
+# Extra flags for both garuda servers, e.g. "--cache-size 64".
 # shellcheck disable=SC2206 -- deliberately split into words.
-PEREGRINE_ARGS=(${PEREGRINE_EXTRA_ARGS:-})
+GARUDA_ARGS=(${GARUDA_EXTRA_ARGS:-})
 URL="http://127.0.0.1:$PORT/"
 OUT=$(mktemp -d)
 
@@ -116,7 +116,7 @@ start() {
     asgi)       app=asgi:app;               interface=asgi ;;
     wsgi)       app=wsgi:application;       interface=wsgi ;;
     fastapi)    app=fastapi_app:app;        interface=asgi ;;
-    # Upstream's peregrine-django entry serves Django over WSGI.
+    # Upstream's garuda-django entry serves Django over WSGI.
     django)     app=django_app:application; interface=wsgi ;;
     flask)      app=flask_app:app;          interface=wsgi ;;
     blacksheep) app=blacksheep_app:app;     interface=asgi ;;
@@ -124,23 +124,23 @@ start() {
     if [ "$SOURCES" = upstream ] && [ "$framework" != elysia ]; then
         # The suite's own directory for the entry, run under the module name
         # its config.yaml gives.
-        appdir=$ROOT/benchmarks/web-frameworks/peregrine-$framework
+        appdir=$ROOT/benchmarks/web-frameworks/garuda-$framework
         app=server:app
         [ "$framework" = django ] && app=app.wsgi:application
     fi
     export PYTHONPATH="$appdir${BASE_PYTHONPATH:+:$BASE_PYTHONPATH}"
     case "$server" in
-    peregrine)
-        server_start "${PIN_SERVER[@]}" "$PEREGRINE" --log-level error --protocol "$interface" \
-            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${PEREGRINE_ARGS[@]}" \
+    garuda)
+        server_start "${PIN_SERVER[@]}" "$GARUDA" --log-level error --protocol "$interface" \
+            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}" \
             --venv "$VENV" --python-path "$appdir" "$app" ;;
-    peregrine-ext)
+    garuda-ext)
         # The same server as an extension module, run by the virtualenv python:
-        # peregrine._native, from scripts/build-extension.sh -- what a wheel
+        # garuda._native, from scripts/build-extension.sh -- what a wheel
         # installs, measured beside the executable above.
-        PYTHONPATH="$EXT_ROOT/python:$PYTHONPATH" server_start "${PIN_SERVER[@]}" "$VENV/bin/python" -m peregrine \
+        PYTHONPATH="$EXT_ROOT/python:$PYTHONPATH" server_start "${PIN_SERVER[@]}" "$VENV/bin/python" -m garuda \
             --log-level error --protocol "$interface" \
-            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${PEREGRINE_ARGS[@]}" \
+            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}" \
             --venv "$VENV" --python-path "$appdir" "$app" ;;
     uvicorn)
         # uvicorn[standard] picks uvloop and httptools by itself. uvicorn spells

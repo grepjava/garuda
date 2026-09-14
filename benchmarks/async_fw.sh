@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# the-benchmarker contract: Sanic and BlackSheep on Peregrine vs Granian.
+# the-benchmarker contract: Sanic and BlackSheep on Garuda vs Granian.
 #
 # Same columns as the dashboard: wrk-style closed-loop GET / at 64, 256, 512
 # connections, 15s each. Server stays up across the three loads.
@@ -10,7 +10,7 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export PYTHONPATH="$ROOT/benchmarks/contract${PYTHONPATH:+:$PYTHONPATH}"
-PEREGRINE=${PEREGRINE:-$HOME/pgbuild/release/peregrine}
+GARUDA=${GARUDA:-$HOME/pgbuild/release/garuda}
 VENV=${VENV:-$HOME/pgvenv}
 PORT=${PORT:-8210}
 DURATION=${DURATION:-15s}
@@ -81,14 +81,14 @@ echo "=== GET /  ${WORKERS} worker(s)  ${DURATION}  columns = connections ==="
 echo
 printf '%-28s%s\n' "server + framework" "$hdr"
 
-row "peregrine + sanic" \
-    "$PEREGRINE" --port "$PORT" --workers "$WORKERS" --log-level error \
+row "garuda + sanic" \
+    "$GARUDA" --port "$PORT" --workers "$WORKERS" --log-level error \
     --venv "$VENV" --python-path "$ROOT/benchmarks/contract" sanic_app:app
 row "granian + sanic" \
     "$VENV/bin/granian" --log-level critical --interface asgi \
     --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" sanic_app:app
-row "peregrine + blacksheep" \
-    "$PEREGRINE" --port "$PORT" --workers "$WORKERS" --log-level error \
+row "garuda + blacksheep" \
+    "$GARUDA" --port "$PORT" --workers "$WORKERS" --log-level error \
     --venv "$VENV" --python-path "$ROOT/benchmarks/contract" blacksheep_app:app
 row "granian + blacksheep" \
     "$VENV/bin/granian" --log-level critical --interface asgi \

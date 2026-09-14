@@ -25,8 +25,8 @@
 // replays it on every `swift test`, and a fixed crash stays fixed.
 //===----------------------------------------------------------------------===//
 
-import CPeregrine
-import PeregrineFuzzTargets
+import CGaruda
+import GarudaFuzzTargets
 
 #if canImport(Glibc)
 import Glibc

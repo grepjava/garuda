@@ -13,7 +13,7 @@
 # Two builds are required, one for a GIL CPython and one for a free-threaded
 # CPython (python3.13t / 3.14t); they are not interchangeable. By default they
 # are the executables GIL_BIN and FT_BIN. With EXTENSION=1 they are
-# peregrine._native, run by each venv's own python -- build one for each
+# garuda._native, run by each venv's own python -- build one for each
 # interpreter with scripts/build-extension.sh.
 set -u
 
@@ -22,8 +22,8 @@ EXTENSION=${EXTENSION:-0}
 export PYTHONPATH="$ROOT/benchmarks/contract${PYTHONPATH:+:$PYTHONPATH}"
 [ "$EXTENSION" = 1 ] && export PYTHONPATH="$ROOT/python:$PYTHONPATH"
 
-GIL_BIN=${GIL_BIN:-$HOME/pgbuild/release/peregrine}
-FT_BIN=${FT_BIN:-$HOME/pgbuild-ft/release/peregrine}
+GIL_BIN=${GIL_BIN:-$HOME/pgbuild/release/garuda}
+FT_BIN=${FT_BIN:-$HOME/pgbuild-ft/release/garuda}
 GIL_VENV=${GIL_VENV:-$HOME/pgvenv}
 FT_VENV=${FT_VENV:-$HOME/pgvenv-ft}
 PORT=${PORT:-8210}
@@ -84,11 +84,11 @@ row() {
 }
 
 # The command that starts the server for one build: the binary, or with
-# EXTENSION=1 the venv's python running peregrine._native.
+# EXTENSION=1 the venv's python running garuda._native.
 server_command() {
     local bin="$1" venv="$2"
     if [ "$EXTENSION" = 1 ]; then
-        echo "$venv/bin/python -m peregrine"
+        echo "$venv/bin/python -m garuda"
     else
         echo "$bin"
     fi
@@ -130,9 +130,9 @@ run_matrix() {
 trap stop EXIT
 
 if [ "$EXTENSION" = 1 ]; then
-    echo "server:     peregrine._native (EXTENSION=1)"
-    echo "GIL:        $("$GIL_VENV/bin/python" -m peregrine --version | tr -d '\n')"
-    echo "FT:         $("$FT_VENV/bin/python" -m peregrine --version | tr -d '\n')"
+    echo "server:     garuda._native (EXTENSION=1)"
+    echo "GIL:        $("$GIL_VENV/bin/python" -m garuda --version | tr -d '\n')"
+    echo "FT:         $("$FT_VENV/bin/python" -m garuda --version | tr -d '\n')"
 else
     echo "GIL binary: $($GIL_BIN --version | tr -d '\n')"
     echo "FT  binary: $($FT_BIN --version | tr -d '\n')"

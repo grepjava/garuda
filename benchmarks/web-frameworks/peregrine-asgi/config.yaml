@@ -1,6 +1,0 @@
-framework:
-  github: grepjava/peregrine
-  version: 1.0
-
-  engines:
-    - peregrine

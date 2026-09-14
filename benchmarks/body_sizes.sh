@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# What moving an ASGI response body costs Peregrine, by size.
+# What moving an ASGI response body costs Garuda, by size.
 #
 #   bash benchmarks/body_sizes.sh > bodies.tsv
-#   BUILD=../peregrine-other bash benchmarks/body_sizes.sh
+#   BUILD=../garuda-other bash benchmarks/body_sizes.sh
 #
 # A raw ASGI application (benchmarks/bodies_app.py) answers with a prebuilt body
 # of each size, so the application's own work is the same at every size and
@@ -15,7 +15,7 @@
 # server's tree. On loopback, write() also delivers into the load generator's
 # socket, so the kernel's share here is larger than over a network.
 #
-# BUILD is a checkout whose python/peregrine holds a built _native
+# BUILD is a checkout whose python/garuda holds a built _native
 # (scripts/build-extension.sh). EXTRA adds server flags.
 #
 # Output, one TSV line per size:
@@ -53,7 +53,7 @@ server_cpu_ns() {
 
 # shellcheck disable=SC2086 -- EXTRA is deliberately split into flags.
 PYTHONPATH="$BUILD/python:$ROOT/benchmarks" server_start \
-    taskset -c "$SERVER_CPU" "$VENV/bin/python" -m peregrine \
+    taskset -c "$SERVER_CPU" "$VENV/bin/python" -m garuda \
     --host 127.0.0.1 --port "$PORT" --workers 1 --log-level error $EXTRA \
     --venv "$VENV" --python-path "$ROOT/benchmarks" bodies_app:app \
     > "$OUT/server.log" 2>&1

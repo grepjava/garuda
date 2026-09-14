@@ -2,7 +2,7 @@
 # --compress and --compress-static: what is compressed, what is left alone, and
 # that what arrives decodes to what the application sent.
 #
-#   bash scripts/compress-test.sh [path-to-peregrine]
+#   bash scripts/compress-test.sh [path-to-garuda]
 #
 # Most of the checks are about the decision rather than the codec. A server that
 # compresses a PNG, compresses a body the application already encoded, strips a
@@ -10,7 +10,7 @@
 # rarely shows and a cache in front of it always will.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8361}
 TLS_PORT=${TLS_PORT:-8362}
 WORK=$(mktemp -d)

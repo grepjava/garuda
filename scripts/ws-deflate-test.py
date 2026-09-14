@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """--ws-compress: permessage-deflate (RFC 7692), end to end.
 
-    python3 scripts/ws-deflate-test.py [path-to-peregrine]
+    python3 scripts/ws-deflate-test.py [path-to-garuda]
 
 Most of this drives the server with a client built here from a socket and zlib,
 because the cases worth testing are the ones a well-behaved library never
@@ -22,8 +22,8 @@ import time
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/debug/peregrine")
-EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/debug/garuda")
+EXTRA = shlex.split(os.environ.get("GARUDA_EXTRA_ARGS", ""))
 
 PASS = 0
 FAIL = 0
@@ -355,7 +355,7 @@ def main():
     if not os.path.exists(BIN):
         print("no such binary: %s" % BIN)
         return 2
-    print("peregrine permessage-deflate tests (%s)" % BIN)
+    print("garuda permessage-deflate tests (%s)" % BIN)
     for test in (negotiation, messages, violations, library):
         try:
             test()

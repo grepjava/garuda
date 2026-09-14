@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/peregrine-fiery-roaring.png" alt="peregrine" width="480">
+  <img src="assets/garuda-fiery-roaring.png" alt="garuda" width="480">
 </p>
 
 # Configuring FastAPI and Flask
@@ -41,7 +41,7 @@ on a thread pool.
 ### One command, everything on
 
 ```bash
-peregrine --port 8443 --workers 0 \
+garuda --port 8443 --workers 0 \
           --tls-cert cert.pem --tls-key key.pem --http3 \
           myapp:app
 ```
@@ -57,7 +57,7 @@ WebTransport:
 
 ```python
 from fastapi import FastAPI
-from peregrine.contrib.fastapi import WebTransportRouter
+from garuda.contrib.fastapi import WebTransportRouter
 
 app = FastAPI(lifespan=lifespan)      # ordinary FastAPI, all HTTP versions
 
@@ -71,7 +71,7 @@ itself and passes everything else — HTTP, WebSocket, lifespan — through to
 * **Lifespan** works, including teardown on `SIGTERM`
   ([lifespan](examples/fastapi_app.py#L14), and the shutdown check in
   `framework-test.sh`). `--no-lifespan` skips the protocol for applications
-  that do not implement it; peregrine detects those anyway.
+  that do not implement it; garuda detects those anyway.
 * **`StreamingResponse`** streams with real backpressure — the application is
   not run further ahead than the socket has drained
   ([/stream](examples/fastapi_app.py#L47)).
@@ -82,7 +82,7 @@ itself and passes everything else — HTTP, WebSocket, lifespan — through to
 ### Knowing what carried the request
 
 ```python
-from peregrine.contrib.fastapi import http_version, is_http3, supports_webtransport
+from garuda.contrib.fastapi import http_version, is_http3, supports_webtransport
 
 @app.get("/proto")
 def proto(request: Request):
@@ -184,7 +184,7 @@ without accepting refuses the session with an HTTP status
 ### Serving it
 
 ```bash
-peregrine --port 8000 --workers 0 myapp:app
+garuda --port 8000 --workers 0 myapp:app
 ```
 
 A Flask `app` is a WSGI application and is detected as one: no adapter, no
@@ -193,7 +193,7 @@ A Flask `app` is a WSGI application and is detected as one: no adapter, no
 well.
 
 `app.run()` starts Werkzeug's development server, not this one. Keep it under
-`if __name__ == "__main__":`, point peregrine at `app`, and use `--reload` for
+`if __name__ == "__main__":`, point garuda at `app`, and use `--reload` for
 the edit-and-refresh loop it was giving you.
 
 ### Inline or on a thread pool
@@ -205,7 +205,7 @@ CPU, and it is what the benchmarks measure.
 Views that wait — on a database, on another service — want a pool:
 
 ```bash
-peregrine --port 8000 --workers 4 --wsgi-threads 8 myapp:app
+garuda --port 8000 --workers 4 --wsgi-threads 8 myapp:app
 ```
 
 `--wsgi-threads` is what lets eight views that are waiting on a database
@@ -312,7 +312,7 @@ that answers `1.1` on the line above, with nothing changed in between.
 ## Behind a reverse proxy
 
 ```bash
-peregrine --forwarded-allow-ips 10.0.0.0/8,127.0.0.1 myapp:app
+garuda --forwarded-allow-ips 10.0.0.0/8,127.0.0.1 myapp:app
 ```
 
 `X-Forwarded-For`, `X-Forwarded-Proto` and `Forwarded` are honoured **only**
@@ -326,11 +326,11 @@ If HTTP/3 lives somewhere the server cannot know about — a terminating proxy i
 front, or a different host or port — advertise it yourself:
 
 ```python
-from peregrine.contrib.asgi import AltSvcMiddleware
+from garuda.contrib.asgi import AltSvcMiddleware
 app = AltSvcMiddleware(app, port=443)
 ```
 
-Peregrine already sends `alt-svc` for its own HTTP/3 listener, so this is only
+Garuda already sends `alt-svc` for its own HTTP/3 listener, so this is only
 for the case where the answer is not its own port.
 
 ---
@@ -338,7 +338,7 @@ for the case where the answer is not its own port.
 ## A production starting point
 
 ```bash
-peregrine \
+garuda \
     --host 0.0.0.0 --port 8443 \
     --workers 0 \
     --tls-cert /etc/ssl/app/fullchain.pem \
@@ -404,7 +404,7 @@ complete object, whatever the peer asked for.
 ### Request IDs
 
 ```bash
-peregrine --request-id --access-log myapp:app
+garuda --request-id --access-log myapp:app
 ```
 
 `--request-id` gives every request an `X-Request-ID`, and puts that one value
@@ -439,7 +439,7 @@ probes, rate-limit refusals and malformed requests do not, and the
 ### Trace context
 
 ```bash
-peregrine --trace-context --access-log myapp:app
+garuda --trace-context --access-log myapp:app
 ```
 
 A request sent from inside a distributed trace carries a W3C `traceparent`
@@ -471,16 +471,16 @@ application still receives what the client sent.
 `--metrics-port 9100` serves the Prometheus text exposition format:
 
 ```
-peregrine_requests_total{status="2xx"} 10241
-peregrine_connections_accepted_total 812
-peregrine_connections_active 37
-peregrine_connection_slots 8192
-peregrine_buffer_pool_hits_total 774
-peregrine_buffer_pool_misses_total 38
-peregrine_workers 4
-peregrine_request_duration_seconds_bucket{le="0.001000"} 9987
-peregrine_request_duration_seconds_sum 4.271038
-peregrine_request_duration_seconds_count 10241
+garuda_requests_total{status="2xx"} 10241
+garuda_connections_accepted_total 812
+garuda_connections_active 37
+garuda_connection_slots 8192
+garuda_buffer_pool_hits_total 774
+garuda_buffer_pool_misses_total 38
+garuda_workers 4
+garuda_request_duration_seconds_bucket{le="0.001000"} 9987
+garuda_request_duration_seconds_sum 4.271038
+garuda_request_duration_seconds_count 10241
 ```
 
 A port of its own, not a route. The application owns every path on the service
@@ -493,7 +493,7 @@ the request path; it is accepted, answered and closed on the loop thread.
 `--workers` and threads under `--free-threaded`; in both cases the counters
 live in a page mapped before anything forked, each worker writing only its own
 slot. A scrape lands on whichever worker `SO_REUSEPORT` gives it and reports
-the sum, so the numbers do not jump about between scrapes. `peregrine_workers`
+the sum, so the numbers do not jump about between scrapes. `garuda_workers`
 says how many are being summed.
 
 **Bind it somewhere private.** `--metrics-host` defaults to `--host`, so a
@@ -502,12 +502,12 @@ data — counts, durations and connection totals — but they are still nobody
 else's business:
 
 ```bash
-peregrine --host 0.0.0.0 --port 8443 \
+garuda --host 0.0.0.0 --port 8443 \
           --metrics-port 9100 --metrics-host 127.0.0.1 \
           myapp:app
 ```
 
-`peregrine_buffer_pool_hits_total` against `_misses_total` is worth watching:
+`garuda_buffer_pool_hits_total` against `_misses_total` is worth watching:
 misses that keep climbing mean connections are outliving the pool's free list,
 or that `--read-buffer` is smaller than what requests actually need.
 
@@ -519,7 +519,7 @@ counters do nothing at all.
 ### Queue time
 
 ```bash
-peregrine --request-start-header myapp:app
+garuda --request-start-header myapp:app
 ```
 
 A tracer inside the application measures from the moment the application is
@@ -547,7 +547,7 @@ is built per worker, so the replacements read the certificate and key off disk
 again — which makes this the certbot hook:
 
 ```bash
-certbot renew --deploy-hook 'kill -HUP $(cat /run/peregrine.pid)'
+certbot renew --deploy-hook 'kill -HUP $(cat /run/garuda.pid)'
 ```
 
 Workers are replaced one at a time, and each replacement is spawned, given the
@@ -581,7 +581,7 @@ flag still means restarting the server.
 ## Caching responses
 
 ```bash
-peregrine --cache-size 64 myapp:app
+garuda --cache-size 64 myapp:app
 ```
 
 `--cache-size` keeps copies of the responses an application marks as fresh, in
@@ -628,7 +628,7 @@ and protocol are part of it as well.
 A copy is served over HTTP/1.1, HTTP/2 and HTTP/3 alike, and compressed for
 each client that accepts it when `--compress` is on. Every response gets its
 own `Date`, `X-Request-ID` and `Strict-Transport-Security`, plus `Age` and
-`Cache-Status: peregrine; hit; ttl=N`. A `304` answered from a copy carries the
+`Cache-Status: garuda; hit; ttl=N`. A `304` answered from a copy carries the
 `Vary` and `ETag` its `200` would have carried for that client.
 
 A copy is kept for what is left of the response's lifetime. A response that
@@ -654,8 +654,8 @@ between entries of four sizes — 8 KiB, 64 KiB, 512 KiB, and big enough for
 `--cache-max-object` — and a response goes in the smallest that holds it; when
 the ones a URL can go in are all taken, the one nearest to expiring is
 replaced. The server logs how many responses the size given has room for.
-With `--metrics-port`, `peregrine_cache_hits_total`,
-`peregrine_cache_misses_total` and `peregrine_cache_stores_total` show how it
+With `--metrics-port`, `garuda_cache_hits_total`,
+`garuda_cache_misses_total` and `garuda_cache_stores_total` show how it
 is doing.
 
 ASGI and WSGI responses are cached alike, inline or under `--wsgi-threads`. A
@@ -670,7 +670,7 @@ before the application has finished deciding what the body is.
 being called:
 
 ```bash
-peregrine --static-dir /static=/srv/app/static \
+garuda --static-dir /static=/srv/app/static \
           --static-dir /media=/srv/app/media \
           myapp:app
 ```
@@ -688,7 +688,7 @@ one:
 
 ```bash
 sudo modprobe tls        # once per boot, or list tls in /etc/modules-load.d
-peregrine --ktls --tls-cert cert.pem --tls-key key.pem \
+garuda --ktls --tls-cert cert.pem --tls-key key.pem \
           --static-dir /static=/srv/app/static myapp:app
 ```
 
@@ -728,7 +728,7 @@ front of it for anything that needs either.
 Two flags, because they carry different risks.
 
 ```bash
-peregrine --compress --compress-static \
+garuda --compress --compress-static \
           --static-dir /static=/srv/app/static \
           myapp:app
 ```
@@ -782,7 +782,7 @@ nothing.
 ## Rate limiting
 
 ```bash
-peregrine --rate-limit 100/s --rate-limit-burst 200 myapp:app
+garuda --rate-limit 100/s --rate-limit-burst 200 myapp:app
 ```
 
 A client past its allowance gets `429 Too Many Requests` with a `Retry-After`
@@ -810,7 +810,7 @@ Who counts as a client:
   client.
 
 The health probe on `--health-check-path` is never refused, and refusals are
-counted in `peregrine_requests_rate_limited_total` on the metrics port.
+counted in `garuda_requests_rate_limited_total` on the metrics port.
 
 The table holds 65,536 clients. An entry whose client has gone quiet long
 enough to have its whole burst back is reused, so the limit covers the clients
@@ -853,7 +853,7 @@ free.
 ### Shutting down behind a load balancer
 
 ```bash
-peregrine --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30000 myapp:app
+garuda --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30000 myapp:app
 ```
 
 ```yaml
@@ -894,7 +894,7 @@ The delay is only for `SIGTERM`:
 first pair is the default; the rest are chosen per connection by SNI:
 
 ```bash
-peregrine --port 443 \
+garuda --port 443 \
     --tls-cert /etc/ssl/shop/fullchain.pem   --tls-key /etc/ssl/shop/privkey.pem \
     --tls-cert /etc/ssl/admin/fullchain.pem  --tls-key /etc/ssl/admin/privkey.pem \
     myapp:app
@@ -922,8 +922,8 @@ reading it, where a dropped handshake is not.
 ### Certificates from Let's Encrypt
 
 ```bash
-peregrine --port 443 --acme-domain example.com --acme-domain www.example.com \
-          --acme-email ops@example.com --acme-cache /var/lib/peregrine/acme \
+garuda --port 443 --acme-domain example.com --acme-domain www.example.com \
+          --acme-email ops@example.com --acme-cache /var/lib/garuda/acme \
           myapp:app
 ```
 
@@ -969,7 +969,7 @@ SNI selection of its own yet.
 ## Redirecting HTTP to HTTPS
 
 ```bash
-peregrine --port 443 --acme-domain example.com \
+garuda --port 443 --acme-domain example.com \
     --redirect-http 80 --hsts 31536000 myapp:app
 ```
 
@@ -1023,13 +1023,13 @@ gone.
 
 ## Application logging
 
-Peregrine writes its own lines with a level and a pid. Python's `logging`
+Garuda writes its own lines with a level and a pid. Python's `logging`
 writes whatever it was last configured with. On one file descriptor that is two
 log formats interleaved, and neither half can be filtered by level without
 filtering both.
 
 ```python
-from peregrine.logging import configure
+from garuda.logging import configure
 
 configure()
 ```
@@ -1064,13 +1064,13 @@ is an ordinary one:
 LOGGING = {
     "version": 1,
     "handlers": {
-        "peregrine": {"class": "peregrine.logging.PeregrineHandler"},
+        "garuda": {"class": "garuda.logging.GarudaHandler"},
     },
-    "root": {"handlers": ["peregrine"], "level": "INFO"},
+    "root": {"handlers": ["garuda"], "level": "INFO"},
 }
 ```
 
-Outside a peregrine process — under pytest, or under another server — the
+Outside a garuda process — under pytest, or under another server — the
 handler falls back to `stderr` and `server_level()` reports `DEBUG`, so a
 configuration naming it does not have to be conditional on what is running it.
 
@@ -1090,7 +1090,7 @@ On a CPython built without the GIL (PEP 703 — `python3.13t`, `python3.14t`),
 processes:
 
 ```bash
-peregrine --workers 0 --free-threaded myapp:app
+garuda --workers 0 --free-threaded myapp:app
 ```
 
 `--workers` still means the same thing; only what a worker *is* changes. Each
@@ -1155,18 +1155,18 @@ Sharing one process also changes three things it is worth knowing about:
   already makes, applied to the whole application rather than to one pool.
 - **A crash takes every worker with it.** With processes the supervisor
   restarts the one that died. Keep a process supervisor in front in production —
-  systemd, or peregrine's own, by combining `--free-threaded` with `--reload`
+  systemd, or garuda's own, by combining `--free-threaded` with `--reload`
   in development.
 
 The option is refused, with an error, on an interpreter that has the GIL:
 running it there would silently be slower than `--workers`, not faster.
-`peregrine --version` says which kind of interpreter the server runs in:
+`garuda --version` says which kind of interpreter the server runs in:
 
 ```
-peregrine 1.1.5 (CPython 3.14.6 free-threaded)
+garuda 1.1.5 (CPython 3.14.6 free-threaded)
 ```
 
-One caveat that is not peregrine's to fix: importing an extension module that
+One caveat that is not garuda's to fix: importing an extension module that
 has not declared itself free-threading-safe switches the GIL back on for the
 whole process, and so does `PYTHON_GIL=1`. The server checks after loading the
 application and warns when that has happened, because the symptom otherwise is

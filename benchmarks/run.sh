@@ -9,7 +9,7 @@
 #
 set -u
 
-PEREGRINE=${PEREGRINE:-$HOME/pgbuild/release/peregrine}
+GARUDA=${GARUDA:-$HOME/pgbuild/release/garuda}
 VENV=${VENV:-$HOME/bench-venv}
 PORT=8210
 DURATION=${DURATION:-10s}
@@ -50,8 +50,8 @@ bench() {
 }
 
 echo "=== WSGI, 1 worker, $CONNECTIONS connections, $DURATION ==="
-bench "peregrine (wsgi)" \
-    "$PEREGRINE" --port $PORT --log-level error --python-path examples wsgi_app:application
+bench "garuda (wsgi)" \
+    "$GARUDA" --port $PORT --log-level error --python-path examples wsgi_app:application
 bench "gunicorn (sync)" \
     "$VENV/bin/gunicorn" -b "127.0.0.1:$PORT" -w 1 --chdir examples \
     --log-level error wsgi_app:application
@@ -61,8 +61,8 @@ bench "gunicorn (gthread x8)" \
 
 echo
 echo "=== ASGI, 1 worker, $CONNECTIONS connections, $DURATION ==="
-bench "peregrine (asgi)" \
-    "$PEREGRINE" --port $PORT --log-level error --python-path examples asgi_app:app
+bench "garuda (asgi)" \
+    "$GARUDA" --port $PORT --log-level error --python-path examples asgi_app:app
 bench "uvicorn (uvloop+httptools)" \
     "$VENV/bin/uvicorn" --host 127.0.0.1 --port $PORT --app-dir examples \
     --log-level error --loop uvloop --http httptools asgi_app:app

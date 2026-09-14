@@ -1,16 +1,16 @@
 <p align="center">
-  <img src="assets/peregrine-fiery-roaring.png" alt="peregrine" width="480">
+  <img src="assets/garuda-fiery-roaring.png" alt="garuda" width="480">
 </p>
 
 # Architecture
 
-Peregrine shares a process with CPython. There is no socket between Swift and
+Garuda shares a process with CPython. There is no socket between Swift and
 Python, no serialisation step and no second process: Swift owns the accept
 loop, the parser and the response writer, and calls the application directly.
 Everything below follows from that one decision.
 
 It is built in one of two forms from the same source. The wheels carry
-`peregrine._native`, an extension module: `python -m peregrine` imports it and
+`garuda._native`, an extension module: `python -m garuda` imports it and
 the server runs inside that interpreter, whose supervisor forks the workers.
 The standalone executable embeds `libpython` instead and starts an interpreter
 in each worker itself. The only difference at run time is where Python's code
@@ -23,20 +23,20 @@ The protocols themselves are in [TRANSPORT.md](TRANSPORT.md).
 
 ```
 Sources/
-  CPeregrine/        C shim: epoll/kqueue, sockets, signals, TLS, crypto,
+  CGaruda/        C shim: epoll/kqueue, sockets, signals, TLS, crypto,
                      UDP, and the CPython macros Swift cannot import
-  PeregrineCore/     buffers, buffer pool, poller, logging, date cache
-  PeregrineHTTP/     HTTP/1.1 parser, chunked decoder, response writer,
+  GarudaCore/     buffers, buffer pool, poller, logging, date cache
+  GarudaHTTP/     HTTP/1.1 parser, chunked decoder, response writer,
                      HPACK, QPACK, HTTP/2 and HTTP/3 framing
-  PeregrinePython/   PyRef, interned constants, custom Python types
-  PeregrineQUIC/     QUIC transport and the TLS 1.3 handshake it needs
-  PeregrineWSGI/     environ building, wsgi.input, start_response
-  PeregrineASGI/     scope and message building
-  PeregrineServer/   connection table, worker loop, both dispatchers,
+  GarudaPython/   PyRef, interned constants, custom Python types
+  GarudaQUIC/     QUIC transport and the TLS 1.3 handshake it needs
+  GarudaWSGI/     environ building, wsgi.input, start_response
+  GarudaASGI/     scope and message building
+  GarudaServer/   connection table, worker loop, both dispatchers,
                      HTTP/2, HTTP/3, WebSocket, WebTransport, supervisor,
                      and the command line parser both forms share
-  PeregrineExtension/ peregrine._native: PyInit and serve(argv)
-  peregrine/         the standalone executable's entry point
+  GarudaExtension/ garuda._native: PyInit and serve(argv)
+  garuda/         the standalone executable's entry point
 ```
 
 `Python.h`, `openssl/ssl.h` and `openssl/evp.h` never appear in a header Swift
@@ -136,7 +136,7 @@ child, and in production systemd plays the same part.
 
 The interesting trick in the ASGI path: an epoll (or kqueue) descriptor is
 *itself pollable*. So instead of running a Swift I/O thread and marshalling
-work across to the Python loop, Peregrine hands its poller to asyncio:
+work across to the Python loop, Garuda hands its poller to asyncio:
 
 ```python
 loop.add_reader(poller_fd, drain)   # drain is a C-level Swift callback

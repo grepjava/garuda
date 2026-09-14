@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# the-benchmarker/web-frameworks contract, Peregrine vs Granian.
+# the-benchmarker/web-frameworks contract, Garuda vs Granian.
 #
 # GET / for 15s, closed-loop (oha, like wrk): same three apps the suite uses —
 # FastAPI, a raw ASGI app, a raw WSGI app — on both servers.
@@ -10,7 +10,7 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export PYTHONPATH="$ROOT/benchmarks/contract${PYTHONPATH:+:$PYTHONPATH}"
-PEREGRINE=${PEREGRINE:-$HOME/pgbuild/release/peregrine}
+GARUDA=${GARUDA:-$HOME/pgbuild/release/garuda}
 VENV=${VENV:-$HOME/pgvenv}
 PORT=${PORT:-8210}
 DURATION=${DURATION:-15s}
@@ -63,8 +63,8 @@ echo "=== the-benchmarker contract  GET /  ${WORKERS} worker(s)  ${CONNECTIONS} 
 echo
 
 echo "-- FastAPI --"
-bench "peregrine + FastAPI" \
-    "$PEREGRINE" --port "$PORT" --workers "$WORKERS" --log-level error \
+bench "garuda + FastAPI" \
+    "$GARUDA" --port "$PORT" --workers "$WORKERS" --log-level error \
     --venv "$VENV" --python-path "$ROOT/benchmarks/contract" fastapi_app:app
 bench "granian + FastAPI" \
     "$VENV/bin/granian" --log-level critical --interface asgi \
@@ -72,8 +72,8 @@ bench "granian + FastAPI" \
 
 echo
 echo "-- ASGI (no framework) --"
-bench "peregrine ASGI" \
-    "$PEREGRINE" --port "$PORT" --workers "$WORKERS" --log-level error \
+bench "garuda ASGI" \
+    "$GARUDA" --port "$PORT" --workers "$WORKERS" --log-level error \
     --venv "$VENV" --python-path "$ROOT/benchmarks/contract" asgi:app
 bench "granian ASGI" \
     "$VENV/bin/granian" --log-level critical --interface asgi \
@@ -81,8 +81,8 @@ bench "granian ASGI" \
 
 echo
 echo "-- WSGI (no framework) --"
-bench "peregrine WSGI" \
-    "$PEREGRINE" --port "$PORT" --workers "$WORKERS" --log-level error \
+bench "garuda WSGI" \
+    "$GARUDA" --port "$PORT" --workers "$WORKERS" --log-level error \
     --venv "$VENV" --python-path "$ROOT/benchmarks/contract" wsgi:application
 bench "granian WSGI" \
     "$VENV/bin/granian" --log-level critical --interface wsgi \

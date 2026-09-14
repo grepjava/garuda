@@ -1,81 +1,42 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/peregrine-fiery-roaring.png" alt="peregrine" width="560">
+  <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/garuda-fiery-roaring.png" alt="garuda" width="560">
 </p>
 
 <p align="center">
-  <b>A drop-in ASGI and WSGI server for Python, written in Swift.</b><br>
-  Up to 302,000 requests a second on four CPUs, and FastAPI at 1.2–1.3× uvicorn in the-benchmarker's results.<br>
-  HTTP/1.1, HTTP/2, HTTP/3, WebSocket and WebTransport.
+  <b>A Swift web server.</b><br>
+  Forked from Peregrine; CPython, ASGI and WSGI are gone.<br>
+  HTTP/1.1, HTTP/2, HTTP/3. Handlers are Swift, at the dispatch seam.
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/peregrine-server/"><img src="https://img.shields.io/pypi/v/peregrine-server" alt="PyPI version"></a>
-  <a href="https://pypi.org/project/peregrine-server/"><img src="https://img.shields.io/pypi/pyversions/peregrine-server" alt="Python versions"></a>
-  <a href="https://github.com/grepjava/peregrine/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/peregrine-server" alt="MIT license"></a>
+  <a href="https://github.com/grepjava/garuda/blob/main/LICENSE"><img src="https://img.shields.io/github/license/grepjava/garuda" alt="MIT license"></a>
 </p>
 
 ---
 
 ```bash
-pip install peregrine-server
-peregrine --host 0.0.0.0 --workers 0 main:app    # where you ran: uvicorn main:app
+swift build -c release --product garuda
+.build/release/garuda --host 0.0.0.0 --port 8000 --workers 0
 ```
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/peregrine/main/assets/benchmark-workers-256.png" alt="Requests per second with a worker per CPU at 256 connections, on four CPUs. On Peregrine: raw WSGI 302,417, raw ASGI 271,396, BlackSheep 202,141, FastAPI 72,306, Flask 50,423, Django 47,806. Reference: Elysia on Bun 350,622." width="760">
-</p>
+The spike router at `Worker.dispatch` answers the-benchmarker's hello-world
+contract: `GET /` and `POST /user` with an empty 200, `GET /user/:id` with
+the id as the body. See [GARUDA.md](GARUDA.md) for the plan, the measured
+ceiling, and what is still missing.
 
-- **Faster with the framework you already use.** In the published results of
-  the-benchmarker/web-frameworks, the same FastAPI application answers 1.2–1.3×
-  as many requests on Peregrine as on uvicorn, and Django 7–34× as many as on
-  gunicorn. On four CPUs here, BlackSheep reaches 202,000 requests a second and
-  FastAPI 77,000. [How that was measured.](https://github.com/grepjava/peregrine#numbers)
-- **Nothing to change in the application.** ASGI 3 and PEP 3333 in full, for
-  FastAPI, Starlette, Django and Flask, with lifespan and WebSockets. The
-  protocol is detected, and the options are the ones you know:
-  [coming from uvicorn or gunicorn](https://github.com/grepjava/peregrine#coming-from-uvicorn-or-gunicorn).
-- **What usually needs a proxy in front, built in.** HTTP/2 and HTTP/3, TLS
-  with Let's Encrypt certificates, static files with `sendfile`, compression,
-  rate limiting, a response cache, Prometheus metrics, and a `SIGHUP` that
-  replaces every worker without refusing a connection.
-- **Free-threaded Python.** On CPython 3.14t, `--free-threaded` runs the
-  workers as threads of one process: the throughput of processes at a third
-  of the memory.
-- **Wheels for Linux x86_64 and aarch64**, CPython 3.11 to 3.14 and 3.14t,
-  including the official `python:*-slim` images. No Swift toolchain needed.
+- **The engine is the old Peregrine one, without Python.** HTTP/2 and HTTP/3,
+  TLS with Let's Encrypt certificates, static files with `sendfile`,
+  compression, rate limiting, a response cache, Prometheus metrics, and a
+  `SIGHUP` that replaces every worker without refusing a connection.
+- **No libpython.** `Package.swift` links OpenSSL, zlib, and the Swift
+  runtime.
 
----
-
-Built around two goals: spend as little time as possible outside the
-application, and spend as little memory as possible per connection.
-
-It runs in the same process as CPython — there is no socket between Swift and
-Python, no serialisation step, and no second process. Swift owns the accept
-loop, the HTTP parser and the response writer; Python owns the application. A
-wheel installs the server as `peregrine._native`, an extension module the
-`peregrine` command loads into your own interpreter, so applications run in
-exactly the `python3` they were installed for.
-
-```
-pip install peregrine-server                # wheel if one matches; else compiled
-
-peregrine --port 8000 myapp:application     # WSGI, protocol auto-detected
-peregrine --port 8000 --workers 0 myapp:app # ASGI, one worker per CPU
-peregrine --reload myapp:app                # restart on source changes
-
-peregrine --http3 --tls-cert cert.pem --tls-key key.pem myapp:app
-```
-
-**Further reading:** [INSTALLATION.md](https://github.com/grepjava/peregrine/blob/main/INSTALLATION.md) — what to install and
-what to do when it goes wrong. [CONFIG.md](https://github.com/grepjava/peregrine/blob/main/CONFIG.md) — configuring FastAPI and
-Flask for every protocol here. [ARCHITECTURE.md](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md) — how the
-server is built, and why. [TRANSPORT.md](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md) — what each protocol
-does and what is implemented of it. [BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md) — the
-raw ASGI and WSGI, FastAPI, Django, Flask and BlackSheep entries on Peregrine,
-and Elysia on Bun, with the load command, applications and worker count of
-[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
-and how that differs from what the site publishes. [DEPLOY.md](https://github.com/grepjava/peregrine/blob/main/DEPLOY.md) — how a release reaches PyPI.
-[RELEASE.md](https://github.com/grepjava/peregrine/blob/main/RELEASE.md) — what changed in each version.
+**Further reading:** [GARUDA.md](GARUDA.md) — what this fork is for.
+[ARCHITECTURE.md](ARCHITECTURE.md) — how the engine is built.
+[TRANSPORT.md](TRANSPORT.md) — what each protocol does.
+[BENCHMARKS.md](BENCHMARKS.md) — numbers from when this engine still hosted
+Python applications. [CONFIG.md](CONFIG.md) — flags that still apply
+(`--host`, `--port`, `--workers`, TLS, HTTP/2/3, static files, cache).
 
 ---
 
@@ -86,9 +47,9 @@ The suite's own applications and load command, from
 zrk, an open-loop ramp to 500,000 requests a second, 15 s per level, with
 `--workers $(nproc)`. Requests per second at 64 / 256 / 512 connections, the
 mean of three runs, all in one session, WSL2 on 4 CPUs with the load generator
-on the same machine, CPython 3.14, Peregrine 1.1.5:
+on the same machine, CPython 3.14, Garuda 1.1.5:
 
-| on Peregrine | 64 | 256 | 512 |
+| on Garuda | 64 | 256 | 512 |
 |---|---:|---:|---:|
 | raw WSGI | **293,025** | **302,417** | 256,660 |
 | raw ASGI | 221,826 | 271,396 | **260,155** |
@@ -103,18 +64,18 @@ quarter, so their order at 512 connections means nothing.
 
 The site measures on its own machine, 16 CPUs, so its figures cannot be set
 beside these. What it shows is the same frameworks on different servers.
-Peregrine was
+Garuda was
 [added to the suite](https://github.com/the-benchmarker/web-frameworks/pull/9776)
-in September 2026; in its dataset of 2026-09-13, on Peregrine 1.0:
+in September 2026; in its dataset of 2026-09-13, on Garuda 1.0:
 
 | site entry | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| FastAPI on **peregrine** | **54,338** | **59,273** | **60,201** |
+| FastAPI on **garuda** | **54,338** | **59,273** | **60,201** |
 | FastAPI on uvicorn | 41,891 | 47,335 | 48,552 |
-| Django on **peregrine** | **39,840** | **39,718** | **39,654** |
+| Django on **garuda** | **39,840** | **39,718** | **39,654** |
 | Django on gunicorn | 1,165 | 5,727 | 4,699 |
 
-[BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md)
+[BENCHMARKS.md](https://github.com/grepjava/garuda/blob/main/BENCHMARKS.md)
 has the latency, every run, the versions, where this machine differs from the
 suite's, and the commands that repeat it.
 
@@ -131,14 +92,14 @@ worker's resident memory is CPython and the application.
 
 ## Coming from uvicorn or gunicorn
 
-Point Peregrine at the same application object. The protocol is detected, so
+Point Garuda at the same application object. The protocol is detected, so
 there is no worker class to name, and most options keep their names. What
-differs is mostly units, because Peregrine's timeouts are in milliseconds:
+differs is mostly units, because Garuda's timeouts are in milliseconds:
 
-| uvicorn | gunicorn | peregrine |
+| uvicorn | gunicorn | garuda |
 |---|---|---|
-| `uvicorn main:app` | `gunicorn -k uvicorn.workers.UvicornWorker main:app` | `peregrine main:app` |
-| | `gunicorn myproject.wsgi` | `peregrine myproject.wsgi:application` |
+| `uvicorn main:app` | `gunicorn -k uvicorn.workers.UvicornWorker main:app` | `garuda main:app` |
+| | `gunicorn myproject.wsgi` | `garuda myproject.wsgi:application` |
 | `--host 0.0.0.0 --port 8000` | `-b 0.0.0.0:8000` | `--host 0.0.0.0 --port 8000` |
 | `--uds /run/app.sock` | `-b unix:/run/app.sock` | `--unix /run/app.sock` |
 | `--workers 4` | `-w 4` | `--workers 4`, or `0` for one per CPU |
@@ -156,7 +117,7 @@ differs is mostly units, because Peregrine's timeouts are in milliseconds:
 | access log on by default | `--access-logfile -` | `--access-log` |
 | `--log-level info` | `--log-level info` | `--log-level info` |
 
-uvloop is used when it is installed (`pip install "peregrine-server[uvloop]"`),
+uvloop is used when it is installed (`pip install "garuda-server[uvloop]"`),
 as with uvicorn. `SIGTERM` drains the workers, and `SIGHUP` replaces them one
 at a time without refusing a connection.
 
@@ -172,7 +133,7 @@ at a time without refusing a connection.
 WebSockets and WebTransport are refused for WSGI rather than half-served: both
 are streams that outlive their response, and PEP 3333 has no way to express
 one. Everything else is the same code for both — see
-[one request path](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#one-request-path).
+[one request path](https://github.com/grepjava/garuda/blob/main/TRANSPORT.md#one-request-path).
 
 **WSGI (PEP 3333):** full environ, `wsgi.input` as a C-level stream (`read`,
 `readline`, `readlines`, iteration), `start_response` including `exc_info`
@@ -181,7 +142,7 @@ semantics and the legacy `write` callable, `wsgi.file_wrapper`, iterable
 `Content-Length`/chunked framing. `start_response` may be called from inside
 the first iteration of the returned iterable, as the spec requires a server to
 allow, and a `Content-Length` the application declares is
-[enforced](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#framing-is-enforced-not-trusted) rather than trusted.
+[enforced](https://github.com/grepjava/garuda/blob/main/TRANSPORT.md#framing-is-enforced-not-trusted) rather than trusted.
 
 Output is unbuffered in the sense PEP 3333 means. A block yielded by an
 iterator goes to the socket before the next one is asked for, and a block
@@ -217,19 +178,19 @@ task waiting on a body nobody will read holds the connection with it.
 **ASGI 3.0 (WebSocket):** the full connect / accept / receive / send / close
 cycle, subprotocol negotiation, extra handshake headers, fragmented messages,
 text and binary, keepalive ping/pong with a dead-peer timeout, and a message
-size limit. [Details.](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#websocket)
+size limit. [Details.](https://github.com/grepjava/garuda/blob/main/TRANSPORT.md#websocket)
 
 **WebTransport:** sessions, streams in both directions, unreliable datagrams
 and the close capsule, through a documented
-[ASGI extension](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#the-asgi-extension) — ASGI has no WebTransport
-specification, so this one is Peregrine's.
+[ASGI extension](https://github.com/grepjava/garuda/blob/main/TRANSPORT.md#the-asgi-extension) — ASGI has no WebTransport
+specification, so this one is Garuda's.
 
 **Free-threaded CPython (PEP 703):** `--free-threaded` runs the workers as
 threads of one process rather than as processes, on an interpreter built
 without the GIL. Same parallelism, one copy of the application:
 
 ```bash
-peregrine --workers 0 --free-threaded myapp:app
+garuda --workers 0 --free-threaded myapp:app
 ```
 
 On four cores with a CPU-bound application that is 5,907 req/s in 47 MB against
@@ -238,7 +199,7 @@ at a third of the memory, because the application is imported once instead of
 four times. The ASGI lifespan runs once per worker thread, on the event loop that
 thread serves requests with, so what an application opens in `startup` is
 attached to the loop that will await
-it. [Details.](https://github.com/grepjava/peregrine/blob/main/CONFIG.md#free-threaded-python)
+it. [Details.](https://github.com/grepjava/garuda/blob/main/CONFIG.md#free-threaded-python)
 
 ---
 
@@ -252,39 +213,39 @@ required. When none does, as on macOS, Alpine or an older distribution, `pip`
 compiles the sdist against the interpreter you are installing into:
 
 ```bash
-pip install peregrine-server
+pip install garuda-server
 ```
 
 In a container nothing else is needed:
 
 ```dockerfile
 FROM python:3.13-slim
-RUN pip install --no-cache-dir "peregrine-server[uvloop]" fastapi
+RUN pip install --no-cache-dir "garuda-server[uvloop]" fastapi
 COPY main.py .
-CMD ["peregrine", "--host", "0.0.0.0", "--workers", "0", "main:app"]
+CMD ["garuda", "--host", "0.0.0.0", "--workers", "0", "main:app"]
 ```
 
 ```bash
 # plus a Swift 6.1+ toolchain from https://swift.org/install
-git clone https://github.com/grepjava/peregrine
-cd peregrine && bash scripts/build-extension.sh    # peregrine._native
-PYTHONPATH=python python3 -m peregrine --port 8000 myapp:app
+git clone https://github.com/grepjava/garuda
+cd garuda && bash scripts/build-extension.sh    # garuda._native
+PYTHONPATH=python python3 -m garuda --port 8000 myapp:app
 ```
 
-The extension module is the default wherever Peregrine is installed or built
+The extension module is the default wherever Garuda is installed or built
 from source. `swift build -c release` builds the standalone executable, which
-embeds `libpython` and takes the same options; it is for working on Peregrine
+embeds `libpython` and takes the same options; it is for working on Garuda
 itself.
 
 Requirements, per-platform packages, certificates and the failure modes worth
-recognising: [INSTALLATION.md](https://github.com/grepjava/peregrine/blob/main/INSTALLATION.md).
+recognising: [INSTALLATION.md](https://github.com/grepjava/garuda/blob/main/INSTALLATION.md).
 
 ---
 
 ## Usage
 
 ```
-peregrine [options] MODULE:ATTRIBUTE
+garuda [options] MODULE:ATTRIBUTE
 
   --host HOST              interface to bind (default 127.0.0.1)
   --port PORT              port to bind (default 8000)
@@ -383,8 +344,8 @@ every worker one at a time, each replacement accepting on the socket its
 predecessor had before that one is asked to stop, so nothing is refused and
 nothing is reset -- which also makes it the certbot deploy hook, because the
 replacements read the certificate off disk again. See
-[reloading without a restart](https://github.com/grepjava/peregrine/blob/main/CONFIG.md#reloading-without-a-restart), and the
-[shutdown sequence](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md#shutdown), which is more careful than it
+[reloading without a restart](https://github.com/grepjava/garuda/blob/main/CONFIG.md#reloading-without-a-restart), and the
+[shutdown sequence](https://github.com/grepjava/garuda/blob/main/ARCHITECTURE.md#shutdown), which is more careful than it
 looks and deliberately so.
 
 ### Behind a reverse proxy
@@ -413,12 +374,12 @@ Checked against real applications rather than only the specifications
 Both run over HTTP/3 with no integration at all: a request is the same request
 whatever carried it. WebTransport is the exception for FastAPI, because a
 session is not a request — Starlette's router asserts on the scope type before
-it routes — so `peregrine.contrib` puts a router in front that answers sessions
+it routes — so `garuda.contrib` puts a router in front that answers sessions
 and passes everything else through:
 
 ```python
 from fastapi import FastAPI
-from peregrine.contrib.fastapi import WebTransportRouter
+from garuda.contrib.fastapi import WebTransportRouter
 
 api = FastAPI()
 app = WebTransportRouter(api)            # serve this one
@@ -433,8 +394,8 @@ async def chat(session):
 Flask needs nothing at all: as a WSGI application it is served over HTTP/1.1,
 HTTP/2 and HTTP/3, and WebSocket and WebTransport, which PEP 3333 cannot
 express, are refused with a 501.
-[How to configure both, protocol by protocol.](https://github.com/grepjava/peregrine/blob/main/CONFIG.md)
-[What the router does.](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#frameworks)
+[How to configure both, protocol by protocol.](https://github.com/grepjava/garuda/blob/main/CONFIG.md)
+[What the router does.](https://github.com/grepjava/garuda/blob/main/TRANSPORT.md#frameworks)
 
 ---
 
@@ -450,7 +411,7 @@ loop and the syscall — a garbage collector that stops the world, a green-threa
 runtime that decides when a read happens — buys concurrency this design does
 not need and costs latency it cannot recover. Swift has neither. Reference
 counting is deterministic, and where it would cost anything it can be removed,
-which is a large part of [what the server does](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md#minimising-arc).
+which is a large part of [what the server does](https://github.com/grepjava/garuda/blob/main/ARCHITECTURE.md#minimising-arc).
 
 **It talks to C without a binding layer.** Embedding CPython means calling a C
 API constantly: `PyDict_SetItem`, `PyObject_Vectorcall`, `Py_DECREF`, a few
@@ -492,7 +453,7 @@ disagreeing lengths, any `Transfer-Encoding` that is not a bare `chunked`,
 `obs-fold`, a missing or repeated `Host`.
 Response headers containing CR or LF are refused outright. Request header names
 containing underscores are dropped, and a `Proxy:` header is dropped entirely.
-[The full list.](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md#strictness-that-prevents-smuggling)
+[The full list.](https://github.com/grepjava/garuda/blob/main/TRANSPORT.md#strictness-that-prevents-smuggling)
 
 Every transport is checked against an implementation that shares none of its
 code, because a test written against the same understanding as the code proves
@@ -526,17 +487,17 @@ swift run -c release pgfuzz                     # mutation fuzzing of every
                                                 #   from the network
 ```
 
-[CI](https://github.com/grepjava/peregrine/blob/main/.github/workflows/ci.yml) runs all of it on every push, against CPython
+[CI](https://github.com/grepjava/garuda/blob/main/.github/workflows/ci.yml) runs all of it on every push, against CPython
 3.11 through 3.14 and a free-threaded 3.14, on Linux and macOS, plus the
 fuzzer under AddressSanitizer. The suites are the ones above — there is no
 CI-only test path, so a green run there means what a green run here means.
-[More on the fuzzing.](https://github.com/grepjava/peregrine/blob/main/fuzz/README.md)
+[More on the fuzzing.](https://github.com/grepjava/garuda/blob/main/fuzz/README.md)
 
 HTTP/2 conformance is checked with
 [h2spec](https://github.com/summerwind/h2spec), which is not vendored here:
 
 ```bash
-peregrine --port 8443 --tls-cert cert.pem --tls-key key.pem examples.asgi_app:app &
+garuda --port 8443 --tls-cert cert.pem --tls-key key.pem examples.asgi_app:app &
 h2spec -h 127.0.0.1 -p 8443 -t -k    # 146 tests, 146 passed
 ```
 

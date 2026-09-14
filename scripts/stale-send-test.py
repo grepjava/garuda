@@ -3,9 +3,9 @@
 
     python3 scripts/stale-send-test.py [server]
 
-The server is the first argument, else $PEREGRINE, else
-~/pgbuild/release/peregrine; pass scripts/peregrine-ext for the extension
-module. PEREGRINE_EXTRA_ARGS adds flags, PORT moves it off 8261.
+The server is the first argument, else $GARUDA, else
+~/pgbuild/release/garuda; pass scripts/garuda-ext for the extension
+module. GARUDA_EXTRA_ARGS adds flags, PORT moves it off 8261.
 
 An ASGI application can keep its channels past the end of a request: a task it
 started still holding `send`, a background job that calls `receive` late.
@@ -35,9 +35,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
-    "PEREGRINE", os.path.expanduser("~/pgbuild/release/peregrine"))
+    "GARUDA", os.path.expanduser("~/pgbuild/release/garuda"))
 PORT = int(os.environ.get("PORT", "8261"))
-EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
+EXTRA = shlex.split(os.environ.get("GARUDA_EXTRA_ARGS", ""))
 WORK = tempfile.mkdtemp(prefix="stale-send-")
 LOG = os.path.join(WORK, "calls.log")
 

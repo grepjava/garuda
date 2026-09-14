@@ -2,19 +2,19 @@
 # --cache-size: repeated GETs answered from a cache every worker shares, for
 # responses the application marks fresh, and nothing else.
 #
-#   bash scripts/cache-test.sh [path-to-peregrine]
+#   bash scripts/cache-test.sh [path-to-garuda]
 #
 # The application logs every call it receives, so "answered from the cache"
 # is checked as "the application was not called", not only as a header.
 #
-# PEREGRINE_EXTRA_ARGS adds flags, e.g. "--free-threaded".
+# GARUDA_EXTRA_ARGS adds flags, e.g. "--free-threaded".
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8253}
 MPORT=${MPORT:-8254}
 # shellcheck disable=SC2206 -- deliberately split into words.
-EXTRA=(${PEREGRINE_EXTRA_ARGS:-})
+EXTRA=(${GARUDA_EXTRA_ARGS:-})
 WORK=$(mktemp -d)
 PASS=0
 FAIL=0
@@ -70,7 +70,7 @@ first=$(cat "$WORK/body")
 is "the first response is the application's" "$(header cache-status)" ""
 fetch /fresh --http1.1
 is "the second is the stored copy, byte for byte" "$(cat "$WORK/body")" "$first"
-like "and says it came from the cache" "$(header cache-status)" '^peregrine; hit; ttl=[0-9]+$'
+like "and says it came from the cache" "$(header cache-status)" '^garuda; hit; ttl=[0-9]+$'
 like "with an Age" "$(header age)" '^[0-9]+$'
 id1=$(header x-request-id)
 fetch /fresh --http1.1
@@ -82,13 +82,13 @@ is "two dozen more, on new connections to four workers, never reach the applicat
     "$(calls GET /fresh)" "1"
 fetch /fresh --http2
 is "HTTP/2 is served the same copy" "$(cat "$WORK/body")" "$first"
-like "and it says so" "$(header cache-status)" '^peregrine; hit'
+like "and it says so" "$(header cache-status)" '^garuda; hit'
 fetch /fresh --http1.1
 cp "$WORK/body" "$WORK/fresh.body"
 # curl writes a HEAD response's headers where the body would go, so the body
 # is measured by what curl counted, not by that file.
 fetch /fresh --http1.1 -I
-like "HEAD is answered from the GET's copy" "$(header cache-status)" '^peregrine; hit'
+like "HEAD is answered from the GET's copy" "$(header cache-status)" '^garuda; hit'
 is "with the length of the body it withholds" "$(header content-length)" \
     "$(wc -c < "$WORK/fresh.body" | tr -d ' ')"
 is "and no body" "$(curl -sk --http1.1 -I -o /dev/null -w '%{size_download}' "$S/fresh")" "0"
@@ -182,7 +182,7 @@ fetch /etag --http1.1
 is "the next plain request still gets the copy" "$(status):$(calls GET /etag)" "200:2"
 fetch /etag --http1.1 -H 'If-None-Match: "v1"'
 is "a matching If-None-Match is answered 304" "$(status)" "304"
-like "from the copy" "$(header cache-status)" '^peregrine; hit'
+like "from the copy" "$(header cache-status)" '^garuda; hit'
 is "with its ETag" "$(header etag)" '"v1"'
 is "no Content-Length" "$(header content-length)" ""
 # curl leaves its output file alone when no body arrives, so the size is what
@@ -194,7 +194,7 @@ is "a weak one matches, over HTTP/2 too" "$(status)" "304"
 fetch /etag --http1.1 -H 'If-None-Match: "v0"' -H 'If-None-Match: "v1"'
 is "one split over two lines still matches" "$(status)" "304"
 fetch /etag --http1.1 -H 'If-None-Match: "v0"'
-like "a different ETag gets the whole copy" "$(status):$(header cache-status)" '^200:peregrine; hit'
+like "a different ETag gets the whole copy" "$(status):$(header cache-status)" '^200:garuda; hit'
 fetch /etag --http1.1 -H 'If-Modified-Since: Mon, 07 Nov 1994 00:00:00 GMT'
 is "If-Modified-Since no earlier than Last-Modified is 304" "$(status)" "304"
 fetch /etag --http1.1 -H 'If-Modified-Since: Sat, 05 Nov 1994 00:00:00 GMT'
@@ -204,7 +204,7 @@ is "If-Unmodified-Since goes to the application" "$(calls GET /etag)" "3"
 fetch /etag --http1.1 -H 'If-Range: "v1"'
 is "and so does If-Range" "$(calls GET /etag)" "4"
 fetch /etag --http1.1 -H 'Accept-Encoding: gzip'
-like "a copy compressed for the client" "$(header content-encoding):$(header cache-status)" '^gzip:peregrine; hit'
+like "a copy compressed for the client" "$(header content-encoding):$(header cache-status)" '^gzip:garuda; hit'
 is "sends its strong ETag weak" "$(header etag)" 'W/"v1"'
 fetch /etag --http1.1 -H 'Accept-Encoding: gzip' -H 'If-None-Match: W/"v1"'
 is "which revalidates" "$(status)" "304"
@@ -239,7 +239,7 @@ is "a copy is served while it is fresh" "$(calls GET /short)" "1"
 sleep 1.6
 fetch /short --http1.1
 is "and not after" "$(calls GET /short)" "2"
-hits=$(curl -s "http://127.0.0.1:$MPORT/metrics" | awk '/^peregrine_cache_hits_total/ {print $2}')
+hits=$(curl -s "http://127.0.0.1:$MPORT/metrics" | awk '/^garuda_cache_hits_total/ {print $2}')
 like "hits are counted" "${hits:-0}" '^[1-9][0-9]*$'
 fetch /maxage --http1.1
 fetch /maxage --http1.1
@@ -265,7 +265,7 @@ for model in inline pooled; do
     first=$(cat "$WORK/body")
     fetch /fresh --http1.1
     is "a fresh WSGI response is served from the cache" "$(cat "$WORK/body")" "$first"
-    like "and says so" "$(header cache-status)" '^peregrine; hit'
+    like "and says so" "$(header cache-status)" '^garuda; hit'
     for _ in $(seq 1 12); do curl -sk -o /dev/null "$S/fresh"; done
     is "the application was called once" "$(calls GET /fresh)" "1"
     fetch /fresh --http2

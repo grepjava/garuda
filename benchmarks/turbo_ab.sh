@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# A/B two builds of peregrine._native on one worker -- a raw ASGI app and
+# A/B two builds of garuda._native on one worker -- a raw ASGI app and
 # FastAPI, closed-loop oha, rounds interleaved in one session -- with the
 # server CPU each request costs. For deciding whether a change on the ASGI path
 # is kept.
 #
-#   BUILD_A=/mnt/d/code/peregrine-main BUILD_B=/mnt/d/code/peregrine \
+#   BUILD_A=/mnt/d/code/garuda-main BUILD_B=/mnt/d/code/garuda \
 #       bash benchmarks/turbo_ab.sh
 #
-# BUILD_A and BUILD_B are checkouts whose python/peregrine holds a built
+# BUILD_A and BUILD_B are checkouts whose python/garuda holds a built
 # _native (scripts/build-extension.sh). Before the rounds, A runs twice: the
 # difference between those two runs is this session's noise, and a change
 # smaller than it is not a result. With BUILD_A and BUILD_B the same, the whole
@@ -69,7 +69,7 @@ start() {
     server_stop
     # shellcheck disable=SC2086 -- extra is deliberately split into flags.
     PYTHONPATH="$build/python:$ROOT/benchmarks/contract" server_start \
-        taskset -c "$SERVER_CPU" "$VENV/bin/python" -m peregrine \
+        taskset -c "$SERVER_CPU" "$VENV/bin/python" -m garuda \
         --host 127.0.0.1 --port "$PORT" --workers 1 --log-level error $extra \
         --venv "$VENV" --python-path "$ROOT/benchmarks/contract" "$target" \
         > "$OUT/server.log" 2>&1

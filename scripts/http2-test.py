@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HTTP/2 checks against an independent implementation.
 
-    <venv>/bin/python scripts/http2-test.py [path-to-peregrine]
+    <venv>/bin/python scripts/http2-test.py [path-to-garuda]
 
 The server's own framing and HPACK are tested by unit tests and by h2spec;
 what this adds is interop with a stack written by someone else (the `h2`
@@ -33,11 +33,11 @@ except ImportError:
     raise SystemExit(2)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/peregrine")
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/garuda")
 
 # Extra server flags, so the same suite can be pointed at a different
-# execution model:  PEREGRINE_EXTRA_ARGS="--workers 4 --free-threaded"
-EXTRA = shlex.split(os.environ.get("PEREGRINE_EXTRA_ARGS", ""))
+# execution model:  GARUDA_EXTRA_ARGS="--workers 4 --free-threaded"
+EXTRA = shlex.split(os.environ.get("GARUDA_EXTRA_ARGS", ""))
 
 # Set for the second pass, which runs everything again over TLS so that ALPN,
 # record boundaries and partial writes are exercised by the same checks.
@@ -50,7 +50,7 @@ def make_certs():
     global CERTS
     if CERTS is not None:
         return CERTS
-    directory = tempfile.mkdtemp(prefix="peregrine-h2-tls-")
+    directory = tempfile.mkdtemp(prefix="garuda-h2-tls-")
     cert = os.path.join(directory, "cert.pem")
     key = os.path.join(directory, "key.pem")
     try:
@@ -261,7 +261,7 @@ def test_basics():
         s1 = c.request(path="/")
         status, headers, body, _ = c.collect([s1])
         is_("a GET is answered", status.get(s1), 200)
-        is_("the body arrives intact", body.get(s1), b"hello from peregrine asgi\n")
+        is_("the body arrives intact", body.get(s1), b"hello from garuda asgi\n")
         is_("headers are lowercase on the wire",
             headers[s1].get(b"content-type"), b"text/plain")
         check("no connection-specific headers are sent",
@@ -343,7 +343,7 @@ def test_request_bodies():
         s = c.request(path="/")
         status, _, body, _ = c.collect([s])
         is_("the connection survives that reset",
-            (status.get(s), body.get(s)), (200, b"hello from peregrine asgi\n"))
+            (status.get(s), body.get(s)), (200, b"hello from garuda asgi\n"))
         c.close()
 
 
@@ -690,7 +690,7 @@ def test_wsgi():
             status, headers, body, _ = c.collect([s])
             is_("a WSGI GET is answered (%s)" % label, status.get(s), 200)
             is_("the body arrives intact (%s)" % label, body.get(s),
-                b"hello from peregrine\n")
+                b"hello from garuda\n")
             is_("a length is declared (%s)" % label,
                 headers[s].get(b"content-length"), b"21")
             check("no HTTP/1 framing survives (%s)" % label,
@@ -699,7 +699,7 @@ def test_wsgi():
                                                     b"keep-alive")),
                   str(sorted(headers[s])))
             is_("the server names itself (%s)" % label,
-                headers[s].get(b"server"), b"peregrine")
+                headers[s].get(b"server"), b"garuda")
 
             s = c.request(path="/env")
             _, _, body, _ = c.collect([s])
@@ -779,7 +779,7 @@ def test_wsgi():
             s = c.request(path="/")
             status, _, body, _ = c.collect([s])
             is_("the connection survives a reset stream (%s)" % label,
-                (status.get(s), body.get(s)), (200, b"hello from peregrine\n"))
+                (status.get(s), body.get(s)), (200, b"hello from garuda\n"))
 
             s = c.request(path="/overlong")
             status, headers, body, _ = c.collect([s])
@@ -811,7 +811,7 @@ def main():
     if not os.path.exists(BIN):
         print("no such binary: %s" % BIN)
         return 2
-    print("peregrine HTTP/2 tests (%s, h2 %s)" % (BIN, h2.__version__))
+    print("garuda HTTP/2 tests (%s, h2 %s)" % (BIN, h2.__version__))
     print("\n== cleartext (prior knowledge) ==")
     run_all()
 

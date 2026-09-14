@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Checks peregrine against the frameworks people actually deploy.
+# Checks garuda against the frameworks people actually deploy.
 #
-#   bash scripts/framework-test.sh [path-to-peregrine] [path-to-venv]
+#   bash scripts/framework-test.sh [path-to-garuda] [path-to-venv]
 #
 # Small example applications prove the protocol; a real framework proves the
 # parts of it that only show up in anger -- middleware stacks, lifespan
@@ -11,13 +11,13 @@
 # The virtualenv needs: fastapi starlette flask django websockets
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/release/peregrine}}
-VENV=${2:-${PEREGRINE_VENV:-$HOME/pgvenv}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/release/garuda}}
+VENV=${2:-${GARUDA_VENV:-$HOME/pgvenv}}
 PY="$VENV/bin/python"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ASGI_PORT=8410
 WSGI_PORT=8411
-MARKER="${TMPDIR:-/tmp}/peregrine-fw-shutdown.$$"
+MARKER="${TMPDIR:-/tmp}/garuda-fw-shutdown.$$"
 
 PASS=0
 FAIL=0
@@ -27,7 +27,7 @@ is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 has() { case "$2" in *"$3"*) ok "$1";; *) bad "$1" "$2" "contains $3";; esac; }
 
 # Only the server this script started is stopped, and as a process group, so
-# nothing is left behind and no unrelated peregrine is taken down with it.
+# nothing is left behind and no unrelated garuda is taken down with it.
 # shellcheck source=scripts/serverlib.sh
 . "$(dirname "$0")/serverlib.sh"
 cleanup() { server_stop; rm -f "$MARKER"; }
@@ -49,17 +49,17 @@ start() {  # port app extra-args...
     cleanup
     # Exported rather than prefixed on the call: a prefix assignment on a shell
     # function leaks into the shell afterwards, which is not what it looks like.
-    export PEREGRINE_SHUTDOWN_MARKER="$MARKER"
+    export GARUDA_SHUTDOWN_MARKER="$MARKER"
     server_start "$BIN" --port "$port" --log-level error \
         --venv "$VENV" --python-path "$HERE/examples" --python-path "$HERE/python" \
         --forwarded-allow-ips 127.0.0.1 "$@" "$app" \
-        > "${TMPDIR:-/tmp}/peregrine-fw-$port.log" 2>&1
+        > "${TMPDIR:-/tmp}/garuda-fw-$port.log" 2>&1
     for _ in $(seq 1 100); do
         curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
         sleep 0.2
     done
     echo "server failed to start: $app"
-    cat "${TMPDIR:-/tmp}/peregrine-fw-$port.log"
+    cat "${TMPDIR:-/tmp}/garuda-fw-$port.log"
     exit 1
 }
 
@@ -68,7 +68,7 @@ echo "FastAPI / Starlette (ASGI)"
 start $ASGI_PORT fastapi_app:app
 H="http://127.0.0.1:$ASGI_PORT"
 
-has "routing and JSON responses" "$(curl -sS --max-time 10 $H/)" '"hello":"peregrine"'
+has "routing and JSON responses" "$(curl -sS --max-time 10 $H/)" '"hello":"garuda"'
 has "lifespan startup ran before the first request" \
     "$(curl -sS --max-time 10 $H/)" '"started":true'
 has "a trusted proxy sets the scheme Starlette reports" \
@@ -114,7 +114,7 @@ PYEOF
 is "a real websockets client round-trips through Starlette" "$WS" "echo:hello 100005"
 
 # Graceful shutdown must run the FastAPI lifespan teardown. TERM to the server
-# this script started, not to every peregrine on the machine.
+# this script started, not to every garuda on the machine.
 rm -f "$MARKER"
 kill -TERM -- "-$SERVER_PID" 2>/dev/null
 sleep 2
@@ -127,7 +127,7 @@ echo "Flask (WSGI, 8 application threads)"
 start $WSGI_PORT flask_app:app --wsgi-threads 8
 H="http://127.0.0.1:$WSGI_PORT"
 
-has "routing and JSON responses" "$(curl -sS --max-time 10 $H/)" '"hello":"peregrine"'
+has "routing and JSON responses" "$(curl -sS --max-time 10 $H/)" '"hello":"garuda"'
 has "wsgi.multithread is reported to the application" \
     "$(curl -sS --max-time 10 $H/)" '"multithread":true'
 has "a trusted proxy makes request.is_secure true" \
@@ -174,7 +174,7 @@ echo "Django (WSGI, 8 application threads)"
 start $WSGI_PORT django_app:application --wsgi-threads 8
 H="http://127.0.0.1:$WSGI_PORT"
 
-has "routing and JSON responses" "$(curl -sS --max-time 10 $H/)" '"hello": "peregrine"'
+has "routing and JSON responses" "$(curl -sS --max-time 10 $H/)" '"hello": "garuda"'
 has "wsgi.multithread is reported to the application" \
     "$(curl -sS --max-time 10 $H/)" '"multithread": true'
 has "a trusted proxy makes request.is_secure() true" \
@@ -208,7 +208,7 @@ fi
 # --------------------------------------------------- Django, over ASGI ------
 # The same project served as ASGI. Django's handler asserts the scope is http,
 # so a WebSocket needs Channels in front of it and a WebTransport session needs
-# peregrine.contrib.django in front of that -- and the ordinary views have to
+# garuda.contrib.django in front of that -- and the ordinary views have to
 # go on working underneath both.
 echo
 echo "Django (ASGI: HTTP, WebSocket, WebTransport router)"
@@ -216,7 +216,7 @@ start $WSGI_PORT django_app:asgi_application
 H="http://127.0.0.1:$WSGI_PORT"
 
 has "views are served through the WebTransport router" \
-    "$(curl -sS --max-time 10 $H/)" '"hello": "peregrine"'
+    "$(curl -sS --max-time 10 $H/)" '"hello": "garuda"'
 has "a view reports the version that carried it" \
     "$(curl -sS --max-time 10 $H/proto)" '"http_version": "1.1"'
 has "and over HTTP/2, with nothing changed in the application" \
@@ -247,7 +247,7 @@ echo "FastAPI through WebTransportRouter"
 start $ASGI_PORT fastapi_app:wt
 H="http://127.0.0.1:$ASGI_PORT"
 has "HTTP still works when the router is in front" \
-    "$(curl -sS --max-time 10 $H/)" '"hello":"peregrine"'
+    "$(curl -sS --max-time 10 $H/)" '"hello":"garuda"'
 has "lifespan still ran underneath the router" \
     "$(curl -sS --max-time 10 $H/)" '"started":true'
 has "HTTP/1.1 does not advertise WebTransport on the request" \

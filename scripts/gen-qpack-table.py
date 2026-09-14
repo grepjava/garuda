@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the QPACK static table for Sources/PeregrineHTTP/QPACKTables.swift.
+"""Generate the QPACK static table for Sources/GarudaHTTP/QPACKTables.swift.
 
 RFC 9204 appendix A lists 99 entries. Rather than transcribe them -- where one
 wrong character would show up much later as a header that decodes to the wrong
@@ -9,7 +9,7 @@ pylsqpack, which answers with the name and value that index means.
 
 Run inside a virtualenv that has pylsqpack (aioquic pulls it in):
 
-    python scripts/gen-qpack-table.py > Sources/PeregrineHTTP/QPACKTables.swift
+    python scripts/gen-qpack-table.py > Sources/GarudaHTTP/QPACKTables.swift
 """
 import sys
 

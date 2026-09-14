@@ -5,7 +5,7 @@
 # supervisor-plus-worker server is counted fairly against a single-process one.
 set -u
 
-PEREGRINE=${PEREGRINE:-$HOME/pgbuild/release/peregrine}
+GARUDA=${GARUDA:-$HOME/pgbuild/release/garuda}
 VENV=${VENV:-$HOME/bench-venv}
 PORT=8211
 CONNS=${CONNS:-500}
@@ -73,13 +73,13 @@ measure() {
 }
 
 echo "=== resident memory, 1 worker, $CONNS concurrent connections ==="
-measure "peregrine (wsgi)" \
-    "$PEREGRINE" --port $PORT --log-level error --python-path examples wsgi_app:application
+measure "garuda (wsgi)" \
+    "$GARUDA" --port $PORT --log-level error --python-path examples wsgi_app:application
 measure "gunicorn (sync)" \
     "$VENV/bin/gunicorn" -b "127.0.0.1:$PORT" -w 1 --chdir examples \
     --log-level error wsgi_app:application
-measure "peregrine (asgi)" \
-    "$PEREGRINE" --port $PORT --log-level error --python-path examples asgi_app:app
+measure "garuda (asgi)" \
+    "$GARUDA" --port $PORT --log-level error --python-path examples asgi_app:app
 measure "uvicorn (uvloop)" \
     "$VENV/bin/uvicorn" --host 127.0.0.1 --port $PORT --app-dir examples \
     --log-level error --loop uvloop --http httptools asgi_app:app

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Python-only checks for peregrine.contrib and peregrine.webtransport.
+"""Python-only checks for garuda.contrib and garuda.webtransport.
 
     python3 scripts/contrib_test.py
 
@@ -17,13 +17,13 @@ import uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "python"))
 
-from peregrine.contrib.asgi import (  # noqa: E402
+from garuda.contrib.asgi import (  # noqa: E402
     AltSvcMiddleware, WebTransportRouter, _Route, http_version, is_http3,
     session_from, supports_webtransport,
 )
-from peregrine.contrib.django import WebTransportRouter as DjangoRouter  # noqa: E402
-from peregrine.contrib.fastapi import WebTransportEndpoint  # noqa: E402
-from peregrine.webtransport import WebTransportSession  # noqa: E402
+from garuda.contrib.django import WebTransportRouter as DjangoRouter  # noqa: E402
+from garuda.contrib.fastapi import WebTransportEndpoint  # noqa: E402
+from garuda.webtransport import WebTransportSession  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -128,7 +128,7 @@ def test_starlette_routes():
           int_route is not None and str_route is not None
           and int_route.handler is not str_route.handler)
 
-    from peregrine.contrib.fastapi import WebTransportRouter as FastAPIRouter
+    from garuda.contrib.fastapi import WebTransportRouter as FastAPIRouter
 
     class Endpoint(WebTransportEndpoint):
         pass
@@ -221,7 +221,7 @@ def test_helpers():
           not supports_webtransport(object()),
           "claimed")
 
-    from peregrine.contrib.django import http_version as django_http_version
+    from garuda.contrib.django import http_version as django_http_version
 
     class WSGIRequest:
         META = {"SERVER_PROTOCOL": "HTTP/3"}
@@ -388,7 +388,7 @@ async def test_close_on_handler_error():
 
 async def test_per_stream_backpressure():
     print("\nPer-stream backpressure")
-    from peregrine.webtransport import DATAGRAM_QUEUE, INCOMING_QUEUE, STREAM_QUEUE
+    from garuda.webtransport import DATAGRAM_QUEUE, INCOMING_QUEUE, STREAM_QUEUE
 
     channel = Channel([{"type": "webtransport.connect"}])
     session = WebTransportSession(SCOPE, channel.receive, channel.send)
@@ -470,7 +470,7 @@ async def test_per_stream_backpressure():
 
 def test_as_bytes():
     print("\nBytes coercion")
-    from peregrine.webtransport import _as_bytes
+    from garuda.webtransport import _as_bytes
     is_("bytes pass through", _as_bytes(b"hi"), b"hi")
     is_("bytearray is copied", _as_bytes(bytearray(b"hi")), b"hi")
     is_("str is encoded", _as_bytes("hi"), b"hi")

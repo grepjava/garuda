@@ -3,12 +3,12 @@
     python benchmarks/asgi_overhead.py            # asyncio and, if installed, uvloop
     python benchmarks/asgi_overhead.py --requests 50000 --reps 5
 
-Sizes the parts of Peregrine's per-request path that live in Python, before
+Sizes the parts of Garuda's per-request path that live in Python, before
 anything is changed in the server:
 
   floor      the application coroutine stepped by hand, no task at all
   today      loop.create_task via a Python helper, a Python done callback
-             that formats nothing unless the task failed -- what Peregrine
+             that formats nothing unless the task failed -- what Garuda
              does now (Interpreter.swift spawn and task_error)
   no-helper  the same task, created and given its callback without the helper
   no-frame   no helper, and the done callback is Task.exception itself, a C
@@ -17,7 +17,7 @@ anything is changed in the server:
 and, for the record, what building an ASGI scope costs in C-level calls: a
 dict copy and a header list for 3 and for 15 headers.
 
-What it cannot size is the difference between Peregrine's own C awaitable
+What it cannot size is the difference between Garuda's own C awaitable
 raising StopIteration and completing without one; that is measured end to end
 with benchmarks/turbo_ab.sh. Every figure is microseconds per request, the
 median and interquartile range over the repetitions.

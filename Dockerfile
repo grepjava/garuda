@@ -1,13 +1,13 @@
-# Builds peregrine for one specific CPython -- the base image's -- and ships it
+# Builds garuda for one specific CPython -- the base image's -- and ships it
 # alone.
 #
-# The server is peregrine._native, an extension module compiled against one
+# The server is garuda._native, an extension module compiled against one
 # CPython ABI, so it has to be built for the interpreter it will run in. The
 # way to get that right is to build it *inside* the runtime image: the python
 # it compiles against is then, by construction, the one that will import it.
 #
-#   docker build -t peregrine:3.14 .
-#   docker build -t peregrine:3.13 --build-arg PYTHON_IMAGE=python:3.13-slim .
+#   docker build -t garuda:3.14 .
+#   docker build -t garuda:3.13 --build-arg PYTHON_IMAGE=python:3.13-slim .
 #
 # The base image decides everything: which CPython the server runs in, and
 # whether --free-threaded is available at all. The official python images have
@@ -18,11 +18,11 @@
 # The result is a scratch-thin image for an application image to take from, in
 # whichever of two ways suits it:
 #
-#   # installed into the image's own python, with the `peregrine` command
-#   COPY --from=peregrine:3.14 /usr/local/ /usr/local/
+#   # installed into the image's own python, with the `garuda` command
+#   COPY --from=garuda:3.14 /usr/local/ /usr/local/
 #
 #   # or the wheel, for a virtualenv
-#   COPY --from=peregrine:3.14 /wheels/ /tmp/wheels/
+#   COPY --from=garuda:3.14 /wheels/ /tmp/wheels/
 #   RUN pip install /tmp/wheels/*.whl
 #
 # Either needs the same base image the server was built on. Building it once
@@ -77,10 +77,10 @@ RUN python3 --version && pkg-config --modversion python3
 # setup.py builds the extension, vendors the Swift runtime beside it -- the
 # runtime image has no toolchain -- and imports the result in a clean
 # interpreter before it will package it; on a free-threaded base it also checks
-# that the import leaves the GIL off. PEREGRINE_REQUIRE_RELOCATE makes a
+# that the import leaves the GIL off. GARUDA_REQUIRE_RELOCATE makes a
 # missing patchelf an error rather than a wheel that only runs here.
-ENV PEREGRINE_SCRATCH_PATH=/tmp/build \
-    PEREGRINE_REQUIRE_RELOCATE=1
+ENV GARUDA_SCRATCH_PATH=/tmp/build \
+    GARUDA_REQUIRE_RELOCATE=1
 RUN python3 -m pip wheel --no-deps --wheel-dir /out/wheels . \
     && python3 -m pip install --no-deps --no-compile --prefix /out/usr/local /out/wheels/*.whl
 
@@ -88,7 +88,7 @@ RUN python3 -m pip wheel --no-deps --wheel-dir /out/wheels . \
 # outside the source tree, rather than leaving it to fail in the application's
 # image.
 RUN cd / && PYTHONPATH="$(echo /out/usr/local/lib/python3*/site-packages)" \
-        /out/usr/local/bin/peregrine --version
+        /out/usr/local/bin/garuda --version
 
 # --- ship -------------------------------------------------------------------
 # A minimal stage holding the installed server and its wheel, for an

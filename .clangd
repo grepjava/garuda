@@ -4,6 +4,6 @@
 # a cascade of undeclared identifiers. Suppress that noise; `swift build` is
 # the compiler that matters here.
 If:
-  PathMatch: .*/Sources/CPeregrine/.*\.c
+  PathMatch: .*/Sources/CGaruda/.*\.c
 Diagnostics:
   Suppress: "*"

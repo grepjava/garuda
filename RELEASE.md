@@ -1,15 +1,15 @@
 <p align="center">
-  <img src="assets/peregrine-fiery-roaring.png" alt="peregrine" width="480">
+  <img src="assets/garuda-fiery-roaring.png" alt="garuda" width="480">
 </p>
 
 # Releases
 
-What changed in each version of Peregrine, newest first. Every version listed
-here is on [PyPI](https://pypi.org/project/peregrine-server/) as
-`peregrine-server`, and from 1.0.0 on also as a
-[GitHub release](https://github.com/grepjava/peregrine/releases).
+What changed in each version of Garuda, newest first. Every version listed
+here is on [PyPI](https://pypi.org/project/garuda-server/) as
+`garuda-server`, and from 1.0.0 on also as a
+[GitHub release](https://github.com/grepjava/garuda/releases).
 
-**Keeping this file.** A change someone using Peregrine would notice gets a
+**Keeping this file.** A change someone using Garuda would notice gets a
 line under [Unreleased](#unreleased) in the commit that makes it. When a
 version is cut, that section is renamed to the version and its date, a new
 empty Unreleased section goes above it, and the GitHub release notes are taken
@@ -89,15 +89,15 @@ version reached PyPI, in UTC.
 ### Documentation
 
 - `BENCHMARKS.md` is replaced by one session on this build: the suite's raw
-  ASGI and WSGI, FastAPI and Django entries on Peregrine, Flask and BlackSheep
-  on Peregrine, and Elysia on Bun, with a worker per CPU and the suite's
+  ASGI and WSGI, FastAPI and Django entries on Garuda, Flask and BlackSheep
+  on Garuda, and Elysia on Bun, with a worker per CPU and the suite's
   current load command, which ramps to 500,000 requests a second.
   `benchmarks/frameworks.sh` gains `SOURCES=upstream`, `AGG=mean`, `RATE` and
   the `asgi`, `wsgi` and `django` frameworks; the suite's sources are in
   `benchmarks/web-frameworks/`.
 - The README leads with those results: its headline, chart and Numbers section
-  show the suite's entries on Peregrine with a worker per CPU, and FastAPI and
-  Django on Peregrine beside uvicorn and gunicorn in the suite's published
+  show the suite's entries on Garuda with a worker per CPU, and FastAPI and
+  Django on Garuda beside uvicorn and gunicorn in the suite's published
   results, in place of the one-worker comparison measured on 1.1.1.
 
 ---
@@ -229,17 +229,17 @@ Tag `v1.1.0` on `a99b35e`.
 
 ### The server runs inside your Python
 
-- `pip install peregrine-server` installs the server as `peregrine._native`, a
-  CPython extension module that the `peregrine` command loads into the
+- `pip install garuda-server` installs the server as `garuda._native`, a
+  CPython extension module that the `garuda` command loads into the
   interpreter it was installed into. Before, it was a standalone executable
   embedding `libpython`. The command and its options are unchanged.
 - Framework code runs 10–16 % faster that way, inside a distribution `python3`
   rather than a shared `libpython`.
 - Wheels for CPython 3.11, 3.12, 3.13, 3.14 and free-threaded 3.14t on Linux
   (`manylinux_2_39_x86_64`).
-- Server processes are named `peregrine`, so `top`, `pgrep` and `pkill` find
+- Server processes are named `garuda`, so `top`, `pgrep` and `pkill` find
   them.
-- `PEREGRINE_BUILD=binary` still builds the standalone executable, and
+- `GARUDA_BUILD=binary` still builds the standalone executable, and
   `swift build` still produces it for development.
 - The Docker image builds the extension module: copy its `/usr/local`, or
   `pip install` the wheel it exports.
@@ -271,7 +271,7 @@ Tag `v1.1.0` on `a99b35e`.
 - `--health-check-path`: a liveness probe answered without the application.
 - `--request-id`, `--request-start-header`.
 - `--ws-compress`: WebSocket permessage-deflate.
-- `peregrine.logging`: Python logging into the server log.
+- `garuda.logging`: Python logging into the server log.
 
 ### Fixed
 
@@ -281,7 +281,7 @@ Tag `v1.1.0` on `a99b35e`.
 - A reload hands each worker over to its replacement, waits for the
   replacement to be serving before retiring the old one, and works under every
   execution model, so SIGHUP always reloads.
-- `peregrine_workers` reported twice the worker count.
+- `garuda_workers` reported twice the worker count.
 - With every waiting place on the metrics port taken, a new scrape was
   answered before its request had arrived and could lose its response to a
   reset. The one that has waited longest gives up its place instead.

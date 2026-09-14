@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="assets/peregrine-fiery-roaring.png" alt="peregrine" width="480">
+  <img src="assets/garuda-fiery-roaring.png" alt="garuda" width="480">
 </p>
 
-# Installing Peregrine
+# Installing Garuda
 
-Peregrine runs your application in CPython directly, with no socket in
-between. A wheel installs the server as `peregrine._native`, an extension
-module that the `peregrine` command loads into the interpreter you installed it
+Garuda runs your application in CPython directly, with no socket in
+between. A wheel installs the server as `garuda._native`, an extension
+module that the `garuda` command loads into the interpreter you installed it
 into. That decides everything unusual about installing it:
 
 * **A wheel is tagged for exactly one interpreter and platform**
@@ -76,7 +76,7 @@ Activate the environment you intend to serve with, then:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install peregrine-server
+pip install garuda-server
 ```
 
 If PyPI has a wheel for this interpreter and platform, `pip` installs it in
@@ -90,8 +90,8 @@ images. Older glibc, Alpine's musl and macOS compile from the sdist. When it
 finishes:
 
 ```bash
-$ peregrine --version
-peregrine 1.1.5 (CPython 3.12.3)
+$ garuda --version
+garuda 1.1.5 (CPython 3.12.3)
 ```
 
 That second number is read from the running interpreter, not from the headers
@@ -99,17 +99,17 @@ the server was compiled against — it is the Python your applications will
 actually run under. If it disagrees with the `python3` on your `PATH`, that is
 worth resolving now rather than after a confusing `ImportError`.
 
-`peregrine` and `python -m peregrine` are the same thing.
+`garuda` and `python -m garuda` are the same thing.
 
 ### From source
 
 A checkout builds either form. The extension module is what the wheels carry:
 
 ```bash
-git clone https://github.com/grepjava/peregrine
-cd peregrine
-bash scripts/build-extension.sh       # python/peregrine/_native.cpython-312-....so
-PYTHONPATH=python python3 -m peregrine --python-path examples --port 8000 asgi_app:app
+git clone https://github.com/grepjava/garuda
+cd garuda
+bash scripts/build-extension.sh       # python/garuda/_native.cpython-312-....so
+PYTHONPATH=python python3 -m garuda --python-path examples --port 8000 asgi_app:app
 ```
 
 `PYTHON=python3.13 bash scripts/build-extension.sh` builds it for another
@@ -117,18 +117,18 @@ interpreter; each gets its own file, named by that interpreter's extension
 suffix, so several can sit side by side.
 
 `swift build` produces the standalone executable, which embeds `libpython`
-instead. It is for working on Peregrine itself; the extension module is what
+instead. It is for working on Garuda itself; the extension module is what
 installing from source, and the Dockerfile, give you:
 
 ```bash
-swift build -c release                # binary at .build/release/peregrine
-.build/release/peregrine --python-path examples --python-path python \
+swift build -c release                # binary at .build/release/garuda
+.build/release/garuda --python-path examples --python-path python \
     --port 8000 asgi_app:app
 ```
 
-The second `--python-path` is what makes `peregrine.contrib` importable from a
+The second `--python-path` is what makes `garuda.contrib` importable from a
 source checkout; an installed copy needs neither. When both forms are present,
-`python -m peregrine` runs the extension module, and `PEREGRINE_NATIVE=0` makes
+`python -m garuda` runs the extension module, and `GARUDA_NATIVE=0` makes
 it run the executable instead.
 
 If the checkout lives on a filesystem the toolchain is slow on — a Windows
@@ -149,11 +149,11 @@ PYTHON=python3.12 bash scripts/build-wheel.sh
 ```
 
 The wheel lands in `dist/` tagged for that interpreter. It carries
-`peregrine/_native` with the Swift runtime vendored beside it in
-`peregrine/_swift`, and leaves Python to whoever installs it. Before packaging,
+`garuda/_native` with the Swift runtime vendored beside it in
+`garuda/_swift`, and leaves Python to whoever installs it. Before packaging,
 the build imports the module in a fresh interpreter with the library search
 path cleared, so a Swift runtime that is only found on the build machine fails
-there rather than on yours. `PEREGRINE_BUILD=binary` packages the standalone
+there rather than on yours. `GARUDA_BUILD=binary` packages the standalone
 executable instead.
 
 GitHub Actions builds the Linux matrix from
@@ -165,7 +165,7 @@ GitHub Actions builds the Linux matrix from
 
 ## Which interpreter, and which packages
 
-Started through the `peregrine` entry point, the launcher fills in what it can
+Started through the `garuda` entry point, the launcher fills in what it can
 work out and you did not say:
 
 * `--venv` from `sys.prefix`, or from `VIRTUAL_ENV` when the server was
@@ -228,8 +228,8 @@ GIL off: an extension that does not say it is safe without the GIL switches it
 back on for the whole process. Check what came out:
 
 ```console
-$ python3.14t -m peregrine --version
-peregrine 1.1.5 (CPython 3.14.6 free-threaded)
+$ python3.14t -m garuda --version
+garuda 1.1.5 (CPython 3.14.6 free-threaded)
 ```
 
 Without `free-threaded` on that line, `--free-threaded` will refuse to start —
@@ -255,7 +255,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
     -days 30 -nodes -subj "/CN=localhost" \
     -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
-peregrine --port 8443 --tls-cert cert.pem --tls-key key.pem \
+garuda --port 8443 --tls-cert cert.pem --tls-key key.pem \
           --http3 myapp:app
 ```
 
@@ -276,7 +276,7 @@ certificate.
 ## Checking the install
 
 ```bash
-peregrine --port 8000 --python-path examples wsgi_app:application
+garuda --port 8000 --python-path examples wsgi_app:application
 curl http://127.0.0.1:8000/
 ```
 
@@ -289,7 +289,7 @@ installs, so build the extension module first:
 
 ```bash
 bash scripts/build-extension.sh                 # the server under test
-S=scripts/peregrine-ext
+S=scripts/garuda-ext
 
 swift test                                      # 150 unit tests
 bash scripts/integration-test.sh $S             #  56 end-to-end checks
@@ -304,9 +304,9 @@ python3 scripts/contrib_test.py                 #  58 Python-only
 ```
 
 Every suite takes the server's path as its first argument.
-`scripts/peregrine-ext` runs `peregrine._native` in `PEREGRINE_PYTHON`
+`scripts/garuda-ext` runs `garuda._native` in `GARUDA_PYTHON`
 (`python3` unless set) and accepts exactly the executable's arguments, so a
-suite cannot tell the two apart; pass `.build/release/peregrine` instead to
+suite cannot tell the two apart; pass `.build/release/garuda` instead to
 test the standalone executable. CI runs the extension on every interpreter it
 supports and the executable on one.
 
@@ -365,7 +365,7 @@ WSL 2 works normally and is what the project is developed on.
 ## Upgrading and removing
 
 ```bash
-pip install --upgrade --no-cache-dir peregrine-server
+pip install --upgrade --no-cache-dir garuda-server
 ```
 
 `--no-cache-dir` matters: a cached wheel from an earlier interpreter is exactly
@@ -373,7 +373,7 @@ the thing the version tag exists to prevent you from installing, and skipping
 the cache avoids finding out the hard way.
 
 ```bash
-pip uninstall peregrine-server
+pip uninstall garuda-server
 ```
 
 Nothing is installed outside the environment — no service files, no daemon, no

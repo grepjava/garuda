@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # --acme-domain: a certificate from a real ACME server, end to end.
 #
-#   bash scripts/acme-test.sh [path-to-peregrine]
+#   bash scripts/acme-test.sh [path-to-garuda]
 #
 # Runs Let's Encrypt's own test CA, pebble, with pebble-challtestsrv answering
 # DNS so that every test domain resolves to 127.0.0.1. Nothing here is mocked:
@@ -14,7 +14,7 @@
 # client's retry.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8443}
 PEBBLE_DIR=${PEBBLE_DIR:-$HOME/pebble}
 PEBBLE=$(find "$PEBBLE_DIR" -type f -name pebble | head -1)
@@ -134,7 +134,7 @@ case "$(issuer app.test)" in
 esac
 is "a client trusting only pebble reaches the application" \
    "$(curl -sS --max-time 10 --cacert "$WORK/root.pem" --resolve "app.test:$PORT:127.0.0.1" \
-        "https://app.test:$PORT/")" "hello from peregrine"
+        "https://app.test:$PORT/")" "hello from garuda"
 is "and so does the second name" \
    "$(curl -sS --max-time 10 --cacert "$WORK/root.pem" --resolve "www.app.test:$PORT:127.0.0.1" \
         -o /dev/null -w '%{http_code}' "https://www.app.test:$PORT/")" "200"

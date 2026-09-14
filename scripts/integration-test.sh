@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # End-to-end checks against a running server, for both protocols.
 #
-#   bash scripts/integration-test.sh [path-to-peregrine]
+#   bash scripts/integration-test.sh [path-to-garuda]
 #
 # Exercises framing, keep-alive, pipelining, chunked transfer in both
 # directions, large bodies, error paths and the request-smuggling defences.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/release/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/release/garuda}}
 # Extra server flags, so the same suite can be pointed at a different execution
 # model without a second copy of it:
-#   PEREGRINE_EXTRA_ARGS="--workers 4 --free-threaded" bash scripts/integration-test.sh
-EXTRA=${PEREGRINE_EXTRA_ARGS:-}
+#   GARUDA_EXTRA_ARGS="--workers 4 --free-threaded" bash scripts/integration-test.sh
+EXTRA=${GARUDA_EXTRA_ARGS:-}
 WSGI_PORT=8301
 ASGI_PORT=8302
 PASS=0
@@ -35,13 +35,13 @@ start() {
     # shellcheck disable=SC2086 -- EXTRA is a deliberate word-split flag list.
     server_start "$BIN" --port "$port" --log-level error \
         --python-path examples $EXTRA "$app" \
-        > "/tmp/peregrine-it-$port.log" 2>&1
+        > "/tmp/garuda-it-$port.log" 2>&1
     for _ in $(seq 1 50); do
         curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
         sleep 0.2
     done
     echo "server failed to start: $app"
-    cat "/tmp/peregrine-it-$port.log"
+    cat "/tmp/garuda-it-$port.log"
     exit 1
 }
 
@@ -66,7 +66,7 @@ echo "WSGI ($BIN)"
 start $WSGI_PORT wsgi_app:application
 H="http://127.0.0.1:$WSGI_PORT"
 
-is "GET / body" "$(curl -sS --max-time 5 $H/)" "hello from peregrine"
+is "GET / body" "$(curl -sS --max-time 5 $H/)" "hello from garuda"
 is "404 status" "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 $H/nope)" "404"
 is "500 on app exception" "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 $H/boom)" "500"
 is "POST echo" "$(curl -sS --max-time 5 -d 'round trip' $H/echo)" "round trip"
@@ -103,7 +103,7 @@ is "keep-alive reuses the connection" \
    "$(curl -sS --max-time 5 -o /dev/null -o /dev/null -o /dev/null -w '%{num_connects}' $H/ $H/ $H/)" \
    "100"
 is "pipelined requests all answered" \
-   "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from peregrine')" \
+   "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from garuda')" \
    "3"
 # Regression: per-request state must not leak into the next pipelined request.
 is "pipelined POSTs keep their own bodies" \
@@ -170,7 +170,7 @@ echo "ASGI"
 start $ASGI_PORT asgi_app:app
 H="http://127.0.0.1:$ASGI_PORT"
 
-is "GET / body" "$(curl -sS --max-time 5 $H/)" "hello from peregrine asgi"
+is "GET / body" "$(curl -sS --max-time 5 $H/)" "hello from garuda asgi"
 is "404 status" "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 $H/nope)" "404"
 is "500 on app exception" "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 $H/boom)" "500"
 is "POST echo" "$(curl -sS --max-time 5 -d 'asgi round trip' $H/echo)" "asgi round trip"
@@ -200,7 +200,7 @@ is "streaming response" "$(curl -sS --max-time 5 $H/stream | tr '\n' ' ')" \
 is "large response size" \
    "$(curl -sS --max-time 10 -o /dev/null -w '%{size_download}' "$H/big?500000")" "500000"
 is "pipelined requests all answered" \
-   "$(raw $ASGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from peregrine asgi')" \
+   "$(raw $ASGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from garuda asgi')" \
    "3"
 # Regression: an ASGI connection must reset bodyDelivered between requests, or
 # the second receive() on a reused connection parks forever.
@@ -241,10 +241,10 @@ is "health path answers HEAD"         "$(curl -sS -I -o /dev/null -w '%{http_cod
 is "POST to it reaches the app"       "$(curl -sS -X POST -o /dev/null -w '%{http_code}' $HB/healthz)" "404"
 is "a longer path reaches the app"    "$(curl -sS -o /dev/null -w '%{http_code}' $HB/healthzz)"     "404"
 is "a prefix of it reaches the app"   "$(curl -sS -o /dev/null -w '%{http_code}' $HB/health)"       "404"
-is "the application still answers"    "$(curl -sS $HB/)"  "hello from peregrine"
+is "the application still answers"    "$(curl -sS $HB/)"  "hello from garuda"
 # Answering without dispatching must not break the connection for what follows.
 is "keep-alive survives a probe" \
-   "$(raw $WSGI_PORT 'GET /healthz HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from peregrine')" \
+   "$(raw $WSGI_PORT 'GET /healthz HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from garuda')" \
    "1"
 
 # ------------------------------------------------------------- summary ------

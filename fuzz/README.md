@@ -27,7 +27,7 @@ CI runs that last form on every push.
 "Does not crash" is the weakest thing a fuzzer can check and the easiest to
 pass by accident, so each target also states an invariant that a corrupted
 parse breaks even when nothing traps
-([`Sources/PeregrineFuzzTargets`](../Sources/PeregrineFuzzTargets)):
+([`Sources/GarudaFuzzTargets`](../Sources/GarudaFuzzTargets)):
 
 - **every slice points inside the bytes it was given.** The parsers return
   offsets into the caller's buffer; one that runs past the end is how a

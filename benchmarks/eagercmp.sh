@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Two peregrine extension builds on the same app: server CPU per request and
+# Two garuda extension builds on the same app: server CPU per request and
 # p50/p99 under closed-loop oha at several connection counts, and system calls
 # per request under strace at 64, so a change's per-request cost can be told
 # from a change in how requests batch.
 #
-#   BUILD_A=/mnt/d/code/peregrine-turbo-a BUILD_B=/mnt/d/code/peregrine-eager \
+#   BUILD_A=/mnt/d/code/garuda-turbo-a BUILD_B=/mnt/d/code/garuda-eager \
 #       APPS="asgi fastapi" CONNS="1 8 64" bash benchmarks/eagercmp.sh
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,7 +39,7 @@ start() {
     [ "$traced" = 1 ] && pre=(strace -f -c -o "$OUT/$tag.strace")
     PYTHONPATH="$build/python:$ROOT/benchmarks/contract" server_start \
         taskset -c "$SERVER_CPUS" "${pre[@]}" \
-        "$VENV/bin/python" -m peregrine --host 127.0.0.1 --port "$PORT" \
+        "$VENV/bin/python" -m garuda --host 127.0.0.1 --port "$PORT" \
         --workers 1 --log-level error --venv "$VENV" \
         --python-path "$ROOT/benchmarks/contract" "$(target "$app")" \
         > "$OUT/$tag.log" 2>&1

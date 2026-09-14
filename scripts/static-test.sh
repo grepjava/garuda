@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # --static-dir: what it serves, what it refuses, and what it leaves alone.
 #
-#   bash scripts/static-test.sh [path-to-peregrine]
+#   bash scripts/static-test.sh [path-to-garuda]
 #
 # The interesting half is the refusals. A static route is a path from a URL to
 # the filesystem, so the checks that matter are the ones where it must not
@@ -9,7 +9,7 @@
 # merely shares a prefix, and anything that is not a regular file.
 set -u
 
-BIN=${1:-${PEREGRINE:-$HOME/pgbuild/debug/peregrine}}
+BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
 PORT=${PORT:-8351}
 TLS_PORT=${TLS_PORT:-8352}
 WORK=$(mktemp -d)
@@ -134,7 +134,7 @@ is "a sibling sharing the prefix is refused" "$(code $H/staticky/leak.txt)" "404
 is "a directory is not served"       "$(code $H/static/deep)"        "404"
 is "the route root is not served"    "$(code $H/static/)"            "404"
 is "a missing file reaches the app"  "$(code $H/static/nothing.css)" "404"
-is "another path reaches the app"    "$(body $H/)"  "hello from peregrine"
+is "another path reaches the app"    "$(body $H/)"  "hello from garuda"
 is "POST to a real file reaches the app" "$(code -X POST $H/static/site.css)" "404"
 
 # --- keep-alive ----------------------------------------------------------
