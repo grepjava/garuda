@@ -1112,8 +1112,9 @@ that gap gets — it is the application and everything it imports, not the
 server, that was being copied.
 
 Hello-world `GET /` is the other way around: with four workers, threads reach
-88–91 % of what four processes do on FastAPI and 77–79 % on Flask. That table
-is in [BENCHMARKS.md](BENCHMARKS.md#processes-or-free-threaded). `--free-threaded` is the
+88–91 % of what four processes do on FastAPI and 77–79 % on Flask, measured
+with closed-loop `oha` by
+[benchmarks/gil_vs_ft.sh](benchmarks/gil_vs_ft.sh). `--free-threaded` is the
 memory and shared-state option, not a request-rate upgrade on an empty view.
 
 Sharing one process also changes three things it is worth knowing about:

@@ -4,594 +4,182 @@
 
 # Benchmarks
 
-Two questions, answered with the load command and the applications of
-[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
-but on one worker and on a different machine. The figures here are **not**
-comparable with the ones that site publishes; see
-[Relation to the published results](#relation-to-the-published-results).
+Six Peregrine entries of
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
+and Elysia on Bun, measured with that suite's load command, its applications
+and a worker per CPU, at 64, 256 and 512 connections. The machine is not the
+suite's, so the figures here are **not** comparable with the ones the site
+publishes; see [Relation to the published results](#relation-to-the-published-results).
 
-1. **FastAPI (ASGI):** Peregrine against uvicorn, granian and fastpysgi, one
-   worker, at 64, 256 and 512 connections.
-2. **Flask (WSGI):** Peregrine against uvicorn, granian and fastpysgi, one
-   worker, at 64, 256 and 512 connections.
+Measured in one session on 2026-09-14, on Peregrine at b8d6ae9: 1.1.4 and every
+fix since, the build 1.1.5 would ship.
 
-[Extension 1.1.2](#extension-112-1-worker) adds the next build under the same
-load: unchanged throughput, the response cache, Elysia on Bun beside it, and
-kernel TLS for static files.
+- **Every entry answered every request.** No run returned an error, a timeout
+  or a non-2xx response, at any level.
+- **Raw WSGI is the fastest Peregrine entry at 64 and 256 connections**,
+  293,025 and 302,417 requests a second, against raw ASGI's 221,826 and
+  271,396. At 512 the two are 1.4 % apart, inside the run-to-run spread.
+- **BlackSheep is the fastest framework**, 179,208–202,141: 2.6–3.1× FastAPI,
+  3.9–4.3× Django and 3.6–4.0× Flask on the same server.
+- **Elysia on Bun serves 1.2–1.6× raw Peregrine** and 1.7–1.9× BlackSheep.
 
-On one worker of this machine Peregrine answers FastAPI 1.41–1.60× as fast as
-the next server at each level, and Flask 1.42–1.47× as fast as the next server
-(fastpysgi) and more than twice as fast as uvicorn and granian. That is
-Peregrine as a wheel installs it, the `peregrine._native` extension module; the
-standalone executable, which embeds `libpython`, is 10–16 % behind it.
+---
+
+## Results, 4 workers
+
+Requests per second, the mean of three runs:
+
+| entry | application | 64 | 256 | 512 |
+|---|---|---:|---:|---:|
+| peregrine-wsgi | raw WSGI | **293,025** | **302,417** | 256,660 |
+| peregrine-asgi | raw ASGI | 221,826 | 271,396 | **260,155** |
+| peregrine-blacksheep | BlackSheep 2.6.3 | 179,208 | 202,141 | 197,687 |
+| peregrine-fastapi | FastAPI 0.141.1 | 57,553 | 72,306 | 76,818 |
+| peregrine-flask | Flask 3.1.3 | 49,933 | 50,423 | 50,964 |
+| peregrine-django | Django 6.1.1 | 46,058 | 47,806 | 45,806 |
+| elysia-bun, reference | Elysia 1.4.30 on Bun 1.4.2 | 346,465 | 350,622 | 356,547 |
+
+Latency, p50 / p99, in milliseconds, the mean of three runs:
+
+| entry | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| peregrine-wsgi | 87 / 1,538 | 47 / 1,233 | 226 / 1,875 |
+| peregrine-asgi | 329 / 2,734 | 224 / 1,896 | 180 / 1,851 |
+| peregrine-blacksheep | 698 / 4,225 | 498 / 3,043 | 624 / 3,225 |
+| peregrine-fastapi | 2,772 / 8,075 | 2,619 / 7,256 | 2,448 / 6,954 |
+| peregrine-flask | 3,324 / 8,739 | 3,224 / 8,391 | 3,274 / 8,421 |
+| peregrine-django | 3,407 / 8,903 | 3,377 / 8,589 | 3,356 / 8,682 |
+| elysia-bun, reference | 38 / 1,084 | 15 / 772 | 14 / 884 |
+
+The three runs behind each figure, in requests per second:
+
+| entry | 64 | 256 | 512 |
+|---|---|---|---|
+| peregrine-wsgi | 288,003 · 291,107 · 299,966 | 280,747 · 315,792 · 310,711 | 207,911 · 284,829 · 277,240 |
+| peregrine-asgi | 203,659 · 235,354 · 226,465 | 286,103 · 271,192 · 256,894 | 240,507 · 254,042 · 285,916 |
+| peregrine-blacksheep | 188,493 · 174,349 · 174,781 | 205,982 · 196,186 · 204,256 | 194,230 · 193,920 · 204,910 |
+| peregrine-fastapi | 51,953 · 58,053 · 62,652 | 65,900 · 72,505 · 78,512 | 76,863 · 77,457 · 76,134 |
+| peregrine-flask | 50,075 · 49,084 · 50,639 | 48,893 · 51,603 · 50,774 | 49,881 · 51,867 · 51,145 |
+| peregrine-django | 45,022 · 48,251 · 44,901 | 47,846 · 45,924 · 49,647 | 46,053 · 46,048 · 45,316 |
+| elysia-bun, reference | 343,970 · 343,530 · 351,895 | 353,516 · 369,948 · 328,402 | 362,111 · 357,651 · 349,879 |
+
+- **Runs vary, the raw entries most.** Raw WSGI at 512 connections ranges from
+  207,911 to 284,829, raw ASGI at 64 from 203,659 to 235,354, and FastAPI at
+  256 from 65,900 to 78,512. Every other cell stays within 13 %. The load
+  generator shares the four CPUs with the server, which likely matters most
+  for the entries that answer the most. Differences of 10 % or less between
+  the raw entries, or between levels, are inside that spread.
+- **Latency measures how far behind the ramp a server falls, not a request's
+  round trip.** The ramp offers requests faster than every entry here can
+  answer them by the end of each run, and zrk counts the time a request waited
+  to be sent. A p50 of seconds means the queue grew for most of the run; tens
+  of milliseconds, that the server kept up until late. Compare the entries with
+  each other, not with a closed-loop benchmark.
+- **Flask and Django are within 12 % of each other**, and both are limited by
+  the framework, not the server: the raw WSGI entry on the same server is
+  5.0–6.4× either.
 
 ---
 
 ## Method
 
-The load command and the applications are the benchmark suite's own, taken from
-[the-benchmarker/web-frameworks at ac364e9](https://github.com/the-benchmarker/web-frameworks/tree/ac364e9b1674c9f9edd184afc9a876a75fbcdf10)
-(`master`, 2026-09-11), the revision whose results the site showed when these
-were measured. The machine, the worker count, the Python version and some of
-the servers are not, and every difference is listed below.
+The load command, the applications and the server command are the suite's own,
+from [the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks)
+on `develop`: the load command at
+[4bb9eaa](https://github.com/the-benchmarker/web-frameworks/blob/4bb9eaa/.tasks/config.rake#L149)
+(2026-09-13), the applications at 3795a31 (2026-09-14). The machine, the
+Python patch release and where the load generator runs are not, and every
+difference is listed below.
 
 | | |
 |---|---|
-| Load generator | [zrk](https://github.com/zoxy-io/zrk) 2.5.0 |
+| Load generator | [zrk](https://github.com/zoxy-io/zrk) 2.5.0, two threads |
 | Warm-up | `zrk -c 50 -d 5s --plain URL` |
-| Each level | `zrk --plain -c N -d 15s -m GET --format json -R1000:100000 --interval 1s --timeout 8s --latency URL` |
+| Each level | `zrk --plain -c N -d 15s -m GET --format json -R1000:500000 --interval 1s --timeout 8s --latency URL` |
 | Levels | 64, 256 and 512 connections, `GET /` |
-| Figure | zrk's `achieved_rate`, in requests per second |
-| Latency | p50 and p99, corrected for coordinated omission |
-| Applications | the suite's `python/fastapi` and `python/flask` sources, byte for byte: [benchmarks/contract/](benchmarks/contract/) |
-| Servers | uvicorn and granian with the suite's engine commands and `--workers 1`; Peregrine as `python -m peregrine` and as the executable; fastpysgi and uvicorn's WSGI adapter as described below |
-| Host | WSL2 on 4 cores, Ubuntu 24.04, CPython 3.12.3, load generator on the same machine |
+| Figure | zrk's `achieved_rate`, in requests per second, the mean of three runs |
+| Latency | p50 and p99, corrected for coordinated omission, the mean of three runs |
+| Server | `python -m peregrine --log-level error --protocol X --workers 4 APP`, the suite's `peregrine` engine command with `--workers $(nproc)` |
+| Applications | the suite's `python/peregrine-asgi`, `-wsgi`, `-fastapi` and `-django` entries, and its `python/flask` and `python/blacksheep` sources run the same way, copied unchanged: [benchmarks/web-frameworks/](benchmarks/web-frameworks/) |
+| Elysia | the suite's `javascript/elysia-bun`, `cluster.ts` starting one `bun ./app.ts` per CPU: [benchmarks/elysia-bun/](benchmarks/elysia-bun/) |
+| Host | WSL2, 4 CPUs of an Intel Core i9-12900KF, 31 GB, Ubuntu 24.04.4, Linux 6.18; load generator on the same machine |
+| Python | CPython 3.14.6, not free-threaded; Peregrine built from source as the extension module a wheel installs |
 
-Versions: FastAPI 0.141.1 (Starlette 1.6.0, Pydantic 2.13.5), Flask 3.1.3
-(Werkzeug 3.1.8), uvicorn 0.52.4 with uvloop 0.22.1 and httptools 0.8.0, granian 2.8.2,
-fastpysgi 0.6.
+Versions: FastAPI 0.141.1 (Starlette 1.6.0, Pydantic 2.13.5), Django 6.1.1,
+Flask 3.1.3 (Werkzeug 3.1.8), BlackSheep 2.6.3, uvloop 0.22.1; Elysia 1.4.30
+on Bun 1.4.2.
 
-The load command is the suite's `collect` command, `.tasks/config.rake` line 152
-at that revision: an open-loop ramp from 1,000 to 100,000 requests a second over
-the run, with keep-alive on. Two things in the suite say otherwise and are out
-of date. Its README describes oha with keep-alive disabled, and the comment just
-above the command describes `--closed`, a closed loop in which each response
-triggers the next request — but the command does not pass `--closed`. The
-repository does not record which command produced a published dataset. The
-site's latencies, a p99 of about 5 s for FastAPI on uvicorn, are what this ramp
-produces and a closed loop would not.
+The command is an open-loop ramp from 1,000 to 500,000 requests a second over
+the 15 s of a run, with keep-alive on. Upstream raised the end of the ramp from
+100,000 at 4bb9eaa. Under the old ramp a run offered at most about 96,500
+requests a second, which every raw entry and Elysia reached, so it could not
+rank them; the new one offers more than any entry here answers. The comment
+above the command in `config.rake` describes `--closed`, a closed loop; the
+command does not pass it.
 
-Every figure below comes from one session, one server after another. Separate
-sessions on this machine differ by up to 10 %, which is more than some of the
-gaps being measured.
+Free-threaded builds were not measured.
 
 **Where this differs from upstream:**
 
-| | upstream at ac364e9, published 2026-09-11 | here |
+| | upstream, dataset of 2026-09-13 | here |
 |---|---|---|
-| Host | 16 CPUs, 7.7 GB, Linux 7.1 (Fedora) | WSL2 on 4 cores, 31 GB, Ubuntu 24.04 |
-| Workers | `--workers $(nproc)`, one per CPU | 1 |
-| Python | 3.14 | 3.12.3 |
-| FastAPI entry | uvicorn (hypercorn, daphne and granian are also configured) | Peregrine, uvicorn, granian, fastpysgi |
-| Flask entry | gunicorn with sync workers (uwsgi, waitress and granian are also configured) | Peregrine, uvicorn's WSGI adapter, granian, fastpysgi |
-| fastpysgi | raw ASGI and WSGI applications, no framework | the FastAPI and Flask applications |
-| Runs | request counts are published in thirds, so each figure is a mean of three runs | three runs, the median by `achieved_rate` |
-
-- **One worker.** It compares what each server does with a core, and keeps the
-  load generator from competing with the servers for the same four cores. It is
-  also the main reason these figures cannot be set beside the site's: a server's
-  throughput on sixteen workers is not sixteen times its throughput on one, and
-  dividing the site's figures by sixteen does not give a single-worker result.
-- **Median rather than mean.** A developer machine is noisier than a dedicated
-  benchmark host, and one disturbed run moves a mean of three more than a median.
-- **Peregrine is measured in both forms.** `peregrine` is `python -m peregrine`
-  with the extension module, which is what a wheel installs. The executable
-  row is the same server built as a standalone binary embedding `libpython`.
-  Peregrine is not on the site.
-- **uvicorn serves Flask through `--interface wsgi`.** The suite has no uvicorn
-  engine for Flask; its Flask engines are gunicorn, uwsgi, waitress and granian.
-  uvicorn's WSGI adapter is included here because the comparison asked for is
-  the same servers on both frameworks.
-- **fastpysgi serves the FastAPI and Flask applications.** The suite's
-  `fastpysgi-asgi` and `fastpysgi-wsgi` entries run hand-written raw ASGI and
-  WSGI applications. Here the same launch they use,
-  `fastpysgi.run(app, host, port, workers=N)`, is given the FastAPI and Flask
-  applications every other server runs, so the framework is the same for all.
+| Host | 16 CPUs, 7.7 GB, Linux 7.1 (Fedora) | WSL2 on 4 CPUs, 31 GB, Ubuntu 24.04.4 |
+| Workers | `--workers $(nproc)`, 16 | `--workers $(nproc)`, 4 |
+| Load generator | the suite runs each server in a container | same machine as the server, sharing its 4 CPUs |
+| Python | 3.14 | 3.14.6 |
+| Peregrine | `pip install 'peregrine-server>=1.0,<1.1'` | built from source at b8d6ae9 |
+| Flask and BlackSheep | on their own engines, gunicorn and uvicorn; there is no Peregrine entry for either | the suite's sources on Peregrine |
 
 ### Relation to the published results
 
-The site shows one entry per framework, each on its default server with a
-worker per CPU. At ac364e9 the entries these benchmarks touch are, in requests
-per second at 64 / 256 / 512 connections:
+The site's dataset of 2026-09-13 09:54 UTC lists Peregrine 1.0 under four
+entries, measured with the same command on sixteen CPUs. Requests per second at
+64 / 256 / 512 connections, beside the entries the same frameworks have on their
+default engines:
 
 | site entry | what it runs | 64 | 256 | 512 |
 |---|---|---:|---:|---:|
-| `fastapi` | FastAPI on uvicorn | 41,461 | 44,182 | 43,226 |
-| `flask` | Flask on gunicorn, sync workers | 1,413 | 8,866 | 6,376 |
-| `fastpysgi-asgi` | a raw ASGI application, no framework | 92,108 | 89,267 | 88,817 |
-| `fastpysgi-wsgi` | a raw WSGI application, no framework | 96,673 | 96,557 | 96,483 |
+| `peregrine-wsgi` | raw WSGI on Peregrine 1.0 | 158,062 | 131,645 | 130,843 |
+| `peregrine-asgi` | raw ASGI on Peregrine 1.0 | 128,342 | 107,861 | 105,471 |
+| `peregrine-fastapi` | FastAPI on Peregrine 1.0 | 54,338 | 59,273 | 60,201 |
+| `peregrine-django` | Django on Peregrine 1.0, WSGI | 39,840 | 39,718 | 39,654 |
+| `fastapi` | FastAPI on uvicorn | 41,891 | 47,335 | 48,552 |
+| `flask` | Flask on gunicorn, sync workers | 5,106 | 12,277 | 5,904 |
+| `django` | Django on gunicorn | 1,165 | 5,727 | 4,699 |
+| `blacksheep` | BlackSheep on uvicorn | 80,409 | 85,160 | 85,960 |
+| `fastpysgi-wsgi` | a raw WSGI application on fastpysgi | 157,810 | 129,789 | 129,033 |
+| `elysia-bun` | Elysia on Bun | 162,284 | 132,591 | 127,945 |
 
-None of them measures what the tables below measure. They use every one of
-sixteen CPUs rather than one worker, Python 3.14 rather than 3.12, a different
-server for Flask, and for fastpysgi no framework at all. The tables below show
-how these servers compare with each other on one worker of this machine —
-Peregrine 1.4–1.6× uvicorn and granian on FastAPI, for instance — and the
-published results neither confirm nor contradict that.
-
-Source: [`data.min.json` at ac364e9](https://github.com/the-benchmarker/web-frameworks/blob/ac364e9b1674c9f9edd184afc9a876a75fbcdf10/data.min.json),
+Source: [`data.min.json` on `develop`](https://github.com/the-benchmarker/web-frameworks/blob/develop/data.min.json),
 the file the site's frontend loads.
 
-**Reading the latencies.** The ramp ends far above what any of these servers
-can do on one core, so for most of each run requests are offered faster than
-they are answered. Latency corrected for coordinated omission counts the time a
-request waited to be sent, so it measures how fast that queue grows: seconds,
-not milliseconds. Compare the servers here with each other — not with a
-closed-loop benchmark, and not with the site's latencies, which come from the
-same ramp on a machine with four times the cores and sixteen workers.
-
-Reproduce:
-
-```bash
-PYTHON=~/fastapi-bench-venv/bin/python bash scripts/build-extension.sh
-swift build -c release --scratch-path ~/pgbuild
-bash benchmarks/frameworks.sh > results.tsv
-```
-
-`WORKERS`, `CONNS`, `RUNS`, `DURATION`, `FRAMEWORKS`, `SERVERS`, `VENV`,
-`PEREGRINE`, `ZRK`, `CONTRACT`, `EXT_ROOT`, `PEREGRINE_EXTRA_ARGS` and `BUN`
-override the defaults. The virtualenv needs `fastapi`,
-`flask`, `uvicorn[standard]`, `granian` and `fastpysgi`; `peregrine-ext` needs
-the extension module built for that virtualenv's python, and `peregrine` the
-executable.
+None of these can be set beside the tables above. Here four workers answered
+up to 302,417 requests a second where sixteen answered 158,062 there, so the
+host and the path from load generator to server count for more than the
+workers do. On this machine the load generator reaches the server over
+loopback, which is likely a large part of it. What the two agree on is the
+order where both have entries: raw WSGI leads raw ASGI at 64 and 256
+connections, FastAPI leads Django, and in the published set FastAPI and Django
+on Peregrine 1.0 are ahead of the same frameworks on their default engines.
 
 ---
 
-## FastAPI (ASGI), 1 worker
-
-Requests per second:
-
-| server | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| **Peregrine** | **24,672** | **24,117** | **24,320** |
-| Peregrine, executable | 21,696 | 21,841 | 21,504 |
-| uvicorn | 17,504 | 15,544 | 15,114 |
-| granian | 15,647 | 15,574 | 15,209 |
-| fastpysgi, running FastAPI | 11,337 | 10,843 | 10,264 |
-
-Latency, p50 / p99, in seconds:
-
-| server | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| **Peregrine** | 1.45 / 4.95 | 1.55 / 5.25 | 1.56 / 5.25 |
-| Peregrine, executable | 1.82 / 5.75 | 1.79 / 5.65 | 1.63 / 5.65 |
-| uvicorn | 2.46 / 7.03 | 2.52 / 7.01 | 2.55 / 7.23 |
-| granian | 2.41 / 6.97 | 2.46 / 6.98 | 2.43 / 6.96 |
-| fastpysgi, running FastAPI | 3.10 / 8.03 | 3.09 / 8.23 | 3.25 / 8.35 |
-
-No server returned an error or a non-2xx response at any level.
-
-## Flask (WSGI), 1 worker
-
-Requests per second:
-
-| server | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| **Peregrine** | **14,768** | **14,992** | **14,458** |
-| Peregrine, executable | 13,084 | 13,029 | 12,488 |
-| fastpysgi, running Flask | 10,419 | 10,202 | 9,978 |
-| uvicorn (`--interface wsgi`) | 6,554 | 6,545 | 5,722 |
-| granian | 6,427 | 6,152 | 6,257 |
-
-Latency, p50 / p99, in seconds:
-
-| server | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| **Peregrine** | 2.51 / 7.11 | 2.52 / 7.06 | 2.53 / 7.24 |
-| Peregrine, executable | 2.52 / 7.57 | 2.77 / 7.55 | 2.50 / 7.49 |
-| fastpysgi, running Flask | 3.27 / 8.34 | 3.27 / 8.37 | 3.28 / 8.41 |
-| uvicorn (`--interface wsgi`) | 3.97 / 9.68 | 3.91 / 9.55 | 4.11 / 9.75 |
-| granian | 3.90 / 9.67 | 4.14 / 9.82 | 4.08 / 9.83 |
-
-No server returned an error or a non-2xx response at any level.
-
----
-
-## Extension 1.1.2, 1 worker
-
-The build after 1.1.1 adds trace context, a response cache, notified reload and
-kernel TLS. It was measured as the extension module in one session on
-2026-09-13, with the same load, applications and machine as the tables above.
-Elysia on Bun ran in the same session as a non-Python reference. The version in
-the code is still 1.1.1; "1.1.2" names this build.
-
-Requests per second:
-
-| server | application | 64 | 256 | 512 |
-|---|---|---:|---:|---:|
-| Peregrine 1.1.2 | FastAPI | 25,681 | 24,960 | 24,520 |
-| Peregrine 1.1.1, [above](#fastapi-asgi-1-worker) | FastAPI | 24,672 | 24,117 | 24,320 |
-| Peregrine 1.1.2 | Flask | 15,143 | 15,158 | 15,036 |
-| Peregrine 1.1.1, [above](#flask-wsgi-1-worker) | Flask | 14,768 | 14,992 | 14,458 |
-| Peregrine 1.1.2, `--cache-size 64` | FastAPI, responses fresh for 60 s | 96,636 | 96,472 | 96,370 |
-| Peregrine 1.1.2, `--cache-size 64` | Flask, responses fresh for 60 s | 96,642 | 96,521 | 96,390 |
-| Elysia 1.4.30 on Bun 1.4.2 | the suite's `javascript/elysia-bun` | 96,610 | 96,455 | 96,442 |
-
-Latency, p50 / p99, in milliseconds:
-
-| server | application | 64 | 256 | 512 |
-|---|---|---:|---:|---:|
-| Peregrine 1.1.2 | FastAPI | 1,438 / 4,966 | 1,455 / 5,024 | 1,602 / 5,196 |
-| Peregrine 1.1.2 | Flask | 2,481 / 7,051 | 2,422 / 6,961 | 2,532 / 7,039 |
-| Peregrine 1.1.2, `--cache-size 64` | FastAPI | 0.051 / 6.9 | 0.053 / 10.1 | 0.055 / 3.1 |
-| Peregrine 1.1.2, `--cache-size 64` | Flask | 0.052 / 15.1 | 0.052 / 8.2 | 0.055 / 4.5 |
-| Elysia 1.4.30 on Bun 1.4.2 | | 0.057 / 4.8 | 0.069 / 13.5 | 0.061 / 3.7 |
-
-No server returned an error or a non-2xx response at any level.
-
-- **Without the cache, 1.1.2 is 1.1.1.** It is 1–4 % ahead at every level, but
-  the 1.1.1 figures come from an earlier session, and sessions on this machine
-  differ by up to 10 %. Read it as no regression, not as a speed-up. Every new
-  feature is off unless its option is given.
-- **About 96,500 requests a second is the ceiling of this load, not a server's
-  capacity.** The ramp offers requests no faster than that over a 15 s run,
-  and a server that answers everything it is offered reaches it. The
-  sub-millisecond p50 shows these three rows did. Upstream's `fastpysgi-wsgi`
-  publishes 96,673 on sixteen CPUs for the same reason. So cached Peregrine and
-  Elysia both exceed what this benchmark can measure, and the table does not
-  say which is faster. The cache is at least 3.8× uncached FastAPI and 6.4×
-  uncached Flask.
-- **The cached rows are a best case, not a production figure.** Every request
-  is the same GET with no cookie, for a response marked fresh, so every
-  request after the first is a hit. Real traffic has cookies and credentials,
-  which are never cached, many URLs, and responses the application does not
-  mark fresh. It lands between the cached and uncached rows, according to its
-  hit rate.
-- **A cache hit never reaches Python.** The response is copied out of memory
-  every worker shares, in Swift, and the framework, which is most of the work,
-  is not run. Only GET responses the application marks fresh with `s-maxage`
-  or `max-age` are kept. Requests with cookies or credentials, and responses
-  that set cookies or are private, never are; see
-  [Caching responses](CONFIG.md#caching-responses). The cached applications,
-  [benchmarks/cached/](benchmarks/cached/), are the contract ones plus
-  `Cache-Control: public, s-maxage=60`.
-- **Elysia runs as one process.** The suite's entry runs `cluster.ts`, which
-  starts one `bun ./app.ts` per CPU. Here `app.ts` runs alone, to match one
-  worker. The sources are the suite's, byte for byte:
-  [benchmarks/elysia-bun/](benchmarks/elysia-bun/).
-
-### Static files over HTTPS, with `--ktls`
-
-With `--ktls` the kernel encrypts TLS, so `--static-dir` files go out with
-`sendfile` over HTTPS, as they already did over plain HTTP. This was measured
-earlier on the same branch with
-[benchmarks/static_files.sh](benchmarks/static_files.sh). That is a different
-load from the tables above: closed-loop `oha`, 16 connections, 10 s per cell,
-one worker, random bytes read into the page cache first.
-
-| file | HTTPS, MiB/s | with `--ktls`, MiB/s | server CPU per GiB | with `--ktls` |
-|---|---:|---:|---:|---:|
-| 1 MiB | 1,485 | 2,172 (+46 %) | 713 ms | 495 ms (−31 %) |
-| 16 MiB | 1,384 | 2,206 (+59 %) | 767 ms | 491 ms (−36 %) |
-
-Plain HTTP costs 64–77 ms of server CPU per GiB on the same machine. Of the
-roughly 420 ms per GiB HTTPS still adds with `--ktls`, about half is the
-AES-256-GCM encryption itself, 218 ms per GiB, which kernel TLS moves into the
-kernel but does not remove.
-
-Reproduce, with the kernel's `tls` module loaded (`sudo modprobe tls`):
+## Reproduce
 
 ```bash
-MODES=https bash benchmarks/static_files.sh
-PEREGRINE_EXTRA_ARGS=--ktls MODES=https bash benchmarks/static_files.sh
+PYTHON=~/.local/share/uv/python/cpython-3.14.6-linux-x86_64-gnu/bin/python3 \
+    SCRATCH=~/pgbuild-ext-314 bash scripts/build-extension.sh
+uv venv ~/wf314-venv --python 3.14
+uv pip install --python ~/wf314-venv/bin/python fastapi==0.141.1 django==6.1.1 \
+    flask==3.1.3 blacksheep==2.6.3 uvloop==0.22.1
+VENV=~/wf314-venv SOURCES=upstream WORKERS=$(nproc) AGG=mean \
+    FRAMEWORKS="asgi wsgi fastapi django flask blacksheep elysia" \
+    SERVERS="peregrine-ext elysia-bun" bash benchmarks/frameworks.sh > results.tsv
 ```
 
-The framework rows:
-
-```bash
-SERVERS=peregrine-ext bash benchmarks/frameworks.sh
-CONTRACT=benchmarks/cached PEREGRINE_EXTRA_ARGS="--cache-size 64" SERVERS=peregrine-ext bash benchmarks/frameworks.sh
-FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
-```
-
-The Elysia row needs [Bun](https://bun.sh) and port 3000, since the suite's
-`app.ts` listens there. The script runs `bun install` the first time.
-
-### BlackSheep on Peregrine, and Elysia on Bun past the ceiling
-
-Measured in one session on 2026-09-13, at 1954e93:
-- **Applications:** [BlackSheep](https://github.com/Neoteroi/BlackSheep) 2.6.3,
-  run as ASGI in the extension module
-  ([benchmarks/contract/blacksheep_app.py](benchmarks/contract/blacksheep_app.py),
-  the same as the suite's `python/blacksheep`); Elysia 1.4.30 on Bun 1.4.2.
-- **Setup:** one worker or process each, on CPython 3.12.
-
-First the suite's ramp, as in the tables above, which cannot tell the two apart
-at the top:
-
-| server | 64 | 256 | 512 | p50 / p99 ms at 64 |
-|---|---:|---:|---:|---:|
-| BlackSheep on Peregrine | 76,321 | 78,735 | 75,042 | 0.458 / 406.9 |
-| Elysia on Bun | 96,659 | 96,490 | 96,407 | 0.057 / 16.4 |
-
-Then closed-loop capacity. The server is pinned to one CPU and `oha` to the
-other three, and each connection sends its next request as soon as the last is
-answered:
-
-| server | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| BlackSheep on Peregrine | 74,781 | 72,996 | 70,757 |
-| Elysia on Bun | 208,830 | 242,964 | 237,983 |
-
-Latency, p50 / p99, in milliseconds:
-
-| server | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| BlackSheep on Peregrine | 0.790 / 2.5 | 3.159 / 10.1 | 6.593 / 18.6 |
-| Elysia on Bun | 0.271 / 0.8 | 0.951 / 2.8 | 1.934 / 5.7 |
-
-No run returned an error or a non-2xx response. Every figure is the median of
-three runs.
-
-- **On one core, Elysia on Bun serves 2.8–3.4× what BlackSheep on Peregrine
-  does.** The ramp hid this: Elysia answered everything it was offered, and
-  BlackSheep fell behind at about 76,000, which its p99 of hundreds of
-  milliseconds shows.
-- **BlackSheep is the fastest Python framework measured here**, about three
-  times FastAPI's 25,000 on the same server.
-- **The load may be what limits Elysia.** Three CPUs of `oha` against one of
-  Bun, so its figure is a floor rather than its ceiling.
-
-```bash
-FRAMEWORKS=blacksheep SERVERS=peregrine-ext bash benchmarks/frameworks.sh
-LOAD=closed PIN=0:1-3 FRAMEWORKS=blacksheep SERVERS=peregrine-ext bash benchmarks/frameworks.sh
-LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
-```
-
-BlackSheep has to be installed in the benchmark venv: `pip install blacksheep`.
-
----
-
-## The ASGI path, change by change
-
-Changes to the per-request ASGI path since 1.1.2, unreleased. Each was
-measured on its own against the build before it, and kept only if it helped.
-
-[benchmarks/turbo_ab.sh](benchmarks/turbo_ab.sh) runs two builds of the
-extension module in one session:
-- **Server:** one worker pinned to one CPU.
-- **Load:** closed-loop `oha -c 64` for 15 s on the other three CPUs.
-- **Rounds:** six, interleaved A B then B A, after an A/A calibration run
-  whose spread is that session's noise.
-- **Second measure:** alongside requests per second, the server's own CPU
-  time per request, read from `/proc/<pid>/task/*/schedstat`. It moves less
-  than req/s when the load generator is what is short of CPU.
-
-The applications are the raw ASGI app,
-[benchmarks/contract/asgi.py](benchmarks/contract/asgi.py), and the FastAPI
-app above. Figures are medians of the six rounds.
-
-On this build a raw ASGI request costs the server about 9 µs of CPU, at about
-116,000 requests a second on one worker. That replaces an older 60,000 from
-before responses were batched and before the extension module. A FastAPI
-request costs about 43 µs, most of it FastAPI's own code.
-
-| change | application | req/s | server CPU per request | rounds B faster, cheaper | A/A spread, req/s and CPU | kept |
-|---|---|---:|---:|:---:|:---:|:---:|
-| `await send()` finishes without creating a `StopIteration` | raw ASGI | 116,099 → 118,728 (+2.3 %) | 9.21 → 9.00 µs (−2.4 %) | 5/6, 6/6 | 0.7 %, 1.0 % | yes |
-| | FastAPI | 25,098 → 24,984 (−0.5 %) | 42.97 → 42.65 µs (−0.7 %) | 3/6, 2/6 | 2.7 %, 2.1 % | |
-| a finished task checked with `task.exception()` from Swift, not a Python function | raw ASGI | 115,556 → 114,261 (−1.1 %) | 9.22 → 9.46 µs (+2.5 %) | 2/6, 2/6 | 4.5 %, 3.2 % | no |
-| | FastAPI | 25,033 → 24,912 (−0.5 %) | 42.65 → 42.98 µs (+0.8 %) | 3/6, 2/6 | 0.1 %, 0.3 % | |
-| one completed awaitable per worker for every `send`, not one allocated per call | raw ASGI | 117,640 → 119,136 (+1.3 %) | 9.03 → 8.93 µs (−1.1 %) | 3/6, 4/6 | 4.0 %, 3.9 % | no |
-| | FastAPI | 25,175 → 25,165 (−0.0 %) | 42.58 → 42.52 µs (−0.1 %) | 3/6, 4/6 | 0.9 %, 0.0 % | |
-| each request's task started eagerly, so an application that never waits finishes before dispatch returns | raw ASGI | 96,693 → 105,157 (+8.8 %) | 10.48 → 9.42 µs (−10.2 %) | 6/6, 6/6 | 4.3 %, 5.3 % | no |
-| | FastAPI | 20,906 → 20,466 (−2.1 %) | 48.74 → 49.82 µs (+2.2 %) | 2/6, 2/6 | 0.3 %, 1.2 % | |
-| the same, with the responses a drain holds flushed every 16 | raw ASGI | 90,667 → 91,284 (+0.7 %) | 11.23 → 11.07 µs (−1.4 %) | 1/6, 2/6 | 3.1 %, 3.4 % | no |
-| | FastAPI | 22,536 → 20,762 (−7.9 %) | 45.38 → 49.19 µs (+8.4 %) | 0/6, 0/6 | 3.3 %, 2.8 % | |
-| the same, with only the first 16 requests of an event batch started eagerly | raw ASGI | 98,979 → 102,306 (+3.4 %) | 10.32 → 9.96 µs (−3.5 %) | 3/6, 5/6 | 1.0 %, 0.6 % | no |
-| | FastAPI | 23,086 → 22,708 (−1.6 %) | 44.30 → 44.86 µs (+1.3 %) | 3/6, 2/6 | 1.0 %, 0.9 % | |
-
-- **A change within noise on FastAPI is expected.** The framework is most of
-  a FastAPI request, so a saving of a fraction of a microsecond on the server
-  side is a percent of a raw ASGI request and a fraction of one on FastAPI.
-- **The second change is why every change goes through the server.**
-  [benchmarks/asgi_overhead.py](benchmarks/asgi_overhead.py), which times the
-  same asyncio work in-process, predicted it would save 0.23–0.29 µs a
-  request. Measured end to end, it saved nothing.
-- **Eager start helped raw ASGI and hurt everything else.** From Python 3.12 a
-  task can run its coroutine's first step as it is created, and every request
-  in both applications finished inside that step. In-process it saved
-  0.8–1.0 µs of the task's cost. The row above is the second of two sessions.
-  The first gave raw ASGI +10.7 % and −10.4 % and FastAPI −1.0 % and +1.0 %,
-  inside an A/A spread of 5.7 % and 6.6 %. In every round of both, latency
-  was worse:
-  - FastAPI p99 8.33–9.05 ms against 6.50–7.09 ms, and p50 2.69–2.77 ms
-    against 2.57–2.64 ms.
-  - Raw ASGI p99 2.35–2.55 ms against 2.19–2.37 ms.
-
-  It was reverted.
-- **Why the latency rose: the batch doubled.** Without eager start, an
-  application runs in the loop's idle phase and the poll phase runs in
-  between, so 64 connections settle into two overlapping halves. Started
-  eagerly, it runs inside the drain, so one wakeup takes every connection,
-  and the deferred flush holds all 64 responses until the drain ends. Under
-  `strace` at 64 connections, `epoll_wait` per request fell from 0.031 to
-  0.016 on both applications. The request itself got cheaper, not dearer: at
-  one connection, where nothing batches, raw ASGI cost 41–44 µs against
-  45–56 µs.
-- **Two caps were tried, and neither was kept.** Flushing every 16 held
-  responses between events, the way WSGI does, did not split the batch:
-  `epoll_wait` per request stayed at 0.016. It only added writes, and FastAPI
-  got 8 % dearer. Starting only the first 16 requests of an event batch
-  eagerly, and scheduling the rest, split it partly, to 0.025. That kept
-  raw ASGI 3.5 % cheaper. FastAPI still lost 1.6 %. Median p99 rose 9.6 % on
-  raw ASGI and 20 % on FastAPI, and FastAPI's p50 rose 21 %. By connection
-  count, against main, with
-  [benchmarks/eagercmp.sh](benchmarks/eagercmp.sh), two runs each:
-
-  | connections | application | main, µs per request | capped, µs per request | main p99 | capped p99 |
-  |---:|---|---:|---:|---:|---:|
-  | 1 | raw ASGI | 45.4–46.4 | 41.8–41.9 | 0.21–0.22 ms | 0.20–0.21 ms |
-  | 8 | raw ASGI | 22.4–25.1 | 20.3–20.7 | 0.53–0.57 ms | 0.62 ms |
-  | 64 | raw ASGI | 10.0–10.3 | 9.8–10.1 | 2.46–2.57 ms | 2.60–2.97 ms |
-  | 1 | FastAPI | 109.8–110.1 | 102.4–105.8 | 0.37–0.38 ms | 0.36–0.39 ms |
-  | 8 | FastAPI | 58.8–59.6 | 57.3–58.4 | 1.10–1.12 ms | 1.19–1.29 ms |
-  | 64 | FastAPI | 43.7–44.8 | 43.8–44.4 | 6.01–6.08 ms | 6.04–7.51 ms |
-
-  The saving holds at one connection. From eight up, the tail is worse.
-- **The in-process benchmark does size what is left.** With uvloop, the
-  asyncio task each request runs in costs 1.1–1.3 µs of the ~9. Building the
-  scope costs 0.6–0.8 µs for 3 headers and about 1.5 µs for 15. Neither is
-  the bulk of it.
-- **Where the rest goes, sampled.** One worker's CPU was sampled every
-  millisecond under the same load, about 5,700 samples each. A raw ASGI
-  request divides as follows:
-  - `write()` 42 % and the other system calls 7 %. On loopback, sending a
-    response also delivers it to the load generator's socket, so this share
-    is higher than it would be over a network.
-  - The Python interpreter 32 %: the application and the asyncio work around
-    it. The distribution's `python3.12` carries no symbols to split it further.
-  - Peregrine's own Swift and C 10 %, of which parsing the request is 1.5 %
-    and building the scope 1 %.
-  - uvloop 4 %.
-
-  On FastAPI the interpreter is 80 %, `write()` 9 % and Peregrine 3.5 %. The
-  callable Peregrine's channels are called through is 0.1 %, so nothing left
-  on the server side is large enough for another change like these to show.
-- **How many system calls, counted.** The same worker was run under
-  `strace -c`, with a run that answers one request subtracted from each:
-
-  | load | `read` | `write` | Peregrine's `epoll_wait` | uvloop's `epoll_pwait` | `epoll_ctl` | total |
-  |---|---:|---:|---:|---:|---:|---:|
-  | raw ASGI, 64 connections | 1.00 | 1.00 | 0.03 | 0.03 | 0.001 | 2.07 |
-  | raw ASGI, 1 connection | 1.00 | 1.00 | 1.00 | 2.00 | 0 | 5.00 |
-  | FastAPI, 64 connections | 1.00 | 1.00 | 0.03 | 0.03 | 0.003 | 2.07 |
-
-  - **Under load a request is one `read` and one `write`.** Each wait
-    collects about 30 events, and read interest stays armed across a request,
-    so it costs no `epoll_ctl`. strace slows every call, which batches more
-    than an untraced worker would; one connection is the case with no
-    batching at all.
-  - **A system call's round trip costs about 100 ns on this kernel**
-    (`getppid` in a loop; a write to `/dev/null` is 114 ns). Batching the
-    calls that are left into shared rings, which is what io_uring offers,
-    would save about 0.2 µs a request: about 2 % of a raw ASGI request and
-    0.5 % of a FastAPI one, inside this machine's noise. With one connection
-    it is 0.2–0.4 µs, because uvloop's own wait stays.
-  - **The 42 % in `write()` is the work, not the call.** It is TCP sending the
-    response and, on loopback, delivering it to the load generator. That
-    happens the same way when the send is submitted through a ring, so an
-    io_uring backend was not built.
-
-Reproduce, with two checkouts each built with `scripts/build-extension.sh`:
-
-```bash
-BUILD_A=../peregrine-before BUILD_B=. bash benchmarks/turbo_ab.sh
-python benchmarks/asgi_overhead.py
-bash benchmarks/syscalls.sh
-```
-
-### Response bodies by size
-
-What a response body costs, as it grows.
-[benchmarks/bodies_app.py](benchmarks/bodies_app.py) answers `GET /<bytes>`
-with a body of that many random bytes, built once and kept, so the
-application's work is the same at every size. It runs on one worker pinned to
-one CPU, with closed-loop `oha -c 64` for 10 s on the other three.
-Measured on 2026-09-13.
-
-| body | req/s | MiB/s | server CPU per request | per KiB |
-|---:|---:|---:|---:|---:|
-| 1 KiB | 105,159 | 103 | 9.99 µs | 9.99 µs |
-| 16 KiB | 67,932 | 1,061 | 16.18 µs | 1.01 µs |
-| 64 KiB | 44,450 | 2,778 | 23.90 µs | 0.37 µs |
-| 256 KiB | 17,433 | 4,358 | 61.03 µs | 0.24 µs |
-| 1 MiB | 4,943 | 4,943 | 220.81 µs | 0.22 µs |
-
-Sampled the same way as above, the server's CPU divides like this:
-
-| body | `write()` | copies and the rest of libc | Python | Peregrine |
-|---:|---:|---:|---:|---:|
-| 1 KiB | 40.5 % | 2.8 % | 30.9 % | 11.4 % |
-| 64 KiB | 52.1 % | 8.8 % | 22.1 % | 7.0 % |
-| 1 MiB | 66.1 % | 23.6 % | 6.0 % | 1.6 % |
-
-- **The body is copied twice, and the kernel's copy is the bigger one.** It is
-  copied once from the application's `bytes` into the connection's write
-  buffer, and once into the socket inside `write()`. Over loopback that second
-  copy also delivers into the load generator's socket.
-- **The copy in userspace is what not copying could save, and it only matters
-  when the body is large.** libc's unnamed functions, which are `memmove`
-  here, are about 3 % of the CPU at 1 KiB, which is the floor, 9 % at 64 KiB
-  and 24 % at 1 MiB. Writing a large body straight from the application's
-  `bytes`, with `writev`, could save at most about 6 % of the CPU at 64 KiB
-  and about 20 % at 1 MiB. It saves nothing on a typical API response of a
-  few KiB, where Python is the cost.
-
-```bash
-bash benchmarks/body_sizes.sh
-```
-
----
-
-## What the gap is made of
-
-On a hello-world route the framework is most of the work, so the difference
-between servers is the part of each request that is not the framework:
-parsing, calling into Python, and writing the response.
-
-- **Peregrine has no Python in its request path.** Parsing, the ASGI scope or
-  WSGI environ, and response framing are all in Swift. uvicorn's HTTP protocol
-  and its WSGI adapter are Python; granian's WSGI path hands each request across
-  threads.
-- **Responses leave in batches.** A write wakes the reader on the other end of
-  the socket, and that wake-up costs more than the write itself. FastAPI
-  responses go out together at the end of each event-loop iteration, and Flask
-  responses at the end of each batch of events. Before this, a FastAPI request
-  spent 18 µs in `write()` against uvicorn's 3.5 µs.
-- **Where Python's own code lives matters.** A distribution `python3.12` is a
-  statically linked, position-dependent executable. The same FastAPI code runs
-  about 16 % slower in `libpython3.12.so`, where every call inside the
-  interpreter goes through the tables a shared library needs. The executable
-  has to load that library; the extension module runs inside `python3.12`,
-  like uvicorn, granian and fastpysgi do. That is the whole difference between
-  the two Peregrine rows.
-
----
-
-## Processes or free-threaded
-
-The same two applications with `--workers N` (processes, CPython 3.12) and with
-`--workers N --free-threaded` (threads of one process, CPython 3.14t), both
-through the extension module. Closed-loop `oha`, 15 s per cell, requests per
-second — a different load from the tables above, so the two are not comparable
-either:
-
-| application | workers | model | 64 | 256 | 512 |
-|---|---:|---|---:|---:|---:|
-| FastAPI | 1 | processes | 25,125 | 25,177 | 24,386 |
-| FastAPI | 1 | free-threaded | 23,841 | 23,953 | 24,673 |
-| FastAPI | 4 | processes | 72,772 | 80,493 | 80,262 |
-| FastAPI | 4 | free-threaded | 66,230 | 70,931 | 71,665 |
-| Flask | 1 | processes | 14,799 | 14,749 | 14,799 |
-| Flask | 1 | free-threaded | 14,016 | 14,044 | 14,122 |
-| Flask | 4 | processes | 52,512 | 54,306 | 53,444 |
-| Flask | 4 | free-threaded | 41,222 | 41,801 | 41,867 |
-
-With four workers, threads reach 88–91 % of four processes on FastAPI and
-77–79 % on Flask.
-
-That is threading model **and** interpreter version, not a clean A/B: 3.14t
-pays a single-thread reference-counting cost that 3.12 does not. On a
-hello-world route `--free-threaded` is not a throughput upgrade. It is for
-memory and for state shared across workers: with a CPU-bound application, four
-threads match four processes at a third of the resident memory, because the
-application is imported once — see
-[Free-threaded Python](CONFIG.md#free-threaded-python).
-
-Reproduce with `EXTENSION=1 bash benchmarks/gil_vs_ft.sh`. It needs the
-extension module built for both interpreters — `scripts/build-extension.sh`
-with `PYTHON` set to each, and `PKG_CONFIG_PATH` pointing at the free-threaded
-one's `lib/pkgconfig` — and a virtualenv for each with FastAPI and Flask.
-Without `EXTENSION=1` it runs two executables instead, one linked against each
-interpreter. `GIL_BIN`, `FT_BIN`, `GIL_VENV`, `FT_VENV`, `APPS`, `DURATION`
-and `CONNS` override the defaults.
+[benchmarks/frameworks.sh](benchmarks/frameworks.sh) prints one line per entry
+and level, with every run. `WORKERS`, `CONNS`, `RUNS`, `AGG`, `RATE`,
+`DURATION`, `FRAMEWORKS`, `SERVERS`, `SOURCES`, `VENV`, `ZRK`, `EXT_ROOT`,
+`PEREGRINE_EXTRA_ARGS` and `BUN` override the defaults. The Elysia entry needs
+[Bun](https://bun.sh) and port 3000, since the suite's `app.ts` listens there;
+the script runs `bun install` the first time.

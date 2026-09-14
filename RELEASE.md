@@ -82,6 +82,16 @@ version reached PyPI, in UTC.
   its turn to run `startup` held the GIL, which the worker already inside
   `startup` needed back to finish.
 
+### Documentation
+
+- `BENCHMARKS.md` is replaced by one session on this build: the suite's raw
+  ASGI and WSGI, FastAPI and Django entries on Peregrine, Flask and BlackSheep
+  on Peregrine, and Elysia on Bun, with a worker per CPU and the suite's
+  current load command, which ramps to 500,000 requests a second.
+  `benchmarks/frameworks.sh` gains `SOURCES=upstream`, `AGG=mean`, `RATE` and
+  the `asgi`, `wsgi` and `django` frameworks; the suite's sources are in
+  `benchmarks/web-frameworks/`.
+
 ---
 
 ## 1.1.4 — 2026-09-14

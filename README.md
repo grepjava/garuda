@@ -69,9 +69,9 @@ peregrine --http3 --tls-cert cert.pem --tls-key key.pem myapp:app
 what to do when it goes wrong. [CONFIG.md](https://github.com/grepjava/peregrine/blob/main/CONFIG.md) — configuring FastAPI and
 Flask for every protocol here. [ARCHITECTURE.md](https://github.com/grepjava/peregrine/blob/main/ARCHITECTURE.md) — how the
 server is built, and why. [TRANSPORT.md](https://github.com/grepjava/peregrine/blob/main/TRANSPORT.md) — what each protocol
-does and what is implemented of it. [BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md) — FastAPI
-and Flask against uvicorn, granian and fastpysgi on one worker, with the load
-and applications of
+does and what is implemented of it. [BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md) — the
+raw ASGI and WSGI, FastAPI, Django, Flask and BlackSheep entries on Peregrine,
+and Elysia on Bun, with the load command, applications and worker count of
 [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
 and how that differs from what the site publishes. [DEPLOY.md](https://github.com/grepjava/peregrine/blob/main/DEPLOY.md) — how a release reaches PyPI.
 [RELEASE.md](https://github.com/grepjava/peregrine/blob/main/RELEASE.md) — what changed in each version.
@@ -116,9 +116,14 @@ in September 2026, and its figures there come from that hardware and those
 settings, not these. What these tables show is how the servers compare with each
 other on one worker of this machine.
 
-Method, latencies, where this differs from the published results, and how to
-reproduce it: [BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md). Run-to-run variance on this box is
-around ±10 %, so read the ratios rather than the absolute figures.
+These tables were measured on 1.1.1 on 2026-09-13, with the suite's earlier
+ramp. [benchmarks/frameworks.sh](https://github.com/grepjava/peregrine/blob/main/benchmarks/frameworks.sh) repeats them with
+`WORKERS=1 RATE=1000:100000`. Run-to-run variance on this box is around ±10 %,
+so read the ratios rather than the absolute figures.
+[BENCHMARKS.md](https://github.com/grepjava/peregrine/blob/main/BENCHMARKS.md) has the suite's own entries under its current
+command, a worker per CPU: raw WSGI up to 302,417 requests a second, BlackSheep
+up to 202,141, FastAPI up to 76,818, Flask about 50,000 and Django about
+46,000.
 
 These are hello-world routes, so they measure what a server adds to a request
 rather than what an application can do. A real application doing database work

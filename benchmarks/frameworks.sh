@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# FastAPI (ASGI), Flask (WSGI) and BlackSheep (ASGI) on peregrine, uvicorn,
-# granian and fastpysgi, and Elysia on Bun as a reference, with the load command
-# and applications of the-benchmarker/web-frameworks at ac364e9 (master,
-# 2026-09-11). The results are not comparable with the figures that site
+# Raw ASGI and WSGI applications, FastAPI, Django, Flask and BlackSheep on
+# peregrine, uvicorn, granian and fastpysgi, and Elysia on Bun as a reference,
+# with the load command
+# and applications of the-benchmarker/web-frameworks at 4bb9eaa (develop,
+# 2026-09-13). The results are not comparable with the figures that site
 # publishes; BENCHMARKS.md says why.
 #
 #   bash benchmarks/frameworks.sh > results.tsv
@@ -10,23 +11,24 @@
 #   LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
 #
 # The load is the upstream collect command, flag for flag (.tasks/config.rake
-# line 152 at that revision; the --closed in the comment above it is not in the
+# line 149 at that revision; the --closed in the comment above it is not in the
 # command):
 #
 #   warm-up    zrk -c 50 -d 5s --plain URL
-#   per level  zrk --plain -c N -d 15s -m GET --format json -R1000:100000
+#   per level  zrk --plain -c N -d 15s -m GET --format json -R1000:500000
 #                  --interval 1s --timeout 8s --latency URL
 #
-# That is an open-loop ramp from 1,000 to 100,000 requests a second over the
-# run, keep-alive on, latency corrected for coordinated omission, and the
+# That is an open-loop ramp from 1,000 to 500,000 requests a second over the
+# run (RATE), keep-alive on, latency corrected for coordinated omission, and the
 # figure reported is zrk's achieved_rate -- the number the results site
 # ranks by. The applications are the upstream python/fastapi, python/flask and
-# python/blacksheep sources, byte for byte (benchmarks/contract/).
+# python/blacksheep sources, byte for byte (benchmarks/contract/), or with
+# SOURCES=upstream the suite's peregrine-* entries (benchmarks/web-frameworks/).
 #
 # LOAD=closed replaces the ramp with closed-loop oha, `oha -c N -z DURATION`,
-# which measures capacity instead. The ramp offers at most about 96,500 req/s
-# over a run, so a server that keeps up with it -- Elysia on Bun, or a cached
-# response -- shows that ceiling and nothing more. PIN="0:1-3" runs the server
+# which measures capacity instead. The ramp offers its average rate at most,
+# so a server that keeps up with it shows that ceiling and nothing more; with
+# the old end of 100,000 that was about 96,500 req/s. PIN="0:1-3" runs the server
 # on CPU 0 and the load generator on CPUs 1-3, so the two do not take turns on
 # a core; it applies to either load.
 #
@@ -59,7 +61,15 @@ PORT=${PORT:-3000}
 WORKERS=${WORKERS:-1}
 CONNS=${CONNS:-"64 256 512"}
 RUNS=${RUNS:-3}
+# How the runs at a level become one figure: median, the run with the median
+# achieved_rate, or mean, every column averaged and errors summed, which is how
+# upstream publishes.
+AGG=${AGG:-median}
 DURATION=${DURATION:-15s}
+# zrk's open-loop ramp, requests a second from start to end of a run. Upstream
+# raised the end from 100,000 to 500,000 at 4bb9eaa (develop, 2026-09-13); the
+# old figure capped a run at about 96,500 req/s.
+RATE=${RATE:-1000:500000}
 FRAMEWORKS=${FRAMEWORKS:-"fastapi flask"}
 SERVERS=${SERVERS:-"peregrine-ext peregrine uvicorn granian fastpysgi"}
 # FRAMEWORKS=elysia SERVERS=elysia-bun measures upstream's javascript/elysia-bun
@@ -77,6 +87,11 @@ fi
 # The applications. benchmarks/cached is the same pair marking their responses
 # fresh, for measuring --cache-size.
 CONTRACT=${CONTRACT:-$ROOT/benchmarks/contract}
+# SOURCES=upstream runs each Python framework from benchmarks/web-frameworks/,
+# the suite's peregrine-* entries (Flask and BlackSheep from its flask and
+# blacksheep entries) copied as they are, instead of from CONTRACT.
+SOURCES=${SOURCES:-contract}
+BASE_PYTHONPATH=${PYTHONPATH:-}
 # Where peregrine-ext loads peregrine._native from: another checkout, built
 # with scripts/build-extension.sh, to compare two versions in one session.
 EXT_ROOT=${EXT_ROOT:-$ROOT}
@@ -85,7 +100,6 @@ EXT_ROOT=${EXT_ROOT:-$ROOT}
 PEREGRINE_ARGS=(${PEREGRINE_EXTRA_ARGS:-})
 URL="http://127.0.0.1:$PORT/"
 OUT=$(mktemp -d)
-export PYTHONPATH="$CONTRACT${PYTHONPATH:+:$PYTHONPATH}"
 
 # Only the server this script started is stopped, and as a process group, so
 # the workers it forked go with it and no unrelated server is touched.
@@ -97,17 +111,29 @@ server_require_port_free "$PORT" || exit 1
 # The server commands are the upstream engines' (python/config.yaml), with
 # --workers taken from WORKERS rather than $(nproc).
 start() {
-    local server=$1 framework=$2 app interface
+    local server=$1 framework=$2 app interface appdir=$CONTRACT
     case "$framework" in
-    fastapi)    app=fastapi_app:app;    interface=asgi ;;
-    flask)      app=flask_app:app;      interface=wsgi ;;
-    blacksheep) app=blacksheep_app:app; interface=asgi ;;
+    asgi)       app=asgi:app;               interface=asgi ;;
+    wsgi)       app=wsgi:application;       interface=wsgi ;;
+    fastapi)    app=fastapi_app:app;        interface=asgi ;;
+    # Upstream's peregrine-django entry serves Django over WSGI.
+    django)     app=django_app:application; interface=wsgi ;;
+    flask)      app=flask_app:app;          interface=wsgi ;;
+    blacksheep) app=blacksheep_app:app;     interface=asgi ;;
     esac
+    if [ "$SOURCES" = upstream ] && [ "$framework" != elysia ]; then
+        # The suite's own directory for the entry, run under the module name
+        # its config.yaml gives.
+        appdir=$ROOT/benchmarks/web-frameworks/peregrine-$framework
+        app=server:app
+        [ "$framework" = django ] && app=app.wsgi:application
+    fi
+    export PYTHONPATH="$appdir${BASE_PYTHONPATH:+:$BASE_PYTHONPATH}"
     case "$server" in
     peregrine)
         server_start "${PIN_SERVER[@]}" "$PEREGRINE" --log-level error --protocol "$interface" \
             --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${PEREGRINE_ARGS[@]}" \
-            --venv "$VENV" --python-path "$CONTRACT" "$app" ;;
+            --venv "$VENV" --python-path "$appdir" "$app" ;;
     peregrine-ext)
         # The same server as an extension module, run by the virtualenv python:
         # peregrine._native, from scripts/build-extension.sh -- what a wheel
@@ -115,7 +141,7 @@ start() {
         PYTHONPATH="$EXT_ROOT/python:$PYTHONPATH" server_start "${PIN_SERVER[@]}" "$VENV/bin/python" -m peregrine \
             --log-level error --protocol "$interface" \
             --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${PEREGRINE_ARGS[@]}" \
-            --venv "$VENV" --python-path "$CONTRACT" "$app" ;;
+            --venv "$VENV" --python-path "$appdir" "$app" ;;
     uvicorn)
         # uvicorn[standard] picks uvloop and httptools by itself. uvicorn spells
         # ASGI 3 as asgi3. WSGI goes through uvicorn's own --interface wsgi
@@ -195,7 +221,7 @@ PY
         return
     fi
     "${PIN_LOAD[@]}" "$ZRK" --plain -c "$1" -d "$DURATION" -m GET --format json --output "$json" \
-        -R1000:100000 --interval 1s --timeout 8s --latency "$URL" > /dev/null 2>&1
+        -R"$RATE" --interval 1s --timeout 8s --latency "$URL" > /dev/null 2>&1
     python3 - "$json" <<'PY'
 import json, sys
 try:
@@ -229,11 +255,17 @@ for framework in $FRAMEWORKS; do
             for _ in $(seq 1 "$RUNS"); do
                 runs="$runs$(one_run "$c")"$'\n'
             done
-            median=$(printf '%s' "$runs" | grep -v '^$' | sort -n -k1,1 \
-                | sed -n "$(( (RUNS + 1) / 2 ))p")
+            if [ "$AGG" = mean ]; then
+                figure=$(printf '%s' "$runs" | grep -v '^$' | awk '
+                    { for (i = 1; i <= 5; i++) s[i] += $i; e += $6; n++ }
+                    END { printf "%.0f %.3f %.3f %.3f %.3f %d", s[1]/n, s[2]/n, s[3]/n, s[4]/n, s[5]/n, e }')
+            else
+                figure=$(printf '%s' "$runs" | grep -v '^$' | sort -n -k1,1 \
+                    | sed -n "$(( (RUNS + 1) / 2 ))p")
+            fi
             all=$(printf '%s' "$runs" | grep -v '^$' | awk '{printf "%s ", $1}')
             printf '%s\t%s\t%s\t%s\t%s\t[%s]\n' "$framework" "$server" "$WORKERS" "$c" \
-                "$median" "$all"
+                "$figure" "$all"
         done
     done
 done
