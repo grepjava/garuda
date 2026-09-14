@@ -84,15 +84,8 @@ extension Worker {
         case .user(let id, let n):
             writeSwiftResponse(slot, status: 200, body: id, bodyCount: n)
         case .delay(let ms):
-            // Streams have no body path for delay yet; answer immediately.
-            if c.pointee.isStream {
-                if c.pointee.isH3Stream {
-                    h3FailRequest(slot, status: 200)
-                } else {
-                    h2FailRequest(slot, status: 200)
-                }
-                return
-            }
+            // A stream parks on the timer exactly as a connection does: every
+            // way a stream ends goes through closeConnection, which cancels it.
             if !armDelay(slot, ms: ms) {
                 failRequest(slot, status: 503)
             }
@@ -105,11 +98,11 @@ extension Worker {
                                      body: UnsafePointer<UInt8>?, bodyCount: Int) {
         let c = table[slot]
         if c.pointee.isH3Stream {
-            h3FailRequest(slot, status: status)
+            h3Respond(slot, status: status, body: body, bodyCount: bodyCount)
             return
         }
         if c.pointee.isStream {
-            h2FailRequest(slot, status: status)
+            h2Respond(slot, status: status, body: body, bodyCount: bodyCount)
             return
         }
         logAccess(slot, status: status)

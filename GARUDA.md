@@ -49,7 +49,7 @@ The realistic target stays the top tier, level with Bun, and clearly ahead of to
 ## What is not true yet
 
 - **TLS is not pure Swift.** TCP TLS is OpenSSL (`Sources/CGaruda/garuda_tls.c`). The QUIC handshake is built in Swift from OpenSSL's crypto primitives (`garuda_crypto.c`).
-- **The public handler API is still thin.** Sync routes and a timer-backed `GET /delay/:ms` sit on the continuation substrate (`AsyncOps.swift`). There is no middleware, no request-view type, and no client I/O helpers yet. HTTP/2 and HTTP/3 still answer router routes with status only (`h2FailRequest` / `h3FailRequest`), so `/user/:id` and delay bodies are HTTP/1.1 for now.
+- **The public handler API is still thin.** Sync routes and a timer-backed `GET /delay/:ms` sit on the continuation substrate (`AsyncOps.swift`). There is no middleware, no request-view type, and no client I/O helpers yet. Router routes answer alike over HTTP/1.1, HTTP/2 and HTTP/3: `/user/:id` with its body, `/delay/:ms` after its timer, and a stream cancelled while it waits takes its timer with it (`scripts/router-streams-test.py`).
 - **WebSocket and WebTransport application APIs are stubs** until Swift handlers exist.
 
 ## First steps

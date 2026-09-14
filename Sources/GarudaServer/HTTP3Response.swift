@@ -168,6 +168,60 @@ extension Worker {
         flushQUIC(parent)
         closeH3Stream(slot)
     }
+
+    /// A router response on a stream: status, length and body. The body is
+    /// queued on the stream and leaves as DATA through `flushH3Stream`, which
+    /// finishes the stream and retires the slot once it has drained. With no
+    /// body this is the status-only response above.
+    mutating func h3Respond(_ slot: Int, status: Int,
+                            body: UnsafePointer<UInt8>?, bodyCount: Int) {
+        guard let body, bodyCount > 0 else {
+            h3FailRequest(slot, status: status)
+            return
+        }
+        let c = table[slot]
+        let parent = Int(c.pointee.parentSlot)
+        guard parent >= 0, let h3 = table[parent].pointee.h3 else {
+            closeConnection(slot)
+            return
+        }
+        if c.pointee.flags.contains(.responseStarted) {
+            h3.quic.resetStream(c.pointee.qstreamID, code: HTTP3Error.internalError)
+            flushQUIC(parent)
+            closeH3Stream(slot)
+            return
+        }
+        dates.refresh()
+        var block = ByteBuffer()
+        defer { block.destroy() }
+        var digits = ByteBuffer()
+        defer { digits.destroy() }
+        digits.writeDecimal(bodyCount)
+        h3.encoder.begin(into: &block)
+        h3.encoder.encodeStatus(status, into: &block)
+        encodeStaticH3(h3, "content-length", UnsafePointer(digits.readPointer),
+                       digits.readableBytes, into: &block)
+        encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
+        encodeStaticH3(h3, "server", "garuda", into: &block)
+        writeH3HeaderBlock(slot, h3, block: &block)
+        c.pointee.flags.insert(.responseStarted)
+        logAccess(slot, status: status)
+        // A HEAD response declares the length a GET would have had, and ends
+        // with its headers.
+        if c.pointee.flags.contains(.suppressBody) {
+            c.pointee.flags.insert(.responseComplete)
+            c.pointee.flags.insert(.endStreamSent)
+            h3.quic.send(c.pointee.qstreamID, emptyH3Byte, 0, fin: true)
+            flushQUIC(parent)
+            closeH3Stream(slot)
+            return
+        }
+        c.pointee.write.write(body, bodyCount)
+        c.pointee.responseRemaining = -1
+        c.pointee.flags.insert(.responseComplete)
+        c.pointee.state = .writing
+        _ = flush(slot)
+    }
 }
 
 extension Worker {
