@@ -95,6 +95,8 @@ is "q-values beat server preference" \
    "$(fetch $H/ $WORK/h -H 'Accept-Encoding: br;q=0.2, gzip;q=0.9' | gzip -dc | digest)" "$EXPECTED"
 is "q=0 refuses a coding" \
    "$(fetch $H/ $WORK/h -H 'Accept-Encoding: br;q=0, zstd;q=0, gzip' -o /dev/null; header $WORK/h content-encoding)" "gzip"
+is "Accept-Encoding split over two lines is one list" \
+   "$(fetch $H/ $WORK/h -H 'Accept-Encoding: identity' -H 'Accept-Encoding: gzip' -o /dev/null; header $WORK/h content-encoding)" "gzip"
 
 fetch $H/ $WORK/h -o $WORK/b > /dev/null
 is "no Accept-Encoding, no encoding" "$(header $WORK/h content-encoding)" ""

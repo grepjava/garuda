@@ -191,6 +191,8 @@ is "and no body" \
     "$(curl -sk --http1.1 -o /dev/null -w '%{size_download}' -H 'If-None-Match: "v1"' "$S/etag")" "0"
 fetch /etag --http2 -H 'If-None-Match: W/"v1"'
 is "a weak one matches, over HTTP/2 too" "$(status)" "304"
+fetch /etag --http1.1 -H 'If-None-Match: "v0"' -H 'If-None-Match: "v1"'
+is "one split over two lines still matches" "$(status)" "304"
 fetch /etag --http1.1 -H 'If-None-Match: "v0"'
 like "a different ETag gets the whole copy" "$(status):$(header cache-status)" '^200:peregrine; hit'
 fetch /etag --http1.1 -H 'If-Modified-Since: Mon, 07 Nov 1994 00:00:00 GMT'

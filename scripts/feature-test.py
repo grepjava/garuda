@@ -742,6 +742,25 @@ def test_forwarded():
         is_("an untrusted hop stops the walk (no spoofing by prepending)",
             scope["client"][0], "198.51.100.7")
 
+        # Several lines are one list, in order. A proxy that adds a line of its
+        # own instead of appending still leaves the client at the far end, and
+        # the walk still stops at the first untrusted hop from the right.
+        def client_for(*lines):
+            s = server.connect()
+            try:
+                s.sendall(b"GET /scope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+                          + b"".join(b"X-Forwarded-For: " + line + b"\r\n" for line in lines)
+                          + b"\r\n")
+                _status, _headers, body = read_http_response(s)
+            finally:
+                s.close()
+            return json.loads(body)["client"][0]
+
+        is_("X-Forwarded-For over two lines is walked as one list",
+            client_for(b"203.0.113.9", b"127.0.0.2"), "203.0.113.9")
+        is_("and an untrusted hop on a later line still stops the walk",
+            client_for(b"203.0.113.9", b"198.51.100.7, 127.0.0.2"), "198.51.100.7")
+
     # RFC 7239.
     port = free_port()
     with Server("--forwarded-allow-ips", "*", port=port) as server:

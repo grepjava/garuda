@@ -63,6 +63,31 @@ struct WebSocketFramingTests {
         }
     }
 
+    @Test("a length in a longer form than it needs is a protocol error")
+    func nonMinimalLength() {
+        // 125 fits in the seven bits of the first length byte.
+        let short: [UInt8] = [0x82, 0xFE, 0x00, 0x7D, 1, 2, 3, 4]
+        // 65535 fits in sixteen.
+        let medium: [UInt8] = [0x82, 0xFF, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 1, 2, 3, 4]
+        for bytes in [short, medium] {
+            withBytes(bytes) { p, n in
+                guard case .failure(.protocolError) = WebSocketCodec.parseHeader(p, n, maxPayload: 1 << 24) else {
+                    Issue.record("expected a protocol error for \(bytes.prefix(10))")
+                    return
+                }
+            }
+        }
+        // The smallest lengths that do need each form still parse.
+        let least16: [UInt8] = [0x82, 0xFE, 0x00, 0x7E, 1, 2, 3, 4]
+        withBytes(least16) { p, n in
+            guard case .header(let h) = WebSocketCodec.parseHeader(p, n, maxPayload: 1 << 24) else {
+                Issue.record("expected a header")
+                return
+            }
+            #expect(h.payloadLength == 126)
+        }
+    }
+
     @Test("a truncated header asks for more rather than guessing")
     func truncated() {
         for prefix in 0..<6 {

@@ -298,9 +298,8 @@ extension Worker {
             // ones the 200 would have had, and both turn on how the 200 would
             // be encoded for this client.
             if (ifNoneMatch != nil || ifModifiedSince != nil) && entry.status == 200
-                && CacheValidation.notModified(ifNoneMatch: ifNoneMatch,
-                                               ifModifiedSince: ifModifiedSince,
-                                               storedHead: entry.head.base, entry.head.count) {
+                && cachedNotModified(slot, entry, ifNoneMatch: ifNoneMatch != nil,
+                                     ifModifiedSince: ifModifiedSince) {
                 entry.notModified = true
             }
             if c.pointee.isH3Stream {
@@ -341,6 +340,32 @@ extension Worker {
         func sends(_ name: ByteSpan) -> Bool {
             !notModified || CacheValidation.keptInNotModified(name)
         }
+    }
+
+    /// Whether a conditional request is satisfied by the stored response.
+    /// If-None-Match, when there is one, decides alone, and every line of it
+    /// counts: a list split over several lines is still one list (RFC 9110
+    /// section 5.3), and it matches when any member does.
+    private func cachedNotModified(_ slot: Int, _ entry: CachedEntry, ifNoneMatch: Bool,
+                                   ifModifiedSince: ByteSpan?) -> Bool {
+        guard ifNoneMatch else {
+            return CacheValidation.notModified(ifNoneMatch: nil, ifModifiedSince: ifModifiedSince,
+                                               storedHead: entry.head.base, entry.head.count)
+        }
+        let c = table[slot]
+        let base = c.pointee.headBase()
+        var i = 0
+        while i < c.pointee.head.headerCount {
+            let h = headers[i]
+            i += 1
+            guard h.name.length == 13,
+                  equalsLowercased(base + Int(h.name.offset), 13, "if-none-match") else { continue }
+            if CacheValidation.notModified(ifNoneMatch: h.value.span(in: base), ifModifiedSince: nil,
+                                           storedHead: entry.head.base, entry.head.count) {
+                return true
+            }
+        }
+        return false
     }
 
     /// Compression's view of the stored response, a 304's included.

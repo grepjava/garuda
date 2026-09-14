@@ -98,6 +98,15 @@ public struct AcceptEncoding: Sendable, Equatable {
         }
     }
 
+    /// Folds in another line of the same header. A coding that line names
+    /// takes the weight it gives there.
+    public mutating func merge(_ other: AcceptEncoding) {
+        if other.gzip >= 0 { gzip = other.gzip }
+        if other.br >= 0 { br = other.br }
+        if other.zstd >= 0 { zstd = other.zstd }
+        if other.wildcard >= 0 { wildcard = other.wildcard }
+    }
+
     /// `0`, `0.5`, `1`, `1.000` -> thousandths. Anything else is 0.
     @usableFromInline
     static func parseWeight(_ p: UnsafePointer<UInt8>, _ n: Int, _ i: inout Int) -> Int {

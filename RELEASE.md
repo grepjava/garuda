@@ -48,6 +48,16 @@ version reached PyPI, in UTC.
   and a 304's `Content-Length` is no longer rewritten to 0: the application's
   is kept, or none is sent. This applies with or without `--cache-size`, to
   ASGI and WSGI over HTTP/1.1, HTTP/2 and HTTP/3.
+- A request header sent on more than one line is read as one list, as RFC 9110
+  says, where only one line was read before. This covers `X-Forwarded-For`
+  behind `--forwarded-allow-ips`, `Accept-Encoding`, and `If-None-Match` for
+  `--static-dir` and `--cache-size`. With two `X-Forwarded-For` lines, the
+  client could resolve to a trusted proxy's address; with two `If-None-Match`
+  lines, a client could be sent a whole response it already had.
+- `--static-dir` answers a request whose `If-Match` names no current tag with
+  `412 Precondition Failed`, as RFC 9110 requires, instead of sending the file.
+- WebSocket: a frame whose length is encoded in more bytes than it needs is
+  refused as a protocol error (RFC 6455 section 5.2).
 - `--root-path` comes off a request's path only when the path is under it:
   the prefix itself, or the prefix followed by `/`. As many characters as the
   prefix had were cut from every path, so under `--root-path /api` a request

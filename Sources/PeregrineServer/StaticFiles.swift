@@ -286,27 +286,21 @@ extension Worker {
         }
         etag[etagLength] = UInt8(ascii: "\""); etagLength += 1
 
+        // Preconditions in the order RFC 9110 section 13.2.2 gives them:
+        // If-Match first, and one that fails is the answer whatever else the
+        // request asked.
+        if requestFailsIfMatch(slot, etag: &etag, length: etagLength) {
+            _ = pg_close(fd)
+            logAccess(slot, status: 412)
+            dates.refresh()
+            sendBodiless(slot, status: 412, etag: &etag, etagLength: etagLength, vary: vary)
+            return
+        }
         if requestHasMatchingETag(slot, etag: &etag, length: etagLength) {
             _ = pg_close(fd)
             logAccess(slot, status: 304)
             dates.refresh()
-            if c.pointee.isStream || c.pointee.isH3Stream {
-                sendNotModifiedOnStream(slot, etag: &etag, etagLength: etagLength, vary: vary)
-                return
-            }
-            HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: 304)
-            HTTPResponseWriter.writeDate(&c.pointee.write, dates)
-            c.pointee.write.write("Server: peregrine\r\n")
-            writeServerHeaders(slot, &c.pointee.write)
-            c.pointee.write.write("ETag: ")
-            etag.withUnsafeBufferPointer { c.pointee.write.write($0.baseAddress!, etagLength) }
-            c.pointee.write.write("\r\n")
-            if vary { c.pointee.write.write("Vary: Accept-Encoding\r\n") }
-            HTTPResponseWriter.writeConnection(&c.pointee.write,
-                                               keepAlive: c.pointee.flags.contains(.keepAlive))
-            HTTPResponseWriter.endHead(&c.pointee.write)
-            c.pointee.state = .writing
-            _ = flush(slot)
+            sendBodiless(slot, status: 304, etag: &etag, etagLength: etagLength, vary: vary)
             return
         }
 
@@ -376,12 +370,41 @@ extension Worker {
     /// sent with sendfile after the head.
     static let inlineFileBytes = 16 * 1024
 
-    /// `304 Not Modified` on a multiplexed stream.
-    ///
-    /// No body and no content-length: a 304 carries neither, and the validator
-    /// is the whole message.
-    private mutating func sendNotModifiedOnStream(_ slot: Int, etag: inout [UInt8],
-                                                  etagLength: Int, vary: Bool) {
+    /// A response that ends with its head: `304 Not Modified`, whose validator
+    /// is the whole message, or `412 Precondition Failed`, which has nothing
+    /// to send.
+    private mutating func sendBodiless(_ slot: Int, status: Int, etag: inout [UInt8],
+                                       etagLength: Int, vary: Bool) {
+        let c = table[slot]
+        if c.pointee.isStream || c.pointee.isH3Stream {
+            sendBodilessOnStream(slot, status: status, etag: &etag, etagLength: etagLength,
+                                 vary: vary)
+            return
+        }
+        HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: status)
+        HTTPResponseWriter.writeDate(&c.pointee.write, dates)
+        c.pointee.write.write("Server: peregrine\r\n")
+        writeServerHeaders(slot, &c.pointee.write)
+        if status == 304 {
+            c.pointee.write.write("ETag: ")
+            etag.withUnsafeBufferPointer { c.pointee.write.write($0.baseAddress!, etagLength) }
+            c.pointee.write.write("\r\n")
+            if vary { c.pointee.write.write("Vary: Accept-Encoding\r\n") }
+        } else {
+            // Anything but a 304 has a body to frame, empty as it is.
+            HTTPResponseWriter.writeContentLength(&c.pointee.write, 0)
+        }
+        HTTPResponseWriter.writeConnection(&c.pointee.write,
+                                           keepAlive: c.pointee.flags.contains(.keepAlive))
+        HTTPResponseWriter.endHead(&c.pointee.write)
+        c.pointee.state = .writing
+        _ = flush(slot)
+    }
+
+    /// The same on a multiplexed stream, where the end of the stream frames
+    /// the empty body.
+    private mutating func sendBodilessOnStream(_ slot: Int, status: Int, etag: inout [UInt8],
+                                               etagLength: Int, vary: Bool) {
         let c = table[slot]
         let parent = Int(c.pointee.parentSlot)
         var block = ByteBuffer()
@@ -393,11 +416,13 @@ extension Worker {
                 return
             }
             h3.encoder.begin(into: &block)
-            h3.encoder.encodeStatus(304, into: &block)
-            etag.withUnsafeBufferPointer {
-                encodeStaticH3(h3, "etag", $0.baseAddress!, etagLength, into: &block)
+            h3.encoder.encodeStatus(status, into: &block)
+            if status == 304 {
+                etag.withUnsafeBufferPointer {
+                    encodeStaticH3(h3, "etag", $0.baseAddress!, etagLength, into: &block)
+                }
+                if vary { encodeStaticH3(h3, "vary", "accept-encoding", into: &block) }
             }
-            if vary { encodeStaticH3(h3, "vary", "accept-encoding", into: &block) }
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "peregrine", into: &block)
             if let hsts = config.hsts {
@@ -416,11 +441,13 @@ extension Worker {
             closeConnection(slot)
             return
         }
-        h2.encoder.encodeStatus(304, into: &block)
-        etag.withUnsafeBufferPointer {
-            encodeStatic(h2, "etag", $0.baseAddress!, etagLength, into: &block)
+        h2.encoder.encodeStatus(status, into: &block)
+        if status == 304 {
+            etag.withUnsafeBufferPointer {
+                encodeStatic(h2, "etag", $0.baseAddress!, etagLength, into: &block)
+            }
+            if vary { encodeStatic(h2, "vary", "accept-encoding", into: &block) }
         }
-        if vary { encodeStatic(h2, "vary", "accept-encoding", into: &block) }
         encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
         encodeStatic(h2, "server", "peregrine", into: &block)
         if let hsts = config.hsts {
@@ -601,11 +628,56 @@ extension Worker {
         }
     }
 
+    /// Whether `If-Match` rules this response out (RFC 9110 section 13.1.1):
+    /// the header is there, and is neither `*` nor a list naming the entity we
+    /// were about to send. The comparison is strong, so a weak tag -- which
+    /// starts `W/` -- never matches. Every line of the header is one list.
+    private func requestFailsIfMatch(_ slot: Int, etag: inout [UInt8], length: Int) -> Bool {
+        let c = table[slot]
+        let base = c.pointee.headBase()
+        var present = false
+        var i = 0
+        while i < c.pointee.head.headerCount {
+            let h = headers[i]
+            i += 1
+            guard h.name.length == 8 else { continue }
+            guard equalsLowercased(base + Int(h.name.offset), 8, "if-match") else { continue }
+            present = true
+
+            let value = base + Int(h.value.offset)
+            let valueLength = Int(h.value.length)
+            var j = 0
+            while j < valueLength {
+                while j < valueLength, value[j] == UInt8(ascii: " ") || value[j] == UInt8(ascii: "\t")
+                        || value[j] == UInt8(ascii: ",") { j += 1 }
+                if j >= valueLength { break }
+                if value[j] == UInt8(ascii: "*") { return false }
+                var k = j
+                while k < valueLength, value[k] != UInt8(ascii: ",") { k += 1 }
+                var end = k
+                while end > j, value[end - 1] == UInt8(ascii: " ")
+                        || value[end - 1] == UInt8(ascii: "\t") { end -= 1 }
+                if end - j == length {
+                    var same = true
+                    var m = 0
+                    while m < length {
+                        if value[j + m] != etag[m] { same = false; break }
+                        m += 1
+                    }
+                    if same { return false }
+                }
+                j = k
+            }
+        }
+        return present
+    }
+
     /// Whether `If-None-Match` names the entity we were about to send.
     ///
     /// `*` matches anything that exists, per RFC 9110. A list of tags is
     /// compared member by member; a weak prefix is skipped, because a weak
-    /// comparison is the right one for a plain GET.
+    /// comparison is the right one for a plain GET. Every line of the header
+    /// is one list.
     private func requestHasMatchingETag(_ slot: Int, etag: inout [UInt8],
                                         length: Int) -> Bool {
         let c = table[slot]
@@ -645,7 +717,6 @@ extension Worker {
                 }
                 j = k
             }
-            return false
         }
         return false
     }

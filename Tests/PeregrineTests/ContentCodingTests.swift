@@ -65,6 +65,15 @@ private func observe(_ e: inout CompressionEligibility, _ name: String, _ value:
         #expect(a.br == 1000)
     }
 
+    @Test func linesOfOneHeaderCombine() {
+        var a = accept("identity")
+        a.merge(accept("gzip;q=0.8"))
+        #expect(a.choose { _ in true } == .gzip)
+        a.merge(accept("br, gzip;q=0"))
+        #expect(a.gzip == 0)
+        #expect(a.br == 1000)
+    }
+
     @Test func malformedWeightRefuses() {
         #expect(accept("gzip;q=high").gzip == 0)
         #expect(accept("gzip;q=2").gzip == 0)

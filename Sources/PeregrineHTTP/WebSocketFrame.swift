@@ -118,6 +118,9 @@ public enum WebSocketCodec {
         if length == 126 {
             if count < 4 { return .needMore }
             length = (Int(base[2]) << 8) | Int(base[3])
+            // Only the shortest encoding of a length is valid (RFC 6455
+            // section 5.2): one that fits in seven bits never takes sixteen.
+            if length < 126 { return .failure(.protocolError) }
             offset = 4
         } else if length == 127 {
             if count < 10 { return .needMore }
@@ -131,6 +134,8 @@ public enum WebSocketCodec {
                 i += 1
             }
             length = v
+            // And one that fits in sixteen never takes sixty-four.
+            if length <= 0xFFFF { return .failure(.protocolError) }
             offset = 10
         }
 

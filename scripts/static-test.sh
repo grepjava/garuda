@@ -89,6 +89,19 @@ is "a matching ETag is 304"       "$(code -H "If-None-Match: $ETAG" $H/static/si
 is "a wildcard ETag is 304"       "$(code -H 'If-None-Match: *' $H/static/site.css)"     "304"
 is "a stale ETag is 200"          "$(code -H 'If-None-Match: \"nope\"' $H/static/site.css)" "200"
 is "a 304 carries no body"        "$(curl -sS -o /dev/null -w '%{size_download}' -H "If-None-Match: $ETAG" $H/static/site.css)" "0"
+is "If-None-Match split over two lines still matches" \
+   "$(code -H 'If-None-Match: "nope"' -H "If-None-Match: $ETAG" $H/static/site.css)" "304"
+is "a matching If-Match is 200"   "$(code -H "If-Match: $ETAG" $H/static/site.css)" "200"
+is "If-Match: * is 200"           "$(code -H 'If-Match: *' $H/static/site.css)" "200"
+is "a stale If-Match is 412"      "$(code -H 'If-Match: "nope"' $H/static/site.css)" "412"
+is "a weak If-Match never matches" "$(code -H "If-Match: W/$ETAG" $H/static/site.css)" "412"
+is "If-Match split over two lines still matches" \
+   "$(code -H 'If-Match: "nope"' -H "If-Match: $ETAG" $H/static/site.css)" "200"
+is "a failed If-Match wins over a matching If-None-Match" \
+   "$(code -H 'If-Match: "nope"' -H "If-None-Match: $ETAG" $H/static/site.css)" "412"
+is "a 412 has no body and keeps the connection" \
+   "$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}:%{size_download} ' -H 'If-Match: "nope"' $H/static/site.css \
+        --next -o /dev/null -w '%{http_code}:%{num_connects}' $H/static/app.js)" "412:0 200:0"
 
 # A file rewritten in place at the same size, within the same second, is a
 # different file. With the tag built from whole seconds it kept the old tag,
@@ -154,6 +167,8 @@ is "a 3MB file over TLS is byte-identical" \
    "$(curl -sS -k --max-time 60 $HS/static/big.bin | cmp -s - "$WORK/assets/big.bin" && echo same)" "same"
 is "a 3MB file over HTTP/2 is byte-identical" \
    "$(curl -sS -k --http2 --max-time 60 $HS/static/big.bin | cmp -s - "$WORK/assets/big.bin" && echo same)" "same"
+is "a stale If-Match over HTTP/2 is 412" \
+   "$(curl -sS -k --http2 -o /dev/null -w '%{http_code}' --max-time 10 -H 'If-Match: "nope"' $HS/static/site.css)" "412"
 
 echo
 echo "  $PASS passed, $FAIL failed"

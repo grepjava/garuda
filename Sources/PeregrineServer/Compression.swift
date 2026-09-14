@@ -129,9 +129,11 @@ func codingUsable(_ coding: ContentCoding) -> Bool {
 extension Worker {
 
     /// The request's `Accept-Encoding`, read while its head is still in hand.
+    /// Several lines of it are one list (RFC 9110 section 5.3).
     func requestAcceptEncoding(_ slot: Int) -> AcceptEncoding {
         let c = table[slot]
         let base = c.pointee.headBase()
+        var accept = AcceptEncoding()
         var i = 0
         while i < c.pointee.head.headerCount {
             let h = headers[i]
@@ -140,9 +142,9 @@ extension Worker {
                   equalsLowercased(base + Int(h.name.offset), 15, "accept-encoding") else {
                 continue
             }
-            return AcceptEncoding(base + Int(h.value.offset), Int(h.value.length))
+            accept.merge(AcceptEncoding(base + Int(h.value.offset), Int(h.value.length)))
         }
-        return AcceptEncoding()
+        return accept
     }
 
     /// Settles which coding a response to this request may use, if the

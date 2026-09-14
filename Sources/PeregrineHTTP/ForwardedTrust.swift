@@ -205,8 +205,9 @@ public enum Forwarded {
             }
         }
 
-        if let list = forwardedFor {
-            info.client = rightmostUntrusted(list, trust: trust)
+        if forwardedFor != nil {
+            info.client = rightmostUntrusted(base: base, headers: headers,
+                                             count: Int(head.headerCount), trust: trust)
         }
         if let proto = forwardedProto {
             let last = lastElement(proto)
@@ -238,8 +239,38 @@ public enum Forwarded {
     /// itself a trusted proxy. When every hop is trusted the leftmost entry is
     /// the original client.
     static func rightmostUntrusted(_ list: ByteSpan, trust: ForwardedTrust) -> ByteSpan? {
-        var end = list.count
         var leftmost: ByteSpan? = nil
+        return rightmostUntrusted(list, trust: trust, leftmost: &leftmost) ?? leftmost
+    }
+
+    /// The same across every X-Forwarded-For line. Several lines are one list
+    /// in the order they arrived (RFC 9110 section 5.3), so the walk from the
+    /// right carries on from each line into the one before it; a proxy that
+    /// adds a line of its own rather than appending to the last one still
+    /// leaves the client at the far end.
+    static func rightmostUntrusted(base: UnsafePointer<UInt8>,
+                                   headers: UnsafePointer<HTTPHeaderRef>,
+                                   count: Int, trust: ForwardedTrust) -> ByteSpan? {
+        var leftmost: ByteSpan? = nil
+        var i = count
+        while i > 0 {
+            i -= 1
+            let h = headers[i]
+            guard h.name.length == 15,
+                  equalsLowercased(base + Int(h.name.offset), 15, "x-forwarded-for") else { continue }
+            let list = ByteSpan(base + Int(h.value.offset), Int(h.value.length))
+            if let found = rightmostUntrusted(list, trust: trust, leftmost: &leftmost) {
+                return found
+            }
+        }
+        return leftmost
+    }
+
+    /// One line's walk: the first untrusted entry from the right, or nil with
+    /// `leftmost` moved to the last entry seen.
+    static func rightmostUntrusted(_ list: ByteSpan, trust: ForwardedTrust,
+                                   leftmost: inout ByteSpan?) -> ByteSpan? {
+        var end = list.count
         while end > 0 {
             var start = end
             while start > 0, list[start - 1] != cComma { start -= 1 }
@@ -251,7 +282,7 @@ public enum Forwarded {
             if start == 0 { break }
             end = start - 1
         }
-        return leftmost
+        return nil
     }
 
     /// Strips the decorations proxies add: quotes, a bracketed IPv6 literal,
