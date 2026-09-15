@@ -181,7 +181,7 @@ jobs:
           import PackageDescription
           let package = Package(
               name: "consumer",
-              platforms: [.macOS(.v14)],
+              platforms: [.macOS(.v15)],
               dependencies: [.package(url: "file://$GITHUB_WORKSPACE", exact: "999.0.0")],
               targets: [.executableTarget(name: "consumer",
                                           dependencies: [.product(name: "Garuda", package: "garuda")])]

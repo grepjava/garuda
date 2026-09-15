@@ -22,7 +22,7 @@ change ([HANDLER-API.md](HANDLER-API.md)).
 | **Swift** | 6.1 or newer (`swift-tools-version: 6.1`; CI uses 6.1.2). From [swift.org/install](https://swift.org/install) |
 | **OpenSSL** | development files. The build links `libssl` and `libcrypto` |
 | **zlib** | development files. The build links `libz` |
-| **An OS with epoll or kqueue** | Linux is the primary platform: development, benchmarks and the end-to-end suites run there (WSL 2). macOS 14+ builds and passes the unit tests in CI. Windows is not supported |
+| **An OS with epoll or kqueue** | Linux is the primary platform: development, benchmarks and the end-to-end suites run there (WSL 2). macOS 15+ builds and passes the unit tests in CI. Windows is not supported |
 
 ### Ubuntu and Debian
 
@@ -194,7 +194,7 @@ the workers without dropping a connection. It does not build for you.
 ## Running the tests
 
 ```bash
-swift test                                    # 206 unit tests
+swift test                                    # 213 unit tests
 ```
 
 The end-to-end suites in `scripts/` default to `.build/release/garuda`, so build

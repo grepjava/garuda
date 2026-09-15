@@ -71,7 +71,7 @@ public final class TestClient {
     }
 
     deinit {
-        worker.pointee.destroy()
+        onWorker { worker.pointee.destroy() }
         worker.deinitialize(count: 1)
         worker.deallocate()
     }
@@ -160,7 +160,7 @@ public final class TestClient {
         _ = pg_close(client)
         let c = worker.pointee.table[slot]
         if c.pointee.state != .free && c.pointee.generation == generation {
-            worker.pointee.closeConnection(slot)
+            onWorker { worker.pointee.closeConnection(slot) }
         }
     }
 
@@ -203,14 +203,24 @@ public final class TestClient {
     /// One turn of the worker's loop, as `runSynchronousLoop` takes it, with
     /// a short wait so that a request waiting on a timer does not spin.
     func turn() {
+        onWorker {
+            let n = worker.pointee.poller.wait(timeoutMillis: 1)
+            if n > 0 { worker.pointee.processEvents(n) }
+            worker.pointee.fireDueTimers()
+            worker.pointee.drainReadyQueue()
+            worker.pointee.runHandlerTasks()
+            worker.pointee.sweepTimeouts()
+        }
+    }
+
+    /// Runs `body` with this client's worker current on the calling thread, as
+    /// the engine expects of anything that touches a worker: its handler
+    /// tasks run only on a thread their worker is current on.
+    func onWorker<R>(_ body: () throws -> R) rethrows -> R {
         let previous = currentWorker
         currentWorker = worker
         defer { currentWorker = previous }
-        let n = worker.pointee.poller.wait(timeoutMillis: 1)
-        if n > 0 { worker.pointee.processEvents(n) }
-        worker.pointee.fireDueTimers()
-        worker.pointee.drainReadyQueue()
-        worker.pointee.sweepTimeouts()
+        return try body()
     }
 
     /// Closes the client's end and turns the loop until the worker has let go
@@ -222,7 +232,7 @@ public final class TestClient {
             if c.pointee.state == .free || c.pointee.generation != generation { return }
             turn()
         }
-        worker.pointee.closeConnection(slot)
+        onWorker { worker.pointee.closeConnection(slot) }
     }
 }
 

@@ -366,7 +366,7 @@ reads the forwarded client and scheme as `request.remoteAddress`,
 Unit tests, including the fuzz corpus:
 
 ```bash
-swift test                                   # 206 tests
+swift test                                   # 213 tests
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 

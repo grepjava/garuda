@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 206 unit tests
+swift test                             # 213 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -88,6 +88,14 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
 - `request[context: Key.self]` replaces `locals`: typed values for the rest of
   a request, across `after`, tagged with the request so they never reach the
   next one on the connection.
+- Each worker keeps a pool of handler tasks on an executor of its own, the
+  ground async handlers will be registered on in a later phase. A task is
+  reused rather than made per request: after warm-up an async request
+  allocates nothing, measured by counting the worker's own heap allocations
+  over a thousand requests. Tasks run only on their worker's thread, in the
+  same loop turn as the request; closing a connection or resetting a stream
+  cancels the handler's wait and returns its task to the pool. A worker that
+  serves only synchronous handlers never makes one.
 - `app.run()` parses the usual flags and runs the supervisor, and
   `app.run(configuration:)` serves a `ServerConfig` instead, checked the way
   the command line is. `onWorkerStart` hooks run in each worker before it

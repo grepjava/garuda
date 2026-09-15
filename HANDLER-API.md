@@ -140,7 +140,7 @@ What an async handler costs:
 
 - **An async route costs about 0.4–1 µs and no allocation**, next to a request's ~6 µs of CPU and a database round trip's 100 µs or more. A synchronous route pays nothing.
 - **A new `Task` per request is ruled out.** It is 3–6× slower, and allocates.
-- **A task created on demand runs inline only when the loop itself runs on the executor**: from outside it, `Task.immediate` with that executor preferred queued all of 1,000,000 tasks instead. The worker loop therefore runs as a job on its own executor.
+- **A task created on demand runs inline only when the loop itself runs on the executor**: from outside it, `Task.immediate` with that executor preferred queued all of 1,000,000 tasks instead. The pool does not create tasks per request, so the loop stays plain code and drains the executor itself: handing a request to a task, or waking one from a wait, is followed by a drain in the same turn.
 
 #### Errors
 
@@ -157,7 +157,7 @@ What an async handler costs:
 
 #### The application instance and the test client
 
-- **Landed so far:** `Application` with its routes and worker hooks, `run()` and `run(configuration:)` over a `ServerConfig` checked as the command line is, and `app.test`, a worker in the test process driven over a socket pair. Then ownership: the lent-bytes accessors, owned copies, `request[context:]`, and six compile-fail checks in `Tests/CompileFail` run by `scripts/compile-fail-test.sh`. Middleware and state factories arrive with steps 2 and 4.
+- **Landed so far:** `Application` with its routes and worker hooks, `run()` and `run(configuration:)` over a `ServerConfig` checked as the command line is, and `app.test`, a worker in the test process driven over a socket pair. Then ownership: the lent-bytes accessors, owned copies, `request[context:]`, and six compile-fail checks in `Tests/CompileFail` run by `scripts/compile-fail-test.sh`. Then the handler task pool (`Sources/Garuda/HandlerTasks.swift`): a `TaskExecutor` per worker that runs jobs only on the worker's thread, long-lived tasks that prefer it (up to 1,024 per worker, then a queue), an engine wait (`Response.sleep`) that a closed connection or reset stream cancels, and a unit test that counts heap allocations on the worker's turns: none per request, after warm-up, for a synchronous route, an async route, or an async route that waits once. Async handlers stay internal until step 3. Middleware and state factories arrive with steps 2 and 4.
 - **`Application`** owns the routes, middleware, state factories and a programmatic `Configuration`. `app.run()` fills the configuration from the command line unless it was given one, and runs the supervisor. It replaces `Routes`, the global `installedRoutes` and the global `lifecycle`. The compiled route table belongs to the application and is freed when it shuts down; workers still inherit it through the fork.
 - **`app.test`** runs a request through routing, extraction, middleware, the handler and the response sink in-process, on a test worker with no socket, and returns the parsed response.
 - **`app.test.withServer { url in … }`** starts the application on an ephemeral port for integration tests and shuts it down deterministically.
@@ -179,7 +179,7 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 1. Packaging, and the module rename if approved.
 2. `Application`, `Configuration` and the test client, over today's raw handlers.
 3. Ownership: the closure-scoped accessors, the typed request context and the compile-fail tests.
-4. The worker executor and the handler task pool, with a unit test that an async handler allocates nothing after warm-up. This is the foundation step 3's async handlers are registered on.
+4. The worker executor and the handler task pool, with a unit test that an async handler allocates nothing after warm-up. This is the foundation step 3's async handlers are registered on. Landed.
 
 ### 2. Typed extraction, responses, errors and state
 

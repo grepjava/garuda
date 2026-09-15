@@ -154,7 +154,7 @@ extension Worker {
         return c.pointee.state == .dispatching
             && c.pointee.generation == generation
             && c.pointee.requestId == requestId
-            && c.pointee.contState != .waiting
+            && !c.pointee.isParked
             && !c.pointee.flags.contains(.responseStarted)
     }
 
@@ -163,7 +163,9 @@ extension Worker {
     }
 
     mutating func handlerReturned(_ slot: Int, generation: UInt32, requestId: UInt32) {
-        guard handlerOwes(slot, generation: generation, requestId: requestId) else { return }
+        // A request on a task is the task's to settle (`taskFinished`).
+        guard table[slot].pointee.contKind != .task,
+              handlerOwes(slot, generation: generation, requestId: requestId) else { return }
         Log.error("a handler returned without answering or waiting; answering 500")
         respond(slot, status: 500, nil, 0)
     }
@@ -187,7 +189,7 @@ extension Worker {
     /// Parks the request on a timer, to call `handler` when it fires.
     mutating func suspend(_ slot: Int, milliseconds: UInt64, then handler: @escaping Handler) {
         let c = table[slot]
-        guard c.pointee.state == .dispatching, c.pointee.contState != .waiting,
+        guard c.pointee.state == .dispatching, !c.pointee.isParked,
               !c.pointee.flags.contains(.responseStarted) else {
             Log.error("a handler waited on a request that was already answered or waiting")
             return
@@ -239,7 +241,7 @@ extension Worker {
     /// `count` bytes of `body`.
     mutating func respond(_ slot: Int, status: Int, _ body: UnsafePointer<UInt8>?, _ count: Int) {
         let c = table[slot]
-        guard c.pointee.state == .dispatching, c.pointee.contState != .waiting,
+        guard c.pointee.state == .dispatching, !c.pointee.isParked,
               !c.pointee.flags.contains(.responseStarted) else {
             Log.error("a handler answered a request that was already answered or waiting")
             return

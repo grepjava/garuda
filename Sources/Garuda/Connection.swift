@@ -154,6 +154,15 @@ public struct Connection {
     /// Set only while `contKind` is `.handler`, which is how releasing it
     /// stays off the path of requests that never wait.
     public var contHandler: Handler? = nil
+    /// While `contKind` is `.task`: the number of the task running the
+    /// request in the worker's pool, or -1 while it waits for one.
+    var contTask: Int32 = -1
+    /// The async handler a request queued for a task will run.
+    var contAsyncHandler: AsyncHandler? = nil
+    /// Parked on something other than a handler running now, so no handler
+    /// may answer it. A request on a task is answered by that task, from
+    /// whichever wait it resumes, so it does not count.
+    var isParked: Bool { contState == .waiting && contKind != .task }
     /// The request's typed context, made when a handler first stores a value.
     var context: RequestContext? = nil
     /// The status `Response.send` uses when it is not given one.

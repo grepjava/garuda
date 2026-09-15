@@ -763,6 +763,8 @@ extension Worker {
         s.pointee.contKind = .none
         s.pointee.contOp = -1
         s.pointee.contHandler = nil
+        s.pointee.contTask = -1
+        s.pointee.contAsyncHandler = nil
         s.pointee.context = nil
         s.pointee.handlerStatus = 200
         s.pointee.responseHeaders = ByteBuffer()

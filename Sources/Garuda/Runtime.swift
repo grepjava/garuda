@@ -1100,6 +1100,7 @@ enum GarudaRuntime {
             if n > 0 { worker.pointee.processEvents(n) }
             worker.pointee.fireDueTimers()
             worker.pointee.drainReadyQueue()
+            worker.pointee.runHandlerTasks()
             worker.pointee.quicTick()
             worker.pointee.sweepTimeouts()
             if worker.pointee.draining && worker.pointee.quiescent {

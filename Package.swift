@@ -15,7 +15,8 @@ let sharedSwiftSettings: [SwiftSetting] = [
 
 let package = Package(
     name: "garuda",
-    platforms: [.macOS(.v14)],
+    // macOS 15: async handlers run on a `TaskExecutor`.
+    platforms: [.macOS(.v15)],
     products: [
         .executable(name: "garuda", targets: ["garuda-server"]),
         .executable(name: "garuda-conformance", targets: ["garuda-conformance"]),
@@ -69,9 +70,12 @@ let package = Package(
                           dependencies: ["CGaruda", "GarudaFuzzTargets"],
                           swiftSettings: sharedSwiftSettings),
 
+        // Counts heap allocations in the test process, on glibc.
+        .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),
+
         .testTarget(name: "GarudaTests",
                     dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC",
-                                   "Garuda", "GarudaFuzzTargets"],
+                                   "Garuda", "GarudaFuzzTargets", "CAllocationCounter"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
     ],
     cLanguageStandard: .gnu11

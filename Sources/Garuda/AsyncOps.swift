@@ -22,6 +22,9 @@ public enum ContKind: UInt8 {
     case none
     /// Resumes by calling the handler stored in `Connection.contHandler`.
     case handler
+    /// The request belongs to an async handler's task (HandlerTasks.swift):
+    /// running on it, waiting on the engine for it, or queued for one.
+    case task
 }
 
 public enum OpKind: UInt8 {
@@ -352,9 +355,13 @@ extension Worker {
                 asyncOps.free(opIndex)
             }
         }
-        // Only a handler continuation holds a closure, so a request that never
-        // waited releases nothing here.
-        if c.pointee.contKind == .handler { c.pointee.contHandler = nil }
+        // Only a handler continuation holds a closure, and only a task one a
+        // task, so a request that never waited releases nothing here.
+        if c.pointee.contKind == .handler {
+            c.pointee.contHandler = nil
+        } else if c.pointee.contKind == .task {
+            cancelTask(slot)
+        }
         c.pointee.contOp = -1
         c.pointee.contState = .none
         c.pointee.contKind = .none
@@ -364,8 +371,14 @@ extension Worker {
     /// when the op pool is exhausted.
     @discardableResult
     mutating func armDelay(_ slot: Int, ms: UInt64, kind: ContKind = .handler) -> Bool {
-        let c = table[slot]
         clearContinuation(slot)
+        return armTimer(slot, ms: ms, kind: kind)
+    }
+
+    /// Arms a timer op without clearing the continuation first, which a task
+    /// keeps across its wait. Returns false when the op pool is exhausted.
+    mutating func armTimer(_ slot: Int, ms: UInt64, kind: ContKind) -> Bool {
+        let c = table[slot]
         // The clock reads truncated microseconds; one more keeps the deadline
         // from landing before the full duration.
         let deadline = pg_monotonic_us() &+ 1 &+ max(1, ms) &* 1000
@@ -464,6 +477,10 @@ extension Worker {
                 c.pointee.contHandler = nil
                 runHandler(slot, handler)
             }
+        case .task:
+            // Still the task's request: only the wait is over.
+            c.pointee.contKind = .task
+            handlerTasks?.wake(Int(c.pointee.contTask))
         case .none:
             break
         }

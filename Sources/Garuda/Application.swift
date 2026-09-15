@@ -57,6 +57,15 @@ public final class Application {
         routes.on(method, pattern, handler)
     }
 
+    /// Registers an async handler, run on one of the worker's handler tasks.
+    /// Internal until step 3 registers typed async handlers on it.
+    func onAsync(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping AsyncHandler) {
+        precondition(compiled == nil, "route \(pattern) added after the application was compiled")
+        routes.on(method, pattern) { request, _ in
+            request.worker.pointee.runOnTask(request.slot, handler)
+        }
+    }
+
     // MARK: Worker hooks
 
     /// Runs in each worker process before it accepts a connection -- a

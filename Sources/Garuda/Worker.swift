@@ -107,6 +107,10 @@ public struct Worker {
     /// or a test client's. With none, every request is answered 404.
     var application: UnsafeMutablePointer<CompiledApplication>? = nil
     static let readyDrainBudget = 64
+    /// The tasks async handlers run on (HandlerTasks.swift), made on the first
+    /// async request, and how many there may be.
+    var handlerTasks: HandlerTaskPool? = nil
+    var handlerTaskLimit = 1024
 
     public init(config: ServerConfig, listenFD: Int32, poller: Poller) {
         self.config = config
@@ -127,6 +131,20 @@ public struct Worker {
     }
 
     public mutating func destroy() {
+        if let pool = handlerTasks {
+            // Cancelled first, so that a task waiting on the engine unwinds
+            // and can be ended.
+            var slot = 0
+            while slot < table.capacity {
+                let c = table[slot]
+                if c.pointee.state != .free && c.pointee.contKind == .task {
+                    cancelOps(slot: slot)
+                }
+                slot += 1
+            }
+            pool.shutdown()
+            handlerTasks = nil
+        }
         closeScrapes()
         quic?.destroy()
         headers.deallocate()
