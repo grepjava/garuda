@@ -1,6 +1,6 @@
 import Testing
 import GarudaHTTP
-@testable import GarudaServer
+@testable import Garuda
 
 private struct Match: Equatable {
     var route: Int32

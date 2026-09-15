@@ -42,10 +42,10 @@ import GarudaCore
 import GarudaHTTP
 import GarudaQUIC
 
-public enum Garuda {
+enum GarudaRuntime {
 
     /// Boots the server. Returns a process exit code.
-    public static func run(config: ServerConfig) -> Int32 {
+    static func run(config: ServerConfig) -> Int32 {
         // --reload: this image may be a supervisor restarted on a rebuilt
         // executable, holding the previous image's sockets and workers.
         var inherited = Reexec.take()

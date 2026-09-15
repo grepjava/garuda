@@ -28,12 +28,12 @@ Sources/
                       QPACK, HTTP/2 and HTTP/3 framing, WebSocket framing,
                       forwarded-header trust, cache policy, root path
   GarudaQUIC/         QUIC transport and the TLS 1.3 handshake it needs
-  GarudaServer/       supervisor, worker loop, connection table, dispatch,
+  Garuda/             supervisor, worker loop, connection table, dispatch,
                       handler API, route table, response sink, async
                       substrate, HTTP/2 and HTTP/3 servers, static files,
                       TLS glue, reload, ACME, metrics, CLI
-  garuda/             the benchmark executable: the-benchmarker's routes,
-                      served with Garuda.serve
+  garuda-server/      the benchmark executable: the-benchmarker's routes,
+                      served through the handler API
   GarudaConformance/  garuda-conformance: routes that make engine behaviour
                       observable to the end-to-end suites
   GarudaFuzzTargets/  fuzz targets and seeds, driven by pgfuzz/
@@ -41,7 +41,7 @@ Tests/GarudaTests/    unit tests
 ```
 
 `Package.swift` builds these as the targets `CGaruda`, `GarudaCore`,
-`GarudaHTTP`, `GarudaQUIC` and `GarudaServer` (the library product `Garuda`),
+`GarudaHTTP`, `GarudaQUIC` and `Garuda` (the library product of the same name),
 the `garuda` and `garuda-conformance` executables, and `GarudaFuzzTargets`
 with its `pgfuzz` driver.
 Swift never imports an OpenSSL header. It sees TLS sessions, contexts and
@@ -262,7 +262,7 @@ worker that answers plain HTTP with a redirect to https and closes
 
 ### Routes and handlers
 
-`Garuda.serve` compiles the application's `Routes` before the first fork
+`serve` compiles the application's `Routes` before the first fork
 (`Handler.swift`), so every worker inherits the same table and only reads it.
 `RouteTable` (`RouteTable.swift`) splits each pattern into literal, `:param`
 and trailing `*rest` segments and lays them out as a flat byte trie.

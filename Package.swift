@@ -2,10 +2,14 @@
 import PackageDescription
 
 // Garuda — a pure-Swift web framework. No Foundation.
+//
+// No target sets unsafe flags: SwiftPM refuses them in a package that is
+// depended on by version. Benchmarks build the way the-benchmarker builds
+// every Swift entry, with the flag on the command line:
+//   swift build -c release -Xswiftc -enforce-exclusivity=unchecked
 
 let sharedSwiftSettings: [SwiftSetting] = [
     .swiftLanguageMode(.v6),
-    .unsafeFlags(["-enforce-exclusivity=unchecked"], .when(configuration: .release)),
     .define("GARUDA_RELEASE", .when(configuration: .release)),
 ]
 
@@ -13,9 +17,9 @@ let package = Package(
     name: "garuda",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "garuda", targets: ["garuda"]),
+        .executable(name: "garuda", targets: ["garuda-server"]),
         .executable(name: "garuda-conformance", targets: ["garuda-conformance"]),
-        .library(name: "Garuda", targets: ["GarudaServer"]),
+        .library(name: "Garuda", targets: ["Garuda"]),
     ],
     targets: [
         .target(
@@ -40,16 +44,20 @@ let package = Package(
         .target(name: "GarudaQUIC", dependencies: ["GarudaCore", "GarudaHTTP"],
                 swiftSettings: sharedSwiftSettings),
 
-        .target(name: "GarudaServer",
+        // The engine and the handler API: `import Garuda`.
+        .target(name: "Garuda",
                 dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC"],
                 swiftSettings: sharedSwiftSettings),
 
-        .executableTarget(name: "garuda", dependencies: ["GarudaServer"],
+        // The `garuda` executable. Its module is not named `garuda`, which a
+        // case-insensitive file system would take for the `Garuda` module.
+        .executableTarget(name: "garuda-server", dependencies: ["Garuda"],
+                          path: "Sources/garuda-server",
                           swiftSettings: sharedSwiftSettings),
 
         // The routes the end-to-end suites need a handler for.
         .executableTarget(name: "garuda-conformance",
-                          dependencies: ["GarudaCore", "GarudaHTTP", "GarudaServer"],
+                          dependencies: ["GarudaCore", "GarudaHTTP", "Garuda"],
                           path: "Sources/GarudaConformance",
                           swiftSettings: sharedSwiftSettings),
 
@@ -63,7 +71,7 @@ let package = Package(
 
         .testTarget(name: "GarudaTests",
                     dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC",
-                                   "GarudaServer", "GarudaFuzzTargets"],
+                                   "Garuda", "GarudaFuzzTargets"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
     ],
     cLanguageStandard: .gnu11

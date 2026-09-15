@@ -77,9 +77,17 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   scheme, authority, headers, the whole body, the client with
   `--forwarded-allow-ips` applied, the request ID, the request start and
   `locals`. A `~Copyable` `Response` sets a status and headers, sends, or waits
-  with `after(milliseconds:then:)`. `Garuda.serve(routes, onStart:,
-  onShutdown:)` parses the usual flags and runs the supervisor; `onStart` runs
-  in each worker before it reports ready, and `onShutdown` after its loop ends.
+  with `after(milliseconds:then:)`. `serve(routes, onStart:, onShutdown:)`
+  parses the usual flags and runs the supervisor; `onStart` runs in each worker
+  before it reports ready, and `onShutdown` after its loop ends.
+- Applications write `import Garuda`: the engine's module, formerly
+  `GarudaServer`, is named `Garuda`, and `Garuda.serve` is the free function
+  `serve`. The executable's sources moved to `Sources/garuda-server`; the
+  binary is still `garuda`.
+- Garuda can be depended on by version. No target sets unsafe build flags any
+  more; `-enforce-exclusivity=unchecked` went from `Package.swift` at a cost of
+  0.6% at 64 connections. A CI job builds a package that depends on Garuda by
+  version, which SwiftPM refuses while any target sets unsafe flags.
 - Every handler response goes through one response sink. It frames 204, 304
   and HEAD, adds the server's own headers unless the handler set its own
   `X-Request-ID`, `Strict-Transport-Security` or `Alt-Svc`, and holds the body

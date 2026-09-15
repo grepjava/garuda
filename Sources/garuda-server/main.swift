@@ -16,7 +16,7 @@ import Glibc
 import Darwin
 #endif
 
-import GarudaServer
+import Garuda
 
 var routes = Routes()
 
@@ -43,4 +43,4 @@ routes.get("/delay/:ms") { request, response in
     }
 }
 
-exit(Garuda.serve(routes))
+exit(serve(routes))

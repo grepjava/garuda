@@ -293,21 +293,19 @@ extension ByteSpan {
 
 // MARK: - Serving
 
-extension Garuda {
-    /// Parses the process's command line as the `garuda` executable does,
-    /// then serves `routes` until shut down. Returns the process exit code.
-    ///
-    /// `onStart` runs in each worker before it accepts a connection -- a
-    /// replacement worker is not handed its slot until it returns -- and
-    /// `onShutdown` in each worker once its in-flight requests have finished
-    /// or --graceful-timeout has run out. Both get the worker's index.
-    public static func serve(_ routes: Routes,
-                             onStart: ((Int) -> Void)? = nil,
-                             onShutdown: ((Int) -> Void)? = nil) -> Int32 {
-        install(routes)
-        lifecycle = Lifecycle(onStart: onStart, onShutdown: onShutdown)
-        return GarudaCLI.main(argc: Int(CommandLine.argc), argv: CommandLine.unsafeArgv)
-    }
+/// Parses the process's command line as the `garuda` executable does, then
+/// serves `routes` until shut down. Returns the process exit code.
+///
+/// `onStart` runs in each worker before it accepts a connection -- a
+/// replacement worker is not handed its slot until it returns -- and
+/// `onShutdown` in each worker once its in-flight requests have finished or
+/// --graceful-timeout has run out. Both get the worker's index.
+public func serve(_ routes: Routes,
+                  onStart: ((Int) -> Void)? = nil,
+                  onShutdown: ((Int) -> Void)? = nil) -> Int32 {
+    install(routes)
+    lifecycle = Lifecycle(onStart: onStart, onShutdown: onShutdown)
+    return GarudaCLI.main(argc: Int(CommandLine.argc), argv: CommandLine.unsafeArgv)
 }
 
 struct Lifecycle {

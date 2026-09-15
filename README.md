@@ -39,18 +39,18 @@ service are in [INSTALLATION.md](INSTALLATION.md).
 
 ## The handler API
 
-The library product `Garuda` (the `GarudaServer` target) takes routes and
+The library product `Garuda` (the `Garuda` module) takes routes and
 serves them with the same command-line flags as the `garuda` binary:
 
 ```swift
 import Glibc                // Darwin on macOS, for exit
-import GarudaServer
+import Garuda
 
 var routes = Routes()
 routes.get("/user/:id") { request, response in
     response.send(request.parameter(0))
 }
-exit(Garuda.serve(routes))
+exit(serve(routes))
 ```
 
 - **Routes** are registered with `get`, `head`, `post`, `put`, `delete`,
@@ -64,7 +64,7 @@ exit(Garuda.serve(routes))
 - **`Response`** is `~Copyable` too: `status`, `addHeader`, `send(status:)`,
   `send(status:_:)`, and `after(milliseconds:then:)`, which calls a handler
   again after a timer.
-- **`Garuda.serve(routes, onStart:, onShutdown:)`** parses the flags and runs
+- **`serve(routes, onStart:, onShutdown:)`** parses the flags and runs
   the supervisor. `onStart` runs in each worker before it reports ready, and
   `onShutdown` after its loop ends.
 
@@ -81,7 +81,7 @@ yet. [HANDLER-API.md](HANDLER-API.md) has the roadmap.
 
 ### What the binary serves
 
-`Sources/garuda/main.swift` serves the-benchmarker's contract through the
+`Sources/garuda-server/main.swift` serves the-benchmarker's contract through the
 handler API:
 
 | request | response |

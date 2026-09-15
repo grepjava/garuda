@@ -132,3 +132,67 @@ jobs:
           name: pgfuzz-findings
           path: pgfuzz-*.bin
           if-no-files-found: ignore
+
+  dependency:
+    name: versioned dependency
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
+            libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev
+
+      - name: Cache the Swift toolchain
+        id: swift-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/swift
+          key: swift-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_PLATFORM }}
+
+      - name: Swift toolchain
+        if: steps.swift-cache.outputs.cache-hit != 'true'
+        run: |
+          dir="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}"
+          url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_SLUG}"
+          url="${url}/swift-${SWIFT_VERSION}-RELEASE/${dir}.tar.gz"
+          curl -fsSL "$url" -o /tmp/swift.tar.gz
+          tar -xzf /tmp/swift.tar.gz -C /tmp
+          sudo cp -r "/tmp/${dir}/usr" /opt/swift
+
+      - name: Environment
+        run: echo "/opt/swift/bin" >> "$GITHUB_PATH"
+
+      # SwiftPM treats a git URL with a version requirement as a remote
+      # dependency and refuses unsafe build flags in one, so this fails if a
+      # target of Garuda's ever sets them again.
+      - name: Build a package that depends on Garuda by version
+        run: |
+          git tag 999.0.0
+          mkdir -p /tmp/consumer/Sources/consumer
+          cat > /tmp/consumer/Package.swift <<EOF
+          // swift-tools-version: 6.1
+          import PackageDescription
+          let package = Package(
+              name: "consumer",
+              platforms: [.macOS(.v14)],
+              dependencies: [.package(url: "file://$GITHUB_WORKSPACE", exact: "999.0.0")],
+              targets: [.executableTarget(name: "consumer",
+                                          dependencies: [.product(name: "Garuda", package: "garuda")])]
+          )
+          EOF
+          cat > /tmp/consumer/Sources/consumer/main.swift <<'EOF'
+          import Garuda
+
+          var routes = Routes()
+          routes.get("/") { _, response in
+              response.send(status: 200)
+          }
+          if CommandLine.arguments.contains("--serve") {
+              _ = serve(routes)
+          }
+          EOF
+          cd /tmp/consumer && swift build -c release

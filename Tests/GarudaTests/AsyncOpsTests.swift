@@ -1,6 +1,6 @@
 import Testing
 import GarudaCore
-@testable import GarudaServer
+@testable import Garuda
 
 /// A worker with no listener, driven by hand. Continuations are parked with
 /// kind `.none`, so resuming one changes state without writing a response.

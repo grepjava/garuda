@@ -1,6 +1,6 @@
 # Handler API
 
-Status, 2026-09-15: phase 1 is implemented. Routes, a `Request` view, a one-shot `Response`, the response sink, errors and lifecycle hooks serve the benchmark contract (`Sources/garuda`) and the end-to-end conformance routes (`Sources/GarudaConformance`). A review of that code set the roadmap below, which replaces the earlier phase list.
+Status, 2026-09-15: phase 1 is implemented. Routes, a `Request` view, a one-shot `Response`, the response sink, errors and lifecycle hooks serve the benchmark contract (`Sources/garuda-server`) and the end-to-end conformance routes (`Sources/GarudaConformance`). A review of that code set the roadmap below, which replaces the earlier phase list.
 
 **The goal of the roadmap:** an application developer can build and test an authenticated JSON CRUD API backed by a database, without touching pointers, integer state slots, manual JSON or engine internals.
 
@@ -16,7 +16,7 @@ Status, 2026-09-15: phase 1 is implemented. Routes, a `Request` view, a one-shot
 ## What phase 1 delivers
 
 ```swift
-import GarudaServer
+import Garuda
 
 var routes = Routes()
 
@@ -37,7 +37,7 @@ routes.get("/delay/:ms") { request, response in
     }
 }
 
-exit(Garuda.serve(routes))
+exit(serve(routes))
 ```
 
 - **Routes.** `get`, `head`, `post`, `put`, `delete`, `patch`, `options` and `on`. Segments are literal, `:param` or a trailing `*rest`. Patterns compile at start-up into a byte trie: literal before parameter before rest, with backtracking, HEAD falling back to GET, at most eight parameters. `--root-path` is taken off before matching.
@@ -45,7 +45,7 @@ exit(Garuda.serve(routes))
 - **`Response`**, `~Copyable`, passed `inout`: `status`, `addHeader`, `send(status:)`, `send(status:_:)` for bytes, strings and arrays, and `after(milliseconds:then:)`.
 - **The response sink.** Every response goes through one engine path. It merges the server's headers without doubling a handler's own `X-Request-ID`, `Strict-Transport-Security` or `Alt-Svc`. It frames 204, 304 and HEAD. It enforces a declared `Content-Length`: extra bytes are cut, too few reset the stream or close the HTTP/1.1 connection.
 - **Errors.** A handler that throws, or returns without answering, gets a 500; the connection lives on.
-- **Lifecycle.** `Garuda.serve(routes, onStart:, onShutdown:)` runs `onStart` in each worker before it reports ready and `onShutdown` after its loop ends.
+- **Lifecycle.** `serve(routes, onStart:, onShutdown:)` runs `onStart` in each worker before it reports ready and `onShutdown` after its loop ends.
 
 ## What phase 1 gets wrong
 
@@ -58,8 +58,8 @@ Checked against the code:
 - **No application state.** Lifecycle hooks return nothing, and a failing `onStart` cannot stop start-up.
 - **No composition.** No middleware, nesting or merging. A known path under the wrong method gets the same 404 as an unknown path.
 - **No streaming.** The body is buffered whole before dispatch, and `send` is one-shot.
-- **Hard to test.** `Garuda.serve` installs process-global routes that live forever, reads the process arguments and runs the supervisor.
-- **Not usable as a versioned dependency.** Every target applies `unsafeFlags(["-enforce-exclusivity=unchecked"])`, and SwiftPM refuses `unsafeFlags` in a package depended on by version.
+- **Hard to test.** `serve` installs process-global routes that live forever, reads the process arguments and runs the supervisor.
+- **Not usable as a versioned dependency.** Every target applied `unsafeFlags(["-enforce-exclusivity=unchecked"])`, and SwiftPM refuses them in a package depended on by version: "the target 'GarudaServer' in product 'Garuda' contains unsafe build flags". Fixed in step 1.
 
 ## Roadmap
 
@@ -160,12 +160,12 @@ What an async handler costs:
 
 #### Packaging
 
-- **`-enforce-exclusivity=unchecked` leaves the library targets.** It stays on the executables. The performance gate decides whether library code needs changing to win back what the flag gave.
-- **CI builds an external package that depends on Garuda by version** (a tagged `file://` repository, which SwiftPM treats as remote), so `unsafeFlags` cannot creep back.
+- **No target sets unsafe flags.** Done: `-enforce-exclusivity=unchecked` is gone from `Package.swift`, and it was not worth keeping. At 64 connections, four workers, one round, the default build served 382,793 requests a second against 384,994 with the flag, 0.6% less.
+- **CI builds an external package that depends on Garuda by version** (the `dependency` job: a tagged `file://` repository, which SwiftPM treats as remote), so unsafe flags cannot creep back.
 
 #### Decisions (taken 2026-09-15)
 
-1. **The module is renamed `Garuda`**, so applications write `import Garuda`. The `Garuda` enum goes; `Application` replaces `Garuda.serve`.
+1. **The module is renamed `Garuda`**, so applications write `import Garuda`. The `Garuda` enum goes; `Application` replaces `serve`.
 2. **The raw `(borrowing Request, inout Response)` API stays public**, closure-scoped as above, as the zero-copy layer under the typed one.
 
 The probes behind the figures in this section are in [benchmarks/async-probes/](benchmarks/async-probes/).
@@ -233,8 +233,8 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 
 ## Where it lives
 
-- **`GarudaServer`, the engine's own target.** The public API lives beside the engine it drives, and the `Garuda` library product points at it. A separate module named `Garuda` would collide with the `Garuda` enum every application calls, and would put a module boundary on the per-request path. Engine types stay `internal` wherever the API does not need them.
-- **`Sources/garuda`** serves the-benchmarker contract through the public API, so the benchmark measures what applications use.
+- **`Garuda`, the engine's own module** (`Sources/Garuda`). The public API lives beside the engine it drives, so there is no module boundary on the per-request path, and applications write `import Garuda`. Engine types stay `internal` wherever the API does not need them.
+- **`Sources/garuda-server`** serves the-benchmarker contract through the public API, so the benchmark measures what applications use.
 - **`Sources/GarudaConformance`** holds the routes the end-to-end suites need. It is not benchmarked, and it is not an example to copy.
 
 ## Performance gate

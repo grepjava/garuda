@@ -20,7 +20,7 @@ ones the site publishes; see [Relation to the published results](#relation-to-th
   370,945 requests a second**, about 4× Hummingbird and 6–7× Vapor at every
   level.
 - **Garuda answers through its public handler API** since phase 1 of
-  [HANDLER-API.md](HANDLER-API.md) ([Sources/garuda/main.swift](Sources/garuda/main.swift)).
+  [HANDLER-API.md](HANDLER-API.md) ([Sources/garuda-server/main.swift](Sources/garuda-server/main.swift)).
   The Swift-framework figures are older: they were measured on the hand-written
   router the API replaced.
 - Figures from Peregrine, the Python server Garuda was forked from, are kept

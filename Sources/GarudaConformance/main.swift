@@ -30,7 +30,7 @@ import Darwin
 
 import GarudaCore
 import GarudaHTTP
-import GarudaServer
+import Garuda
 
 /// The worker index onStart ran with in this process, or -1.
 nonisolated(unsafe) var startedWorker = -1
@@ -254,7 +254,7 @@ routes.get("/delay/:ms") { request, response in
     }
 }
 
-exit(Garuda.serve(
+exit(serve(
     routes,
     onStart: { index in
         startedWorker = index

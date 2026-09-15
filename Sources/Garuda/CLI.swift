@@ -665,6 +665,6 @@ public enum GarudaCLI {
             config.serverPortString = makeCString(Int(config.port))
         }
 
-        return Garuda.run(config: config)
+        return GarudaRuntime.run(config: config)
     }
 }
