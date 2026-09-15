@@ -156,11 +156,11 @@ public enum Fuzz {
     /// chose to send.
     private static func json(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
         let bytes = Array(UnsafeBufferPointer(start: base, count: n))
-        guard let value = try? JSON.decode(Value.self, from: bytes) else { return nil }
-        guard let written = try? JSON.encode(value) else {
+        guard let value = try? JSONCoder.decode(Value.self, from: bytes) else { return nil }
+        guard let written = try? JSONCoder.encode(value) else {
             return "a document that decoded could not be encoded again"
         }
-        guard let again = try? JSON.decode(Value.self, from: written) else {
+        guard let again = try? JSONCoder.decode(Value.self, from: written) else {
             return "what the encoder wrote did not decode: "
                 + String(decoding: written, as: UTF8.self)
         }

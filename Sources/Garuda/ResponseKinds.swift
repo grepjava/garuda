@@ -70,7 +70,7 @@ extension Worker {
     /// Encodes `value` into the worker's own buffer and answers with it.
     mutating func respond(_ slot: Int, status: Int, json value: some Encodable) throws {
         jsonScratch.clear()
-        try JSON.encode(value, into: &jsonScratch)
+        try JSONCoder.encode(value, into: &jsonScratch)
         if !hasContentType(slot) {
             let name: StaticString = "content-type"
             let type: StaticString = "application/json"

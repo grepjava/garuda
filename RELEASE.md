@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 240 unit tests
+swift test                             # 248 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -96,7 +96,7 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   same loop turn as the request; closing a connection or resetting a stream
   cancels the handler's wait and returns its task to the pool. A worker that
   serves only synchronous handlers never makes one.
-- `JSON.encode` and `JSON.decode` are Garuda's own JSON coder, over the
+- `JSONCoder.encode` and `JSONCoder.decode` are Garuda's own JSON coder, over the
   standard library's `Encodable` and `Decodable`: `JSONEncoder` and
   `JSONDecoder` are Foundation, which Garuda does not link. The writer streams
   a value out with no tree in between; the reader proves a document is JSON
@@ -118,6 +118,18 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   so a body that is not what it claimed is a 400 naming the key at fault.
   An error that conforms is an answer rather than a fault and is not logged as
   one; anything else thrown is still a 500 and a log line.
+- Handlers can declare what they need and return what they mean:
+  `app.get("/person/:id") { (id: Path<Int>) in JSON(person(id.value)) }`.
+  Registration is generic over a pack of extractors, so a handler takes none,
+  one or several: `Path<Value>` for the next path parameter, percent-decoded;
+  `Query<Value>` for the whole query string decoded into a type, where a
+  repeated name is a list, an absent one is nil if the type allows it and `+`
+  is a space; and `Body<Value>` for a JSON body. What the handler returns
+  writes itself — `JSON`, `HTML`, `Text`, `Bytes`, `Redirect`, a `String`, an
+  `HTTPStatus`, or an Optional whose nil is the ordinary 404. Everything that
+  will not decode answers the same way: a 400 whose body says what was wrong.
+  The raw `(borrowing Request, inout Response)` handlers register through the
+  same names and are unaffected.
 - `app.run()` parses the usual flags and runs the supervisor, and
   `app.run(configuration:)` serves a `ServerConfig` instead, checked the way
   the command line is. `onWorkerStart` hooks run in each worker before it

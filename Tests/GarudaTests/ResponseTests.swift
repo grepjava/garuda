@@ -54,7 +54,7 @@ private func typedApp() -> Application {
         throw Broken()
     }
     app.post("/decode") { request, response in
-        let user = try request.withBody { try JSON.decode(User.self, from: $0) }
+        let user = try request.withBody { try JSONCoder.decode(User.self, from: $0) }
         try response.send(status: .created, json: user)
     }
     return app

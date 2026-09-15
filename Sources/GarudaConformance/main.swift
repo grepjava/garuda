@@ -80,7 +80,7 @@ func hexDigit(_ b: UInt8) -> UInt8? {
     }
 }
 
-struct JSON {
+struct JSONOut {
     var bytes: [UInt8] = []
 
     mutating func raw(_ s: StaticString) {
@@ -127,7 +127,7 @@ func methodName(_ method: HTTPMethod) -> StaticString {
     }
 }
 
-extension JSON {
+extension JSONOut {
     mutating func string(_ span: Span<UInt8>) {
         span.withUnsafeBufferPointer { buffer in
             let empty: StaticString = ""
@@ -175,7 +175,7 @@ app.post("/echo") { request, response in
 }
 
 app.get("/headers") { request, response in
-    var json = JSON()
+    var json = JSONOut()
     json.raw("{\"method\":")
     json.string(methodName(request.method))
     json.raw(",\"path\":")

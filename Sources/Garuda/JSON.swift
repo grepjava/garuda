@@ -3,7 +3,7 @@
 //
 // `Encodable` and `Decodable` are in the standard library, but `JSONEncoder`
 // and `JSONDecoder` are Foundation, which Garuda does not link. So the coder
-// is here: `JSON.encode` writes a value's bytes, and `JSON.decode` reads a
+// is here: `JSONCoder.encode` writes a value's bytes, and `JSONCoder.decode` reads a
 // type straight out of the request's bytes, without building a dictionary of
 // everything first (JSONDecoding.swift).
 //
@@ -20,7 +20,7 @@ import GarudaCore
 public enum JSONError: Error, Equatable {
     /// The bytes are not JSON, at this offset.
     case syntax(offset: Int)
-    /// More than `JSON.depthLimit` objects and arrays deep.
+    /// More than `JSONCoder.depthLimit` objects and arrays deep.
     case depthExceeded(offset: Int)
     /// A complete value, and then more bytes.
     case trailingBytes(offset: Int)
@@ -36,7 +36,7 @@ public enum JSONError: Error, Equatable {
     case invalidValue(path: String, reason: String)
 }
 
-public enum JSON {
+public enum JSONCoder {
     /// How deeply objects and arrays may nest, reading or writing. Deep
     /// nesting is a cheap way to make a parser recurse until it dies, so it
     /// is bounded rather than trusted.
@@ -93,7 +93,7 @@ final class JSONWriter {
     /// level its own elements are written at.
     @discardableResult
     func begin(_ kind: Kind, level: Int, key: String?) -> Int {
-        guard open.count < JSON.depthLimit else {
+        guard open.count < JSONCoder.depthLimit else {
             record(.depthExceeded(offset: buffer.readableBytes))
             return level
         }

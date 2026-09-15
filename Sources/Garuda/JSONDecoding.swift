@@ -6,13 +6,13 @@
 // by walking that object's members, so nothing is copied into a dictionary
 // first and a request body costs only what the handler reads out of it.
 //
-// Scanning recurses, so it is bounded by `JSON.depthLimit`: the check is the
+// Scanning recurses, so it is bounded by `JSONCoder.depthLimit`: the check is the
 // only thing standing between a hostile body and the stack.
 //===----------------------------------------------------------------------===//
 
 import GarudaCore
 
-extension JSON {
+extension JSONCoder {
     /// Reads `type` out of a JSON document.
     public static func decode<T: Decodable>(_ type: T.Type = T.self, from bytes: [UInt8]) throws -> T {
         try bytes.withUnsafeBufferPointer { try decode(type, from: $0.baseAddress, count: $0.count) }
@@ -69,7 +69,7 @@ struct JSONScanner {
     /// Advances past one complete value. Recursion is bounded by the depth
     /// limit, which is what keeps a nested document off the stack.
     mutating func skipValue(depth: Int = 0) throws {
-        guard depth < JSON.depthLimit else { throw JSONError.depthExceeded(offset: index) }
+        guard depth < JSONCoder.depthLimit else { throw JSONError.depthExceeded(offset: index) }
         skipWhitespace()
         guard index < count else { throw JSONError.syntax(offset: index) }
         switch base[index] {

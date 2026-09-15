@@ -2,7 +2,7 @@ import Testing
 @testable import Garuda
 
 private func text(_ value: some Encodable) throws -> String {
-    String(decoding: try JSON.encode(value), as: UTF8.self)
+    String(decoding: try JSONCoder.encode(value), as: UTF8.self)
 }
 
 private struct Author: Codable, Equatable {
@@ -94,19 +94,19 @@ struct JSONEncodingTests {
     }
 
     @Test func aNumberThatIsNotOneIsRefused() throws {
-        #expect(throws: JSONError.self) { try JSON.encode(Double.infinity) }
-        #expect(throws: JSONError.self) { try JSON.encode(Double.nan) }
-        #expect(throws: JSONError.self) { try JSON.encode(["x": -Double.infinity]) }
+        #expect(throws: JSONError.self) { try JSONCoder.encode(Double.infinity) }
+        #expect(throws: JSONError.self) { try JSONCoder.encode(Double.nan) }
+        #expect(throws: JSONError.self) { try JSONCoder.encode(["x": -Double.infinity]) }
     }
 
     @Test func nestingPastTheLimitIsRefused() throws {
-        #expect(throws: Never.self) { try JSON.encode(Nest(depth: JSON.depthLimit - 2)) }
-        #expect(throws: JSONError.self) { try JSON.encode(Nest(depth: JSON.depthLimit + 8)) }
+        #expect(throws: Never.self) { try JSONCoder.encode(Nest(depth: JSONCoder.depthLimit - 2)) }
+        #expect(throws: JSONError.self) { try JSONCoder.encode(Nest(depth: JSONCoder.depthLimit + 8)) }
     }
 }
 
 private func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
-    try JSON.decode(type, from: Array(json.utf8))
+    try JSONCoder.decode(type, from: Array(json.utf8))
 }
 
 @Suite("JSON decoding")
@@ -115,12 +115,12 @@ struct JSONDecodingTests {
         let article = Article(title: "Garuda", words: 900, draft: false, rating: 4.5,
                               author: Author(name: "Ada", age: 36),
                               tags: ["swift", "http"], note: "kept")
-        let bytes = try JSON.encode(article)
-        #expect(try JSON.decode(Article.self, from: bytes) == article)
+        let bytes = try JSONCoder.encode(article)
+        #expect(try JSONCoder.decode(Article.self, from: bytes) == article)
 
         let withoutNote = Article(title: "T", words: 1, draft: true, rating: 0,
                                   author: Author(name: "B", age: 1), tags: [], note: nil)
-        #expect(try JSON.decode(Article.self, from: JSON.encode(withoutNote)) == withoutNote)
+        #expect(try JSONCoder.decode(Article.self, from: JSONCoder.encode(withoutNote)) == withoutNote)
     }
 
     @Test func scalarsAndCollectionsDecodeOnTheirOwn() throws {
@@ -145,7 +145,7 @@ struct JSONDecodingTests {
     @Test func aBodyIsReadStraightFromLentBytes() throws {
         let bytes = Array(#"{"name":"Ada","age":36}"#.utf8)
         let author = try bytes.withUnsafeBufferPointer { buffer in
-            try JSON.decode(Author.self, from: buffer.span)
+            try JSONCoder.decode(Author.self, from: buffer.span)
         }
         #expect(author == Author(name: "Ada", age: 36))
     }
@@ -203,7 +203,7 @@ struct JSONDecodingTests {
             #expect(throws: JSONError.self, "\(json)") { try decode(Int.self, json) }
         }
         // A control character may not appear raw inside a string.
-        #expect(throws: JSONError.self) { try JSON.decode(String.self, from: [0x22, 0x01, 0x22]) }
+        #expect(throws: JSONError.self) { try JSONCoder.decode(String.self, from: [0x22, 0x01, 0x22]) }
     }
 
     @Test func aSecondValueAfterTheFirstIsRefused() throws {
@@ -214,11 +214,11 @@ struct JSONDecodingTests {
     }
 
     @Test func nestingPastTheLimitIsRefused() throws {
-        let deep = String(repeating: "[", count: JSON.depthLimit + 8)
-            + String(repeating: "]", count: JSON.depthLimit + 8)
+        let deep = String(repeating: "[", count: JSONCoder.depthLimit + 8)
+            + String(repeating: "]", count: JSONCoder.depthLimit + 8)
         #expect(throws: JSONError.self) { try decode([Int].self, deep) }
         let shallow = String(repeating: "[", count: 8) + String(repeating: "]", count: 8)
-        #expect(throws: Never.self) { try JSON.decode([[[[[[[[Int]]]]]]]].self,
+        #expect(throws: Never.self) { try JSONCoder.decode([[[[[[[[Int]]]]]]]].self,
                                                       from: Array(shallow.utf8)) }
     }
 }

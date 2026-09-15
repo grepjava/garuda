@@ -17,13 +17,14 @@
 Garuda was forked from Peregrine, a Python ASGI/WSGI server. The engine was
 kept. CPython, ASGI, WSGI and the Python package were removed.
 
-**Status: the handler API is early and will change.** Its first phase is in
-the tree: routes, a request view with its headers and whole body, one-shot
-responses and a timer continuation. Handlers are synchronous, and there is no
-typed extraction, JSON, middleware, streaming, WebSocket or WebTransport
-handler yet. It is useful for evaluating the engine: its protocols, TLS,
-operational behaviour and raw throughput. It is not yet a stable way to serve
-your own application. [HANDLER-API.md](HANDLER-API.md) holds the design and
+**Status: the handler API is early and will change.** In the tree: routes, a
+request view with its headers and whole body, one-shot responses, a timer
+continuation, Garuda's own JSON coder, typed answers and errors, and typed
+extraction of path parameters, query strings and JSON bodies. Handlers are
+still synchronous, and there is no application state, middleware, streaming,
+WebSocket or WebTransport handler yet. It is useful for evaluating the engine:
+its protocols, TLS, operational behaviour and raw throughput. It is not yet a
+stable way to serve your own application. [HANDLER-API.md](HANDLER-API.md) holds the design and
 roadmap, and [GARUDA.md](GARUDA.md) is the authoritative status document.
 
 ```bash
@@ -81,7 +82,21 @@ exit(app.run())
   `HTTPError(.conflict, "the name is taken")` for 409 and
   `{"error":"the name is taken"}`. `JSONError` conforms, so a malformed body
   is a 400 that says which key. Anything else thrown is a 500 and a log line.
-- **`JSON.encode` and `JSON.decode`** are Garuda's own coder, over the standard
+- **Typed handlers** declare what they need and return what they mean:
+
+  ```swift
+  app.get("/person/:id") { (id: Path<Int>) in JSON(Person(id: id.value, name: "Ada")) }
+  app.get("/search")     { (query: Query<Search>) in JSON(query.value) }
+  app.post("/people")    { (body: Body<NewPerson>) in JSON(body.value, status: .created) }
+  ```
+
+  `Path` takes the next path parameter percent-decoded, `Query` decodes the
+  whole query string into a type (a repeated name is a list, `+` is a space),
+  and `Body` decodes the JSON body. A handler may take none, one or several.
+  Returning `JSON`, `HTML`, `Text`, `Bytes`, `Redirect`, a `String`, a status —
+  or an Optional whose `nil` is a 404 — writes the response. Anything that
+  will not decode is one consistent 400 saying what was wrong.
+- **`JSONCoder.encode` and `JSONCoder.decode`** are Garuda's own coder, over the standard
   library's `Encodable` and `Decodable` — `JSONEncoder` and `JSONDecoder` are
   Foundation, which Garuda does not link. Decoding reads only the keys a type
   asks for, straight from the bytes the request lent it. The typed extraction
@@ -101,8 +116,8 @@ a declared `Content-Length`. A handler that throws, or returns without
 answering or waiting, gets a 500.
 
 The API is not stable. Handlers are synchronous, and suspension is only the
-timer continuation. There is no typed extraction, JSON, middleware, 405,
-streaming, WebSocket or WebTransport handler yet.
+timer continuation. There is no application state, middleware, 405, streaming,
+WebSocket or WebTransport handler yet.
 [HANDLER-API.md](HANDLER-API.md) has the roadmap.
 
 ### What the binary serves
@@ -381,7 +396,7 @@ reads the forwarded client and scheme as `request.remoteAddress`,
 Unit tests, including the fuzz corpus:
 
 ```bash
-swift test                                   # 240 tests
+swift test                                   # 248 tests
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 

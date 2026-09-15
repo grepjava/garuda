@@ -78,7 +78,7 @@ extension JSONError: ResponseError {
         case .syntax(let offset):
             return "the body is not JSON, at byte \(offset)"
         case .depthExceeded(let offset):
-            return "the body nests deeper than \(JSON.depthLimit), at byte \(offset)"
+            return "the body nests deeper than \(JSONCoder.depthLimit), at byte \(offset)"
         case .trailingBytes(let offset):
             return "the body has more after the JSON value, at byte \(offset)"
         case .typeMismatch(let path, let expected):

@@ -42,7 +42,7 @@ public struct TestResponse {
 
     /// The body read as `type`, for an answer that is JSON.
     public func json<T: Decodable>(_ type: T.Type = T.self) throws -> T {
-        try JSON.decode(type, from: body)
+        try JSONCoder.decode(type, from: body)
     }
 }
 
