@@ -44,36 +44,42 @@ the-benchmarker/web-frameworks, published dataset of 2026-09-13, 16 CPUs, 512 co
 - Vapor: 88,435; Hummingbird: 82,488;
 - the top 15 in any language: 147k–176k.
 
-The realistic target stays the top tier, level with Bun, and clearly ahead of today's Swift frameworks. Hello-world will not set a runaway record: every fast server there is already close to the kernel's floor.
+The target is axum, in speed and in usability: level with Bun at least, and clearly ahead of today's Swift frameworks. The first quick comparison has Garuda at 1.95× axum on the suite's ramp and 1.72× on one pinned core ([BENCHMARKS.md](BENCHMARKS.md#against-axum-quick-comparison)). Hello-world will not set a runaway record: every fast server there is already close to the kernel's floor.
 
 ## What is not true yet
 
 - **TLS is not pure Swift.** TCP TLS is OpenSSL (`Sources/CGaruda/garuda_tls.c`). The QUIC handshake is built in Swift from OpenSSL's crypto primitives (`garuda_crypto.c`).
-- **The public handler API is still thin.** Sync routes and a timer-backed `GET /delay/:ms` sit on the continuation substrate (`AsyncOps.swift`). There is no middleware, no request-view type, and no client I/O helpers yet. Router routes answer alike over HTTP/1.1, HTTP/2 and HTTP/3: `/user/:id` with its body, `/delay/:ms` after its timer, and a stream cancelled while it waits takes its timer with it (`scripts/router-streams-test.py`).
-- **WebSocket and WebTransport application APIs are stubs** until Swift handlers exist. HTTP/3 still advertises extended CONNECT and WebTransport in its SETTINGS; a CONNECT is refused with 501.
-- **Some flags have nothing to act on.** `--request-start-header` is parsed and never read. `--compress` has no response to compress (router responses carry no content type, static files are served pre-compressed or not at all), and `--cache-size` never stores one.
+- **The public handler API is early.** `Routes`, a `~Copyable` `Request` view and a one-shot `Response` serve the benchmark contract and `garuda-conformance` alike over HTTP/1.1, HTTP/2 and HTTP/3. Handlers are synchronous and suspend only through `response.after(milliseconds:)`; borrowed byte views can still be kept past the request; there is no typed extraction, JSON, application state, middleware, 405 or streaming yet. A stream cancelled while its handler waits takes the timer with it (`scripts/router-streams-test.py`). [HANDLER-API.md](HANDLER-API.md) has the roadmap.
+- **WebSocket and WebTransport application APIs are stubs** until handlers for them exist. HTTP/3 still advertises extended CONNECT and WebTransport in its SETTINGS; a CONNECT is refused with 501.
+- **Some flags have nothing to act on.** `--compress` has no response to compress (the response sink does not compress yet, and static files are served pre-compressed or not at all), and `--cache-size` never stores one. Both arrive with streaming responses.
 - **`--reload` watches the executable, not the sources.** A rebuild (`swift build` in another terminal) has the supervisor exec the new file with its listening sockets kept open, then replace the workers one slot at a time, so no connection is dropped (`scripts/reload-test.sh` rebuilds under load). A changed `--tls-cert` or `--tls-key` replaces the workers without an exec. Nothing builds for you.
 
 ## Coverage waiting on the handler API
 
-The proposed API, and the phase that brings back each line below, is in [HANDLER-API.md](HANDLER-API.md).
+The roadmap step that brings back each line below is in [HANDLER-API.md](HANDLER-API.md#roadmap).
 
-235 end-to-end checks went with CPython, because they needed an application to answer. The engine features they covered are still in the binary, untested end to end until a handler can produce what each test needs. Each line is a capability a handler needs, and the tests that capability brings back:
+235 end-to-end checks went with CPython, because they needed an application to answer. The engine features they covered stayed in the binary, untested end to end until a handler could produce what each test needs.
 
-- **Echo the request body.** Body framing delivered byte for byte: Content-Length, chunked, pipelined, 100-continue, 1 MiB. HTTP/2 and HTTP/3 bodies larger than a frame or a window, and drip-fed ones arriving in order. Request-body backpressure, delivery in pieces, answering before an upload finishes and draining the rest, a TLS round trip.
-- **Read request headers, client address and scheme.** The request ID handed to the handler: the client's replaced, a trusted proxy's kept, untouched without the flag, over HTTP/1.1 and HTTP/2. `traceparent` passed through unchanged. `X-Request-Start` stamping. Underscore header names dropped. `X-Forwarded-For` and `Forwarded`. The https scheme, HTTP version and authority on HTTP/2 and HTTP/3, and the full set of headers received.
-- **See cancellation.** A reset HTTP/2 or HTTP/3 stream stopping the handler's work, not only a parked timer.
-- **Set status and headers.** 204 and 304 framing and keep-alive after them. A handler's Content-Length not duplicated. A handler's own `X-Request-ID`, `Strict-Transport-Security` and `Alt-Svc` kept, not doubled. A declared Content-Length enforced against a body longer or shorter: cut to length, or the stream reset.
-- **Large and streamed bodies.** Chunked framing for a stream, bodies with no declared length on HTTP/2 and HTTP/3, large writes under flow control, a window update arriving mid-response, write backpressure and memory under a slow client. `--compress`: codec choice, Content-Length removal, Vary, weak ETag, no-transform, event streams, flushing pieces, the small-body exemption, HTTP/1.0 close framing, HTTP/2.
-- **Cacheable responses.** `--cache-size`: store, hit, HEAD from a GET, 304 revalidation, retirement on unsafe methods, Age and TTL, credentials and no-cache kept out, flush on reload, hit metrics.
-- **Errors and lifecycle.** 500 when a handler throws, with the connection surviving. Start-up and shutdown hooks and their ordering after requests drain. A signal during slow start-up. Bounded shutdown against a handler that ignores cancellation. A blocking handler stalling a worker, with `X-Request-Start` taken at kernel arrival.
-- **WebSocket and WebTransport handlers.** Handshake, framing, UTF-8 checks, size limits, pings and timeouts, control frames while the handler is busy, `--ws-compress`. WebTransport sessions, streams, datagrams, close capsules.
-- **A logging API.** Level applied to handler records, level mapping, multi-line records.
+**Brought back by phase 1**, in `scripts/handler-test.py` against `garuda-conformance`, 107 checks:
+
+- **Echo the request body, buffered.** Content-Length, chunked with a trailer section, pipelined, 100-continue, 1 MiB either way, a body far larger than a TLS record. HTTP/2 and HTTP/3 bodies larger than a frame or a window, and drip-fed ones arriving in order.
+- **Read request headers, client address and scheme.** The request ID handed to the handler: the client's replaced, a trusted proxy's kept, untouched without the flag, over HTTP/1.1 and HTTP/2. `traceparent` passed through unchanged. `X-Request-Start` stamping, including a request queued behind a blocking handler. `X-Forwarded-For` and `Forwarded`, with trusted-hop walking. The https scheme, HTTP version and authority on HTTP/2 and HTTP/3, and the full set of headers received. (Dropping underscore header names is retired: it guarded CGI-style environments, where `X-Foo` and `X_Foo` collide; a handler reads header names as they were sent.)
+- **Set status and headers.** 204 and 304 framing and keep-alive after them. A handler's Content-Length not duplicated. A handler's own `X-Request-ID`, `Strict-Transport-Security` and `Alt-Svc` kept, not doubled. A declared Content-Length enforced against a body longer or shorter: cut to length, or the stream reset or the connection closed.
+- **Errors and lifecycle.** 500 when a handler throws, with the connection surviving. Start-up hooks once per worker, and the shutdown hook after in-flight requests drain. SIGTERM and SIGINT during a slow start-up hook. Bounded shutdown against a handler that never answers and against a shutdown hook that never returns.
+
+**Still waiting**, each line a capability a handler needs and the tests it brings back:
+
+- **Stream the request body** (step 5). Request-body backpressure, delivery in pieces, answering before an upload finishes and draining the rest.
+- **See cancellation** (step 3). A reset HTTP/2 or HTTP/3 stream stopping the handler's work, not only a parked timer.
+- **Large and streamed responses** (step 5). Chunked framing for a stream, bodies with no declared length on HTTP/2 and HTTP/3, large writes under flow control, a window update arriving mid-response, write backpressure and memory under a slow client. `--compress`: codec choice, Content-Length removal, Vary, weak ETag, no-transform, event streams, flushing pieces, the small-body exemption, HTTP/1.0 close framing, HTTP/2.
+- **Cacheable responses** (step 5). `--cache-size`: store, hit, HEAD from a GET, 304 revalidation, retirement on unsafe methods, Age and TTL, credentials and no-cache kept out, flush on reload, hit metrics.
+- **WebSocket and WebTransport handlers** (step 5). Handshake, framing, UTF-8 checks, size limits, pings and timeouts, control frames while the handler is busy, `--ws-compress`. WebTransport sessions, streams, datagrams, close capsules.
+- **A logging API** (step 4). Level applied to handler records, level mapping, multi-line records.
 
 ## First steps
 
 1. **Measure the pure-Swift ceiling with no new code.** Done, 2026-09-14. `--health-check-path /` on the then-current engine, suite zrk at 64 / 256 / 512 next to Elysia, CPU split as in the table above. Swift user time is already Bun's; see those figures.
-2. **Build a synchronous router spike at that dispatch seam.** Done. `Sources/GarudaServer/Router.swift` matches method and path bytes at `Worker.dispatch` after health-check, rate-limit, static, compress, and cache. Contract:
+2. **Build a synchronous router spike at that dispatch seam.** Done, then replaced. The spike, `Router.swift`, matched method and path bytes at `Worker.dispatch` after health-check, rate-limit, static, compress, and cache. Phase 1 of the handler API now answers the same contract through `Routes` at the same seam; in the same session, suite zrk at 64 connections, four workers, the spike at 0e0cbbc served 350,161 requests a second and the handler API 343,334, 2% less. Contract:
    - `GET /` → 200, empty body
    - `GET /user/:id` → 200, the id bytes as the body
    - `POST /user` → 200, empty body
@@ -91,7 +97,7 @@ The proposed API, and the phase that brings back each line below, is in [HANDLER
 
 ### Async architecture (step 4)
 
-Principle: **do not require a scheduling handoff before useful work.** Sync `respondRoute` stays a normal call. Suspension is opt-in via worker-owned continuations and pooled ops — not `Task` / Tokio-style spawn.
+Principle: **do not require a scheduling handoff before useful work.** A handler that finishes synchronously stays a normal call from `dispatchRoute`. Suspension is opt-in via worker-owned continuations and pooled ops — not `Task` / Tokio-style spawn.
 
 - **Sync is the ordinary path.** A handler that can finish does so inline. `GET /` allocates no op.
 - **Worker-owned request continuations + pooled operation records.** Uncommon wait state lives in `AsyncOps`, not a fat enum on every `Connection` slot.

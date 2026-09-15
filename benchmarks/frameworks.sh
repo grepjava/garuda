@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# garuda's router, the-benchmarker/web-frameworks' Hummingbird and Vapor
-# entries, and Elysia on Bun as a reference, under the load command of that
-# suite at 4bb9eaa (develop, 2026-09-13). The results are not comparable with
-# the figures that site publishes; BENCHMARKS.md says why.
+# garuda, the-benchmarker/web-frameworks' axum, Hummingbird and Vapor entries,
+# and Elysia on Bun as a reference, under the load command of that suite at
+# 4bb9eaa (develop, 2026-09-13). The results are not comparable with the
+# figures that site publishes; BENCHMARKS.md says why.
 #
 #   bash benchmarks/frameworks.sh > results.tsv
+#   FRAMEWORKS="swift rust" SERVERS="garuda axum" WORKERS=4 AGG=mean bash benchmarks/frameworks.sh
 #   FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 AGG=mean bash benchmarks/frameworks.sh
 #   LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
 #
@@ -27,12 +28,15 @@
 # PIN="0:1-3" runs the server on CPU 0 and the load generator on CPUs 1-3, so
 # the two do not take turns on a core; it applies to either load. SwiftNIO
 # sizes its event loops from the CPU count, not the affinity mask, so a pinned
-# Hummingbird or Vapor runs one loop per CPU on the one core it is given.
+# Hummingbird or Vapor runs one loop per CPU on the one core it is given. Tokio
+# sizes its runtime from std::thread::available_parallelism, which reads the
+# affinity mask, so a pinned axum runs one worker thread.
 #
 # Differences from upstream; BENCHMARKS.md lists them all:
 #   WORKERS=1  upstream starts every server with $(nproc) workers. WORKERS is
 #              garuda's and Elysia's; Hummingbird and Vapor are one process
-#              with SwiftNIO's default of an event loop per CPU.
+#              with SwiftNIO's default of an event loop per CPU, and axum one
+#              process with Tokio's default of a worker thread per CPU.
 #   RUNS=3     upstream's published figures are means of three runs. Each level
 #              here runs three times and, by default, the median by
 #              achieved_rate is kept (AGG=mean for upstream's way).
@@ -51,6 +55,10 @@ GARUDA=${GARUDA:-$ROOT/.build/release/garuda}
 #   swift build -c release -Xswiftc -enforce-exclusivity=unchecked
 HUMMINGBIRD=${HUMMINGBIRD:-$HOME/swiftbench/hummingbird-framework/.build/release/server}
 VAPOR=${VAPOR:-$HOME/swiftbench/vapor-framework/.build/release/server}
+# The suite's rust/axum entry (benchmarks/axum/, byte for byte), built as
+# rust/Dockerfile builds it; built on first use when AXUM is not given.
+AXUM=${AXUM:-$ROOT/benchmarks/axum/target/release/server}
+CARGO=${CARGO:-$(command -v cargo || echo "$HOME/.cargo/bin/cargo")}
 ZRK=${ZRK:-zrk}
 OHA=${OHA:-oha}
 LOAD=${LOAD:-ramp}
@@ -63,11 +71,14 @@ RUNS=${RUNS:-3}
 # upstream publishes.
 AGG=${AGG:-median}
 DURATION=${DURATION:-15s}
+# The warm-up before the first level; upstream runs 5s.
+WARMUP=${WARMUP:-5s}
 # zrk's open-loop ramp, requests a second from start to end of a run. Upstream
 # raised the end from 100,000 to 500,000 at 4bb9eaa; the old figure capped a
 # run at about 96,500 req/s.
 RATE=${RATE:-1000:500000}
 # swift: garuda, hummingbird and vapor answer the contract natively.
+# rust: axum, which listens on 0.0.0.0:3000 itself, so PORT must be 3000.
 # elysia: upstream's javascript/elysia-bun (benchmarks/elysia-bun/, byte for
 # byte), which listens on 3000 itself, so PORT must be 3000. Needs bun on PATH
 # or in ~/.bun.
@@ -108,6 +119,16 @@ start() {
     vapor)
         SERVER_HOSTNAME=127.0.0.1 SERVER_PORT=$PORT VAPOR_ENV=production \
             server_start "${PIN_SERVER[@]}" "$VAPOR" serve ;;
+    axum)
+        [ "$PORT" = 3000 ] || { echo "axum listens on 3000; PORT=$PORT"; return 1; }
+        if [ ! -x "$AXUM" ]; then
+            # rust/Dockerfile's build command; the profile repeats Cargo.toml's.
+            (cd "$ROOT/benchmarks/axum" && "$CARGO" build --release \
+                --config 'profile.release.lto=true' \
+                --config 'profile.release.panic="abort"' \
+                --config 'profile.release.codegen-units=1') || return 1
+        fi
+        server_start "${PIN_SERVER[@]}" "$AXUM" ;;
     elysia-bun)
         # Upstream runs cluster.ts, which spawns one `bun ./app.ts` per CPU.
         # One worker is app.ts itself; cluster.ts only when WORKERS is every CPU.
@@ -134,9 +155,9 @@ start() {
 
 warm_up() {
     if [ "$LOAD" = closed ]; then
-        "${PIN_LOAD[@]}" "$OHA" -z 5s -c 50 --no-tui "$URL" > /dev/null 2>&1
+        "${PIN_LOAD[@]}" "$OHA" -z "$WARMUP" -c 50 --no-tui "$URL" > /dev/null 2>&1
     else
-        "${PIN_LOAD[@]}" "$ZRK" -c 50 -d 5s --plain "$URL" > /dev/null 2>&1
+        "${PIN_LOAD[@]}" "$ZRK" -c 50 -d "$WARMUP" --plain "$URL" > /dev/null 2>&1
     fi
 }
 
@@ -187,10 +208,9 @@ PY
 printf 'framework\tserver\tworkers\tconnections\treq/s p50_ms p75_ms p90_ms p99_ms errors\truns\n'
 for framework in $FRAMEWORKS; do
     for server in $SERVERS; do
-        # Elysia is its own server, and the Swift servers answer only the
-        # Swift contract.
+        # Each framework pairs only with its own servers.
         case "$framework:$server" in
-        swift:garuda|swift:hummingbird|swift:vapor|elysia:elysia-bun) ;;
+        swift:garuda|swift:hummingbird|swift:vapor|rust:axum|elysia:elysia-bun) ;;
         *) continue ;;
         esac
         server_stop

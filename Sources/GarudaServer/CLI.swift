@@ -173,14 +173,14 @@ public enum GarudaCLI {
               --compress               compress handler responses (br, zstd or gzip,
                                        as the client accepts) when their type is
                                        text-like; read CONFIG.md about BREACH first
-                                       (router responses have no type to compress yet)
+                                       (handler responses are not compressed yet)
               --compress-min-size N    leave bodies declared smaller than this as they
                                        are (default 1024)
               --compress-static        serve FILE.br, FILE.zst or FILE.gz beside a
                                        --static-dir file to clients that accept it
               --request-start-header   give handlers X-Request-Start: t=<usec> for
                                        when the request arrived, for APM agents that
-                                       report queue time (no handler reads it yet)
+                                       report queue time
               --request-id             give every request an X-Request-ID, echoed on
                                        the response and in the access log; one from a
                                        --forwarded-allow-ips proxy is kept

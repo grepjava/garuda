@@ -26,11 +26,12 @@ hand, not on push. It builds `swift build -c release --product garuda` and runs
 and on macOS 15 with the newest installed Xcode, and fuzzes the parsers with
 `pgfuzz` for 60 s under AddressSanitizer. The end-to-end scripts are not in
 CI. Run them against the release build; each takes the binary's path as its
-first argument, defaulting to `.build/release/garuda`:
+first argument, defaulting to `.build/release/garuda`
+(`.build/release/garuda-conformance` for `handler-test.py`):
 
 ```bash
 swift build -c release
-swift test                             # 187 unit tests
+swift test                             # 193 unit tests
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
 bash scripts/sni-test.sh               # 11
@@ -46,11 +47,12 @@ python3 scripts/feature-test.py        # 62
 python3 scripts/http2-test.py          # 50
 python3 scripts/http3-test.py          # 53
 python3 scripts/router-streams-test.py # 41
+python3 scripts/handler-test.py        # 107
 bash scripts/cache-unit-test.sh
 ```
 
 The scripts need curl and openssl, and python3 with the client libraries the
-Python scripts import (`h2` for HTTP/2).
+Python scripts import (`h2` for HTTP/2, `aioquic` for HTTP/3).
 
 ---
 
@@ -65,20 +67,37 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   and the Swift runtime, not `libpython`. There are no wheels and no
   `pip install`.
 
-### A built-in router
+### A handler API, first phase
 
-- A synchronous Swift router answers at the engine's dispatch seam, after the
-  health check, rate limit, static files, compression and cache:
+- The library product `Garuda` has a public handler API, early and still
+  changing ([HANDLER-API.md](HANDLER-API.md)). `Routes` registers handlers by
+  method and pattern (literal, `:param` and trailing `*rest` segments, at most
+  8 parameters), compiled into a byte trie at start-up; HEAD falls back to GET.
+  A `~Copyable` `Request` gives the method, path, query, parameters, version,
+  scheme, authority, headers, the whole body, the client with
+  `--forwarded-allow-ips` applied, the request ID, the request start and
+  `locals`. A `~Copyable` `Response` sets a status and headers, sends, or waits
+  with `after(milliseconds:then:)`. `Garuda.serve(routes, onStart:,
+  onShutdown:)` parses the usual flags and runs the supervisor; `onStart` runs
+  in each worker before it reports ready, and `onShutdown` after its loop ends.
+- Every handler response goes through one response sink. It frames 204, 304
+  and HEAD, adds the server's own headers unless the handler set its own
+  `X-Request-ID`, `Strict-Transport-Security` or `Alt-Svc`, and holds the body
+  to a declared `Content-Length`. A handler that throws, or returns without
+  answering, gets a 500.
+- The `garuda` binary serves the-benchmarker's contract through that API:
   `GET /` → 200, empty body; `GET /user/:id` → 200, the id as the body;
   `POST /user` → 200, empty body; `GET /delay/:ms` → 200 after a timer. HEAD is
-  answered wherever GET is; anything else is 404. There is no public handler
-  API yet.
+  answered wherever GET is; anything else is 404. The hand-written router
+  (`Router.swift`) is gone.
+- `--request-start-header` is read by handlers as `request.requestStart`, and
+  `--scheme` is the scheme `request.scheme` falls back to.
 - Waiting work runs on a worker-owned async substrate: request continuations
   and pooled operation records, a timer heap and a worker-local ready queue,
   with no scheduling hop before a response that can finish at once. `GET /`
   allocates no operation. Timer deadlines come from the precise clock, so a
   delay never resumes early.
-- Router routes answer alike over HTTP/1.1, HTTP/2 and HTTP/3: `/user/:id` with
+- Routes answer alike over HTTP/1.1, HTTP/2 and HTTP/3: `/user/:id` with
   its body, `/delay/:ms` after its timer. A stream cancelled while it waits
   takes its timer with it.
 
@@ -99,8 +118,12 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
 
 - WebSocket and WebTransport application APIs are stubs. HTTP/3 still
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
-- `--request-start-header` is parsed and never read. `--compress` and
-  `--cache-size` have no router response to act on.
+- The handler API's later steps: borrowed byte views can still be kept past
+  the request, handlers are synchronous with only the timer continuation to
+  suspend on, and there is no typed extraction, JSON, middleware, 405,
+  streaming response, or WebSocket or WebTransport handler.
+- `--compress` and `--cache-size` act on no handler response; they wait for
+  streaming responses.
 - TLS is OpenSSL, not Swift.
 
 ### Tests
@@ -109,6 +132,12 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   test a Python application are retired. The 235 checks that went with CPython
   are listed in [GARUDA.md](GARUDA.md), by the handler capability that would
   bring them back.
+- `scripts/handler-test.py` covers the handler API end to end: request bodies
+  over HTTP/1.1, HTTP/2 and HTTP/3, request headers, client, scheme, request
+  IDs and `X-Request-Start`, response framing and server-header merging,
+  errors and lifecycle hooks. It runs a second executable,
+  `garuda-conformance`, whose routes exist only to make engine behaviour
+  observable to the tests.
 
 ### Documentation
 
@@ -118,6 +147,12 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   99,706 and 60,411 / 58,946 / 60,837. `benchmarks/frameworks.sh` gains
   `FRAMEWORKS=swift` with the `garuda`, `hummingbird` and `vapor` servers.
   Peregrine's figures move to a historical section.
+- `benchmarks/frameworks.sh` runs the suite's `rust/axum` entry, copied byte
+  for byte into `benchmarks/axum/` and built with `cargo` on first use
+  (`FRAMEWORKS="swift rust" SERVERS="garuda axum"`), and gains `WARMUP`
+  (default 5s). `benchmarks/vs-axum.sh` compares Garuda with axum in under two
+  minutes at 64 connections: the ramp for 15 s, closed loop for 10 s, and
+  pinned to one core for 10 s, one run each.
 
 ---
 

@@ -17,11 +17,14 @@
 Garuda was forked from Peregrine, a Python ASGI/WSGI server. The engine was
 kept. CPython, ASGI, WSGI and the Python package were removed.
 
-**Status: there is no public handler API yet.** It is being designed. Today the
-binary answers with a small built-in router, so it is useful for evaluating
-the engine: its protocols, TLS, operational behaviour and raw throughput. It
-is not yet a way to serve your own application. [GARUDA.md](GARUDA.md) is the
-authoritative status document.
+**Status: the handler API is early and will change.** Its first phase is in
+the tree: routes, a request view with its headers and whole body, one-shot
+responses and a timer continuation. Handlers are synchronous, and there is no
+typed extraction, JSON, middleware, streaming, WebSocket or WebTransport
+handler yet. It is useful for evaluating the engine: its protocols, TLS,
+operational behaviour and raw throughput. It is not yet a stable way to serve
+your own application. [HANDLER-API.md](HANDLER-API.md) holds the design and
+roadmap, and [GARUDA.md](GARUDA.md) is the authoritative status document.
 
 ```bash
 swift build -c release
@@ -34,10 +37,52 @@ service are in [INSTALLATION.md](INSTALLATION.md).
 
 ---
 
-## The built-in router
+## The handler API
 
-`Sources/GarudaServer/Router.swift` matches the method and path at the
-dispatch seam and writes the response straight into the connection:
+The library product `Garuda` (the `GarudaServer` target) takes routes and
+serves them with the same command-line flags as the `garuda` binary:
+
+```swift
+import Glibc                // Darwin on macOS, for exit
+import GarudaServer
+
+var routes = Routes()
+routes.get("/user/:id") { request, response in
+    response.send(request.parameter(0))
+}
+exit(Garuda.serve(routes))
+```
+
+- **Routes** are registered with `get`, `head`, `post`, `put`, `delete`,
+  `patch`, `options` or `on`. A pattern segment is a literal, a `:param`, or a
+  trailing `*rest`, with at most 8 parameters. The table is compiled into a
+  byte trie at start-up. HEAD falls back to GET.
+- **`Request`** is a `~Copyable` view of the request: `method`, `path`,
+  `query`, `parameter(i)`, `version`, `scheme`, `authority`, `header(_:)`,
+  `forEachHeader`, the whole `body`, `remoteAddress` and `remotePort` (with
+  `--forwarded-allow-ips` applied), `requestID`, `requestStart` and `locals`.
+- **`Response`** is `~Copyable` too: `status`, `addHeader`, `send(status:)`,
+  `send(status:_:)`, and `after(milliseconds:then:)`, which calls a handler
+  again after a timer.
+- **`Garuda.serve(routes, onStart:, onShutdown:)`** parses the flags and runs
+  the supervisor. `onStart` runs in each worker before it reports ready, and
+  `onShutdown` after its loop ends.
+
+Every handler response goes through one response path. It frames 204, 304 and
+HEAD responses, adds the server's headers unless the handler set its own
+`X-Request-ID`, `Strict-Transport-Security` or `Alt-Svc`, and holds the body to
+a declared `Content-Length`. A handler that throws, or returns without
+answering or waiting, gets a 500.
+
+The API is not stable. Byte views borrowed from a request can still be kept
+past it, and suspension is only the timer continuation. There is no typed
+extraction, JSON, middleware, 405, streaming, WebSocket or WebTransport handler
+yet. [HANDLER-API.md](HANDLER-API.md) has the roadmap.
+
+### What the binary serves
+
+`Sources/garuda/main.swift` serves the-benchmarker's contract through the
+handler API:
 
 | request | response |
 |---|---|
@@ -52,7 +97,7 @@ The answers are the same over HTTP/1.1, HTTP/2 and HTTP/3. A stream cancelled
 while `/delay/:ms` waits takes its timer with it. With `--root-path`, the
 prefix is taken off the path before routing.
 
-Server features that act before dispatch still apply in front of the router:
+Server features that act before dispatch still apply in front of the routes:
 `--health-check-path`, `--rate-limit`, `--static-dir`, `--redirect-http`,
 `--hsts`, `--request-id`, `--trace-context`, the access log and metrics.
 
@@ -96,13 +141,12 @@ These features are built in and covered by the end-to-end suites listed
 ### Present, but nothing to act on yet
 
 These flags are parsed and the engine code behind them exists, but nothing
-reaches that code until handlers can produce responses:
+reaches that code until a later step of the handler API:
 
-- **`--compress`**: router responses carry no content type, so nothing is
-  compressed. `--compress-static` does work.
+- **`--compress`**: handler responses are not compressed yet. That arrives
+  with streaming responses. `--compress-static` does work.
 - **`--cache-size`** (and `--cache-max-object`, `--cache-ttl-max`): the cache
-  never stores a router response.
-- **`--request-start-header`**: parsed, but never read.
+  never stores a handler response. That also arrives with streaming responses.
 - **WebSocket and WebTransport**: the engine has framing and session code but
   no application API, so the `--ws-*` options have no route to apply to.
   `--no-websockets` refuses upgrades with 501. HTTP/3 advertises extended
@@ -128,10 +172,20 @@ There were zero errors. Requests per second:
 | Vapor | 60,411 | 58,946 | 60,837 |
 
 Hummingbird and Vapor are the suite's own `swift/*-framework` entries.
-This is a hello-world route against a fixed router, so it measures what the
-server adds to a request, not what an application built on it will do. Figures
-from different sessions on this machine move by tens of percent. Compare rows
-within one table.
+This is a hello-world route, measured on the built-in router that the handler
+API has since replaced, so it measures what the server adds to a request, not
+what an application built on it will do. Figures from different sessions on
+this machine move by tens of percent. Compare rows within one table.
+
+`benchmarks/frameworks.sh` also runs the suite's `rust/axum` entry
+(`FRAMEWORKS="swift rust" SERVERS="garuda axum"`), the framework Garuda aims to
+beat; the first run builds it with `cargo`. `benchmarks/vs-axum.sh` is a quick
+Garuda-against-axum read at 64 connections, under two minutes, for use between
+changes. Its first run, through the handler API, one run per pass, had Garuda
+at 1.95× axum on the suite's ramp (390,324 against 200,048 requests a second)
+and 1.72× on one pinned core (200,890 against 116,799);
+[BENCHMARKS.md](BENCHMARKS.md#against-axum-quick-comparison) has every pass and
+why single runs need care.
 
 The versions, build flags, reproduction command and caveats are in
 [GARUDA.md](GARUDA.md). Method and history are in [BENCHMARKS.md](BENCHMARKS.md).
@@ -250,14 +304,14 @@ usage: garuda [options]
   --compress               compress handler responses (br, zstd or gzip,
                            as the client accepts) when their type is
                            text-like; read CONFIG.md about BREACH first
-                           (router responses have no type to compress yet)
+                           (handler responses are not compressed yet)
   --compress-min-size N    leave bodies declared smaller than this as they
                            are (default 1024)
   --compress-static        serve FILE.br, FILE.zst or FILE.gz beside a
                            --static-dir file to clients that accept it
   --request-start-header   give handlers X-Request-Start: t=<usec> for
                            when the request arrived, for APM agents that
-                           report queue time (no handler reads it yet)
+                           report queue time
   --request-id             give every request an X-Request-ID, echoed on
                            the response and in the access log; one from a
                            --forwarded-allow-ips proxy is kept
@@ -280,9 +334,9 @@ examples:
             --forwarded-allow-ips 10.0.0.0/8
 ```
 
-Flags the help marks as having no effect yet configure engine code that the
-planned handler API will reach ([HANDLER-API.md](HANDLER-API.md)). Timeouts
-are in milliseconds.
+Flags the help marks as having no effect yet configure engine code that later
+steps of the handler API will reach ([HANDLER-API.md](HANDLER-API.md#roadmap)).
+Timeouts are in milliseconds.
 [CONFIG.md](CONFIG.md) covers the flags in depth.
 
 ### Behind a reverse proxy
@@ -290,7 +344,9 @@ are in milliseconds.
 `--forwarded-allow-ips` controls trust. `X-Forwarded-*` and `Forwarded` headers
 are honoured only from a peer on that list and ignored from anyone else, since a
 client can send them too. The forwarded client address is what `--rate-limit`
-counts. A request ID from a trusted proxy is kept by `--request-id`.
+counts. A request ID from a trusted proxy is kept by `--request-id`. A handler
+reads the forwarded client and scheme as `request.remoteAddress`,
+`request.remotePort` and `request.scheme`.
 
 ---
 
@@ -299,13 +355,17 @@ counts. A request ID from a trusted proxy is kept by `--request-id`.
 Unit tests, including the fuzz corpus:
 
 ```bash
-swift test                                   # 187 tests
+swift test                                   # 193 tests
 ```
 
 The end-to-end suites run against the release binary, `.build/release/garuda`
 by default. Each takes another binary path as its first argument. They are
-answered by the built-in router and the server's own features, so no
-application is needed:
+answered by the binary's routes and the server's own features, so no
+application is needed. `handler-test.py` runs
+`.build/release/garuda-conformance` instead
+(`swift build -c release --product garuda-conformance`), whose routes exist
+only to make engine behaviour observable to the tests; it is not benchmarked
+or meant as an example:
 
 ```bash
 bash scripts/integration-test.sh             # 36  HTTP/1.1 framing, keep-alive,
@@ -324,7 +384,11 @@ python3 scripts/feature-test.py              # 62  shutdown, supervision, unix
                                              #     sockets, slow clients
 <venv>/bin/python scripts/http2-test.py      # 50  against `h2`
 <venv>/bin/python scripts/http3-test.py      # 53  against `aioquic`
-<venv>/bin/python scripts/router-streams-test.py  # 41  router over h2 and h3
+<venv>/bin/python scripts/router-streams-test.py  # 41  routes over h2 and h3
+<venv>/bin/python scripts/handler-test.py    # 107 the handler API: bodies over h1,
+                                             #     h2 and h3, headers, client,
+                                             #     scheme, request IDs, framing,
+                                             #     errors, lifecycle hooks
 ```
 
 The shell suites need `curl`, and some need `openssl`, `nc` or `python3`; each
@@ -350,8 +414,10 @@ not run in CI.
 
 ## Not supported
 
-- **A public handler API**, middleware, and WebSocket or WebTransport
-  application APIs. See [GARUDA.md](GARUDA.md).
+- **A stable handler API.** Asynchronous handlers, typed extraction, JSON,
+  middleware, 405, streaming responses, and WebSocket or WebTransport handlers
+  are not there yet. See [HANDLER-API.md](HANDLER-API.md) and
+  [GARUDA.md](GARUDA.md).
 - **Byte ranges, directory indexes and `Last-Modified` for `--static-dir`.** It
   serves assets with an `ETag`; it is not a file server.
 - **Compressing static files on the fly.** `--compress-static` serves copies
@@ -363,7 +429,8 @@ not run in CI.
 ---
 
 **Further reading:** [GARUDA.md](GARUDA.md) is the status, plan and
-measurements. [INSTALLATION.md](INSTALLATION.md) covers building, certificates
+measurements. [HANDLER-API.md](HANDLER-API.md) is the handler API and its
+roadmap. [INSTALLATION.md](INSTALLATION.md) covers building, certificates
 and deployment. [CONFIG.md](CONFIG.md) covers the flags.
 [ARCHITECTURE.md](ARCHITECTURE.md) explains how the engine is built.
 [TRANSPORT.md](TRANSPORT.md) describes what each protocol does.

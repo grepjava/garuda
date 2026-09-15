@@ -18,7 +18,7 @@
 //
 // The request head is rebuilt as HTTP/1.1 text in the stream's `headStore` and
 // handed to the ordinary parser. It costs one copy and one parse per request,
-// and in exchange the router, the trusted-proxy logic and the access log
+// and in exchange the handlers, the trusted-proxy logic and the access log
 // all keep working on the representation they were written for.
 //===----------------------------------------------------------------------===//
 
@@ -311,7 +311,7 @@ extension Worker {
                     return
                 }
                 s.pointee.body.write(payload + offset, length)
-                // The router takes the whole body before it answers, so a
+                // A handler is given the whole body before it runs, so a
                 // byte buffered is a byte consumed. Holding the window back
                 // until a handler read it would stall every upload larger than
                 // the window; --max-body above is what bounds the buffer.
@@ -550,7 +550,7 @@ extension Worker {
 
     /// Rebuilds the request as HTTP/1.1 text and parses it.
     ///
-    /// Everything downstream -- the router, the forwarded-header logic,
+    /// Everything downstream -- the handlers, the forwarded-header logic,
     /// the access log -- reads a parsed head with slices into a base pointer,
     /// so producing one here is what lets HTTP/2 reuse all of it.
     mutating func buildRequestHead(_ streamSlot: Int, _ h2: H2Connection) -> HeaderOutcome {
@@ -650,6 +650,7 @@ extension Worker {
         s.pointee.headOrigin = 0
 
         var parsed = HTTPRequestHead()
+        headersOwner = HeaderTableOwner()
         let base = UnsafePointer(s.pointee.headStore.pointer(at: 0))
         let result = HTTPParser.parse(base, s.pointee.headStore.readableBytes,
                                       maxHeadSize: config.maxHeadSize,
@@ -662,6 +663,7 @@ extension Worker {
         // it is malformed rather than merely odd.
         if parsed.flags.contains(.chunked) { return .malformed }
         s.pointee.head = parsed
+        ownHeaders(streamSlot)
         // The same rule as HTTP/1: a HEAD response carries the headers of the
         // GET and none of its body. `beginRequest` does this for HTTP/1, and
         // an HTTP/2 stream never goes through it.
@@ -909,6 +911,10 @@ extension Worker {
         s.pointee.contState = .none
         s.pointee.contKind = .none
         s.pointee.contOp = -1
+        s.pointee.contHandler = nil
+        s.pointee.locals = SIMD4()
+        s.pointee.handlerStatus = 200
+        s.pointee.responseHeaders = ByteBuffer()
         s.pointee.lastActivity = pg_monotonic_ms()
         s.pointee.h2 = nil
         s.pointee.responseRemaining = -1
@@ -1062,7 +1068,7 @@ extension Worker {
     // MARK: - Receive-side flow control
 
     /// Called when body bytes are taken off the stream, which is what makes
-    /// room for more. The router buffers a whole body before it answers, so for
+    /// room for more. A handler is given a whole body before it runs, so for
     /// it that is on arrival; a handler reading as it goes would call this as it
     /// reads, and one that stopped reading would stop the peer from sending.
     mutating func h2NoteConsumed(_ streamSlot: Int, _ n: Int) {

@@ -20,7 +20,8 @@ public enum ContState: UInt8 {
 
 public enum ContKind: UInt8 {
     case none
-    case delay
+    /// Resumes by calling the handler stored in `Connection.contHandler`.
+    case handler
 }
 
 public enum OpKind: UInt8 {
@@ -351,6 +352,9 @@ extension Worker {
                 asyncOps.free(opIndex)
             }
         }
+        // Only a handler continuation holds a closure, so a request that never
+        // waited releases nothing here.
+        if c.pointee.contKind == .handler { c.pointee.contHandler = nil }
         c.pointee.contOp = -1
         c.pointee.contState = .none
         c.pointee.contKind = .none
@@ -359,7 +363,7 @@ extension Worker {
     /// Arms a timer op and parks the connection continuation. Returns false
     /// when the op pool is exhausted.
     @discardableResult
-    mutating func armDelay(_ slot: Int, ms: UInt64, kind: ContKind = .delay) -> Bool {
+    mutating func armDelay(_ slot: Int, ms: UInt64, kind: ContKind = .handler) -> Bool {
         let c = table[slot]
         clearContinuation(slot)
         // The clock reads truncated microseconds; one more keeps the deadline
@@ -453,8 +457,13 @@ extension Worker {
         c.pointee.contKind = .none
         c.pointee.contOp = -1
         switch kind {
-        case .delay:
-            writeSwiftResponse(slot, status: 200, body: nil, bodyCount: 0)
+        case .handler:
+            // Taken off the slot before it runs: the handler may wait again,
+            // storing the next one where this one was.
+            if let handler = c.pointee.contHandler {
+                c.pointee.contHandler = nil
+                runHandler(slot, handler)
+            }
         case .none:
             break
         }

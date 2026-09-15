@@ -35,8 +35,9 @@ any other.
 **A request stream is also a slot.** Each HTTP/2 and HTTP/3 stream takes one
 from the same table, with `fd = -1` and `parentSlot` pointing at its
 connection. A stream slot has a head, a body buffer, a write buffer, a
-Content-Length check and continuation fields, so dispatch, the router, the
-timer substrate and cancellation work on a stream exactly as on a connection.
+Content-Length check and continuation fields, so dispatch, the handler API,
+the timer substrate and cancellation work on a stream exactly as on a
+connection.
 Only three things know the difference: writing (bytes become frames on the
 parent), read interest (a stream has no descriptor), and teardown.
 
@@ -45,21 +46,26 @@ request arrives as pseudo-headers plus a compressed field section. It is
 validated, rendered into the stream's `headStore` as `GET /path
 HTTP/1.1\r\nhost: …`, and handed to the ordinary parser. That costs one copy
 and one parse per request. In exchange, the health check, rate limiter, static
-files, forwarded-header trust, request ID, access log and router all work on
-the one representation they were written for.
+files, forwarded-header trust, request ID, access log and a handler's
+`Request` all work on the one representation they were written for. A handler
+sees `:authority` as `Host`, and `:scheme` as `request.scheme`.
 
-**The response side is one call with three encodings.** The router calls
-`writeSwiftResponse`. On HTTP/1.1 that writes header text straight into the
-write buffer. On a stream it becomes `h2Respond` or `h3Respond`, which encode
-`:status`, `content-length`, `date`, `server` and the server headers with
-HPACK or QPACK, then queue the body on the stream. The server headers are
-Alt-Svc, HSTS and X-Request-ID, written by `writeServerHeaders`,
-`encodeServerHeaders` and `encodeServerHeadersH3`. A status with no body, such
-as a health check or an error, ends the stream on its HEADERS frame.
+**The response side is one call with three encodings.** Every handler answer
+goes through `respond` (`Respond.swift`). On HTTP/1.1 that writes header text
+straight into the write buffer. On a stream it becomes `respondH2` or
+`respondH3`, which encode `:status`, `content-length`, `date`, `server`, the
+server headers and the handler's headers with HPACK or QPACK, then queue the
+body on the stream. The server headers are Alt-Svc, HSTS and X-Request-ID,
+written by `writeServerHeaders`, `encodeServerHeaders` and
+`encodeServerHeadersH3`; a handler that sets one of them has its own sent
+instead. A handler's `Content-Length` is held to on every protocol: a longer
+body is cut to it, and a shorter one closes the HTTP/1.1 connection after it or
+resets the stream. A status with no body, such as a health check or an error,
+ends the stream on its HEADERS frame.
 
 On HTTP/2 and HTTP/3 a request is dispatched when its stream ends (END_STREAM,
-a trailer section, or the QUIC stream's FIN), because the router answers with
-the whole request in hand. The one exception is an HTTP/3 extended CONNECT,
+a trailer section, or the QUIC stream's FIN), because a handler is given the
+whole body. The one exception is an HTTP/3 extended CONNECT,
 which never ends. It is dispatched on its head and refused.
 
 ---
@@ -67,8 +73,9 @@ which never ends. It is dispatched on its head and refused.
 ## HTTP/1.1
 
 Keep-alive, pipelining, chunked request bodies, `Expect: 100-continue`, `HEAD`,
-and HTTP/1.0. Router and static-file responses always carry a
-`Content-Length`.
+and HTTP/1.0. Handler and static-file responses carry a `Content-Length`,
+except a 204 or 1xx, which never has one, and a 304, which has one only when
+the handler gave it.
 
 The parser (`HTTPParser.swift`) makes a single pass with no backtracking and
 no allocation, producing `(offset, length)` slices into the read buffer.
@@ -186,8 +193,8 @@ time as the window opens.
 **Receiving.** A DATA frame is charged against both windows before anything
 else can reject it, because the peer has spent the window either way. Our
 initial stream window is the larger of 65,535 and the body high-water mark,
-and the connection window is raised to match at the start. The router buffers
-the whole body before it answers, so body bytes count as consumed on arrival
+and the connection window is raised to match at the start. The whole body is
+buffered before a handler is called, so body bytes count as consumed on arrival
 (`h2NoteConsumed`). Once half the initial window has accumulated,
 `h2FlushWindowUpdates` sends `WINDOW_UPDATE` for the stream and the
 connection, and it does so *before* the body is dispatched. Uploads larger
@@ -205,7 +212,9 @@ granting window, when what is left is small. A large remainder gets
 **Ending.** A response ends with END_STREAM on its last DATA frame, or on its
 HEADERS for a bodyless response or `HEAD`. A file-fed response that comes up
 short of its declared length is reset with `INTERNAL_ERROR` instead of ending
-cleanly, so the client does not mistake a truncation for the whole body.
+cleanly, so the client does not mistake a truncation for the whole body. A
+handler body shorter than the `Content-Length` it declared is reset the same
+way.
 
 ### Cancellation has a budget
 
@@ -223,7 +232,7 @@ back up to the cap. A peer that only cancels exhausts it and is sent
 a race, and costs nothing.
 
 A reset stream goes through `closeStream` → `closeConnection` →
-`cancelOps`, so a request parked on a timer (`GET /delay/:ms`) is cancelled with
+`cancelOps`, so a request parked on a timer (`Response.after`) is cancelled with
 it and never answers late.
 
 ### A stream measures its own progress
@@ -359,9 +368,9 @@ alt-svc: h3=":443"; ma=86400
 ```
 
 naming the UDP port, which is `--quic-port` when it differs from the TCP port.
-That covers router responses, health checks, static files, errors and cached
-responses. HTTP/3 responses do not carry it, because the client is already
-there.
+That covers handler responses, health checks, static files, errors and cached
+responses. A handler that sets its own `Alt-Svc` has it sent instead. HTTP/3
+responses do not carry it, because the client is already there.
 
 ---
 
@@ -374,7 +383,7 @@ parsed.
 
 There is no handshake path. With `--no-websockets`, an upgrade request is
 refused with 501 before anything else can answer. Without it, an upgrade
-request is an ordinary request to the router. The server never enters the
+request is an ordinary request to the routes. The server never enters the
 `websocket` state. WebSocket over HTTP/2 or HTTP/3 (RFC 8441 / RFC 9220) is not
 implemented.
 
@@ -405,6 +414,7 @@ understanding is consistent.
 <venv>/bin/python scripts/http2-test.py          # 50 checks against `h2`, cleartext and TLS
 <venv>/bin/python scripts/http3-test.py          # 53 checks against `aioquic`
 <venv>/bin/python scripts/router-streams-test.py # 41: routes, delays and cancellation on h2 and h3
+<venv>/bin/python scripts/handler-test.py        # 107: handler bodies, headers and framing on h1, h2 and h3
 python3 scripts/feature-test.py                  # 62: shutdown, supervision, unix sockets, scrapes
 ```
 

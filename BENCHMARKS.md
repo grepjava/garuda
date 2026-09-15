@@ -4,21 +4,72 @@
 
 # Benchmarks
 
-Garuda's built-in router next to Hummingbird and Vapor, the Swift framework
-entries of [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
-measured with that suite's load command at 64, 256 and 512 connections. The
+Garuda next to [axum](https://github.com/tokio-rs/axum), the framework it
+aims to beat, and next to Hummingbird and Vapor, the Swift framework entries of
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/).
+Every entry but Garuda is that suite's own application for the same contract,
+built as its Dockerfile builds it, and the load is the suite's command. The
 machine is not the suite's, so the figures here are **not** comparable with the
 ones the site publishes; see [Relation to the published results](#relation-to-the-published-results).
 
-- **The router served 414,234 / 389,445 / 370,945 requests a second**, about
-  4× Hummingbird and 6–7× Vapor at every level, with no errors from any entry.
-- **What Garuda answers is its built-in router, not an application.** There is
-  no public handler API yet: `GET /` is matched at the engine's dispatch seam
-  and answered 200 with an empty body. Hummingbird and Vapor run the suite's
-  own applications for the same contract.
+- **Against axum, Garuda served 1.95× on the suite's ramp and 1.72× on one
+  pinned core**, in a quick comparison of one run per pass, with no errors from
+  either. The closed-loop pass, 1.21×, is probably held down by the load
+  generator.
+- **Against the Swift frameworks, the router served 414,234 / 389,445 /
+  370,945 requests a second**, about 4× Hummingbird and 6–7× Vapor at every
+  level.
+- **Garuda answers through its public handler API** since phase 1 of
+  [HANDLER-API.md](HANDLER-API.md) ([Sources/garuda/main.swift](Sources/garuda/main.swift)).
+  The Swift-framework figures are older: they were measured on the hand-written
+  router the API replaced.
 - Figures from Peregrine, the Python server Garuda was forked from, are kept
   at the end under [Historical: Peregrine (Python), before the fork](#historical-peregrine-python-before-the-fork).
   They are not Garuda's.
+
+---
+
+## Against axum, quick comparison
+
+Measured on 2026-09-15. Garuda: phase 1 of the handler API, on top of
+0e0cbbc. axum 0.8.9 on Tokio 1.53.1 and hyper 1.11.1: the suite's `rust/axum`
+entry, byte for byte ([benchmarks/axum/](benchmarks/axum/)), built with rustc
+1.96.0 as the suite's `rust/Dockerfile` builds it (release, LTO,
+`panic = "abort"`, one codegen unit). `GET /` at 64 connections, one run per
+pass, `bash benchmarks/vs-axum.sh`, 88 s in all. Requests per second:
+
+| pass | Garuda | axum | Garuda ÷ axum |
+|---|---:|---:|---:|
+| suite ramp, 15 s | **390,324** | 200,048 | 1.95× |
+| closed loop, 10 s | **201,360** | 167,078 | 1.21× |
+| pinned, one core each, 10 s | **200,890** | 116,799 | 1.72× |
+
+Latency, p50 / p99 in milliseconds:
+
+| pass | Garuda | axum |
+|---|---:|---:|
+| suite ramp | 3.9 / 646 | 471 / 2,973 |
+| closed loop | 0.26 / 1.21 | 0.30 / 1.01 |
+| pinned | 0.27 / 1.08 | 0.53 / 2.28 |
+
+- **The passes.**
+  - *Suite ramp:* the suite's zrk command ([Method](#method)), Garuda's four
+    worker processes against axum's one process with Tokio's default of a
+    worker thread per CPU. axum's ramp latencies are queueing: it fell behind
+    the offered rate.
+  - *Closed loop:* `oha -c 64 -z 10s`, the same processes, capacity instead of
+    the ramp.
+  - *Pinned:* the server on CPU 0 and oha on CPUs 1–3. One Garuda worker
+    against one Tokio worker thread: Tokio sizes its runtime from
+    `std::thread::available_parallelism`, which reads the affinity mask.
+- **The closed-loop figure is probably oha's ceiling, not Garuda's.** Garuda
+  served the same ~201k on four workers sharing the CPUs with oha as on one
+  pinned core. Read 1.21× as a floor; the pinned 1.72× may be one too.
+- **One run each, after a 2 s warm-up.** Single runs on this machine move by
+  20–30%. The script is a check to repeat between changes. For a figure to
+  quote, run `frameworks.sh` with three runs at every level:
+  `FRAMEWORKS="swift rust" SERVERS="garuda axum" WORKERS=4 AGG=mean bash benchmarks/frameworks.sh`.
+- **rustc 1.96.0 here**; the suite's Dockerfile uses 1.98.
 
 ---
 
@@ -111,12 +162,28 @@ between sessions is that large.
 
 ## Reproduce
 
+The quick comparison against axum, under two minutes:
+
 ```bash
 swift build -c release --product garuda
+bash benchmarks/vs-axum.sh
+```
+
+[benchmarks/vs-axum.sh](benchmarks/vs-axum.sh) prints one line per pass and
+server. It runs `frameworks.sh` three times (ramp, closed loop, pinned) with
+one run at 64 connections and a 2 s warm-up, and needs what that script needs
+for Garuda and axum, below.
+
+Every level, three runs each:
+
+```bash
+swift build -c release --product garuda
+FRAMEWORKS="swift rust" SERVERS="garuda axum" WORKERS=4 AGG=mean \
+    bash benchmarks/frameworks.sh > axum.tsv
 HUMMINGBIRD=/path/to/hummingbird-framework/.build/release/server \
 VAPOR=/path/to/vapor-framework/.build/release/server \
 FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 AGG=mean \
-    bash benchmarks/frameworks.sh > results.tsv
+    bash benchmarks/frameworks.sh > swift.tsv
 ```
 
 [benchmarks/frameworks.sh](benchmarks/frameworks.sh) prints one TSV line per
@@ -134,9 +201,13 @@ entry and level, with every run. It needs:
   `~/swiftbench/vapor-framework/.build/release/server` unless `HUMMINGBIRD`
   and `VAPOR` say otherwise, and starts them with `SERVER_HOSTNAME` and
   `SERVER_PORT` (Vapor with `serve` and `VAPOR_ENV=production`).
+- **axum** from [benchmarks/axum/](benchmarks/axum/), the suite's `rust/axum`
+  entry. The script builds it with `cargo` on first use, with the flags of the
+  suite's `rust/Dockerfile`, or runs `AXUM` if given. It listens on 3000 itself,
+  so `PORT` must stay 3000.
 - `AGG=mean` averages the runs, as the suite publishes; the default, `median`,
-  keeps the median run. `RUNS` (3), `CONNS` (`64 256 512`), `DURATION` (15s) and
-  `RATE` (`1000:500000`) override the rest. `LOAD=closed` runs closed-loop oha
+  keeps the median run. `RUNS` (3), `CONNS` (`64 256 512`), `DURATION` (15s),
+  `WARMUP` (5s) and `RATE` (`1000:500000`) override the rest. `LOAD=closed` runs closed-loop oha
   instead of the ramp, and `PIN=0:1-3` pins server and load generator.
 
 `FRAMEWORKS=elysia SERVERS=elysia-bun` still runs the suite's Elysia entry

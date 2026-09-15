@@ -11,7 +11,7 @@
 // A QUIC connection takes a slot in the same connection table as everything
 // else, with no descriptor of its own, and every request stream takes a child
 // slot -- exactly as HTTP/2 does. The request head is rebuilt as HTTP/1.1 text
-// and re-parsed, so the router, the forwarded-header logic and the
+// and re-parsed, so the handlers, the forwarded-header logic and the
 // access log work unchanged. Three protocols, one request path.
 //
 // The unidirectional streams are the awkward part, because their type is the
@@ -726,7 +726,7 @@ extension Worker {
             dispatch(streamSlot)
             return table[streamSlot].pointee.state == .free ? -1 : streamSlot
         }
-        // The router answers once the whole request is in: the frame loop
+        // The handler runs once the whole request is in: the frame loop
         // reads the DATA frames that follow, and the end of the stream is what
         // dispatches it.
         s.pointee.state = .readingBody
@@ -762,6 +762,10 @@ extension Worker {
         s.pointee.contState = .none
         s.pointee.contKind = .none
         s.pointee.contOp = -1
+        s.pointee.contHandler = nil
+        s.pointee.locals = SIMD4()
+        s.pointee.handlerStatus = 200
+        s.pointee.responseHeaders = ByteBuffer()
         s.pointee.lastActivity = pg_monotonic_ms()
         s.pointee.h2 = nil
         s.pointee.h3 = nil
@@ -897,6 +901,7 @@ extension Worker {
         s.pointee.headOrigin = 0
 
         var parsed = HTTPRequestHead()
+        headersOwner = HeaderTableOwner()
         let parseBase = UnsafePointer(s.pointee.headStore.pointer(at: 0))
         let result = HTTPParser.parse(parseBase, s.pointee.headStore.readableBytes,
                                       maxHeadSize: config.maxHeadSize,
@@ -907,6 +912,7 @@ extension Worker {
         parsed.httpMajor = 3
         if parsed.flags.contains(.chunked) { return .malformed }
         s.pointee.head = parsed
+        ownHeaders(streamSlot)
         if parsed.method == .head { s.pointee.flags.insert(.suppressBody) }
         s.pointee.h2Scheme = equalsLowercased(base0 + schemeAt.0, schemeAt.1, "https")
         if sawProtocol {

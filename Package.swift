@@ -14,6 +14,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "garuda", targets: ["garuda"]),
+        .executable(name: "garuda-conformance", targets: ["garuda-conformance"]),
         .library(name: "Garuda", targets: ["GarudaServer"]),
     ],
     targets: [
@@ -44,6 +45,12 @@ let package = Package(
                 swiftSettings: sharedSwiftSettings),
 
         .executableTarget(name: "garuda", dependencies: ["GarudaServer"],
+                          swiftSettings: sharedSwiftSettings),
+
+        // The routes the end-to-end suites need a handler for.
+        .executableTarget(name: "garuda-conformance",
+                          dependencies: ["GarudaCore", "GarudaHTTP", "GarudaServer"],
+                          path: "Sources/GarudaConformance",
                           swiftSettings: sharedSwiftSettings),
 
         .target(name: "GarudaFuzzTargets",

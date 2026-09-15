@@ -52,6 +52,8 @@ public struct Worker {
     /// One shared header table: parsing a head and dispatching it happen back
     /// to back for a single request, so there is never a second live set.
     public var headers: UnsafeMutablePointer<HTTPHeaderRef>
+    /// The request `headers` was last filled for. See Respond.swift.
+    var headersOwner = HeaderTableOwner()
 
     /// TLS configuration, when the listener is https. One per worker.
     public var tlsContext: TLSContext? = nil
@@ -520,6 +522,7 @@ public struct Worker {
                 let origin = c.pointee.read.readerOffset
                 let base = UnsafePointer(c.pointee.read.readPointer)
                 var head = HTTPRequestHead()
+                headersOwner = HeaderTableOwner()
                 let result = HTTPParser.parse(base, c.pointee.read.readableBytes,
                                               maxHeadSize: config.maxHeadSize,
                                               maxHeaders: config.maxHeaders,
@@ -537,6 +540,7 @@ public struct Worker {
                 case .complete:
                     c.pointee.head = head
                     if !beginRequest(slot, origin: origin) { return }
+                    ownHeaders(slot)
                 }
 
             case .readingBody:
@@ -584,6 +588,10 @@ public struct Worker {
         // fails before it is dispatched.
         c.pointee.requestID.clear()
         c.pointee.traceContext.clear()
+        // What the last request's handler set is not this one's.
+        c.pointee.locals = SIMD4()
+        c.pointee.handlerStatus = 200
+        c.pointee.responseHeaders.clear()
         // An inactive capture holds nothing: whatever deactivates one frees it.
         if c.pointee.capture.active { c.pointee.capture.abandon() }
         c.pointee.chunked = ChunkedDecoder(maxTrailerBytes: config.maxHeadSize)
@@ -697,6 +705,9 @@ public struct Worker {
         if config.accessLog || Metrics.enabled {
             table[slot].pointee.requestStartUs = pg_monotonic_us()
         }
+        // Everything below reads the header table, and a request whose body
+        // arrived over several loop turns may find another request's there.
+        ensureHeaders(slot)
         // Before anything can answer the request, so that every answer --
         // a probe, a 429, a static file -- is logged with its ID.
         if config.requestID { assignRequestID(slot) }
@@ -740,7 +751,7 @@ public struct Worker {
             failRequest(slot, status: 501)
             return
         }
-        respondRoute(slot)
+        dispatchRoute(slot)
     }
 
     /// Dispatch once the request body is complete. HTTP/2 and HTTP/3 feed
@@ -1289,6 +1300,7 @@ public struct Worker {
             c.pointee.quicRef = nil
         }
         c.pointee.h3Protocol.destroy()
+        c.pointee.responseHeaders.destroy()
 
         let wasStream = c.pointee.isStream
         if wasStream {

@@ -4,12 +4,15 @@
 
 # Architecture
 
-Garuda is one Swift executable. A supervisor process owns the listening
+A Garuda server is one Swift executable: the `Garuda` library and the routes an
+application registers with it. A supervisor process owns the listening
 sockets and forks worker processes; each worker is a single thread running a
 readiness poller over a flat table of connections. It parses HTTP/1.1, HTTP/2
-and HTTP/3 itself, and answers requests with a synchronous router that writes
-straight into the connection's write buffer. The binary links OpenSSL, zlib and
-the Swift runtime, nothing else. Foundation is not linked.
+and HTTP/3 itself, and answers requests with synchronous handlers whose
+responses go through one response sink into the connection's write buffer.
+The handler API is early and will change ([HANDLER-API.md](HANDLER-API.md)).
+The binary links OpenSSL, zlib and the Swift runtime, nothing else. Foundation
+is not linked.
 
 The protocols are described in [TRANSPORT.md](TRANSPORT.md). What works today
 and what does not yet is tracked in [GARUDA.md](GARUDA.md).
@@ -26,16 +29,21 @@ Sources/
                       forwarded-header trust, cache policy, root path
   GarudaQUIC/         QUIC transport and the TLS 1.3 handshake it needs
   GarudaServer/       supervisor, worker loop, connection table, dispatch,
-                      router, async substrate, HTTP/2 and HTTP/3 servers,
-                      static files, TLS glue, reload, ACME, metrics, CLI
-  garuda/             the executable's entry point (calls GarudaCLI.main)
+                      handler API, route table, response sink, async
+                      substrate, HTTP/2 and HTTP/3 servers, static files,
+                      TLS glue, reload, ACME, metrics, CLI
+  garuda/             the benchmark executable: the-benchmarker's routes,
+                      served with Garuda.serve
+  GarudaConformance/  garuda-conformance: routes that make engine behaviour
+                      observable to the end-to-end suites
   GarudaFuzzTargets/  fuzz targets and seeds, driven by pgfuzz/
 Tests/GarudaTests/    unit tests
 ```
 
 `Package.swift` builds these as the targets `CGaruda`, `GarudaCore`,
 `GarudaHTTP`, `GarudaQUIC` and `GarudaServer` (the library product `Garuda`),
-the `garuda` executable, and `GarudaFuzzTargets` with its `pgfuzz` driver.
+the `garuda` and `garuda-conformance` executables, and `GarudaFuzzTargets`
+with its `pgfuzz` driver.
 Swift never imports an OpenSSL header. It sees TLS sessions, contexts and
 loaded keys as opaque handles behind functions in the shim.
 
@@ -77,7 +85,8 @@ opened by each worker for itself, also with `SO_REUSEPORT`.
 ### Readiness and replacement
 
 Every worker is forked with a readiness pipe. Once it has built its poller,
-TLS context and listeners, it writes one byte and closes its end. The
+TLS context and listeners and run the application's `onStart`, it writes one
+byte and closes its end. The
 supervisor reads rather than polls: one byte means ready, and end of file means
 the worker died during start-up.
 
@@ -146,7 +155,8 @@ a certificate to start.
   *between* requests. A freshly accepted connection that has not been read yet
   is kept, because its client may already have sent a request. The worker
   stops polling the listener, closes its handle on it and its redirect
-  listener, and exits once the table is empty.
+  listener, and ends its loop once the table is empty. The application's
+  `onShutdown` runs after the loop ends.
 - **`--graceful-timeout`** bounds in-flight requests. Past it, every remaining
   connection is closed.
 - Behind that, a `SIGALRM` watchdog `_exit`s the worker ten seconds after the
@@ -244,33 +254,44 @@ In order:
    shared cache. Both exist, but today no response is compressible or stored;
    see [GARUDA.md](GARUDA.md);
 7. an extended CONNECT (`:protocol` on HTTP/3) is refused with 501;
-8. **`respondRoute`** (`Router.swift`).
+8. **`dispatchRoute`** (`Respond.swift`): the route table, then the handler.
 
 `--redirect-http` is not part of this path. It is a separate listener in each
 worker that answers plain HTTP with a redirect to https and closes
 (`HTTPS.swift`).
 
-### The router
+### Routes and handlers
 
-`Router.match` compares method and path bytes, after stripping `--root-path`,
-and returns a `Route`:
+`Garuda.serve` compiles the application's `Routes` before the first fork
+(`Handler.swift`), so every worker inherits the same table and only reads it.
+`RouteTable` (`RouteTable.swift`) splits each pattern into literal, `:param`
+and trailing `*rest` segments and lays them out as a flat byte trie.
+`CompiledRoutes.match` walks the request path as it arrived, after stripping
+`--root-path`, trying a literal before a parameter and a parameter before the
+rest, and backtracking when a branch leads nowhere. Parameters are offsets and
+lengths in the path, at most 8 of them. `HEAD` falls back to `GET`. No match is
+a 404, and the connection is kept.
 
-| route | answer |
-| --- | --- |
-| `GET /` | 200, empty body |
-| `GET /user/:id` | 200, the id bytes as the body |
-| `POST /user` | 200, empty body |
-| `GET /delay/:ms` | 200 after `ms` milliseconds (clamped 1–5000) |
-| anything else | 404, connection kept |
+`runHandler` calls the handler with a `Request` and a `Response`, both
+`~Copyable` views of the connection slot. Request headers are read from the
+worker's shared header table. When another request's head has been parsed
+into it since, the head is parsed again from bytes that stay put until the
+request is answered, so that costs a parse and never a copy. A handler that
+throws, or returns without answering or waiting, gets a 500.
 
-`HEAD` is answered wherever `GET` is. `writeSwiftResponse` writes the status
-line, `Date` (from a cache reformatted at most once a second), `Server`, the
-server headers (`writeServerHeaders`: Alt-Svc, HSTS, X-Request-ID),
-`Content-Length`, `Connection` and the body straight into the connection's
-write buffer. It then flushes once, so head and body leave in one `write`.
-On a stream the same call goes to `h2Respond` or `h3Respond`, which encode the
-head with HPACK or QPACK (`encodeServerHeaders` / `encodeServerHeadersH3`) and
-queue the body on the stream.
+`respond` (`Respond.swift`) is the response sink every handler answer goes
+through. It writes the status line, `Date` (from a cache reformatted at most
+once a second) and `Server` unless the handler set them, the server headers
+(`writeServerHeaders`: Alt-Svc, HSTS, X-Request-ID) unless the handler set its
+own, the handler's headers, `Content-Length`, `Connection` and the body into
+the connection's write buffer. It then flushes once, so head and body leave in
+one `write`. A 204 or 1xx gets no `Content-Length`, a 304 keeps the handler's,
+and a `HEAD` response states the length and sends no body. A body longer than
+a declared `Content-Length` is cut to it. A shorter one closes the HTTP/1.1
+connection after it, or resets the stream, so a client never takes it for
+whole. On a stream the same call goes to `respondH2` or `respondH3`, which
+encode the head with HPACK or QPACK (`encodeServerHeaders` /
+`encodeServerHeadersH3`) and queue the body on the stream.
 
 ---
 
@@ -278,8 +299,8 @@ queue the body on the stream.
 
 `GET /` allocates nothing and never suspends: a handler that can finish does
 so inside `dispatch`. Waiting is opt-in, and it is implemented without `Task`
-or any other scheduler hop (`AsyncOps.swift`). Today the only user is
-`GET /delay/:ms`, and there is no public handler API on top of it yet.
+or any other scheduler hop (`AsyncOps.swift`). Today its only user is
+`Response.after(milliseconds:then:)`, the one way a handler can wait.
 
 **`AsyncOpPool`** is a fixed-capacity slab of `AsyncOp` records (one per
 possible connection) with a free list. Each record has a generation bumped on
@@ -312,16 +333,18 @@ when a continuation becomes ready, it is compacted in place to drop stale
 entries (a slot has at most one runnable entry, so there is always room). The
 resume never runs inline.
 
-The flow for `/delay/:ms`:
+The flow for `Response.after`:
 
 1. `armDelay` clears any previous continuation, allocates an op, pushes it on
-   the heap and parks the connection as `waiting`;
+   the heap and parks the connection as `waiting`, with the handler to call
+   stored as `contHandler`. With no op free, the request is answered 503;
 2. `fireDueTimers` pops due entries; `completeTimerOp` frees the op and, if the
    slot, `requestId`, state and `contOp` still match, `enqueueReady` marks it
    `ready` with a fresh ticket and queues it;
 3. `drainReadyQueue` resumes up to **64** continuations per turn. Only resumes
-   that actually run spend the budget; stale entries cost a check each. While
-   work remains, the next poll uses timeout 0.
+   that actually run spend the budget; stale entries cost a check each. A
+   resume calls `contHandler` through `runHandler`, with fresh views of the
+   same request. While work remains, the next poll uses timeout 0.
 
 **Cancellation** always goes through `cancelOps`, which frees exactly the op
 named by `contOp` (checked against `contOpGeneration`) and unlinks it from the
@@ -349,8 +372,10 @@ connection: `H2Connection`, `H3Connection`, `QUICConnection`, `QUICListener`,
   confined to a few files.
 - **Pooled read buffers**, recycled LIFO (`BufferPool`), so the block handed
   out next is the one still in cache.
-- **Nothing becomes a `String`.** The parser yields slices, the router matches
-  bytes, and log lines are assembled in a buffer and written with one `write`.
+- **Nothing becomes a `String`** unless a handler asks for one. The parser
+  yields slices, the route table matches bytes, header values, parameters and
+  the body reach a handler as byte spans, and log lines are assembled in a
+  buffer and written with one `write`.
 - **Character classes are register constants.** `tchar` membership is two
   64-bit shifts.
 - **Interest changes only when the mask does.** `setInterest` skips the
@@ -379,8 +404,8 @@ connection: `H2Connection`, `H3Connection`, `QUICConnection`, `QUICListener`,
 
 ## Engine code with nothing to serve yet
 
-These parts compile and are reachable from the command line, but no handler
-produces what they act on:
+These parts compile and are reachable from the command line, but the handler
+API does not reach them yet:
 
 - **WebSocket**: framing, UTF-8 validation and permessage-deflate live in
   GarudaHTTP and are unit-tested. The server never enters the `websocket`
@@ -389,19 +414,21 @@ produces what they act on:
   datagrams. `WebTransport.swift` stubs drop them, and a CONNECT is answered
   501.
 - **Response compression** (`Compression.swift`) and the **response cache**
-  (`ResponseCache.swift`, `garuda_cache.c`): no router response carries a
-  content type, and nothing is stored.
+  (`ResponseCache.swift`, `garuda_cache.c`): handler responses are not
+  compressed or stored. Both wait for streaming responses.
 
 ## Testing
 
 - `swift test`: unit tests for the parser, HPACK (RFC 7541 appendix C and the
   Huffman code), QUIC packet protection (RFC 9001 vectors generated by
   `scripts/quic-vectors.py`), QUIC streams, WebSocket framing and deflate,
-  cache policy, trace context, root path, and the async substrate
-  (`AsyncOpsTests`).
+  cache policy, trace context, root path, the route table
+  (`RouteTableTests`), and the async substrate (`AsyncOpsTests`).
 - `pgfuzz` with `GarudaFuzzTargets` for the parsers.
 - `scripts/`: end-to-end suites against independent clients. Transport
   coverage is in [TRANSPORT.md](TRANSPORT.md#testing). `feature-test.py` (62)
   covers supervision, shutdown, unix sockets and reload. The shell scripts
   cover ACME, static files, rate limiting, redirects, request IDs, trace
-  context, SNI, draining and `reload-test.sh`.
+  context, SNI, draining and `reload-test.sh`. `handler-test.py` runs
+  `garuda-conformance` and covers the handler API: request bodies, headers,
+  client and scheme, response framing, errors and lifecycle hooks.

@@ -25,10 +25,10 @@
 // rather than when accept() is called.
 //
 // Threads are not used for request handling. A worker answers from its own
-// poller loop: routes are matched and answered by a synchronous call
-// (Router.swift), and a handler that has to wait parks a continuation on its
-// connection slot (AsyncOps.swift) instead of holding a thread, so there is
-// nothing for a second thread to do.
+// poller loop: routes are matched and handlers called synchronously
+// (RouteTable.swift, Respond.swift), and a handler that has to wait parks a
+// continuation on its connection slot (AsyncOps.swift) instead of holding a
+// thread, so there is nothing for a second thread to do.
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
@@ -976,7 +976,7 @@ public enum Garuda {
             }
             fd = opened
         }
-        let ok = runWorker(config, listenFD: fd, metricsSlot: metricsSlot)
+        let ok = runWorker(config, listenFD: fd, index: index, metricsSlot: metricsSlot)
         exitProcess(ok ? 0 : 1)
     }
 
@@ -1072,14 +1072,21 @@ public enum Garuda {
     }
 
     static func runWorker(_ config: ServerConfig, listenFD: Int32,
-                          metricsSlot: Int = 0) -> Bool {
+                          index: Int = 0, metricsSlot: Int = 0) -> Bool {
         guard let workerPtr = makeWorker(config, listenFD: listenFD,
                                          controlFD: pg_signal_pipe_init(),
                                          metricsSlot: metricsSlot) else {
             return false
         }
+        // Before the worker reports ready, so that a reload does not retire
+        // the worker this one replaces until its start-up hook has returned.
+        // A signal that arrives meanwhile waits in the pipe for the loop.
+        lifecycle.onStart?(index)
         logReady(config)
         runSynchronousLoop(workerPtr)
+        // The loop ends once in-flight requests have finished or the grace
+        // period has; the exit watchdog armed at the drain bounds this too.
+        lifecycle.onShutdown?(index)
         workerPtr.pointee.destroy()
         currentWorker = nil
         return true

@@ -380,32 +380,4 @@ struct AsyncOpsTests {
         #expect(pool[Int(due.opIndex)].pointee.requestId == 2)
     }
 
-    @Test("router matches delay path and clamps")
-    func delayRouteMatch() {
-        let path = Array("/delay/50".utf8)
-        let route = path.withUnsafeBufferPointer {
-            Router.match(method: .get, path: $0.baseAddress!, count: $0.count)
-        }
-        guard case .delay(let ms) = route else {
-            Issue.record("expected delay route")
-            return
-        }
-        #expect(ms == 50)
-
-        let big = Array("/delay/99999".utf8)
-        let clamped = big.withUnsafeBufferPointer {
-            Router.match(method: .get, path: $0.baseAddress!, count: $0.count)
-        }
-        guard case .delay(let ms2) = clamped else {
-            Issue.record("expected clamped delay")
-            return
-        }
-        #expect(ms2 == 5000)
-
-        let bad = Array("/delay/".utf8)
-        let none = bad.withUnsafeBufferPointer {
-            Router.match(method: .get, path: $0.baseAddress!, count: $0.count)
-        }
-        #expect(none == nil)
-    }
 }

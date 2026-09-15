@@ -8,9 +8,13 @@ Garuda is configured entirely on the command line. There is no configuration
 file, and a running server does not re-read its flags: changing one means a
 restart. `garuda --help` prints the list this page explains.
 
-**What answers requests today.** There is no public handler API yet; it is
-being designed. Requests that no server feature answers first go to a built-in
-synchronous router (`Sources/GarudaServer/Router.swift`):
+**What answers requests today.** Requests that no server feature answers first
+go to the routes registered through the handler API (`Routes` and
+`Garuda.serve`, in `Sources/GarudaServer/Handler.swift`). That API is early and
+will change; [HANDLER-API.md](HANDLER-API.md) has its roadmap. `Garuda.serve`
+parses the flags on this page, so an application built on it takes the same
+command line. The `garuda` executable (`Sources/garuda/main.swift`) registers
+these routes:
 
 | request | answer |
 |---|---|
@@ -21,10 +25,11 @@ synchronous router (`Sources/GarudaServer/Router.swift`):
 | `HEAD` on any GET route | the same head, no body |
 | anything else | 404, connection kept open |
 
-The router answers the same way over HTTP/1.1, HTTP/2 and HTTP/3. Everything on
-this page that sits in front of it — TLS, static files, rate limiting, health
+The routes answer the same way over HTTP/1.1, HTTP/2 and HTTP/3. Everything on
+this page that sits in front of them — TLS, static files, rate limiting, health
 checks, the access log, metrics, reloads — is working and tested end to end. A
-few flags are parsed but have nothing to act on until handlers exist; they are
+few flags are parsed but have nothing to act on until a later step of the
+handler API; they are
 collected under [Flags with no effect yet](#flags-with-no-effect-yet), and
 [GARUDA.md](GARUDA.md) tracks that status.
 
@@ -89,6 +94,7 @@ Defaults are what the server uses when a flag is left out.
 | flag | default | what it does |
 |---|---|---|
 | `--forwarded-allow-ips LIST` | nobody | peers whose forwarded headers are believed: addresses, CIDR blocks, `unix`, or `*` |
+| `--scheme http\|https` | `https` with TLS, else `http` | the scheme a handler sees as `request.scheme` when neither TLS, an HTTP/2 or HTTP/3 `:scheme`, nor a trusted proxy says otherwise |
 
 ### Serving and traffic
 
@@ -108,6 +114,7 @@ Defaults are what the server uses when a flag is left out.
 | `--access-log-format F` | `text` | `text` or `json`; implies `--access-log` |
 | `--request-id` | off | an `X-Request-ID` for every request, on the response and in the access log |
 | `--trace-context` | off | record a W3C `traceparent`'s trace and span IDs in the access log |
+| `--request-start-header` | off | timestamp each request's arrival, for a handler to read as `request.requestStart` |
 | `--metrics-port PORT` | — | serve Prometheus metrics on a port of their own |
 | `--metrics-host HOST` | `--host` | what the metrics port binds |
 | `--log-level LEVEL` | `info` | `debug`, `info`, `warning`, `error` or `silent` |
@@ -122,7 +129,7 @@ Defaults are what the server uses when a flag is left out.
 ### Accepted, but with no effect yet
 
 `--compress`, `--compress-min-size`, `--cache-size`, `--cache-max-object`,
-`--cache-ttl-max`, `--request-start-header`, `--scheme`, `--ws-max-message`,
+`--cache-ttl-max`, `--ws-max-message`,
 `--ws-ping-interval`, `--ws-ping-timeout`, `--ws-max-queue`,
 `--ws-max-queue-bytes` and `--ws-compress`. See
 [Flags with no effect yet](#flags-with-no-effect-yet).
@@ -134,8 +141,8 @@ or a stray argument is an error, and the server exits with status 2.
 
 ## Protocols
 
-A protocol is a server flag. The router answers the same request the same way
-whichever version carried it.
+A protocol is a server flag. A handler is given the same request, and answers
+it the same way, whichever version carried it.
 
 | protocol | flags |
 |---|---|
@@ -171,9 +178,10 @@ curl -k --http3 https://127.0.0.1:8443/user/17          # needs a curl built wit
 
 The suites do not depend on curl supporting HTTP/3.
 [scripts/http2-test.py](scripts/http2-test.py),
-[scripts/http3-test.py](scripts/http3-test.py) and
-[scripts/router-streams-test.py](scripts/router-streams-test.py) drive the
-router over HTTP/2 and HTTP/3 themselves.
+[scripts/http3-test.py](scripts/http3-test.py),
+[scripts/router-streams-test.py](scripts/router-streams-test.py) and
+[scripts/handler-test.py](scripts/handler-test.py) drive the routes over
+HTTP/2 and HTTP/3 themselves.
 
 ---
 
@@ -256,14 +264,14 @@ because a client can send them too. The list takes addresses, CIDR blocks,
 `unix` and `*`. An entry that does not parse stops start-up. Use `*` only when
 nothing but the proxy can reach the server.
 
-Two features use trusted forwarded information today:
+Trusted forwarded information is used in three places:
 
 - **Rate limiting** keys a client by the address the proxy reports, not by the
   proxy's own address.
 - **Request IDs** from a trusted proxy's `X-Request-ID` are kept rather than
   replaced.
-
-Handlers will see the client address and scheme once the handler API exists.
+- **Handlers** read the client the proxy reports as `request.remoteAddress` and
+  `request.remotePort`, and the scheme it reports as `request.scheme`.
 
 ### Mounted under a prefix
 
@@ -271,15 +279,15 @@ Handlers will see the client address and scheme once the handler API exists.
 garuda --root-path /api
 ```
 
-`--root-path` removes a leading path prefix before the router matches, so
+`--root-path` removes a leading path prefix before routes are matched, so
 `GET /api/user/7` is answered as `GET /user/7`:
 
 - **Whole segments only.** `/apis` is not under `/api`, and a trailing slash on
   the flag (`/api/`) means the same as without it.
 - **Paths outside the prefix are routed as they came.** That covers a proxy
   that has already removed the prefix.
-- **Router only.** `--static-dir` prefixes and `--health-check-path` match the
-  path as the client sent it.
+- **Routes only.** `--static-dir` prefixes and `--health-check-path` match the
+  path as the client sent it. `request.path` is also the path as sent.
 
 ---
 
@@ -346,8 +354,10 @@ garuda --request-id --access-log
 
 `--request-id` gives every request an `X-Request-ID`:
 
-- **In the response.** Router responses and static files carry it on HTTP/1.1,
-  HTTP/2 and HTTP/3.
+- **In the response.** Handler responses and static files carry it on
+  HTTP/1.1, HTTP/2 and HTTP/3. A handler that sets its own `X-Request-ID` has
+  its value sent instead of the server's, not beside it.
+- **In the handler.** A handler reads it as `request.requestID`.
 - **In the access log.** A text line ends with ` id=...` and a JSON line gets
   `"request_id"`.
 
@@ -364,8 +374,7 @@ value must be 1 to 128 characters of letters, digits and `-_.:+/=@~`. Any other
 The ID is assigned before any server feature answers, so health probes and 429
 refusals are logged with one and carry it back, over every protocol. A
 malformed request that never parses gets no ID, and the
-`--redirect-http` port assigns none. Handlers will receive the ID when the
-handler API exists. The router does not read request headers.
+`--redirect-http` port assigns none.
 [scripts/request-id-test.sh](scripts/request-id-test.sh) covers this.
 
 ### Trace context
@@ -504,7 +513,7 @@ and certificate changes.
 ## Health checks
 
 `--health-check-path /healthz` answers that path inside the worker, before rate
-limiting, static files or the router, with `200` and an empty body:
+limiting, static files or the routes, with `200` and an empty body:
 
 ```yaml
 livenessProbe:
@@ -555,7 +564,7 @@ When the delay is up, the server stops accepting and drains under
 
 ## Serving assets
 
-`--static-dir` answers a URL prefix from a directory, before the router:
+`--static-dir` answers a URL prefix from a directory, before the routes:
 
 ```bash
 garuda --static-dir /static=/srv/app/static --static-dir /media=/srv/app/media
@@ -565,8 +574,8 @@ garuda --static-dir /static=/srv/app/static --static-dir /media=/srv/app/media
   `/staticky` is not under `/static`. When prefixes overlap, the longest
   matches first, in whatever order the flags were given.
 - **Fallthrough.** Only `GET` and `HEAD` are served. A path with no regular
-  file behind it goes on to the router, and so does any other method; the
-  router answers 404 unless one of its routes matches.
+  file behind it goes on to the routes, and so does any other method; it is
+  answered 404 unless a route matches.
 - **Containment.** `..`, `%2e%2e`, and a symlink pointing out of the tree are
   refused by where the path lands, not by how it is spelled. The path is
   percent-decoded, resolved, and must still be inside the directory. Only
@@ -627,7 +636,7 @@ A client past its allowance gets `429 Too Many Requests` with a `Retry-After`
 in whole seconds, rounded up, and the connection stays open. The rate is `N/s`,
 `N/m` or `N/h`. The burst is how many requests may arrive at once before the
 rate applies; it defaults to `N`. The check runs after the health probe and
-before static files and the router.
+before static files and the routes.
 
 The count is for the whole server, not for each worker. With `--workers 8` the
 kernel spreads a client's connections over eight accept queues, and a limit
@@ -750,7 +759,7 @@ Location: https://example.com/cart?id=7
 - **Location.** The host comes from `Host`, with its port replaced by the TLS
   port. The port is left out when it is 443.
 - **Refusals.** A request with no usable `Host` gets `400`.
-- **Nothing else.** These requests never reach the router, and every response
+- **Nothing else.** These requests never reach a handler, and every response
   closes the connection.
 
 It needs TLS and a port of its own, and it is refused with `--unix`.
@@ -760,8 +769,9 @@ root or `CAP_NET_BIND_SERVICE`.
 ### Strict-Transport-Security
 
 `--hsts SECONDS` adds `Strict-Transport-Security: max-age=SECONDS` to every TLS
-response: router responses, static files and health checks, over HTTP/1.1,
-HTTP/2 and HTTP/3. It needs TLS, and it is never sent over plain HTTP.
+response: handler responses, static files and health checks, over HTTP/1.1,
+HTTP/2 and HTTP/3. A handler that sets its own `Strict-Transport-Security` has
+its value sent instead. It needs TLS, and it is never sent over plain HTTP.
 `includeSubDomains` and `preload` are not added, because they commit other
 host names to https.
 
@@ -775,26 +785,22 @@ gone. [scripts/redirect-test.sh](scripts/redirect-test.sh) covers both flags.
 
 These flags are parsed and accepted, so existing command lines keep starting.
 None of them changes what the server does today. The engine code behind most of
-them is still in the binary, waiting for the handler API.
+them is still in the binary, waiting for a later step of the handler API
+([HANDLER-API.md](HANDLER-API.md)).
 
 - **`--compress`, `--compress-min-size`.** These are meant to compress handler
   responses that are text-like (brotli, zstd or gzip, as the client accepts),
-  with `Vary`, weak ETags and a size floor. Router responses carry no content
-  type, so nothing is compressed. Static files are served pre-compressed with
-  `--compress-static`, or as they are. Once handlers exist, read about BREACH
-  before turning `--compress` on. Compressing a TLS response that puts a secret
+  with `Vary`, weak ETags and a size floor. Handler responses are not
+  compressed yet; that arrives with streaming responses. Static files are
+  served pre-compressed with `--compress-static`, or as they are. Once it
+  works, read about BREACH before turning `--compress` on. Compressing a TLS response that puts a secret
   next to text the client chose lets an observer of response sizes recover the
   secret.
 - **`--cache-size`, `--cache-max-object`, `--cache-ttl-max`.** These are meant
   to be a response cache shared by all workers, for responses marked fresh with
   `Cache-Control: s-maxage` or `max-age`. `--cache-size` still maps the memory
   and logs its size at start-up. Nothing is ever stored, and the `garuda_cache_*`
-  metrics stay at zero.
-- **`--request-start-header`.** This is meant to give handlers
-  `X-Request-Start: t=<microseconds>` for APM queue time. Arrival is timestamped
-  when the flag is set, but nothing reads the timestamp.
-- **`--scheme`.** This was the scheme reported to the application. Nothing
-  reads it today, apart from the unused response cache.
+  metrics stay at zero. The cache waits for streaming responses too.
 - **`--ws-max-message`, `--ws-ping-interval`, `--ws-ping-timeout`,
   `--ws-max-queue`, `--ws-max-queue-bytes`, `--ws-compress`.** These are
   WebSocket limits and permessage-deflate negotiation, and nothing reads them.

@@ -230,7 +230,7 @@ public struct ServerConfig {
     /// A path the server answers itself, with 200 and an empty body, or nil.
     ///
     /// For an orchestrator's liveness probe. It is answered in the worker
-    /// before the request reaches the router, which is the point: a probe that runs
+    /// before the request reaches a handler, which is the point: a probe that runs
     /// through the application measures the application, so it goes unanswered
     /// exactly when every worker is busy -- and an orchestrator reads an
     /// unanswered liveness probe as a process to kill. This one says the

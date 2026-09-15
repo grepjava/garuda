@@ -8,8 +8,10 @@ Garuda is a single executable built from source with SwiftPM. There is no
 package, installer or prebuilt binary. You clone the repository, build it, and
 run `.build/release/garuda`.
 
-There is no public handler API yet. Run without an application, the binary
-serves its built-in router (see [README.md](README.md#the-built-in-router)).
+The `garuda` binary serves the-benchmarker's test routes through the handler
+API (see [README.md](README.md#what-the-binary-serves)). An application of your
+own is built against the `Garuda` library product; that API is early and will
+change ([HANDLER-API.md](HANDLER-API.md)).
 
 ---
 
@@ -192,20 +194,23 @@ the workers without dropping a connection. It does not build for you.
 ## Running the tests
 
 ```bash
-swift test                                    # 187 unit tests
+swift test                                    # 193 unit tests
 ```
 
 The end-to-end suites in `scripts/` default to `.build/release/garuda`, so build
-the release binary first. The shell suites need `curl`, and some also need
+the release binary first. `handler-test.py` defaults to
+`.build/release/garuda-conformance` instead, which
+`swift build -c release --product garuda-conformance` builds. The shell suites need `curl`, and some also need
 `openssl`, `nc` or `python3`. `acme-test.sh` needs a local
-[Pebble](https://github.com/letsencrypt/pebble). The HTTP/2 and HTTP/3 suites
-use Python as a test client only:
+[Pebble](https://github.com/letsencrypt/pebble). The HTTP/2, HTTP/3 and handler
+suites use Python as a test client only:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install h2 aioquic
 .venv/bin/python scripts/http2-test.py
 .venv/bin/python scripts/http3-test.py
 .venv/bin/python scripts/router-streams-test.py
+.venv/bin/python scripts/handler-test.py
 ```
 
 [README.md](README.md#tests) has the full list with check counts.

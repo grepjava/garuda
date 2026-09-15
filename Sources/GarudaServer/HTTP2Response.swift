@@ -33,15 +33,16 @@ extension Worker {
 
     /// Alt-Svc, HSTS and the request ID: what `writeServerHeaders` adds to an
     /// HTTP/1.1 head, for a response the server builds itself on a stream.
-    func encodeServerHeaders(_ slot: Int, _ h2: H2Connection, into block: inout ByteBuffer) {
-        if let altSvc = config.altSvc {
+    func encodeServerHeaders(_ slot: Int, _ h2: H2Connection, into block: inout ByteBuffer,
+                             skipping: ResponseHeaderKind = []) {
+        if let altSvc = config.altSvc, !skipping.contains(.altSvc) {
             encodeStatic(h2, "alt-svc", altSvc, config.altSvcLength, into: &block)
         }
-        if let hsts = config.hsts {
+        if let hsts = config.hsts, !skipping.contains(.hsts) {
             encodeStatic(h2, "strict-transport-security", hsts, config.hstsLength, into: &block)
         }
         let c = table[slot]
-        if config.requestID && c.pointee.requestID.readableBytes > 0 {
+        if config.requestID && c.pointee.requestID.readableBytes > 0 && !skipping.contains(.requestID) {
             encodeStatic(h2, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
                          c.pointee.requestID.readableBytes, into: &block)
         }
@@ -115,56 +116,4 @@ extension Worker {
         }
         // Already committed to a response we cannot finish.
         closeStream(slot, resetWith: .internalError)
-    }
-
-    /// A router response on a stream: status, length and body. The body is
-    /// queued on the stream and leaves as DATA through `flushStream`, which
-    /// ends the stream and retires the slot once it has drained. With no body
-    /// this is the status-only response above.
-    mutating func h2Respond(_ slot: Int, status: Int,
-                            body: UnsafePointer<UInt8>?, bodyCount: Int) {
-        guard let body, bodyCount > 0 else {
-            h2FailRequest(slot, status: status)
-            return
-        }
-        let c = table[slot]
-        let parent = Int(c.pointee.parentSlot)
-        guard parent >= 0, let h2 = table[parent].pointee.h2 else {
-            closeConnection(slot)
-            return
-        }
-        if c.pointee.flags.contains(.responseStarted) {
-            closeStream(slot, resetWith: .internalError)
-            return
-        }
-        dates.refresh()
-        var block = ByteBuffer()
-        defer { block.destroy() }
-        var digits = ByteBuffer()
-        defer { digits.destroy() }
-        digits.writeDecimal(bodyCount)
-        h2.encoder.encodeStatus(status, into: &block)
-        encodeStatic(h2, "content-length", UnsafePointer(digits.readPointer),
-                     digits.readableBytes, into: &block)
-        encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
-        encodeStatic(h2, "server", "garuda", into: &block)
-        encodeServerHeaders(slot, h2, into: &block)
-        // A HEAD response declares the length a GET would have had, and ends
-        // with its headers.
-        let sendBody = !c.pointee.flags.contains(.suppressBody)
-        writeHeaderBlock(slot, h2, block: &block, endStream: !sendBody)
-        c.pointee.flags.insert(.responseStarted)
-        logAccess(slot, status: status)
-        if !sendBody {
-            c.pointee.flags.insert(.responseComplete)
-            _ = flush(parent)
-            closeStream(slot, resetWith: nil)
-            return
-        }
-        c.pointee.write.write(body, bodyCount)
-        c.pointee.responseRemaining = -1
-        c.pointee.flags.insert(.responseComplete)
-        c.pointee.state = .writing
-        _ = flush(slot)
-    }
-}
+    }}

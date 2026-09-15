@@ -23,7 +23,7 @@ public enum ConnState: UInt8 {
     case readingHead
     /// Head parsed, reading the body into `body`.
     case readingBody
-    /// Handed to the router. Usually over within the same call; a handler that
+    /// Handed to a handler. Usually over within the same call; a handler that
     /// parks a continuation (AsyncOps.swift) holds the slot here until it is
     /// resumed.
     case dispatching
@@ -150,6 +150,20 @@ public struct Connection {
     public var contOpGeneration: UInt32 = 0
     /// Ticket of the ready-queue entry that may resume this continuation.
     public var contTicket: UInt32 = 0
+    /// The handler a `.handler` continuation calls when it resumes, or nil.
+    /// Set only while `contKind` is `.handler`, which is how releasing it
+    /// stays off the path of requests that never wait.
+    public var contHandler: Handler? = nil
+    /// Four words a handler keeps across a suspension.
+    public var locals = SIMD4<UInt64>()
+    /// The status `Response.send` uses when it is not given one.
+    public var handlerStatus: UInt16 = 200
+    /// The route's parameters, and where the routed path starts relative to
+    /// the head, so a resumed handler can read them again.
+    public var routeParameters = RouteParameters()
+    public var routeOffset: Int32 = 0
+    /// Headers the handler added. See `forEachHeaderRecord`.
+    public var responseHeaders = ByteBuffer()
     public var state: ConnState = .free
     public var flags: ConnFlags = []
     /// Poller mask currently registered, so we only issue epoll_ctl on change.

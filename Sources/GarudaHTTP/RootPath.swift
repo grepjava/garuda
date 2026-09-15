@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 // --root-path: the prefix a proxy mounts the server under.
 //
-// It comes off the front of a request's path before the router matches it, so
+// It comes off the front of a request's path before the routes match it, so
 // routes are written as the paths within the mount.
 //
 // Only a whole leading segment comes off. A request that does not start with
