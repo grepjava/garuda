@@ -174,6 +174,25 @@ int64_t pg_mtime_ns(const char *path);
 int pg_is_dir(const char *path);
 /* Non-blocking, close-on-exec pipe. */
 int pg_pipe(int fds[2]);
+
+/* --reload, restarting the supervisor on a rebuilt executable. */
+/* The running executable's absolute path. 0, or -1 where it cannot be found. */
+int pg_executable_path(char *out, size_t cap);
+/* A digest of what a file is on disk -- device, inode, size, mode and
+ * modification time -- or 0 when it does not exist or is not an executable
+ * regular file (`executable`) or a regular file at all. */
+uint64_t pg_file_signature(const char *path, int executable);
+/* Runs `path --version` with its output discarded, waiting up to timeout_ms.
+ * 1 when it exited 0, which says the file is a whole executable that starts. */
+int pg_probe_executable(const char *path, int timeout_ms);
+int pg_clear_cloexec(int fd);
+/* execv. Returns only on failure, with errno set. */
+int pg_execv(const char *path, char *const argv[]);
+/* Blocks, and unblocks, the signals the supervisor's pipe carries. The mask
+ * survives exec, so a signal arriving before the new image has handlers waits
+ * for them instead of taking its default action. */
+void pg_block_piped_signals(void);
+void pg_unblock_piped_signals(void);
 int pg_random_bytes(void *out, size_t n);
 
 /* ---------------------------------------------------------------------------

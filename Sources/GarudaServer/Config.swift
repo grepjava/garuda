@@ -207,7 +207,8 @@ public struct ServerConfig {
     public var cacheTTLMaxSeconds = 300
 
     // --- development ---
-    /// Restart workers when a watched source file changes.
+    /// Restart on the executable when it is rebuilt, and replace the workers
+    /// when a certificate or key file changes.
     public var reload = false
     public var reloadIntervalMs: UInt64 = 500
 

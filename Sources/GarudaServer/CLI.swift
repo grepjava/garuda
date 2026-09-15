@@ -111,7 +111,12 @@ public enum GarudaCLI {
               --forwarded-allow-ips L  proxies whose X-Forwarded-* headers are trusted:
                                        a comma-separated list of addresses or CIDR
                                        blocks, "unix", or "*" for every peer
-              --reload                 restart workers when source files change
+              --reload                 when the executable is rebuilt, restart on it
+                                       without dropping a connection; when a
+                                       --tls-cert or --tls-key file changes, replace
+                                       the workers
+              --reload-interval MS     how often --reload looks, where the kernel
+                                       sends no notification (default 500)
               --tls-cert PATH          PEM certificate chain; enables TLS with ALPN.
                                        Repeatable, with a --tls-key each: the first
                                        pair is the default and the rest are picked by

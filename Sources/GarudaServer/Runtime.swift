@@ -50,6 +50,17 @@ public enum Garuda {
 
     /// Boots the server. Returns a process exit code.
     public static func run(config: ServerConfig) -> Int32 {
+        // --reload: this image may be a supervisor restarted on a rebuilt
+        // executable, holding the previous image's sockets and workers.
+        var inherited = Reexec.take()
+        let code = start(config, inherited: &inherited)
+        // A rebuilt executable that could not start stops the workers it
+        // inherited, rather than leaving them serving with no supervisor.
+        inherited?.release()
+        return code
+    }
+
+    static func start(_ config: ServerConfig, inherited: inout Reexec?) -> Int32 {
         Log.level = config.logLevel
         Log.pid = Int(pg_getpid())
         // Inside python (garuda._native) the process is named "python" until
@@ -191,7 +202,8 @@ public enum Garuda {
         // the worst way for a certbot deploy hook to fail.
         return runSupervisor(config,
                              workers: max(1, workerCount),
-                             listeners: workerCount)
+                             listeners: workerCount,
+                             inherited: &inherited)
     }
 
     /// Builds the TLS context, with the ALPN list the rest of the
@@ -308,7 +320,8 @@ public enum Garuda {
     /// where one child holds every worker as a thread and therefore wants every
     /// socket.
     static func runSupervisor(_ config: ServerConfig, workers: Int,
-                              listeners listenerCount: Int) -> Int32 {
+                              listeners listenerCount: Int,
+                              inherited: inout Reexec?) -> Int32 {
         // One listener per worker, created here and inherited across fork.
         //
         // For TCP that is N sockets with SO_REUSEPORT -- N independent accept
@@ -331,7 +344,26 @@ public enum Garuda {
         let listeners = UnsafeMutablePointer<Int32>.allocate(capacity: count)
         defer { listeners.deallocate() }
         listeners.initialize(repeating: -1, count: count)
-        if config.unixPath != nil {
+        // --reload, after an exec: the sockets are the ones already listening,
+        // and the workers already serving from them are adopted below.
+        var adopted: [pid_t] = []
+        if let record = inherited {
+            inherited = nil
+            if record.fits(workers: workers, listeners: count) {
+                for i in 0..<count {
+                    listeners[i] = record.listeners[i]
+                    // Open across the exec on purpose; closed across any other.
+                    _ = pg_set_cloexec(listeners[i])
+                }
+                adopted = record.workers
+            } else {
+                Log.warn("the rebuilt executable runs a different number of workers; starting afresh")
+                record.release()
+            }
+        }
+        if !adopted.isEmpty {
+            // Already listening.
+        } else if config.unixPath != nil {
             guard let fd = openListener(config, reusePort: false, unlinkStale: true) else {
                 return 1
             }
@@ -350,14 +382,25 @@ public enum Garuda {
         defer { removeUnixPath(config) }
 
         let signalFD = pg_signal_pipe_init()
+        // A supervisor that exec'd this image blocked these first, so that
+        // one arriving in between would wait for the handlers just installed.
+        pg_unblock_piped_signals()
         let pids = UnsafeMutablePointer<pid_t>.allocate(capacity: workers)
         defer { pids.deallocate() }
         pids.initialize(repeating: 0, count: workers)
 
-        Log.info { line in
-            line.str("garuda starting with ")
-            line.int(workers)
-            line.str(" workers")
+        if adopted.isEmpty {
+            Log.info { line in
+                line.str("garuda starting with ")
+                line.int(workers)
+                line.str(" workers")
+            }
+        } else {
+            Log.info { line in
+                line.str("garuda restarted on the rebuilt executable, adopting ")
+                line.int(workers)
+                line.str(" workers")
+            }
         }
 
         // Metrics slots come in pairs, so that a worker and the replacement
@@ -385,6 +428,10 @@ public enum Garuda {
         }
 
         for i in 0..<workers {
+            if !adopted.isEmpty && adopted[i] > 0 {
+                pids[i] = adopted[i]
+                continue
+            }
             let started = spawn(i)
             // Nothing is waiting on readiness at start-up: there is no worker
             // being replaced, so there is nothing to hold on to it for.
@@ -394,7 +441,20 @@ public enum Garuda {
         }
 
         let watcher = config.reload ? ReloadWatcher(config: config) : nil
-        if watcher != nil { Log.info("watching for source changes (--reload)") }
+        if let watcher {
+            if let path = watcher.executablePath {
+                Log.info { line in
+                    line.str("--reload: watching ")
+                    path.withCString { line.cstr($0) }
+                    line.str(" for a rebuild")
+                }
+            } else {
+                Log.warn("--reload: cannot find the running executable; only certificates are watched")
+            }
+        }
+        /// A rebuilt executable waiting for a restart pass or a draining
+        /// worker to finish, since neither survives the exec.
+        var execPending = false
 
         var shuttingDown = false
         var killDeadline: UInt64 = 0
@@ -603,6 +663,41 @@ public enum Garuda {
             advanceRestart()
         }
 
+        /// Execs the rebuilt executable in place of this process, handing it
+        /// the listening sockets and the workers. Returns only if that failed,
+        /// with everything as it was.
+        func reexec() {
+            guard let path = watcher?.executablePath else { return }
+            // Catches a file that is not a whole executable before this
+            // process becomes it: a failed exec returns, a bad image does not.
+            if pg_probe_executable(path, 5_000) == 0 {
+                Log.error("--reload: the rebuilt executable does not run; keeping the current one")
+                return
+            }
+            Log.info("executable rebuilt; restarting the supervisor on it")
+            let record = Reexec(listeners: (0..<count).map { listeners[$0] },
+                                workers: (0..<workers).map { pids[$0] })
+            var distinct: [Int32] = []
+            for fd in record.listeners where !distinct.contains(fd) { distinct.append(fd) }
+            setenv(Reexec.variable, record.encoded(), 1)
+            for fd in distinct { _ = pg_clear_cloexec(fd) }
+            pg_block_piped_signals()
+            _ = path.withCString { pg_execv($0, CommandLine.unsafeArgv) }
+            let e = pg_errno()
+            pg_unblock_piped_signals()
+            for fd in distinct { _ = pg_set_cloexec(fd) }
+            unsetenv(Reexec.variable)
+            Log.error { line in
+                line.str("--reload: cannot exec the rebuilt executable: ")
+                line.cstr(pg_strerror(e))
+            }
+        }
+
+        // The workers adopted after an exec run the old code; replace them.
+        if !adopted.isEmpty {
+            beginRestart("replacing the workers forked from the previous executable")
+        }
+
         while alive > 0 {
             // A pending handover is the one thing this loop waits on that is
             // not a signal, and the wait is measured in the tens of
@@ -705,8 +800,20 @@ public enum Garuda {
                 killDeadline = 0
             }
 
-            if let watcher, !shuttingDown, watcher.changed() {
-                beginRestart("source change detected; reloading workers")
+            if let watcher, !shuttingDown {
+                switch watcher.poll() {
+                case .executable:
+                    execPending = true
+                case .certificates:
+                    beginRestart("certificate changed on disk; reloading workers")
+                case .none:
+                    break
+                }
+            }
+            if execPending && !shuttingDown && restartCursor < 0 && handoverSlot < 0
+                && acmePid == 0 && !(0..<workers).contains(where: { retiring[$0] != 0 }) {
+                execPending = false
+                reexec()
             }
 
             checkCertificate()

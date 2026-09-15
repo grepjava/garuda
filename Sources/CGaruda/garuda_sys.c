@@ -662,6 +662,18 @@ pid_t pg_fork_worker(void) {
     return pid;
 }
 
+void pg_block_piped_signals(void) {
+    sigset_t set;
+    piped_signals(&set);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+}
+
+void pg_unblock_piped_signals(void) {
+    sigset_t set;
+    piped_signals(&set);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
+
 /* For a child that is not a worker: the ordinary dispositions back, and no
  * pipe. Without this a SIGTERM to such a child ran the inherited handler,
  * which wrote the signal into the supervisor's pipe -- so the helper ignored

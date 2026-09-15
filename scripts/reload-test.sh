@@ -23,6 +23,10 @@
 # Now the supervisor owns the listeners and a replacement inherits the same
 # socket its predecessor had, so a slot's accept queue is never orphaned, and
 # the replacement is spawned before the worker it replaces is asked to stop.
+#
+# The middle reload is a rebuild rather than a SIGHUP: the server runs from a
+# copy of the binary with --reload, the copy is replaced, and the supervisor
+# execs the new file while keeping its sockets. That must cost nothing either.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -48,9 +52,13 @@ server_trap_cleanup
 
 server_require_port_free "$PORT" || exit 1
 
+# A copy for the rebuild to replace, leaving the real binary alone.
+COPY=${TMPDIR:-/tmp}/garuda-reload-bin-$PORT
+cp "$BIN" "$COPY" && chmod 755 "$COPY" || exit 1
+
 # shellcheck disable=SC2086 -- EXTRA is a deliberate word-split flag list.
-server_start "$BIN" --port "$PORT" --workers "$WORKERS" --log-level info \
-    --access-log $EXTRA > "$LOG" 2>&1
+server_start "$COPY" --port "$PORT" --workers "$WORKERS" --log-level info \
+    --access-log --reload $EXTRA > "$LOG" 2>&1
 
 for _ in $(seq 1 60); do
     curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null && break
@@ -98,8 +106,13 @@ gap=$((SECONDS_OF_LOAD / (RELOADS + 1)))
 i=0
 while [ "$i" -lt "$RELOADS" ]; do
     sleep "$gap"
-    echo "  SIGHUP"
-    kill -HUP "$SERVER_PID" 2>/dev/null
+    if [ "$i" -eq 1 ]; then
+        echo "  rebuild"
+        cp "$BIN" "$COPY.new" && chmod 755 "$COPY.new" && mv -f "$COPY.new" "$COPY"
+    else
+        echo "  SIGHUP"
+        kill -HUP "$SERVER_PID" 2>/dev/null
+    fi
     i=$((i + 1))
 done
 
@@ -180,6 +193,17 @@ if grep -q "reloading workers" "$LOG"; then
 else
     bad "the supervisor logged the reload" "no reload line in $LOG"
 fi
+
+if [ "$RELOADS" -gt 1 ]; then
+    RUNNING=$(readlink "/proc/$SERVER_PID/exe" 2>/dev/null)
+    if grep -q "restarting the supervisor on it" "$LOG" && [ "$RUNNING" = "$COPY" ]; then
+        ok "the rebuild restarted the same supervisor on the new executable"
+    else
+        bad "the rebuild restarted the same supervisor on the new executable" \
+            "pid $SERVER_PID is running '$RUNNING'"
+    fi
+fi
+rm -f "$COPY" "$COPY.new"
 
 echo
 echo "  $PASS passed, $FAIL failed"

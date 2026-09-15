@@ -83,12 +83,12 @@ def is_(name, actual, expected):
 
 class Server:
     def __init__(self, *args, port=None, unix=None, env=None, tls=False, alpn=None,
-                 cwd=None):
+                 cwd=None, binary=None):
         self.port = port
         self.unix = unix
         self.tls = tls
         self.alpn = alpn
-        cmd = [BIN, "--log-level", "error"]
+        cmd = [binary or BIN, "--log-level", "error"]
         cmd += EXTRA
         if tls:
             cert, key = make_certs()
@@ -793,38 +793,96 @@ def test_worker_restart():
         server.stop()
 
 
+def copy_executable(path):
+    """A private copy of the server, for a test to rebuild under itself."""
+    shutil.copyfile(BIN, path)
+    os.chmod(path, 0o755)
+
+
+def rebuild(path, content=None):
+    """A rebuild the way a linker writes one: a new file renamed over the old.
+    With `content`, what gets written is that rather than a working server."""
+    temporary = path + ".new"
+    if content is None:
+        shutil.copyfile(BIN, temporary)
+    else:
+        with open(temporary, "wb") as fh:
+            fh.write(content)
+    os.chmod(temporary, 0o755)
+    os.replace(temporary, path)
+
+
+def process_executable(pid):
+    try:
+        return os.readlink("/proc/%d/exe" % pid)
+    except OSError:
+        return None
+
+
+def wait_restarted(server, binary, before, timeout):
+    """Waits for the supervisor to be running `binary` itself -- not a deleted
+    file of that name -- with none of the workers in `before` left. Returns the
+    workers, and how long it took."""
+    began = time.monotonic()
+    after = before
+    while time.monotonic() - began < timeout:
+        time.sleep(0.1)
+        after = server.workers() or set()
+        # Disjoint, not merely different: the replacement is started before
+        # the worker it replaces is asked to stop.
+        if (after and after.isdisjoint(before)
+                and process_executable(server.proc.pid) == binary):
+            break
+    return after, time.monotonic() - began
+
+
 def test_reload():
     print("\nDevelopment reload")
-    # --reload watches the directory the server runs in, so it runs in one of
-    # its own, holding a file that nothing else depends on. Only some kinds of
-    # file are watched, configuration among them, hence the .toml.
+    # --reload watches the executable, so the server runs from a copy that the
+    # test can rebuild without touching the one the rest of the suite uses.
     project = tempfile.mkdtemp(prefix="garuda-reload-")
-    scratch = os.path.join(project, "reload_probe.toml")
-    with open(scratch, "w") as fh:
-        fh.write("MARK = 1\n")
+    binary = os.path.join(project, "garuda")
+    copy_executable(binary)
     port = free_port()
-    server = Server("--reload", "--reload-interval", "200", port=port, cwd=project)
+    server = Server("--reload", "--reload-interval", "200", port=port, cwd=project,
+                    binary=binary)
     try:
         before = server.wait_workers(1)
         if before is None:
             print("  --   skipped: no /proc to find the workers in")
             return
+        supervisor = server.proc.pid
         time.sleep(0.4)
-        with open(scratch, "w") as fh:
-            fh.write("MARK = 2\n")
-        deadline = time.monotonic() + 15.0
-        after = before
-        while time.monotonic() < deadline:
-            time.sleep(0.3)
-            after = server.workers() or set()
-            # Disjoint, not merely different: the replacement is started
-            # before the worker it replaces is asked to stop.
-            if after and after.isdisjoint(before):
-                break
-        check("editing a watched file restarts the worker",
-              bool(after) and after.isdisjoint(before),
-              "the workers went from %s to %s" % (sorted(before), sorted(after)))
+        rebuild(binary)
+        after, _ = wait_restarted(server, binary, before, 15.0)
+        check("a rebuilt executable restarts the server on it",
+              bool(after) and after.isdisjoint(before)
+              and process_executable(supervisor) == binary,
+              "workers %s -> %s, supervisor running %s"
+              % (sorted(before), sorted(after), process_executable(supervisor)))
+        check("the supervisor keeps its pid across the restart",
+              server.proc.poll() is None and server.proc.pid == supervisor)
+        running = {pid: process_executable(pid) for pid in after}
+        check("every worker runs the rebuilt executable",
+              bool(running) and all(exe == binary for exe in running.values()),
+              "worker executables: %s" % running)
         is_("the server still answers after a reload", server.get("/")[0], 200)
+
+        # A half-written or broken build is not something to become.
+        rebuild(binary, b"\x7fELF not a whole executable\n")
+        time.sleep(2.0)
+        still = server.workers() or set()
+        check("a rebuilt executable that does not run is not restarted on",
+              server.proc.poll() is None and still == after,
+              "workers %s -> %s" % (sorted(after), sorted(still)))
+        is_("the server still answers after a broken build", server.get("/")[0], 200)
+
+        rebuild(binary)
+        fixed, _ = wait_restarted(server, binary, after, 15.0)
+        check("the next good build is picked up",
+              bool(fixed) and fixed.isdisjoint(after)
+              and process_executable(supervisor) == binary,
+              "workers %s -> %s" % (sorted(after), sorted(fixed)))
     finally:
         server.stop()
         shutil.rmtree(project, ignore_errors=True)
@@ -832,37 +890,72 @@ def test_reload():
 
 def test_reload_notified():
     print("\nDevelopment reload, woken by the kernel")
-    # A tree on a local filesystem, because a bind mount or a Windows drive
-    # under WSL may never send a notification, and an interval long enough
-    # that a reload arriving quickly can only have been woken, not polled.
-    project = tempfile.mkdtemp(prefix="pg-reload-", dir=os.path.expanduser("~"))
-    probe = os.path.join(project, "reload_probe.toml")
-    with open(probe, "w") as fh:
-        fh.write("MARK = 1\n")
+    # A local filesystem, because a bind mount or a Windows drive under WSL may
+    # never send a notification, and an interval long enough that a restart
+    # arriving quickly can only have been woken, not polled.
+    project = tempfile.mkdtemp(prefix="garuda-reload-", dir=os.path.expanduser("~"))
+    binary = os.path.join(project, "garuda")
+    copy_executable(binary)
     port = free_port()
-    server = Server("--reload", "--reload-interval", "10000", port=port, cwd=project)
+    server = Server("--reload", "--reload-interval", "10000", port=port, cwd=project,
+                    binary=binary)
     try:
         before = server.wait_workers(1)
         if before is None:
             print("  --   skipped: no /proc to find the workers in")
             return
         time.sleep(0.5)
-        # Saved the way most editors save: a new file renamed over the old one.
-        temporary = probe + ".swp"
-        with open(temporary, "w") as fh:
-            fh.write("MARK = 2\n")
-        os.replace(temporary, probe)
-        began = time.monotonic()
+        rebuild(binary)
+        after, elapsed = wait_restarted(server, binary, before, 8.0)
+        check("a rebuild restarts well inside a 10 s --reload-interval",
+              bool(after) and after.isdisjoint(before) and elapsed < 5.0,
+              "workers %s -> %s after %.1fs" % (sorted(before), sorted(after), elapsed))
+    finally:
+        server.stop()
+        shutil.rmtree(project, ignore_errors=True)
+
+
+def test_reload_certificates():
+    print("\nDevelopment reload, certificates")
+    if not have_openssl():
+        print("  --   skipped: no openssl to make a certificate with")
+        return
+    project = tempfile.mkdtemp(prefix="garuda-reload-tls-")
+    cert, key = make_certs()
+    my_cert = os.path.join(project, "cert.pem")
+    my_key = os.path.join(project, "key.pem")
+    shutil.copyfile(cert, my_cert)
+    shutil.copyfile(key, my_key)
+    port = free_port()
+    server = Server("--reload", "--reload-interval", "200", "--log-level", "info",
+                    "--tls-cert", my_cert, "--tls-key", my_key, port=port, cwd=project)
+    server.tls = True
+    try:
+        before = server.wait_workers(1)
+        if before is None:
+            print("  --   skipped: no /proc to find the workers in")
+            return
+        time.sleep(0.4)
+        # Renewed the way a tool writes one: a new file renamed over the old.
+        temporary = my_cert + ".new"
+        shutil.copyfile(cert, temporary)
+        os.replace(temporary, my_cert)
+        deadline = time.monotonic() + 15.0
         after = before
-        while time.monotonic() - began < 8.0:
-            time.sleep(0.1)
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
             after = server.workers() or set()
             if after and after.isdisjoint(before):
                 break
-        elapsed = time.monotonic() - began
-        check("a save reloads well inside a 10 s --reload-interval",
-              bool(after) and after.isdisjoint(before) and elapsed < 5.0,
-              "workers %s -> %s after %.1fs" % (sorted(before), sorted(after), elapsed))
+        check("a changed certificate replaces the workers",
+              bool(after) and after.isdisjoint(before),
+              "workers %s -> %s" % (sorted(before), sorted(after)))
+        output = server.output()
+        check("without restarting the supervisor",
+              b"certificate changed on disk" in output
+              and b"restarting the supervisor" not in output,
+              output.decode(errors="replace")[-400:])
+        is_("the server still answers over TLS", server.get("/")[0], 200)
     finally:
         server.stop()
         shutil.rmtree(project, ignore_errors=True)
@@ -940,7 +1033,8 @@ def main():
     print("garuda feature tests (%s)" % BIN)
     for test in (test_tls, test_websocket_refusal, test_access_log, test_metrics,
                  test_body_limit, test_multiworker_unix, test_worker_restart,
-                 test_reload, test_reload_notified, test_graceful_shutdown):
+                 test_reload, test_reload_notified, test_reload_certificates,
+                 test_graceful_shutdown):
         try:
             test()
         except Exception as exc:                            # noqa: BLE001

@@ -23,7 +23,13 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <limits.h>
+#include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 /* ======================================================================== */
 /* Addresses                                                                */
@@ -92,6 +98,96 @@ int pg_pipe(int fds[2]) {
         pg_set_cloexec(fds[i]);
     }
     return 0;
+}
+
+/* ======================================================================== */
+/* --reload: the executable                                                 */
+/* ======================================================================== */
+
+int pg_executable_path(char *out, size_t cap) {
+    if (cap < 2) return -1;
+#if defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", out, cap - 1);
+    if (n <= 0 || (size_t)n >= cap - 1) return -1;
+    out[n] = 0;
+    /* Replaced before it could be asked: there is no file left to watch. */
+    static const char deleted[] = " (deleted)";
+    size_t d = sizeof deleted - 1;
+    if ((size_t)n > d && memcmp(out + n - d, deleted, d) == 0) return -1;
+    return 0;
+#elif defined(__APPLE__)
+    char raw[PATH_MAX];
+    uint32_t size = sizeof raw;
+    if (_NSGetExecutablePath(raw, &size) != 0) return -1;
+    char resolved[PATH_MAX];
+    if (!realpath(raw, resolved)) return -1;
+    size_t n = strlen(resolved);
+    if (n >= cap) return -1;
+    memcpy(out, resolved, n + 1);
+    return 0;
+#else
+    (void)out;
+    return -1;
+#endif
+}
+
+uint64_t pg_file_signature(const char *path, int executable) {
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+    if (executable && access(path, X_OK) != 0) return 0;
+#if defined(__APPLE__)
+    int64_t sec = st.st_mtimespec.tv_sec, nsec = st.st_mtimespec.tv_nsec;
+#else
+    int64_t sec = st.st_mtim.tv_sec, nsec = st.st_mtim.tv_nsec;
+#endif
+    uint64_t parts[6] = {
+        (uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_size,
+        (uint64_t)st.st_mode, (uint64_t)sec, (uint64_t)nsec,
+    };
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < sizeof parts; i++) {
+        h = (h ^ ((unsigned char *)parts)[i]) * 1099511628211ULL;
+    }
+    return h ? h : 1;
+}
+
+int pg_probe_executable(const char *path, int timeout_ms) {
+    pid_t pid = fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, 0);
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+        }
+        execl(path, path, "--version", (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    for (int waited = 0;; waited += 5) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 1 : 0;
+        if (r < 0 && errno != EINTR) return 0;
+        if (waited >= timeout_ms) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return 0;
+        }
+        struct timespec ts = { 0, 5000000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+int pg_clear_cloexec(int fd) {
+    int f = fcntl(fd, F_GETFD, 0);
+    if (f < 0) return -1;
+    return fcntl(fd, F_SETFD, f & ~FD_CLOEXEC);
+}
+
+int pg_execv(const char *path, char *const argv[]) {
+    execv(path, argv);
+    return -1;
 }
 
 /* ======================================================================== */
