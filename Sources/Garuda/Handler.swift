@@ -22,23 +22,14 @@ public typealias Handler = (borrowing Request, inout Response) throws -> Void
 
 // MARK: - Routes
 
-public struct Routes {
+/// Routes as an `Application` registers them, compiled when it runs.
+struct Routes {
     var table = RouteTable()
     var handlers: [Handler] = []
 
-    public init() {}
-
-    public mutating func get(_ pattern: String, _ handler: @escaping Handler) { on(.get, pattern, handler) }
-    public mutating func head(_ pattern: String, _ handler: @escaping Handler) { on(.head, pattern, handler) }
-    public mutating func post(_ pattern: String, _ handler: @escaping Handler) { on(.post, pattern, handler) }
-    public mutating func put(_ pattern: String, _ handler: @escaping Handler) { on(.put, pattern, handler) }
-    public mutating func delete(_ pattern: String, _ handler: @escaping Handler) { on(.delete, pattern, handler) }
-    public mutating func patch(_ pattern: String, _ handler: @escaping Handler) { on(.patch, pattern, handler) }
-    public mutating func options(_ pattern: String, _ handler: @escaping Handler) { on(.options, pattern, handler) }
-
     /// Registers `handler` for `method` and `pattern`. A pattern that cannot
     /// be served is a mistake in the program, found before the server starts.
-    public mutating func on(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping Handler) {
+    mutating func on(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping Handler) {
         do {
             try table.add(method, pattern, route: Int32(handlers.count))
         } catch {
@@ -46,23 +37,6 @@ public struct Routes {
         }
         handlers.append(handler)
     }
-}
-
-/// The routes every worker serves: compiled before the first fork, only read
-/// after it, and never freed.
-struct InstalledRoutes {
-    let routes: CompiledRoutes
-    let handlers: UnsafeMutablePointer<Handler>
-}
-
-nonisolated(unsafe) var installedRoutes: UnsafeMutablePointer<InstalledRoutes>? = nil
-
-func install(_ routes: Routes) {
-    let handlers = UnsafeMutablePointer<Handler>.allocate(capacity: max(1, routes.handlers.count))
-    for (i, handler) in routes.handlers.enumerated() { (handlers + i).initialize(to: handler) }
-    let installed = UnsafeMutablePointer<InstalledRoutes>.allocate(capacity: 1)
-    installed.initialize(to: InstalledRoutes(routes: routes.table.compile(), handlers: handlers))
-    installedRoutes = installed
 }
 
 // MARK: - Request
@@ -290,27 +264,3 @@ extension ByteSpan {
         count == literal.utf8CodeUnitCount && equalsExact(base, count, literal)
     }
 }
-
-// MARK: - Serving
-
-/// Parses the process's command line as the `garuda` executable does, then
-/// serves `routes` until shut down. Returns the process exit code.
-///
-/// `onStart` runs in each worker before it accepts a connection -- a
-/// replacement worker is not handed its slot until it returns -- and
-/// `onShutdown` in each worker once its in-flight requests have finished or
-/// --graceful-timeout has run out. Both get the worker's index.
-public func serve(_ routes: Routes,
-                  onStart: ((Int) -> Void)? = nil,
-                  onShutdown: ((Int) -> Void)? = nil) -> Int32 {
-    install(routes)
-    lifecycle = Lifecycle(onStart: onStart, onShutdown: onShutdown)
-    return GarudaCLI.main(argc: Int(CommandLine.argc), argv: CommandLine.unsafeArgv)
-}
-
-struct Lifecycle {
-    var onStart: ((Int) -> Void)?
-    var onShutdown: ((Int) -> Void)?
-}
-
-nonisolated(unsafe) var lifecycle = Lifecycle()

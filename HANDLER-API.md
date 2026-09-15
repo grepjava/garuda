@@ -18,34 +18,39 @@ Status, 2026-09-15: phase 1 is implemented. Routes, a `Request` view, a one-shot
 ```swift
 import Garuda
 
-var routes = Routes()
+let app = Application()
 
-routes.get("/") { _, response in
+app.get("/") { _, response in
     response.send(status: 200)
 }
-routes.get("/user/:id") { request, response in
+app.get("/user/:id") { request, response in
     response.send(request.parameter(0))          // the id's bytes, no String made
 }
-routes.post("/echo") { request, response in
-    response.addHeader("content-type", request.header("content-type") ?? "application/octet-stream")
+app.post("/echo") { request, response in
+    if let type = request.header("content-type") {
+        response.addHeader("content-type", type)
+    }
     response.send(request.body)                  // the whole body, buffered up to --max-body
 }
-routes.get("/delay/:ms") { request, response in
+app.get("/delay/:ms") { request, response in
     let ms = UInt64(min(5000, max(1, request.parameter(0).integer ?? 1)))
     response.after(milliseconds: ms) { _, response in
         response.send(status: 200)
     }
 }
 
-exit(serve(routes))
+exit(app.run())
 ```
 
-- **Routes.** `get`, `head`, `post`, `put`, `delete`, `patch`, `options` and `on`. Segments are literal, `:param` or a trailing `*rest`. Patterns compile at start-up into a byte trie: literal before parameter before rest, with backtracking, HEAD falling back to GET, at most eight parameters. `--root-path` is taken off before matching.
+This is the phase-1 API as step 1 has reshaped it so far: the routes and hooks belong to an `Application`, and the module is `Garuda`.
+
+- **Routes.** `get`, `head`, `post`, `put`, `delete`, `patch`, `options` and `on`. Segments are literal, `:param` or a trailing `*rest`. Patterns compile into a byte trie when the application first runs or is tested: literal before parameter before rest, with backtracking, HEAD falling back to GET, at most eight parameters. `--root-path` is taken off before matching.
 - **`Request`**, a `~Copyable` view passed `borrowing`: `method`, `path`, `query`, `parameter(_:)`, `version`, `scheme`, `authority`, `header(_:)`, `forEachHeader`, `body`, `remoteAddress` and `remotePort` (with `--forwarded-allow-ips` applied), `requestID`, `requestStart` (kernel arrival under `--request-start-header`), `locals`.
 - **`Response`**, `~Copyable`, passed `inout`: `status`, `addHeader`, `send(status:)`, `send(status:_:)` for bytes, strings and arrays, and `after(milliseconds:then:)`.
 - **The response sink.** Every response goes through one engine path. It merges the server's headers without doubling a handler's own `X-Request-ID`, `Strict-Transport-Security` or `Alt-Svc`. It frames 204, 304 and HEAD. It enforces a declared `Content-Length`: extra bytes are cut, too few reset the stream or close the HTTP/1.1 connection.
 - **Errors.** A handler that throws, or returns without answering, gets a 500; the connection lives on.
-- **Lifecycle.** `serve(routes, onStart:, onShutdown:)` runs `onStart` in each worker before it reports ready and `onShutdown` after its loop ends.
+- **Lifecycle.** `app.onWorkerStart` hooks run in each worker before it reports ready, and `app.onWorkerShutdown` hooks after its loop ends.
+- **Running and testing.** `app.run()` parses the command line; `app.run(configuration:)` takes a `ServerConfig` through the same checks. `app.test` serves the routes from a worker in the test process over a socket pair, with no port.
 
 ## What phase 1 gets wrong
 
@@ -58,7 +63,7 @@ Checked against the code:
 - **No application state.** Lifecycle hooks return nothing, and a failing `onStart` cannot stop start-up.
 - **No composition.** No middleware, nesting or merging. A known path under the wrong method gets the same 404 as an unknown path.
 - **No streaming.** The body is buffered whole before dispatch, and `send` is one-shot.
-- **Hard to test.** `serve` installs process-global routes that live forever, reads the process arguments and runs the supervisor.
+- **Hard to test.** `Garuda.serve` installed process-global routes that lived forever, read the process arguments and ran the supervisor. Fixed in step 1: `Application` owns its routes and hooks, `run(configuration:)` needs no command line, and `app.test` runs requests in-process.
 - **Not usable as a versioned dependency.** Every target applied `unsafeFlags(["-enforce-exclusivity=unchecked"])`, and SwiftPM refuses them in a package depended on by version: "the target 'GarudaServer' in product 'Garuda' contains unsafe build flags". Fixed in step 1.
 
 ## Roadmap
@@ -154,6 +159,7 @@ What an async handler costs:
 
 #### The application instance and the test client
 
+- **Landed so far:** `Application` with its routes and worker hooks, `run()` and `run(configuration:)` over a `ServerConfig` checked as the command line is, and `app.test`, a worker in the test process driven over a socket pair. Middleware and state factories arrive with steps 2 and 4.
 - **`Application`** owns the routes, middleware, state factories and a programmatic `Configuration`. `app.run()` fills the configuration from the command line unless it was given one, and runs the supervisor. It replaces `Routes`, the global `installedRoutes` and the global `lifecycle`. The compiled route table belongs to the application and is freed when it shuts down; workers still inherit it through the fork.
 - **`app.test`** runs a request through routing, extraction, middleware, the handler and the response sink in-process, on a test worker with no socket, and returns the parsed response.
 - **`app.test.withServer { url in … }`** starts the application on an ephemeral port for integration tests and shuts it down deterministically.

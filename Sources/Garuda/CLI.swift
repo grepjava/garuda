@@ -21,6 +21,24 @@ public enum GarudaCLI {
     /// exiting, so that the caller decides how the process ends.
     public static func main(argc: Int,
                             argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32 {
+        switch parse(argc: argc, argv: argv) {
+        case .exit(let status):
+            return status
+        case .run(let config):
+            return GarudaRuntime.run(config: config)
+        }
+    }
+
+    enum Parsed {
+        /// Serve with this configuration.
+        case run(ServerConfig)
+        /// Stop with this status: --help, --version, or a mistake already reported.
+        case exit(Int32)
+    }
+
+    /// Reads `argv` into a configuration, checked and finished by `finish`.
+    static func parse(argc: Int,
+                      argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Parsed {
         @inline(__always)
         func matches(_ arg: UnsafePointer<CChar>, _ name: StaticString) -> Bool {
             strcmp(arg, staticCString(name)) == 0
@@ -30,60 +48,6 @@ public enum GarudaCLI {
             Int(strtol(s, nil, 10))
         }
 
-        /// Formats an integer into a permanently-allocated C string. Used only for the
-        /// SERVER_PORT environ value, once per process.
-        func makeCString(_ value: Int) -> UnsafePointer<CChar> {
-            let buf = UnsafeMutablePointer<CChar>.allocate(capacity: 24)
-            var n = 0
-            buf.withMemoryRebound(to: UInt8.self, capacity: 24) { p in
-                n = writeDecimal(value, p)
-            }
-            buf[n] = 0
-            return UnsafePointer(buf)
-        }
-
-        /// `dir` followed by `suffix`, in permanently allocated memory. Once per
-        /// process, for the paths --acme-cache implies.
-        func joinPath(_ dir: UnsafePointer<CChar>, _ suffix: StaticString) -> UnsafePointer<CChar> {
-            let head = Int(strlen(dir))
-            let tail = suffix.utf8CodeUnitCount
-            let out = UnsafeMutablePointer<CChar>.allocate(capacity: head + tail + 1)
-            out.update(from: dir, count: head)
-            UnsafeRawPointer(suffix.utf8Start).withMemoryRebound(to: CChar.self, capacity: tail) {
-                (out + head).update(from: $0, count: tail)
-            }
-            out[head + tail] = 0
-            return UnsafePointer(out)
-        }
-
-        /// `h3=":443"; ma=86400` -- the Alt-Svc value advertising HTTP/3 on the UDP
-        /// port. The lifetime is a day, long enough to be worth caching and short
-        /// enough that turning HTTP/3 off is not a decision clients keep honouring.
-        func makeAltSvc(port: UInt16) -> (UnsafePointer<UInt8>, Int) {
-            var buf = ByteBuffer(capacity: 32)
-            defer { buf.destroy() }
-            buf.write("h3=\":")
-            buf.writeDecimal(Int(port))
-            buf.write("\"; ma=86400")
-            let n = buf.readableBytes
-            let out = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
-            out.update(from: buf.readPointer, count: n)
-            return (UnsafePointer(out), n)
-        }
-
-        /// `max-age=N`, the Strict-Transport-Security value --hsts asks for.
-        /// includeSubDomains and preload are left out: they commit other hosts to
-        /// https, which is a decision for whoever owns them, not a server flag.
-        func makeHSTS(seconds: Int) -> (UnsafePointer<UInt8>, Int) {
-            var buf = ByteBuffer(capacity: 32)
-            defer { buf.destroy() }
-            buf.write("max-age=")
-            buf.writeDecimal(seconds)
-            let n = buf.readableBytes
-            let out = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
-            out.update(from: buf.readPointer, count: n)
-            return (UnsafePointer(out), n)
-        }
 
         func printUsage() {
             let usage: StaticString = """
@@ -258,10 +222,10 @@ public enum GarudaCLI {
 
             if matches(arg, "-h") || matches(arg, "--help") {
                 printUsage()
-                return 0
+                return .exit(0)
             } else if matches(arg, "--version") {
                 printVersion()
-                return 0
+                return .exit(0)
             } else if matches(arg, "--host") {
                 guard let v = next("--host needs a value") else { break }
                 config.host = v
@@ -382,7 +346,7 @@ public enum GarudaCLI {
                 let p = parseInt(v)
                 if p <= 0 || p > 65535 {
                     Log.error("--quic-port must be between 1 and 65535")
-                    return 2
+                    return .exit(2)
                 }
                 config.quicPort = UInt16(p)
             } else if matches(arg, "--no-http2") {
@@ -548,8 +512,44 @@ public enum GarudaCLI {
         }
 
         if failed {
-            return 2
+            return .exit(2)
         }
+
+        let inputs = ConfigurationInputs(tlsCerts: tlsCerts, tlsKeys: tlsKeys,
+                                         staticRoutes: staticRoutes, schemeGiven: schemeGiven,
+                                         hstsSeconds: hstsSeconds, portSet: portSet)
+        if let status = finish(&config, inputs) {
+            return .exit(status)
+        }
+        return .run(config)
+    }
+
+    /// What the command line gathers that is not a configuration field of its
+    /// own, and `finish` needs.
+    struct ConfigurationInputs {
+        var tlsCerts: [UnsafePointer<CChar>] = []
+        var tlsKeys: [UnsafePointer<CChar>] = []
+        var staticRoutes: [(prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>)] = []
+        /// --scheme was given, so a TLS listener does not change it to https.
+        var schemeGiven = false
+        /// --hsts, or -1.
+        var hstsSeconds = -1
+        /// --port was given, so `serverPortString` already holds it.
+        var portSet = false
+    }
+
+    /// Checks a configuration and derives what the workers read from it: the
+    /// certificate pairs, the ACME paths, the https scheme, the HSTS and
+    /// Alt-Svc values and the port string. Returns an exit status once a
+    /// mistake has been reported, or nil when the configuration can be served.
+    /// The command line and `Application` both come through here.
+    static func finish(_ config: inout ServerConfig, _ inputs: ConfigurationInputs) -> Int32? {
+        let tlsCerts = inputs.tlsCerts
+        let tlsKeys = inputs.tlsKeys
+        let staticRoutes = inputs.staticRoutes
+        let schemeGiven = inputs.schemeGiven
+        let hstsSeconds = inputs.hstsSeconds
+        let portSet = inputs.portSet
 
         // Pair the certificates with their keys, in the order they were given. An
         // unequal count is a mistake worth stopping for: pairing what is there and
@@ -665,6 +665,63 @@ public enum GarudaCLI {
             config.serverPortString = makeCString(Int(config.port))
         }
 
-        return GarudaRuntime.run(config: config)
+        return nil
     }
+}
+
+// MARK: - Helpers
+
+/// Formats an integer into a permanently-allocated C string. Used only for the
+/// SERVER_PORT environ value, once per process.
+private func makeCString(_ value: Int) -> UnsafePointer<CChar> {
+    let buf = UnsafeMutablePointer<CChar>.allocate(capacity: 24)
+    var n = 0
+    buf.withMemoryRebound(to: UInt8.self, capacity: 24) { p in
+        n = writeDecimal(value, p)
+    }
+    buf[n] = 0
+    return UnsafePointer(buf)
+}
+
+/// `dir` followed by `suffix`, in permanently allocated memory. Once per
+/// process, for the paths --acme-cache implies.
+private func joinPath(_ dir: UnsafePointer<CChar>, _ suffix: StaticString) -> UnsafePointer<CChar> {
+    let head = Int(strlen(dir))
+    let tail = suffix.utf8CodeUnitCount
+    let out = UnsafeMutablePointer<CChar>.allocate(capacity: head + tail + 1)
+    out.update(from: dir, count: head)
+    UnsafeRawPointer(suffix.utf8Start).withMemoryRebound(to: CChar.self, capacity: tail) {
+        (out + head).update(from: $0, count: tail)
+    }
+    out[head + tail] = 0
+    return UnsafePointer(out)
+}
+
+/// `h3=":443"; ma=86400` -- the Alt-Svc value advertising HTTP/3 on the UDP
+/// port. The lifetime is a day, long enough to be worth caching and short
+/// enough that turning HTTP/3 off is not a decision clients keep honouring.
+private func makeAltSvc(port: UInt16) -> (UnsafePointer<UInt8>, Int) {
+    var buf = ByteBuffer(capacity: 32)
+    defer { buf.destroy() }
+    buf.write("h3=\":")
+    buf.writeDecimal(Int(port))
+    buf.write("\"; ma=86400")
+    let n = buf.readableBytes
+    let out = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
+    out.update(from: buf.readPointer, count: n)
+    return (UnsafePointer(out), n)
+}
+
+/// `max-age=N`, the Strict-Transport-Security value --hsts asks for.
+/// includeSubDomains and preload are left out: they commit other hosts to
+/// https, which is a decision for whoever owns them, not a server flag.
+private func makeHSTS(seconds: Int) -> (UnsafePointer<UInt8>, Int) {
+    var buf = ByteBuffer(capacity: 32)
+    defer { buf.destroy() }
+    buf.write("max-age=")
+    buf.writeDecimal(seconds)
+    let n = buf.readableBytes
+    let out = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
+    out.update(from: buf.readPointer, count: n)
+    return (UnsafePointer(out), n)
 }

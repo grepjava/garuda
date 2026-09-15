@@ -9,11 +9,11 @@ file, and a running server does not re-read its flags: changing one means a
 restart. `garuda --help` prints the list this page explains.
 
 **What answers requests today.** Requests that no server feature answers first
-go to the routes registered through the handler API (`Routes` and
-`serve`, in `Sources/Garuda/Handler.swift`). That API is early and
-will change; [HANDLER-API.md](HANDLER-API.md) has its roadmap. `serve`
-parses the flags on this page, so an application built on it takes the same
-command line. The `garuda` executable (`Sources/garuda-server/main.swift`) registers
+go to the routes registered through the handler API (`Application`, in
+`Sources/Garuda/Application.swift`). That API is early and will change;
+[HANDLER-API.md](HANDLER-API.md) has its roadmap. `app.run()` parses the flags
+on this page, so an application built on it takes the same command line, and
+`app.run(configuration:)` takes the same settings as a `ServerConfig`. The `garuda` executable (`Sources/garuda-server/main.swift`) registers
 these routes:
 
 | request | answer |

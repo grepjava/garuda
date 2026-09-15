@@ -39,24 +39,25 @@ service are in [INSTALLATION.md](INSTALLATION.md).
 
 ## The handler API
 
-The library product `Garuda` (the `Garuda` module) takes routes and
-serves them with the same command-line flags as the `garuda` binary:
+The library product `Garuda` (the `Garuda` module) serves an `Application`
+with the same command-line flags as the `garuda` binary:
 
 ```swift
 import Glibc                // Darwin on macOS, for exit
 import Garuda
 
-var routes = Routes()
-routes.get("/user/:id") { request, response in
+let app = Application()
+app.get("/user/:id") { request, response in
     response.send(request.parameter(0))
 }
-exit(serve(routes))
+exit(app.run())
 ```
 
-- **Routes** are registered with `get`, `head`, `post`, `put`, `delete`,
-  `patch`, `options` or `on`. A pattern segment is a literal, a `:param`, or a
-  trailing `*rest`, with at most 8 parameters. The table is compiled into a
-  byte trie at start-up. HEAD falls back to GET.
+- **Routes** are registered on the application with `get`, `head`, `post`,
+  `put`, `delete`, `patch`, `options` or `on`. A pattern segment is a literal, a
+  `:param`, or a trailing `*rest`, with at most 8 parameters. The table is
+  compiled into a byte trie when the application first runs or is tested.
+  HEAD falls back to GET.
 - **`Request`** is a `~Copyable` view of the request: `method`, `path`,
   `query`, `parameter(i)`, `version`, `scheme`, `authority`, `header(_:)`,
   `forEachHeader`, the whole `body`, `remoteAddress` and `remotePort` (with
@@ -64,9 +65,13 @@ exit(serve(routes))
 - **`Response`** is `~Copyable` too: `status`, `addHeader`, `send(status:)`,
   `send(status:_:)`, and `after(milliseconds:then:)`, which calls a handler
   again after a timer.
-- **`serve(routes, onStart:, onShutdown:)`** parses the flags and runs
-  the supervisor. `onStart` runs in each worker before it reports ready, and
-  `onShutdown` after its loop ends.
+- **`app.run()`** parses the flags and runs the supervisor;
+  `app.run(configuration:)` serves a `ServerConfig` instead. `onWorkerStart`
+  hooks run in each worker before it reports ready, and `onWorkerShutdown`
+  hooks after its loop ends.
+- **`app.test`** serves the routes from a worker in the test process, over a
+  socket pair with no port bound: `try app.test.get("/user/42")` returns the
+  status, headers and body.
 
 Every handler response goes through one response path. It frames 204, 304 and
 HEAD responses, adds the server's headers unless the handler set its own
@@ -355,7 +360,7 @@ reads the forwarded client and scheme as `request.remoteAddress`,
 Unit tests, including the fuzz corpus:
 
 ```bash
-swift test                                   # 193 tests
+swift test                                   # 203 tests
 ```
 
 The end-to-end suites run against the release binary, `.build/release/garuda`

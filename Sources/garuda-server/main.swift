@@ -18,21 +18,21 @@ import Darwin
 
 import Garuda
 
-var routes = Routes()
+let app = Application()
 
-routes.get("/") { _, response in
+app.get("/") { _, response in
     response.send(status: 200)
 }
 
-routes.get("/user/:id") { request, response in
+app.get("/user/:id") { request, response in
     response.send(request.parameter(0))
 }
 
-routes.post("/user") { _, response in
+app.post("/user") { _, response in
     response.send(status: 200)
 }
 
-routes.get("/delay/:ms") { request, response in
+app.get("/delay/:ms") { request, response in
     let digits = request.parameter(0)
     guard digits.count <= 5, let ms = digits.integer else {
         response.send(status: 404)
@@ -43,4 +43,4 @@ routes.get("/delay/:ms") { request, response in
     }
 }
 
-exit(serve(routes))
+exit(app.run())

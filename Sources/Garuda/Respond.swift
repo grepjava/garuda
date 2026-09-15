@@ -102,7 +102,7 @@ extension Worker {
     /// Matches the request against the installed routes and runs its handler,
     /// or answers 404.
     mutating func dispatchRoute(_ slot: Int) {
-        guard let installed = installedRoutes else {
+        guard let installed = application else {
             respond(slot, status: 404, nil, 0)
             return
         }

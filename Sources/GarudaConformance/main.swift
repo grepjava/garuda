@@ -133,13 +133,13 @@ func stuck(_ request: borrowing Request, _ response: inout Response) throws {
     response.after(milliseconds: 1000, then: stuck)
 }
 
-var routes = Routes()
+let app = Application()
 
-routes.get("/") { _, response in
+app.get("/") { _, response in
     response.send(status: 200)
 }
 
-routes.post("/echo") { request, response in
+app.post("/echo") { request, response in
     if let type = request.header("content-type") {
         response.addHeader("content-type", type)
     } else {
@@ -148,7 +148,7 @@ routes.post("/echo") { request, response in
     response.send(request.body)
 }
 
-routes.get("/headers") { request, response in
+app.get("/headers") { request, response in
     var json = JSON()
     json.raw("{\"method\":")
     json.string(methodName(request.method))
@@ -191,7 +191,7 @@ routes.get("/headers") { request, response in
     response.send(json.bytes)
 }
 
-routes.get("/status/:code") { request, response in
+app.get("/status/:code") { request, response in
     guard let code = request.parameter(0).integer, code >= 100, code <= 999 else {
         response.send(status: 400)
         return
@@ -220,7 +220,7 @@ routes.get("/status/:code") { request, response in
     response.send(status: code)
 }
 
-routes.get("/length/:declared/:actual") { request, response in
+app.get("/length/:declared/:actual") { request, response in
     guard let declared = request.parameter(0).integer,
           let actual = request.parameter(1).integer, actual <= 16 * 1024 * 1024 else {
         response.send(status: 400)
@@ -235,42 +235,42 @@ routes.get("/length/:declared/:actual") { request, response in
     response.send(body)
 }
 
-routes.get("/throw") { _, _ in
+app.get("/throw") { _, _ in
     throw HandlerFailure()
 }
 
-routes.get("/block/:ms") { request, response in
+app.get("/block/:ms") { request, response in
     let ms = min(10_000, request.parameter(0).integer ?? 0)
     usleep(UInt32(ms) * 1000)
     response.send(status: 200)
 }
 
-routes.get("/stuck", stuck)
+app.get("/stuck", stuck)
 
-routes.get("/delay/:ms") { request, response in
+app.get("/delay/:ms") { request, response in
     let ms = UInt64(min(5000, max(1, request.parameter(0).integer ?? 1)))
     response.after(milliseconds: ms) { _, response in
         response.send(status: 200)
     }
 }
 
-exit(serve(
-    routes,
-    onStart: { index in
-        startedWorker = index
-        if let path = environment("GARUDA_START_MARKER") {
-            append(path, "start \(getpid()) \(index)")
-        }
-        if let ms = environment("GARUDA_START_SLEEP_MS").flatMap({ Int($0) }), ms > 0 {
-            usleep(UInt32(ms) * 1000)
-        }
-    },
-    onShutdown: { index in
-        if let path = environment("GARUDA_SHUTDOWN_MARKER") {
-            append(path, "shutdown \(getpid()) \(index) \(wallMicros())")
-        }
-        if environment("GARUDA_SHUTDOWN_HANG") != nil {
-            while true { sleep(1) }
-        }
+app.onWorkerStart { index in
+    startedWorker = index
+    if let path = environment("GARUDA_START_MARKER") {
+        append(path, "start \(getpid()) \(index)")
     }
-))
+    if let ms = environment("GARUDA_START_SLEEP_MS").flatMap({ Int($0) }), ms > 0 {
+        usleep(UInt32(ms) * 1000)
+    }
+}
+
+app.onWorkerShutdown { index in
+    if let path = environment("GARUDA_SHUTDOWN_MARKER") {
+        append(path, "shutdown \(getpid()) \(index) \(wallMicros())")
+    }
+    if environment("GARUDA_SHUTDOWN_HANG") != nil {
+        while true { sleep(1) }
+    }
+}
+
+exit(app.run())

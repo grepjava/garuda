@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 193 unit tests
+swift test                             # 203 unit tests
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
 bash scripts/sni-test.sh               # 11
@@ -70,20 +70,26 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
 ### A handler API, first phase
 
 - The library product `Garuda` has a public handler API, early and still
-  changing ([HANDLER-API.md](HANDLER-API.md)). `Routes` registers handlers by
-  method and pattern (literal, `:param` and trailing `*rest` segments, at most
-  8 parameters), compiled into a byte trie at start-up; HEAD falls back to GET.
-  A `~Copyable` `Request` gives the method, path, query, parameters, version,
-  scheme, authority, headers, the whole body, the client with
-  `--forwarded-allow-ips` applied, the request ID, the request start and
-  `locals`. A `~Copyable` `Response` sets a status and headers, sends, or waits
-  with `after(milliseconds:then:)`. `serve(routes, onStart:, onShutdown:)`
-  parses the usual flags and runs the supervisor; `onStart` runs in each worker
-  before it reports ready, and `onShutdown` after its loop ends.
+  changing ([HANDLER-API.md](HANDLER-API.md)). An `Application` registers
+  handlers by method and pattern (literal, `:param` and trailing `*rest`
+  segments, at most 8 parameters), compiled into a byte trie when it first runs
+  or is tested; HEAD falls back to GET. A `~Copyable` `Request` gives the
+  method, path, query, parameters, version, scheme, authority, headers, the
+  whole body, the client with `--forwarded-allow-ips` applied, the request ID,
+  the request start and `locals`. A `~Copyable` `Response` sets a status and
+  headers, sends, or waits with `after(milliseconds:then:)`.
+- `app.run()` parses the usual flags and runs the supervisor, and
+  `app.run(configuration:)` serves a `ServerConfig` instead, checked the way
+  the command line is. `onWorkerStart` hooks run in each worker before it
+  reports ready, and `onWorkerShutdown` hooks after its loop ends. The routes
+  and hooks belong to the application, not the process.
+- `app.test` serves the application's routes from a worker in the test
+  process, over a socket pair and with no port bound: parsing, routing,
+  handlers, timers and the response sink run as they do in a server.
+  `try app.test.get("/user/42")` returns the status, headers and body.
 - Applications write `import Garuda`: the engine's module, formerly
-  `GarudaServer`, is named `Garuda`, and `Garuda.serve` is the free function
-  `serve`. The executable's sources moved to `Sources/garuda-server`; the
-  binary is still `garuda`.
+  `GarudaServer`, is named `Garuda`. The executable's sources moved to
+  `Sources/garuda-server`; the binary is still `garuda`.
 - Garuda can be depended on by version. No target sets unsafe build flags any
   more; `-enforce-exclusivity=unchecked` went from `Package.swift` at a cost of
   0.6% at 64 connections. A CI job builds a package that depends on Garuda by

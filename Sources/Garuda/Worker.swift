@@ -103,6 +103,9 @@ public struct Worker {
     var readySerial: UInt32 = 0
     /// --root-path, measured once: the mount routes are matched within.
     let rootPath: RootPath
+    /// The routes and hooks this worker serves: the running application's,
+    /// or a test client's. With none, every request is answered 404.
+    var application: UnsafeMutablePointer<CompiledApplication>? = nil
     static let readyDrainBudget = 64
 
     public init(config: ServerConfig, listenFD: Int32, poller: Poller) {
@@ -274,54 +277,64 @@ public struct Worker {
                 return
             }
 
-            let slot = table.allocate()
-            if slot < 0 {
-                rejectOverCapacity(fd)
-                continue
-            }
-            Metrics.add(PG_M_CONNECTIONS_ACCEPTED)
-            Metrics.set(PG_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount))
-            let c = table[slot]
-            c.pointee.fd = fd
-            c.pointee.state = .readingHead
-            c.pointee.flags = []
-            c.pointee.fileFD = -1
-            c.pointee.fileOffset = 0
-            c.pointee.fileRemaining = 0
-            c.pointee.interest = 0
-            c.pointee.read = pool.take()
-            c.pointee.write = ByteBuffer()
-            c.pointee.body = ByteBuffer()
-            c.pointee.head = HTTPRequestHead()
-            c.pointee.chunked = ChunkedDecoder()
-            c.pointee.bodyRemaining = 0
-            c.pointee.requestCount = 0
-            c.pointee.lastActivity = pg_monotonic_ms()
-            c.pointee.remoteAddr.clear()
-            c.pointee.remotePort = 0
-            c.pointee.responseRemaining = -1
-            c.pointee.tls = nil
-
-            if config.tcpNoDelay { _ = pg_set_nodelay(fd, 1) }
-
             withUnsafeBytes(of: &peer) { raw in
-                let p = raw.baseAddress!.assumingMemoryBound(to: CChar.self)
+                let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
                 var n = 0
                 while n < 48 && p[n] != 0 { n += 1 }
-                c.pointee.remoteAddr.write(
-                    UnsafeRawPointer(p).assumingMemoryBound(to: UInt8.self), n)
+                _ = adoptConnection(fd, address: p, addressLength: n, port: port)
             }
-            c.pointee.remotePort = port
-
-            let token = PollToken.make(slot: slot, generation: c.pointee.generation)
-            if !poller.add(fd, .read, token: token) {
-                Log.error("failed to register an accepted connection")
-                closeConnection(slot)
-                continue
-            }
-            c.pointee.interest = PollMask.read.rawValue
-            if tlsContext != nil && !beginTLS(slot) { continue }
         }
+    }
+
+    /// Takes `fd`, a connected non-blocking socket, into a connection slot and
+    /// registers it with the poller: what accept does with every connection,
+    /// and what the test client does with its end of a socket pair. Returns
+    /// the slot, or -1 when the table is full or the socket could not be
+    /// registered, in which case the descriptor has been dealt with.
+    mutating func adoptConnection(_ fd: Int32, address: UnsafePointer<UInt8>, addressLength: Int,
+                                  port: UInt16) -> Int {
+        let slot = table.allocate()
+        if slot < 0 {
+            rejectOverCapacity(fd)
+            return -1
+        }
+        Metrics.add(PG_M_CONNECTIONS_ACCEPTED)
+        Metrics.set(PG_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount))
+        let c = table[slot]
+        c.pointee.fd = fd
+        c.pointee.state = .readingHead
+        c.pointee.flags = []
+        c.pointee.fileFD = -1
+        c.pointee.fileOffset = 0
+        c.pointee.fileRemaining = 0
+        c.pointee.interest = 0
+        c.pointee.read = pool.take()
+        c.pointee.write = ByteBuffer()
+        c.pointee.body = ByteBuffer()
+        c.pointee.head = HTTPRequestHead()
+        c.pointee.chunked = ChunkedDecoder()
+        c.pointee.bodyRemaining = 0
+        c.pointee.requestCount = 0
+        c.pointee.lastActivity = pg_monotonic_ms()
+        c.pointee.remoteAddr.clear()
+        c.pointee.remotePort = 0
+        c.pointee.responseRemaining = -1
+        c.pointee.tls = nil
+
+        if config.tcpNoDelay { _ = pg_set_nodelay(fd, 1) }
+
+        c.pointee.remoteAddr.write(address, addressLength)
+        c.pointee.remotePort = port
+
+        let token = PollToken.make(slot: slot, generation: c.pointee.generation)
+        if !poller.add(fd, .read, token: token) {
+            Log.error("failed to register an accepted connection")
+            closeConnection(slot)
+            return -1
+        }
+        c.pointee.interest = PollMask.read.rawValue
+        if tlsContext != nil && !beginTLS(slot) { return -1 }
+        return slot
     }
 
     /// Keeps reading while TLS holds decrypted bytes the poller cannot see.

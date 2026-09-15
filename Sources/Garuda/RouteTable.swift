@@ -124,8 +124,8 @@ public struct RouteTable {
         return parameters
     }
 
-    /// Lays the table out as flat memory for matching. The result is never
-    /// freed: it lives as long as the process serves it.
+    /// Lays the table out as flat memory for matching. The `Application`
+    /// that compiled it frees it with `destroy`.
     public func compile() -> CompiledRoutes {
         let edgeTotal = nodes.reduce(0) { $0 + $1.literals.count }
         let byteTotal = nodes.reduce(0) { $0 + $1.literals.reduce(0) { $0 + $1.0.count } }
@@ -163,6 +163,12 @@ public struct CompiledRoutes {
         self.nodes = nodes
         self.edges = edges
         self.bytes = bytes
+    }
+
+    func destroy() {
+        nodes.deallocate()
+        edges.deallocate()
+        bytes.deallocate()
     }
 
     /// The route for `method` and `path`, or -1. HEAD falls back to GET.

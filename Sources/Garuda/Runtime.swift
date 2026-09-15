@@ -998,6 +998,7 @@ enum GarudaRuntime {
 
         let workerPtr = UnsafeMutablePointer<Worker>.allocate(capacity: 1)
         workerPtr.initialize(to: Worker(config: config, listenFD: listenFD, poller: poller))
+        workerPtr.pointee.application = application
         currentWorker = workerPtr
         if config.tlsEnabled {
             guard let context = makeTLSContext(config) else { return nil }
@@ -1081,12 +1082,12 @@ enum GarudaRuntime {
         // Before the worker reports ready, so that a reload does not retire
         // the worker this one replaces until its start-up hook has returned.
         // A signal that arrives meanwhile waits in the pipe for the loop.
-        lifecycle.onStart?(index)
+        application?.pointee.onStart?(index)
         logReady(config)
         runSynchronousLoop(workerPtr)
         // The loop ends once in-flight requests have finished or the grace
         // period has; the exit watchdog armed at the drain bounds this too.
-        lifecycle.onShutdown?(index)
+        application?.pointee.onShutdown?(index)
         workerPtr.pointee.destroy()
         currentWorker = nil
         return true

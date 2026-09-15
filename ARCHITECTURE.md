@@ -262,8 +262,10 @@ worker that answers plain HTTP with a redirect to https and closes
 
 ### Routes and handlers
 
-`serve` compiles the application's `Routes` before the first fork
-(`Handler.swift`), so every worker inherits the same table and only reads it.
+`Application.run` compiles the application's routes and hooks before the
+first fork (`Application.swift`), so every worker inherits the same table and
+only reads it through its `application` pointer. A test client points a worker
+of its own at the same compiled table (`TestClient.swift`).
 `RouteTable` (`RouteTable.swift`) splits each pattern into literal, `:param`
 and trailing `*rest` segments and lays them out as a flat byte trie.
 `CompiledRoutes.match` walks the request path as it arrived, after stripping
