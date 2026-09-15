@@ -71,6 +71,16 @@ exit(app.run())
 - **`Response`** is `~Copyable` too: `status`, `addHeader`, `send(status:)`,
   `send(status:_:)` (a lent `Span` is sent without a copy), and
   `after(milliseconds:then:)`, which calls a handler again after a timer.
+- **Typed answers**: `send(json:)`, `send(text:)`, `send(html:)`,
+  `send(bytes:contentType:)` and `redirect(to:status:)`. Each sets the content
+  type it implies unless the handler set one. Statuses are named —
+  `send(status: .created, json: user)` — and an integer literal still works
+  for one that has no name.
+- **Errors that are answers.** A thrown error conforming to `ResponseError`
+  becomes the response: `throw HTTPError.notFound`, or
+  `HTTPError(.conflict, "the name is taken")` for 409 and
+  `{"error":"the name is taken"}`. `JSONError` conforms, so a malformed body
+  is a 400 that says which key. Anything else thrown is a 500 and a log line.
 - **`JSON.encode` and `JSON.decode`** are Garuda's own coder, over the standard
   library's `Encodable` and `Decodable` — `JSONEncoder` and `JSONDecoder` are
   Foundation, which Garuda does not link. Decoding reads only the keys a type
@@ -371,7 +381,7 @@ reads the forwarded client and scheme as `request.remoteAddress`,
 Unit tests, including the fuzz corpus:
 
 ```bash
-swift test                                   # 231 tests
+swift test                                   # 240 tests
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 

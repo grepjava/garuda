@@ -238,9 +238,9 @@ public struct Response: ~Copyable {
     }
 
     /// The status `send` uses when it is not given one. 200 to begin with.
-    public var status: Int {
-        get { Int(worker.pointee.table[slot].pointee.handlerStatus) }
-        nonmutating set { worker.pointee.table[slot].pointee.handlerStatus = UInt16(clamping: newValue) }
+    public var status: HTTPStatus {
+        get { HTTPStatus(Int(worker.pointee.table[slot].pointee.handlerStatus)) }
+        nonmutating set { worker.pointee.table[slot].pointee.handlerStatus = UInt16(clamping: newValue.code) }
     }
 
     /// Whether this request has been answered, or has a continuation waiting.
@@ -287,30 +287,30 @@ public struct Response: ~Copyable {
     // response sink, which frames it for the protocol, merges in the server's
     // own headers, and holds the body to any Content-Length the handler set.
 
-    public func send(status: Int) {
-        worker.pointee.respond(slot, status: status, nil, 0)
+    public func send(status: HTTPStatus) {
+        worker.pointee.respond(slot, status: status.code, nil, 0)
     }
 
-    public func send(status: Int? = nil, _ body: StaticString) {
-        worker.pointee.respond(slot, status: status ?? self.status,
+    public func send(status: HTTPStatus? = nil, _ body: StaticString) {
+        worker.pointee.respond(slot, status: (status ?? self.status).code,
                                body.utf8Start, body.utf8CodeUnitCount)
     }
 
     /// Sends bytes lent by the request, or any other span, without copying
     /// them first.
-    public func send(status: Int? = nil, _ body: Span<UInt8>) {
-        let code = status ?? self.status
+    public func send(status: HTTPStatus? = nil, _ body: Span<UInt8>) {
+        let code = (status ?? self.status).code
         withByteSpan(body) { worker.pointee.respond(slot, status: code, $0.base, $0.count) }
     }
 
-    public func send(status: Int? = nil, _ body: String) {
-        let code = status ?? self.status
+    public func send(status: HTTPStatus? = nil, _ body: String) {
+        let code = (status ?? self.status).code
         var body = body
         body.withUTF8 { worker.pointee.respond(slot, status: code, $0.baseAddress, $0.count) }
     }
 
-    public func send(status: Int? = nil, _ body: [UInt8]) {
-        let code = status ?? self.status
+    public func send(status: HTTPStatus? = nil, _ body: [UInt8]) {
+        let code = (status ?? self.status).code
         body.withUnsafeBufferPointer {
             worker.pointee.respond(slot, status: code, $0.baseAddress, $0.count)
         }

@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 231 unit tests
+swift test                             # 240 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -104,6 +104,20 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   what the handler takes from it rather than what it contains. Objects and
   arrays may nest 64 deep, a number that does not fit its type is an error
   rather than a silent wrap, and the coder is fuzzed.
+- Answers have types. `HTTPStatus` names the statuses and still takes an
+  integer literal, so `response.send(status: .created, json: user)` and
+  `response.status == .ok` read as themselves while an unnamed code still
+  works. `send(json:)`, `send(text:)`, `send(html:)`,
+  `send(bytes:contentType:)` and `redirect(to:status:)` each set the content
+  type they imply unless the handler set one, and a JSON answer is encoded
+  into a buffer the worker keeps rather than a fresh one per request.
+- Errors can be answers. An error conforming to `ResponseError` becomes the
+  response it describes: `throw HTTPError.notFound` answers 404, and
+  `HTTPError(.conflict, "the name is taken")` answers 409 with
+  `{"error":"the name is taken"}`, escaped by the coder. `JSONError` conforms,
+  so a body that is not what it claimed is a 400 naming the key at fault.
+  An error that conforms is an answer rather than a fault and is not logged as
+  one; anything else thrown is still a 500 and a log line.
 - `app.run()` parses the usual flags and runs the supervisor, and
   `app.run(configuration:)` serves a `ServerConfig` instead, checked the way
   the command line is. `onWorkerStart` hooks run in each worker before it

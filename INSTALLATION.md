@@ -194,7 +194,7 @@ the workers without dropping a connection. It does not build for you.
 ## Running the tests
 
 ```bash
-swift test                                    # 231 unit tests
+swift test                                    # 240 unit tests
 ```
 
 The end-to-end suites in `scripts/` default to `.build/release/garuda`, so build

@@ -20,7 +20,7 @@ import CGaruda
 import GarudaCore
 
 public struct TestResponse {
-    public let status: Int
+    public let status: HTTPStatus
     /// Every header as received, in order and with repeats.
     public let headers: [(name: String, value: String)]
     public let body: [UInt8]
@@ -38,6 +38,11 @@ public struct TestResponse {
     public func headers(named name: String) -> [String] {
         let wanted = name.lowercased()
         return headers.filter { $0.name.lowercased() == wanted }.map { $0.value }
+    }
+
+    /// The body read as `type`, for an answer that is JSON.
+    public func json<T: Decodable>(_ type: T.Type = T.self) throws -> T {
+        try JSON.decode(type, from: body)
     }
 }
 
@@ -269,20 +274,20 @@ extension TestResponse {
                 headers.first { $0.name.lowercased() == name }?.value
             }
             if bodyless || status == 204 || status == 304 {
-                return TestResponse(status: status, headers: headers, body: [])
+                return TestResponse(status: HTTPStatus(status), headers: headers, body: [])
             }
             if let length = value("content-length").flatMap({ Int($0) }) {
                 guard bytes.count - bodyStart >= length else { return nil }
-                return TestResponse(status: status, headers: headers,
+                return TestResponse(status: HTTPStatus(status), headers: headers,
                                     body: Array(bytes[bodyStart..<(bodyStart + length)]))
             }
             if value("transfer-encoding")?.lowercased() == "chunked" {
                 guard let body = try dechunk(bytes, from: bodyStart) else { return nil }
-                return TestResponse(status: status, headers: headers, body: body)
+                return TestResponse(status: HTTPStatus(status), headers: headers, body: body)
             }
             // Neither: the body runs to the close.
             guard closed else { return nil }
-            return TestResponse(status: status, headers: headers, body: Array(bytes[bodyStart...]))
+            return TestResponse(status: HTTPStatus(status), headers: headers, body: Array(bytes[bodyStart...]))
         }
     }
 

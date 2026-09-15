@@ -171,10 +171,15 @@ extension Worker {
     }
 
     mutating func handlerThrew(_ slot: Int, generation: UInt32, requestId: UInt32, _ error: any Error) {
-        let description = String(describing: error)
-        Log.error { line in
-            line.str("handler threw: ")
-            description.withCString { line.cstr($0) }
+        // An error the application planned for is an answer, not a fault, so
+        // it is not logged as one.
+        let answer = error as? any ResponseError
+        if answer == nil {
+            let description = String(describing: error)
+            Log.error { line in
+                line.str("handler threw: ")
+                description.withCString { line.cstr($0) }
+            }
         }
         let c = table[slot]
         guard c.pointee.state != .free, c.pointee.generation == generation,
@@ -182,7 +187,11 @@ extension Worker {
         if c.pointee.state == .dispatching && !c.pointee.flags.contains(.responseStarted) {
             // A wait armed before the throw is for an answer that is not coming.
             clearContinuation(slot)
-            respond(slot, status: 500, nil, 0)
+            if let answer {
+                respondError(slot, status: answer.status, reason: answer.reason)
+            } else {
+                respond(slot, status: 500, nil, 0)
+            }
         }
     }
 

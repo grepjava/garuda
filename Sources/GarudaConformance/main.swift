@@ -240,7 +240,7 @@ app.get("/status/:code") { request, response in
         }
         start = end + 1
     }
-    response.send(status: code)
+    response.send(status: HTTPStatus(code))
 }
 
 app.get("/length/:declared/:actual") { request, response in

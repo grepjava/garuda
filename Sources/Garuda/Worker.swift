@@ -89,6 +89,9 @@ public struct Worker {
     /// --cache-size: where a cached response is copied out of the shared
     /// table to be sent, grown once to the largest entry the table holds.
     var cacheScratch = ByteBuffer()
+    /// Where a JSON answer is encoded, kept and reused so that answering
+    /// costs no allocation for the buffer after the first request.
+    var jsonScratch = ByteBuffer()
     /// When draining must stop being polite. A request that never completes
     /// would otherwise hold the whole process open indefinitely.
     public var drainDeadline: UInt64 = 0
@@ -152,6 +155,8 @@ public struct Worker {
         readyQueue.destroy()
         timerHeap.destroy()
         asyncOps.destroy()
+        jsonScratch.destroy()
+        cacheScratch.destroy()
         pool.destroy()
         dates.destroy()
         table.destroy()
