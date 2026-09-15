@@ -4,544 +4,411 @@
 
 # Transports
 
-Garuda speaks HTTP/1.1, HTTP/2, HTTP/3, WebSocket and WebTransport. This
-document is about what each of those is, what Garuda implements of it, and
-where the implementations disagree with the obvious approach and why.
+Garuda speaks HTTP/1.1, HTTP/2 and HTTP/3. This document covers what each of
+them is, what the engine implements, and where the implementation departs from
+the obvious approach and why. The process model, the connection table and the
+async substrate are described in [ARCHITECTURE.md](ARCHITECTURE.md). Flags are
+documented in [CONFIG.md](CONFIG.md).
 
-The architecture underneath — the connection table, the process model, the
-asyncio integration — is in [ARCHITECTURE.md](ARCHITECTURE.md).
-
-| | HTTP/1.1 | HTTP/2 | HTTP/3 | WebSocket | WebTransport |
-| --- | --- | --- | --- | --- | --- |
-| ASGI | ✓ | ✓ | ✓ | ✓ | ✓ |
-| WSGI | ✓ | ✓ | ✓ | 501 | 501 |
-
-WebSockets and WebTransport are refused for WSGI rather than half-served: both
-are streams that outlive their response, and PEP 3333 has no way to express
-one. Everything else is the same server for both, which is the point of the
-next section.
+| | status |
+| --- | --- |
+| HTTP/1.1 | served, cleartext and TLS |
+| HTTP/2 | served: `h2` over TLS via ALPN, `h2c` with prior knowledge |
+| HTTP/3 | served with `--http3`, over Garuda's own QUIC |
+| WebSocket | framing code only; no application API |
+| WebTransport | advertised on HTTP/3; a session CONNECT is answered 501 |
 
 ---
 
 ## One request path
 
 HTTP/2 and HTTP/3 do not change what a request is. They change how it is
-framed, how many can share a connection, and how the head is encoded. So
-Garuda keeps one request path and makes the transports agree with it rather
-than the other way round.
+framed, how many share a connection, and how the head is encoded. So there is
+one request path, and each transport adapts to it.
 
-**A connection is a slot in the connection table.** For HTTP/1.1 that slot owns
-a socket. For HTTP/2 it owns a socket, the HPACK tables and the connection
-window. For HTTP/3 it owns no descriptor at all — the socket belongs to the
-QUIC listener — and the slot exists so a QUIC connection can be a connection
-like any other.
+**A connection is a slot in the connection table.** For HTTP/1.1 the slot owns
+a socket. For HTTP/2 it owns the socket, the HPACK state and the connection
+window. For HTTP/3 it owns no descriptor at all (the UDP socket belongs to the
+QUIC listener), and the slot exists so a QUIC connection can be handled like
+any other.
 
-**A request is also a slot.** Every HTTP/2 and HTTP/3 stream takes one from the
-same table, with `fd` set to `-1` and a pointer back to its connection. A
-stream slot has a head, a body buffer, a write buffer, a task and a
-Content-Length budget, so ASGI dispatch, request-body streaming, write
-backpressure and disconnect delivery work on a stream exactly as they work on a
-connection. Three things know the difference: writing (bytes become frames on
-the parent instead of going to a socket), read interest (a stream has no
-descriptor of its own), and teardown.
+**A request stream is also a slot.** Each HTTP/2 and HTTP/3 stream takes one
+from the same table, with `fd = -1` and `parentSlot` pointing at its
+connection. A stream slot has a head, a body buffer, a write buffer, a
+Content-Length check and continuation fields, so dispatch, the router, the
+timer substrate and cancellation work on a stream exactly as on a connection.
+Only three things know the difference: writing (bytes become frames on the
+parent), read interest (a stream has no descriptor), and teardown.
 
 **The head is rebuilt as HTTP/1.1 text and re-parsed.** An HTTP/2 or HTTP/3
-request arrives as pseudo-headers and a compressed field section; it is
-rendered back into `GET /path HTTP/1.1\r\nhost: ...` and handed to the ordinary
-parser. That costs a copy and a parse per request. In exchange the scope
-builder, the environ builder, the trusted-proxy logic and the access log keep
-working on the representation they were written for, rather than growing a
-second one — and a bug fixed in one is fixed in all three.
+request arrives as pseudo-headers plus a compressed field section. It is
+validated, rendered into the stream's `headStore` as `GET /path
+HTTP/1.1\r\nhost: …`, and handed to the ordinary parser. That costs one copy
+and one parse per request. In exchange, the health check, rate limiter, static
+files, forwarded-header trust, request ID, access log and router all work on
+the one representation they were written for.
 
-The response side is the mirror image, and it is where WSGI needed work: see
-[WSGI on a multiplexed stream](#wsgi-on-a-multiplexed-stream).
+**The response side is one call with three encodings.** The router calls
+`writeSwiftResponse`. On HTTP/1.1 that writes header text straight into the
+write buffer. On a stream it becomes `h2Respond` or `h3Respond`, which encode
+`:status`, `content-length`, `date`, `server` and the server headers with
+HPACK or QPACK, then queue the body on the stream. The server headers are
+Alt-Svc, HSTS and X-Request-ID, written by `writeServerHeaders`,
+`encodeServerHeaders` and `encodeServerHeadersH3`. A status with no body, such
+as a health check or an error, ends the stream on its HEADERS frame.
+
+On HTTP/2 and HTTP/3 a request is dispatched when its stream ends (END_STREAM,
+a trailer section, or the QUIC stream's FIN), because the router answers with
+the whole request in hand. The one exception is an HTTP/3 extended CONNECT,
+which never ends. It is dispatched on its head and refused.
 
 ---
 
 ## HTTP/1.1
 
-Keep-alive, pipelining, chunked transfer in both directions, `Expect:
-100-continue`, `HEAD`, and the statuses that forbid a body.
+Keep-alive, pipelining, chunked request bodies, `Expect: 100-continue`, `HEAD`,
+and HTTP/1.0. Router and static-file responses always carry a
+`Content-Length`.
 
-The parser produces `(offset, length)` pairs into the read buffer and never
-allocates a `String`. Character-class membership (`tchar`, field-value bytes)
-is two 64-bit shifts rather than a table lookup, so the inner loops touch no
-memory beyond the request itself.
-
-### Framing is enforced, not trusted
-
-A declared `Content-Length` is a promise to the client and to every
-intermediary between here and it. Both ways of breaking it are handled:
-
-- an application that sends **more** than it promised has the excess dropped
-  rather than written, because those bytes would be read as the start of the
-  next response on a keep-alive connection;
-- one that sends **less** has the connection closed rather than leaving the
-  client waiting on bytes that are not coming.
-
-Either way the application is told it has a bug, and the connection is not
-reused. This holds for ASGI and for WSGI in both of its execution modes, and on
-a WSGI response it covers the returned iterable and the legacy `write()`
-callable alike — between them they produce one message, so they are accounted
-against one budget. `write()` is told directly, by an exception at the call that
-went too far; everywhere else it is a log line, because there is nothing left
-running to tell. On a multiplexed stream, where there is no connection to close,
-a short message ends as a reset rather than as a clean end of stream.
+The parser (`HTTPParser.swift`) makes a single pass with no backtracking and
+no allocation, producing `(offset, length)` slices into the read buffer.
+Character-class membership is two 64-bit shifts rather than a table lookup.
 
 ### Strictness that prevents smuggling
 
-The parser is deliberately unforgiving wherever leniency would let two
-implementations disagree about where a message ends:
+The parser is unforgiving wherever leniency would let two implementations
+disagree about where a message ends:
 
 - whitespace between a header name and its colon is rejected;
-- `Content-Length` together with `Transfer-Encoding` is rejected;
-- two disagreeing `Content-Length` values are rejected;
-- `Transfer-Encoding` is parsed as the comma-separated coding list it is, and
-  only a bare `chunked` frames a body. `xchunked` is not `chunked`, and neither
-  is `chunked;x=1`; a list whose last coding is not `chunked` cannot be framed
-  at all and is a 400 (RFC 9112 6.3), while `gzip, chunked` — framable, but
-  under a coding this server cannot remove — is a 501 (RFC 9112 6.1). A second
-  `Transfer-Encoding` field continues the same list, so it means the first
-  field's coding was not the final one: also a 400;
+- `Content-Length` together with `Transfer-Encoding` is rejected, and so are
+  two `Content-Length` values that disagree;
+- `Transfer-Encoding` is parsed as a comma-separated list of codings, and only
+  a bare `chunked` frames a body. `xchunked` is not `chunked`, and neither is
+  `chunked;x=1`. A list whose last coding is not `chunked` cannot be framed and
+  is a 400 (RFC 9112 6.3). `gzip, chunked` can be framed but uses a coding
+  this server cannot remove, so it is a 501 (RFC 9112 6.1). A second
+  `Transfer-Encoding` field continues the list, so it too is a 400;
 - `obs-fold` continuation lines are rejected rather than unfolded;
-- HTTP/1.1 without `Host` is a 400, and so is a second `Host`, whether or not
-  the two agree (RFC 9112 3.2);
-- the chunked trailer section is bounded by `--max-header-size`, the same limit
-  the header section at the front of the message gets. Trailers decode to no
-  body, so `--max-body` never grows while they arrive, and without a ceiling of
-  their own a peer could stream them for as long as it liked and hold a
-  connection, a slot and a read buffer for free. Past the limit the request is
-  a 431.
+- HTTP/1.1 without `Host` is a 400, and so is a second `Host` (RFC 9112 3.2);
+- the chunked trailer section is bounded by `--max-header-size`, like the head.
+  Trailers add nothing to the body, so without their own limit a peer could
+  stream them indefinitely.
 
-On the response side, an application header containing CR or LF is refused
-outright — the classic response-splitting hole. On the request side, header
-names containing underscores are dropped (they would otherwise collide with the
-dash-to-underscore environ mapping and let a client forge `X-Real-IP`), and a
-`Proxy:` header is dropped entirely (httpoxy).
+`--max-body` counts decoded bytes cumulatively, not what happens to be
+buffered. A request that answers early leaves its body unread: a small
+remainder already on the socket is read and discarded so the connection can be
+reused, and otherwise the connection closes after the response.
 
 ---
 
 ## TLS
 
-```bash
-garuda --tls-cert fullchain.pem --tls-key privkey.pem myapp:app
-```
+OpenSSL handles TCP TLS (`Sources/CGaruda/garuda_tls.c`, `TLS.swift`). It is
+given the descriptor directly, so a TLS connection is the same slot, the same
+poller interest and the same state machine as any other. The read and write
+wrappers report `EAGAIN` the way a socket does.
 
-OpenSSL is handed the descriptor directly, so a TLS connection is the same
-connection as any other — same slab slot, same poller interest, same buffers,
-same state machine — and the read and write wrappers report `EAGAIN` the way a
-socket does, which is what keeps that true.
+Two things cannot be wrapped away, and both are handled explicitly:
 
-Two things about TLS cannot be wrapped away, and both are handled explicitly:
-the handshake happens before any request exists and can want readability *or*
-writability at each step, and a record is decrypted whole, so OpenSSL can be
-holding bytes the socket no longer has — which a level-triggered poller will
-never mention again.
+- the handshake runs before any request exists and can want readability *or*
+  writability at each step (`driveHandshake`);
+- a record is decrypted whole, so OpenSSL can hold bytes the socket no longer
+  has, and a level-triggered poller will never report them. Every read path
+  keeps reading while `pg_tls_pending` is non-zero (`drainBufferedTLS`).
 
-**ALPN** is what makes HTTP/2 reachable from a browser, and it is where the
-protocol is settled: `h2` if the client offers it, `http/1.1` otherwise, in the
-server's order of preference rather than the client's. `--no-http2` and
-`--http2-only` narrow the advertised list to match. A TLS listener also reports
-`https` to the application, so URLs it builds are right without being told.
+**ALPN** is how a browser reaches HTTP/2. The server picks `h2` if offered and
+`http/1.1` otherwise, in its own order of preference. `--no-http2` and
+`--http2-only` narrow the list to match. A connection that negotiated `h2`
+must open with the HTTP/2 preface.
 
-TLS 1.2 is the floor, renegotiation is off, and `--tls-ciphers` takes an
-OpenSSL cipher list for anyone who needs to narrow the 1.2 suites. Certificates
-are checked once at start-up rather than discovered to be unreadable inside
-each worker.
+TLS 1.2 is the floor and renegotiation is off. `--tls-ciphers` narrows the 1.2
+suites. Extra certificates are chosen by SNI. With `--acme-domain`, a
+`tls-alpn-01` handshake is completed and the connection closed, as RFC 8737
+specifies.
+
+**`--ktls`** asks OpenSSL for kernel TLS. When the kernel took the send side
+for a connection, a `--static-dir` file goes out with `SSL_sendfile` instead of
+being read and encrypted in the process. Otherwise TLS falls back to reading
+the file into the write buffer.
 
 ---
 
 ## HTTP/2
 
 Cleartext HTTP/2 is served to any client that opens with the connection
-preface — `curl --http2-prior-knowledge`, a gRPC client, or a proxy configured
-to talk h2c upstream. The same port still answers HTTP/1.1, because the preface
-is recognised in full before anything is assumed. `--http2-only` drops the
-HTTP/1 fallback for ports that only ever carry h2c, and `--no-http2` turns the
-whole thing off.
+preface, such as `curl --http2-prior-knowledge` or a proxy talking h2c
+upstream. The same port still answers HTTP/1.1, because the preface is
+recognised in full before anything is assumed. A connection that begins
+`PRI ` and then diverges, or whose first byte cannot start an HTTP/1 method,
+is sent `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 3.4). `--http2-only` drops the
+HTTP/1 fallback, and `--no-http2` turns HTTP/2 off.
 
-The upgrade dance from RFC 7540 is deliberately absent: RFC 9113 removed it, no
-browser ever used it, and prior knowledge covers every cleartext client that
-exists.
+The RFC 7540 `Upgrade: h2c` dance is absent: RFC 9113 removed it and prior
+knowledge covers every cleartext client.
+
+The server's first SETTINGS advertises `MAX_CONCURRENT_STREAMS`,
+`INITIAL_WINDOW_SIZE`, `MAX_FRAME_SIZE` and `MAX_HEADER_LIST_SIZE`, plus
+`ENABLE_PUSH = 0`. It does not advertise `ENABLE_CONNECT_PROTOCOL`, because
+nothing would answer an extended CONNECT. Priority is parsed only far enough to
+reject a stream that depends on itself. `PUSH_PROMISE` from a client is a
+connection error.
 
 ### HPACK
 
-A full implementation — static and dynamic tables, Huffman in both directions,
-the eviction rules — checked against every example in RFC 7541 appendix C. The
-Huffman table is generated from the RFC, and a unit test re-derives all 257
-codes from their lengths alone, so a transcription error could not survive the
-build.
+A full implementation (`HPACK.swift`): static and dynamic tables, Huffman in
+both directions, and eviction. The Huffman and static tables are generated
+from RFC 7541 by `scripts/gen-hpack-tables.py`. Unit tests check that the
+committed codes are the canonical ones for their lengths, that the code is
+complete, and that every example in appendix C decodes.
 
-Decoding hands out borrowed pointers rather than objects, and the dynamic table
-is a FIFO of descriptors over an append-only arena, so a compressed header
-block costs a memcpy per field and no allocations.
+Decoding hands out borrowed pointers. The dynamic table is a FIFO of
+descriptors over an append-only arena, and eviction moves a watermark rather
+than bytes. The encoder never uses incremental indexing. Mirroring the peer's
+table would save a few bytes on response headers that barely repeat, and
+Huffman-coded literals get most of that saving without the bookkeeping.
 
-The encoder never uses incremental indexing. Mirroring the peer's table would
-save a few bytes on responses whose headers barely repeat, and Huffman coding
-of literals gets most of it for none of the bookkeeping.
+A header block that is not wanted (a trailer, a refused stream) is still
+decoded, because HPACK is stateful. A new stream past the advertised
+concurrency limit, or after the peer's GOAWAY, is refused with
+`RST_STREAM(REFUSED_STREAM)`.
 
 ### Flow control
 
-Real in both directions. A response is held in the stream buffer until the
-peer's window allows it, which is what makes `await send()` apply backpressure
-on a multiplexed connection; the window is only given back as the application
-actually reads the request body, so an upload nobody is consuming stops rather
-than filling memory.
+**Sending.** A response body waits in the stream's write buffer. `flushStream`
+moves it to the parent as DATA frames no larger than the peer's maximum frame
+size, the stream window and the connection window allow. It stops while the
+parent's write buffer is above the write high-water mark. `WINDOW_UPDATE`, a
+changed `SETTINGS_INITIAL_WINDOW_SIZE` (applied to every open stream, one value
+at a time) and socket writability all pump the waiting streams again. A
+`--static-dir` file on a stream is read into the write buffer a block at a
+time as the window opens.
+
+**Receiving.** A DATA frame is charged against both windows before anything
+else can reject it, because the peer has spent the window either way. Our
+initial stream window is the larger of 65,535 and the body high-water mark,
+and the connection window is raised to match at the start. The router buffers
+the whole body before it answers, so body bytes count as consumed on arrival
+(`h2NoteConsumed`). Once half the initial window has accumulated,
+`h2FlushWindowUpdates` sends `WINDOW_UPDATE` for the stream and the
+connection, and it does so *before* the body is dispatched. Uploads larger
+than the window therefore keep moving. DATA for a stream that is already gone
+still returns its bytes to the connection window, so the peer is not stalled
+by bytes nobody wanted.
+
+**Body length.** A body that runs past its declared `Content-Length`, or ends
+short of it, is `RST_STREAM(PROTOCOL_ERROR)` (RFC 9113 8.1.1). A body past
+`--max-body` is `RST_STREAM(ENHANCE_YOUR_CALM)`. If the response finished
+before the upload did, the stream waits in `closing`, still counting and still
+granting window, when what is left is small. A large remainder gets
+`RST_STREAM(NO_ERROR)` instead.
+
+**Ending.** A response ends with END_STREAM on its last DATA frame, or on its
+HEADERS for a bodyless response or `HEAD`. A file-fed response that comes up
+short of its declared length is reset with `INTERNAL_ERROR` instead of ending
+cleanly, so the client does not mistake a truncation for the whole body.
 
 ### Cancellation has a budget
 
-`RST_STREAM` frees a stream slot at once, so a limit on concurrent streams is
-by construction no defence against a peer that opens a stream and cancels it in
-the same breath: the count never rises, while the server still decodes a header
-block, builds a request and starts an application task for every one. That is
-CVE-2023-44487, the rapid reset.
+`RST_STREAM` frees a stream at once, so a concurrency limit is no defence
+against a peer that opens a stream and cancels it immediately. The count never
+rises while the server decodes a header block and dispatches every request.
+That is CVE-2023-44487, the rapid reset.
 
-Cancelling is legitimate — a browser does it whenever a user navigates away —
-so what is bounded here is not the count but the ratio. A connection starts
-with an allowance of twice the concurrent-stream limit it advertises (256),
-every cancelled stream that was never answered spends one, and every stream the
-server does answer earns one back. A client that cancels among requests it also
-completes never comes near it; one that only ever cancels spends the allowance
-and is sent `GOAWAY(ENHANCE_YOUR_CALM)`. A reset that arrives after the
-response was already finished is a race rather than an attack, and costs
-nothing.
+Cancelling is legitimate (a browser does it on navigation), so what is bounded
+is the ratio, not the count. A connection starts with an allowance of
+`max(100, 2 × the advertised concurrent-stream limit)`. Every stream cancelled
+before its response ended spends one, and every stream answered earns one
+back up to the cap. A peer that only cancels exhausts it and is sent
+`GOAWAY(ENHANCE_YOUR_CALM)`. A reset that arrives after END_STREAM was sent is
+a race, and costs nothing.
 
-HTTP/3 keeps the same account for the same reason. QUIC has no `RST_STREAM`
-frame, but closing a stream queues `MAX_STREAMS`, and a credit handed back is a
-credit handed back whatever it is called; a peer that resets every stream it
-opens holds one at a time and keeps a worker decoding headers indefinitely. The
-cancellation is dearer to send than HTTP/2's — a packet of its own rather than
-eight bytes trailing the request — but dearer is not bounded, so `RESET_STREAM`
-and `STOP_SENDING` on a request stream spend from the same allowance, and a
-peer that exhausts it is closed with `H3_EXCESSIVE_LOAD`.
+A reset stream goes through `closeStream` → `closeConnection` →
+`cancelOps`, so a request parked on a timer (`GET /delay/:ms`) is cancelled with
+it and never answers late.
 
 ### A stream measures its own progress
 
-`--request-timeout` asks whether a request has stalled, and on HTTP/1 the
-answer comes from the poller: every readable or writable event on the socket is
-progress, so a slow-but-moving transfer is never mistaken for a stuck one.
+`--request-timeout` asks whether a request has stalled. On HTTP/1.1 the poller
+answers: every event on the socket is progress. A stream has no descriptor,
+so it records the bytes that move on it instead, DATA in and DATA out.
+Otherwise the timeout would cap how long an upload may take rather than detect
+a stall. A window the peer never opens is still a stall and still times out,
+because nothing moves.
 
-A stream has no socket, so it has no events to be refreshed by, and it records
-the bytes that move on it instead — DATA in, DATA out. Without that the timeout
-would stop asking whether the request is stalled and start capping how long it
-may take, which for an upload over a thin link is a different question with a
-much worse answer. A window the peer never opens is still a stall, and still
-times out: nothing is written in that case, so nothing is recorded.
-
-Conformance is checked with [h2spec](https://github.com/summerwind/h2spec):
-**146/146 over TLS**, for ASGI and WSGI alike.
+Frame handling and HPACK are covered by unit tests and checked with
+[h2spec](https://github.com/summerwind/h2spec); `scripts/http2-test.py` checks
+interop against the `h2` library.
 
 ---
 
 ## HTTP/3 and QUIC
 
-```bash
-garuda --http3 --tls-cert fullchain.pem --tls-key privkey.pem myapp:app
-```
+The QUIC stack is Garuda's own (`Sources/GarudaQUIC`): packets, loss recovery,
+congestion control, streams, flow control, connection IDs, key update, and a
+TLS 1.3 handshake. OpenSSL supplies primitives only (hash, HKDF, AEAD, key
+agreement, signatures) through `garuda_crypto.c`. QUIC replaces the TLS record
+layer, and `SSL_*` cannot be used without it.
 
-The QUIC stack is Garuda's own: packets, loss recovery, congestion control,
-streams, flow control, key update, and a TLS 1.3 handshake. OpenSSL supplies
-primitives and nothing else — hash, HKDF, AEAD, key agreement, signature —
-because QUIC replaces the TLS record layer outright and `SSL_*` has no way to
-be used without it.
+The handshake (`TLS13.swift`) implements what QUIC needs and nothing more:
+TLS 1.3 only, no session resumption or 0-RTT, no client certificates, and no
+HelloRetryRequest (a client offering no group we support is refused). The
+certificate is loaded again for QUIC, separately from the TCP `SSL_CTX`.
 
-Written from scratch, so it is checked against things that share none of it:
-the packet protection reproduces RFC 9001 appendix A byte for byte, the
-handshake and the HTTP/3 layer are driven by `aioquic` in
-`scripts/http3-test.py`, and the QPACK static table is generated by reading
-each entry back out of an independent implementation rather than transcribed.
-
-What is implemented, and what each part is for:
+Because it was written from scratch, it is checked against implementations
+that share none of its code. Packet protection is tested against vectors from
+`scripts/quic-vectors.py`, which uses aioquic and RFC 9001 appendix A.3/A.5.
+The QPACK static table is generated by reading every entry back out of
+pylsqpack (`scripts/gen-qpack-table.py`). The handshake, transport and HTTP/3
+layer are driven by aioquic in `scripts/http3-test.py`.
 
 | | |
 | --- | --- |
-| RFC 9000 | packets, frames, streams, flow control, connection IDs, the 3× anti-amplification limit |
-| RFC 9001 | packet protection, header protection, key update |
-| RFC 9002 | loss detection by packet ordering and by time, NewReno congestion control, PTO |
-| RFC 9114 | HTTP/3 frames, control and QPACK streams, extended CONNECT |
+| RFC 9000 | packets, frames, streams, flow control, connection IDs, the 3× anti-amplification limit, version negotiation |
+| RFC 9001 | packet and header protection, key update |
+| RFC 9002 | loss detection by packet ordering and by time, PTO, NewReno |
+| RFC 9114 | HTTP/3 frames, control and QPACK streams |
 | RFC 9204 | QPACK, static table and Huffman |
-| RFC 9221 | unreliable datagrams |
-| RFC 9297 | HTTP datagrams and the capsule protocol |
+| RFC 9221 | the datagram transport parameter and frames |
+
+### Settings
+
+The control stream's SETTINGS carries a QPACK dynamic table capacity of 0,
+blocked streams 0, `MAX_FIELD_SECTION_SIZE`, and `ENABLE_CONNECT_PROTOCOL = 1`.
+When the peer allows datagrams it also carries `H3_DATAGRAM = 1` and a
+WebTransport session limit of 16. The server opens its QPACK encoder and
+decoder streams, though it never sends instructions on them. An unknown
+unidirectional stream type gets `STOP_SENDING`, and its bytes are dropped.
+Losing the peer's control stream closes the connection
+(`H3_CLOSED_CRITICAL_STREAM`).
 
 ### QPACK advertises a dynamic table capacity of zero
 
-That is a promise rather than a shortcut. It says no header block on this
-connection can ever wait for another stream — which is the head-of-line
-blocking HTTP/3 exists to remove. Encoding uses the static table and Huffman
-literals, which is where nearly all of the saving was anyway.
+That is a promise rather than a shortcut: no header block on this connection
+can ever wait on another stream, which is the head-of-line blocking HTTP/3
+exists to remove. The encoder uses the static table and Huffman literals,
+which is where nearly all of the saving is anyway. A peer that sends encoder
+instructions anyway is closed with `QPACK_ENCODER_STREAM_ERROR`.
+
+### Streams, flow control and cancellation
+
+Transport parameters come from the configuration. The idle timeout is
+`--keep-alive`. Per-stream data is the body high-water mark, and connection data
+is eight times that. Concurrent bidirectional streams match the HTTP/2 limit.
+`extendStreamWindow` reopens a stream's window as its bytes are read.
+
+Retiring a stream queues `MAX_STREAMS`, and `closeH3Stream` flushes it
+immediately. A peer at its stream limit may have no packet of its own to carry
+the credit back on, and without that flush the connection would serve exactly
+`initial_max_streams_bidi` requests and stall.
+
+`RESET_STREAM` and `STOP_SENDING` on a request stream spend from the same kind
+of allowance as HTTP/2's rapid-reset budget. A QUIC cancellation costs the peer
+a packet rather than eight bytes, but that is dearer, not bounded. A peer that
+exhausts the allowance is closed with `H3_EXCESSIVE_LOAD`. The aborted stream
+is closed through `closeConnection`, which cancels any parked timer.
+
+A body that disagrees with its declared length is reset with
+`H3_MESSAGE_ERROR`. A body past `--max-body` is answered 413.
 
 ### One socket per worker
 
-One UDP socket serves every client, bound with `SO_REUSEPORT` so the kernel
-hashes datagrams to workers by four-tuple. A connection is identified by its
-connection ID rather than by the four-tuple, so a client that changes address
-keeps its connection; a client that migrates to an address hashing to a
-*different worker* reaches one that has never heard of it, and recovers by
-making a new connection.
+Each worker binds its own UDP socket with `SO_REUSEPORT`, so the kernel hashes
+datagrams to workers by four-tuple. A connection is found by its destination
+connection ID, not its address. A client that changes address keeps its
+connection, but only once a packet from the new address has authenticated and
+is newer than anything seen. A forged datagram carrying a visible connection ID
+cannot redirect the connection's traffic. A client that migrates to an address
+hashing to a *different worker* reaches one that has never heard of it, and
+recovers by making a new connection.
 
-### Sending
+A new connection needs a client Initial of at least 1,200 bytes, and the server
+sends no more than three times what it has received until the address is
+validated.
 
-A connection sends only while its congestion window has room; past that,
-only acknowledgements go out, plus the one or two probes a timeout allows.
-A receiver slower than the server is the normal case, not an edge case, and
-a sender that ignored the window would fill the receiver's socket buffer.
-It would then retransmit everything the kernel threw away.
-`scripts/http3-test.py` downloads 20 MB with a Python client and checks that
-the kernel dropped next to nothing.
+### Receiving and sending
 
-On Linux, full-size datagrams to the same client go out in runs of up to 32
-per `sendmsg`, using UDP GSO (`UDP_SEGMENT`), so a burst costs one syscall
-instead of one per datagram. If the kernel or the network device refuses
-segmentation, the worker falls back to one datagram per call for the rest
-of its life. `GARUDA_UDP_GSO=0` forces that fallback, for comparison or
-for a path that misbehaves with it.
+`recvmmsg` takes up to 32 datagrams per syscall. The socket joins the worker's
+poller as one descriptor. A readiness event services every connection it
+touched, and `quicTick` runs loss, acknowledgement and idle timers at most
+every 4 ms. The worker's poll timeout is shortened to the nearest QUIC
+deadline.
+
+A connection sends only while its congestion window has room. Past that only
+acknowledgements go out, plus the probes a PTO allows. A lost packet is never
+retransmitted: the *data* it carried is sent again in a new packet, which is
+why every sent packet records what it held. A receiver slower than the server
+is the normal case, and a sender that ignored the window would fill the
+receiver's socket buffer and then retransmit what the kernel threw away.
+`scripts/http3-test.py` downloads 20 MB and checks that the kernel dropped
+next to nothing.
+
+On Linux, runs of equal-sized datagrams to one peer go out as one `sendmsg`
+with UDP GSO (`UDP_SEGMENT`), up to 32 per call. If the kernel or device
+refuses segmentation, the worker falls back to one datagram per call for the
+rest of its life. `GARUDA_UDP_GSO=0` forces that fallback. When the socket is
+full the pending run is kept, and the worker waits for writability.
 
 ### Alt-Svc
 
-A client cannot discover HTTP/3 by trying. There is no upgrade, no well-known
-port, and nothing in a TCP response that implies a UDP one, so it has to be
-told on a connection it already has. With `--http3`, every response served over
-TCP — HTTP/1.1 and HTTP/2, WSGI and ASGI alike — carries
+A client cannot discover HTTP/3 by trying: there is no upgrade and no
+well-known port. It has to be told over a connection it already has. With
+`--http3`, every response the server builds on HTTP/1.1 and HTTP/2 carries
 
 ```
 alt-svc: h3=":443"; ma=86400
 ```
 
-naming the UDP port, which is `--quic-port` when it differs from the TCP one.
-The header is advisory (RFC 7838): a client that ignores it stays where it is.
-An application that sets its own `alt-svc` keeps it, and the server adds nothing
-beside it. A response already travelling over HTTP/3 does not carry it, because
-there is nothing left to discover.
+naming the UDP port, which is `--quic-port` when it differs from the TCP port.
+That covers router responses, health checks, static files, errors and cached
+responses. HTTP/3 responses do not carry it, because the client is already
+there.
 
 ---
 
 ## WebSocket
 
-The full connect / accept / receive / send / close cycle, subprotocol
-negotiation, extra handshake headers, fragmented messages, text and binary,
-keepalive ping/pong with a dead-peer timeout, and a message size limit.
+The engine pieces exist in GarudaHTTP: `WebSocketFrame.swift` (framing and
+UTF-8 validation) and `WebSocketDeflate.swift` with `garuda_wsdeflate.c`
+(permessage-deflate). Both are covered by unit tests. The `--ws-*` flags are
+parsed.
 
-**Frames are decoded as they arrive** rather than when the application next
-calls `receive()`. That matters more than it sounds: a push-only endpoint, or
-one merely busy between receives, would otherwise leave pings unanswered and
-never see the pong for the server's own keepalive ping — so the server would
-eventually close a connection that was working perfectly.
-
-Data messages therefore queue, bounded by `--ws-max-queue` and
-`--ws-max-queue-bytes`, and the read side switches off at the bound so a slow
-application becomes TCP backpressure rather than memory.
-
-The framing is strict where leniency would let a peer desynchronise the stream:
-an unmasked client frame, a set reserved bit, an unknown opcode, a fragmented
-or oversized control frame, an invalid close code and non-UTF-8 text are each a
-protocol failure with the close code RFC 6455 prescribes.
-
-WebSocket over HTTP/2 and HTTP/3 (RFC 8441 / RFC 9220) is not implemented.
-HTTP/3 advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` because that is how
-WebTransport arrives; `webtransport` is the only `:protocol` served. HTTP/2
-does not advertise it — nothing here would answer an extended CONNECT on that
-connection.
-
----
+There is no handshake path. With `--no-websockets`, an upgrade request is
+refused with 501 before anything else can answer. Without it, an upgrade
+request is an ordinary request to the router. The server never enters the
+`websocket` state. WebSocket over HTTP/2 or HTTP/3 (RFC 8441 / RFC 9220) is not
+implemented.
 
 ## WebTransport
 
-WebTransport over HTTP/3 (draft-ietf-webtrans-http3) is an extended `CONNECT`
-with `:protocol: webtransport` that never finishes, carrying streams and
-unreliable datagrams that name their session by the identifier of the CONNECT
-stream they belong to.
+HTTP/3 advertises extended CONNECT and, when datagrams are allowed, a
+WebTransport session limit. The frame loop recognises the WebTransport shapes:
 
-So a session is a router, not a connection:
+- a peer unidirectional stream whose type is `0x54`, followed by a session ID;
+- a peer bidirectional stream opening with `WEBTRANSPORT_STREAM` (`0x41`),
+  which is told apart from a request by its first varint alone;
+- HTTP datagrams.
 
-- a peer **unidirectional** stream whose first varint is `0x54`, followed by a
-  session identifier, belongs to that session;
-- a peer **bidirectional** stream whose first varint is `0x41`
-  (`WEBTRANSPORT_STREAM`), likewise — and because a request stream begins with
-  a frame type instead, the two are told apart by that first varint alone;
-- a **datagram** begins with the session's *quarter* stream identifier, which
-  is how RFC 9297 fits a 62-bit stream id into as few bytes as possible.
-
-The close capsule (`CLOSE_WEBTRANSPORT_SESSION`) works in both directions.
-
-Session streams get no slot in the connection table. A slot carries a request
-head, a parser and a body buffer, and a WebTransport stream wants none of that:
-it is a byte pipe, read straight out of the QUIC receive buffer so that bulk
-data is copied once into a Python `bytes` and not before.
-
-### The ASGI extension
-
-ASGI has no WebTransport specification, so this one is Garuda's. It is
-announced the way the specification says a server extension should be, in
-`scope["extensions"]["webtransport"]`, and `scope["type"]` is `"webtransport"`.
-
-`receive()` produces:
-
-| message | fields |
-| --- | --- |
-| `webtransport.connect` | — |
-| `webtransport.stream.opened` | `stream`, `bidirectional` |
-| `webtransport.stream.receive` | `stream`, `data`, `more_data` |
-| `webtransport.datagram.receive` | `data` |
-| `webtransport.disconnect` | `code`, `reason` |
-
-`send()` accepts:
-
-| message | fields |
-| --- | --- |
-| `webtransport.accept` | `headers` (optional) |
-| `webtransport.close` | `code`, `reason` |
-| `webtransport.stream.open` | `bidirectional` |
-| `webtransport.stream.send` | `stream`, `data`, `end_stream` |
-| `webtransport.stream.pause` | `stream` |
-| `webtransport.stream.resume` | `stream` |
-| `webtransport.datagram.send` | `data` |
-
-```python
-async def app(scope, receive, send):
-    assert scope["type"] == "webtransport"
-    assert (await receive())["type"] == "webtransport.connect"
-    await send({"type": "webtransport.accept"})
-    while True:
-        message = await receive()
-        if message["type"] == "webtransport.disconnect":
-            return
-        if message["type"] == "webtransport.stream.receive" \
-                and not message["more_data"]:
-            await send({"type": "webtransport.stream.send",
-                        "stream": message["stream"],
-                        "data": b"got it", "end_stream": True})
-```
-
-Three details worth knowing:
-
-- **`more_data` is false on the last message for a stream** whether the peer
-  finished it or reset it. Either way nothing more is coming, which is the only
-  thing an application can act on.
-- **A stream the application opens is answered with
-  `webtransport.stream.opened`** rather than by a return value, because ASGI's
-  `send()` returns nothing. They arrive in the order they were asked for.
-- **Backpressure is the transport's, per stream.** `webtransport.stream.pause`
-  stops delivering one stream: its bytes stay in the QUIC receive buffer and
-  its window does not reopen. `resume` starts it again. The session's
-  `receive()` FIFO is not paused, so every other stream and every datagram
-  still move. `await send()` waits when the session has more queued than
-  acknowledged.
-
-Before accept, `webtransport.close` refuses the session with an HTTP status: a
-code in 400–599 is used as one, anything else becomes 403.
-
-### Frameworks
-
-That extension is a message protocol, and writing against it directly is fine.
-What no framework can do unaided is *route* to it: a session is not a request,
-so it arrives with `scope["type"] == "webtransport"`, and every ASGI framework
-asserts on that field before it looks at the path. Starlette's router, which
-FastAPI is built on, allows `http`, `websocket` and `lifespan`, and nothing
-else.
-
-So `garuda.contrib` puts a router in front, which answers sessions itself
-and hands everything else to FastAPI unchanged.
-
-```python
-from fastapi import FastAPI
-from garuda.contrib.fastapi import WebTransportRouter
-
-api = FastAPI()
-app = WebTransportRouter(api)            # serve this one
-
-@app.route("/chat/{room}")
-async def chat(session):
-    await session.accept()
-    room = session.path_params["room"]
-    async for stream in session.incoming_streams():
-        await stream.send(b"welcome to " + room.encode(), end=True)
-```
-
-Paths keep Starlette's spelling — `{room}`, and `{count:int}` for a converted
-parameter. A missing or extra trailing slash is tried the other way: a session
-cannot be HTTP-redirected.
-
-`garuda.webtransport.WebTransportSession` is what those hand the endpoint,
-and it is framework-agnostic: it demultiplexes the one ASGI `receive()` channel
-into streams, datagrams and the answers to stream-open requests, so an endpoint
-reads a stream as an async iterator rather than running its own state machine.
-A full stream queue pauses that stream at the server rather than stopping the
-pump. Datagrams drop the oldest when their queue is full, matching the server.
-The queues are bounds, not buffers.
-
-FastAPI also gets `WebTransportEndpoint`, the class-based form that mirrors
-Starlette's `WebSocketEndpoint`, with `on_connect` / `on_stream` / `on_datagram`
-/ `on_disconnect`; streams and datagrams are dispatched concurrently.
-
-**HTTP/3 needs no integration at all.** A request is the same request whatever
-carried it. FastAPI's `request.url.scheme` and `request.client`, and Flask's
-`request.scheme`, `request.is_secure` and `request.remote_addr`, are right over
-QUIC without either framework being told. For FastAPI, `http_version(request)`
-and `is_http3(request)` are provided for applications that want to know; a
-Flask view reads `SERVER_PROTOCOL`, which is `HTTP/3`. `AltSvcMiddleware` covers
-the case where HTTP/3 lives somewhere this process cannot see — a terminating
-proxy, or a different port.
-
-Flask is a WSGI application, so the router does not apply to it: WebSocket and
-WebTransport are streams that outlive a response, PEP 3333 cannot express one,
-and both are refused with a 501 on WSGI. [CONFIG.md](CONFIG.md) has what to
-configure in each framework for every protocol here.
-
----
-
-## WSGI on a multiplexed stream
-
-PEP 3333 knows nothing about streams and does not have to. HTTP/1.1, HTTP/2 and
-HTTP/3 differ in how a message is framed, and framing is the server's job in
-all three. But two things do not carry across untouched.
-
-**The head has to be compressed, and the compressor belongs to the
-connection.** HPACK and QPACK are tables that both ends keep in step, so only
-the thread that owns the connection may touch one — while a WSGI application
-may be running on a `--wsgi-threads` pool thread, which owns nothing. So the
-response head is staged in a neutral form by whichever thread produced it, and
-encoded on the loop thread at the moment the first bytes are about to go out.
-One walk over the application's headers produces either HTTP/1.1 text or that
-staged block, so the two cannot drift apart. The body needs nothing: it is
-already bytes, and the stream flush turns bytes into DATA frames whatever
-produced them.
-
-**The request cannot be dispatched on its head.** An ASGI application is
-started as soon as the head is parsed — that is what lets it reject an upload
-at byte one. WSGI is called once, with `wsgi.input` already holding the whole
-body, so a multiplexed request waits for the stream to end exactly as it waits
-for the body on HTTP/1.
-
-Two things a WSGI application can observe about the transport are told the
-truth: `SERVER_PROTOCOL` is `HTTP/2` or `HTTP/3`, and `wsgi.url_scheme` follows
-the `:scheme` pseudo-header. A trusted proxy can still override the scheme, as
-on HTTP/1.
-
-One limitation is worth stating plainly: an inline WSGI application (the
-default, `--wsgi-threads 1`) that streams an unbounded response over HTTP/2 or
-HTTP/3 buffers whatever the peer has not taken, because there is no socket to
-block on and blocking the loop would stall the acknowledgements that let it
-drain. `--wsgi-threads N` does not have that problem — the pool holds the bytes
-with the job and the loop takes them as the connection drains, which is real
-backpressure.
+The handlers for all three are stubs (`WebTransport.swift`) that drop what
+they are given. A CONNECT with `:protocol` is dispatched on its head, because
+the stream never ends, and `dispatch` answers it 501. No session is ever
+created.
 
 ---
 
 ## Testing
 
 Every transport is checked against an implementation that shares none of its
-code, because a test written against the same understanding as the code proves
-only that the understanding is consistent.
+code. A test written from the same understanding as the code only proves that
+understanding is consistent.
 
 ```bash
-<venv>/bin/python scripts/http2-test.py         # 162 checks against `h2`
-<venv>/bin/python scripts/http3-test.py         # 114 checks against `aioquic`
-python3 scripts/contrib_test.py                 #  58 Python-only
-<venv>/bin/python scripts/webtransport-test.py  # including FastAPI over HTTP/3
-
-h2spec -h 127.0.0.1 -p 8443 -t -k               # 146/146
+<venv>/bin/python scripts/http2-test.py          # 50 checks against `h2`, cleartext and TLS
+<venv>/bin/python scripts/http3-test.py          # 53 checks against `aioquic`
+<venv>/bin/python scripts/router-streams-test.py # 41: routes, delays and cancellation on h2 and h3
+python3 scripts/feature-test.py                  # 62: shutdown, supervision, unix sockets, scrapes
 ```
 
-The HTTP/2 suite runs twice, cleartext and over TLS, because the record layer
-decides where frame boundaries fall. Both multiplexed suites run their WSGI
-sections twice more, inline and pooled.
+The HTTP/2 suite runs each check twice, once cleartext with prior knowledge
+and once over TLS with ALPN, because the record layer decides where frame
+boundaries fall. `swift test` covers the parser, HPACK, QUIC packet protection
+and streams, and WebSocket framing.

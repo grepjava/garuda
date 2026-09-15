@@ -4,355 +4,404 @@
 
 # Architecture
 
-Garuda shares a process with CPython. There is no socket between Swift and
-Python, no serialisation step and no second process: Swift owns the accept
-loop, the parser and the response writer, and calls the application directly.
-Everything below follows from that one decision.
+Garuda is one Swift executable. A supervisor process owns the listening
+sockets and forks worker processes; each worker is a single thread running a
+readiness poller over a flat table of connections. It parses HTTP/1.1, HTTP/2
+and HTTP/3 itself, and answers requests with a synchronous router that writes
+straight into the connection's write buffer. The binary links OpenSSL, zlib and
+the Swift runtime, nothing else. Foundation is not linked.
 
-It is built in one of two forms from the same source. The wheels carry
-`garuda._native`, an extension module: `python -m garuda` imports it and
-the server runs inside that interpreter, whose supervisor forks the workers.
-The standalone executable embeds `libpython` instead and starts an interpreter
-in each worker itself. The only difference at run time is where Python's code
-lives. A distribution `python3` is a statically linked, position-dependent
-executable, and framework code runs 10-15 % faster there than in the shared
-`libpython` an embedding executable has to load — see
-[BENCHMARKS.md](BENCHMARKS.md).
-
-The protocols themselves are in [TRANSPORT.md](TRANSPORT.md).
+The protocols are described in [TRANSPORT.md](TRANSPORT.md). What works today
+and what does not yet is tracked in [GARUDA.md](GARUDA.md).
 
 ```
 Sources/
-  CGaruda/        C shim: epoll/kqueue, sockets, signals, TLS, crypto,
-                     UDP, and the CPython macros Swift cannot import
-  GarudaCore/     buffers, buffer pool, poller, logging, date cache
-  GarudaHTTP/     HTTP/1.1 parser, chunked decoder, response writer,
-                     HPACK, QPACK, HTTP/2 and HTTP/3 framing
-  GarudaPython/   PyRef, interned constants, custom Python types
-  GarudaQUIC/     QUIC transport and the TLS 1.3 handshake it needs
-  GarudaWSGI/     environ building, wsgi.input, start_response
-  GarudaASGI/     scope and message building
-  GarudaServer/   connection table, worker loop, both dispatchers,
-                     HTTP/2, HTTP/3, WebSocket, WebTransport, supervisor,
-                     and the command line parser both forms share
-  GarudaExtension/ garuda._native: PyInit and serve(argv)
-  garuda/         the standalone executable's entry point
+  CGaruda/            C shim: epoll/kqueue, sockets, signals, fork, sendfile,
+                      TLS (garuda_tls.c), crypto primitives for QUIC, UDP with
+                      recvmmsg/GSO, ACME, and the shared-memory tables for
+                      metrics, rate limiting and the response cache
+  GarudaCore/         ByteBuffer, BufferPool, Poller, logging, the Date cache
+  GarudaHTTP/         HTTP/1.1 parser, chunked decoder, response writer, HPACK,
+                      QPACK, HTTP/2 and HTTP/3 framing, WebSocket framing,
+                      forwarded-header trust, cache policy, root path
+  GarudaQUIC/         QUIC transport and the TLS 1.3 handshake it needs
+  GarudaServer/       supervisor, worker loop, connection table, dispatch,
+                      router, async substrate, HTTP/2 and HTTP/3 servers,
+                      static files, TLS glue, reload, ACME, metrics, CLI
+  garuda/             the executable's entry point (calls GarudaCLI.main)
+  GarudaFuzzTargets/  fuzz targets and seeds, driven by pgfuzz/
+Tests/GarudaTests/    unit tests
 ```
 
-`Python.h`, `openssl/ssl.h` and `openssl/evp.h` never appear in a header Swift
-imports. Everything they offer arrives through opaque functions in the shim,
-which is what keeps the Swift side free of the macro soup and the C++-ish
-declarations those headers contain.
+`Package.swift` builds these as the targets `CGaruda`, `GarudaCore`,
+`GarudaHTTP`, `GarudaQUIC` and `GarudaServer` (the library product `Garuda`),
+the `garuda` executable, and `GarudaFuzzTargets` with its `pgfuzz` driver.
+Swift never imports an OpenSSL header. It sees TLS sessions, contexts and
+loaded keys as opaque handles behind functions in the shim.
 
 ---
 
-## One process per worker
+## Processes
 
-Each worker is a separate process with its own interpreter and its own poller.
-How the listening socket is shared depends on the address family, because the
-two have opposite constraints:
+### The supervisor owns the sockets
 
-- **TCP:** every worker opens its own socket with `SO_REUSEPORT`, so each gets
-  an independent accept queue in the kernel. No shared accept lock, no
-  thundering herd; the kernel spreads connections by hashing the four-tuple.
-- **UDP (HTTP/3):** the same, with the same consequence and one extra one — a
-  client that migrates to an address hashing to a different worker reaches a
-  worker that has never heard of its connection.
-- **Unix:** a path can only be bound once, so the supervisor creates the
-  listener and the workers inherit it across `fork`. Letting each worker bind
-  for itself would have every worker unlink and replace the socket the previous
-  one had just published, leaving only the last one reachable.
+Everything runs under a supervisor, including a single worker
+(`Runtime.swift`, `runSupervisor`). Before the first fork it:
 
-The supervisor restarts workers that die, forwards signals, and owns the
-`--reload` watcher. `SIGHUP` restarts the workers without dropping the
-listening socket.
+- opens the listening sockets. For TCP that is **one socket per worker slot**,
+  each with `SO_REUSEPORT`, so every worker has its own accept queue in the
+  kernel: no shared accept lock, no thundering herd. For a unix socket it is
+  **one socket shared by every worker**, because a path can only be bound once;
+- maps the pages every worker shares: the metrics page (two slots per worker,
+  see below), the `--rate-limit` table, and the `--cache-size` table;
+- checks the TLS certificates once, so a bad path is one error at start-up
+  rather than one per worker.
+
+Workers are forked with `pg_fork_worker`. It blocks the piped signals across
+the fork and gives the child a signal pipe of its own, so a signal that arrives
+during the fork is not lost. A child closes every other slot's listener and
+keeps only its own. (A unix socket is the same descriptor in every slot, so it
+keeps that one.)
+
+The supervisor keeps the sockets open for as long as it runs. That is what lets
+a worker be *replaced* without dropping connections. The kernel assigns a
+connection to one socket in the `SO_REUSEPORT` group when the SYN arrives, not
+when `accept()` is called. A socket that leaves the group takes its accept
+queue and its half-finished handshakes with it, however carefully its worker
+drained. A replacement inherits the same socket, so the group never loses a
+member.
+
+The metrics listener, the `--redirect-http` listener and the QUIC socket are
+opened by each worker for itself, also with `SO_REUSEPORT`.
+
+### Readiness and replacement
+
+Every worker is forked with a readiness pipe. Once it has built its poller,
+TLS context and listeners, it writes one byte and closes its end. The
+supervisor reads rather than polls: one byte means ready, and end of file means
+the worker died during start-up.
+
+A worker that exits on its own is restarted in its slot. `SIGHUP` replaces the
+workers **one slot at a time**:
+
+1. fork the replacement for slot *i*, and move the slot to the other half of
+   its metrics pair (the outgoing worker is still writing to its own half);
+2. wait for the replacement's readiness byte. Both workers serve the slot
+   meanwhile. The wait is bounded at 60 s, after which the old worker is
+   retired anyway;
+3. send the old worker `SIGQUIT`. Its replacement is already serving, so there
+   is nothing for `--drain-delay` to wait for;
+4. once the old worker has exited, move on to slot *i + 1*.
+
+If a replacement dies before it reports ready, the slot goes back to the worker
+it was replacing and the pass stops, so one worker that cannot start never
+takes the others down with it. A reload requested while a pass is running
+queues another pass. Each reload flushes the shared response cache.
+
+### `--reload`: restarting on a rebuilt executable
+
+The handlers are compiled into the server, so the file that matters is the
+executable (`ReloadWatcher.swift`). The supervisor watches its directory with
+inotify or kqueue, and also re-stats it every `--reload-interval`, because a
+bind mount or WSL's view of a Windows drive may never send a notification. A
+change counts once the file's signature (device, inode, size, mode, mtime) has
+held still for 300 ms, since a linker writes in several steps.
+
+Forked workers can never run the new code, so the supervisor replaces itself
+(`Reexec.swift`). It waits until no restart pass, handover, retiring worker or
+ACME helper is in flight. Then it checks that the new file actually runs
+(`pg_probe_executable`) and `exec`s it with the same arguments. The listening
+descriptors are left open across the exec, and they travel together with the
+worker pids in `GARUDA_REEXEC` (`fd,fd,…;pid,pid,…`). The new image takes that
+record and adopts the old workers, which are still its children. It then
+replaces them exactly as a `SIGHUP` would. If the worker or listener count no
+longer matches, it stops the inherited workers and closes their sockets rather
+than leave them unsupervised.
+
+A change to `--tls-cert`, `--tls-key` or an extra SNI certificate needs no
+exec: new workers read the files again as they start, so the supervisor just
+begins a replacement pass. Certificates managed by `--acme-domain` are not
+watched, because their helper already triggers the reload.
+
+### ACME
+
+`--acme-domain` runs the ACME client in a **helper process** forked from the
+supervisor, one at a time. It is a process rather than a thread because the
+supervisor forks workers, and forking while another thread holds the
+allocator's lock would leave the child with a lock nobody releases. The helper
+closes the listeners and the signal pipe, and its exit status is its whole
+report. Exit 0 means a new certificate is on disk, and the supervisor replaces
+the workers onto it. Failures back off from one minute, doubling up to six
+hours. With nothing cached at start-up the server boots on a self-signed
+placeholder, because the workers that answer the `tls-alpn-01` challenge need
+a certificate to start.
+
+### Shutdown
+
+- **`SIGTERM`**: the supervisor forwards it. Each worker starts failing its
+  `--health-check-path` with 503, keeps serving for `--drain-delay`, then
+  drains.
+- **`SIGINT` / `SIGQUIT`**: drain now. A second one cuts a drain delay short.
+- **Draining** (`beginDraining`) closes keep-alive connections that are idle
+  *between* requests. A freshly accepted connection that has not been read yet
+  is kept, because its client may already have sent a request. The worker
+  stops polling the listener, closes its handle on it and its redirect
+  listener, and exits once the table is empty.
+- **`--graceful-timeout`** bounds in-flight requests. Past it, every remaining
+  connection is closed.
+- Behind that, a `SIGALRM` watchdog `_exit`s the worker ten seconds after the
+  grace period, and the supervisor `SIGKILL`s any worker still alive past
+  drain delay + grace period + 2 s.
 
 ---
 
-## One thread per worker, when the interpreter allows it
+## The worker
 
-A worker is a process for one reason: the GIL. A second thread cannot serve a
-second request, so the only way to a second core is a second interpreter, and
-the only way to a second interpreter is a second process. CPython 3.13 shipped
-a build without the GIL (PEP 703) and that reasoning stops applying.
-`--free-threaded` is the option that says so — the workers become threads of
-one process, and nothing else about them changes.
+A worker is one thread and one `Worker` struct, reached through a raw pointer
+(`makeWorker`). Its loop is `runSynchronousLoop`:
 
-What makes that a small change rather than a rewrite is that a worker never
-reaches outside itself. It owns its poller, its connection slab, its buffer
-pool, its date cache and its event loop; the only things it reads that it does
-not own are written once at start-up and never again — the interned constants,
-the internal Python types, the glue functions, the application object. So the
-work was to move the last few pieces of per-worker state off the process:
-
-- `currentWorker` became a thread-local. It is what a `send`/`receive` callable
-  or the asyncio reader callback uses to find its worker, and those arrive from
-  Python carrying nothing but a connection token.
-- The ASGI event loop, the lifespan handle and the scope builder moved from
-  statics onto `Worker`. The scope builder is the one that mattered: it carries
-  a mutable memoised header-name cache and a scratch buffer, so one shared
-  across threads would have been a data race on the request path.
-
-The main thread is not a worker. It costs one mostly-idle thread and buys the
-ordering that matters: **signals land somewhere that is not serving a request.**
-Worker threads are started with every signal blocked; the main thread owns the
-signal pipe and asks each worker to drain by writing down a pipe that worker
-already polls, so `handleSignals` cannot tell the difference between that and a
-real signal.
-
-**The lifespan follows the event loop, not the process.** This started out the
-other way around — one lifespan on the main thread's loop, one `startup` for one
-application — and that was wrong. `startup` is where an application builds
-asyncio objects, and an asyncio object binds to the loop that was running when
-it was created; a pool built on the supervising loop and awaited from a worker's
-loop is the "attached to a different loop" error, when it fails loudly at all.
-So each worker thread runs the lifespan on its own loop and publishes its own
-`state` mapping to the scopes that loop serves, and shuts it down on that loop
-once its own requests have drained. The startups are serialised behind a mutex:
-they run against one application object that has never had to be thread-safe.
-
-`--lifespan-scope process` asks for the original reading — exactly one `startup`,
-on the supervising loop — which is right for start-up that opens nothing
-loop-bound, and only then. There the shutdown ordering is what it always was:
-every worker drains and is joined *first*, and only then does the application get
-`lifespan.shutdown`.
-
-What is genuinely shared is the application, which is the point. One import,
-one set of module-level caches, one warm JIT — instead of N copies. Four workers
-serving a CPU-bound application on four cores reach the same throughput either
-way, in 47 MB as threads against 143 MB as processes. Connection pools are the
-exception, and belong to their loop for the reason above: an application that
-wants one pool per worker thread puts it in the lifespan `state` mapping, which
-is per loop here, rather than in a module global.
-
-The trade is isolation: a crash takes every worker with it, where the process
-supervisor would have restarted one. So the two compose rather than compete —
-`--free-threaded --reload` puts the supervisor in front of a single threaded
-child, and in production systemd plays the same part.
-
----
-
-## The asyncio integration is one file descriptor
-
-The interesting trick in the ASGI path: an epoll (or kqueue) descriptor is
-*itself pollable*. So instead of running a Swift I/O thread and marshalling
-work across to the Python loop, Garuda hands its poller to asyncio:
-
-```python
-loop.add_reader(poller_fd, drain)   # drain is a C-level Swift callback
-loop.run_forever()
+```swift
+while running {
+    let timeout = quicPollTimeout(200)   // 0 if the ready queue has work
+    let n = poller.wait(timeoutMillis: timeout)
+    if n > 0 { processEvents(n) }
+    fireDueTimers()                      // TimerHeap -> ReadyQueue
+    drainReadyQueue()                    // at most 64 resumes
+    quicTick()                           // QUIC loss/ack/idle timers
+    sweepTimeouts()                      // once a second: idle, stalls, drain
+    if draining && quiescent { running = false }
+}
 ```
 
-asyncio then treats the entire server as one more readable descriptor. The
-result is one thread, one event loop per worker: no cross-thread queues, no
-`call_soon_threadsafe` wakeups, no GIL handoffs — and uvloop works unchanged,
-because `add_reader` is part of the loop contract. Under `--free-threaded` a
-process holds several of these, one per worker thread, and each is still the
-same self-contained arrangement — the loops never speak to each other.
+The poll timeout is the default 200 ms, cut to the nearest QUIC deadline and
+the nearest timer deadline (rounded *up*, because waking early only spins). It
+is 0 while the ready queue still holds work.
 
-HTTP/3 adds one thing to this: QUIC has timers of its own — an acknowledgement
-owed in milliseconds, a probe that has to fire — so a worker serving QUIC
-cannot sleep for the usual interval. The loop's periodic callback runs at 20 ms
-instead of the default, and the poll timeout is shortened to whatever the
-nearest QUIC deadline is.
+### Poll tokens
 
-The WSGI path uses no asyncio at all. The poller is the only thing that blocks,
-and the GIL is released around it so application threads — the optional pool,
-or threads the application started itself — still run.
+The poller is epoll on Linux and kqueue elsewhere, with a reused event array of
+256. Every registration carries a 64-bit token. A connection's token is
+`(generation << 24) | slot`. Fixed tokens name the listener, the signal pipe,
+the QUIC socket, the metrics listener, the redirect listener, and eight slots
+for scrapes or redirects whose request has not finished arriving. Those are
+answered without a connection slot.
 
----
+### The connection table
 
-## The connection table
+Connections live in one contiguous slab of `Connection` structs, indexed by
+slot, with a free list threaded through the unused entries
+(`Connection.swift`). Accepting is an index pop and closing is an index push.
+`allocate` bumps the slot's `generation`. An event whose token carries an old
+generation is for a descriptor closed earlier in the same batch, and it is
+discarded with one compare.
 
-Connections live in one contiguous slab indexed by slot, with a free list
-threaded through the unused entries. Accepting is an index pop; closing is an
-index push.
+A slot is a connection **or a stream**. An HTTP/2 or HTTP/3 request stream
+takes a slot from the same table, with `fd = -1` and `parentSlot` pointing at
+the connection that carries it. An HTTP/3 connection's own slot has no
+descriptor either, because the UDP socket belongs to the QUIC listener. Code
+above the transport treats all of these alike; see
+[one request path](TRANSPORT.md#one-request-path).
 
-Poller tokens pack `(generation, slot)` into 64 bits, and the generation makes
-a stale event — one epoll collected for a descriptor we closed earlier in the
-same batch — a discarded compare rather than a use-after-free. The same token
-is what a Python `send`/`receive` callable carries, so an application holding
-one after its connection has gone finds an empty slot instead of somebody
-else's.
+States: `readingHead → [readingBody] → dispatching → writing → (reuse |
+close)`. The long-lived states are `http2` and `http3`, plus `closing` for a
+stream whose response finished before its upload did. A full table answers 503
+and closes rather than queueing. Accepts are bounded at 64 per wake-up, and
+`EMFILE` pauses accepting until a slot is freed.
 
-A slot is a connection *or* a stream. A stream slot has `fd = -1` and a pointer
-back to its parent, and everything above the transport treats the two
-identically; see [one request path](TRANSPORT.md#one-request-path).
+### An HTTP/1.1 request
 
----
+1. **Read.** `fill` drains the socket into the pooled read buffer. Over TLS it
+   keeps reading while OpenSSL still holds decrypted bytes, because a
+   level-triggered poller will not mention those again.
+2. **Parse.** `HTTPParser.parse` produces `(offset, length)` slices into the
+   read buffer and allocates nothing.
+3. **Begin.** `beginRequest` bumps `requestId` and clears any continuation.
+   It decides keep-alive (not while draining, not past the per-connection
+   request limit), rejects an oversized `Content-Length` with 413 and sends
+   `100 Continue` if asked. It also settles body framing. A Content-Length
+   body is read into its own `body` buffer, never past its declared end, so
+   the head bytes stay valid where they are. A chunked body needs the read
+   buffer for framing, so the head is copied into `headStore` first.
+4. **Dispatch** once the body is complete (below).
+5. **Finish.** `finishResponse` runs once the write buffer drains. If the
+   request body was never fully read, a small remainder already on the socket
+   is swallowed, and otherwise the connection closes. Then the slot either
+   returns to `readingHead` (processing any pipelined bytes already buffered)
+   or closes.
 
-## Minimising ARC
+### The dispatch seam
 
-The brief was to keep Swift's reference counting off the request path — not to
-ban classes outright. Start-up configuration, the WSGI thread pool, the QUIC
-connection objects and the `--reload` watcher use ordinary Swift classes and
-arrays, because they run once per process, or once per connection, and clarity
-is worth more there. On the request path:
+`Worker.dispatch` is where every request, whatever carried it, is answered.
+In order:
 
-**Python objects are never wrapped in Swift classes.** A `PyObject` already has
-its own reference count, which under a standard CPython build is a non-atomic
-increment protected by the GIL. Putting it behind a Swift class would mean
-paying *two* counts, one of them atomic. Instead `PyRef` is a `~Copyable`
-struct whose `deinit` calls `Py_DECREF`; the compiler proves single ownership
-and inserts the decref exactly once on every path, at zero runtime cost.
-Borrowed references are a bare `OpaquePointer`.
+1. stamp the start time (access log, metrics), assign `--request-id` and
+   `--trace-context`;
+2. `--no-websockets`: an upgrade request is refused with 501;
+3. `--health-check-path`: 200, or 503 once draining;
+4. `--rate-limit`: 429 with `Retry-After`;
+5. `--static-dir`: a file, if one matches (`StaticFiles.swift`);
+6. `--compress`: negotiate the coding, then `--cache-size`: answer from the
+   shared cache. Both exist, but today no response is compressible or stored;
+   see [GARUDA.md](GARUDA.md);
+7. an extended CONNECT (`:protocol` on HTTP/3) is refused with 501;
+8. **`respondRoute`** (`Router.swift`).
 
-**No object per connection.** The slab above.
+`--redirect-http` is not part of this path. It is a separate listener in each
+worker that answers plain HTTP with a redirect to https and closes
+(`HTTPS.swift`).
 
-**Buffers are values, not objects.** `ByteBuffer` is a trivial struct — a
-pointer and three integers, passed in registers — with an explicit `destroy()`
-at the one place a buffer dies. It is not a class (that would be ARC on every
-hand-off) and not `~Copyable` with a `deinit` (that fights the move-only
-checker on every partial mutation of a slab entry). Ownership is a documented
-invariant here rather than a language-enforced one; that is the trade this
-server is built to make, and it is confined to a handful of files.
+### The router
 
-**Nothing on the request path becomes a `String`.** The parser produces
-`(offset, length)` pairs into the read buffer. Header names, values, paths and
-query strings stay as bytes until the moment they are handed to Python, where
-they are copied exactly once into a `str` or `bytes`. Logging assembles bytes
-in a stack buffer and issues one `write(2)`; there is no string interpolation
-anywhere in the server.
+`Router.match` compares method and path bytes, after stripping `--root-path`,
+and returns a `Route`:
 
-**Foundation is not linked.** It would drag in ARC-heavy bridging types for no
-benefit here.
+| route | answer |
+| --- | --- |
+| `GET /` | 200, empty body |
+| `GET /user/:id` | 200, the id bytes as the body |
+| `POST /user` | 200, empty body |
+| `GET /delay/:ms` | 200 after `ms` milliseconds (clamped 1–5000) |
+| anything else | 404, connection kept |
 
-The Python side gets the same treatment. `send`, `receive` and the awaitable
-they return are C-level types built with `PyType_FromSpec` whose slots are
-Swift `@convention(c)` functions, so `await send(msg)` is a `tp_call` plus a
-`tp_iternext` and nothing else — no Python frame, and no trip through the event
-loop, because a send that completes synchronously returns a pre-completed
-awaitable that raises `StopIteration` on its first step.
-
----
-
-## The WSGI thread pool
-
-`--wsgi-threads N` turns on a bounded pool. A synchronous application spends
-most of its wall clock *waiting* — on a database, a cache, another service —
-and CPython releases the GIL around every blocking syscall, so those waits can
-overlap. The GIL is not the reason to run one request at a time; it just means
-the pool buys nothing for CPU-bound work, which is why the default is still one
-thread and the inline path is unchanged.
-
-The split is what keeps the pool safe:
-
-- the **loop thread** owns every connection, buffer and poller, builds the
-  environ, and encodes anything that touches a per-connection compressor;
-- a **pool thread** owns only the job, and holds the GIL while it calls the
-  application and serialises the response into the job buffer.
-
-Bytes cross back under one mutex, and the loop is woken through a pipe it
-already polls.
-
-Backpressure is real rather than advisory: when a job buffer passes the high
-water mark the producing thread releases the GIL and blocks until the loop has
-written enough of it, so a streaming response runs at the speed of the client.
+`HEAD` is answered wherever `GET` is. `writeSwiftResponse` writes the status
+line, `Date` (from a cache reformatted at most once a second), `Server`, the
+server headers (`writeServerHeaders`: Alt-Svc, HSTS, X-Request-ID),
+`Content-Length`, `Connection` and the body straight into the connection's
+write buffer. It then flushes once, so head and body leave in one `write`.
+On a stream the same call goes to `h2Respond` or `h3Respond`, which encode the
+head with HPACK or QPACK (`encodeServerHeaders` / `encodeServerHeadersH3`) and
+queue the body on the stream.
 
 ---
 
-## Backpressure
+## The async substrate
 
-Three producers can outrun their consumer, and each is stopped by the same
-idea — refuse to buffer, and let the pressure reach whoever is producing.
+`GET /` allocates nothing and never suspends: a handler that can finish does
+so inside `dispatch`. Waiting is opt-in, and it is implemented without `Task`
+or any other scheduler hop (`AsyncOps.swift`). Today the only user is
+`GET /delay/:ms`, and there is no public handler API on top of it yet.
 
-- **An ASGI application writing a response.** `await send(...)` normally
-  completes without suspending, because the bytes go straight into the write
-  buffer. When that buffer passes the high water mark it returns a real
-  `Future` instead, resolved once the connection has drained back below the low
-  one. On a multiplexed stream "drained" means acknowledged by the peer, not
-  written to a socket — so the transport tells the layer above when an
-  acknowledgement frees send buffer, and a producer parked on a window update
-  that a peer with a large window would never send is a bug that has been
-  fixed rather than a hazard to live with.
-- **A client uploading a body.** Body bytes are read no further ahead than the
-  application has asked for: past the high water mark the worker stops reading
-  the socket, so an upload nobody is consuming costs TCP window rather than
-  memory. On HTTP/2 and HTTP/3 the window is only given back as the application
-  actually reads.
-- **A peer flooding a WebSocket.** Decoded messages queue, bounded by
-  `--ws-max-queue` and `--ws-max-queue-bytes`, and the read side switches off
-  at the bound.
-- **A WSGI application streaming a response.** PEP 3333 makes this the
-  application's own problem to feel: a yielded block goes to the socket before
-  the next is requested, and a `write()` goes out before it returns, so a
-  producer faster than the client parks in the write that will not complete.
-  Inline that means draining the block to the socket entirely, waiting on
-  writability as often as it takes — stopping at the high water mark instead
-  strands up to that much of the block, and on the inline path there is nothing
-  to send it while the application runs. On a pool thread the same block is
-  handed to the loop, which writes it while the application produces the next
-  one, and the high water mark parks the thread. Buffering it all until the
-  application returns, which is what the server used to do, hides the pressure
-  and delays every byte.
+**`AsyncOpPool`** is a fixed-capacity slab of `AsyncOp` records (one per
+possible connection) with a free list. Each record has a generation bumped on
+allocate, and stores its slot, the `requestId` it was armed for, its kind
+(`timer`), a microsecond deadline and its heap index.
 
-  The exception is a WSGI response on an HTTP/2 or HTTP/3 stream, where a block
-  can only go as far as the peer's flow-control window allows. Waiting for more
-  window inline would deadlock — the `WINDOW_UPDATE` that would release it
-  arrives on the loop that is blocked — so the bytes stay with the transport
-  and go out when the loop next runs. `--wsgi-threads` is what removes that
-  gap, because then the loop is running.
+**`TimerHeap`** is a min-heap of `(deadlineUs, opIndex, opGeneration)`, with
+each op remembering its index so it can be removed from the middle. Deadlines
+come from `pg_monotonic_us`, not the coarse millisecond clock, plus one
+microsecond for truncation, so a timer never fires early. `popDue` discards
+heap nodes whose op has been recycled or unlinked.
 
-Bodies are bounded by `--max-body`, heads by `--max-header-size`, header count
-by a fixed limit, and connections by `--max-connections`; a full table answers
-503 and hangs up rather than queueing without bound.
+**Per-connection continuation fields** keep `Connection` small: `contState`
+(`none` / `waiting` / `ready`), `contKind` (what to do on resume), `contOp` and
+`contOpGeneration` (the one op this request is parked on), and `contTicket`.
+
+**Two identities.** The connection generation names the slot's lifetime and
+changes only on allocate. `requestId` names the request and changes at every
+`beginRequest` (or stream open). A keep-alive connection reuses its slot and
+generation, so a timer armed by request A must match on `requestId` too, or it
+could resume request B.
+
+**`ReadyQueue`** is a bounded FIFO ring buffer, sized to a power of two at least
+the table capacity. Its entries carry `slot`, `generation`, `requestId` and a
+`ticket`. The ticket is a per-worker serial stamped on the connection when it
+becomes ready, so if a request is armed again after becoming ready, only the
+newest entry can resume it. Cancelling does not remove queue entries.
+`isRunnable` rejects stale ones at drain time instead. If the queue is full
+when a continuation becomes ready, it is compacted in place to drop stale
+entries (a slot has at most one runnable entry, so there is always room). The
+resume never runs inline.
+
+The flow for `/delay/:ms`:
+
+1. `armDelay` clears any previous continuation, allocates an op, pushes it on
+   the heap and parks the connection as `waiting`;
+2. `fireDueTimers` pops due entries; `completeTimerOp` frees the op and, if the
+   slot, `requestId`, state and `contOp` still match, `enqueueReady` marks it
+   `ready` with a fresh ticket and queues it;
+3. `drainReadyQueue` resumes up to **64** continuations per turn. Only resumes
+   that actually run spend the budget; stale entries cost a check each. While
+   work remains, the next poll uses timeout 0.
+
+**Cancellation** always goes through `cancelOps`, which frees exactly the op
+named by `contOp` (checked against `contOpGeneration`) and unlinks it from the
+heap. It never scans the pool. It runs on every `beginRequest` and keep-alive
+completion, and from `closeConnection`. Every way a stream can end reaches
+`closeConnection`: an HTTP/2 `RST_STREAM`, an HTTP/3 `RESET_STREAM` or
+`STOP_SENDING`, or its parent connection closing (which closes each child
+first). So a cancelled stream takes its timer with it
+(`scripts/router-streams-test.py`).
 
 ---
 
-## Other things that make it fast
+## Keeping ARC and allocation off the request path
 
-- **A prototype environ/scope dict** holding every constant entry is built once
-  and shallow-copied per request. `PyDict_Copy` on a small dict is a table
-  memcpy; the alternative is ten-plus hashed insertions every request.
-- **Interned keys.** Every environ and scope key is interned at start-up, so
-  dict insertion compares a cached hash instead of hashing key bytes again.
-- **Memoised header keys.** `User-Agent` becomes `HTTP_USER_AGENT` (WSGI) or
-  lowercased `b"user-agent"` (ASGI) once per process, in an open-addressed
-  cache keyed by the raw bytes. The cache stops growing once half full, so a
-  flood of unique header names cannot become a memory-exhaustion vector.
+Classes and dictionaries are used where they run once per process or once per
+connection: `H2Connection`, `H3Connection`, `QUICConnection`, `QUICListener`,
+`TLSContext`, `ReloadWatcher`, the supervisor. On the request path:
+
+- **No object per connection.** Connections are slab entries, reached by
+  pointer.
+- **Buffers are values.** `ByteBuffer` is a pointer and three integers, with an
+  explicit `destroy()` at teardown. A class would put ARC on every hand-off. A
+  `~Copyable` struct with a `deinit` fights the move-only checker on every
+  partial mutation of a slab entry. Ownership is a documented invariant,
+  confined to a few files.
+- **Pooled read buffers**, recycled LIFO (`BufferPool`), so the block handed
+  out next is the one still in cache.
+- **Nothing becomes a `String`.** The parser yields slices, the router matches
+  bytes, and log lines are assembled in a buffer and written with one `write`.
 - **Character classes are register constants.** `tchar` membership is two
-  64-bit shifts, not a table lookup.
-- **A cached `Date` header**, reformatted at most once a second by a
-  no-allocation, no-locale civil-from-days conversion.
-- **Vectorcall everywhere** — no intermediate argument tuples.
-- **`await send()` never waits and never raises.** A send whose bytes went
-  straight into the write buffer returns an awaitable that is already
-  complete, so the coroutine resumes without a trip through the event loop.
-  It completes by returning with no exception set rather than by raising
-  `StopIteration`, which CPython reads as a return of `None`, so no exception
-  object is created per `await`.
-- **Pooled read buffers** recycled LIFO, so the block handed out next is the
-  one still in cache.
-- **Framing decided with full information.** A WSGI response that is a list
-  gets an exact `Content-Length`; a generator gets chunked encoding on
-  HTTP/1.1, and on a multiplexed stream the end of the stream is the framing.
-- **One `write()` per flush, `sendfile` for static files, `TCP_NODELAY`,
-  `accept4`, `MSG`-free reads**, and one `epoll_ctl` only when the interest
-  mask actually changes. A response's head and body are copied into the
-  connection's write buffer and leave together; nothing on the request path
-  calls `writev`.
-- **`recvmmsg` for QUIC**, 32 datagrams per syscall.
+  64-bit shifts.
+- **Interest changes only when the mask does.** `setInterest` skips the
+  `epoll_ctl` call when nothing changed.
+- **`accept4`**, `TCP_NODELAY`, `sendfile` for static files (and `SSL_sendfile`
+  under `--ktls`), `recvmmsg` and UDP GSO for QUIC.
 
----
+## Limits and backpressure
 
-## Shutdown
+- Heads are bounded by `--max-header-size`, header count by a fixed limit, and
+  bodies by `--max-body`, counted cumulatively as bytes arrive, on every
+  protocol. Connections are bounded by `--max-connections`, and a full table
+  answers 503.
+- An HTTP/1.1 body is never read past its declared length. Bytes after it
+  belong to the next pipelined request and wait in the socket, with read
+  interest off, until the current response finishes.
+- A write buffer that grew past four read-buffer sizes is freed once it drains,
+  so one large response does not pin memory on an idle keep-alive connection.
+- A multiplexed stream moves bytes to its connection only while the
+  connection's own write buffer is under the write high-water mark, and HTTP/2
+  flow control applies on top of that. See [TRANSPORT.md](TRANSPORT.md).
+- `sweepTimeouts` runs once a second. It enforces `--keep-alive` on idle
+  connections and `--request-timeout` on a head, body or response that has
+  stopped moving. HTTP/2 connections with no streams time out as idle, and
+  QUIC runs its own negotiated idle timeout.
 
-`SIGTERM` or `SIGINT` drains gracefully, with a deadline. The listener stops
-accepting, idle connections close immediately, websockets are sent a `going
-away` close, and in-flight requests get `--graceful-timeout` to finish.
-Whatever is still running when that expires is cancelled and awaited — so
-cancellation is actually delivered rather than merely requested — and only then
-does the application receive `lifespan.shutdown`.
+## Engine code with nothing to serve yet
 
-Doing it in that order is the point: cancelling every task first would cancel
-the lifespan task too, and the application would never reach the code after its
-`yield`, so its cleanup — closing database pools, flushing telemetry — would
-silently not run.
+These parts compile and are reachable from the command line, but no handler
+produces what they act on:
 
-Every layer of that is cooperative, and cooperation is not a guarantee: a task
-can catch `CancelledError` and carry on, a C extension can sit in a syscall,
-and a single worker started without `--workers` has no supervisor to escalate
-to. So the cancellation phase has its own bound, the lifespan handler's
-cancellation has one too, async generator cleanup has one, and behind all of it
-a `SIGALRM` watchdog `_exit`s the process once the grace period plus a margin
-has passed. A deadline that nothing enforces is not a deadline.
+- **WebSocket**: framing, UTF-8 validation and permessage-deflate live in
+  GarudaHTTP and are unit-tested. The server never enters the `websocket`
+  state, and `WebSocket.swift` only holds the state struct and stubs.
+- **WebTransport**: HTTP/3 advertises it and recognises session streams and
+  datagrams. `WebTransport.swift` stubs drop them, and a CONNECT is answered
+  501.
+- **Response compression** (`Compression.swift`) and the **response cache**
+  (`ResponseCache.swift`, `garuda_cache.c`): no router response carries a
+  content type, and nothing is stored.
+
+## Testing
+
+- `swift test`: unit tests for the parser, HPACK (RFC 7541 appendix C and the
+  Huffman code), QUIC packet protection (RFC 9001 vectors generated by
+  `scripts/quic-vectors.py`), QUIC streams, WebSocket framing and deflate,
+  cache policy, trace context, root path, and the async substrate
+  (`AsyncOpsTests`).
+- `pgfuzz` with `GarudaFuzzTargets` for the parsers.
+- `scripts/`: end-to-end suites against independent clients. Transport
+  coverage is in [TRANSPORT.md](TRANSPORT.md#testing). `feature-test.py` (62)
+  covers supervision, shutdown, unix sockets and reload. The shell scripts
+  cover ACME, static files, rate limiting, redirects, request IDs, trace
+  context, SNI, draining and `reload-test.sh`.

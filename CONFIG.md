@@ -2,336 +2,178 @@
   <img src="assets/garuda-fiery-roaring.png" alt="garuda" width="480">
 </p>
 
-# Configuring FastAPI and Flask
+# Configuring Garuda
 
-The governing rule is that **the protocol is a server flag, not an application
-change.** A view is the same view whether HTTP/1.1, HTTP/2 or HTTP/3 carried
-the request to it. Nothing about the request changes except the version it
-reports, so there is nothing for the framework to do differently and nothing
-to configure.
+Garuda is configured entirely on the command line. There is no configuration
+file, and a running server does not re-read its flags: changing one means a
+restart. `garuda --help` prints the list this page explains.
 
-There are exactly two exceptions, and they are exceptions for the same reason:
-a **WebSocket** and a **WebTransport session** are not requests. They outlive a
-response. FastAPI is ASGI, and its router (Starlette's) admits `http`,
-`websocket` and `lifespan` scopes and nothing else, so a WebTransport session
-has to be answered in front of it. Flask is WSGI, and PEP 3333 has no way to
-express either one, so both are refused with a 501.
+**What answers requests today.** There is no public handler API yet; it is
+being designed. Requests that no server feature answers first go to a built-in
+synchronous router (`Sources/GarudaServer/Router.swift`):
 
-| | FastAPI (ASGI) | Flask (WSGI) | Server flags |
-|---|---|---|---|
-| **HTTP/1.1** | nothing to do | nothing to do | *(default)* |
-| **HTTP/2**, cleartext | nothing to do | nothing to do | *(default; prior knowledge)* |
-| **HTTP/2**, TLS | nothing to do | nothing to do | `--tls-cert --tls-key` |
-| **HTTP/3 / QUIC** | nothing to do | nothing to do | `--http3 --tls-cert --tls-key` |
-| **WebSocket** | native `@app.websocket` | 501 | *(default)* |
-| **WebTransport** | `contrib.fastapi.WebTransportRouter` | 501 | `--http3 …` |
+| request | answer |
+|---|---|
+| `GET /` | 200, empty body |
+| `GET /user/:id` | 200, the id as the body |
+| `POST /user` | 200, empty body |
+| `GET /delay/:ms` | 200, empty body, after `ms` milliseconds (clamped to 1–5000) |
+| `HEAD` on any GET route | the same head, no body |
+| anything else | 404, connection kept open |
 
-Working code is in [examples/fastapi_app.py](examples/fastapi_app.py) and
-[examples/flask_app.py](examples/flask_app.py).
-[scripts/framework-test.sh](scripts/framework-test.sh) runs both over HTTP/1.1
-and HTTP/2, [scripts/webtransport-test.py](scripts/webtransport-test.py) runs
-FastAPI over HTTP/3 and WebTransport, and
-[scripts/http3-test.py](scripts/http3-test.py) runs WSGI over HTTP/3, inline and
-on a thread pool.
+The router answers the same way over HTTP/1.1, HTTP/2 and HTTP/3. Everything on
+this page that sits in front of it — TLS, static files, rate limiting, health
+checks, the access log, metrics, reloads — is working and tested end to end. A
+few flags are parsed but have nothing to act on until handlers exist; they are
+collected under [Flags with no effect yet](#flags-with-no-effect-yet), and
+[GARUDA.md](GARUDA.md) tracks that status.
 
 ---
 
-## FastAPI and Starlette
+## Flag reference
 
-### One command, everything on
+Defaults are what the server uses when a flag is left out.
 
-```bash
-garuda --port 8443 --workers 0 \
-          --tls-cert cert.pem --tls-key key.pem --http3 \
-          myapp:app
-```
+### Listening and workers
 
-That serves HTTP/1.1 and HTTP/2 over TCP (chosen by ALPN), HTTP/3 over UDP on
-the same port number, WebSockets, and — once a router is in front — WebTransport
-sessions. `--workers 0` is one worker per CPU.
+| flag | default | what it does |
+|---|---|---|
+| `--host HOST` | `127.0.0.1` | interface to bind |
+| `--port PORT` | `8000` | TCP port (and HTTP/3's UDP port unless `--quic-port`) |
+| `--unix PATH` | — | listen on a unix socket instead of TCP |
+| `--workers N` | `1` | worker processes; `0` is one per CPU |
+| `--backlog N` | `2048` | listen backlog |
+| `--root-path PATH` | — | mount prefix removed from the path before routing |
 
-### The application object
+### Limits and timeouts
 
-FastAPI needs no adapter. Serve `app` directly, and only wrap it when you want
-WebTransport:
+| flag | default | what it does |
+|---|---|---|
+| `--max-connections N` | `4096` | concurrent connections per worker |
+| `--max-body BYTES` | 16 MiB | largest request body; larger gets 413 |
+| `--max-header-size BYTES` | 32 KiB | largest request head; larger gets 431 (minimum 1024) |
+| `--keep-alive MS` | `5000` | idle time allowed between requests |
+| `--request-timeout MS` | `30000` | how long a request may stall part-way through |
+| `--graceful-timeout MS` | `10000` | time in-flight requests get on shutdown |
+| `--drain-delay MS` | `0` | on SIGTERM, keep serving this long with the health check failing |
 
-```python
-from fastapi import FastAPI
-from garuda.contrib.fastapi import WebTransportRouter
+### Protocols
 
-app = FastAPI(lifespan=lifespan)      # ordinary FastAPI, all HTTP versions
+| flag | default | what it does |
+|---|---|---|
+| `--no-http2` | off | HTTP/1.1 only |
+| `--http2-only` | off | HTTP/2 only (h2c in the clear, `h2` alone in ALPN) |
+| `--http3` | off | also serve HTTP/3 over QUIC; needs TLS, not available on `--unix` |
+| `--quic-port PORT` | the TCP port | UDP port for HTTP/3 |
+| `--no-websockets` | off | refuse WebSocket upgrades with 501 |
 
-wt = WebTransportRouter(app)          # serve *this* when you want sessions too
-```
+### TLS and certificates
 
-`WebTransportRouter` is an ASGI application that answers `webtransport` scopes
-itself and passes everything else — HTTP, WebSocket, lifespan — through to
-`app` untouched. Wrapping costs one `dict.get` per request.
+| flag | default | what it does |
+|---|---|---|
+| `--tls-cert PATH` | — | PEM certificate chain; repeatable, paired with `--tls-key` in order |
+| `--tls-key PATH` | — | PEM private key for the preceding `--tls-cert` |
+| `--tls-ciphers LIST` | OpenSSL's | OpenSSL cipher list for TLS 1.2 (TLS 1.3 suites are not configurable) |
+| `--ktls` | off | let the Linux kernel encrypt, so static files use `sendfile` over HTTPS |
+| `--acme-domain NAME` | — | get and renew a certificate for NAME (repeatable) |
+| `--acme-email ADDR` | — | contact address for the ACME account |
+| `--acme-cache DIR` | `./acme` | where the account key and certificate are kept |
+| `--acme-staging` | off | use Let's Encrypt's staging CA |
+| `--acme-directory URL` | Let's Encrypt | use another ACME CA |
+| `--acme-ca-bundle PATH` | system roots | roots to trust for the CA's own HTTPS |
+| `--redirect-http PORT` | — | answer plain HTTP on PORT with a redirect to https |
+| `--hsts SECONDS` | — | send `Strict-Transport-Security: max-age=SECONDS` on TLS responses |
 
-* **Lifespan** works, including teardown on `SIGTERM`
-  ([lifespan](examples/fastapi_app.py#L14), and the shutdown check in
-  `framework-test.sh`). `--no-lifespan` skips the protocol for applications
-  that do not implement it; garuda detects those anyway.
-* **`StreamingResponse`** streams with real backpressure — the application is
-  not run further ahead than the socket has drained
-  ([/stream](examples/fastapi_app.py#L47)).
-* **Synchronous endpoints** run in the `anyio` thread pool FastAPI manages;
-  nothing here interferes with it.
-* **uvloop** is used automatically when importable. `--no-uvloop` opts out.
+### Reverse proxy
 
-### Knowing what carried the request
+| flag | default | what it does |
+|---|---|---|
+| `--forwarded-allow-ips LIST` | nobody | peers whose forwarded headers are believed: addresses, CIDR blocks, `unix`, or `*` |
 
-```python
-from garuda.contrib.fastapi import http_version, is_http3, supports_webtransport
+### Serving and traffic
 
-@app.get("/proto")
-def proto(request: Request):
-    return {"http_version": http_version(request),      # "1.1", "2" or "3"
-            "webtransport": supports_webtransport(request)}  # True on HTTP/3
-```
+| flag | default | what it does |
+|---|---|---|
+| `--static-dir P=DIR` | — | serve URL prefix P from DIR (repeatable) |
+| `--compress-static` | off | serve `FILE.br`, `FILE.zst` or `FILE.gz` beside a static file when accepted |
+| `--rate-limit RATE` | — | 429 past RATE requests per client, as in `100/s`, `600/m`, `5000/h` |
+| `--rate-limit-burst N` | the count in RATE | requests allowed at once before the rate applies |
+| `--health-check-path P` | — | answer GET/HEAD for P with 200 in the server |
 
-[examples/fastapi_app.py:72](examples/fastapi_app.py#L72). This is for feature
-detection and logging — routing on it is almost always a mistake.
+### Observability
 
-### WebSocket
+| flag | default | what it does |
+|---|---|---|
+| `--access-log` | off | one line per request |
+| `--access-log-format F` | `text` | `text` or `json`; implies `--access-log` |
+| `--request-id` | off | an `X-Request-ID` for every request, on the response and in the access log |
+| `--trace-context` | off | record a W3C `traceparent`'s trace and span IDs in the access log |
+| `--metrics-port PORT` | — | serve Prometheus metrics on a port of their own |
+| `--metrics-host HOST` | `--host` | what the metrics port binds |
+| `--log-level LEVEL` | `info` | `debug`, `info`, `warning`, `error` or `silent` |
 
-Native, and nothing to configure on the framework side
-([/ws](examples/fastapi_app.py#L61)):
+### Development
 
-```python
-@app.websocket("/ws")
-async def ws(socket: WebSocket):
-    await socket.accept()
-    while True:
-        await socket.send_text("echo:" + await socket.receive_text())
-```
+| flag | default | what it does |
+|---|---|---|
+| `--reload` | off | restart on a rebuilt executable; replace workers when a certificate file changes |
+| `--reload-interval MS` | `500` | how often `--reload` rescans (minimum 50) |
 
-Server-side limits, all with usable defaults: `--ws-max-message` (16 MiB),
-`--ws-ping-interval` / `--ws-ping-timeout` (20 s each, for detecting a peer
-that has gone away silently), `--ws-max-queue` and `--ws-max-queue-bytes` for
-how much a slow application may buffer. `--no-websockets` refuses upgrades
-with 501.
+### Accepted, but with no effect yet
 
-`--ws-compress` negotiates permessage-deflate (RFC 7692) with any client that
-offers it, which every browser does. Messages are compressed and decompressed
-in the server, and the application still sends and receives plain `str` and
-`bytes`. Chat, tickers and dashboards send many small messages that look alike,
-and they compress well because the compression context carries from one
-message to the next.
+`--compress`, `--compress-min-size`, `--cache-size`, `--cache-max-object`,
+`--cache-ttl-max`, `--request-start-header`, `--scheme`, `--ws-max-message`,
+`--ws-ping-interval`, `--ws-ping-timeout`, `--ws-max-queue`,
+`--ws-max-queue-bytes` and `--ws-compress`. See
+[Flags with no effect yet](#flags-with-no-effect-yet).
 
-- **What it costs:** memory for each connection that actually uses it. The
-  server compresses with a 4 KiB window and a small zlib memory level, about
-  40 KiB per connection. It also asks the browser to use a 4 KiB window for the
-  messages it sends. Nothing is allocated until the first compressed message.
-  Messages under 64 bytes are sent as they are.
-- **What it refuses:** a message is decompressed only up to `--ws-max-message`.
-  A few kilobytes that would inflate past it close the connection with 1009,
-  and data that is not deflate at all closes it with 1007. A client may still
-  send uncompressed messages, and those work as before.
-- **What to watch for:** as with `--compress` for HTTP, compressing over TLS a
-  message that mixes a secret with text the other side controls lets an
-  attacker who can watch message sizes learn the secret. It is off by default
-  for that reason, and because it costs CPU.
-
-WebSocket runs over HTTP/1.1 here. It is not carried over HTTP/2 or HTTP/3 —
-see [what is not](README.md#what-is-not).
-
-### WebTransport
-
-Two forms. The function, for a session you drive yourself
-([/wt/echo](examples/fastapi_app.py#L94)):
-
-```python
-@wt.route("/wt/echo")
-async def echo(session):
-    await session.accept()
-    async for stream in session.incoming_streams():
-        await stream.send(b"echo:" + await stream.read(), end=True)
-```
-
-and the class, mirroring Starlette's `WebSocketEndpoint`
-([WTChat](examples/fastapi_app.py#L125)), which dispatches streams and
-datagrams concurrently so neither waits on the other:
-
-```python
-class Chat(WebTransportEndpoint):
-    async def on_connect(self):     await self.session.accept()
-    async def on_stream(self, s):
-        body = await s.read()
-        if s.bidirectional:
-            await s.send(b"chat:" + body, end=True)
-        else:
-            reply = await self.session.create_stream(bidirectional=False)
-            await reply.send(b"chat:" + body, end=True)
-    async def on_datagram(self, d): await self.session.send_datagram(b"chat:" + d)
-
-wt.add_route("/wt/chat", Chat)
-```
-
-`{name}` in a path is a single-segment parameter, in Starlette's spelling;
-`{name:int}`, `{name:uuid}`, `{name:path}` and `{name:slug}` convert the same
-way Starlette's HTTP router does. They arrive as `session.path_params["name"]`
-([/wt/room/{name}](examples/fastapi_app.py#L106),
-[/wt/n/{count:int}](examples/fastapi_app.py#L116)). A missing or extra trailing
-slash is tried the other way — a session cannot be HTTP-redirected. Closing
-without accepting refuses the session with an HTTP status
-([/wt/reject](examples/fastapi_app.py#L143)); an unrouted path gets a 404.
+`--version` prints the version; `-h`/`--help` prints the list. An unknown flag
+or a stray argument is an error, and the server exits with status 2.
 
 ---
 
-## Flask
+## Protocols
 
-### Serving it
+A protocol is a server flag. The router answers the same request the same way
+whichever version carried it.
 
-```bash
-garuda --port 8000 --workers 0 myapp:app
-```
-
-A Flask `app` is a WSGI application and is detected as one: no adapter, no
-`--protocol`, and no change to the application. The same command with
-`--tls-cert`, `--tls-key` and `--http3` serves it over HTTP/2 and HTTP/3 as
-well.
-
-`app.run()` starts Werkzeug's development server, not this one. Keep it under
-`if __name__ == "__main__":`, point garuda at `app`, and use `--reload` for
-the edit-and-refresh loop it was giving you.
-
-### Inline or on a thread pool
-
-By default a worker calls the view itself, and concurrency comes from
-`--workers`. That is the fastest arrangement for views that are busy on the
-CPU, and it is what the benchmarks measure.
-
-Views that wait — on a database, on another service — want a pool:
+| protocol | flags |
+|---|---|
+| HTTP/1.1 | *(default)* |
+| HTTP/2 in the clear, prior knowledge | *(default)* |
+| HTTP/2 over TLS, chosen by ALPN | `--tls-cert --tls-key` |
+| HTTP/3 over QUIC | `--http3 --tls-cert --tls-key` |
 
 ```bash
-garuda --port 8000 --workers 4 --wsgi-threads 8 myapp:app
+garuda --port 8443 --workers 0 --tls-cert cert.pem --tls-key key.pem --http3
 ```
 
-`--wsgi-threads` is what lets eight views that are waiting on a database
-overlap instead of queueing ([the pool](ARCHITECTURE.md#the-wsgi-thread-pool)). It
-does not help views that are busy on the CPU; `--workers` does. Flask's request
-context is local to the thread, so ordinary Flask code needs nothing for this;
-module-level state an application mutates does.
+That serves HTTP/1.1 and HTTP/2 over TCP and HTTP/3 over UDP on the same port
+number. Every TCP response carries `Alt-Svc: h3=":8443"; ma=86400` so that
+clients can find HTTP/3. There is no other way for them to find it.
+`--quic-port` moves HTTP/3 to another UDP port, and the header follows.
 
-It also changes what a streamed response costs. PEP 3333 requires each yielded
-block to be transmitted before the next one is asked for, so the inline path
-makes one write syscall per block — on a view streaming hundreds of small rows,
-that dominates. A pool thread instead hands each block to the loop, which
-writes it while the view produces the next one; the spec allows that, and it
-costs a mutex rather than a syscall. Measured on a view yielding two hundred
-100-byte rows (`/rows` in [examples/flask_app.py](examples/flask_app.py)):
-**1,430 req/s inline against 5,123 req/s with `--wsgi-threads 4`**, one
-worker and 64 connections. A view that returns a string or a list is unaffected
-either way: its response is in hand when the view returns, and it goes out in
-one write.
+`--no-http2` leaves only `http/1.1` in ALPN, and no longer recognises the
+cleartext HTTP/2 preface.
+`--http2-only` leaves only `h2`. In the clear it treats every connection as
+HTTP/2 prior knowledge, which is what an h2c upstream from Envoy or Caddy
+expects. HTTP/3 has no cleartext form, so `--http3` without a certificate is a
+start-up error, and so is `--http3` with `--unix`.
 
-### Knowing what carried the request
-
-```python
-@app.get("/proto")
-def proto():
-    # "HTTP/1.1", "HTTP/2" or "HTTP/3"
-    return {"http_version": request.environ["SERVER_PROTOCOL"].partition("/")[2]}
-```
-
-The same view answers on every version
-([/proto](examples/flask_app.py)). This is for logging and feature detection —
-routing on it is almost always a mistake.
-
-### What a WSGI application cannot have
-
-WebSocket and WebTransport are refused with a 501. Both are streams that outlive
-a response, and PEP 3333 has no way to hand one to the application. The
-WebSocket support in `flask-sock` and Flask-SocketIO depends on a server that
-gives the application the raw socket, which this one does not. Real-time
-traffic belongs in an ASGI application — FastAPI, above — served next to the
-Flask one.
-
-### Settings worth knowing about
-
-* **`request.scheme`, `request.is_secure` and `request.remote_addr`** are right
-  over TLS and over HTTP/3 with nothing configured. Behind a terminating proxy,
-  use `--forwarded-allow-ips` (below) rather than Werkzeug's `ProxyFix`: the
-  server resolves the scheme and `REMOTE_ADDR` before Flask sees them, and only
-  for peers you have named. `url_for(..., _external=True)` then builds `https`
-  URLs from what the server resolved.
-* **The `Host` header** reaches Flask unchanged, so `SERVER_NAME` and
-  host-matched routes behave as they do anywhere else.
-* **Static files** go through the application unless something is in front.
-  `--static-dir /static=/srv/app/static` serves Flask's `static` folder with
-  `sendfile(2)` instead, and a path with no file behind it still reaches Flask
-  ([Serving assets](#serving-assets)).
-* **Streamed responses** — a generator, `stream_with_context` — go out block by
-  block as they are yielded, chunked on HTTP/1.1.
-* **`DEBUG`** and the interactive debugger are as unsuitable here as anywhere
-  else in production.
-
----
-
-## Proving each protocol
-
-With the example applications running, from a checkout:
+To check each one:
 
 ```bash
-# HTTP/1.1
-curl --http1.1 http://127.0.0.1:8000/proto
-# {"http_version":"1.1", …}
-
-# HTTP/2, cleartext, prior knowledge. Same application, same view.
-curl --http2-prior-knowledge http://127.0.0.1:8000/proto
-# {"http_version":"2", …}
-
-# HTTP/2 over TLS: ALPN chooses it, so an ordinary request is enough.
-curl -k --http2 https://127.0.0.1:8443/proto
-
-# HTTP/3. Few curl builds have it; `curl -V` lists HTTP3 when yours does.
-curl -k --http3 https://127.0.0.1:8443/proto
+curl --http1.1 http://127.0.0.1:8000/user/17            # 17
+curl --http2-prior-knowledge http://127.0.0.1:8000/user/17
+curl -k --http2 https://127.0.0.1:8443/user/17
+curl -k --http3 https://127.0.0.1:8443/user/17          # needs a curl built with HTTP/3
 ```
 
-The suites do not rely on curl having HTTP/3, and drive the server with
-`aioquic` instead:
-
-```bash
-bash scripts/framework-test.sh                  # FastAPI and Flask over
-                                                #   HTTP/1.1 and HTTP/2, and
-                                                #   Starlette websockets
-python3 scripts/contrib_test.py                 # 58 Python-only: routing
-<venv>/bin/python scripts/webtransport-test.py  # FastAPI over HTTP/3 and
-                                                #   WebTransport
-<venv>/bin/python scripts/http3-test.py         # 114, WSGI and ASGI over
-                                                #   HTTP/3
-```
-
-The HTTP/3 checks there include fetching `/proto` from the FastAPI example over
-QUIC and reading `"http_version": "3"` back out of the view — the same view
-that answers `1.1` on the line above, with nothing changed in between.
-
----
-
-## Behind a reverse proxy
-
-```bash
-garuda --forwarded-allow-ips 10.0.0.0/8,127.0.0.1 myapp:app
-```
-
-`X-Forwarded-For`, `X-Forwarded-Proto` and `Forwarded` are honoured **only**
-from a peer on that list; from anyone else they are ignored rather than
-trusted, because a client can send them too. The list takes addresses, CIDR
-blocks, `unix`, or `*`. This is what makes `request.client`, `request.scheme`,
-`request.is_secure()` and `REMOTE_ADDR` correct behind a proxy, in both
-frameworks.
-
-If HTTP/3 lives somewhere the server cannot know about — a terminating proxy in
-front, or a different host or port — advertise it yourself:
-
-```python
-from garuda.contrib.asgi import AltSvcMiddleware
-app = AltSvcMiddleware(app, port=443)
-```
-
-Garuda already sends `alt-svc` for its own HTTP/3 listener, so this is only
-for the case where the answer is not its own port.
+The suites do not depend on curl supporting HTTP/3.
+[scripts/http2-test.py](scripts/http2-test.py),
+[scripts/http3-test.py](scripts/http3-test.py) and
+[scripts/router-streams-test.py](scripts/router-streams-test.py) drive the
+router over HTTP/2 and HTTP/3 themselves.
 
 ---
 
@@ -345,515 +187,338 @@ garuda \
     --tls-key  /etc/ssl/app/privkey.pem \
     --http3 \
     --forwarded-allow-ips 10.0.0.0/8 \
-    --static-dir /static=/srv/app/static \
+    --static-dir /static=/srv/app/static --compress-static \
     --health-check-path /healthz \
     --max-body 8388608 \
     --drain-delay 10000 \
     --graceful-timeout 30000 \
-    --access-log --log-level warning \
-    myapp:app
+    --metrics-port 9100 --metrics-host 127.0.0.1 \
+    --access-log --access-log-format json --log-level warning
 ```
 
-Add `--wsgi-threads 8` for a WSGI application that waits on I/O. Leave
-`--reload` for development only — it watches and rescans the source tree.
+A few notes on this command:
 
-`SIGHUP` reloads the certificate without dropping a connection, so this wants a
-certbot deploy hook rather than a restart; see
-[Reloading without a restart](#reloading-without-a-restart).
+- **`--log-level warning` also silences the access log.** Access lines are
+  logged at `info`, so this command writes none. Keep `--log-level info` if you
+  want them.
+- **Leave out `--reload` in production.** It is for development only.
+- **`SIGHUP` reloads the certificate** without dropping a connection. See
+  [Reloading without a restart](#reloading-without-a-restart).
 
-### The access log
+---
 
-`--access-log` gives one line per request:
+## Workers, sockets and signals
+
+Everything runs under a supervisor process, even with one worker. The
+supervisor owns the listening sockets. Each worker gets its own socket in an
+`SO_REUSEPORT` group, its own poller and its own connection table, so workers
+share no lock. A worker that crashes is restarted in its slot.
+
+### Unix sockets
+
+```bash
+garuda --unix /run/app.sock --workers 4 --forwarded-allow-ips unix
+```
+
+Every worker accepts on the one socket. A stale socket file left at the path is
+removed at start-up, and the socket file is removed again on exit. Peers on a
+unix socket have no address. To believe the forwarded headers a proxy sends
+over it, list `unix` in `--forwarded-allow-ips`. `--http3` and
+`--redirect-http` are refused with `--unix`, because neither has anything to
+bind.
+
+### Signals
+
+| signal | effect |
+|---|---|
+| `SIGTERM` | fail the health check for `--drain-delay`, then stop accepting and drain within `--graceful-timeout` |
+| `SIGINT`, `SIGQUIT` | drain at once; a second one cuts short a `--drain-delay` already running |
+| `SIGHUP` | replace every worker, one slot at a time, without dropping a connection |
+
+When a worker drains, it stops accepting, closes idle keep-alive connections,
+and finishes the requests it already has. The supervisor kills any worker still
+running once `--drain-delay` + `--graceful-timeout` + 2 s have passed, so
+shutdown always ends. Each worker also runs the drain delay itself. An init
+system that signals the whole process group, as systemd does by default, gets
+the same behaviour as one that signals only the supervisor.
+
+---
+
+## Behind a reverse proxy
+
+```bash
+garuda --forwarded-allow-ips 10.0.0.0/8,127.0.0.1
+```
+
+The server reads `X-Forwarded-For`, `X-Forwarded-Proto` and `Forwarded` only
+when the connecting peer is on the list. From any other peer it ignores them,
+because a client can send them too. The list takes addresses, CIDR blocks,
+`unix` and `*`. An entry that does not parse stops start-up. Use `*` only when
+nothing but the proxy can reach the server.
+
+Two features use trusted forwarded information today:
+
+- **Rate limiting** keys a client by the address the proxy reports, not by the
+  proxy's own address.
+- **Request IDs** from a trusted proxy's `X-Request-ID` are kept rather than
+  replaced.
+
+Handlers will see the client address and scheme once the handler API exists.
+
+### Mounted under a prefix
+
+```bash
+garuda --root-path /api
+```
+
+`--root-path` removes a leading path prefix before the router matches, so
+`GET /api/user/7` is answered as `GET /user/7`:
+
+- **Whole segments only.** `/apis` is not under `/api`, and a trailing slash on
+  the flag (`/api/`) means the same as without it.
+- **Paths outside the prefix are routed as they came.** That covers a proxy
+  that has already removed the prefix.
+- **Router only.** `--static-dir` prefixes and `--health-check-path` match the
+  path as the client sent it.
+
+---
+
+## Limits and timeouts
+
+- **`--max-connections`** is per worker. A connection arriving at a full table
+  is answered `503 Service Unavailable` and closed rather than queued, and
+  counted in `garuda_connections_rejected_total`. HTTP/3 has the same cap. At
+  start-up the server raises its descriptor limit, and warns when `ulimit -n`
+  is still below `--max-connections`.
+- **`--max-body`** is checked against a declared `Content-Length` before
+  anything is read, and against the bytes actually received for a chunked
+  body, an HTTP/2 body or an HTTP/3 body. Past the limit the answer is 413.
+- **`--max-header-size`** bounds the HTTP/1.1 request head and chunked
+  trailers. It is also the HTTP/2 header-list limit and the HTTP/3 field
+  section limit the server advertises. A head too large gets 431.
+- **`--keep-alive`** is how long an HTTP/1.1 connection may sit idle between
+  requests. It also closes an HTTP/2 connection idle with no open streams, and
+  sets the QUIC idle timeout.
+- **`--request-timeout`** is how long a connection may make no progress in the
+  middle of a request head, a request body, or a response being written.
+
+---
+
+## The access log
+
+`--access-log` writes one line per request to stderr, at `info`:
 
 ```
-GET /orders/17?expand=items 200 431us
+[info]  pid=8961 GET /user/17?x=1 200 43us
 ```
 
-`--access-log-format json` gives the same information as one JSON object per
-line, which is what to use when something is collecting these rather than
-someone reading them. It implies `--access-log`:
+`--access-log-format json` writes the same fields as one JSON object per line,
+and implies `--access-log`:
 
 ```json
-{"level":"info","pid":8961,"method":"GET","target":"/orders/17","status":200,"duration_us":431,"proto":"HTTP/1.1"}
+{"level":"info","pid":8961,"method":"GET","target":"/user/17?x=1","status":200,"duration_us":43,"proto":"HTTP/2"}
 ```
 
-The whole line is the object — there is no `[info] pid=…` in front of it to
-strip — so a collector can parse it without being told where the JSON starts.
+The whole line is the object, with no `[info] pid=…` in front of it, so a
+collector can parse it as it arrives. `proto` is `HTTP/1.0`, `HTTP/1.1`,
+`HTTP/2` or `HTTP/3`.
 
-`duration_us` is measured from the request being dispatched to the response
-head being settled and queued, not to the last byte of the body: for a
-streaming response that last byte is the client's pace rather than the
-application's, and a number that mixes the two says nothing about either.
+`duration_us` runs from dispatch to the response head being queued, not to the
+last byte of the body. The time to the last byte depends on how fast the client
+reads, not on the server.
 
-A request target is whatever bytes the peer sent. `"` and `\` are escaped, and
-a target that is not valid UTF-8 has its bytes escaped as `\u00XX` rather than
-being dropped or truncated — so the line is always parseable and the target is
-always recoverable, byte for byte.
+The request target is whatever bytes the peer sent. `"` and `\` are escaped.
+A target that is not valid UTF-8 has its bytes escaped as `\u00XX` rather than
+dropped, so the line always parses and the target can be recovered byte for
+byte. A line is assembled in a fixed 4 KiB buffer. A target too long for it is
+cut on a character boundary, and the object gets `"truncated":true`, so every
+line is still a complete object.
 
-That is true up to the length of the line, which is assembled in a fixed
-buffer. Rather than let a very long target run off the end — leaving a string
-unterminated, an object unclosed, and no newline to separate it from whatever
-is logged next — the target is cut short and the object carries
-`"truncated":true` alongside the fields that follow it. The cut lands on a
-character boundary rather than in the middle of one, so the line is still
-valid UTF-8 and a parser reading the raw bytes will take it. Every line is a
-complete object, whatever the peer asked for.
-
-`--access-log` costs a clock read per request; without it there is none.
+The server's own log lines use the same `[level] pid=N` prefix and go to
+stderr. `--log-level` filters both, so `--log-level warning` also turns off the
+access log.
 
 ### Request IDs
 
 ```bash
-garuda --request-id --access-log myapp:app
+garuda --request-id --access-log
 ```
 
-`--request-id` gives every request an `X-Request-ID`, and puts that one value
-in three places:
+`--request-id` gives every request an `X-Request-ID`:
 
-- **The application** sees it as a request header: `X-Request-ID` in the ASGI
-  scope's headers, `HTTP_X_REQUEST_ID` in the WSGI environ. Log it, or pass it
-  on to the services the request calls.
-- **The response** carries it, so a client or a support ticket can quote it
-  back. An application that sets its own `X-Request-ID` response header keeps
-  its value.
-- **The access log** records it: ` id=...` at the end of a text line, and
-  `"request_id"` in a JSON one.
+- **In the response.** Router responses and static files carry it on HTTP/1.1,
+  HTTP/2 and HTTP/3.
+- **In the access log.** A text line ends with ` id=...` and a JSON line gets
+  `"request_id"`.
 
 ```
-GET /cart 200 1843us id=0b6f1c9e-3c1d-4f7a-9a52-6d2e8f41c7b0
+[info]  pid=8961 GET /user/17 200 51us id=0b6f1c9e-3c1d-4f7a-9a52-6d2e8f41c7b0
 ```
 
-A new ID is a random version 4 UUID. When a proxy listed in
-`--forwarded-allow-ips` sends its own `X-Request-ID`, that ID is kept, because
-the proxy saw the request first and may already have logged it. The value must
-be 1 to 128 characters of letters, digits and `-_.:+/=@~`. Any other
-`X-Request-ID`, including one a client sends directly, is replaced before the
-application sees it. A value that anyone can set is not an identifier anyone
-else can rely on.
+A new ID is a version 4 UUID, generated without a system call. When a peer
+listed in `--forwarded-allow-ips` sends an `X-Request-ID`, that ID is kept,
+because the proxy saw the request first and may already have logged it. The
+value must be 1 to 128 characters of letters, digits and `-_.:+/=@~`. Any other
+`X-Request-ID` is replaced, including one a client sends directly.
 
-The server answers a few requests itself, without the application, and logs
-their IDs as well. Static files also carry the ID in a response header. Health
-probes, rate-limit refusals and malformed requests do not, and the
-`--redirect-http` port assigns no IDs.
+The ID is assigned before any server feature answers, so health probes and 429
+refusals are logged with one and carry it back, over every protocol. A
+malformed request that never parses gets no ID, and the
+`--redirect-http` port assigns none. Handlers will receive the ID when the
+handler API exists. The router does not read request headers.
+[scripts/request-id-test.sh](scripts/request-id-test.sh) covers this.
 
 ### Trace context
 
 ```bash
-garuda --trace-context --access-log myapp:app
+garuda --trace-context --access-log
 ```
 
 A request sent from inside a distributed trace carries a W3C `traceparent`
-header naming the trace and the span that sent the request. `--trace-context`
-records both on the access line, so the line can be found from the trace and
-the trace from the line:
+header naming the trace and the span that sent it. `--trace-context` records
+both IDs on the access line:
 
 ```
-GET /cart 200 1843us trace=4bf92f3577b34da6a3ce929d0e0e4736 span=00f067aa0ba902b7
+[info]  pid=8961 GET /user/17 200 51us trace=4bf92f3577b34da6a3ce929d0e0e4736 span=00f067aa0ba902b7
 ```
 
-A JSON line has `"trace_id"` and `"parent_id"`. With `--request-id` as well,
+A JSON line gets `"trace_id"` and `"parent_id"`. With `--request-id` as well,
 the request ID comes first.
 
-The server only records a traceparent. It never generates one and never
-changes the header on its way to the application, where an OpenTelemetry
-propagator reads it as usual. An invented traceparent would name a parent
-span that nothing ever recorded, and the application's spans would hang from
-a gap in the trace.
+The server only records a traceparent. It never generates one and never changes
+the header. A value is recorded only when it follows the specification:
 
-A traceparent is recorded only when it follows the specification: version
-`00` exactly as `00-<32 hex>-<16 hex>-<2 hex>`, in lowercase; a later version
-with any extra fields after a dash; neither ID all zeros, and not version
-`ff`. Anything else is ignored, and so is a request carrying two. The
-application still receives what the client sent.
+- lowercase hex;
+- version `00` exactly as `00-<32 hex>-<16 hex>-<2 hex>`, or a later version
+  with anything extra after a dash;
+- neither ID all zeros, and not version `ff`.
+
+Anything else is ignored.
+[scripts/trace-context-test.sh](scripts/trace-context-test.sh) covers this.
 
 ### Metrics
 
-`--metrics-port 9100` serves the Prometheus text exposition format:
+`--metrics-port 9100` serves the Prometheus text format:
 
-```
-garuda_requests_total{status="2xx"} 10241
-garuda_connections_accepted_total 812
-garuda_connections_active 37
-garuda_connection_slots 8192
-garuda_buffer_pool_hits_total 774
-garuda_buffer_pool_misses_total 38
-garuda_workers 4
-garuda_request_duration_seconds_bucket{le="0.001000"} 9987
-garuda_request_duration_seconds_sum 4.271038
-garuda_request_duration_seconds_count 10241
-```
+| metric | type |
+|---|---|
+| `garuda_requests_total{status="1xx".."5xx"}` | counter |
+| `garuda_request_duration_seconds` (`_bucket`, `_sum`, `_count`) | histogram, dispatch to response head queued |
+| `garuda_connections_accepted_total`, `_closed_total`, `_rejected_total` | counters |
+| `garuda_connections_active`, `garuda_connection_slots` | gauges |
+| `garuda_buffer_pool_hits_total`, `garuda_buffer_pool_misses_total` | counters |
+| `garuda_requests_rate_limited_total` | counter |
+| `garuda_cache_hits_total`, `_misses_total`, `_stores_total` | counters (stay at zero; see [below](#flags-with-no-effect-yet)) |
+| `garuda_workers` | gauge |
 
-A port of its own, not a route. The application owns every path on the service
-port, and monitoring that can be reached through the application — or an
-application that can be reached through monitoring — is a configuration
-accident waiting for a bad day. Nothing on the metrics port goes anywhere near
-the request path; it is accepted, answered and closed on the loop thread.
+Metrics get a port of their own rather than a path on the service port.
+Nothing on the metrics port goes near the request path: each scrape is
+accepted, answered and closed on the worker's loop.
 
-**One scrape answers for every worker.** Workers are separate processes under
-`--workers` and threads under `--free-threaded`; in both cases the counters
-live in a page mapped before anything forked, each worker writing only its own
-slot. A scrape lands on whichever worker `SO_REUSEPORT` gives it and reports
-the sum, so the numbers do not jump about between scrapes. `garuda_workers`
-says how many are being summed.
+**One scrape answers for every worker.** The counters live in a page mapped
+before the workers fork, and each worker writes only its own slot. A scrape
+lands on whichever worker `SO_REUSEPORT` picks and reports the sum.
+`garuda_workers` says how many workers are summed. During a reload the old
+worker and its replacement each keep separate counters, so the totals stay
+correct.
 
 **Bind it somewhere private.** `--metrics-host` defaults to `--host`, so a
-server on `0.0.0.0` publishes its metrics there too. They contain no request
-data — counts, durations and connection totals — but they are still nobody
-else's business:
+server on `0.0.0.0` publishes its metrics there too:
 
 ```bash
-garuda --host 0.0.0.0 --port 8443 \
-          --metrics-port 9100 --metrics-host 127.0.0.1 \
-          myapp:app
+garuda --host 0.0.0.0 --port 8443 --metrics-port 9100 --metrics-host 127.0.0.1
 ```
 
-`garuda_buffer_pool_hits_total` against `_misses_total` is worth watching:
-misses that keep climbing mean connections are outliving the pool's free list,
-or that `--read-buffer` is smaller than what requests actually need.
-
-Counting costs one load, one add and one store per event, on a cache line no
-other worker touches. With no `--metrics-port` there is no page and the
-counters do nothing at all.
-
-
-### Queue time
-
-```bash
-garuda --request-start-header myapp:app
-```
-
-A tracer inside the application measures from the moment the application is
-called. What happened before that — the worker finishing the request ahead of
-this one, a WSGI thread pool with every thread taken, the event loop behind on
-its callbacks — is invisible to it, and it is usually the first thing to grow
-when a server is short of capacity.
-
-`--request-start-header` hands the application `X-Request-Start:
-t=<microseconds since the epoch>` for when the request arrived, which is what
-New Relic, Datadog and Scout read to report queue time. On a plaintext
-connection the time is the kernel's receive timestamp, so a request that sat in
-the accept queue behind a busy worker is stamped when it arrived, not when it
-was read. Over TLS it is when the decrypted request reached the worker, and on
-HTTP/2 and HTTP/3 when the stream opened.
-
-A proxy that already sends the header is left alone: it saw the request first.
+Without `--metrics-port` the shared page is never mapped and nothing is
+counted.
 
 ---
 
 ## Reloading without a restart
 
-`SIGHUP` replaces every worker without dropping a connection. The TLS context
-is built per worker, so the replacements read the certificate and key off disk
-again — which makes this the certbot hook:
+`SIGHUP` to the supervisor replaces every worker without dropping a connection.
+Each worker builds its own TLS context, so the replacements read the
+certificate and key from disk again. That makes `SIGHUP` the right certbot
+deploy hook:
+
+```ini
+# garuda.service
+ExecReload=/bin/kill -HUP $MAINPID
+```
 
 ```bash
-certbot renew --deploy-hook 'kill -HUP $(cat /run/garuda.pid)'
+certbot renew --deploy-hook 'systemctl reload garuda'
 ```
 
-Workers are replaced one at a time, and each replacement is spawned, given the
-listening socket its predecessor had, and allowed to report that it is
-accepting *before* the worker it replaces is asked to stop. Both serve the same
-socket in the meantime. Nothing is refused, nothing is reset, and the worst
-case a client sees is the ordinary latency of the request it was making.
+Workers are replaced one slot at a time, and no connection is dropped:
 
-The listening sockets belong to the supervisor rather than to the workers,
-which is what makes that possible. A worker that opened its own socket would
-take the socket's accept queue with it when it exited, along with every
-connection still completing its handshake on it — the kernel picks which socket
-in an `SO_REUSEPORT` group a connection belongs to when the SYN arrives, not
-when `accept` is called, so no amount of draining on the worker side rescues
-them.
+1. The replacement is forked and handed the listening socket its predecessor
+   had.
+2. The replacement reports that it is accepting. Only then is the old worker
+   sent `SIGQUIT` to finish what it has.
+3. A replacement that dies before it is ready gives the slot back to the old
+   worker, and the reload stops there.
+4. A replacement that is alive but never reports ready is waited for 60 s. The
+   old worker is then retired anyway.
 
-`--reload` uses the same mechanism when it sees a source file change, so a save
-during development costs no more than a certificate renewal does in production.
+A `SIGHUP` that arrives while a reload is running queues one more pass. A
+reload restarts workers; it does not re-read the command line.
+[scripts/reload-test.sh](scripts/reload-test.sh) sends reloads under load and
+fails on any refused, reset or truncated connection.
 
-It watches the source tree with inotify on Linux and kqueue on macOS, so a save
-is noticed within a few tens of milliseconds. It also rescans every
-`--reload-interval` milliseconds (500 by default), which catches the changes the
-kernel does not report: files on a bind mount, a network filesystem or a Windows
-drive under WSL, and on macOS a file written in place rather than replaced.
+### `--reload`, for development
 
-A reload restarts workers; it does not re-read the command line. Changing a
-flag still means restarting the server.
+`--reload` watches the running executable. Unless `--acme-domain` manages the
+certificates, it also watches every `--tls-cert` and `--tls-key` file.
 
----
+- **When the executable is rebuilt:**
+  1. The change must hold still for about 300 ms, since a linker writes in
+     several steps.
+  2. The new file must run `garuda --version` successfully, within 5 s.
+  3. The supervisor execs the new file in place of itself: same pid, same
+     arguments. The listening sockets stay open across the exec. Their
+     descriptors and the worker pids are passed in the `GARUDA_REEXEC`
+     environment variable.
+  4. The new image adopts the old workers and replaces them one slot at a time,
+     exactly as `SIGHUP` does. No connection is dropped.
 
-## Caching responses
+  A build that does not run is not exec'd; the server logs an error and keeps
+  running the old one.
+- **When only a certificate or key changes:** the workers are replaced, with no
+  exec.
 
-```bash
-garuda --cache-size 64 myapp:app
-```
+The kernel notifies the watcher of changes to the directories holding those
+files (inotify on Linux, kqueue on macOS). The watcher also rescans every
+`--reload-interval` milliseconds, 500 by default. That catches changes the
+kernel never reports: bind mounts, network filesystems, a Windows drive under
+WSL.
 
-`--cache-size` keeps copies of the responses an application marks as fresh, in
-64 MiB of memory every worker shares, and answers repeated requests from them
-without calling the application. Nothing is cached unless the application
-asks: a response is kept only when its `Cache-Control` has `s-maxage` or
-`max-age`, for that long, and never longer than `--cache-ttl-max` (300 seconds
-by default).
-
-```python
-@app.get("/prices")
-def prices(response: Response):
-    response.headers["Cache-Control"] = "public, s-maxage=10"
-    return load_prices()
-```
-
-`s-maxage` is the one to use. It applies to shared caches like this one and to
-CDNs, and leaves what a browser keeps to `max-age`.
-
-The failure this has to avoid is one user's response sent to another, so these
-are never cached:
-
-- **A request with `Authorization`, `Cookie` or `Range`**, one asking for a
-  fresh copy (`Cache-Control: no-cache` or `max-age=0`, `Pragma: no-cache`), or
-  one with a precondition only the application can check (`If-Match`,
-  `If-Unmodified-Since`, `If-Range`). It goes to the application, and its
-  response is not stored.
-- **A response with `Set-Cookie`**, `private`, `no-store` or `no-cache`, a
-  `Vary` naming anything but `Accept-Encoding`, or a `Content-Encoding` of its
-  own.
-- **Anything but GET and HEAD**, and any status but 200, 203, 204, 300, 301,
-  308, 404, 405, 410, 414 and 501.
-- **A body larger than `--cache-max-object`** (1024 KiB by default), or one
-  that did not match its own Content-Length.
-
-An application that personalises a page by cookie is covered by the first
-rule. One that personalises it by anything else — a header an authenticating
-proxy adds, a client certificate — must not mark that page `s-maxage`.
-
-The key is the scheme, the host and the whole request target, query string
-included. Behind a proxy listed in `--forwarded-allow-ips`, the forwarded host
-and protocol are part of it as well.
-
-A copy is served over HTTP/1.1, HTTP/2 and HTTP/3 alike, and compressed for
-each client that accepts it when `--compress` is on. Every response gets its
-own `Date`, `X-Request-ID` and `Strict-Transport-Security`, plus `Age` and
-`Cache-Status: garuda; hit; ttl=N`. A `304` answered from a copy carries the
-`Vary` and `ETag` its `200` would have carried for that client.
-
-A copy is kept for what is left of the response's lifetime. A response that
-arrives with an `Age`, or with a `Date` in the past, has used some of its
-`max-age` already, and so has one the application took seconds to produce. The
-cache counts all of that, as RFC 9111 says, serves the copy with the age it
-has, and does not keep a response that is already stale.
-
-A successful change to a URL retires what is cached for it. When a request
-with any method but GET, HEAD, OPTIONS and TRACE is answered with a 2xx or 3xx,
-every copy cached for its path and query string is dropped, on every worker.
-So is the response to a GET that was still being answered when the change was
-made, because it describes the URL as it was. A request the application refuses
-changes nothing, so a client without permission to make the change cannot
-empty the cache of it either. Host and scheme are ignored here: a change made
-over HTTP retires the copy served over HTTPS. `Location` and
-`Content-Location` are not followed, so a change that affects other URLs waits
-for their copies to expire; give those a short `s-maxage`.
-
-A reload — `SIGHUP`, `--reload`, a renewed certificate — discards everything
-cached, since the new workers may run new code. The memory is split evenly
-between entries of four sizes — 8 KiB, 64 KiB, 512 KiB, and big enough for
-`--cache-max-object` — and a response goes in the smallest that holds it; when
-the ones a URL can go in are all taken, the one nearest to expiring is
-replaced. The server logs how many responses the size given has room for.
-With `--metrics-port`, `garuda_cache_hits_total`,
-`garuda_cache_misses_total` and `garuda_cache_stores_total` show how it
-is doing.
-
-ASGI and WSGI responses are cached alike, inline or under `--wsgi-threads`. A
-WSGI response sent through the `write()` callable is not: its head goes out
-before the application has finished deciding what the body is.
-
----
-
-## Serving assets
-
-`--static-dir` answers a URL prefix from a directory, without the application
-being called:
-
-```bash
-garuda --static-dir /static=/srv/app/static \
-          --static-dir /media=/srv/app/media \
-          myapp:app
-```
-
-On a plaintext HTTP/1.1 connection the bytes never enter the process: the file
-descriptor goes to `sendfile(2)` and the kernel moves them from the page cache
-to the socket. On an HTTP/2 or HTTP/3 stream, and over TLS, they are read and
-framed like any other response — the bytes have to be multiplexed or encrypted
-— which is still an interpreter, a `dict` of CGI variables and a list of byte
-strings per asset less than serving them from Python.
-
-`--ktls` takes TLS off that list on Linux. The kernel encrypts instead of
-OpenSSL, so an HTTPS/1.1 response gets the same `sendfile(2)` as a plaintext
-one:
-
-```bash
-sudo modprobe tls        # once per boot, or list tls in /etc/modules-load.d
-garuda --ktls --tls-cert cert.pem --tls-key key.pem \
-          --static-dir /static=/srv/app/static myapp:app
-```
-
-On one worker, files of 1 MiB went out at 2172 MiB/s instead of 1485, and of
-16 MiB at 2206 instead of 1384, at about a third less CPU per gibibyte
-(`benchmarks/static_files.sh`). Everything else on the connection works as
-before, since OpenSSL still does the handshake and hands the kernel the keys.
-Where kernel TLS cannot be had — the module is not loaded, the cipher is one the
-kernel does not implement, the OpenSSL was built without it — OpenSSL encrypts
-as it always did, and the server says at start-up when the module is missing.
-HTTP/2 still reads its files: its bytes have to be framed first.
-
-**A path with no file behind it reaches the application.** So does a `POST`, a
-path that is a prefix of the route rather than under it, and a directory. A
-route that answered 404 for everything under its prefix would take those URLs
-away from an application that already serves them; this is meant to go in front
-of Flask's own `static` route or FastAPI's `StaticFiles` mount, not to compete
-with them for URLs.
-
-`..`, `%2e%2e` and a symlink pointing out of the tree are all refused by where
-the path lands rather than by how it is spelled: both the root and the result
-are resolved with `realpath(3)` and the result has to still be inside. Only
-regular files are opened — not a directory, not a fifo, not a device.
-
-An `ETag` is built from the file's size and modification time, and
-`If-None-Match` is answered with `304`. There is no `Last-Modified`: a date has
-one-second resolution and says nothing about a file that changed twice within a
-second, and emitting only the strong validator means a client can only ask the
-question that can be answered exactly. There are no byte ranges and no
-directory indexes — this is an asset route, not a file server. Put a CDN in
-front of it for anything that needs either.
-
----
-
-## Compression
-
-Two flags, because they carry different risks.
-
-```bash
-garuda --compress --compress-static \
-          --static-dir /static=/srv/app/static \
-          myapp:app
-```
-
-`--compress-static` serves a copy compressed at build time — `app.js.br`,
-`app.js.zst` or `app.js.gz` beside `app.js` — to a client that accepts it. The
-bytes still go out with `sendfile(2)` on a plaintext connection, the copy gets
-its own `ETag`, and a file with no copy is served as it is. The compressing is
-done once, at whatever level the build can afford:
-
-```bash
-find static -type f \( -name '*.js' -o -name '*.css' -o -name '*.svg' \) \
-    -exec brotli -kq 11 {} \; -exec gzip -k9 {} \;
-```
-
-`--compress` compresses what the application sends, as it sends it: brotli,
-zstd or gzip, whichever the client rates highest, brotli first on a tie. Only
-text-like responses are touched — `text/*` apart from `text/event-stream`,
-JSON, JavaScript, XML, SVG, WebAssembly. Nothing is compressed that already has
-a `Content-Encoding`, says `Cache-Control: no-transform`, is a `206`, answers
-a `HEAD`, or declares a `Content-Length` below `--compress-min-size` (1024 by
-default). A response that could have been compressed says
-`Vary: Accept-Encoding` whether it was or not, so that a cache in front does
-not hand one client's copy to the next. A strong `ETag` on a compressed
-response is sent weak, `W/"v1"` for `"v1"`: the tag named the application's
-bytes, and the compressed ones are different bytes. `If-None-Match` still
-matches the weak tag; `If-Match` and `If-Range` do not.
-
-A compressed response has no `Content-Length`; it is chunked on HTTP/1.1 and
-ended by the stream on HTTP/2 and HTTP/3. The length the application declared
-is still held against what it sends. Each body message is flushed through the
-compressor as it arrives, so a response streamed in pieces reaches the client
-in pieces.
-
-gzip is always available. brotli and zstd are used when `libbrotlienc` and
-`libzstd` are installed, and silently left out when they are not.
-
-**Read this before turning `--compress` on.** Compression over TLS leaks
-through length. A page that puts a secret — a CSRF token, a session-bound
-value — in the same response as text an attacker can choose, such as a search
-term echoed back, lets an attacker who can watch the size of the traffic recover
-the secret a byte at a time (BREACH). Whether an application has pages like
-that is its own knowledge, which is why this is off by default and not
-something the server can decide. The usual answers are to keep secrets out of
-responses that reflect input, to mask tokens so they differ in every response,
-or to leave `--compress` off and use only `--compress-static`, which reflects
-nothing.
-
----
-
-## Rate limiting
-
-```bash
-garuda --rate-limit 100/s --rate-limit-burst 200 myapp:app
-```
-
-A client past its allowance gets `429 Too Many Requests` with a `Retry-After`
-in whole seconds, before the application is called. The rate is `N/s`, `N/m`
-or `N/h`; the burst is how many requests may arrive at once before the rate
-applies, and defaults to `N`.
-
-The count is the server's, not each worker's. With `--workers 8` a client's
-connections are spread over eight accept queues by the kernel, and a limit kept
-per worker would let it through up to eight times over, unevenly. The state
-lives in a table mapped before the workers start, and every worker charges the
-same entry for the same client with a compare-and-swap, so two workers
-admitting the same client at the same moment cannot both spend its last
-request.
-
-Who counts as a client:
-
-- **Behind a proxy on `--forwarded-allow-ips`**, the address the proxy
-  reports. Keying by the peer there would put every user in one bucket.
-- **Otherwise the peer address**, and `X-Forwarded-For` is ignored — believing
-  it would give any client a fresh allowance per request.
-- **IPv6 by `/64`**, which is what one subscriber is normally given. Keyed by
-  the full address, each of them would have 2⁶⁴ allowances.
-- **Unix socket peers** are not limited unless a trusted proxy names the
-  client.
-
-The health probe on `--health-check-path` is never refused, and refusals are
-counted in `garuda_requests_rate_limited_total` on the metrics port.
-
-The table holds 65,536 clients. An entry whose client has gone quiet long
-enough to have its whole burst back is reused, so the limit covers the clients
-active *now*, not everyone ever seen. If a new client finds no entry to take,
-its request is allowed: a limiter that refuses traffic because its own table is
-full is a denial of service against everyone.
-
-This is a guard against a single client overwhelming the server, not a quota
-system. There is no per-route limit and no key other than the address; an
-application that needs either wants a limiter that knows its users.
+`--reload` does not build anything. Run `swift build` yourself, in another
+terminal. It is a development convenience, not a deployment mechanism.
+[scripts/feature-test.py](scripts/feature-test.py) and
+[scripts/reload-test.sh](scripts/reload-test.sh) cover rebuilds, broken builds
+and certificate changes.
 
 ---
 
 ## Health checks
 
-`--health-check-path /healthz` answers that path in the server, with `200` and
-an empty body, before anything reaches Python:
+`--health-check-path /healthz` answers that path inside the worker, before rate
+limiting, static files or the router, with `200` and an empty body:
 
 ```yaml
 livenessProbe:
   httpGet: { path: /healthz, port: 8000 }
 ```
 
-A liveness probe that runs through the application measures the application.
-That sounds like the point and is close to the opposite of it: the probe goes
-unanswered exactly when every worker is busy, and an orchestrator reads an
-unanswered liveness probe as a process to kill — so the busiest moment is the
-one where it shoots the server. This answers from the accept loop, which is
-what liveness actually is.
-
-Readiness is a different question and still the application's: whether the
-database is reachable, whether migrations have run. Give that one a route of
-its own.
-
-The match is exact once the query string is split off, and only `GET` and
-`HEAD` are answered, so a `POST` to the same path is still the application's.
-It is off unless asked for — the server has no business assuming `/healthz` is
-free.
+Only `GET` and `HEAD` are answered. The match is exact once the query string is
+removed, so `/healthz?probe=1` counts too. It works over HTTP/1.1, HTTP/2 and
+HTTP/3, and it is never rate limited. It is off unless you ask for it.
 
 ### Shutting down behind a load balancer
 
 ```bash
-garuda --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30000 myapp:app
+garuda --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30000
 ```
 
 ```yaml
@@ -864,113 +529,209 @@ terminationGracePeriodSeconds: 45
 ```
 
 Kubernetes sends `SIGTERM` and removes the pod from its Service at the same
-moment, and the removal takes a few seconds to reach every node and every
-ingress. Anything that stops accepting connections as soon as `SIGTERM`
-arrives spends those seconds refusing traffic that was still routed to it.
+moment, and the removal takes a few seconds to reach every node and ingress. A
+server that stops accepting as soon as `SIGTERM` arrives refuses traffic that
+is still being routed to it.
 
-`--drain-delay` fills that gap. When `SIGTERM` arrives, the server keeps
-serving for that many milliseconds, but the health check answers `503`. HTTP/1.1
-responses also say `Connection: close`, so clients that hold a connection open
-reconnect somewhere else. Only after the delay does it stop accepting and start
-the usual drain under `--graceful-timeout`. Set the delay a little longer than
-your readiness probe takes to notice: its period multiplied by its failure
-threshold. Set `terminationGracePeriodSeconds` to cover the delay plus the
-graceful timeout.
+With `--drain-delay`, the server keeps serving for that many milliseconds after
+`SIGTERM`, but:
 
-The delay is only for `SIGTERM`:
-- `SIGINT` (Ctrl-C) and `SIGQUIT` drain at once. `SIGQUIT` also cuts short a
-  delay that is already running.
-- A `SIGHUP` reload never waits, because each replacement worker is serving
-  before the worker it replaces is retired.
-- Each worker keeps the delay itself, so an init system that signals the whole
-  process group, as systemd does by default, gets the same behaviour as one
-  that signals only the supervisor.
+- the health check answers `503`;
+- HTTP/1.1 responses say `Connection: close`, so clients reconnect elsewhere.
+
+When the delay is up, the server stops accepting and drains under
+`--graceful-timeout`.
+
+- **Choosing the delay.** Make it a little longer than your readiness probe
+  takes to notice: its period multiplied by its failure threshold.
+- **Choosing the grace period.** `terminationGracePeriodSeconds` must cover the
+  delay plus the graceful timeout.
+- **Only `SIGTERM` waits.** `SIGINT` and `SIGQUIT` drain at once, and a
+  `SIGHUP` reload never waits.
+
+[scripts/drain-test.sh](scripts/drain-test.sh) covers this.
 
 ---
 
-## More than one certificate
+## Serving assets
 
-`--tls-cert` and `--tls-key` are repeatable and paired in the order given. The
-first pair is the default; the rest are chosen per connection by SNI:
+`--static-dir` answers a URL prefix from a directory, before the router:
+
+```bash
+garuda --static-dir /static=/srv/app/static --static-dir /media=/srv/app/media
+```
+
+- **Routing.** The prefix must start with `/` and end on a segment boundary, so
+  `/staticky` is not under `/static`. When prefixes overlap, the longest
+  matches first, in whatever order the flags were given.
+- **Fallthrough.** Only `GET` and `HEAD` are served. A path with no regular
+  file behind it goes on to the router, and so does any other method; the
+  router answers 404 unless one of its routes matches.
+- **Containment.** `..`, `%2e%2e`, and a symlink pointing out of the tree are
+  refused by where the path lands, not by how it is spelled. The path is
+  percent-decoded, resolved, and must still be inside the directory. Only
+  regular files are opened.
+- **Validators.** The `ETag` is built from the file's size and its modification
+  time to the nanosecond, and `If-None-Match` is answered with `304`. There is
+  no `Last-Modified`, no byte ranges and no directory index. This is an asset
+  route, not a file server.
+
+On a plaintext HTTP/1.1 connection the bytes go from the page cache to the
+socket with `sendfile(2)` and never enter the process. Over TLS, HTTP/2 and
+HTTP/3 they are read and then encrypted or framed.
+
+`--ktls` removes TLS from that list on Linux. The kernel encrypts instead of
+OpenSSL, so an HTTPS/1.1 file response gets `sendfile` too:
+
+```bash
+sudo modprobe tls        # once per boot, or list tls in /etc/modules-load.d
+garuda --ktls --tls-cert cert.pem --tls-key key.pem --static-dir /static=/srv/app/static
+```
+
+OpenSSL still does the handshake and hands the kernel the keys. Where kernel
+TLS is not available, OpenSSL encrypts as before, and the server logs a
+warning at start-up. That happens when the module is not loaded or OpenSSL was
+built without kernel TLS. HTTP/2 still reads its files, because its bytes have
+to be framed.
+
+### Pre-compressed files
+
+`--compress-static` serves a copy compressed at build time, `app.js.br`,
+`app.js.zst` or `app.js.gz` beside `app.js`, to a client that accepts it:
+
+- **Choice.** The copy comes in the order the client prefers. The original must
+  exist as well, and a file with no copy is served as it is.
+- **Headers.** The copy gets its own `ETag`, and the response says
+  `Vary: Accept-Encoding`.
+- **Transfer.** It still goes out with `sendfile` where the original would.
+
+```bash
+find static -type f \( -name '*.js' -o -name '*.css' -o -name '*.svg' \) \
+    -exec brotli -kq 11 {} \; -exec gzip -k9 {} \;
+```
+
+A static file reflects nothing from the request, so this carries none of the
+BREACH risk of compressing dynamic responses.
+[scripts/static-test.sh](scripts/static-test.sh) and
+[scripts/compress-test.sh](scripts/compress-test.sh) cover both flags.
+
+---
+
+## Rate limiting
+
+```bash
+garuda --rate-limit 100/s --rate-limit-burst 200
+```
+
+A client past its allowance gets `429 Too Many Requests` with a `Retry-After`
+in whole seconds, rounded up, and the connection stays open. The rate is `N/s`,
+`N/m` or `N/h`. The burst is how many requests may arrive at once before the
+rate applies; it defaults to `N`. The check runs after the health probe and
+before static files and the router.
+
+The count is for the whole server, not for each worker. With `--workers 8` the
+kernel spreads a client's connections over eight accept queues, and a limit
+kept per worker would let the client through up to eight times over. All
+workers share one table mapped before they fork, and they charge a client's
+entry with a compare-and-swap.
+
+Who counts as a client:
+
+- **Behind a proxy on `--forwarded-allow-ips`:** the address the proxy
+  reports.
+- **Otherwise:** the peer address. `X-Forwarded-For` is ignored.
+- **IPv6:** grouped by `/64`, which is what one subscriber is normally given.
+- **Unix socket peers:** not limited unless a trusted proxy names the client.
+
+The table holds 65,536 clients. An entry whose client has earned its whole
+burst back is reused. If a new client finds no entry free, its request is
+allowed, so a full table never refuses traffic. Refusals are counted in
+`garuda_requests_rate_limited_total`.
+
+This guards against one client overwhelming the server. It is not a quota
+system: there are no per-route limits and no key other than the address.
+[scripts/ratelimit-test.sh](scripts/ratelimit-test.sh) covers this.
+
+---
+
+## TLS
+
+`--tls-cert` and `--tls-key` turn on TLS for the TCP port, with ALPN choosing
+HTTP/2 or HTTP/1.1. TCP TLS is OpenSSL. `--tls-ciphers` sets the TLS 1.2 cipher
+list. The certificate and key are loaded and checked once at start-up, so an
+unreadable file stops the server before it binds.
+
+### More than one certificate
+
+The flags are repeatable and paired in the order given. The first pair is the
+default, and the rest are chosen per connection by SNI:
 
 ```bash
 garuda --port 443 \
     --tls-cert /etc/ssl/shop/fullchain.pem   --tls-key /etc/ssl/shop/privkey.pem \
-    --tls-cert /etc/ssl/admin/fullchain.pem  --tls-key /etc/ssl/admin/privkey.pem \
-    myapp:app
+    --tls-cert /etc/ssl/admin/fullchain.pem  --tls-key /etc/ssl/admin/privkey.pem
 ```
 
-Which names each certificate covers is read out of the certificate — its
-subject alternative names, or its common name if it has none — rather than
-declared alongside it. The certificate already carries that list, and a second
-copy of it on a command line is a second copy to get wrong, in the direction
-where the mistake surfaces as a browser warning rather than as an error at
-start-up. Start-up logs what each certificate is good for when there is more
-than one.
+An unequal number of certificates and keys is a start-up error.
 
-Matching follows RFC 6125: case-insensitive, and a wildcard covers exactly one
-label, so `*.example.com` matches `a.example.com` but neither
-`a.b.example.com` nor `example.com`.
+- **Names.** The names each certificate covers are read from the certificate
+  itself: its subject alternative names, or its common name if it has none.
+  With more than one certificate, start-up logs what each one covers.
+- **Matching.** Matching follows RFC 6125. It is case-insensitive, and a
+  wildcard covers exactly one label: `*.example.com` matches `a.example.com`,
+  but not `a.b.example.com` or `example.com`.
+- **No match.** A name no certificate claims, or no SNI at all, gets the
+  default certificate rather than a refused connection.
 
-A name no certificate claims, and a client that sends no SNI at all, get the
-default certificate rather than a refused connection. That is the kinder
-failure: a name mismatch is something a browser can explain to the person
-reading it, where a dropped handshake is not.
-
-`SIGHUP` reloads all of them.
+HTTP/3 serves the default pair whatever the client asks for, because its QUIC
+handshake has no SNI selection yet. `SIGHUP` reloads every pair.
+[scripts/sni-test.sh](scripts/sni-test.sh) covers this.
 
 ### Certificates from Let's Encrypt
 
 ```bash
 garuda --port 443 --acme-domain example.com --acme-domain www.example.com \
-          --acme-email ops@example.com --acme-cache /var/lib/garuda/acme \
-          myapp:app
+    --acme-email ops@example.com --acme-cache /var/lib/garuda/acme
 ```
 
-The server gets its own certificate. With nothing cached it starts on a
-self-signed placeholder, registers an account, answers the CA's `tls-alpn-01`
-challenge on the port it is already serving, installs the certificate in the
-cache directory, and reloads its workers onto it the way `SIGHUP` does — no
-connection is dropped. It checks twice a day and renews with thirty days left.
-A restart finds the certificate in the cache and does not ask again.
+The server gets its own certificate, starting from an empty cache:
 
-`tls-alpn-01` rather than `http-01`, because it needs nothing but the port
-being served: no port 80, no web root, no route kept free for the CA. The CA
-connects offering only the `acme-tls/1` protocol; whichever worker accepts the
-connection serves the challenge certificate and closes it.
+1. It starts on a self-signed placeholder.
+2. It registers an account and answers the CA's `tls-alpn-01` challenge on the
+   port it is already serving.
+3. It writes the certificate to the cache directory.
+4. It replaces its workers onto the new certificate, the way `SIGHUP` does.
 
-The client runs in a helper process the supervisor forks, not in a worker. A CA
-that is slow or down costs one waiting process and nothing that serves
-requests. A failed attempt is retried after a minute, then two, doubling up to
-six hours, which stays well inside Let's Encrypt's rate limits.
+After that it checks every 12 hours and renews when 30 days are left. A restart
+finds the certificate in the cache and does not ask again.
 
-- `--acme-staging` uses Let's Encrypt's staging CA, which issues untrusted
-  certificates without production rate limits. Try a new setup there first.
-- `--acme-directory URL` uses another ACME CA, and `--acme-ca-bundle PATH`
-  trusts a private one's HTTPS.
-- The cache holds `account.key`, `cert.pem` and `key.pem`, keys at mode 0600.
-  Keep it on persistent storage: a server that loses it registers a new account
-  and asks for a new certificate, which counts against the rate limits.
+The ACME client runs in a helper process forked by the supervisor, so a slow or
+unavailable CA holds up no worker. A failed attempt is retried after a minute,
+then the wait doubles each time, up to six hours.
 
-A public CA validates on port 443, so the server has to be reachable there,
-directly or through a TCP forward. A proxy that terminates TLS in front of it
-sees the challenge instead of passing it on, and needs to do ACME itself.
+- **Staging.** `--acme-staging` uses Let's Encrypt's staging CA, which issues
+  untrusted certificates without production rate limits. Try a new setup there
+  first.
+- **Other CAs.** `--acme-directory URL` uses another ACME CA, and
+  `--acme-ca-bundle PATH` trusts a private CA's HTTPS.
+- **The cache.** It holds `account.key`, `cert.pem` and `key.pem`, with keys at
+  mode 0600. Keep it on persistent storage: losing it means a new account and a
+  new certificate, which count against rate limits.
+- **Incompatible flags.** `--acme-domain` cannot be combined with `--tls-cert`.
+  Names must be plain DNS names, so wildcards (which need `dns-01`) are
+  refused.
+- **Port 443.** A public CA validates on port 443, and the server warns if
+  `--port` is anything else. A proxy that terminates TLS in front of the server
+  sees the challenge instead of passing it on.
 
-Wildcards are not possible here: a wildcard certificate needs `dns-01`, which
-needs credentials for a DNS provider. HTTP/3 serves the certificate from the
-same files and picks it up on the same reload.
+HTTP/3 uses the same files and picks the new certificate up on the same reload.
+[scripts/acme-test.sh](scripts/acme-test.sh) runs the whole flow against
+pebble.
 
-HTTP/3 serves the default pair whatever the client asks for. The QUIC handshake
-here is built from the primitives rather than driven by OpenSSL, and it has no
-SNI selection of its own yet.
-
----
-
-## Redirecting HTTP to HTTPS
+### Redirecting HTTP to HTTPS
 
 ```bash
-garuda --port 443 --acme-domain example.com \
-    --redirect-http 80 --hsts 31536000 myapp:app
+garuda --port 443 --acme-domain example.com --redirect-http 80 --hsts 31536000
 ```
 
 `--redirect-http 80` listens for plain HTTP on port 80 and answers every
@@ -985,199 +746,68 @@ Location: https://example.com/cart?id=7
 ```
 
 - **Status.** `GET` and `HEAD` get `301`. Every other method gets `308`, which
-  keeps the method and the body; a `301` would let the client repeat a `POST`
-  as a `GET`.
-- **Location.** The host comes from `Host`, or from the request target when a
-  client sends an absolute URL. Its port is replaced with the TLS port, which
-  is left out when it is 443.
-- **Refusals.** A request with no `Host`, or with a `Host` that is not a host
-  name or address, gets `400`. The redirect target comes from the client, so
-  it is checked before it goes into a header.
-- **Nothing else.** The application never sees these requests, and every
-  response closes the connection.
+  keeps the method and the body.
+- **Location.** The host comes from `Host`, with its port replaced by the TLS
+  port. The port is left out when it is 443.
+- **Refusals.** A request with no usable `Host` gets `400`.
+- **Nothing else.** These requests never reach the router, and every response
+  closes the connection.
 
-Certificates from `--acme-domain` do not need port 80: they are validated on
-the TLS port with tls-alpn-01. Behind a proxy that terminates TLS, redirect at
-the proxy instead. Ports below 1024 need the same privilege as port 443, root
-or `CAP_NET_BIND_SERVICE`.
+It needs TLS and a port of its own, and it is refused with `--unix`.
+Certificates from `--acme-domain` do not need port 80. Ports below 1024 need
+root or `CAP_NET_BIND_SERVICE`.
 
 ### Strict-Transport-Security
 
-`--hsts SECONDS` adds `Strict-Transport-Security: max-age=SECONDS` to every
-TLS response: application responses and static files, over HTTP/1.1, HTTP/2
-and HTTP/3. A browser that has seen it goes straight to https for that long,
-so its first request no longer travels as plain HTTP where it could be
-intercepted before the redirect. The header is never sent over plain HTTP,
-because browsers ignore it there.
-
-An application that sets the header itself keeps its own value, and the server
-adds no second one. `includeSubDomains` and `preload` are not added. They
-commit other host names to https, which is for whoever owns those names to
-decide; an application that wants them sets the header itself.
+`--hsts SECONDS` adds `Strict-Transport-Security: max-age=SECONDS` to every TLS
+response: router responses, static files and health checks, over HTTP/1.1,
+HTTP/2 and HTTP/3. It needs TLS, and it is never sent over plain HTTP.
+`includeSubDomains` and `preload` are not added, because they commit other
+host names to https.
 
 Start with a short `max-age`, such as `300`. A browser that has seen a long one
 refuses plain HTTP to the site until it expires, even after the certificate is
-gone.
+gone. [scripts/redirect-test.sh](scripts/redirect-test.sh) covers both flags.
 
 ---
 
-## Application logging
+## Flags with no effect yet
 
-Garuda writes its own lines with a level and a pid. Python's `logging`
-writes whatever it was last configured with. On one file descriptor that is two
-log formats interleaved, and neither half can be filtered by level without
-filtering both.
+These flags are parsed and accepted, so existing command lines keep starting.
+None of them changes what the server does today. The engine code behind most of
+them is still in the binary, waiting for the handler API.
 
-```python
-from garuda.logging import configure
+- **`--compress`, `--compress-min-size`.** These are meant to compress handler
+  responses that are text-like (brotli, zstd or gzip, as the client accepts),
+  with `Vary`, weak ETags and a size floor. Router responses carry no content
+  type, so nothing is compressed. Static files are served pre-compressed with
+  `--compress-static`, or as they are. Once handlers exist, read about BREACH
+  before turning `--compress` on. Compressing a TLS response that puts a secret
+  next to text the client chose lets an observer of response sizes recover the
+  secret.
+- **`--cache-size`, `--cache-max-object`, `--cache-ttl-max`.** These are meant
+  to be a response cache shared by all workers, for responses marked fresh with
+  `Cache-Control: s-maxage` or `max-age`. `--cache-size` still maps the memory
+  and logs its size at start-up. Nothing is ever stored, and the `garuda_cache_*`
+  metrics stay at zero.
+- **`--request-start-header`.** This is meant to give handlers
+  `X-Request-Start: t=<microseconds>` for APM queue time. Arrival is timestamped
+  when the flag is set, but nothing reads the timestamp.
+- **`--scheme`.** This was the scheme reported to the application. Nothing
+  reads it today, apart from the unused response cache.
+- **`--ws-max-message`, `--ws-ping-interval`, `--ws-ping-timeout`,
+  `--ws-max-queue`, `--ws-max-queue-bytes`, `--ws-compress`.** These are
+  WebSocket limits and permessage-deflate negotiation, and nothing reads them.
+  There is no WebSocket application API, so no upgrade is ever accepted.
+  `--no-websockets` does work: it refuses an upgrade with 501 before anything
+  else answers.
 
-configure()
-```
-
-after which `logging.getLogger("shop").info("checkout complete")` comes out as
-
-```
-[info]  pid=29404 shop: checkout complete
-```
-
-next to the server's own lines, behind the server's own `--log-level`. Taking
-the level from the server rather than from a second setting is the point:
-`--log-level warning` quiets the application to match, with nothing to keep in
-step.
-
-`configure()` replaces the handlers already on the logger, because the case it
-is for is an application where something has already called `basicConfig` — a
-library, a settings module, the application's own start-up — and adding to
-those would duplicate every line. Pass `replace=False` to sit alongside them
-instead.
-
-In a Flask application, call `configure()` before anything first uses
-`app.logger`. Flask gives that logger a handler of its own, writing to stderr,
-the first time it is used, unless a handler already sees its records. Configured
-first, the server's log is where `app.logger.info(...)` goes. Configured after,
-every line from `app.logger` is written twice.
-
-For an application that builds its logging configuration by hand, the handler
-is an ordinary one:
-
-```python
-LOGGING = {
-    "version": 1,
-    "handlers": {
-        "garuda": {"class": "garuda.logging.GarudaHandler"},
-    },
-    "root": {"handlers": ["garuda"], "level": "INFO"},
-}
-```
-
-Outside a garuda process — under pytest, or under another server — the
-handler falls back to `stderr` and `server_level()` reports `DEBUG`, so a
-configuration naming it does not have to be conditional on what is running it.
-
-A record containing newlines, which in practice means a traceback, arrives as
-one line with `" | "` where the breaks were. A traceback that stayed multi-line
-would read to a line-oriented collector as several records of unknown level.
-
-`sys.stdout` is left alone. Taking over a stream the application may be writing
-to itself is a surprise, and `print` is not logging.
+**WebTransport** has no flag and no application API. HTTP/3 still advertises
+extended CONNECT in its SETTINGS, and a CONNECT is refused with 501.
 
 ---
 
-## Free-threaded Python
-
-On a CPython built without the GIL (PEP 703 — `python3.13t`, `python3.14t`),
-`--free-threaded` turns the workers into threads of one process instead of
-processes:
-
-```bash
-garuda --workers 0 --free-threaded myapp:app
-```
-
-`--workers` still means the same thing; only what a worker *is* changes. Each
-one keeps its own poller, its own connection table and its own event loop, so
-nothing about request handling is different — they simply share an address
-space.
-
-What that buys, measured on a four-core machine with a CPU-bound application:
-
-| | throughput | resident memory |
-|---|---|---|
-| 1 worker | 1,695 req/s | — |
-| 4 workers, processes | 5,832 req/s | 143 MB |
-| 4 workers, threads | 5,907 req/s | 47 MB |
-
-The same parallelism for a third of the memory, because the application is
-imported once rather than four times. The larger the application, the wider
-that gap gets — it is the application and everything it imports, not the
-server, that was being copied.
-
-Hello-world `GET /` is the other way around: with four workers, threads reach
-88–91 % of what four processes do on FastAPI and 77–79 % on Flask, measured
-with closed-loop `oha` by
-[benchmarks/gil_vs_ft.sh](benchmarks/gil_vs_ft.sh). `--free-threaded` is the
-memory and shared-state option, not a request-rate upgrade on an empty view.
-
-Sharing one process also changes three things it is worth knowing about:
-
-- **The ASGI lifespan runs once per worker thread**, on the event loop that
-  thread will serve requests with, and each worker gets its own `state` mapping.
-  It is tempting to run it once for the process, since there is one application
-  — and that is what this used to do. It is wrong: `startup` is where an
-  application builds asyncio objects, and an asyncio object belongs to the loop
-  that was running when it was created. A pool built on the supervising thread's
-  loop and awaited from a worker's loop raises `got Future attached to a
-  different loop`, when it fails loudly at all. Each worker shuts its own
-  lifespan down on its own loop, after its own requests have drained.
-
-  The consequence to plan for is that `startup` runs N times against one
-  application object. The startups are serialised, so they do not race each
-  other, but an application that stores its pool in a module global or on
-  `app.state` keeps only the last one and puts every other worker back to
-  reaching across loops. Put per-worker resources in the `state` mapping the
-  lifespan scope hands you:
-
-  ```python
-  async def lifespan(app):
-      async with asyncpg.create_pool(DSN) as pool:
-          yield {"pool": pool}          # per worker thread, on its own loop
-
-  # in a handler: scope["state"]["pool"], or request.state.pool in Starlette
-  ```
-
-  `--lifespan-scope process` restores the single startup for applications whose
-  start-up opens nothing loop-bound — reading configuration, building
-  synchronous objects, warming a cache. There the lifespan lives on the
-  supervising thread's loop, all workers share its `state`, and shutdown waits
-  for every worker to be joined first.
-- **`wsgi.multithread` is `True` and `wsgi.multiprocess` is `False`**, which is
-  the opposite of what `--workers` reports. An application that is not
-  thread-safe will notice. This is the same requirement `--wsgi-threads`
-  already makes, applied to the whole application rather than to one pool.
-- **A crash takes every worker with it.** With processes the supervisor
-  restarts the one that died. Keep a process supervisor in front in production —
-  systemd, or garuda's own, by combining `--free-threaded` with `--reload`
-  in development.
-
-The option is refused, with an error, on an interpreter that has the GIL:
-running it there would silently be slower than `--workers`, not faster.
-`garuda --version` says which kind of interpreter the server runs in:
-
-```
-garuda 1.1.5 (CPython 3.14.6 free-threaded)
-```
-
-One caveat that is not garuda's to fix: importing an extension module that
-has not declared itself free-threading-safe switches the GIL back on for the
-whole process, and so does `PYTHON_GIL=1`. The server checks after loading the
-application and warns when that has happened, because the symptom otherwise is
-just "it is not any faster".
-
-`SIGTERM` and `SIGINT` drain gracefully within `--graceful-timeout`; `SIGHUP`
-restarts the workers without dropping the listening socket, which is how to
-pick up new code without dropping a connection.
-
----
-
-Next: [INSTALLATION.md](INSTALLATION.md) — getting it built and installed.
-[TRANSPORT.md](TRANSPORT.md) — what each protocol does and what is implemented
-of it. [ARCHITECTURE.md](ARCHITECTURE.md) — how the server is built, and why.
+Next: [INSTALLATION.md](INSTALLATION.md) covers getting Garuda built and
+installed. [TRANSPORT.md](TRANSPORT.md) covers what each protocol does and how
+much of it is implemented. [ARCHITECTURE.md](ARCHITECTURE.md) explains how the
+server is built, and [GARUDA.md](GARUDA.md) tracks what is not done yet.

@@ -4,182 +4,175 @@
 
 # Benchmarks
 
-Six Garuda entries of
-[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/)
-and Elysia on Bun, measured with that suite's load command, its applications
-and a worker per CPU, at 64, 256 and 512 connections. The machine is not the
-suite's, so the figures here are **not** comparable with the ones the site
-publishes; see [Relation to the published results](#relation-to-the-published-results).
+Garuda's built-in router next to Hummingbird and Vapor, the Swift framework
+entries of [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/),
+measured with that suite's load command at 64, 256 and 512 connections. The
+machine is not the suite's, so the figures here are **not** comparable with the
+ones the site publishes; see [Relation to the published results](#relation-to-the-published-results).
 
-Measured in one session on 2026-09-14, on Garuda at b8d6ae9: 1.1.4 and every
-fix since, the build 1.1.5 would ship.
-
-- **Every entry answered every request.** No run returned an error, a timeout
-  or a non-2xx response, at any level.
-- **Raw WSGI is the fastest Garuda entry at 64 and 256 connections**,
-  293,025 and 302,417 requests a second, against raw ASGI's 221,826 and
-  271,396. At 512 the two are 1.4 % apart, inside the run-to-run spread.
-- **BlackSheep is the fastest framework**, 179,208–202,141: 2.6–3.1× FastAPI,
-  3.9–4.3× Django and 3.6–4.0× Flask on the same server.
-- **Elysia on Bun serves 1.2–1.6× raw Garuda** and 1.7–1.9× BlackSheep.
+- **The router served 414,234 / 389,445 / 370,945 requests a second**, about
+  4× Hummingbird and 6–7× Vapor at every level, with no errors from any entry.
+- **What Garuda answers is its built-in router, not an application.** There is
+  no public handler API yet: `GET /` is matched at the engine's dispatch seam
+  and answered 200 with an empty body. Hummingbird and Vapor run the suite's
+  own applications for the same contract.
+- Figures from Peregrine, the Python server Garuda was forked from, are kept
+  at the end under [Historical: Peregrine (Python), before the fork](#historical-peregrine-python-before-the-fork).
+  They are not Garuda's.
 
 ---
 
 ## Results, 4 workers
 
-Requests per second, the mean of three runs:
-
-| entry | application | 64 | 256 | 512 |
-|---|---|---:|---:|---:|
-| garuda-wsgi | raw WSGI | **293,025** | **302,417** | 256,660 |
-| garuda-asgi | raw ASGI | 221,826 | 271,396 | **260,155** |
-| garuda-blacksheep | BlackSheep 2.6.3 | 179,208 | 202,141 | 197,687 |
-| garuda-fastapi | FastAPI 0.141.1 | 57,553 | 72,306 | 76,818 |
-| garuda-flask | Flask 3.1.3 | 49,933 | 50,423 | 50,964 |
-| garuda-django | Django 6.1.1 | 46,058 | 47,806 | 45,806 |
-| elysia-bun, reference | Elysia 1.4.30 on Bun 1.4.2 | 346,465 | 350,622 | 356,547 |
-
-Latency, p50 / p99, in milliseconds, the mean of three runs:
+Measured on 2026-09-15, Garuda at 09eb178. Requests per second, `GET /`, the
+mean of three runs:
 
 | entry | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| garuda-wsgi | 87 / 1,538 | 47 / 1,233 | 226 / 1,875 |
-| garuda-asgi | 329 / 2,734 | 224 / 1,896 | 180 / 1,851 |
-| garuda-blacksheep | 698 / 4,225 | 498 / 3,043 | 624 / 3,225 |
-| garuda-fastapi | 2,772 / 8,075 | 2,619 / 7,256 | 2,448 / 6,954 |
-| garuda-flask | 3,324 / 8,739 | 3,224 / 8,391 | 3,274 / 8,421 |
-| garuda-django | 3,407 / 8,903 | 3,377 / 8,589 | 3,356 / 8,682 |
-| elysia-bun, reference | 38 / 1,084 | 15 / 772 | 14 / 884 |
+| Garuda router | **414,234** | **389,445** | **370,945** |
+| Hummingbird 2.26.0 | 88,864 | 102,399 | 99,706 |
+| Vapor 4.122.1 | 60,411 | 58,946 | 60,837 |
 
-The three runs behind each figure, in requests per second:
-
-| entry | 64 | 256 | 512 |
-|---|---|---|---|
-| garuda-wsgi | 288,003 · 291,107 · 299,966 | 280,747 · 315,792 · 310,711 | 207,911 · 284,829 · 277,240 |
-| garuda-asgi | 203,659 · 235,354 · 226,465 | 286,103 · 271,192 · 256,894 | 240,507 · 254,042 · 285,916 |
-| garuda-blacksheep | 188,493 · 174,349 · 174,781 | 205,982 · 196,186 · 204,256 | 194,230 · 193,920 · 204,910 |
-| garuda-fastapi | 51,953 · 58,053 · 62,652 | 65,900 · 72,505 · 78,512 | 76,863 · 77,457 · 76,134 |
-| garuda-flask | 50,075 · 49,084 · 50,639 | 48,893 · 51,603 · 50,774 | 49,881 · 51,867 · 51,145 |
-| garuda-django | 45,022 · 48,251 · 44,901 | 47,846 · 45,924 · 49,647 | 46,053 · 46,048 · 45,316 |
-| elysia-bun, reference | 343,970 · 343,530 · 351,895 | 353,516 · 369,948 · 328,402 | 362,111 · 357,651 · 349,879 |
-
-- **Runs vary, the raw entries most.** Raw WSGI at 512 connections ranges from
-  207,911 to 284,829, raw ASGI at 64 from 203,659 to 235,354, and FastAPI at
-  256 from 65,900 to 78,512. Every other cell stays within 13 %. The load
-  generator shares the four CPUs with the server, which likely matters most
-  for the entries that answer the most. Differences of 10 % or less between
-  the raw entries, or between levels, are inside that spread.
-- **Latency measures how far behind the ramp a server falls, not a request's
-  round trip.** The ramp offers requests faster than every entry here can
-  answer them by the end of each run, and zrk counts the time a request waited
-  to be sent. A p50 of seconds means the queue grew for most of the run; tens
-  of milliseconds, that the server kept up until late. Compare the entries with
-  each other, not with a closed-loop benchmark.
-- **Flask and Django are within 12 % of each other**, and both are limited by
-  the framework, not the server: the raw WSGI entry on the same server is
-  5.0–6.4× either.
-
----
+- **No latencies.** The ramp offers far more than Hummingbird and Vapor can
+  serve, so their corrected p50s are seconds of queueing, not what a request
+  costs. Set beside the router's, they would say nothing.
+- **No pinned one-core pass.** SwiftNIO sizes its event loop group from cgroup
+  limits or the online CPU count, not from CPU affinity, so under `taskset`
+  Hummingbird and Vapor would each run four loops on one core.
+- **Compare rows within one table.** The load generator shares the server's
+  four CPUs, and figures from different sessions on this machine move by tens
+  of percent.
 
 ## Method
 
-The load command, the applications and the server command are the suite's own,
-from [the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks)
-on `develop`: the load command at
-[4bb9eaa](https://github.com/the-benchmarker/web-frameworks/blob/4bb9eaa/.tasks/config.rake#L149)
-(2026-09-13), the applications at 3795a31 (2026-09-14). The machine, the
-Python patch release and where the load generator runs are not, and every
-difference is listed below.
-
 | | |
 |---|---|
-| Load generator | [zrk](https://github.com/zoxy-io/zrk) 2.5.0, two threads |
+| Load generator | [zrk](https://github.com/zoxy-io/zrk), the suite's load command at [4bb9eaa](https://github.com/the-benchmarker/web-frameworks/blob/4bb9eaa/.tasks/config.rake#L149) |
 | Warm-up | `zrk -c 50 -d 5s --plain URL` |
 | Each level | `zrk --plain -c N -d 15s -m GET --format json -R1000:500000 --interval 1s --timeout 8s --latency URL` |
 | Levels | 64, 256 and 512 connections, `GET /` |
 | Figure | zrk's `achieved_rate`, in requests per second, the mean of three runs |
-| Latency | p50 and p99, corrected for coordinated omission, the mean of three runs |
-| Server | `python -m garuda --log-level error --protocol X --workers 4 APP`, the suite's `garuda` engine command with `--workers $(nproc)` |
-| Applications | the suite's `python/garuda-asgi`, `-wsgi`, `-fastapi` and `-django` entries, and its `python/flask` and `python/blacksheep` sources run the same way, copied unchanged: [benchmarks/web-frameworks/](benchmarks/web-frameworks/) |
-| Elysia | the suite's `javascript/elysia-bun`, `cluster.ts` starting one `bun ./app.ts` per CPU: [benchmarks/elysia-bun/](benchmarks/elysia-bun/) |
-| Host | WSL2, 4 CPUs of an Intel Core i9-12900KF, 31 GB, Ubuntu 24.04.4, Linux 6.18; load generator on the same machine |
-| Python | CPython 3.14.6, not free-threaded; Garuda built from source as the extension module a wheel installs |
-
-Versions: FastAPI 0.141.1 (Starlette 1.6.0, Pydantic 2.13.5), Django 6.1.1,
-Flask 3.1.3 (Werkzeug 3.1.8), BlackSheep 2.6.3, uvloop 0.22.1; Elysia 1.4.30
-on Bun 1.4.2.
+| Garuda | release build at 09eb178, `garuda --log-level error --host 127.0.0.1 --port 3000 --workers 4` |
+| Hummingbird, Vapor | the suite's `swift/hummingbird-framework` and `swift/vapor-framework` entries, byte for byte, built as its Dockerfile builds them: Swift 6.3.3, `swift build -c release -Xswiftc -enforce-exclusivity=unchecked`. Each is one process with SwiftNIO 2.102.0's default of an event loop per CPU |
+| Host | WSL2, 4 CPUs of an Intel Core i9-12900KF; load generator on the same machine, sharing those CPUs |
 
 The command is an open-loop ramp from 1,000 to 500,000 requests a second over
-the 15 s of a run, with keep-alive on. Upstream raised the end of the ramp from
-100,000 at 4bb9eaa. Under the old ramp a run offered at most about 96,500
-requests a second, which every raw entry and Elysia reached, so it could not
-rank them; the new one offers more than any entry here answers. The comment
-above the command in `config.rake` describes `--closed`, a closed loop; the
-command does not pass it.
-
-Free-threaded builds were not measured.
-
-**Where this differs from upstream:**
-
-| | upstream, dataset of 2026-09-13 | here |
-|---|---|---|
-| Host | 16 CPUs, 7.7 GB, Linux 7.1 (Fedora) | WSL2 on 4 CPUs, 31 GB, Ubuntu 24.04.4 |
-| Workers | `--workers $(nproc)`, 16 | `--workers $(nproc)`, 4 |
-| Load generator | the suite runs each server in a container | same machine as the server, sharing its 4 CPUs |
-| Python | 3.14 | 3.14.6 |
-| Garuda | `pip install 'garuda-server>=1.0,<1.1'` | built from source at b8d6ae9 |
-| Flask and BlackSheep | on their own engines, gunicorn and uvicorn; there is no Garuda entry for either | the suite's sources on Garuda |
+the 15 s of a run, keep-alive on, latency corrected for coordinated omission.
 
 ### Relation to the published results
 
-The site's dataset of 2026-09-13 09:54 UTC lists Garuda 1.0 under four
-entries, measured with the same command on sixteen CPUs. Requests per second at
-64 / 256 / 512 connections, beside the entries the same frameworks have on their
-default engines:
+The site's dataset of 2026-09-13, on 16 CPUs at 512 connections, has Vapor at
+88,435 and Hummingbird at 82,488 requests a second, and the top 15 entries in
+any language between 147k and 176k. Here, on four CPUs shared with the load
+generator, Hummingbird served 99,706 and Vapor 60,837 at 512: the host and the
+path from load generator to server (loopback here) differ too much for the two
+to be set side by side.
 
-| site entry | what it runs | 64 | 256 | 512 |
-|---|---|---:|---:|---:|
-| `garuda-wsgi` | raw WSGI on Garuda 1.0 | 158,062 | 131,645 | 130,843 |
-| `garuda-asgi` | raw ASGI on Garuda 1.0 | 128,342 | 107,861 | 105,471 |
-| `garuda-fastapi` | FastAPI on Garuda 1.0 | 54,338 | 59,273 | 60,201 |
-| `garuda-django` | Django on Garuda 1.0, WSGI | 39,840 | 39,718 | 39,654 |
-| `fastapi` | FastAPI on uvicorn | 41,891 | 47,335 | 48,552 |
-| `flask` | Flask on gunicorn, sync workers | 5,106 | 12,277 | 5,904 |
-| `django` | Django on gunicorn | 1,165 | 5,727 | 4,699 |
-| `blacksheep` | BlackSheep on uvicorn | 80,409 | 85,160 | 85,960 |
-| `fastpysgi-wsgi` | a raw WSGI application on fastpysgi | 157,810 | 129,789 | 129,033 |
-| `elysia-bun` | Elysia on Bun | 162,284 | 132,591 | 127,945 |
+---
 
-Source: [`data.min.json` on `develop`](https://github.com/the-benchmarker/web-frameworks/blob/develop/data.min.json),
-the file the site's frontend loads.
+## Before the router: the Swift path on Peregrine's engine
 
-None of these can be set beside the tables above. Here four workers answered
-up to 302,417 requests a second where sixteen answered 158,062 there, so the
-host and the path from load generator to server count for more than the
-workers do. On this machine the load generator reaches the server over
-loopback, which is likely a large part of it. What the two agree on is the
-order where both have entries: raw WSGI leads raw ASGI at 64 and 256
-connections, FastAPI leads Django, and in the published set FastAPI and Django
-on Garuda 1.0 are ahead of the same frameworks on their default engines.
+Measured on 2026-09-14, the day of the fork, before the router existed and
+before CPython was removed. `--health-check-path /` answers in `Worker.swift`
+before dispatch, with no Python per request, so it measured what a Swift
+handler at that seam could cost; CPython was still loaded in the process.
+
+Per-request CPU for one worker pinned to CPU 0, load generator on CPUs 1–3,
+closed-loop oha for 15 s at 64 connections, the mean of three runs:
+
+| server | user µs | kernel µs | req/s |
+|---|---:|---:|---:|
+| Peregrine, `--health-check-path /` | **1.27** | 5.42 | 152,480 |
+| Elysia on Bun | 1.45 | 4.36 | 175,572 |
+| Peregrine, raw ASGI | 5.07 | 4.90 | 105,745 |
+
+- **The Swift path was already at Bun's user time**: 1.27 µs against Elysia's
+  1.45. The gap on one core was kernel time, 5.42 against 4.36.
+- Raw ASGI's extra ~3.8 µs of user time was Python and asyncio.
+- Kernel time was 4.4–5.4 µs for every server. At 5.8 µs a request, one core
+  gives about 172k requests a second, which is what Elysia delivered on one
+  pinned worker.
+
+The suite's zrk command, four workers, the mean of three runs, the same
+session, no errors:
+
+| entry | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| Peregrine, `--health-check-path /` | **330,563** | **322,119** | 291,295 |
+| Elysia on Bun | 282,771 | 321,087 | **297,502** |
+| Peregrine, raw ASGI | 216,249 | 251,656 | 247,575 |
+
+The health-check path beat or matched that session's Elysia at 64 and 256.
+Elysia was slower here than the 346k–357k of the other session that day
+([below](#historical-peregrine-python-before-the-fork)); shared-CPU noise
+between sessions is that large.
 
 ---
 
 ## Reproduce
 
 ```bash
-PYTHON=~/.local/share/uv/python/cpython-3.14.6-linux-x86_64-gnu/bin/python3 \
-    SCRATCH=~/pgbuild-ext-314 bash scripts/build-extension.sh
-uv venv ~/wf314-venv --python 3.14
-uv pip install --python ~/wf314-venv/bin/python fastapi==0.141.1 django==6.1.1 \
-    flask==3.1.3 blacksheep==2.6.3 uvloop==0.22.1
-VENV=~/wf314-venv SOURCES=upstream WORKERS=$(nproc) AGG=mean \
-    FRAMEWORKS="asgi wsgi fastapi django flask blacksheep elysia" \
-    SERVERS="garuda-ext elysia-bun" bash benchmarks/frameworks.sh > results.tsv
+swift build -c release --product garuda
+HUMMINGBIRD=/path/to/hummingbird-framework/.build/release/server \
+VAPOR=/path/to/vapor-framework/.build/release/server \
+FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 AGG=mean \
+    bash benchmarks/frameworks.sh > results.tsv
 ```
 
-[benchmarks/frameworks.sh](benchmarks/frameworks.sh) prints one line per entry
-and level, with every run. `WORKERS`, `CONNS`, `RUNS`, `AGG`, `RATE`,
-`DURATION`, `FRAMEWORKS`, `SERVERS`, `SOURCES`, `VENV`, `ZRK`, `EXT_ROOT`,
-`GARUDA_EXTRA_ARGS` and `BUN` override the defaults. The Elysia entry needs
-[Bun](https://bun.sh) and port 3000, since the suite's `app.ts` listens there;
-the script runs `bun install` the first time.
+[benchmarks/frameworks.sh](benchmarks/frameworks.sh) prints one TSV line per
+entry and level, with every run. It needs:
+
+- **zrk** 2.4 or later on `PATH`, or `ZRK`; **python3**, which reads zrk's JSON
+  output; **curl**; and port 3000 free, or `PORT`.
+- **Garuda** at `.build/release/garuda`, or `GARUDA`. `WORKERS` is Garuda's
+  worker count (default 1); `GARUDA_EXTRA_ARGS` adds server flags.
+- **Hummingbird and Vapor** built from the suite's `swift/hummingbird-framework`
+  and `swift/vapor-framework` entries with
+  `swift build -c release -Xswiftc -enforce-exclusivity=unchecked`. The script
+  looks for their executables at
+  `~/swiftbench/hummingbird-framework/.build/release/server` and
+  `~/swiftbench/vapor-framework/.build/release/server` unless `HUMMINGBIRD`
+  and `VAPOR` say otherwise, and starts them with `SERVER_HOSTNAME` and
+  `SERVER_PORT` (Vapor with `serve` and `VAPOR_ENV=production`).
+- `AGG=mean` averages the runs, as the suite publishes; the default, `median`,
+  keeps the median run. `RUNS` (3), `CONNS` (`64 256 512`), `DURATION` (15s) and
+  `RATE` (`1000:500000`) override the rest. `LOAD=closed` runs closed-loop oha
+  instead of the ramp, and `PIN=0:1-3` pins server and load generator.
+
+`FRAMEWORKS=elysia SERVERS=elysia-bun` still runs the suite's Elysia entry
+([benchmarks/elysia-bun/](benchmarks/elysia-bun/)) as a reference. It needs
+[Bun](https://bun.sh) and port 3000.
+
+The other harnesses in `benchmarks/` predate the fork: `async_fw.sh`,
+`body_sizes.sh`, `django_fastapi.sh`, `eagercmp.sh`, `free_threaded.sh`,
+`gil_vs_ft.sh`, `granian.sh`, `memory.sh`, `run.sh`, `syscalls.sh`,
+`turbo_ab.sh`, and `frameworks.sh`'s Python frameworks, all start Python
+applications, which Garuda no longer serves. `static_files.sh` starts
+`scripts/request_id_apps.py`, which has been deleted.
+
+---
+
+## Historical: Peregrine (Python), before the fork
+
+**These are Peregrine's figures, not Garuda's.** Peregrine is the Python ASGI
+and WSGI server Garuda was forked from; every request below, except Elysia's,
+ran Python. They are kept for scale. The full write-up, with latencies, every
+run and the Python method, is [Peregrine's BENCHMARKS.md at v1.1.5](https://github.com/grepjava/peregrine/blob/v1.1.5/BENCHMARKS.md).
+
+Measured on 2026-09-14 on Peregrine at b8d6ae9, the build 1.1.5 shipped: the
+suite's Python entries on Peregrine and its Elysia entry, four workers, the
+same zrk command (zrk 2.5.0), the same host. Requests per second, the mean of
+three runs, no errors:
+
+| entry | application | 64 | 256 | 512 |
+|---|---|---:|---:|---:|
+| peregrine-wsgi | raw WSGI | **293,025** | **302,417** | 256,660 |
+| peregrine-asgi | raw ASGI | 221,826 | 271,396 | **260,155** |
+| peregrine-blacksheep | BlackSheep 2.6.3 | 179,208 | 202,141 | 197,687 |
+| peregrine-fastapi | FastAPI 0.141.1 | 57,553 | 72,306 | 76,818 |
+| peregrine-flask | Flask 3.1.3 | 49,933 | 50,423 | 50,964 |
+| peregrine-django | Django 6.1.1 | 46,058 | 47,806 | 45,806 |
+| elysia-bun, reference | Elysia 1.4.30 on Bun 1.4.2 | 346,465 | 350,622 | 356,547 |
+
+In the site's dataset of 2026-09-13 (16 CPUs), raw WSGI on Peregrine 1.0
+served 130,843 requests a second at 512 connections.

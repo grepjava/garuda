@@ -56,6 +56,8 @@ The realistic target stays the top tier, level with Bun, and clearly ahead of to
 
 ## Coverage waiting on the handler API
 
+The proposed API, and the phase that brings back each line below, is in [HANDLER-API.md](HANDLER-API.md).
+
 235 end-to-end checks went with CPython, because they needed an application to answer. The engine features they covered are still in the binary, untested end to end until a handler can produce what each test needs. Each line is a capability a handler needs, and the tests that capability brings back:
 
 - **Echo the request body.** Body framing delivered byte for byte: Content-Length, chunked, pipelined, 100-continue, 1 MiB. HTTP/2 and HTTP/3 bodies larger than a frame or a window, and drip-fed ones arriving in order. Request-body backpressure, delivery in pieces, answering before an upload finishes and draining the rest, a TLS round trip.

@@ -20,7 +20,7 @@ swift build -c release -Xswiftc -sanitize=address
 .build/release/pgfuzz --seconds 60
 ```
 
-CI runs that last form on every push.
+CI runs that last form (`.github/workflows/ci.yml`, started by hand).
 
 ## What is actually checked
 
