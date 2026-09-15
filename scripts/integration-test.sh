@@ -122,7 +122,7 @@ is "1 MiB chunked upload, then the connection carries on" \
 rm -f /tmp/pg-upload.bin
 
 # Concurrency: 20 requests that each wait 250ms must overlap.
-start_ms=$(date +%s%N)
+start_ms=$(ms)
 pids=""
 for _ in $(seq 1 20); do
     curl -sS --max-time 10 -o /dev/null $H/delay/250 &
@@ -131,7 +131,7 @@ done
 # Wait only on the clients: a bare `wait` would also block on the server, which
 # this script started in the background and stops from the EXIT trap.
 for p in $pids; do wait "$p"; done
-elapsed=$(( ($(date +%s%N) - start_ms) / 1000000 ))
+elapsed=$(( $(ms) - start_ms ))
 if [ "$elapsed" -lt 2000 ]; then ok "20 concurrent 250ms requests overlap (${elapsed}ms)"
 else bad "concurrency" "<2000ms" "${elapsed}ms"; fi
 

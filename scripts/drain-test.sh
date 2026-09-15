@@ -27,7 +27,6 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/serverlib.sh"
 trap 'server_stop; rm -rf "$WORK"' EXIT
 
-ms() { echo $(( $(date +%s%N) / 1000000 )); }
 code() { curl -s -o /dev/null --max-time 5 -w '%{http_code}' "http://127.0.0.1:$PORT$1"; }
 
 start() {

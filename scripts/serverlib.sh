@@ -118,3 +118,15 @@ server_trap_cleanup() {
     trap 'server_stop; exit 130' INT TERM
     trap 'server_stop' EXIT
 }
+
+# Milliseconds on a clock that never steps, for timing a test: WSL2 once set
+# the wall clock back mid-test, and a 2 s drain read as 1177 ms.
+ms() {
+    if [ -r /proc/uptime ]; then
+        local up
+        read -r up _ < /proc/uptime
+        echo $(( ${up%.*} * 1000 + 10#${up#*.} * 10 ))
+    else
+        echo $(( $(date +%s%N) / 1000000 ))
+    fi
+}
