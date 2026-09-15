@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/garuda-fiery-roaring.png" alt="garuda" width="480">
+  <img src="assets/garuda-stylized-lockup.png" alt="Garuda" width="640">
 </p>
 
 # Configuring Garuda
