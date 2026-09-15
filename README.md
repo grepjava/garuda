@@ -48,7 +48,7 @@ import Garuda
 
 let app = Application()
 app.get("/user/:id") { request, response in
-    response.send(request.parameter(0))
+    request.withParameter(0) { response.send($0) }   // lent, not copied
 }
 exit(app.run())
 ```
@@ -58,13 +58,19 @@ exit(app.run())
   `:param`, or a trailing `*rest`, with at most 8 parameters. The table is
   compiled into a byte trie when the application first runs or is tested.
   HEAD falls back to GET.
-- **`Request`** is a `~Copyable` view of the request: `method`, `path`,
-  `query`, `parameter(i)`, `version`, `scheme`, `authority`, `header(_:)`,
-  `forEachHeader`, the whole `body`, `remoteAddress` and `remotePort` (with
-  `--forwarded-allow-ips` applied), `requestID`, `requestStart` and `locals`.
+- **`Request`** is a `~Copyable` view of the request. Bytes it already holds
+  are lent to a closure as a `Span`, which the compiler keeps inside it:
+  `withPath`, `withQuery`, `withParameter(i)`, `withHeader(_:)`,
+  `forEachHeader`, `withBody`, `withRemoteAddress` and `withRequestID`. A
+  handler that wants to keep a value asks for an owned copy: `path`, `query`,
+  `parameter(i)`, `header(_:)`, `authority`, `remoteAddress` and `requestID` as
+  `String`, `body` as `[UInt8]`. Also `method`, `version`, `scheme`,
+  `remotePort` (with `--forwarded-allow-ips` applied) and `requestStart`.
+- **`request[context: Key.self]`** holds typed values for the rest of the
+  request, across a wait, and never for the next request on the connection.
 - **`Response`** is `~Copyable` too: `status`, `addHeader`, `send(status:)`,
-  `send(status:_:)`, and `after(milliseconds:then:)`, which calls a handler
-  again after a timer.
+  `send(status:_:)` (a lent `Span` is sent without a copy), and
+  `after(milliseconds:then:)`, which calls a handler again after a timer.
 - **`app.run()`** parses the flags and runs the supervisor;
   `app.run(configuration:)` serves a `ServerConfig` instead. `onWorkerStart`
   hooks run in each worker before it reports ready, and `onWorkerShutdown`
@@ -79,10 +85,10 @@ HEAD responses, adds the server's headers unless the handler set its own
 a declared `Content-Length`. A handler that throws, or returns without
 answering or waiting, gets a 500.
 
-The API is not stable. Byte views borrowed from a request can still be kept
-past it, and suspension is only the timer continuation. There is no typed
-extraction, JSON, middleware, 405, streaming, WebSocket or WebTransport handler
-yet. [HANDLER-API.md](HANDLER-API.md) has the roadmap.
+The API is not stable. Handlers are synchronous, and suspension is only the
+timer continuation. There is no typed extraction, JSON, middleware, 405,
+streaming, WebSocket or WebTransport handler yet.
+[HANDLER-API.md](HANDLER-API.md) has the roadmap.
 
 ### What the binary serves
 
@@ -360,7 +366,8 @@ reads the forwarded client and scheme as `request.remoteAddress`,
 Unit tests, including the fuzz corpus:
 
 ```bash
-swift test                                   # 203 tests
+swift test                                   # 206 tests
+bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
 The end-to-end suites run against the release binary, `.build/release/garuda`

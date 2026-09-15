@@ -31,7 +31,8 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 203 unit tests
+swift test                             # 206 unit tests
+bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
 bash scripts/sni-test.sh               # 11
@@ -75,9 +76,18 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   segments, at most 8 parameters), compiled into a byte trie when it first runs
   or is tested; HEAD falls back to GET. A `~Copyable` `Request` gives the
   method, path, query, parameters, version, scheme, authority, headers, the
-  whole body, the client with `--forwarded-allow-ips` applied, the request ID,
-  the request start and `locals`. A `~Copyable` `Response` sets a status and
-  headers, sends, or waits with `after(milliseconds:then:)`.
+  whole body, the client with `--forwarded-allow-ips` applied, the request ID
+  and the request start. A `~Copyable` `Response` sets a status and headers,
+  sends, or waits with `after(milliseconds:then:)`.
+- Request bytes are lent, not handed out. `withPath`, `withParameter`,
+  `withHeader`, `withBody` and the rest pass a `Span` to a closure, and the
+  compiler refuses a handler that stores one, returns it or captures it in a
+  continuation. `path`, `parameter(_:)`, `header(_:)`, `body` and the rest make
+  owned copies for a handler to keep. The accessors that returned raw
+  `ByteSpan`s are gone.
+- `request[context: Key.self]` replaces `locals`: typed values for the rest of
+  a request, across `after`, tagged with the request so they never reach the
+  next one on the connection.
 - `app.run()` parses the usual flags and runs the supervisor, and
   `app.run(configuration:)` serves a `ServerConfig` instead, checked the way
   the command line is. `onWorkerStart` hooks run in each worker before it
@@ -132,10 +142,9 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
 
 - WebSocket and WebTransport application APIs are stubs. HTTP/3 still
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
-- The handler API's later steps: borrowed byte views can still be kept past
-  the request, handlers are synchronous with only the timer continuation to
-  suspend on, and there is no typed extraction, JSON, middleware, 405,
-  streaming response, or WebSocket or WebTransport handler.
+- The handler API's later steps: handlers are synchronous with only the timer
+  continuation to suspend on, and there is no typed extraction, JSON,
+  middleware, 405, streaming response, or WebSocket or WebTransport handler.
 - `--compress` and `--cache-size` act on no handler response; they wait for
   streaming responses.
 - TLS is OpenSSL, not Swift.

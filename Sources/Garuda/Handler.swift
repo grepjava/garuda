@@ -1,17 +1,19 @@
 //===----------------------------------------------------------------------===//
-// The handler API: routes, the request a handler reads, the response it writes.
+// The handler API: the request a handler reads and the response it writes.
 //
 // A handler is a plain function value, called on the worker's own thread from
 // inside dispatch. `Request` and `Response` are views of one connection slot,
 // valid for the length of that call and no longer: both are ~Copyable, so a
-// handler cannot keep either, and a handler that has to wait says so with
-// `Response.after`, which parks a continuation and calls a handler again later
-// with fresh views of the same request (HANDLER-API.md, "Suspension").
+// handler cannot keep either. Bytes the request already holds -- the path, a
+// parameter, a header, the body -- are lent to a closure as a `Span`, which the
+// compiler keeps inside that closure; a handler that wants to keep a value asks
+// for an owned copy instead (`String`, `[UInt8]`). A handler that has to wait
+// says so with `Response.after`, which calls a handler again later with fresh
+// views of the same request, and what it needs across that wait goes in the
+// request's typed context (RequestContext.swift).
 //
-// Nothing here allocates on the way to an answer. Header values, parameters and
-// the body are byte spans into memory the connection already owns; a handler
-// that wants a String asks for one. The engine side -- dispatch, the response
-// sink, what a request reads -- is in Respond.swift.
+// Lending allocates nothing. The engine side -- dispatch, the response sink,
+// what a request reads -- is in Respond.swift.
 //===----------------------------------------------------------------------===//
 
 import CGaruda
@@ -54,30 +56,6 @@ public struct Request: ~Copyable {
 
     public var method: HTTPMethod { connection.pointee.head.method }
 
-    /// The request target's path, still percent-encoded, as the client sent it.
-    public var path: ByteSpan {
-        let c = connection
-        return c.pointee.head.path.span(in: c.pointee.headBase())
-    }
-
-    /// The query string without its "?", or empty.
-    public var query: ByteSpan {
-        let c = connection
-        return c.pointee.head.query.span(in: c.pointee.headBase())
-    }
-
-    public var parameterCount: Int { connection.pointee.routeParameters.count }
-
-    /// Route parameter `index`, in the order the pattern names them, still
-    /// percent-encoded.
-    public func parameter(_ index: Int) -> ByteSpan {
-        let c = connection
-        precondition(index >= 0 && index < c.pointee.routeParameters.count,
-                     "no such route parameter")
-        let (start, count) = c.pointee.routeParameters[index]
-        return ByteSpan(c.pointee.headBase() + Int(c.pointee.routeOffset) + start, count)
-    }
-
     /// 1.0, 1.1, 2 or 3.
     public var version: (major: Int, minor: Int) {
         let c = connection
@@ -89,59 +67,158 @@ public struct Request: ~Copyable {
     /// or when a trusted proxy said so; --scheme otherwise.
     public var scheme: StaticString { worker.pointee.requestScheme(slot) }
 
-    /// The first value of `name`, compared without regard to case, or nil.
-    public func header(_ name: StaticString) -> ByteSpan? {
-        worker.pointee.requestHeader(slot, name.utf8Start, name.utf8CodeUnitCount)
-    }
+    /// How many parameters the matched route's pattern names.
+    public var parameterCount: Int { connection.pointee.routeParameters.count }
 
-    public func header(_ name: String) -> ByteSpan? {
-        var name = name
-        return name.withUTF8 { worker.pointee.requestHeader(slot, $0.baseAddress!, $0.count) }
-    }
-
-    /// Every header as received, in order and with repeats. HTTP/2 and
-    /// HTTP/3 pseudo-headers are not among them: :authority arrives as Host,
-    /// and :scheme is `scheme`.
-    public func forEachHeader(_ body: (_ name: ByteSpan, _ value: ByteSpan) throws -> Void) rethrows {
-        try worker.pointee.forEachRequestHeader(slot, body)
-    }
-
-    /// Host, which is where HTTP/2's and HTTP/3's :authority arrives.
-    public var authority: ByteSpan? { header("host") }
-
-    /// The whole request body, which arrived before the handler was called.
-    public var body: ByteSpan {
-        let c = connection
-        guard c.pointee.body.readableBytes > 0 else { return ByteSpan(c.pointee.headBase(), 0) }
-        return c.pointee.body.readableSpan
-    }
-
-    /// The client, or the address a trusted proxy forwarded for it.
-    public var remoteAddress: ByteSpan { worker.pointee.requestClient(slot).address }
-
+    /// The client's port, or the one a trusted proxy forwarded for it.
     public var remotePort: Int { worker.pointee.requestClient(slot).port }
-
-    /// The ID --request-id assigned or kept, or nil.
-    public var requestID: ByteSpan? {
-        let c = connection
-        return c.pointee.requestID.readableBytes > 0 ? c.pointee.requestID.readableSpan : nil
-    }
 
     /// With --request-start-header, when the request arrived, in microseconds
     /// since the epoch -- the kernel's receive time where it has one. Nil
     /// without the flag.
     public var requestStart: UInt64? { worker.pointee.requestStartMicros(slot) }
 
-    /// Four words that survive a suspension, for a handler's own state.
-    public var locals: RequestLocals { RequestLocals(connection: connection) }
+    // MARK: Lent bytes
+    //
+    // Each lends bytes the connection already holds to `body`, for as long as
+    // `body` runs. The span cannot be stored, returned or captured by an
+    // escaping closure: the compiler refuses it.
+
+    /// The request target's path, still percent-encoded, as the client sent it.
+    @discardableResult
+    public borrowing func withPath<R>(_ body: (Span<UInt8>) throws -> R) rethrows -> R {
+        try lend(pathBytes, body)
+    }
+
+    /// The query string without its "?", or empty.
+    @discardableResult
+    public borrowing func withQuery<R>(_ body: (Span<UInt8>) throws -> R) rethrows -> R {
+        try lend(queryBytes, body)
+    }
+
+    /// Route parameter `index`, in the order the pattern names them, still
+    /// percent-encoded.
+    @discardableResult
+    public borrowing func withParameter<R>(_ index: Int, _ body: (Span<UInt8>) throws -> R) rethrows -> R {
+        try lend(parameterBytes(index), body)
+    }
+
+    /// The first value of `name`, compared without regard to case. Nil, and
+    /// `body` is not called, when the request has no such header.
+    @discardableResult
+    public borrowing func withHeader<R>(_ name: StaticString, _ body: (Span<UInt8>) throws -> R) rethrows -> R? {
+        guard let value = headerBytes(name) else { return nil }
+        return try lend(value, body)
+    }
+
+    @discardableResult
+    public borrowing func withHeader<R>(_ name: String, _ body: (Span<UInt8>) throws -> R) rethrows -> R? {
+        guard let value = headerBytes(name) else { return nil }
+        return try lend(value, body)
+    }
+
+    /// Every header as received, in order and with repeats. HTTP/2 and
+    /// HTTP/3 pseudo-headers are not among them: :authority arrives as Host,
+    /// and :scheme is `scheme`.
+    public borrowing func forEachHeader(_ body: (_ name: Span<UInt8>, _ value: Span<UInt8>) throws -> Void) rethrows {
+        try worker.pointee.forEachRequestHeader(slot) { name, value in
+            try body(UnsafeBufferPointer(start: name.base, count: name.count).span,
+                     UnsafeBufferPointer(start: value.base, count: value.count).span)
+        }
+    }
+
+    /// The whole request body, which arrived before the handler was called.
+    @discardableResult
+    public borrowing func withBody<R>(_ body: (Span<UInt8>) throws -> R) rethrows -> R {
+        try lend(bodyBytes, body)
+    }
+
+    /// The client's address, or the one a trusted proxy forwarded for it.
+    @discardableResult
+    public borrowing func withRemoteAddress<R>(_ body: (Span<UInt8>) throws -> R) rethrows -> R {
+        try lend(worker.pointee.requestClient(slot).address, body)
+    }
+
+    /// The ID --request-id assigned or kept. Nil, and `body` is not called,
+    /// without one.
+    @discardableResult
+    public borrowing func withRequestID<R>(_ body: (Span<UInt8>) throws -> R) rethrows -> R? {
+        guard let id = requestIDBytes else { return nil }
+        return try lend(id, body)
+    }
+
+    // MARK: Owned copies
+    //
+    // Each makes a value the handler owns, which it can keep, return, or take
+    // across `Response.after`.
+
+    public var path: String { pathBytes.string }
+    public var query: String { queryBytes.string }
+    public func parameter(_ index: Int) -> String { parameterBytes(index).string }
+    public func header(_ name: StaticString) -> String? { headerBytes(name)?.string }
+    public func header(_ name: String) -> String? { headerBytes(name)?.string }
+    /// Host, which is where HTTP/2's and HTTP/3's :authority arrives.
+    public var authority: String? { headerBytes("host")?.string }
+    public var body: [UInt8] {
+        let bytes = bodyBytes
+        return Array(UnsafeBufferPointer(start: bytes.base, count: bytes.count))
+    }
+    public var remoteAddress: String { worker.pointee.requestClient(slot).address.string }
+    public var requestID: String? { requestIDBytes?.string }
+
+    // MARK: The bytes themselves, for the engine
+
+    var pathBytes: ByteSpan {
+        let c = connection
+        return c.pointee.head.path.span(in: c.pointee.headBase())
+    }
+
+    var queryBytes: ByteSpan {
+        let c = connection
+        return c.pointee.head.query.span(in: c.pointee.headBase())
+    }
+
+    func parameterBytes(_ index: Int) -> ByteSpan {
+        let c = connection
+        precondition(index >= 0 && index < c.pointee.routeParameters.count,
+                     "no such route parameter")
+        let (start, count) = c.pointee.routeParameters[index]
+        return ByteSpan(c.pointee.headBase() + Int(c.pointee.routeOffset) + start, count)
+    }
+
+    func headerBytes(_ name: StaticString) -> ByteSpan? {
+        worker.pointee.requestHeader(slot, name.utf8Start, name.utf8CodeUnitCount)
+    }
+
+    func headerBytes(_ name: String) -> ByteSpan? {
+        var name = name
+        return name.withUTF8 { worker.pointee.requestHeader(slot, $0.baseAddress!, $0.count) }
+    }
+
+    var bodyBytes: ByteSpan {
+        let c = connection
+        guard c.pointee.body.readableBytes > 0 else { return ByteSpan(c.pointee.headBase(), 0) }
+        return c.pointee.body.readableSpan
+    }
+
+    var requestIDBytes: ByteSpan? {
+        let c = connection
+        return c.pointee.requestID.readableBytes > 0 ? c.pointee.requestID.readableSpan : nil
+    }
 }
 
-public struct RequestLocals {
-    let connection: UnsafeMutablePointer<Connection>
+/// Lends `bytes` to `body` as a span that cannot outlive the call.
+@inline(__always)
+func lend<R>(_ bytes: ByteSpan, _ body: (Span<UInt8>) throws -> R) rethrows -> R {
+    try body(UnsafeBufferPointer(start: bytes.base, count: bytes.count).span)
+}
 
-    public subscript(index: Int) -> UInt64 {
-        get { connection.pointee.locals[index] }
-        nonmutating set { connection.pointee.locals[index] = newValue }
+/// The span's bytes as a `ByteSpan`, for the engine, for the length of `body`.
+@inline(__always)
+func withByteSpan<R>(_ span: Span<UInt8>, _ body: (ByteSpan) -> R) -> R {
+    span.withUnsafeBufferPointer { buffer in
+        let empty: StaticString = ""
+        return body(ByteSpan(buffer.baseAddress ?? empty.utf8Start, buffer.count))
     }
 }
 
@@ -173,7 +250,7 @@ public struct Response: ~Copyable {
 
     /// Adds a header. Returns false, and adds nothing, once the response has
     /// been sent, or for a name that is not a token, a value holding CR, LF or
-    /// NUL, or a Content-Length that is not a number.
+    /// NUL, or a Content-Length that is not a number. The bytes are copied.
     @discardableResult
     public func addHeader(_ name: StaticString, _ value: StaticString) -> Bool {
         worker.pointee.addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
@@ -181,13 +258,17 @@ public struct Response: ~Copyable {
     }
 
     @discardableResult
-    public func addHeader(_ name: StaticString, _ value: ByteSpan) -> Bool {
-        worker.pointee.addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount), value)
+    public func addHeader(_ name: StaticString, _ value: Span<UInt8>) -> Bool {
+        withByteSpan(value) { v in
+            worker.pointee.addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount), v)
+        }
     }
 
     @discardableResult
-    public func addHeader(_ name: ByteSpan, _ value: ByteSpan) -> Bool {
-        worker.pointee.addResponseHeader(slot, name, value)
+    public func addHeader(_ name: Span<UInt8>, _ value: Span<UInt8>) -> Bool {
+        withByteSpan(name) { n in
+            withByteSpan(value) { v in worker.pointee.addResponseHeader(slot, n, v) }
+        }
     }
 
     @discardableResult
@@ -215,8 +296,11 @@ public struct Response: ~Copyable {
                                body.utf8Start, body.utf8CodeUnitCount)
     }
 
-    public func send(status: Int? = nil, _ body: ByteSpan) {
-        worker.pointee.respond(slot, status: status ?? self.status, body.base, body.count)
+    /// Sends bytes lent by the request, or any other span, without copying
+    /// them first.
+    public func send(status: Int? = nil, _ body: Span<UInt8>) {
+        let code = status ?? self.status
+        withByteSpan(body) { worker.pointee.respond(slot, status: code, $0.base, $0.count) }
     }
 
     public func send(status: Int? = nil, _ body: String) {
@@ -242,14 +326,40 @@ public struct Response: ~Copyable {
 
 // MARK: - Bytes
 
-extension ByteSpan {
+extension Span where Element == UInt8 {
     /// A copy as a String, with invalid UTF-8 repaired.
     public var string: String {
+        withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) }
+    }
+
+    /// The bytes as a non-negative decimal integer of up to 18 digits, or nil.
+    public var integer: Int? {
+        guard count > 0, count <= 18 else { return nil }
+        var value = 0
+        for i in indices {
+            let d = self[i]
+            guard d >= 0x30 && d <= 0x39 else { return nil }
+            value = value * 10 + Int(d - 0x30)
+        }
+        return value
+    }
+
+    /// Whether the bytes are exactly `literal`'s.
+    public func equals(_ literal: StaticString) -> Bool {
+        guard count == literal.utf8CodeUnitCount else { return false }
+        for i in indices where self[i] != literal.utf8Start[i] { return false }
+        return true
+    }
+}
+
+extension ByteSpan {
+    /// A copy as a String, with invalid UTF-8 repaired.
+    var string: String {
         String(decoding: UnsafeBufferPointer(start: base, count: count), as: UTF8.self)
     }
 
     /// The span as a non-negative decimal integer of up to 18 digits, or nil.
-    public var integer: Int? {
+    var integer: Int? {
         guard count > 0, count <= 18 else { return nil }
         var value = 0
         for i in 0..<count {
@@ -260,7 +370,7 @@ extension ByteSpan {
         return value
     }
 
-    public func equals(_ literal: StaticString) -> Bool {
+    func equals(_ literal: StaticString) -> Bool {
         count == literal.utf8CodeUnitCount && equalsExact(base, count, literal)
     }
 }

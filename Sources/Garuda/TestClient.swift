@@ -125,7 +125,9 @@ public final class TestClient {
 
     // MARK: The exchange
 
-    func exchange(_ bytes: [UInt8], bodyless: Bool) throws -> TestResponse {
+    /// A socket pair with the worker's end adopted into a connection slot:
+    /// the client's descriptor, the slot and its generation.
+    func connect() throws -> (client: Int32, slot: Int, generation: UInt32) {
         var fds: [Int32] = [-1, -1]
         #if canImport(Glibc)
         let made = socketpair(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0, &fds)
@@ -133,7 +135,6 @@ public final class TestClient {
         let made = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
         #endif
         guard made == 0 else { throw TestClientError.socket(pg_errno()) }
-        let client = fds[1]
         for fd in fds {
             _ = pg_set_nonblock(fd)
             _ = pg_set_cloexec(fd)
@@ -143,10 +144,28 @@ public final class TestClient {
                                                   addressLength: address.utf8CodeUnitCount,
                                                   port: 1)
         guard slot >= 0 else {
-            _ = pg_close(client)
+            _ = pg_close(fds[1])
             throw TestClientError.socket(0)
         }
-        let generation = worker.pointee.table[slot].pointee.generation
+        return (fds[1], slot, worker.pointee.table[slot].pointee.generation)
+    }
+
+    /// A client that sends `bytes`, lets the worker take `turns` turns, and
+    /// goes away without reading the answer. The worker closes its end at
+    /// once, cancelling whatever the request was waiting on.
+    func abandon(_ bytes: [UInt8], turns: Int) throws {
+        let (client, slot, generation) = try connect()
+        _ = bytes.withUnsafeBufferPointer { pg_write(client, $0.baseAddress!, $0.count) }
+        for _ in 0..<turns { turn() }
+        _ = pg_close(client)
+        let c = worker.pointee.table[slot]
+        if c.pointee.state != .free && c.pointee.generation == generation {
+            worker.pointee.closeConnection(slot)
+        }
+    }
+
+    func exchange(_ bytes: [UInt8], bodyless: Bool) throws -> TestResponse {
+        let (client, slot, generation) = try connect()
         defer { hangUp(client, slot: slot, generation: generation) }
 
         let deadline = pg_monotonic_ms() + timeoutMillis

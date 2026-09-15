@@ -602,7 +602,7 @@ public struct Worker {
         c.pointee.requestID.clear()
         c.pointee.traceContext.clear()
         // What the last request's handler set is not this one's.
-        c.pointee.locals = SIMD4()
+        c.pointee.context = nil
         c.pointee.handlerStatus = 200
         c.pointee.responseHeaders.clear()
         // An inactive capture holds nothing: whatever deactivates one frees it.
@@ -1314,6 +1314,7 @@ public struct Worker {
         }
         c.pointee.h3Protocol.destroy()
         c.pointee.responseHeaders.destroy()
+        c.pointee.context = nil
 
         let wasStream = c.pointee.isStream
         if wasStream {

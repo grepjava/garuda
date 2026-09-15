@@ -25,7 +25,7 @@ app.get("/") { _, response in
 }
 
 app.get("/user/:id") { request, response in
-    response.send(request.parameter(0))
+    request.withParameter(0) { response.send($0) }
 }
 
 app.post("/user") { _, response in
@@ -33,8 +33,7 @@ app.post("/user") { _, response in
 }
 
 app.get("/delay/:ms") { request, response in
-    let digits = request.parameter(0)
-    guard digits.count <= 5, let ms = digits.integer else {
+    guard let ms = request.withParameter(0, { $0.count <= 5 ? $0.integer : nil }) else {
         response.send(status: 404)
         return
     }

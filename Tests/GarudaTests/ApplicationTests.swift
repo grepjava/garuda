@@ -5,6 +5,11 @@ import GarudaCore
 
 private struct HandlerFailure: Error {}
 
+/// What `/context/:n` keeps across its wait.
+private enum Remembered: RequestContextKey {
+    typealias Value = Int
+}
+
 /// The routes most tests here share.
 private func sample() -> Application {
     let app = Application()
@@ -12,19 +17,17 @@ private func sample() -> Application {
         response.send(status: 200)
     }
     app.get("/user/:id") { request, response in
-        response.send(request.parameter(0))
+        request.withParameter(0) { response.send($0) }
     }
     app.post("/echo") { request, response in
-        if let type = request.header("content-type") {
-            response.addHeader("content-type", type)
-        }
-        response.send(request.body)
+        request.withHeader("content-type") { response.addHeader("content-type", $0) }
+        request.withBody { response.send($0) }
     }
     app.get("/throw") { _, _ in
         throw HandlerFailure()
     }
     app.get("/later/:ms") { request, response in
-        let ms = UInt64(request.parameter(0).integer ?? 1)
+        let ms = UInt64(request.withParameter(0) { $0.integer } ?? 1)
         response.after(milliseconds: ms) { _, response in
             response.send(status: 202, "late")
         }
@@ -34,6 +37,21 @@ private func sample() -> Application {
             response.send(id)
         } else {
             response.send(status: 200)
+        }
+    }
+    app.get("/copies/:id") { request, response in
+        // Owned copies, kept past the closures that could have lent them.
+        let id = request.parameter(0)
+        let path = request.path
+        let agent = request.header("user-agent") ?? "none"
+        response.send("\(id) \(path) \(agent)")
+    }
+    app.get("/context/:n") { request, response in
+        let before = request[context: Remembered.self]
+        request[context: Remembered.self] = request.withParameter(0) { $0.integer }
+        response.after(milliseconds: 1) { request, response in
+            let after = request[context: Remembered.self]
+            response.send("before=\(before.map(String.init) ?? "none") after=\(after.map(String.init) ?? "none")")
         }
     }
     return app
@@ -77,6 +95,11 @@ struct ApplicationTests {
         #expect(response.header("content-type") == "text/plain")
     }
 
+    @Test func ownedCopiesOutliveTheirRequest() throws {
+        let response = try sample().test.get("/copies/9", headers: [("User-Agent", "probe/1")])
+        #expect(response.text == "9 /copies/9 probe/1")
+    }
+
     @Test func aThrowingHandlerIsAnswered500() throws {
         let response = try sample().test.get("/throw")
         #expect(response.status == 500)
@@ -97,6 +120,28 @@ struct ApplicationTests {
             let response = try client.get("/user/\(id)")
             #expect(response.text == "\(id)")
         }
+    }
+
+    @Test func contextCrossesAWaitButNotARequest() throws {
+        let client = sample().test
+        #expect(try client.get("/context/7").text == "before=none after=7")
+        // The next request most likely takes the same slot; it starts empty.
+        #expect(try client.get("/context/9").text == "before=none after=9")
+    }
+
+    @Test func aCancelledWaitNeverAnswersALaterRequest() throws {
+        let client = sample().test
+        // A client that asks for a 40 ms wait and goes away after two turns:
+        // the worker closes the connection with the timer still armed.
+        try client.abandon(Array("GET /later/40 HTTP/1.1\r\nHost: test\r\n\r\n".utf8), turns: 2)
+        #expect(client.worker.pointee.table.liveCount == 0)
+        // A new request, very likely on the same slot, before the old deadline.
+        #expect(try client.get("/user/5").text == "5")
+        // Past the old deadline: nothing resumes into the reused slot.
+        let started = pg_monotonic_ms()
+        while pg_monotonic_ms() - started < 80 { client.turn() }
+        #expect(client.worker.pointee.table.liveCount == 0)
+        #expect(try client.get("/user/6").text == "6")
     }
 
     @Test func applicationsInOneProcessKeepTheirOwnRoutes() throws {

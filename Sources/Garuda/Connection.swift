@@ -154,8 +154,8 @@ public struct Connection {
     /// Set only while `contKind` is `.handler`, which is how releasing it
     /// stays off the path of requests that never wait.
     public var contHandler: Handler? = nil
-    /// Four words a handler keeps across a suspension.
-    public var locals = SIMD4<UInt64>()
+    /// The request's typed context, made when a handler first stores a value.
+    var context: RequestContext? = nil
     /// The status `Response.send` uses when it is not given one.
     public var handlerStatus: UInt16 = 200
     /// The route's parameters, and where the routed path starts relative to

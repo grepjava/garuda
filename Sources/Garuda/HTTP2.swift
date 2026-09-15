@@ -912,7 +912,7 @@ extension Worker {
         s.pointee.contKind = .none
         s.pointee.contOp = -1
         s.pointee.contHandler = nil
-        s.pointee.locals = SIMD4()
+        s.pointee.context = nil
         s.pointee.handlerStatus = 200
         s.pointee.responseHeaders = ByteBuffer()
         s.pointee.lastActivity = pg_monotonic_ms()

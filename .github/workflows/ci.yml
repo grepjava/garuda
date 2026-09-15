@@ -54,6 +54,9 @@ jobs:
       - name: Unit tests and the fuzz corpus
         run: swift test
 
+      - name: Handler code that must not compile
+        run: bash scripts/compile-fail-test.sh
+
   macos:
     name: macos
     runs-on: macos-15

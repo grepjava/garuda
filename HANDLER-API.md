@@ -24,16 +24,14 @@ app.get("/") { _, response in
     response.send(status: 200)
 }
 app.get("/user/:id") { request, response in
-    response.send(request.parameter(0))          // the id's bytes, no String made
+    request.withParameter(0) { response.send($0) }   // the id's bytes, lent, no String made
 }
 app.post("/echo") { request, response in
-    if let type = request.header("content-type") {
-        response.addHeader("content-type", type)
-    }
-    response.send(request.body)                  // the whole body, buffered up to --max-body
+    request.withHeader("content-type") { response.addHeader("content-type", $0) }
+    request.withBody { response.send($0) }          // the whole body, buffered up to --max-body
 }
 app.get("/delay/:ms") { request, response in
-    let ms = UInt64(min(5000, max(1, request.parameter(0).integer ?? 1)))
+    let ms = UInt64(min(5000, max(1, request.withParameter(0) { $0.integer } ?? 1)))
     response.after(milliseconds: ms) { _, response in
         response.send(status: 200)
     }
@@ -45,7 +43,7 @@ exit(app.run())
 This is the phase-1 API as step 1 has reshaped it so far: the routes and hooks belong to an `Application`, and the module is `Garuda`.
 
 - **Routes.** `get`, `head`, `post`, `put`, `delete`, `patch`, `options` and `on`. Segments are literal, `:param` or a trailing `*rest`. Patterns compile into a byte trie when the application first runs or is tested: literal before parameter before rest, with backtracking, HEAD falling back to GET, at most eight parameters. `--root-path` is taken off before matching.
-- **`Request`**, a `~Copyable` view passed `borrowing`: `method`, `path`, `query`, `parameter(_:)`, `version`, `scheme`, `authority`, `header(_:)`, `forEachHeader`, `body`, `remoteAddress` and `remotePort` (with `--forwarded-allow-ips` applied), `requestID`, `requestStart` (kernel arrival under `--request-start-header`), `locals`.
+- **`Request`**, a `~Copyable` view passed `borrowing`: `method`, `path`, `query`, `parameter(_:)`, `version`, `scheme`, `authority`, `header(_:)`, `forEachHeader`, `body`, `remoteAddress` and `remotePort` (with `--forwarded-allow-ips` applied), `requestID`, `requestStart` (kernel arrival under `--request-start-header`). Bytes are lent to closures (`withPath`, `withParameter`, `withHeader`, `withBody` and the rest) and copied on request (`path`, `parameter(_:)`, `header(_:)`, `body`); `request[context:]` holds typed values for the request.
 - **`Response`**, `~Copyable`, passed `inout`: `status`, `addHeader`, `send(status:)`, `send(status:_:)` for bytes, strings and arrays, and `after(milliseconds:then:)`.
 - **The response sink.** Every response goes through one engine path. It merges the server's headers without doubling a handler's own `X-Request-ID`, `Strict-Transport-Security` or `Alt-Svc`. It frames 204, 304 and HEAD. It enforces a declared `Content-Length`: extra bytes are cut, too few reset the stream or close the HTTP/1.1 connection.
 - **Errors.** A handler that throws, or returns without answering, gets a 500; the connection lives on.
@@ -56,8 +54,8 @@ This is the phase-1 API as step 1 has reshaped it so far: the routes and hooks b
 
 Checked against the code:
 
-- **Borrowed data escapes.** `Request` is `~Copyable`, but `body`, `path`, `parameter(_:)` and `header(_:)` return `ByteSpan`, a copyable struct holding a raw pointer. A handler can keep one past the request, and read another request's bytes through it.
-- **`RequestLocals` is a copyable raw `Connection` pointer** with no request-identity check, and holds four `UInt64` words.
+- **Borrowed data escapes.** `Request` is `~Copyable`, but `body`, `path`, `parameter(_:)` and `header(_:)` returned `ByteSpan`, a copyable struct holding a raw pointer. A handler could keep one past the request, and read another request's bytes through it. Fixed in step 1: the bytes are lent to closures as `Span`s, and `scripts/compile-fail-test.sh` checks that storing, returning or capturing one does not compile.
+- **`RequestLocals` was a copyable raw `Connection` pointer** with no request-identity check, holding four `UInt64` words. Fixed in step 1: `request[context: Key.self]` holds typed values tagged with the request.
 - **Handlers are synchronous.** The only suspension is a timer. There is no way to await a database query or an HTTP request.
 - **Everything is bytes.** Parameters are positional and still percent-encoded; query strings and bodies are raw; there is no JSON. `garuda-conformance` hand-writes query decoding and JSON output.
 - **No application state.** Lifecycle hooks return nothing, and a failing `onStart` cannot stop start-up.
@@ -154,12 +152,12 @@ What an async handler costs:
 
 - **Borrowed bytes only inside a closure.** The raw `Request` gains `withBody { (span: Span<UInt8>) in … }`, `withPath`, `withQuery` and `withHeader(_:)`, which hand out `Span`s the compiler keeps inside the closure. Checked: a closure that stores its span does not compile ("lifetime-dependent variable 'span' escapes its scope"), with no experimental feature. The accessors that return `ByteSpan` become internal. A `Span`-returning property would need the experimental `Lifetimes` feature and stays out.
 - **Owned values for keeping.** `String`, `[UInt8]` and decoded types, made only when asked for.
-- **Typed request context instead of `locals`.** Values keyed by type (`request.context[User.self]`), stored with the request's identity and checked on every access, so a context read after the request has ended fails loudly instead of reading another request's data.
+- **Typed request context instead of `locals`.** Values keyed by type (`request[context: User.self]`), stored with the request's identity and checked on every access, so a context read after the request has ended fails loudly instead of reading another request's data.
 - **Tests.** Compile-fail tests, one file per way borrowed data could escape, compiled through SIL diagnostics (`-emit-sil`; `-typecheck` does not run the lifetime checks). Runtime tests for a resume after cancellation and after slot reuse.
 
 #### The application instance and the test client
 
-- **Landed so far:** `Application` with its routes and worker hooks, `run()` and `run(configuration:)` over a `ServerConfig` checked as the command line is, and `app.test`, a worker in the test process driven over a socket pair. Middleware and state factories arrive with steps 2 and 4.
+- **Landed so far:** `Application` with its routes and worker hooks, `run()` and `run(configuration:)` over a `ServerConfig` checked as the command line is, and `app.test`, a worker in the test process driven over a socket pair. Then ownership: the lent-bytes accessors, owned copies, `request[context:]`, and six compile-fail checks in `Tests/CompileFail` run by `scripts/compile-fail-test.sh`. Middleware and state factories arrive with steps 2 and 4.
 - **`Application`** owns the routes, middleware, state factories and a programmatic `Configuration`. `app.run()` fills the configuration from the command line unless it was given one, and runs the supervisor. It replaces `Routes`, the global `installedRoutes` and the global `lifecycle`. The compiled route table belongs to the application and is freed when it shuts down; workers still inherit it through the fork.
 - **`app.test`** runs a request through routing, extraction, middleware, the handler and the response sink in-process, on a test worker with no socket, and returns the parsed response.
 - **`app.test.withServer { url in … }`** starts the application on an ephemeral port for integration tests and shuts it down deterministically.

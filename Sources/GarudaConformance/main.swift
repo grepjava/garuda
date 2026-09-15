@@ -127,6 +127,33 @@ func methodName(_ method: HTTPMethod) -> StaticString {
     }
 }
 
+extension JSON {
+    mutating func string(_ span: Span<UInt8>) {
+        span.withUnsafeBufferPointer { buffer in
+            let empty: StaticString = ""
+            string(ByteSpan(buffer.baseAddress ?? empty.utf8Start, buffer.count))
+        }
+    }
+}
+
+/// Percent-decoding for query values, with "+" as a space.
+func decodedQueryValue(_ bytes: ArraySlice<UInt8>) -> [UInt8] {
+    var out: [UInt8] = []
+    var i = bytes.startIndex
+    while i < bytes.endIndex {
+        let b = bytes[i]
+        if b == 0x25, i + 2 < bytes.endIndex, let hi = hexDigit(bytes[i + 1]),
+           let lo = hexDigit(bytes[i + 2]) {
+            out.append(hi << 4 | lo)
+            i += 3
+            continue
+        }
+        out.append(b == 0x2B ? 0x20 : b)
+        i += 1
+    }
+    return out
+}
+
 struct HandlerFailure: Error {}
 
 func stuck(_ request: borrowing Request, _ response: inout Response) throws {
@@ -140,12 +167,11 @@ app.get("/") { _, response in
 }
 
 app.post("/echo") { request, response in
-    if let type = request.header("content-type") {
-        response.addHeader("content-type", type)
-    } else {
+    let typed = request.withHeader("content-type") { response.addHeader("content-type", $0) }
+    if typed == nil {
         response.addHeader("content-type", "application/octet-stream")
     }
-    response.send(request.body)
+    request.withBody { response.send($0) }
 }
 
 app.get("/headers") { request, response in
@@ -153,22 +179,22 @@ app.get("/headers") { request, response in
     json.raw("{\"method\":")
     json.string(methodName(request.method))
     json.raw(",\"path\":")
-    json.string(request.path)
+    request.withPath { json.string($0) }
     json.raw(",\"query\":")
-    json.string(request.query)
+    request.withQuery { json.string($0) }
     let version = request.version
     json.raw(",\"version\":\"")
     json.raw(version.major == 1 ? "1.\(version.minor)" : "\(version.major)")
     json.raw("\",\"scheme\":")
     json.string(request.scheme)
     json.raw(",\"authority\":")
-    if let authority = request.authority { json.string(authority) } else { json.raw("null") }
+    if request.withHeader("host", { json.string($0) }) == nil { json.raw("null") }
     json.raw(",\"remote\":")
-    json.string(request.remoteAddress)
+    request.withRemoteAddress { json.string($0) }
     json.raw(",\"port\":")
     json.raw("\(request.remotePort)")
     json.raw(",\"requestID\":")
-    if let id = request.requestID { json.string(id) } else { json.raw("null") }
+    if request.withRequestID({ json.string($0) }) == nil { json.raw("null") }
     json.raw(",\"requestStart\":")
     if let start = request.requestStart { json.raw("\(start)") } else { json.raw("null") }
     json.raw(",\"started\":")
@@ -192,27 +218,24 @@ app.get("/headers") { request, response in
 }
 
 app.get("/status/:code") { request, response in
-    guard let code = request.parameter(0).integer, code >= 100, code <= 999 else {
+    guard let code = request.withParameter(0, { $0.integer }), code >= 100, code <= 999 else {
         response.send(status: 400)
         return
     }
     // ?header=name:value, repeatable.
-    let query = request.query
+    let query = Array(request.query.utf8)
+    let prefix = Array("header=".utf8)
     var start = 0
     while start <= query.count {
         var end = start
-        while end < query.count && query.base[end] != 0x26 { end += 1 }
-        let item = ByteSpan(query.base + start, end - start)
-        if item.count > 7 && equalsExact(item.base, 7, "header=") {
-            let pair = decoded(ByteSpan(item.base + 7, item.count - 7))
+        while end < query.count && query[end] != 0x26 { end += 1 }
+        if end - start > prefix.count && query[start..<(start + prefix.count)].elementsEqual(prefix) {
+            let pair = decodedQueryValue(query[(start + prefix.count)..<end])
             if let colon = pair.firstIndex(of: 0x3A) {
                 var valueStart = colon + 1
                 while valueStart < pair.count && pair[valueStart] == 0x20 { valueStart += 1 }
-                pair.withUnsafeBufferPointer { p in
-                    let base = p.baseAddress!
-                    response.addHeader(ByteSpan(base, colon),
-                                       ByteSpan(base + valueStart, pair.count - valueStart))
-                }
+                response.addHeader(String(decoding: pair[..<colon], as: UTF8.self),
+                                   String(decoding: pair[valueStart...], as: UTF8.self))
             }
         }
         start = end + 1
@@ -221,17 +244,16 @@ app.get("/status/:code") { request, response in
 }
 
 app.get("/length/:declared/:actual") { request, response in
-    guard let declared = request.parameter(0).integer,
-          let actual = request.parameter(1).integer, actual <= 16 * 1024 * 1024 else {
+    guard request.withParameter(0, { $0.integer }) != nil,
+          let actual = request.withParameter(1, { $0.integer }), actual <= 16 * 1024 * 1024 else {
         response.send(status: 400)
         return
     }
-    response.addHeader("content-length", request.parameter(0))
+    request.withParameter(0) { response.addHeader("content-length", $0) }
     let pattern = Array("abcdefghijklmnopqrstuvwxyz".utf8)
     var body = [UInt8]()
     body.reserveCapacity(actual)
     for i in 0..<actual { body.append(pattern[i % pattern.count]) }
-    _ = declared
     response.send(body)
 }
 
@@ -240,7 +262,7 @@ app.get("/throw") { _, _ in
 }
 
 app.get("/block/:ms") { request, response in
-    let ms = min(10_000, request.parameter(0).integer ?? 0)
+    let ms = min(10_000, request.withParameter(0) { $0.integer } ?? 0)
     usleep(UInt32(ms) * 1000)
     response.send(status: 200)
 }
@@ -248,7 +270,7 @@ app.get("/block/:ms") { request, response in
 app.get("/stuck", stuck)
 
 app.get("/delay/:ms") { request, response in
-    let ms = UInt64(min(5000, max(1, request.parameter(0).integer ?? 1)))
+    let ms = UInt64(min(5000, max(1, request.withParameter(0) { $0.integer } ?? 1)))
     response.after(milliseconds: ms) { _, response in
         response.send(status: 200)
     }
