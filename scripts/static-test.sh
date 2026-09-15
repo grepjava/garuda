@@ -6,12 +6,33 @@
 # The interesting half is the refusals. A static route is a path from a URL to
 # the filesystem, so the checks that matter are the ones where it must not
 # reach: `..`, a symlink pointing out of the tree, a sibling directory that
-# merely shares a prefix, and anything that is not a regular file.
+# merely shares a prefix, and anything that is not a regular file. What is
+# refused falls through to the built-in router, which answers 404 for anything
+# it has no route for; /user/:id, which answers with the id, shows that a path
+# outside the static prefix reaches it. The last section repeats the essentials
+# over TLS and HTTP/2.
+#
+# Needs the release build (or GARUDA, or the path as the first argument), curl,
+# openssl, and python3 for picking free ports and setting file times to the
+# nanosecond. PORT and TLS_PORT override the ports.
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
-PORT=${PORT:-8351}
-TLS_PORT=${TLS_PORT:-8352}
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(dirname "$HERE")
+
+# N ports nothing is listening on, chosen by the kernel while all N sockets are
+# held open, so no two of them can come back the same.
+free_ports() {
+    python3 -c 'import socket, sys
+socks = [socket.socket() for _ in range(int(sys.argv[1]))]
+for s in socks: s.bind(("127.0.0.1", 0))
+print(*[s.getsockname()[1] for s in socks])' "$1"
+}
+
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+read -r FREE_PORT FREE_TLS_PORT <<< "$(free_ports 2)"
+PORT=${PORT:-$FREE_PORT}
+TLS_PORT=${TLS_PORT:-$FREE_TLS_PORT}
 WORK=$(mktemp -d)
 PASS=0
 FAIL=0
@@ -20,8 +41,6 @@ ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 
-HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(dirname "$HERE")
 # shellcheck source=scripts/serverlib.sh
 . "$HERE/serverlib.sh"
 trap 'server_stop; rm -rf "$WORK"' EXIT
@@ -48,7 +67,6 @@ head -c 16385 /dev/urandom   > "$WORK/assets/sendfile.bin"
 server_require_port_free "$PORT" || exit 1
 server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
     --static-dir "/static=$WORK/assets" \
-    --python-path "$ROOT/examples" wsgi_app:application \
     > "$WORK/server.log" 2>&1
 
 for _ in $(seq 1 60); do
@@ -124,8 +142,8 @@ is "and the old ETag no longer matches" \
    "$(code -H "If-None-Match: $ETAG_BEFORE" $H/static/rewritten.txt)" "200"
 
 # --- refusals ------------------------------------------------------------
-# Each of these must reach the application, which answers 404, rather than
-# being served from disk.
+# Each of these must fall through to the router, which has no route for them
+# and answers 404, rather than being served from disk.
 is "dot-dot does not escape"         "$(code --path-as-is $H/static/../secret/passwd)" "404"
 is "encoded dot-dot does not escape" "$(code --path-as-is $H/static/%2e%2e/secret/passwd)" "404"
 is "a symlink out of the tree is refused" "$(code $H/static/escape.txt)" "404"
@@ -133,9 +151,9 @@ is "a symlinked directory out of the tree is refused" "$(code $H/static/up/passw
 is "a sibling sharing the prefix is refused" "$(code $H/staticky/leak.txt)" "404"
 is "a directory is not served"       "$(code $H/static/deep)"        "404"
 is "the route root is not served"    "$(code $H/static/)"            "404"
-is "a missing file reaches the app"  "$(code $H/static/nothing.css)" "404"
-is "another path reaches the app"    "$(body $H/)"  "hello from garuda"
-is "POST to a real file reaches the app" "$(code -X POST $H/static/site.css)" "404"
+is "a missing file reaches the router" "$(code $H/static/nothing.css)" "404"
+is "another path reaches the router" "$(body $H/user/42)" "42"
+is "POST to a real file reaches the router" "$(code -X POST $H/static/site.css)" "404"
 
 # --- keep-alive ----------------------------------------------------------
 is "keep-alive survives a static file" \
@@ -152,10 +170,10 @@ server_stop
 # produce the same bytes.
 openssl req -x509 -newkey rsa:2048 -keyout "$WORK/s.key" -out "$WORK/s.pem" \
     -days 2 -nodes -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+server_require_port_free "$TLS_PORT" || exit 1
 server_start "$BIN" --port "$TLS_PORT" --workers 2 --log-level error \
     --tls-cert "$WORK/s.pem" --tls-key "$WORK/s.key" \
     --static-dir "/static=$WORK/assets" \
-    --python-path "$ROOT/examples" wsgi_app:application \
     > "$WORK/tls.log" 2>&1
 for _ in $(seq 1 60); do
     curl -sS -k --max-time 1 -o /dev/null "https://127.0.0.1:$TLS_PORT/" 2>/dev/null && break

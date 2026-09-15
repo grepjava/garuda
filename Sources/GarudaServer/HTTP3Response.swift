@@ -130,6 +130,20 @@ extension Worker {
         return stream.send.data.readableBytes
     }
 
+    /// HSTS and the request ID: what `writeServerHeaders` adds to an HTTP/1.1
+    /// head, less Alt-Svc, which here would advertise the protocol already in
+    /// use.
+    func encodeServerHeadersH3(_ slot: Int, _ h3: H3Connection, into block: inout ByteBuffer) {
+        if let hsts = config.hsts {
+            encodeStaticH3(h3, "strict-transport-security", hsts, config.hstsLength, into: &block)
+        }
+        let c = table[slot]
+        if config.requestID && c.pointee.requestID.readableBytes > 0 {
+            encodeStaticH3(h3, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
+                           c.pointee.requestID.readableBytes, into: &block)
+        }
+    }
+
     /// The HTTP/3 form of a server-generated error: a status and nothing else.
     mutating func h3FailRequest(_ slot: Int, status: Int, retryAfter: Int = 0) {
         let c = table[slot]
@@ -147,6 +161,7 @@ extension Worker {
             encodeStaticH3(h3, "content-length", "0", into: &block)
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "garuda", into: &block)
+            encodeServerHeadersH3(slot, h3, into: &block)
             if retryAfter > 0 {
                 var digits = ByteBuffer()
                 defer { digits.destroy() }
@@ -203,6 +218,7 @@ extension Worker {
                        digits.readableBytes, into: &block)
         encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
         encodeStaticH3(h3, "server", "garuda", into: &block)
+        encodeServerHeadersH3(slot, h3, into: &block)
         writeH3HeaderBlock(slot, h3, block: &block)
         c.pointee.flags.insert(.responseStarted)
         logAccess(slot, status: status)

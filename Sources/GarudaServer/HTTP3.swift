@@ -717,10 +717,18 @@ extension Worker {
 
         let s = table[streamSlot]
         s.pointee.bodyRemaining = -1
-        // As on HTTP/2: ASGI starts on the head, WSGI waits for the whole
-        // body, because it is called once and cannot be handed the rest
-        // afterwards. The frame loop reads the DATA frames that follow and
-        // the end of the stream is what dispatches it.
+        if s.pointee.h3Protocol.readableBytes > 0 {
+            // Extended CONNECT. The stream stays open as the session it asks
+            // for, so waiting for the end of its body would wait forever and
+            // the client would never hear back. Dispatch now: nothing serves a
+            // :protocol, and dispatch refuses it with 501.
+            s.pointee.state = .dispatching
+            dispatch(streamSlot)
+            return table[streamSlot].pointee.state == .free ? -1 : streamSlot
+        }
+        // The router answers once the whole request is in: the frame loop
+        // reads the DATA frames that follow, and the end of the stream is what
+        // dispatches it.
         s.pointee.state = .readingBody
         return streamSlot
     }

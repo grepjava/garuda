@@ -11,10 +11,11 @@ exercising it after the first request.
 Writes a JSON summary to stdout:
 
     {"ok": 41231, "refused": 0, "reset": 0, "timeout": 0,
-     "truncated": 0, "other": {}, "pids": {"1234": 10300, ...}}
+     "truncated": 0, "other": {}, "p50_ms": 0.4, ...}
 
-`pids` counts responses by the worker that served them, which is what shows
-the reload actually replaced anything.
+Every request is GET /user/load, which the router answers with the body
+`load`. Anything short of that whole body counts as truncated. Which worker
+served each one is in the server's access log, not here.
 """
 
 import json
@@ -23,10 +24,11 @@ import sys
 import threading
 import time
 
-REQUEST = (b"GET /pid HTTP/1.1\r\n"
+REQUEST = (b"GET /user/load HTTP/1.1\r\n"
            b"Host: localhost\r\n"
            b"Connection: close\r\n"
            b"\r\n")
+EXPECTED_BODY = b"load"
 
 
 class Counts:
@@ -38,16 +40,14 @@ class Counts:
         self.timeout = 0
         self.truncated = 0
         self.other = {}
-        self.pids = {}
         # Latencies matter as much as failures here: a handover that loses
-        # nothing but stalls every connection for the length of an interpreter
-        # boot is still an outage, it just does not show up as an error.
+        # nothing but stalls every connection for the length of a worker's
+        # start-up is still an outage, it just does not show up as an error.
         self.latencies = []
 
-    def record_ok(self, pid, seconds):
+    def record_ok(self, seconds):
         with self.lock:
             self.ok += 1
-            self.pids[pid] = self.pids.get(pid, 0) + 1
             self.latencies.append(seconds)
 
     def record(self, field):
@@ -60,7 +60,7 @@ class Counts:
 
 
 def one_request(host, port):
-    """Returns the serving worker pid, or raises."""
+    """Returns when a whole response came back, or raises."""
     sock = socket.create_connection((host, port), timeout=5)
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -76,16 +76,16 @@ def one_request(host, port):
 
     raw = b"".join(chunks)
     head, sep, body = raw.partition(b"\r\n\r\n")
-    if not sep or not head.startswith(b"HTTP/1.1 200"):
+    if not sep or not head.startswith(b"HTTP/1.1 200") or body != EXPECTED_BODY:
         raise ValueError("truncated")
-    return body.decode().strip()
 
 
 def hammer(host, port, deadline, counts):
     while time.monotonic() < deadline:
         started = time.monotonic()
         try:
-            counts.record_ok(one_request(host, port), time.monotonic() - started)
+            one_request(host, port)
+            counts.record_ok(time.monotonic() - started)
         except ConnectionRefusedError:
             counts.record("refused")
         except ConnectionResetError:
@@ -130,7 +130,6 @@ def main():
         "timeout": counts.timeout,
         "truncated": counts.truncated,
         "other": counts.other,
-        "pids": counts.pids,
         "p50_ms": at(0.50),
         "p99_ms": at(0.99),
         "p999_ms": at(0.999),

@@ -1,15 +1,14 @@
 //===----------------------------------------------------------------------===//
-// --root-path: the prefix a proxy mounts the application under.
+// --root-path: the prefix a proxy mounts the server under.
 //
-// It is reported to the application as SCRIPT_NAME and as the ASGI root_path,
-// and it comes off the front of a request's path so that PATH_INFO and the
-// ASGI path are the path within the application.
+// It comes off the front of a request's path before the router matches it, so
+// routes are written as the paths within the mount.
 //
 // Only a whole leading segment comes off. A request that does not start with
 // the prefix keeps its path as it came -- which is every request behind a proxy
-// that already removed the prefix, the usual way uvicorn's --root-path is
-// deployed, and a health check that bypasses the mount. One that shares only
-// the first letters of a segment, `/apis` under `/api`, is not under the mount.
+// that already removed the prefix, and a health check that bypasses the mount.
+// One that shares only the first letters of a segment, `/apis` under `/api`, is
+// not under the mount.
 //===----------------------------------------------------------------------===//
 
 import GarudaCore

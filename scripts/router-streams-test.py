@@ -355,6 +355,18 @@ class H3Client(QuicConnectionProtocol):
         self.transmit()
         return stream
 
+    def extended_connect(self, path, protocol):
+        """Opens an extended CONNECT stream, left open as a session would be."""
+        stream = self._quic.get_next_available_stream_id()
+        block = [(b":method", b"CONNECT"), (b":protocol", protocol.encode()),
+                 (b":scheme", b"https"), (b":authority", b"localhost"),
+                 (b":path", path.encode())]
+        self._http.send_headers(stream_id=stream, headers=block, end_stream=False)
+        self.started[stream] = time.monotonic()
+        self._done[stream] = asyncio.get_running_loop().create_future()
+        self.transmit()
+        return stream
+
     def cancel(self, stream):
         self._quic.reset_stream(stream, H3_REQUEST_CANCELLED)
         self.transmit()
@@ -462,6 +474,22 @@ async def h3_cancellation():
             is_("nor does its timer disturb the connection", client.status.get(again), 200)
 
 
+async def h3_extended_connect():
+    print("\nHTTP/3: extended CONNECT")
+    # Nothing serves a :protocol. A CONNECT stream stays open by design, so a
+    # refusal that waited for the end of the request would never be sent.
+    with Server() as server:
+        async with h3_connect(server) as client:
+            session = client.extended_connect("/wt", "webtransport")
+            unknown = client.extended_connect("/x", "unknown-protocol")
+            await client.collect([session, unknown], timeout=5.0)
+            is_("a WebTransport CONNECT is refused with 501", client.status.get(session), 501)
+            is_("so is an unknown :protocol", client.status.get(unknown), 501)
+            after = client.request("GET", "/user/5")
+            await client.collect([after])
+            is_("and the connection serves on", client.body.get(after), b"5")
+
+
 async def h3_abandoned():
     print("\nHTTP/3: abandoned delays")
     with Server("--max-connections", "64") as server:
@@ -495,6 +523,7 @@ def main():
     run(h3_routes())
     run(h3_delays())
     run(h3_cancellation())
+    run(h3_extended_connect())
     run(h3_abandoned())
     print("\n%d passed, %d failed" % (PASS, FAIL))
     raise SystemExit(1 if FAIL else 0)

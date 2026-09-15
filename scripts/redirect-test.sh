@@ -3,12 +3,32 @@
 #
 #   bash scripts/redirect-test.sh [path-to-garuda]
 #
-# GARUDA_EXTRA_ARGS adds flags, e.g. "--free-threaded".
+# The redirect listener answers everything itself, so those checks need nothing
+# behind it. The HSTS checks need TLS responses of several kinds, and take them
+# from the built-in router (GET / answers at once, GET /delay/:ms after a timer)
+# and from --static-dir, over HTTP/1.1 and HTTP/2.
+#
+# Needs the release build (or GARUDA, or the path as the first argument), curl,
+# openssl, and python3 for picking free ports; PORT and RPORT override them.
+# GARUDA_EXTRA_ARGS adds flags, e.g. "--ktls".
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
-PORT=${PORT:-8243}
-RPORT=${RPORT:-8280}
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(dirname "$HERE")
+
+# N ports nothing is listening on, chosen by the kernel while all N sockets are
+# held open, so no two of them can come back the same.
+free_ports() {
+    python3 -c 'import socket, sys
+socks = [socket.socket() for _ in range(int(sys.argv[1]))]
+for s in socks: s.bind(("127.0.0.1", 0))
+print(*[s.getsockname()[1] for s in socks])' "$1"
+}
+
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+read -r FREE_PORT FREE_RPORT <<< "$(free_ports 2)"
+PORT=${PORT:-$FREE_PORT}
+RPORT=${RPORT:-$FREE_RPORT}
 # shellcheck disable=SC2206 -- deliberately split into words.
 EXTRA=(${GARUDA_EXTRA_ARGS:-})
 WORK=$(mktemp -d)
@@ -19,7 +39,6 @@ ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 
-HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=scripts/serverlib.sh
 . "$HERE/serverlib.sh"
 trap 'server_stop; rm -rf "$WORK"' EXIT
@@ -30,12 +49,10 @@ mkdir -p "$WORK/static"
 echo "body { color: red }" > "$WORK/static/site.css"
 
 start() {
-    local app=$1
-    shift
     server_start "$BIN" --port "$PORT" --workers 2 --log-level warning \
         --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" \
         --static-dir "/static=$WORK/static" "${EXTRA[@]}" "$@" \
-        --python-path "$HERE" "$app" > "$WORK/server.log" 2>&1
+        > "$WORK/server.log" 2>&1
     for _ in $(seq 1 100); do
         curl -sk -o /dev/null "https://127.0.0.1:$PORT/" && return 0
         sleep 0.1
@@ -45,7 +62,7 @@ start() {
     exit 1
 }
 
-# The value of one response header, lower-cased name, from a plain request.
+# The status and Location of a response, from a plain request.
 redirect() {
     curl -s -o /dev/null -w '%{http_code} %header{location}' --max-time 5 "$@"
 }
@@ -62,7 +79,7 @@ server_require_port_free "$PORT" || exit 1
 server_require_port_free "$RPORT" || exit 1
 
 echo "redirecting plain HTTP"
-start hsts_apps:asgi_app --redirect-http "$RPORT" --hsts 31536000
+start --redirect-http "$RPORT" --hsts 31536000
 R="http://127.0.0.1:$RPORT"
 is "a GET is sent to https, path and query kept" \
    "$(redirect -H 'Host: example.com' "$R/a/b?x=1&y=%20")" \
@@ -95,37 +112,33 @@ is "a request that arrives in two pieces is answered whole" "$line" "HTTP/1.1 30
 
 echo "HSTS on TLS responses"
 S="https://127.0.0.1:$PORT"
-is "an ASGI response over HTTP/1.1 carries it" "$(hsts --http1.1 "$S/")" "1 max-age=31536000"
+is "a routed response over HTTP/1.1 carries it" "$(hsts --http1.1 "$S/")" "1 max-age=31536000"
 is "over HTTP/2 too" "$(hsts --http2 "$S/")" "1 max-age=31536000"
-is "an application's own value is kept, not doubled" "$(hsts --http1.1 "$S/own-hsts")" "1 max-age=60"
-is "and not doubled over HTTP/2" "$(hsts --http2 "$S/own-hsts")" "1 max-age=60"
 is "a static file carries it" "$(hsts --http1.1 "$S/static/site.css")" "1 max-age=31536000"
 is "a static file over HTTP/2 carries it" "$(hsts --http2 "$S/static/site.css")" "1 max-age=31536000"
 server_stop
 
-start hsts_apps:wsgi_app --hsts 600
-is "a WSGI response over HTTP/1.1 carries it" "$(hsts --http1.1 "$S/")" "1 max-age=600"
-is "over HTTP/2 too" "$(hsts --http2 "$S/")" "1 max-age=600"
-is "a WSGI application's own value is kept, not doubled" "$(hsts --http1.1 "$S/own-hsts")" "1 max-age=60"
-is "and not doubled over HTTP/2" "$(hsts --http2 "$S/own-hsts")" "1 max-age=60"
+# A response that waits on a timer is written when the handler resumes, not in
+# the pass that read the request, so it is a separate way for the header to be
+# left off.
+start --hsts 600
+is "a delayed response over HTTP/1.1 carries it" "$(hsts --http1.1 "$S/delay/50")" "1 max-age=600"
+is "over HTTP/2 too" "$(hsts --http2 "$S/delay/50")" "1 max-age=600"
 server_stop
 
-start hsts_apps:wsgi_app --hsts 600 --wsgi-threads 4
-is "a pooled WSGI response carries it" "$(hsts --http1.1 "$S/")" "1 max-age=600"
-is "and a pooled one over HTTP/2" "$(hsts --http2 "$S/own-hsts")" "1 max-age=60"
-server_stop
-
-start hsts_apps:asgi_app
+start
 is "without --hsts there is none" "$(hsts --http1.1 "$S/")" "0 "
 server_stop
 
 echo "refused configurations"
-"$BIN" --port "$PORT" --redirect-http "$RPORT" hsts_apps:asgi_app > "$WORK/bad.log" 2>&1
+# Each of these must exit at once. The timeout is only there so that one which
+# is wrongly accepted fails the check instead of serving until killed.
+timeout 10 "$BIN" --port "$PORT" --redirect-http "$RPORT" > "$WORK/bad.log" 2>&1
 is "--redirect-http without TLS is refused" "$?" 2
-"$BIN" --port "$PORT" --hsts 600 hsts_apps:asgi_app > "$WORK/bad.log" 2>&1
+timeout 10 "$BIN" --port "$PORT" --hsts 600 > "$WORK/bad.log" 2>&1
 is "--hsts without TLS is refused" "$?" 2
-"$BIN" --port "$PORT" --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" \
-    --redirect-http "$PORT" hsts_apps:asgi_app > "$WORK/bad.log" 2>&1
+timeout 10 "$BIN" --port "$PORT" --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" \
+    --redirect-http "$PORT" > "$WORK/bad.log" 2>&1
 is "--redirect-http on the TLS port itself is refused" "$?" 2
 
 echo

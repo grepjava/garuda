@@ -2,7 +2,7 @@
  *
  *   bash scripts/cache-unit-test.sh
  *
- * These are the cases scripts/cache-test.sh cannot arrange from outside a
+ * These are the cases an end-to-end test cannot arrange from outside a
  * server -- a writer paused part way through a copy, one that died holding a
  * slot, two copies of one response in different size classes, a request
  * dispatched before its target changed and stored after.

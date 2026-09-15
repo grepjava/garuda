@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# --trace-context: a W3C traceparent recorded in the access log, never made up
-# and never changed on its way to the application.
+# --trace-context: a W3C traceparent recorded in the access log, and never made
+# up.
 #
 #   bash scripts/trace-context-test.sh [path-to-garuda]
 #
-# GARUDA_EXTRA_ARGS adds flags, e.g. "--free-threaded".
+# Served by the built-in router over TLS, with a static file beside it, so the
+# only requirements are the release binary, curl and openssl. Each request goes
+# to its own GET /user/:id path so that its access line can be picked out.
+# Whether the header reaches the application unchanged cannot be seen from
+# here: the router does not echo request headers.
+#
+# GARUDA_EXTRA_ARGS adds flags, e.g. "--workers 4".
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
-PORT=${PORT:-8252}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+PORT=${PORT:-19321}
 # shellcheck disable=SC2206 -- deliberately split into words.
 EXTRA=(${GARUDA_EXTRA_ARGS:-})
 WORK=$(mktemp -d)
@@ -17,7 +24,6 @@ FAIL=0
 
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
-is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=scripts/serverlib.sh
@@ -35,14 +41,12 @@ PARENT=00f067aa0ba902b7
 GOOD="00-$TRACE-$PARENT-01"
 
 start() {
-    local app=$1
-    shift
     server_start "$BIN" --port "$PORT" --workers 2 --log-level info \
         --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" \
         --static-dir "/static=$WORK/static" "${EXTRA[@]}" "$@" \
-        --python-path "$HERE" "$app" > "$WORK/server.log" 2>&1
+        > "$WORK/server.log" 2>&1
     for _ in $(seq 1 100); do
-        curl -sk -o /dev/null "$S/ready" && return 0
+        curl -sk -o /dev/null "$S/" && return 0
         sleep 0.1
     done
     echo "server did not start:"
@@ -78,56 +82,50 @@ lacks() {
 server_require_port_free "$PORT" || exit 1
 
 echo "a traceparent in the access log"
-start trace_context_apps:asgi_app --trace-context --access-log
-get /good --http1.1 -H "traceparent: $GOOD"
-has "the text line has the trace ID and the parent span" "$(line_for /good)" \
+start --trace-context --access-log
+get /user/good --http1.1 -H "traceparent: $GOOD"
+has "the text line has the trace ID and the parent span" "$(line_for /user/good)" \
     "trace=$TRACE span=$PARENT"
-is "the application sees the header unchanged" "$(cat "$WORK/body")" "n=1 tp=$GOOD"
-get /good-h2 --http2 -H "traceparent: $GOOD"
-has "over HTTP/2 as well" "$(line_for /good-h2)" "trace=$TRACE span=$PARENT"
+get /user/good-h2 --http2 -H "traceparent: $GOOD"
+has "over HTTP/2 as well" "$(line_for /user/good-h2)" "trace=$TRACE span=$PARENT"
 get /static/site.css --http1.1 -H "traceparent: $GOOD"
 has "a static file's line has it too" "$(line_for /static/site.css)" "trace=$TRACE"
-get /later-version --http1.1 -H "traceparent: 01-$TRACE-$PARENT-01-future"
-has "a later version with more fields is read" "$(line_for /later-version)" "trace=$TRACE"
-get /none --http1.1
-lacks "a request without one gets none" "$(line_for /none)" "trace="
+get /user/later-version --http1.1 -H "traceparent: 01-$TRACE-$PARENT-01-future"
+has "a later version with more fields is read" "$(line_for /user/later-version)" "trace=$TRACE"
+get /user/none --http1.1
+lacks "a request without one gets none" "$(line_for /user/none)" "trace="
 
-get /upper --http1.1 -H "traceparent: 00-${TRACE^^}-$PARENT-01"
-lacks "uppercase hex is not a traceparent" "$(line_for /upper)" "trace="
-get /zero-trace --http1.1 -H "traceparent: 00-00000000000000000000000000000000-$PARENT-01"
-lacks "an all-zero trace ID is ignored" "$(line_for /zero-trace)" "trace="
-get /zero-parent --http1.1 -H "traceparent: 00-$TRACE-0000000000000000-01"
-lacks "an all-zero parent ID is ignored" "$(line_for /zero-parent)" "trace="
-get /version-ff --http1.1 -H "traceparent: ff-$TRACE-$PARENT-01"
-lacks "version ff is ignored" "$(line_for /version-ff)" "trace="
-get /long-00 --http1.1 -H "traceparent: $GOOD-extra"
-lacks "version 00 with anything after the flags is ignored" "$(line_for /long-00)" "trace="
-get /short --http1.1 -H "traceparent: 00-$TRACE-$PARENT"
-lacks "a truncated one is ignored" "$(line_for /short)" "trace="
-get /two --http1.1 -H "traceparent: $GOOD" -H "traceparent: 00-$TRACE-1111111111111111-01"
-lacks "two traceparents are ignored" "$(line_for /two)" "trace="
-is "and the application still gets both, as sent" "$(cat "$WORK/body")" \
-    "n=2 tp=$GOOD,00-$TRACE-1111111111111111-01"
+get /user/upper --http1.1 -H "traceparent: 00-${TRACE^^}-$PARENT-01"
+lacks "uppercase hex is not a traceparent" "$(line_for /user/upper)" "trace="
+get /user/zero-trace --http1.1 -H "traceparent: 00-00000000000000000000000000000000-$PARENT-01"
+lacks "an all-zero trace ID is ignored" "$(line_for /user/zero-trace)" "trace="
+get /user/zero-parent --http1.1 -H "traceparent: 00-$TRACE-0000000000000000-01"
+lacks "an all-zero parent ID is ignored" "$(line_for /user/zero-parent)" "trace="
+get /user/version-ff --http1.1 -H "traceparent: ff-$TRACE-$PARENT-01"
+lacks "version ff is ignored" "$(line_for /user/version-ff)" "trace="
+get /user/long-00 --http1.1 -H "traceparent: $GOOD-extra"
+lacks "version 00 with anything after the flags is ignored" "$(line_for /user/long-00)" "trace="
+get /user/short --http1.1 -H "traceparent: 00-$TRACE-$PARENT"
+lacks "a truncated one is ignored" "$(line_for /user/short)" "trace="
+get /user/two --http1.1 -H "traceparent: $GOOD" -H "traceparent: 00-$TRACE-1111111111111111-01"
+lacks "two traceparents are ignored" "$(line_for /user/two)" "trace="
 server_stop
 
-echo "JSON and WSGI"
-start trace_context_apps:wsgi_app --trace-context --access-log --access-log-format json \
-    --request-id
-get /json --http1.1 -H "traceparent: $GOOD"
-line=$(line_for /json)
+echo "JSON"
+start --trace-context --access-log --access-log-format json --request-id
+get /user/json --http1.1 -H "traceparent: $GOOD"
+line=$(line_for /user/json)
 has "the JSON line has trace_id" "$line" "\"trace_id\":\"$TRACE\""
 has "and parent_id" "$line" "\"parent_id\":\"$PARENT\""
 has "beside the request ID" "$line" "\"request_id\":"
-is "the WSGI application sees the header unchanged" "$(cat "$WORK/body")" "n=1 tp=$GOOD"
-get /json-none --http1.1
-lacks "a JSON line without one has no trace_id" "$(line_for /json-none)" "trace_id"
+get /user/json-none --http1.1
+lacks "a JSON line without one has no trace_id" "$(line_for /user/json-none)" "trace_id"
 server_stop
 
 echo "without --trace-context"
-start trace_context_apps:asgi_app --access-log
-get /off --http1.1 -H "traceparent: $GOOD"
-lacks "nothing is recorded" "$(line_for /off)" "trace="
-is "and the header still reaches the application" "$(cat "$WORK/body")" "n=1 tp=$GOOD"
+start --access-log
+get /user/off --http1.1 -H "traceparent: $GOOD"
+lacks "nothing is recorded" "$(line_for /user/off)" "trace="
 server_stop
 
 echo

@@ -127,6 +127,8 @@ public struct Worker {
     var readyQueue: ReadyQueue
     /// Last ticket issued to a ready continuation. 0 is never issued.
     var readySerial: UInt32 = 0
+    /// --root-path, measured once: the mount routes are matched within.
+    let rootPath: RootPath
     static let readyDrainBudget = 64
 
     public init(config: ServerConfig, listenFD: Int32, poller: Poller) {
@@ -144,6 +146,7 @@ public struct Worker {
         self.asyncOps = AsyncOpPool(capacity: n)
         self.timerHeap = TimerHeap(capacity: n)
         self.readyQueue = ReadyQueue(minimumCapacity: n)
+        self.rootPath = RootPath(config.rootPath)
     }
 
     public mutating func destroy() {
@@ -739,6 +742,12 @@ public struct Worker {
         // a probe, a 429, a static file -- is logged with its ID.
         if config.requestID { assignRequestID(slot) }
         if config.traceContext { assignTraceContext(slot) }
+        // --no-websockets. Refused before anything else can answer, so an
+        // upgrade is never mistaken for an ordinary request to its path.
+        if !config.websocketsEnabled && isWebSocketUpgrade(slot) {
+            failRequest(slot, status: 501)
+            return
+        }
         // --health-check-path, answered here rather than in the application.
         // This is the only interception on the path to dispatch, and it is
         // opt-in, so an application that wants to answer its own probe simply
@@ -1149,6 +1158,7 @@ public struct Worker {
         HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: status)
         HTTPResponseWriter.writeDate(&c.pointee.write, dates)
         c.pointee.write.write("Server: garuda\r\n")
+        writeServerHeaders(slot, &c.pointee.write)
         HTTPResponseWriter.writeContentLength(&c.pointee.write, 0)
         HTTPResponseWriter.writeConnection(&c.pointee.write,
                                            keepAlive: c.pointee.flags.contains(.keepAlive))
@@ -1175,7 +1185,8 @@ public struct Worker {
         dates.refresh()
         c.pointee.write.clear()
         HTTPResponseWriter.writeError(&c.pointee.write, status: status,
-                                      closeConnection: true, dateCache: dates)
+                                      closeConnection: true, dateCache: dates,
+                                      omitBody: c.pointee.head.method.hasNoResponseBody)
         c.pointee.state = .writing
         _ = flush(slot)
     }

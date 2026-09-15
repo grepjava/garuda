@@ -10,6 +10,7 @@
 //   GET  /user/:id  200, the id as the body
 //   POST /user      200, empty body
 //   GET  /delay/:ms 200 after ms (clamped 1..5000), empty body
+// HEAD is answered wherever GET is, with the same head and no body.
 //===----------------------------------------------------------------------===//
 
 import CGaruda
@@ -28,7 +29,7 @@ public enum Router {
     public static func match(method: HTTPMethod,
                              path: UnsafePointer<UInt8>,
                              count: Int) -> Route? {
-        if method == .get {
+        if method == .get || method == .head {
             if count == 1 && path[0] == 0x2F { return .hello }
             if count > 6 && path[0] == 0x2F
                 && path[1] == 0x75 && path[2] == 0x73 && path[3] == 0x65
@@ -70,14 +71,32 @@ public enum Router {
 }
 
 extension Worker {
+    /// Whether an HTTP/1.1 request asks to become a WebSocket.
+    func isWebSocketUpgrade(_ slot: Int) -> Bool {
+        let c = table[slot]
+        if c.pointee.isStream || !c.pointee.head.flags.contains(.upgrade) { return false }
+        let base = c.pointee.headBase()
+        var i = 0
+        while i < c.pointee.head.headerCount {
+            let h = headers[i]
+            i += 1
+            guard h.name.length == 7,
+                  equalsLowercased(base + Int(h.name.offset), 7, "upgrade") else { continue }
+            let value = h.value.span(in: base)
+            return value.count == 9 && equalsLowercased(value.base, 9, "websocket")
+        }
+        return false
+    }
+
     /// Answers a matched route, or 404, writing straight into the connection.
     mutating func respondRoute(_ slot: Int) {
         let c = table[slot]
         let path = c.pointee.head.path
-        let base = c.pointee.headBase() + Int(path.offset)
-        let route = Router.match(method: c.pointee.head.method,
-                                 path: base,
-                                 count: path.count)
+        // --root-path: routes are matched on the path within the mount. A
+        // path outside it is matched as it came, as behind a proxy that has
+        // already taken the prefix off.
+        let (base, count) = rootPath.strip(c.pointee.headBase() + Int(path.offset), path.count)
+        let route = Router.match(method: c.pointee.head.method, path: base, count: count)
         switch route {
         case .hello, .createUser:
             writeSwiftResponse(slot, status: 200, body: nil, bodyCount: 0)
@@ -90,7 +109,9 @@ extension Worker {
                 failRequest(slot, status: 503)
             }
         case nil:
-            failRequest(slot, status: 404)
+            // A path with no route is an ordinary answer, not a failure: the
+            // connection stays open for the next request.
+            writeSwiftResponse(slot, status: 404, body: nil, bodyCount: 0)
         }
     }
 
@@ -107,17 +128,19 @@ extension Worker {
         }
         logAccess(slot, status: status)
         dates.refresh()
+        // A HEAD response declares the length a GET would have had, and sends
+        // none of it.
         let suppress = c.pointee.head.method.hasNoResponseBody
-        let n = suppress ? 0 : bodyCount
         HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: status)
         HTTPResponseWriter.writeDate(&c.pointee.write, dates)
         c.pointee.write.write("Server: garuda\r\n")
-        HTTPResponseWriter.writeContentLength(&c.pointee.write, n)
+        writeServerHeaders(slot, &c.pointee.write)
+        HTTPResponseWriter.writeContentLength(&c.pointee.write, bodyCount)
         HTTPResponseWriter.writeConnection(&c.pointee.write,
                                            keepAlive: c.pointee.flags.contains(.keepAlive))
         HTTPResponseWriter.endHead(&c.pointee.write)
-        if n > 0, let body {
-            c.pointee.write.write(body, n)
+        if !suppress, bodyCount > 0, let body {
+            c.pointee.write.write(body, bodyCount)
         }
         c.pointee.state = .writing
         _ = flush(slot)

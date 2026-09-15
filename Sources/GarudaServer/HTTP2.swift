@@ -311,6 +311,11 @@ extension Worker {
                     return
                 }
                 s.pointee.body.write(payload + offset, length)
+                // The router takes the whole body before it answers, so a
+                // byte buffered is a byte consumed. Holding the window back
+                // until a handler read it would stall every upload larger than
+                // the window; --max-body above is what bounds the buffer.
+                h2NoteConsumed(streamSlot, length)
             }
         }
 
@@ -346,9 +351,10 @@ extension Worker {
             h2FlushWindowUpdates(streamSlot)
             return
         }
+        h2FlushWindowUpdates(streamSlot)
         onBodyProgress(streamSlot)
-        // A WSGI application dispatched by that call has already produced its
-        // whole response, and the frames it wrote are waiting on the parent.
+        // A response written during that call has its frames waiting on the
+        // parent.
         if table[slot].pointee.state == .http2 { _ = flush(slot) }
     }
 
@@ -1061,10 +1067,10 @@ extension Worker {
 
     // MARK: - Receive-side flow control
 
-    /// Called when the application takes body bytes, which is what makes room
-    /// for more. Doing it here rather than on arrival is what gives HTTP/2 the
-    /// same backpressure as HTTP/1: an application that does not read stops the
-    /// peer from sending.
+    /// Called when body bytes are taken off the stream, which is what makes
+    /// room for more. The router buffers a whole body before it answers, so for
+    /// it that is on arrival; a handler reading as it goes would call this as it
+    /// reads, and one that stopped reading would stop the peer from sending.
     mutating func h2NoteConsumed(_ streamSlot: Int, _ n: Int) {
         if n <= 0 { return }
         table[streamSlot].pointee.pendingRecvUpdate += n

@@ -6,13 +6,22 @@
 The server's own framing and HPACK are tested by unit tests and by h2spec;
 what this adds is interop with a stack written by someone else (the `h2`
 library) and the behaviour a conformance suite has no opinion about --
-multiplexing that actually overlaps, flow control on a real body, an
-application that answers before the upload finishes, and cancellation.
+multiplexing that actually overlaps, flow control on a real body in both
+directions, a body held to its declared length, body and request timeouts on
+a stream, header blocks split across frames, and the rapid-reset defence.
 
-Needs `h2` in the interpreter running it:  pip install h2
+Everything is served by the built-in router (GET /, GET /user/:id, POST /user
+and GET /delay/:ms) or by the server's own --static-dir, so no application is
+needed. Each check runs twice: cleartext with prior knowledge, then over TLS
+with ALPN. Routes, delays and cancelling a waiting delay are covered over TLS
+by scripts/router-streams-test.py and are not repeated here.
+
+Needs `h2` in the interpreter running it, and openssl for the TLS pass:
+pip install h2
 """
 
 import os
+import shutil
 import socket
 import ssl
 import shlex
@@ -28,15 +37,16 @@ try:
     import h2.errors
     import h2.events
     import h2.exceptions
+    import h2.settings
 except ImportError:
     sys.stderr.write("this script needs the h2 package: pip install h2\n")
     raise SystemExit(2)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/garuda")
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, ".build", "release", "garuda")
 
 # Extra server flags, so the same suite can be pointed at a different
-# execution model:  GARUDA_EXTRA_ARGS="--workers 4 --free-threaded"
+# execution model:  GARUDA_EXTRA_ARGS="--workers 4"
 EXTRA = shlex.split(os.environ.get("GARUDA_EXTRA_ARGS", ""))
 
 # Set for the second pass, which runs everything again over TLS so that ALPN,
@@ -107,14 +117,12 @@ def free_port():
 
 
 class Server:
-    def __init__(self, *args, app="asgi_app:app"):
+    def __init__(self, *args):
         self.port = free_port()
-        cmd = [BIN, "--port", str(self.port), "--log-level", "error",
-               "--python-path", os.path.join(ROOT, "examples")] + EXTRA + list(args)
+        cmd = [BIN, "--port", str(self.port), "--log-level", "error"] + EXTRA + list(args)
         if USE_TLS:
             cert, key = make_certs()
             cmd += ["--tls-cert", cert, "--tls-key", key]
-        cmd += [app]
         self.proc = subprocess.Popen(cmd)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -261,26 +269,17 @@ def test_basics():
         s1 = c.request(path="/")
         status, headers, body, _ = c.collect([s1])
         is_("a GET is answered", status.get(s1), 200)
-        is_("the body arrives intact", body.get(s1), b"hello from garuda asgi\n")
-        is_("headers are lowercase on the wire",
-            headers[s1].get(b"content-type"), b"text/plain")
+        is_("an empty body is declared as one", headers[s1].get(b"content-length"), b"0")
         check("no connection-specific headers are sent",
               not any(k in headers[s1] for k in (b"connection", b"transfer-encoding",
                                                  b"keep-alive")),
               str(sorted(headers[s1])))
 
-        s2 = c.request(path="/scope")
+        # The id comes back as the body, so what arrives is what HPACK decoded.
+        s2 = c.request(path="/user/survives-hpack")
         status, _, body, _ = c.collect([s2])
-        scope = body[s2].decode()
-        check("the scope reports HTTP/2", '"http_version": "2"' in scope, scope[:200])
-        check("the path survives HPACK", '"path": "/scope"' in scope, scope[:200])
-        check("the authority becomes the host header",
-              '"host": "127.0.0.1:%d"' % server.port in scope, scope[:300])
-
-        s3 = c.request(method="HEAD", path="/")
-        status, headers, body, _ = c.collect([s3])
-        is_("HEAD is answered", status.get(s3), 200)
-        is_("HEAD is answered without a body", body.get(s3, b""), b"")
+        is_("the path survives HPACK", (status.get(s2), body.get(s2)),
+            (200, b"survives-hpack"))
         c.close()
 
 
@@ -288,10 +287,10 @@ def test_multiplexing():
     print("\nMultiplexing")
     with Server() as server:
         c = Client(server)
-        # Each of these sleeps 250ms in the application. Run sequentially they
-        # would take two and a half seconds.
+        # Each of these waits 250ms in the router. Run sequentially they would
+        # take two and a half seconds.
         began = time.monotonic()
-        streams = [c.request(path="/sleep") for _ in range(10)]
+        streams = [c.request(path="/delay/250") for _ in range(10)]
         status, _, body, _ = c.collect(streams)
         elapsed = time.monotonic() - began
         is_("every stream is answered", len(status), 10)
@@ -306,30 +305,23 @@ def test_request_bodies():
     with Server() as server:
         c = Client(server)
         payload = bytes(range(256)) * 400          # 100 KiB, larger than one frame
-        s = c.request(method="POST", path="/echo", body=payload)
+        s = c.request(method="POST", path="/user", body=payload)
         status, _, body, _ = c.collect([s])
-        is_("a body larger than a frame round trips", body.get(s), payload)
-
-        # An application that answers on the head alone must not have to wait
-        # for the upload, exactly as in HTTP/1.
-        stream = c.request(method="POST", path="/reject", body=b"x" * 100, end=False)
-        status, _, body, _ = c.collect([stream], deadline=10.0)
-        is_("an early rejection does not wait for the body", status.get(stream), 403)
+        is_("a body larger than a frame is taken whole", status.get(s), 200)
 
         # A trailer section ends a body as surely as END_STREAM on DATA does,
         # and is held to the same declared length (RFC 9113 section 8.1.1).
         # Before, trailers ended it unchecked, and a body three bytes into a
         # declared ten reached the application as if it were whole.
-        s = c.request(method="POST", path="/echo",
+        s = c.request(method="POST", path="/user",
                       extra=[("content-length", "3")], end=False)
         c.send_body(s, b"abc", end=False)
         c.conn.send_headers(s, [("x-checksum", "1")], end_stream=True)
         c.flush()
         status, _, body, _ = c.collect([s])
-        is_("a body of its declared length ends with trailers",
-            (status.get(s), body.get(s)), (200, b"abc"))
+        is_("a body of its declared length ends with trailers", status.get(s), 200)
 
-        s = c.request(method="POST", path="/echo",
+        s = c.request(method="POST", path="/user",
                       extra=[("content-length", "10")], end=False)
         c.send_body(s, b"abc", end=False)
         c.conn.send_headers(s, [("x-checksum", "1")], end_stream=True)
@@ -337,125 +329,112 @@ def test_request_bodies():
         c.collect([s])
         is_("a body short of its declared length is refused at the trailers",
             c.reset.get(s), h2.errors.ErrorCodes.PROTOCOL_ERROR)
-        check("and never reaches the application as a whole body",
+        check("and never reaches the router as a whole body",
               c.status.get(s) is None, "answered %r" % c.status.get(s))
 
-        s = c.request(path="/")
+        s = c.request(path="/user/after-reset")
         status, _, body, _ = c.collect([s])
         is_("the connection survives that reset",
-            (status.get(s), body.get(s)), (200, b"hello from garuda asgi\n"))
+            (status.get(s), body.get(s)), (200, b"after-reset"))
         c.close()
 
 
 def test_flow_control():
     print("\nFlow control")
-    with Server() as server:
-        # A deliberately small window, so the response cannot be sent in one go
-        # and the server has to wait for WINDOW_UPDATE frames.
-        c = Client(server, window=16384)
-        s = c.request(path="/big?400000")
-        status, _, body, _ = c.collect([s], deadline=30.0)
-        is_("a response far larger than the window arrives whole",
-            len(body.get(s, b"")), 400000)
+    # The router has no large responses, so the large one comes from
+    # --static-dir, which refills a stream from the file as the window opens.
+    root = tempfile.mkdtemp(prefix="garuda-h2-static-")
+    large = os.urandom(400000)
+    with open(os.path.join(root, "big.bin"), "wb") as fh:
+        fh.write(large)
+    try:
+        with Server("--static-dir", "/static=" + root) as server:
+            flow_control_checks(server, large)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
-        # And the other direction: the server's own window has to be refreshed
-        # as the application reads, or an upload stalls at the initial window.
-        payload = b"z" * (1024 * 1024)
-        s2 = c.request(method="POST", path="/echo", body=payload)
+
+def flow_control_checks(server, large):
+    # A deliberately small window, so the response cannot be sent in one go
+    # and the server has to wait for WINDOW_UPDATE frames.
+    c = Client(server, window=16384)
+    s = c.request(path="/static/big.bin")
+    status, _, body, _ = c.collect([s], deadline=30.0)
+    is_("a response far larger than the window arrives whole",
+        (status.get(s), body.get(s, b"") == large), (200, True))
+
+    # And the other direction: the server's own window has to be refreshed
+    # as the router reads, or an upload stalls at the initial window.
+    payload = b"z" * (1024 * 1024)
+    try:
+        s2 = c.request(method="POST", path="/user", body=payload)
+    except RuntimeError as exc:
+        # Recorded rather than raised, so the SETTINGS checks below still run.
+        bad("an upload larger than the initial window completes",
+            "the upload to finish", "%s: the server never refreshed it" % exc)
+    else:
         status, _, body, _ = c.collect([s2], deadline=30.0)
-        is_("an upload larger than the initial window completes",
-            len(body.get(s2, b"")), len(payload))
-        c.close()
+        is_("an upload larger than the initial window completes", status.get(s2), 200)
+    c.close()
 
-        # One SETTINGS frame may change INITIAL_WINDOW_SIZE more than once, and
-        # each value applies in turn to the streams already open, not just the
-        # last. The h2 library never sends that, so these frames are made here.
-        def frame(kind, flags, stream, payload=b""):
-            return len(payload).to_bytes(3, "big") + bytes([kind, flags]) \
-                + struct.pack("!I", stream) + payload
+    # One SETTINGS frame may change INITIAL_WINDOW_SIZE more than once, and
+    # each value applies in turn to the streams already open, not just the
+    # last. The h2 library never sends that, so these frames are made here.
+    # Every case starts from a window of 0: the router writes its answer while
+    # decoding the HEADERS frame, so a response with any window at all would
+    # be gone before the SETTINGS after it were read.
+    def frame(kind, flags, stream, payload=b""):
+        return len(payload).to_bytes(3, "big") + bytes([kind, flags]) \
+            + struct.pack("!I", stream) + payload
 
-        def settings(*windows):
-            return frame(4, 0, 0, b"".join(struct.pack("!HI", 4, w) for w in windows))
+    def settings(*windows):
+        return frame(4, 0, 0, b"".join(struct.pack("!HI", 4, w) for w in windows))
 
-        def data_received(initial, updates):
-            """DATA bytes a 100-byte response gets, or all it gets before stalling."""
-            sock = socket.create_connection(("127.0.0.1", server.port), 5)
-            if USE_TLS:
-                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                context.set_alpn_protocols(["h2"])
-                sock = context.wrap_socket(sock, server_hostname="localhost")
-            path = b"/late?100"
-            # GET, :scheme http, then :path and :authority as literals.
-            block = b"\x82\x86\x04" + bytes([len(path)]) + path + b"\x01\x09localhost"
-            sock.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + settings(initial)
-                         + frame(1, 0x5, 1, block) + settings(*updates))
-            received = 0
-            pending = b""
-            sock.settimeout(1.0)
-            try:
-                while True:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        return received
-                    pending += chunk
-                    while len(pending) >= 9:
-                        n = int.from_bytes(pending[:3], "big")
-                        if len(pending) < 9 + n:
-                            break
-                        kind, flags = pending[3], pending[4]
-                        pending = pending[9 + n:]
-                        if kind == 4 and not flags & 1:
-                            sock.sendall(frame(4, 1, 0))
-                        elif kind == 0:
-                            received += n
-                            if flags & 1:
-                                return received
-            except socket.timeout:
-                return received
-            finally:
-                sock.close()
+    def data_received(initial, updates):
+        """DATA bytes a 100-byte response gets, or all it gets before stalling."""
+        sock = socket.create_connection(("127.0.0.1", server.port), 5)
+        if USE_TLS:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(["h2"])
+            sock = context.wrap_socket(sock, server_hostname="localhost")
+        # /user/:id answers with the id, so a 100-byte id is a 100-byte body.
+        path = b"/user/" + b"w" * 100
+        # GET, :scheme http, then :path and :authority as literals.
+        block = b"\x82\x86\x04" + bytes([len(path)]) + path + b"\x01\x09localhost"
+        sock.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + settings(initial)
+                     + frame(1, 0x5, 1, block) + settings(*updates))
+        received = 0
+        pending = b""
+        sock.settimeout(1.0)
+        try:
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return received
+                pending += chunk
+                while len(pending) >= 9:
+                    n = int.from_bytes(pending[:3], "big")
+                    if len(pending) < 9 + n:
+                        break
+                    kind, flags = pending[3], pending[4]
+                    pending = pending[9 + n:]
+                    if kind == 4 and not flags & 1:
+                        sock.sendall(frame(4, 1, 0))
+                    elif kind == 0:
+                        received += n
+                        if flags & 1:
+                            return received
+        except socket.timeout:
+            return received
+        finally:
+            sock.close()
 
-        is_("INITIAL_WINDOW_SIZE given twice counts both (0, then 100 and 100)",
-            data_received(0, [100, 100]), 100)
-        is_("the second of two is what the window ends at (0, then 100 and 50)",
-            data_received(0, [100, 50]), 50)
-        is_("and no more is sent than the last allows (100, then 0 and 50)",
-            data_received(100, [0, 50]), 50)
-
-
-def test_cancellation():
-    print("\nCancellation")
-    with Server() as server:
-        c = Client(server)
-        s = c.request(path="/slow?10")
-        time.sleep(0.3)
-        c.conn.reset_stream(s, error_code=8)        # CANCEL
-        c.flush()
-        time.sleep(0.5)
-        # The connection stays usable, and the cancelled request never answers.
-        s2 = c.request(path="/")
-        status, _, body, _ = c.collect([s2], deadline=10.0)
-        is_("the connection survives a reset stream", status.get(s2), 200)
-        is_("the cancelled stream is not answered", status.get(s), None)
-        is_("the cancelled request produced no body", body.get(s), None)
-
-        # RST_STREAM is the one disconnect that is not ambiguous: unlike a FIN
-        # on a socket, which may only mean the peer has finished talking, it
-        # says this request is over. /abandonable never calls receive(), so the
-        # http.disconnect message ASGI would deliver has nobody waiting for it
-        # and cancellation is the only thing that can still reach the task.
-        abandoned = c.request(path="/abandonable")
-        time.sleep(0.3)
-        c.conn.reset_stream(abandoned, error_code=8)
-        c.flush()
-        time.sleep(0.5)
-        s3 = c.request(path="/cancelled")
-        status, _, body, _ = c.collect([s3], deadline=10.0)
-        is_("a reset stream cancels the task nobody is left to talk to",
-            body.get(s3, b"").strip(), b"yes")
-        c.close()
+    is_("INITIAL_WINDOW_SIZE given twice counts both (0, then 100 and 100)",
+        data_received(0, [100, 100]), 100)
+    is_("the second of two is what the window ends at (0, then 100 and 50)",
+        data_received(0, [100, 50]), 50)
 
 
 def test_rapid_reset():
@@ -464,10 +443,14 @@ def test_rapid_reset():
     A reset frees the stream slot immediately, so the concurrency limit alone
     never sees a peer that opens a stream and cancels it in the same breath --
     while the server still decodes a header block, builds a request and starts
-    an application task for every one. What bounds it here is the ratio of
-    cancelled streams to answered ones, so the first half of this checks that
-    an ordinary client, which cancels among requests it completes, is left
-    alone.
+    work for every one. What bounds it here is the ratio of cancelled streams
+    to answered ones, so the first half of this checks that an ordinary
+    client, which cancels among requests it completes, is left alone.
+
+    The cancelled requests are /delay/5000, not /: the router answers / inside
+    the dispatch that decoded it, so by the time a reset for it is read the
+    response is already finished and the reset is the harmless race, charged
+    nothing. A delay is still waiting when its reset arrives.
     """
     print("\nRapid reset")
     with Server() as server:
@@ -475,7 +458,7 @@ def test_rapid_reset():
         for _ in range(40):
             done = c.request(path="/")
             c.collect([done], deadline=10.0)
-            cancelled = c.request(path="/")
+            cancelled = c.request(path="/delay/5000")
             c.conn.reset_stream(cancelled, error_code=8)
             c.flush()
         s = c.request(path="/")
@@ -525,14 +508,14 @@ def test_rapid_reset():
 def test_body_limit():
     """--max-body is a limit on the upload, not on what happens to be buffered.
 
-    An ASGI application reads the body as it arrives, so the buffer empties as
-    fast as it fills. A limit measured there would let a peer send any amount
-    at all provided it sent it slowly enough.
+    The router reads the body as it arrives and discards it, so the buffer
+    empties as fast as it fills. A limit measured there would let a peer send
+    any amount at all provided it sent it slowly enough.
     """
     print("\nBody limits")
-    with Server("--max-body", "1024", app="asgi_app:app") as server:
+    with Server("--max-body", "1024") as server:
         c = Client(server)
-        stream = c.request(method="POST", path="/echo", end=False)
+        stream = c.request(method="POST", path="/user", end=False)
         sent = 0
         killed = None
         for _ in range(8):
@@ -543,7 +526,7 @@ def test_body_limit():
                 killed = type(exc).__name__
                 break
             sent += 512
-            # Slow enough for the application to have taken each block.
+            # Slow enough for the router to have taken each block.
             time.sleep(0.15)
             c.step(timeout=0.01)
             if c.reset.get(stream) is not None:
@@ -557,10 +540,9 @@ def test_body_limit():
 
         # Under the limit, everything still works.
         c = Client(server)
-        ok_stream = c.request(method="POST", path="/echo", body=b"y" * 512)
+        ok_stream = c.request(method="POST", path="/user", body=b"y" * 512)
         status, _, body, _ = c.collect([ok_stream], deadline=10.0)
         is_("a body inside the limit is served", status.get(ok_stream), 200)
-        is_("and comes back whole", body.get(ok_stream), b"y" * 512)
         c.close()
 
 
@@ -572,14 +554,14 @@ def test_slow_stream():
     the bytes that move on it, the timeout stops being a check for a stalled
     request and becomes an absolute cap on a slow one.
 
-    WSGI, because PEP 3333 hands the application a whole body and so leaves the
-    stream reading until END_STREAM -- which is the state the sweep looks at.
+    POST /user answers only once the whole body has been read, so the stream
+    stays reading until END_STREAM -- which is the state the sweep looks at.
     """
     print("\nSlow but steady streams")
-    with Server("--request-timeout", "2000", app="wsgi_app:application") as server:
+    with Server("--request-timeout", "2000") as server:
         c = Client(server)
         body = b"abcdefghij"
-        stream = c.request(method="POST", path="/echo",
+        stream = c.request(method="POST", path="/user",
                            extra=[("content-length", str(len(body)))], end=False)
         # Six seconds of dribbling against a two-second timeout: any absolute
         # cap fires long before the last byte.
@@ -600,10 +582,9 @@ def test_slow_stream():
                 "the upload to finish", "the server dropped the stream " + killed)
             c.close()
             return
-        status, _, echoed, _ = c.collect([stream], deadline=10.0)
+        status, _, _, _ = c.collect([stream], deadline=10.0)
         is_("a steadily uploaded body outlives the request timeout",
             status.get(stream), 200)
-        is_("and arrives whole", echoed.get(stream), body)
         is_("the stream is not reset out from under it", c.reset.get(stream), None)
         c.close()
 
@@ -614,7 +595,7 @@ def burst(client, count):
         stream = client.conn.get_next_available_stream_id()
         client.conn.send_headers(stream, [
             (":method", "GET"), (":scheme", "http"),
-            (":authority", "127.0.0.1:%d" % client.port), (":path", "/"),
+            (":authority", "127.0.0.1:%d" % client.port), (":path", "/delay/5000"),
         ], end_stream=True)
         client.conn.reset_stream(stream, error_code=8)
     client.flush()
@@ -634,169 +615,19 @@ def test_large_headers():
         c = Client(server)
         # 24 KiB of request headers, which must arrive as CONTINUATION frames.
         extra = [("x-pad-%03d" % i, "v" * 512) for i in range(48)]
-        s = c.request(path="/scope", extra=extra)
+        s = c.request(path="/user/continued", extra=extra)
         status, _, body, _ = c.collect([s])
         is_("a request split across CONTINUATION frames is understood",
-            status.get(s), 200)
-        check("every padded header arrives", body.get(s, b"").count(b"x-pad-") == 48,
-              str(body.get(s, b"").count(b"x-pad-")))
+            (status.get(s), body.get(s)), (200, b"continued"))
         c.close()
-
-
-def test_response_framing():
-    print("\nResponse framing")
-    with Server() as server:
-        c = Client(server)
-        s = c.request(path="/overlong")
-        status, headers, body, _ = c.collect([s], deadline=10.0)
-        is_("an overlong body is truncated to what was declared",
-            body.get(s, b""), b"LO")
-        is_("the declared length is what the client is told",
-            headers[s].get(b"content-length"), b"2")
-
-        s2 = c.request(path="/short")
-        c.collect([s2], deadline=10.0)
-        check("a short body resets the stream rather than ending it",
-              c.reset.get(s2) is not None,
-              "the stream ended cleanly, which would pass off a truncated "
-              "body as the whole message")
-
-        s3 = c.request(path="/nocontent")
-        s4 = c.request(path="/notmodified")
-        _, headers, body, _ = c.collect([s3, s4], deadline=10.0)
-        is_("a 204 has no content-length", headers[s3].get(b"content-length"), None)
-        is_("a 304 keeps the content-length the application gave",
-            headers[s4].get(b"content-length"), b"5")
-        is_("and neither has a body", (body.get(s3, b""), body.get(s4, b"")), (b"", b""))
-        c.close()
-
-
-def test_wsgi():
-    """A WSGI application over HTTP/2.
-
-    PEP 3333 has no idea what a stream is, and it does not need one: the two
-    differ in how a message is framed, and framing is the server's job in both.
-    What has to be checked is that a head produced by code that only knows how
-    to write HTTP/1.1 comes out as a proper header block, and that nothing
-    belonging to HTTP/1 framing survives the trip.
-    """
-    print("\nWSGI")
-    for threads in (1, 4):
-        label = "pooled" if threads > 1 else "inline"
-        with Server("--wsgi-threads", str(threads),
-                    app="wsgi_app:application") as server:
-            c = Client(server)
-            s = c.request(path="/")
-            status, headers, body, _ = c.collect([s])
-            is_("a WSGI GET is answered (%s)" % label, status.get(s), 200)
-            is_("the body arrives intact (%s)" % label, body.get(s),
-                b"hello from garuda\n")
-            is_("a length is declared (%s)" % label,
-                headers[s].get(b"content-length"), b"21")
-            check("no HTTP/1 framing survives (%s)" % label,
-                  not any(k in headers[s] for k in (b"connection",
-                                                    b"transfer-encoding",
-                                                    b"keep-alive")),
-                  str(sorted(headers[s])))
-            is_("the server names itself (%s)" % label,
-                headers[s].get(b"server"), b"garuda")
-
-            s = c.request(path="/env")
-            _, _, body, _ = c.collect([s])
-            check("SERVER_PROTOCOL says HTTP/2 (%s)" % label,
-                  b"SERVER_PROTOCOL='HTTP/2'" in body.get(s, b""),
-                  body.get(s, b"")[:200])
-
-            s = c.request(path="/headers")
-            _, headers, _, _ = c.collect([s])
-            is_("application headers reach the client (%s)" % label,
-                (headers[s].get(b"x-one"), headers[s].get(b"x-two")), (b"1", b"2"))
-
-            # No Content-Length: a generator whose length nobody knows. On
-            # HTTP/1 that is chunked; here the stream ending is the framing.
-            s = c.request(path="/stream")
-            _, headers, body, _ = c.collect([s])
-            is_("a generator response arrives whole (%s)" % label, body.get(s),
-                b"".join(b"chunk-%d\n" % i for i in range(5)))
-            check("with no transfer-encoding (%s)" % label,
-                  b"transfer-encoding" not in headers[s], str(sorted(headers[s])))
-
-            # Large enough to be split across frames and, when pooled, to be
-            # handed over in pieces while the head is still being staged.
-            s = c.request(path="/big?300000")
-            status, _, body, _ = c.collect([s], deadline=30.0)
-            is_("a large WSGI response is intact (%s)" % label,
-                (status.get(s), len(body.get(s, b""))), (200, 300000))
-
-            s = c.request(method="HEAD", path="/")
-            status, headers, body, _ = c.collect([s])
-            is_("HEAD carries no body (%s)" % label,
-                (status.get(s), body.get(s, b"")), (200, b""))
-            is_("but still declares a length (%s)" % label,
-                headers[s].get(b"content-length"), b"21")
-
-            s = c.request(path="/write")
-            _, _, body, _ = c.collect([s])
-            is_("the legacy write() callable works (%s)" % label, body.get(s),
-                b"written and returned\n")
-
-            s = c.request(path="/nope")
-            status, _, _, _ = c.collect([s])
-            is_("an unknown path is 404 (%s)" % label, status.get(s), 404)
-
-            # wsgi.input is a single read of the whole body, so the request
-            # cannot be dispatched on its head the way an ASGI one is: the
-            # application would be called with nothing to read.
-            s = c.request(method="POST", path="/echo", body=b"a body")
-            status, _, body, _ = c.collect([s])
-            is_("a request body reaches the application (%s)" % label,
-                (status.get(s), body.get(s)), (200, b"a body"))
-
-            big = bytes(i % 251 for i in range(200000))
-            s = c.request(method="POST", path="/echo", body=big)
-            status, _, body, _ = c.collect([s], deadline=30.0)
-            is_("a body larger than the window round trips (%s)" % label,
-                (status.get(s), body.get(s) == big), (200, True))
-
-            s = c.request(method="POST", path="/echo")
-            status, _, body, _ = c.collect([s])
-            is_("an empty body is still a body (%s)" % label,
-                (status.get(s), body.get(s, b"")), (200, b""))
-
-            # A message that is not the length it declared must not be ended as
-            # if it were whole. On a stream the ending is a flag on a frame, so
-            # the only honest ending left is a reset -- there is no connection
-            # close to mean anything here, and the connection itself is fine.
-            s = c.request(path="/shortbody")
-            status, headers, body, _ = c.collect([s])
-            is_("a short WSGI response declares the length it promised (%s)"
-                % label, headers.get(s, {}).get(b"content-length"), b"10")
-            is_("what it did produce still arrives (%s)" % label,
-                body.get(s, b""), b"12345")
-            is_("and the stream is reset rather than ended cleanly (%s)" % label,
-                c.reset.get(s), h2.errors.ErrorCodes.INTERNAL_ERROR)
-
-            s = c.request(path="/")
-            status, _, body, _ = c.collect([s])
-            is_("the connection survives a reset stream (%s)" % label,
-                (status.get(s), body.get(s)), (200, b"hello from garuda\n"))
-
-            s = c.request(path="/overlong")
-            status, headers, body, _ = c.collect([s])
-            is_("an over-long WSGI response is cut to its declared length (%s)"
-                % label, body.get(s, b""), b"12")
-            check("and that stream ends cleanly, having kept its promise (%s)"
-                  % label, s not in c.reset, "reset with %r" % c.reset.get(s))
-            c.close()
 
 
 def run_all():
     global FAIL
     for test in (test_basics, test_multiplexing, test_request_bodies,
-                 test_flow_control, test_cancellation, test_rapid_reset,
+                 test_flow_control, test_rapid_reset,
                  test_slow_stream, test_body_limit,
-                 test_large_headers,
-                 test_response_framing, test_wsgi):
+                 test_large_headers):
         try:
             test()
         except Exception:

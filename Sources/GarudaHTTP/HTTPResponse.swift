@@ -149,9 +149,12 @@ public enum HTTPResponseWriter {
     }
 
     /// A complete, self-contained error response. Used for parse failures and
-    /// for application crashes, where there is nothing left to negotiate.
+    /// for requests the server refuses, where there is nothing left to
+    /// negotiate. `omitBody` is for a HEAD request: the length stays, the
+    /// reason phrase does not go out.
     public static func writeError(_ buf: inout ByteBuffer, status: Int,
-                                  closeConnection: Bool, dateCache: borrowing DateCache) {
+                                  closeConnection: Bool, dateCache: borrowing DateCache,
+                                  omitBody: Bool = false) {
         let body = reason(status)
         writeStatusLine(&buf, status: status)
         writeDate(&buf, dateCache)
@@ -159,7 +162,7 @@ public enum HTTPResponseWriter {
         writeContentLength(&buf, body.utf8CodeUnitCount)
         writeConnection(&buf, keepAlive: !closeConnection)
         endHead(&buf)
-        buf.write(body)
+        if !omitBody { buf.write(body) }
     }
 
     /// Reason phrases for the statuses a server actually emits. Unknown codes

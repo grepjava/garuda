@@ -9,10 +9,18 @@ that shares none of that code: aioquic drives the handshake, the transport and
 the HTTP/3 layer, so anything the two implementations disagree about shows up
 as a request that does not work rather than as a test that agrees with itself.
 
-Needs `aioquic` in the interpreter running it:  pip install aioquic
+Everything is served by the built-in router (GET /, GET /user/:id, POST /user
+and GET /delay/:ms) or by the server's own features: --hsts, --request-id,
+--health-check-path, --static-dir with --compress-static, and the Alt-Svc
+advertisement on TCP. Routes, delays and cancelling a waiting delay are
+covered by scripts/router-streams-test.py and are not repeated here.
+
+Needs `aioquic` in the interpreter running it, and openssl for a certificate:
+pip install aioquic (and `h2` too, for the HTTP/2 Alt-Svc check)
 """
 
 import asyncio
+import gzip
 import os
 import re
 import socket
@@ -36,10 +44,10 @@ except ImportError:
     raise SystemExit(2)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/pgbuild/release/garuda")
+BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, ".build", "release", "garuda")
 
 # Extra server flags, so the same suite can be pointed at a different
-# execution model:  GARUDA_EXTRA_ARGS="--workers 4 --free-threaded"
+# execution model:  GARUDA_EXTRA_ARGS="--workers 4"
 EXTRA = shlex.split(os.environ.get("GARUDA_EXTRA_ARGS", ""))
 
 PASS = 0
@@ -115,12 +123,11 @@ def free_port():
 
 
 class Server:
-    def __init__(self, *args, app="asgi_app:app"):
+    def __init__(self, *args):
         self.port = free_port()
         cert, key = make_certs()
         cmd = [BIN, "--port", str(self.port), "--log-level", "error",
-               "--http3", "--tls-cert", cert, "--tls-key", key,
-               "--python-path", os.path.join(ROOT, "examples")] + EXTRA + list(args) + [app]
+               "--http3", "--tls-cert", cert, "--tls-key", key] + EXTRA + list(args)
         self.process = subprocess.Popen(cmd)
         # The TCP listener comes up with the UDP one, and is the easier of the
         # two to wait on.
@@ -237,22 +244,7 @@ async def basics():
                            create_protocol=Client) as client:
             status, headers, body = await client.request("GET", "/")
             is_("a GET is answered", status, 200)
-            is_("the body arrives whole", body, b"hello from garuda asgi\n")
-            is_("the server names itself", headers.get(b"server"), b"garuda")
             check("a date is present", b"date" in headers, headers)
-
-            status, headers, body = await client.request("HEAD", "/")
-            is_("HEAD is answered", status, 200)
-            is_("HEAD carries no body", body, b"")
-
-            status, _, _ = await client.request("GET", "/nope")
-            is_("an unknown path is 404", status, 404)
-
-            status, _, body = await client.request("GET", "/scope")
-            check("the scope reports HTTP/3", b'"http_version": "3"' in body, body[:200])
-            check("the scope reports https", b'"scheme": "https"' in body, body[:200])
-            check("an HTTP/3 request advertises the WebTransport extension",
-                  b'"webtransport"' in body, body[:300])
 
 
 async def hsts():
@@ -266,12 +258,11 @@ async def hsts():
     with Server("--request-id") as server:
         async with connect("127.0.0.1", server.port, configuration=configuration(),
                            create_protocol=Client) as client:
-            _, headers, body = await client.request("GET", "/scope")
+            _, headers, _ = await client.request("GET", "/")
             rid = headers.get(b"x-request-id") or b""
             check("--request-id reaches an HTTP/3 response",
                   re.fullmatch(rb"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
                                rid) is not None, rid)
-            check("and the application's scope has the same ID", rid and rid in body, body[:300])
 
 
 async def health_check():
@@ -283,11 +274,11 @@ async def health_check():
             is_("the probe is answered", status, 200)
             is_("it carries no body", body, b"")
             # The probe answers and ends its stream inside the dispatch that
-            # received it, which is a shape no application response has. The
-            # request after it is the one that shows whether the connection
-            # survived that.
-            status, _, body = await client.request("GET", "/")
-            is_("the connection still serves afterwards", status, 200)
+            # received it. The request after it is the one that shows whether
+            # the connection survived that.
+            status, _, body = await client.request("GET", "/user/after-probe")
+            is_("the connection still serves afterwards", (status, body),
+                (200, b"after-probe"))
             status, _, _ = await client.request("GET", "/healthz")
             is_("a second probe is answered", status, 200)
 
@@ -336,9 +327,9 @@ async def static_files():
             status, _, _ = await client.request("GET", "/static/../etc/passwd")
             is_("dot-dot does not escape", status, 404)
             status, _, _ = await client.request("GET", "/static/missing.css")
-            is_("a missing file reaches the application", status, 404)
-            status, _, body = await client.request("GET", "/")
-            is_("the application still answers", body, b"hello from garuda asgi\n")
+            is_("a missing file reaches the router", status, 404)
+            status, _, body = await client.request("GET", "/user/still-routed")
+            is_("the router still answers", (status, body), (200, b"still-routed"))
 
     shutil.rmtree(root, ignore_errors=True)
 
@@ -386,41 +377,23 @@ async def congestion():
 
 async def compression():
     print("\nCompression")
-    import gzip
-    scripts = os.path.join(ROOT, "scripts")
-    sys.path.insert(0, scripts)
-    from compress_apps import TEXT
-
+    # Text that compresses well and is past --compress-min-size, so gzip is
+    # plainly worth serving.
+    text = b"".join(b"line %04d of a stylesheet that repeats itself\n" % i
+                    for i in range(400))
     root = tempfile.mkdtemp()
     with open(os.path.join(root, "site.css"), "wb") as fh:
-        fh.write(TEXT)
+        fh.write(text)
     with open(os.path.join(root, "site.css.gz"), "wb") as fh:
-        fh.write(gzip.compress(TEXT))
+        fh.write(gzip.compress(text))
 
-    with Server("--compress", "--compress-static", "--static-dir", "/static=" + root,
-                "--python-path", scripts, app="compress_apps:asgi") as server:
+    with Server("--compress-static", "--static-dir", "/static=" + root) as server:
         async with connect("127.0.0.1", server.port, configuration=configuration(),
                            create_protocol=Client) as client:
             gz = ((b"accept-encoding", b"gzip"),)
-            status, headers, body = await client.request("GET", "/", headers=gz)
-            is_("a response is compressed over HTTP/3", headers.get(b"content-encoding"), b"gzip")
-            is_("it decodes to what the application sent", gzip.decompress(body), TEXT)
-            check("it has no content-length", b"content-length" not in headers, headers)
-            is_("it says vary", headers.get(b"vary"), b"accept-encoding")
-
-            status, headers, body = await client.request("GET", "/pieces", headers=gz)
-            is_("a body sent in pieces decodes", gzip.decompress(body), TEXT)
-
-            status, headers, body = await client.request("GET", "/small", headers=gz)
-            check("a small body is not compressed", b"content-encoding" not in headers, headers)
-            is_("and keeps its length", headers.get(b"content-length"), b"4")
-
-            status, headers, body = await client.request("GET", "/")
-            is_("no accept-encoding, plain body", body, TEXT)
-
             status, headers, body = await client.request("GET", "/static/site.css", headers=gz)
             is_("a pre-compressed file is served", headers.get(b"content-encoding"), b"gzip")
-            is_("and decodes", gzip.decompress(body), TEXT)
+            is_("and decodes", gzip.decompress(body), text)
             check("with its own etag", headers.get(b"etag", b"").endswith(b'-gzip"'), headers)
 
     shutil.rmtree(root, ignore_errors=True)
@@ -431,82 +404,54 @@ async def request_bodies():
     with Server() as server:
         async with connect("127.0.0.1", server.port, configuration=configuration(),
                            create_protocol=Client) as client:
-            status, _, body = await client.request("POST", "/echo", body=b"hello")
-            is_("a small body echoes back", (status, body), (200, b"hello"))
+            # Four times the 256 KiB stream window, so the upload only
+            # completes if the server raises MAX_STREAM_DATA as the router
+            # reads.
+            payload = bytes(range(256)) * 4096
+            status, _, _ = await client.collect(
+                client.start("POST", "/user", body=payload), timeout=60.0)
+            is_("an upload larger than the stream window completes", status, 200)
 
-            status, _, body = await client.request("POST", "/echo", body=b"")
-            is_("an empty body is still a body", (status, body), (200, b""))
+            status, _, _ = await client.request("POST", "/user", body=b"")
+            is_("an empty body is still a body", status, 200)
 
-            payload = bytes(range(256)) * 400        # 100 KiB, past one packet
-            status, _, body = await client.request("POST", "/echo", body=payload)
-            is_("a body larger than the window round trips",
-                (status, len(body), body == payload), (200, len(payload), True))
-
-            # The application answers without reading, which leaves the rest of
-            # the upload with nowhere to go.
-            status, _, _ = await client.request("POST", "/reject", body=b"x" * 40000)
-            is_("an early answer is not disturbed by the rest of the upload", status, 403)
-
-            status, _, body = await client.request("GET", "/")
+            status, _, body = await client.request("GET", "/user/afterwards")
             is_("the connection still works afterwards", (status, body),
-                (200, b"hello from garuda asgi\n"))
+                (200, b"afterwards"))
 
 
 async def multiplexing():
     print("\nMultiplexing")
-    with Server() as server:
+    root = tempfile.mkdtemp()
+    large = os.urandom(1024 * 1024)
+    with open(os.path.join(root, "big.bin"), "wb") as fh:
+        fh.write(large)
+
+    with Server("--static-dir", "/static=" + root) as server:
         async with connect("127.0.0.1", server.port, configuration=configuration(),
                            create_protocol=Client) as client:
             started = time.monotonic()
             results = await asyncio.gather(*[
-                client.request("GET", "/sleep") for _ in range(10)])
+                client.request("GET", "/delay/250") for _ in range(10)])
             elapsed = time.monotonic() - started
             is_("ten concurrent requests all answer",
                 [r[0] for r in results], [200] * 10)
-            # /sleep waits 250ms. Serialised that would be 2.5 seconds.
+            # /delay/250 waits 250ms. Serialised that would be 2.5 seconds.
             check("they overlapped rather than queued", elapsed < 1.5,
                   "%.3fs" % elapsed)
 
             # Interleaved: a large response and a small one on the same
             # connection, where the small one must not wait for the large.
-            big = client.start("GET", "/big?1048576")
+            # The router has no large responses, so that one is a file.
+            big = client.start("GET", "/static/big.bin")
             small = client.start("GET", "/")
             status, _, body = await client.collect(small)
             is_("a small response is not stuck behind a large one", status, 200)
-            status, _, big_body = await client.collect(big)
-            is_("the large response is intact", (status, len(big_body)),
-                (200, 1024 * 1024))
+            status, _, big_body = await client.collect(big, timeout=60.0)
+            is_("the large response is intact", (status, big_body == large),
+                (200, True))
 
-
-async def cancellation():
-    print("\nCancellation")
-    with Server() as server:
-        async with connect("127.0.0.1", server.port, configuration=configuration(),
-                           create_protocol=Client) as client:
-            stream_id = client.start("GET", "/slow?5")
-            await asyncio.sleep(0.05)
-            client._quic.reset_stream(stream_id, 0x010c)     # H3_REQUEST_CANCELLED
-            client.transmit()
-            await asyncio.sleep(0.4)
-
-            status, _, body = await client.request("GET", "/")
-            is_("a cancelled request does not disturb the connection",
-                (status, body), (200, b"hello from garuda asgi\n"))
-
-            # A reset stream is an unambiguous end, unlike a FIN on a socket,
-            # which may only mean the peer has finished talking. /abandonable
-            # never calls receive(), so nothing is waiting for the disconnect
-            # message and cancellation is all that can reach the task -- which
-            # also shows the request really did start, and that a flood of
-            # resets would be paying for application work rather than nothing.
-            abandoned = client.start("GET", "/abandonable")
-            await asyncio.sleep(0.3)
-            client._quic.reset_stream(abandoned, 0x010c)
-            client.transmit()
-            await asyncio.sleep(0.5)
-            status, _, body = await client.request("GET", "/cancelled")
-            is_("a reset stream cancels the task nobody is left to talk to",
-                body.strip(), b"yes")
+    shutil.rmtree(root, ignore_errors=True)
 
 
 async def rapid_reset():
@@ -514,7 +459,7 @@ async def rapid_reset():
 
     The HTTP/2 shape of this is CVE-2023-44487: open a stream, cancel it, and
     the concurrency credit comes straight back, so a peer can keep the server
-    decoding headers and starting tasks while never holding more than one
+    decoding headers and starting work while never holding more than one
     stream open. QUIC has the same property -- closing a stream queues
     MAX_STREAMS -- so it needs the same accounting.
     """
@@ -525,7 +470,7 @@ async def rapid_reset():
             status, _, _ = await client.request("GET", "/")
             is_("the connection works before the flood", status, 200)
 
-            # /slow never answers within the test, so nothing earns its
+            # /delay/5000 never answers within the test, so nothing earns its
             # cancellation back and the allowance only falls. The pairs go out
             # together, the way an attacker would send them: a response that
             # had already finished would be a race, not a reset, and is
@@ -536,7 +481,7 @@ async def rapid_reset():
                     break
                 for _ in range(32):
                     try:
-                        stream_id = client.start("GET", "/slow?5")
+                        stream_id = client.start("GET", "/delay/5000")
                     except ValueError:
                         break       # out of stream credit; let the server catch up
                     client._quic.reset_stream(stream_id, 0x010c)
@@ -583,12 +528,12 @@ async def spoofed_address():
             # request timed out.
             try:
                 status, _, body = await asyncio.wait_for(
-                    client.request("GET", "/"), 10)
+                    client.request("GET", "/user/real-client"), 10)
             except asyncio.TimeoutError:
                 status, body = None, b""
             is_("a forged packet does not redirect the connection", status, 200)
             is_("and the answer still reaches the client that asked",
-                body, b"hello from garuda asgi\n")
+                body, b"real-client")
 
             leaked = b""
             try:
@@ -609,15 +554,8 @@ async def large_headers():
             # that Huffman coding will actually shorten.
             headers = [(b"x-long-%d" % i, (b"aeiou-repeated-text " * 20).strip())
                        for i in range(4)]
-            status, _, body = await client.request("GET", "/scope", headers=headers)
-            is_("many long headers survive QPACK", status, 200)
-            check("a long value round trips", b"aeiou-repeated-text" in body, body[:80])
-
-            # A header whose name is not in the static table at all.
-            status, _, body = await client.request(
-                "GET", "/scope", headers=[(b"x-garuda-probe", b"1")])
-            check("an unknown header name round trips",
-                  b"x-garuda-probe" in body, body[:200])
+            status, _, body = await client.request("GET", "/user/long", headers=headers)
+            is_("many long headers survive QPACK", (status, body), (200, b"long"))
 
             # A value that is worse under Huffman than as bytes, so the
             # encoder has to choose the plain form.
@@ -625,137 +563,6 @@ async def large_headers():
             status, _, _ = await client.request(
                 "GET", "/", headers=[(b"x-binary", raw.hex().encode())])
             is_("a value Huffman cannot shrink is still sent", status, 200)
-
-
-async def response_framing():
-    print("\nResponse framing")
-    with Server() as server:
-        async with connect("127.0.0.1", server.port, configuration=configuration(),
-                           create_protocol=Client) as client:
-            status, headers, body = await client.request("GET", "/big?1048576")
-            is_("a large response arrives whole", (status, len(body)),
-                (200, 1024 * 1024))
-
-            # A response that declares its own length has to say so, and say
-            # it right: the stream ending is the other way a body can end, and
-            # the two must not disagree.
-            status, headers, body = await client.request("GET", "/fixed")
-            is_("a declared length reaches the client",
-                headers.get(b"content-length"), str(len(body)).encode())
-            is_("and the body matches it", body, b"fixed length" + bytes([10]))
-
-            # A HEAD whose GET would have declared a length is deliberately
-            # not checked here: aioquic's HTTP/3 client does not record which
-            # method it sent, so it measures the (correctly absent) body
-            # against the content-length and calls it an error. The equivalent
-            # over HTTP/2 is covered by scripts/http2-test.py, where the h2
-            # library does keep track.
-
-            status, headers, body = await client.request("GET", "/stream")
-            is_("a streamed response arrives", status, 200)
-            check("a streamed response has no content-length",
-                  b"content-length" not in headers, headers)
-            check("its body is complete", len(body) > 0, len(body))
-
-            # A body with no declared length is delimited by the stream
-            # ending, which is legal and is what HTTP/2 does too.
-            status, headers, body = await client.request("GET", "/nope")
-            is_("an undeclared length is delimited by the stream ending",
-                (status, b"content-length" in headers, len(body) > 0),
-                (404, False, True))
-
-
-async def flow_control():
-    print("\nFlow control")
-    with Server() as server:
-        async with connect("127.0.0.1", server.port, configuration=configuration(),
-                           create_protocol=Client) as client:
-            # A body sent in pieces, with the application reading as it goes.
-            stream_id = client.start("POST", "/echo", body=b"", end_stream=False)
-            total = b""
-            for i in range(20):
-                chunk = bytes([65 + (i % 26)]) * 8192
-                total += chunk
-                client.send_body(stream_id, chunk)
-                await asyncio.sleep(0)
-            client.send_body(stream_id, b"", end_stream=True)
-            status, _, body = await client.collect(stream_id)
-            is_("a drip-fed body reassembles in order",
-                (status, len(body), body == total), (200, len(total), True))
-
-
-async def wsgi():
-    """A WSGI application over HTTP/3.
-
-    Same reasoning as the HTTP/2 suite: PEP 3333 knows nothing about streams
-    and does not have to. The head it produces is staged and encoded with
-    QPACK here, so what is checked is that it arrives as a header block and
-    that nothing belonging to HTTP/1 framing came with it.
-    """
-    print("\nWSGI")
-    for threads in (1, 4):
-        label = "pooled" if threads > 1 else "inline"
-        with Server("--wsgi-threads", str(threads),
-                    app="wsgi_app:application") as server:
-            async with connect("127.0.0.1", server.port, configuration=configuration(),
-                               create_protocol=Client) as client:
-                status, headers, body = await client.request("GET", "/")
-                is_("a WSGI GET is answered (%s)" % label, status, 200)
-                is_("the body arrives intact (%s)" % label, body,
-                    b"hello from garuda\n")
-                is_("a length is declared (%s)" % label,
-                    headers.get(b"content-length"), b"21")
-                check("no HTTP/1 framing survives (%s)" % label,
-                      not any(k in headers for k in (b"connection",
-                                                     b"transfer-encoding",
-                                                     b"keep-alive")),
-                      str(sorted(headers)))
-
-                _, _, body = await client.request("GET", "/env")
-                check("SERVER_PROTOCOL says HTTP/3 (%s)" % label,
-                      b"SERVER_PROTOCOL='HTTP/3'" in body, body[:200])
-                check("the scheme is https (%s)" % label,
-                      b"wsgi.url_scheme='https'" in body, body[:400])
-
-                _, headers, body = await client.request("GET", "/stream")
-                is_("a generator response arrives whole (%s)" % label, body,
-                    b"".join(b"chunk-%d\n" % i for i in range(5)))
-                check("with no transfer-encoding (%s)" % label,
-                      b"transfer-encoding" not in headers, str(sorted(headers)))
-
-                status, _, body = await client.request("GET", "/big?300000")
-                is_("a large WSGI response is intact (%s)" % label,
-                    (status, len(body)), (200, 300000))
-
-                # HEAD is not checked here for the same reason as above: this
-                # application declares a length, and aioquic measures the
-                # correctly absent body against it. scripts/http2-test.py
-                # covers HEAD for WSGI, where the h2 library knows what it
-                # asked for.
-
-                _, _, body = await client.request("GET", "/write")
-                is_("the legacy write() callable works (%s)" % label, body,
-                    b"written and returned\n")
-
-                status, _, _ = await client.request("GET", "/nope")
-                is_("an unknown path is 404 (%s)" % label, status, 404)
-
-                # wsgi.input is a single read of the whole body, so the
-                # request cannot be dispatched on its head the way an ASGI
-                # one is: the application would find nothing to read.
-                status, _, body = await client.request("POST", "/echo",
-                                                       body=b"a body")
-                is_("a request body reaches the application (%s)" % label,
-                    (status, body), (200, b"a body"))
-
-                big = bytes(i % 251 for i in range(200000))
-                status, _, body = await client.request("POST", "/echo", body=big)
-                is_("a body larger than the window round trips (%s)" % label,
-                    (status, body == big), (200, True))
-
-                status, _, body = await client.request("POST", "/echo", body=b"")
-                is_("an empty body is still a body (%s)" % label,
-                    (status, body), (200, b""))
 
 
 async def long_lived():
@@ -774,12 +581,12 @@ async def long_lived():
             statuses = set()
             bodies = set()
             for _ in range(200):
-                status, _, body = await client.request("GET", "/")
+                status, _, body = await client.request("GET", "/user/42")
                 statuses.add(status)
                 bodies.add(body)
             is_("200 requests on one connection are all answered",
                 statuses, {200})
-            is_("and every one of them is the whole response", len(bodies), 1)
+            is_("and every one of them is the whole response", bodies, {b"42"})
 
 
 async def key_update():
@@ -796,19 +603,19 @@ async def key_update():
     with Server() as server:
         async with connect("127.0.0.1", server.port, configuration=configuration(),
                            create_protocol=Client) as client:
-            status, _, before = await client.request("GET", "/")
-            is_("a request before the update", status, 200)
+            status, _, before = await client.request("GET", "/user/keyed")
+            is_("a request before the update", (status, before), (200, b"keyed"))
 
             client._quic.request_key_update()
             client.transmit()
 
-            status, _, after = await client.request("GET", "/")
+            status, _, after = await client.request("GET", "/user/keyed")
             is_("the connection survives the update", status, 200)
             is_("and answers the same thing", after, before)
 
             # The phase stays flipped, so this one is ordinary traffic under
             # the new keys rather than the announcement itself.
-            status, _, later = await client.request("GET", "/")
+            status, _, later = await client.request("GET", "/user/keyed")
             is_("and goes on working under the new keys", status, 200)
             is_("with nothing lost in the change", later, before)
 
@@ -843,7 +650,7 @@ def http2_alt_svc(port, path):
         import h2.connection
         import h2.events
     except ImportError:
-        return None
+        return False
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
@@ -886,15 +693,11 @@ async def alt_svc():
         is_("exactly once", count, 1)
 
         value = http2_alt_svc(server.port, "/")
-        if value is None:
+        if value is False:
             print("  ..   skipped the HTTP/2 check (no h2 library)")
         else:
             is_("HTTP/2 advertises it too", value,
                 b'h3=":%d"; ma=86400' % server.port)
-
-        value, count = http1_headers(server.port, "/altsvc")
-        is_("an application's own alt-svc is left alone", value, 'h3=":9999"')
-        is_("and is not doubled", count, 1)
 
     # A separate UDP port is what the value has to name, not the TCP one.
     port = free_port()
@@ -914,9 +717,9 @@ async def main():
         return 0
     print("garuda HTTP/3 tests (%s)" % BIN)
 
-    for test in (basics, hsts, health_check, static_files, congestion, compression, request_bodies, multiplexing, cancellation, rapid_reset,
-                 spoofed_address, large_headers, response_framing, flow_control, long_lived,
-                 key_update, wsgi, alt_svc):
+    for test in (basics, hsts, health_check, static_files, congestion, compression,
+                 request_bodies, multiplexing, rapid_reset, spoofed_address,
+                 large_headers, long_lived, key_update, alt_svc):
         try:
             await test()
         except Exception:

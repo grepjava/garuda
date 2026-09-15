@@ -95,7 +95,7 @@ public enum GarudaCLI {
               --port PORT              port to bind (default 8000)
               --unix PATH              listen on a unix socket instead
               --workers N              worker processes, 0 = one per CPU (default 1)
-              --root-path PATH         SCRIPT_NAME prefix
+              --root-path PATH         mount prefix, taken off paths before routing
               --scheme http|https      scheme reported to the application
               --backlog N              listen backlog (default 2048)
               --max-connections N      concurrent connections per worker (default 4096)

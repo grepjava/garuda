@@ -31,6 +31,22 @@ extension Worker {
         encodeStatic(h2, name, value.utf8Start, value.utf8CodeUnitCount, into: &block)
     }
 
+    /// Alt-Svc, HSTS and the request ID: what `writeServerHeaders` adds to an
+    /// HTTP/1.1 head, for a response the server builds itself on a stream.
+    func encodeServerHeaders(_ slot: Int, _ h2: H2Connection, into block: inout ByteBuffer) {
+        if let altSvc = config.altSvc {
+            encodeStatic(h2, "alt-svc", altSvc, config.altSvcLength, into: &block)
+        }
+        if let hsts = config.hsts {
+            encodeStatic(h2, "strict-transport-security", hsts, config.hstsLength, into: &block)
+        }
+        let c = table[slot]
+        if config.requestID && c.pointee.requestID.readableBytes > 0 {
+            encodeStatic(h2, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
+                         c.pointee.requestID.readableBytes, into: &block)
+        }
+    }
+
     /// Emits a header block as HEADERS plus as many CONTINUATIONs as it takes.
     mutating func writeHeaderBlock(_ slot: Int, _ h2: H2Connection,
                                    block: inout ByteBuffer, endStream: Bool) {
@@ -81,6 +97,7 @@ extension Worker {
             encodeStatic(h2, "content-length", "0", into: &block)
             encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStatic(h2, "server", "garuda", into: &block)
+            encodeServerHeaders(slot, h2, into: &block)
             if retryAfter > 0 {
                 var digits = ByteBuffer()
                 defer { digits.destroy() }
@@ -131,6 +148,7 @@ extension Worker {
                      digits.readableBytes, into: &block)
         encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
         encodeStatic(h2, "server", "garuda", into: &block)
+        encodeServerHeaders(slot, h2, into: &block)
         // A HEAD response declares the length a GET would have had, and ends
         // with its headers.
         let sendBody = !c.pointee.flags.contains(.suppressBody)

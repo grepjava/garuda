@@ -9,12 +9,30 @@
 # kernel, so a limit kept per worker lets a client through N times over. The
 # rates here are per minute, so nothing refills while a check is running and
 # the counts come out exact.
+#
+# The requests go to the built-in router's GET /, which answers 200, so every
+# code other than 200 is the limiter's. Needs the release build (or GARUDA, or
+# the path as the first argument), curl, openssl, and python3 for picking free
+# ports; PORT, TLS_PORT and METRICS_PORT override them.
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
-PORT=${PORT:-8381}
-TLS_PORT=${TLS_PORT:-8382}
-METRICS_PORT=${METRICS_PORT:-8383}
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(dirname "$HERE")
+
+# N ports nothing is listening on, chosen by the kernel while all N sockets are
+# held open, so no two of them can come back the same.
+free_ports() {
+    python3 -c 'import socket, sys
+socks = [socket.socket() for _ in range(int(sys.argv[1]))]
+for s in socks: s.bind(("127.0.0.1", 0))
+print(*[s.getsockname()[1] for s in socks])' "$1"
+}
+
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+read -r FREE_PORT FREE_TLS_PORT FREE_METRICS_PORT <<< "$(free_ports 3)"
+PORT=${PORT:-$FREE_PORT}
+TLS_PORT=${TLS_PORT:-$FREE_TLS_PORT}
+METRICS_PORT=${METRICS_PORT:-$FREE_METRICS_PORT}
 WORK=$(mktemp -d)
 PASS=0
 FAIL=0
@@ -23,8 +41,6 @@ ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 
-HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(dirname "$HERE")
 # shellcheck source=scripts/serverlib.sh
 . "$HERE/serverlib.sh"
 trap 'server_stop; rm -rf "$WORK"' EXIT
@@ -32,8 +48,7 @@ trap 'server_stop; rm -rf "$WORK"' EXIT
 H="http://127.0.0.1:$PORT"
 
 start() {
-    server_start "$BIN" --port "$PORT" --log-level error "$@" \
-        --python-path "$ROOT/examples" wsgi_app:application > "$WORK/server.log" 2>&1
+    server_start "$BIN" --port "$PORT" --log-level error "$@" > "$WORK/server.log" 2>&1
     for _ in $(seq 1 80); do
         # The probe path is exempt, so waiting on it spends nothing.
         curl -sS --max-time 1 -o /dev/null "$H/healthz" 2>/dev/null && return 0
@@ -110,9 +125,11 @@ server_stop
 echo "HTTP/2 and metrics"
 openssl req -x509 -newkey rsa:2048 -keyout "$WORK/s.key" -out "$WORK/s.pem" \
     -days 2 -nodes -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+server_require_port_free "$TLS_PORT" || exit 1
+server_require_port_free "$METRICS_PORT" || exit 1
 server_start "$BIN" --port "$TLS_PORT" --log-level error --rate-limit 1/m --rate-limit-burst 1 \
     --tls-cert "$WORK/s.pem" --tls-key "$WORK/s.key" --metrics-port "$METRICS_PORT" \
-    --python-path "$ROOT/examples" wsgi_app:application > "$WORK/tls.log" 2>&1
+    > "$WORK/tls.log" 2>&1
 for _ in $(seq 1 80); do
     curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$METRICS_PORT/metrics" 2>/dev/null && break
     sleep 0.2

@@ -425,13 +425,7 @@ extension Worker {
             }
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "garuda", into: &block)
-            if let hsts = config.hsts {
-                encodeStaticH3(h3, "strict-transport-security", hsts, config.hstsLength, into: &block)
-            }
-            if config.requestID && c.pointee.requestID.readableBytes > 0 {
-                encodeStaticH3(h3, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
-                               c.pointee.requestID.readableBytes, into: &block)
-            }
+            encodeServerHeadersH3(slot, h3, into: &block)
             writeH3HeaderBlock(slot, h3, block: &block)
             endEmptyH3Response(slot, h3, parent: parent)
             return
@@ -450,13 +444,7 @@ extension Worker {
         }
         encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
         encodeStatic(h2, "server", "garuda", into: &block)
-        if let hsts = config.hsts {
-            encodeStatic(h2, "strict-transport-security", hsts, config.hstsLength, into: &block)
-        }
-        if config.requestID && c.pointee.requestID.readableBytes > 0 {
-            encodeStatic(h2, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
-                         c.pointee.requestID.readableBytes, into: &block)
-        }
+        encodeServerHeaders(slot, h2, into: &block)
         writeHeaderBlock(slot, h2, block: &block, endStream: true)
         c.pointee.flags.insert(.responseStarted)
         c.pointee.flags.insert(.responseComplete)
@@ -531,13 +519,7 @@ extension Worker {
             }
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "garuda", into: &block)
-            if let hsts = config.hsts {
-                encodeStaticH3(h3, "strict-transport-security", hsts, config.hstsLength, into: &block)
-            }
-            if config.requestID && c.pointee.requestID.readableBytes > 0 {
-                encodeStaticH3(h3, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
-                               c.pointee.requestID.readableBytes, into: &block)
-            }
+            encodeServerHeadersH3(slot, h3, into: &block)
             writeH3HeaderBlock(slot, h3, block: &block)
         } else {
             let parent = Int(c.pointee.parentSlot)
@@ -561,13 +543,7 @@ extension Worker {
             }
             encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStatic(h2, "server", "garuda", into: &block)
-            if let hsts = config.hsts {
-                encodeStatic(h2, "strict-transport-security", hsts, config.hstsLength, into: &block)
-            }
-            if config.requestID && c.pointee.requestID.readableBytes > 0 {
-                encodeStatic(h2, "x-request-id", UnsafePointer(c.pointee.requestID.readPointer),
-                             c.pointee.requestID.readableBytes, into: &block)
-            }
+            encodeServerHeaders(slot, h2, into: &block)
             writeHeaderBlock(slot, h2, block: &block, endStream: empty)
         }
 

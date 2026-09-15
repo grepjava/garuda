@@ -133,9 +133,14 @@ extension Worker {
     }
 
     /// The headers the server adds to every HTTP/1.1 response it builds
-    /// itself, a static file for one: HSTS and the request ID.
+    /// itself, a static file for one: Alt-Svc, HSTS and the request ID.
     @inline(__always)
     func writeServerHeaders(_ slot: Int, _ buf: inout ByteBuffer) {
+        if let altSvc = config.altSvc {
+            buf.write("Alt-Svc: ")
+            buf.write(altSvc, config.altSvcLength)
+            buf.writeCRLF()
+        }
         writeHSTS(&buf)
         writeRequestIDHeader(slot, &buf)
     }

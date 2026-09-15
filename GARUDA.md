@@ -50,7 +50,22 @@ The realistic target stays the top tier, level with Bun, and clearly ahead of to
 
 - **TLS is not pure Swift.** TCP TLS is OpenSSL (`Sources/CGaruda/garuda_tls.c`). The QUIC handshake is built in Swift from OpenSSL's crypto primitives (`garuda_crypto.c`).
 - **The public handler API is still thin.** Sync routes and a timer-backed `GET /delay/:ms` sit on the continuation substrate (`AsyncOps.swift`). There is no middleware, no request-view type, and no client I/O helpers yet. Router routes answer alike over HTTP/1.1, HTTP/2 and HTTP/3: `/user/:id` with its body, `/delay/:ms` after its timer, and a stream cancelled while it waits takes its timer with it (`scripts/router-streams-test.py`).
-- **WebSocket and WebTransport application APIs are stubs** until Swift handlers exist.
+- **WebSocket and WebTransport application APIs are stubs** until Swift handlers exist. HTTP/3 still advertises extended CONNECT and WebTransport in its SETTINGS; a CONNECT is refused with 501.
+- **Some flags have nothing to act on.** `--request-start-header` is parsed and never read. `--compress` has no response to compress (router responses carry no content type, static files are served pre-compressed or not at all), and `--cache-size` never stores one. `--reload` restarts workers by forking the supervisor, so a rebuilt binary is not picked up, and it watches Python-era file types.
+
+## Coverage waiting on the handler API
+
+235 end-to-end checks went with CPython, because they needed an application to answer. The engine features they covered are still in the binary, untested end to end until a handler can produce what each test needs. Each line is a capability a handler needs, and the tests that capability brings back:
+
+- **Echo the request body.** Body framing delivered byte for byte: Content-Length, chunked, pipelined, 100-continue, 1 MiB. HTTP/2 and HTTP/3 bodies larger than a frame or a window, and drip-fed ones arriving in order. Request-body backpressure, delivery in pieces, answering before an upload finishes and draining the rest, a TLS round trip.
+- **Read request headers, client address and scheme.** The request ID handed to the handler: the client's replaced, a trusted proxy's kept, untouched without the flag, over HTTP/1.1 and HTTP/2. `traceparent` passed through unchanged. `X-Request-Start` stamping. Underscore header names dropped. `X-Forwarded-For` and `Forwarded`. The https scheme, HTTP version and authority on HTTP/2 and HTTP/3, and the full set of headers received.
+- **See cancellation.** A reset HTTP/2 or HTTP/3 stream stopping the handler's work, not only a parked timer.
+- **Set status and headers.** 204 and 304 framing and keep-alive after them. A handler's Content-Length not duplicated. A handler's own `X-Request-ID`, `Strict-Transport-Security` and `Alt-Svc` kept, not doubled. A declared Content-Length enforced against a body longer or shorter: cut to length, or the stream reset.
+- **Large and streamed bodies.** Chunked framing for a stream, bodies with no declared length on HTTP/2 and HTTP/3, large writes under flow control, a window update arriving mid-response, write backpressure and memory under a slow client. `--compress`: codec choice, Content-Length removal, Vary, weak ETag, no-transform, event streams, flushing pieces, the small-body exemption, HTTP/1.0 close framing, HTTP/2.
+- **Cacheable responses.** `--cache-size`: store, hit, HEAD from a GET, 304 revalidation, retirement on unsafe methods, Age and TTL, credentials and no-cache kept out, flush on reload, hit metrics.
+- **Errors and lifecycle.** 500 when a handler throws, with the connection surviving. Start-up and shutdown hooks and their ordering after requests drain. A signal during slow start-up. Bounded shutdown against a handler that ignores cancellation. A blocking handler stalling a worker, with `X-Request-Start` taken at kernel arrival.
+- **WebSocket and WebTransport handlers.** Handshake, framing, UTF-8 checks, size limits, pings and timeouts, control frames while the handler is busy, `--ws-compress`. WebTransport sessions, streams, datagrams, close capsules.
+- **A logging API.** Level applied to handler records, level mapping, multi-line records.
 
 ## First steps
 

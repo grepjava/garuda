@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# --request-id: an X-Request-ID for every request, given to the application,
-# echoed on the response and written to the access log.
+# --request-id: an X-Request-ID for every request, echoed on the response and
+# written to the access log.
 #
 #   bash scripts/request-id-test.sh [path-to-garuda]
 #
-# GARUDA_EXTRA_ARGS adds flags, e.g. "--free-threaded".
+# Served by the built-in router over TLS, with a static file beside it, so the
+# only requirements are the release binary, curl and openssl. What the
+# application is handed cannot be seen from here: the router does not echo
+# request headers.
+#
+# GARUDA_EXTRA_ARGS adds flags, e.g. "--workers 4".
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
-PORT=${PORT:-8251}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+PORT=${PORT:-19311}
 # shellcheck disable=SC2206 -- deliberately split into words.
 EXTRA=(${GARUDA_EXTRA_ARGS:-})
 WORK=$(mktemp -d)
@@ -34,12 +40,10 @@ UUID='^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
 S="https://127.0.0.1:$PORT"
 
 start() {
-    local app=$1
-    shift
     server_start "$BIN" --port "$PORT" --workers 2 --log-level info \
         --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" \
         --static-dir "/static=$WORK/static" "${EXTRA[@]}" "$@" \
-        --python-path "$HERE" "$app" > "$WORK/server.log" 2>&1
+        > "$WORK/server.log" 2>&1
     for _ in $(seq 1 100); do
         curl -sk -o /dev/null "$S/" && return 0
         sleep 0.1
@@ -57,17 +61,14 @@ fetch() {
 }
 # The X-Request-ID values on the last response, one per line.
 response_ids() { grep -i '^x-request-id:' "$WORK/head.txt" | sed 's/^[^:]*: *//'; }
-# What the application said it was handed: "n=1 id=...".
-app_saw() { cat "$WORK/body"; }
 
 server_require_port_free "$PORT" || exit 1
 
 echo "an ID for every request"
-start request_id_apps:asgi_app --request-id --access-log
+start --request-id --access-log
 fetch --http1.1 "$S/"
 first=$(response_ids)
 like "the response carries a UUID" "$first" "$UUID"
-is "the application was handed the same one, once" "$(app_saw)" "n=1 id=$first"
 fetch --http1.1 "$S/"
 second=$(response_ids)
 if [ -n "$second" ] && [ "$second" != "$first" ]; then
@@ -75,18 +76,12 @@ if [ -n "$second" ] && [ "$second" != "$first" ]; then
 else
     bad "the next request gets a different one" "not $first" "$second"
 fi
-fetch --http2 "$S/"
-h2=$(response_ids)
-like "HTTP/2 responses carry one too" "$h2" "$UUID"
-is "and the application sees it" "$(app_saw)" "n=1 id=$h2"
+fetch --http2 "$S/user/7"
+like "HTTP/2 responses carry one too" "$(response_ids)" "$UUID"
 fetch --http1.1 "$S/static/site.css"
 like "a static file carries one" "$(response_ids)" "$UUID"
-fetch --http1.1 "$S/own-id"
-is "an application's own X-Request-ID is kept, not doubled" "$(response_ids)" "from-the-app"
 fetch --http1.1 -H "X-Request-ID: client-chosen-id" "$S/"
-replaced=$(response_ids)
-like "an ID from a client that is not a trusted proxy is replaced" "$replaced" "$UUID"
-is "and the application sees only the replacement" "$(app_saw)" "n=1 id=$replaced"
+like "an ID from a client that is not a trusted proxy is replaced" "$(response_ids)" "$UUID"
 sleep 0.3
 if grep -q "$first" "$WORK/server.log"; then
     ok "the access log has the ID"
@@ -96,10 +91,9 @@ fi
 server_stop
 
 echo "behind a trusted proxy"
-start request_id_apps:asgi_app --request-id --forwarded-allow-ips 127.0.0.1
+start --request-id --forwarded-allow-ips 127.0.0.1
 fetch --http1.1 -H "X-Request-ID: proxy-7f3a.42" "$S/"
 is "the proxy's ID is kept" "$(response_ids)" "proxy-7f3a.42"
-is "and reaches the application" "$(app_saw)" "n=1 id=proxy-7f3a.42"
 fetch --http1.1 -H "X-Request-ID: has spaces in it" "$S/"
 like "one with characters an ID should not have is replaced" "$(response_ids)" "$UUID"
 long=$(printf 'a%.0s' $(seq 1 200))
@@ -107,38 +101,24 @@ fetch --http1.1 -H "X-Request-ID: $long" "$S/"
 like "and so is one too long to be an ID" "$(response_ids)" "$UUID"
 server_stop
 
-echo "WSGI"
-start request_id_apps:wsgi_app --request-id --access-log --access-log-format json
-fetch --http1.1 "$S/"
-wid=$(response_ids)
-like "a WSGI response carries a UUID" "$wid" "$UUID"
-is "and HTTP_X_REQUEST_ID matches it" "$(app_saw)" "n=1 id=$wid"
-fetch --http2 -H "X-Request-ID: client-chosen-id" "$S/"
-wid2=$(response_ids)
-is "a client's ID is replaced in the environ too" "$(app_saw)" "n=1 id=$wid2"
-fetch --http1.1 "$S/own-id"
-is "a WSGI application's own X-Request-ID is kept" "$(response_ids)" "from-the-app"
+echo "JSON access log"
+start --request-id --access-log --access-log-format json
+fetch --http2 -H "X-Request-ID: client-chosen-id" "$S/user/json"
+jid=$(response_ids)
+like "a client's ID is replaced over HTTP/2 as well" "$jid" "$UUID"
 sleep 0.3
-if grep -q "\"request_id\":\"$wid\"" "$WORK/server.log"; then
+if grep -q "\"request_id\":\"$jid\"" "$WORK/server.log"; then
     ok "the JSON access log has a request_id field"
 else
-    bad "the JSON access log has a request_id field" "\"request_id\":\"$wid\"" \
+    bad "the JSON access log has a request_id field" "\"request_id\":\"$jid\"" \
         "$(grep -m1 '"method"' "$WORK/server.log")"
 fi
 server_stop
 
-start request_id_apps:wsgi_app --request-id --wsgi-threads 4
-fetch --http1.1 "$S/"
-pid=$(response_ids)
-like "a pooled WSGI response carries one" "$pid" "$UUID"
-is "and the pooled application sees it" "$(app_saw)" "n=1 id=$pid"
-server_stop
-
 echo "without --request-id"
-start request_id_apps:asgi_app
+start
 fetch --http1.1 -H "X-Request-ID: client-chosen-id" "$S/"
 is "nothing is added to the response" "$(response_ids)" ""
-is "and the client's header reaches the application untouched" "$(app_saw)" "n=1 id=client-chosen-id"
 server_stop
 
 echo

@@ -3,10 +3,15 @@
 #
 #   bash scripts/reload-test.sh [path-to-garuda]
 #
-# Hammers the server with short-lived connections, sends SIGHUP underneath the
-# load, and fails if a single connection was refused, reset, truncated or timed
-# out. The workers are checked to have actually been replaced, because a reload
-# that quietly did nothing would otherwise pass.
+# Hammers the built-in router with short-lived connections, sends SIGHUP
+# underneath the load, and fails if a single connection was refused, reset,
+# truncated or timed out. The workers are checked to have actually been
+# replaced, because a reload that quietly did nothing would otherwise pass.
+# Needs the release binary, curl and python3 (for the load generator).
+#
+# Which worker served a request is read from the access log, whose lines carry
+# the serving worker's pid. Each request that is to be attributed goes to a
+# GET /user/:id path of its own kind, so its lines can be picked out.
 #
 # What it is guarding: workers used to be signalled all at once, and a draining
 # worker stopped polling its listener while still holding it open. The socket
@@ -20,16 +25,16 @@
 # the replacement is spawned before the worker it replaces is asked to stop.
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
 EXTRA=${GARUDA_EXTRA_ARGS:-}
-PORT=${PORT:-8311}
+PORT=${PORT:-19341}
 WORKERS=${WORKERS:-4}
 SECONDS_OF_LOAD=${SECONDS_OF_LOAD:-12}
 CLIENTS=${CLIENTS:-16}
 RELOADS=${RELOADS:-3}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(dirname "$HERE")
 LOG=${TMPDIR:-/tmp}/garuda-reload-$PORT.log
 PASS=0
 FAIL=0
@@ -45,8 +50,7 @@ server_require_port_free "$PORT" || exit 1
 
 # shellcheck disable=SC2086 -- EXTRA is a deliberate word-split flag list.
 server_start "$BIN" --port "$PORT" --workers "$WORKERS" --log-level info \
-    --python-path "$ROOT/examples" $EXTRA wsgi_app:application \
-    > "$LOG" 2>&1
+    --access-log $EXTRA > "$LOG" 2>&1
 
 for _ in $(seq 1 60); do
     curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null && break
@@ -58,18 +62,30 @@ if ! curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; t
     exit 1
 fi
 
-# The workers serving before the reload. Sampled rather than read from the log
-# so that this measures what a client can actually reach.
-sample_pids() {
-    local n=$1 i=0 seen=""
-    while [ "$i" -lt "$n" ]; do
-        seen="$seen $(curl -sS --max-time 2 "http://127.0.0.1:$PORT/pid" 2>/dev/null)"
-        i=$((i + 1))
+# The distinct worker pids on the access lines for GET /user/<prefix>..., once
+# the log has caught up with them.
+pids_for() {
+    local prefix=$1 want=$2 got
+    for _ in $(seq 1 30); do
+        got=$(grep -c "GET /user/$prefix" "$LOG")
+        [ "$got" -ge "$want" ] && break
+        sleep 0.1
     done
-    echo "$seen" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | xargs
+    grep "GET /user/$prefix" "$LOG" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u | tr '\n' ' ' | xargs
 }
 
-BEFORE=$(sample_pids $((WORKERS * 8)))
+# The workers serving before the reload. Sampled with requests rather than read
+# from the startup lines so that this measures what a client can actually reach.
+sample_pids() {
+    local prefix=$1 n=$2 i=0
+    while [ "$i" -lt "$n" ]; do
+        curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$PORT/user/$prefix-$i" 2>/dev/null
+        i=$((i + 1))
+    done
+    pids_for "$prefix-" "$n"
+}
+
+BEFORE=$(sample_pids before $((WORKERS * 8)))
 echo "  workers before: $BEFORE"
 
 # Load first, reloads underneath it.
@@ -89,7 +105,7 @@ done
 
 wait "$LOAD_PID"
 
-AFTER=$(sample_pids $((WORKERS * 8)))
+AFTER=$(sample_pids after $((WORKERS * 8)))
 echo "  workers after:  $AFTER"
 
 python3 - "$RESULT" <<'PY'
@@ -101,12 +117,12 @@ print("  requests: %d ok, %d refused, %d reset, %d timeout, %d truncated, other=
          data["truncated"], data["other"] or "{}"))
 print("  latency:  p50 %sms  p99 %sms  p99.9 %sms  max %sms"
       % (data["p50_ms"], data["p99_ms"], data["p999_ms"], data["max_ms"]))
-print("  served by %d distinct workers" % len(data["pids"]))
 PY
 
 BAD=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["refused"]+d["reset"]+d["timeout"]+d["truncated"]+sum(d["other"].values()))' "$RESULT")
 SERVED=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["ok"])' "$RESULT")
-DISTINCT=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["pids"]))' "$RESULT")
+DISTINCT=$(pids_for load "$SERVED" | wc -w)
+echo "  served by $DISTINCT distinct workers"
 
 if [ "$SERVED" -lt 100 ]; then
     bad "the load actually ran" "only $SERVED requests completed"
@@ -134,10 +150,9 @@ fi
 # More distinct pids over the run than were serving at the start is the overlap
 # itself showing up: old and new were both taking requests.
 #
-# Counted from what was observed rather than from $WORKERS, because the two
-# execution models answer "how many processes" differently: --free-threaded
-# serves every worker from threads of one process, so a generation is one pid
-# there and $WORKERS of them otherwise.
+# Counted from what was observed rather than from $WORKERS, because the sample
+# before the load is a handful of fresh connections, which SO_REUSEPORT is not
+# obliged to spread across every worker.
 BEFORE_COUNT=$(echo "$BEFORE" | wc -w)
 if [ "$DISTINCT" -gt "$BEFORE_COUNT" ]; then
     ok "old and new workers both served during the handover ($DISTINCT distinct pids)"
@@ -147,8 +162,8 @@ else
 fi
 
 # Losing nothing is not the whole of it: retiring a worker before its
-# replacement is serving stalls the slot for as long as an interpreter takes to
-# boot, which is an outage that reports itself as latency rather than as errors.
+# replacement is serving stalls the slot for as long as a worker takes to start,
+# which is an outage that reports itself as latency rather than as errors.
 # The bound is loose on purpose -- it is there to catch the handover regressing
 # to "signal first, hope second", which measured just over a second, not to pin
 # a number that depends on the machine. Idle p99.9 here is about 12ms.

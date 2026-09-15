@@ -3,11 +3,15 @@
 #
 #   bash scripts/drain-test.sh [path-to-garuda]
 #
-# GARUDA_EXTRA_ARGS adds flags, e.g. "--free-threaded".
+# Served by the built-in router with two workers, so the only requirements are
+# the release binary and curl.
+#
+# GARUDA_EXTRA_ARGS adds flags, e.g. "--keep-alive 1000".
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
-PORT=${PORT:-8231}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+PORT=${PORT:-19331}
 # shellcheck disable=SC2206 -- deliberately split into words.
 EXTRA=(${GARUDA_EXTRA_ARGS:-})
 WORK=$(mktemp -d)
@@ -19,7 +23,6 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   %
 is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(dirname "$HERE")
 # shellcheck source=scripts/serverlib.sh
 . "$HERE/serverlib.sh"
 trap 'server_stop; rm -rf "$WORK"' EXIT
@@ -31,8 +34,7 @@ start() {
     local log=$1
     shift
     server_start "$BIN" --port "$PORT" --workers 2 --log-level info \
-        --health-check-path /healthz "${EXTRA[@]}" "$@" \
-        --python-path "$ROOT/examples" asgi_app:app > "$log" 2>&1
+        --health-check-path /healthz "${EXTRA[@]}" "$@" > "$log" 2>&1
     for _ in $(seq 1 100); do
         [ "$(code /healthz)" = 200 ] && return 0
         sleep 0.1
@@ -72,7 +74,7 @@ t0=$(ms)
 kill -TERM "$SERVER_PID"
 sleep 0.4
 is "every worker fails its health check at once" "$(all_probes 503)" 503
-is "and the application is still served" "$(code /)" 200
+is "and the router is still served" "$(code /)" 200
 is "on a connection the server closes after the response" \
    "$(curl -si --max-time 5 "http://127.0.0.1:$PORT/" | tr -d '\r' | grep -ci '^connection: close')" 1
 sleep 1
@@ -142,24 +144,6 @@ else
 fi
 is "and the new workers pass their health check" "$(all_probes 200)" 200
 server_stop
-
-echo "a signal that arrives while the workers are still starting"
-for sig in TERM INT; do
-    server_start "$BIN" --port "$PORT" --workers 2 --log-level warning "${EXTRA[@]}" \
-        --python-path "$HERE" slow_import_app:app > "$WORK/boot.log" 2>&1
-    # Well inside the import's 1.5s sleep: the workers have forked and have not
-    # reached their poll loops.
-    sleep 0.5
-    t0=$(ms)
-    kill -"$sig" "$SERVER_PID"
-    took=$(exit_after "$t0")
-    if [ "$took" -lt 5000 ]; then
-        ok "SIG$sig during start-up is not lost (${took}ms)"
-    else
-        bad "SIG$sig during start-up is not lost" "under 5000ms, not the kill deadline" "${took}ms"
-    fi
-    server_stop
-done
 
 echo "without --drain-delay nothing changes"
 start "$WORK/plain.log"

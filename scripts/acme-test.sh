@@ -7,15 +7,34 @@
 # DNS so that every test domain resolves to 127.0.0.1. Nothing here is mocked:
 # the server registers an account, answers tls-alpn-01 on its own port, gets a
 # certificate signed by pebble, and reloads onto it -- and the checks are made
-# by clients that trust only pebble's root.
+# by clients that trust only pebble's root, asking the built-in router for
+# /user/:id so that the id coming back shows the request was answered.
 #
 # PEBBLE_DIR points at the unpacked release binaries (default ~/pebble). Pebble
 # rejects a tenth of nonces here on purpose, which is what exercises the
-# client's retry.
+# client's retry. Needs no network: pebble, its DNS and the server all run on
+# 127.0.0.1, on ports the kernel picks (python3 does the picking). Also needs
+# the release build (or GARUDA, or the path as the first argument), curl and
+# openssl.
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
-PORT=${PORT:-8443}
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(dirname "$HERE")
+
+# N ports nothing is listening on, chosen by the kernel while all N sockets are
+# held open, so no two of them can come back the same.
+free_ports() {
+    python3 -c 'import socket, sys
+socks = [socket.socket() for _ in range(int(sys.argv[1]))]
+for s in socks: s.bind(("127.0.0.1", 0))
+print(*[s.getsockname()[1] for s in socks])' "$1"
+}
+
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+# The server's port is also where pebble sends its tls-alpn-01 validation, so
+# pebble is told it; the rest are pebble's and challtestsrv's own.
+read -r FREE_PORT ACME_PORT ACME_MGMT_PORT ACME_HTTP_PORT DNS_PORT DNS_MGMT_PORT <<< "$(free_ports 6)"
+PORT=${PORT:-$FREE_PORT}
 PEBBLE_DIR=${PEBBLE_DIR:-$HOME/pebble}
 PEBBLE=$(find "$PEBBLE_DIR" -type f -name pebble | head -1)
 CHALLTESTSRV=$(find "$PEBBLE_DIR" -type f -name pebble-challtestsrv | head -1)
@@ -27,8 +46,6 @@ ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 
-HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(dirname "$HERE")
 # shellcheck source=scripts/serverlib.sh
 . "$HERE/serverlib.sh"
 
@@ -70,11 +87,11 @@ openssl x509 -req -in "$WORK/pebble.csr" -CA "$WORK/ca.pem" -CAkey "$WORK/ca.key
 cat > "$WORK/pebble.json" <<JSON
 {
   "pebble": {
-    "listenAddress": "127.0.0.1:14000",
-    "managementListenAddress": "127.0.0.1:15000",
+    "listenAddress": "127.0.0.1:$ACME_PORT",
+    "managementListenAddress": "127.0.0.1:$ACME_MGMT_PORT",
     "certificate": "$WORK/pebble.pem",
     "privateKey": "$WORK/pebble.key",
-    "httpPort": 5002,
+    "httpPort": $ACME_HTTP_PORT,
     "tlsPort": $PORT,
     "ocspResponderURL": "",
     "externalAccountBindingRequired": false
@@ -82,15 +99,15 @@ cat > "$WORK/pebble.json" <<JSON
 }
 JSON
 
-"$CHALLTESTSRV" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dnsserver 127.0.0.1:8053 \
-    -http01 "" -https01 "" -tlsalpn01 "" -doh "" -management 127.0.0.1:8055 \
+"$CHALLTESTSRV" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dnsserver "127.0.0.1:$DNS_PORT" \
+    -http01 "" -https01 "" -tlsalpn01 "" -doh "" -management "127.0.0.1:$DNS_MGMT_PORT" \
     > "$WORK/challtestsrv.log" 2>&1 &
 PIDS="$PIDS $!"
 PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=10 "$PEBBLE" -config "$WORK/pebble.json" \
-    -dnsserver 127.0.0.1:8053 > "$WORK/pebble.log" 2>&1 &
+    -dnsserver "127.0.0.1:$DNS_PORT" > "$WORK/pebble.log" 2>&1 &
 PIDS="$PIDS $!"
 for _ in $(seq 1 50); do
-    curl -s --cacert "$WORK/ca.pem" -o /dev/null https://127.0.0.1:14000/dir && break
+    curl -s --cacert "$WORK/ca.pem" -o /dev/null "https://127.0.0.1:$ACME_PORT/dir" && break
     sleep 0.2
 done
 
@@ -99,8 +116,8 @@ start() {
     server_start "$BIN" --port "$PORT" --workers 2 --log-level info \
         --acme-domain app.test --acme-domain www.app.test \
         --acme-email ops@app.test --acme-cache "$CACHE" \
-        --acme-directory https://127.0.0.1:14000/dir --acme-ca-bundle "$WORK/ca.pem" \
-        --python-path "$ROOT/examples" wsgi_app:application > "$1" 2>&1
+        --acme-directory "https://127.0.0.1:$ACME_PORT/dir" --acme-ca-bundle "$WORK/ca.pem" \
+        > "$1" 2>&1
 }
 wait_for_log() {
     for _ in $(seq 1 "$3"); do
@@ -125,16 +142,16 @@ else
         "$(tail -5 "$WORK/first.log" | tr '\n' '|')"
 fi
 
-curl -s --cacert "$WORK/ca.pem" https://127.0.0.1:15000/roots/0 > "$WORK/root.pem"
-curl -s --cacert "$WORK/ca.pem" https://127.0.0.1:15000/intermediates/0 >> "$WORK/root.pem"
+curl -s --cacert "$WORK/ca.pem" "https://127.0.0.1:$ACME_MGMT_PORT/roots/0" > "$WORK/root.pem"
+curl -s --cacert "$WORK/ca.pem" "https://127.0.0.1:$ACME_MGMT_PORT/intermediates/0" >> "$WORK/root.pem"
 
 case "$(issuer app.test)" in
     *Pebble*) ok "app.test is served a certificate pebble issued" ;;
     *) bad "app.test is served a certificate pebble issued" "issuer=...Pebble..." "$(issuer app.test)" ;;
 esac
-is "a client trusting only pebble reaches the application" \
+is "a client trusting only pebble has its request answered" \
    "$(curl -sS --max-time 10 --cacert "$WORK/root.pem" --resolve "app.test:$PORT:127.0.0.1" \
-        "https://app.test:$PORT/")" "hello from garuda"
+        "https://app.test:$PORT/user/acme")" "acme"
 is "and so does the second name" \
    "$(curl -sS --max-time 10 --cacert "$WORK/root.pem" --resolve "www.app.test:$PORT:127.0.0.1" \
         -o /dev/null -w '%{http_code}' "https://www.app.test:$PORT/")" "200"

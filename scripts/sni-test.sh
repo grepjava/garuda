@@ -7,10 +7,28 @@
 # rule for a name nothing claims, which is to answer with the first certificate
 # and let the client decide. Refusing the connection instead would replace a
 # browser warning the user can read with a failure they cannot.
+#
+# Behind the certificates is the built-in router, whose /user/:id answers with
+# the id, to show that a connection made this way still gets its request
+# answered. Needs the release build (or GARUDA, or the path as the first
+# argument), curl, openssl, and python3 for picking a free port; PORT overrides
+# it.
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/debug/garuda}}
-PORT=${PORT:-8341}
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(dirname "$HERE")
+
+# N ports nothing is listening on, chosen by the kernel while all N sockets are
+# held open, so no two of them can come back the same.
+free_ports() {
+    python3 -c 'import socket, sys
+socks = [socket.socket() for _ in range(int(sys.argv[1]))]
+for s in socks: s.bind(("127.0.0.1", 0))
+print(*[s.getsockname()[1] for s in socks])' "$1"
+}
+
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+PORT=${PORT:-$(free_ports 1)}
 WORK=$(mktemp -d)
 PASS=0
 FAIL=0
@@ -19,8 +37,6 @@ ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 
-HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(dirname "$HERE")
 # shellcheck source=scripts/serverlib.sh
 . "$HERE/serverlib.sh"
 server_trap_cleanup
@@ -44,7 +60,6 @@ server_start "$BIN" --port "$PORT" --workers 2 --log-level info \
     --tls-cert "$WORK/alpha.pem" --tls-key "$WORK/alpha.key" \
     --tls-cert "$WORK/beta.pem"  --tls-key "$WORK/beta.key" \
     --tls-cert "$WORK/star.pem"  --tls-key "$WORK/star.key" \
-    --python-path "$ROOT/examples" wsgi_app:application \
     > "$WORK/server.log" 2>&1
 
 for _ in $(seq 1 60); do
@@ -78,7 +93,7 @@ is "matching is case-insensitive"             "$(served_for BETA.Example)"      
 
 # The point of all this is that the server still serves.
 is "requests are still answered" \
-   "$(curl -sS -k --max-time 5 "https://127.0.0.1:$PORT/")" "hello from garuda"
+   "$(curl -sS -k --max-time 5 "https://127.0.0.1:$PORT/user/sni")" "sni"
 
 # ALPN has to survive the context swap: SSL_set_SSL_CTX carries almost nothing
 # over, so a certificate chosen by SNI must still negotiate HTTP/2.

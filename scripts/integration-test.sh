@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# End-to-end checks against a running server, for both protocols.
+# End-to-end checks against the built-in router over HTTP/1.1.
 #
 #   bash scripts/integration-test.sh [path-to-garuda]
 #
-# Exercises framing, keep-alive, pipelining, chunked transfer in both
-# directions, large bodies, error paths and the request-smuggling defences.
+# Exercises framing, keep-alive, pipelining, request bodies both by length and
+# chunked, 100-continue, concurrent timed requests, the health check path and
+# the request-smuggling defences. Every check is answered by the router's fixed
+# routes (GET /, GET /user/:id, POST /user, GET /delay/:ms, 404 for the rest),
+# so nothing beyond the release binary is needed. Needs curl and nc.
 set -u
 
-BIN=${1:-${GARUDA:-$HOME/pgbuild/release/garuda}}
-# Extra server flags, so the same suite can be pointed at a different execution
-# model without a second copy of it:
-#   GARUDA_EXTRA_ARGS="--workers 4 --free-threaded" bash scripts/integration-test.sh
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN=${1:-${GARUDA:-$ROOT/.build/release/garuda}}
+# Extra server flags, so the same suite can be pointed at a different
+# configuration without a second copy of it:
+#   GARUDA_EXTRA_ARGS="--workers 4" bash scripts/integration-test.sh
 EXTRA=${GARUDA_EXTRA_ARGS:-}
-WSGI_PORT=8301
-ASGI_PORT=8302
+PORT=${PORT:-19301}
 PASS=0
 FAIL=0
 
@@ -30,17 +33,16 @@ cleanup() { server_stop; }
 server_trap_cleanup
 
 start() {
-    local port=$1 app=$2
+    local port=$1
     cleanup
     # shellcheck disable=SC2086 -- EXTRA is a deliberate word-split flag list.
-    server_start "$BIN" --port "$port" --log-level error \
-        --python-path examples $EXTRA "$app" \
+    server_start "$BIN" --port "$port" --log-level error $EXTRA \
         > "/tmp/garuda-it-$port.log" 2>&1
     for _ in $(seq 1 50); do
         curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
         sleep 0.2
     done
-    echo "server failed to start: $app"
+    echo "server failed to start"
     cat "/tmp/garuda-it-$port.log"
     exit 1
 }
@@ -61,162 +63,69 @@ raw() {  # raw request bytes -> response
     printf '%b' "$2" | $TIMEOUT ${TIMEOUT:+5} nc 127.0.0.1 "$1"
 }
 
-# ---------------------------------------------------------------- WSGI ------
-echo "WSGI ($BIN)"
-start $WSGI_PORT wsgi_app:application
-H="http://127.0.0.1:$WSGI_PORT"
+server_require_port_free "$PORT" || exit 1
 
-is "GET / body" "$(curl -sS --max-time 5 $H/)" "hello from garuda"
+# -------------------------------------------------------------- HTTP/1.1 ----
+echo "HTTP/1.1 ($BIN)"
+start "$PORT"
+H="http://127.0.0.1:$PORT"
+
+is "GET / is 200 with an empty body" \
+   "$(curl -sS -o /dev/null -w '%{http_code}:%{size_download}' --max-time 5 $H/)" "200:0"
+is "GET /user/:id answers the id" "$(curl -sS --max-time 5 $H/user/round-trip)" "round-trip"
 is "404 status" "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 $H/nope)" "404"
-is "500 on app exception" "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 $H/boom)" "500"
-is "POST echo" "$(curl -sS --max-time 5 -d 'round trip' $H/echo)" "round trip"
+is "POST with a Content-Length body" \
+   "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -d 'round trip' $H/user)" "200"
 is "chunked request" \
-   "$(curl -sS --max-time 5 -H 'Transfer-Encoding: chunked' --data-binary 'chunky' $H/echo)" \
-   "chunky"
-is "100-continue" "$(curl -sS --max-time 5 -H 'Expect: 100-continue' -d 'continued' $H/echo)" \
-   "continued"
-is "legacy write() plus iterable" "$(curl -sS --max-time 5 $H/write)" "written and returned"
-# write() sends the head before the application returns, so there is no return
-# value to measure and the framing has to be chunked.
-is "legacy write() forces chunked framing" \
-   "$(curl -sS -i --max-time 5 $H/write | grep -ci '^transfer-encoding: chunked')" "1"
-is "legacy write() streams both blocks" \
-   "$(curl -sS --max-time 8 $H/slowwrite?0.2 | tr -d '\n')" "firstsecond"
+   "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -H 'Transfer-Encoding: chunked' --data-binary 'chunky' $H/user)" \
+   "200"
+# curl sends the body anyway after a second without an interim response, so the
+# status alone would pass against a server that ignores Expect; the 100 has to
+# be on the wire.
+is "100-continue" \
+   "$(curl -sS -i --max-time 5 -H 'Expect: 100-continue' -d 'continued' $H/user | tr -d '\r' | grep '^HTTP/' | tr '\n' ' ')" \
+   "HTTP/1.1 100 Continue HTTP/1.1 200 OK "
 is "exactly one Content-Length" \
-   "$(curl -sS -i --max-time 5 $H/ | grep -ci '^content-length')" "1"
-is "a 204 has no Content-Length" \
-   "$(curl -sS -i --max-time 5 $H/nocontent | grep -ci '^content-length')" "0"
-is "a 304 keeps the Content-Length the application gave" \
-   "$(curl -sS -i --max-time 5 $H/notmodified | grep -i '^content-length' | tr -d '\r' | awk '{print $2}')" "5"
-is "and the connection carries on after both" \
-   "$(curl -sS --max-time 5 -o /dev/null -o /dev/null -o /dev/null -w '%{http_code}:%{num_connects} ' $H/nocontent $H/notmodified $H/)" \
-   "204:1 304:0 200:0 "
-is "chunked response for a generator" \
-   "$(curl -sS -i --max-time 5 $H/stream | grep -ci '^transfer-encoding: chunked')" "1"
-is "generator body" "$(curl -sS --max-time 5 $H/stream | tr '\n' ' ')" \
-   "chunk-0 chunk-1 chunk-2 chunk-3 chunk-4 "
-is "large response size" \
-   "$(curl -sS --max-time 10 -o /dev/null -w '%{size_download}' "$H/big?250000")" "250000"
+   "$(curl -sS -i --max-time 5 $H/user/one | grep -ci '^content-length')" "1"
+# HEAD is answered wherever GET is: its head has to describe the body a GET
+# would get, and no body may follow it.
 is "HEAD sends no body but keeps the length" \
-   "$(curl -sS -I --max-time 5 $H/ | grep -i '^content-length' | tr -d '\r' | awk '{print $2}')" "21"
+   "$(raw $PORT 'HEAD /user/abc HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | tr -d '\r' | awk 'BEGIN{h=1} h&&tolower($1)=="content-length:"{l=$2} h&&$0==""{h=0;next} !h{b=b $0} END{print l ":" length(b)}')" \
+   "3:0"
 is "keep-alive reuses the connection" \
-   "$(curl -sS --max-time 5 -o /dev/null -o /dev/null -o /dev/null -w '%{num_connects}' $H/ $H/ $H/)" \
+   "$(curl -sS --max-time 5 -o /dev/null -o /dev/null -o /dev/null -w '%{num_connects}' $H/ $H/user/1 $H/)" \
    "100"
-is "pipelined requests all answered" \
-   "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from garuda')" \
-   "3"
+is "pipelined requests all answered, in order" \
+   "$(raw $PORT 'GET /user/pipe-1 HTTP/1.1\r\nHost: x\r\n\r\nGET /user/pipe-2 HTTP/1.1\r\nHost: x\r\n\r\nGET /user/pipe-3 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -o 'pipe-[0-9]' | tr '\n' ' ')" \
+   "pipe-1 pipe-2 pipe-3 "
 # Regression: per-request state must not leak into the next pipelined request.
-is "pipelined POSTs keep their own bodies" \
-   "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nAAAPOST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\nBBB' | tr -d '\r' | grep -c -e AAA -e BBB)" \
-   "2"
+# A body read short or long leaves the next request line misframed, so the
+# request after the bodies is the one that shows it.
+is "pipelined POSTs consume exactly their own bodies" \
+   "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nAAAPOST /user HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nBBBGET /user/third HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | tr -d '\r' | grep -o -e '^HTTP/1.1 [0-9]*' -e 'third$' | tr '\n' ' ')" \
+   "HTTP/1.1 200 HTTP/1.1 200 HTTP/1.1 200 third "
+is "and so does a pipelined chunked POST" \
+   "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nchunky\r\n0\r\n\r\nGET /user/after HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | tr -d '\r' | grep -o -e '^HTTP/1.1 [0-9]*' -e 'after$' | tr '\n' ' ')" \
+   "HTTP/1.1 200 HTTP/1.1 200 after "
 
-# megabyte round trips
+# Megabyte uploads. The router discards the body, so what shows it was read to
+# the end is the next request on the same connection being answered.
 head -c 1048576 /dev/urandom > /tmp/pg-upload.bin
-curl -sS --max-time 30 --data-binary @/tmp/pg-upload.bin -o /tmp/pg-dl1.bin $H/echo
-if cmp -s /tmp/pg-upload.bin /tmp/pg-dl1.bin; then ok "1 MiB Content-Length round trip"
-else bad "1 MiB Content-Length round trip" "identical" "differs"; fi
-curl -sS --max-time 30 -H 'Transfer-Encoding: chunked' --data-binary @/tmp/pg-upload.bin \
-     -o /tmp/pg-dl2.bin $H/echo
-if cmp -s /tmp/pg-upload.bin /tmp/pg-dl2.bin; then ok "1 MiB chunked round trip"
-else bad "1 MiB chunked round trip" "identical" "differs"; fi
+is "1 MiB Content-Length upload, then the connection carries on" \
+   "$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}:%{num_connects} ' --data-binary @/tmp/pg-upload.bin $H/user \
+        --next -o /dev/null -w '%{http_code}:%{num_connects} ' $H/user/after)" \
+   "200:1 200:0 "
+is "1 MiB chunked upload, then the connection carries on" \
+   "$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}:%{num_connects} ' -H 'Transfer-Encoding: chunked' --data-binary @/tmp/pg-upload.bin $H/user \
+        --next -o /dev/null -w '%{http_code}:%{num_connects} ' $H/user/after)" \
+   "200:1 200:0 "
+rm -f /tmp/pg-upload.bin
 
-echo "WSGI hardening"
-has "missing Host is rejected" "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\n\r\n')" "400"
-has "Content-Length + Transfer-Encoding is rejected" \
-    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')" \
-    "400"
-has "space before colon is rejected" \
-    "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\nFoo : bar\r\n\r\n')" "400"
-has "obs-fold is rejected" \
-    "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\n  folded\r\n\r\n')" "400"
-# A lone `gzip` leaves chunked out of the list, so the body cannot be framed at
-# all: RFC 9112 6.3 asks for 400 there, and reserves 501 for the case where
-# chunked is final but wraps a coding the server cannot remove.
-has "unknown transfer coding is rejected" \
-    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n')" "400"
-has "chunked under an unknown coding is a 501" \
-    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n')" \
-    "501"
-has "a coding that merely ends in chunked is rejected" \
-    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n')" \
-    "400"
-has "chunked before another coding is rejected" \
-    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n')" \
-    "400"
-has "a repeated Transfer-Encoding is rejected" \
-    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')" \
-    "400"
-has "a second Host header is rejected" \
-    "$(raw $WSGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n')" "400"
-has "a chunked trailer section is accepted" \
-    "$(raw $WSGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: 1\r\n\r\n')" \
-    "hello"
-# Trailers decode to no body, so the body limit never grows while they arrive:
-# without a ceiling of their own a peer could stream them for as long as it
-# liked and hold a connection, a slot and a read buffer for free.
-TRAILERS=""
-for _ in $(seq 1 1000); do
-    TRAILERS="${TRAILERS}X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"
-done
-has "a trailer section past the head limit is rejected" \
-    "$(raw $WSGI_PORT "POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n${TRAILERS}\r\n")" \
-    "431"
-is "underscore headers are dropped (HTTP_X_A spoofing)" \
-   "$(curl -sS --max-time 5 -H 'X_Spoofed: 1' $H/env | grep -c 'X_SPOOFED')" "0"
-
-# ---------------------------------------------------------------- ASGI ------
-echo
-echo "ASGI"
-start $ASGI_PORT asgi_app:app
-H="http://127.0.0.1:$ASGI_PORT"
-
-is "GET / body" "$(curl -sS --max-time 5 $H/)" "hello from garuda asgi"
-is "404 status" "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 $H/nope)" "404"
-is "500 on app exception" "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 $H/boom)" "500"
-is "POST echo" "$(curl -sS --max-time 5 -d 'asgi round trip' $H/echo)" "asgi round trip"
-is "chunked request" \
-   "$(curl -sS --max-time 5 -H 'Transfer-Encoding: chunked' --data-binary 'chunky asgi' $H/echo)" \
-   "chunky asgi"
-is "lifespan startup ran" \
-   "$(curl -sS --max-time 5 $H/scope | python3 -c 'import json,sys; print(json.load(sys.stdin)["startup_ran"])')" \
-   "True"
-is "lifespan state reaches the request scope" \
-   "$(curl -sS --max-time 5 $H/scope | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"]["shared"])')" \
-   "from-lifespan"
-is "scope headers are lowercased bytes" \
-   "$(curl -sS --max-time 5 -H 'X-Mixed-Case: v' $H/scope | python3 -c 'import json,sys; print("x-mixed-case" in json.load(sys.stdin)["headers"])')" \
-   "True"
-is "explicit content-length is not duplicated" \
-   "$(curl -sS -i --max-time 5 $H/fixed | grep -ci '^content-length')" "1"
-is "a 204 has no Content-Length" \
-   "$(curl -sS -i --max-time 5 $H/nocontent | grep -ci '^content-length')" "0"
-is "a 304 keeps the Content-Length the application gave" \
-   "$(curl -sS -i --max-time 5 $H/notmodified | grep -i '^content-length' | tr -d '\r' | awk '{print $2}')" "5"
-is "and the connection carries on after both" \
-   "$(curl -sS --max-time 5 -o /dev/null -o /dev/null -o /dev/null -w '%{http_code}:%{num_connects} ' $H/nocontent $H/notmodified $H/)" \
-   "204:1 304:0 200:0 "
-is "streaming response" "$(curl -sS --max-time 5 $H/stream | tr '\n' ' ')" \
-   "chunk-0 chunk-1 chunk-2 chunk-3 chunk-4 "
-is "large response size" \
-   "$(curl -sS --max-time 10 -o /dev/null -w '%{size_download}' "$H/big?500000")" "500000"
-is "pipelined requests all answered" \
-   "$(raw $ASGI_PORT 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from garuda asgi')" \
-   "3"
-# Regression: an ASGI connection must reset bodyDelivered between requests, or
-# the second receive() on a reused connection parks forever.
-is "pipelined POSTs keep their own bodies" \
-   "$(raw $ASGI_PORT 'POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nAAAPOST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\nBBB' | tr -d '\r' | grep -c -e AAA -e BBB)" \
-   "2"
-
-curl -sS --max-time 30 --data-binary @/tmp/pg-upload.bin -o /tmp/pg-dl3.bin $H/echo
-if cmp -s /tmp/pg-upload.bin /tmp/pg-dl3.bin; then ok "1 MiB Content-Length round trip"
-else bad "1 MiB Content-Length round trip" "identical" "differs"; fi
-
-# Concurrency: 20 requests that each sleep 250ms must overlap.
+# Concurrency: 20 requests that each wait 250ms must overlap.
 start_ms=$(date +%s%N)
 pids=""
 for _ in $(seq 1 20); do
-    curl -sS --max-time 10 -o /dev/null $H/sleep &
+    curl -sS --max-time 10 -o /dev/null $H/delay/250 &
     pids="$pids $!"
 done
 # Wait only on the clients: a bare `wait` would also block on the server, which
@@ -226,25 +135,68 @@ elapsed=$(( ($(date +%s%N) - start_ms) / 1000000 ))
 if [ "$elapsed" -lt 2000 ]; then ok "20 concurrent 250ms requests overlap (${elapsed}ms)"
 else bad "concurrency" "<2000ms" "${elapsed}ms"; fi
 
+echo "hardening"
+has "missing Host is rejected" "$(raw $PORT 'GET / HTTP/1.1\r\n\r\n')" "400"
+has "Content-Length + Transfer-Encoding is rejected" \
+    "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')" \
+    "400"
+has "space before colon is rejected" \
+    "$(raw $PORT 'GET / HTTP/1.1\r\nHost: x\r\nFoo : bar\r\n\r\n')" "400"
+has "obs-fold is rejected" \
+    "$(raw $PORT 'GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\n  folded\r\n\r\n')" "400"
+# A lone `gzip` leaves chunked out of the list, so the body cannot be framed at
+# all: RFC 9112 6.3 asks for 400 there, and reserves 501 for the case where
+# chunked is final but wraps a coding the server cannot remove.
+has "unknown transfer coding is rejected" \
+    "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n')" "400"
+has "chunked under an unknown coding is a 501" \
+    "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n')" \
+    "501"
+has "a coding that merely ends in chunked is rejected" \
+    "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n')" \
+    "400"
+has "chunked before another coding is rejected" \
+    "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n')" \
+    "400"
+has "a repeated Transfer-Encoding is rejected" \
+    "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')" \
+    "400"
+has "a second Host header is rejected" \
+    "$(raw $PORT 'GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n')" "400"
+has "a chunked trailer section is accepted" \
+    "$(raw $PORT 'POST /user HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: 1\r\n\r\n')" \
+    "HTTP/1.1 200 OK"
+# Trailers decode to no body, so the body limit never grows while they arrive:
+# without a ceiling of their own a peer could stream them for as long as it
+# liked and hold a connection, a slot and a read buffer for free.
+TRAILERS=""
+for _ in $(seq 1 1000); do
+    TRAILERS="${TRAILERS}X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"
+done
+has "a trailer section past the head limit is rejected" \
+    "$(raw $PORT "POST /user HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n${TRAILERS}\r\n")" \
+    "431"
+
 # ------------------------------------------------- health check path --------
 # Answered in the worker, so the interesting cases are the ones where it must
 # NOT answer: a different path, and a method that is not a read. Both have to
-# reach the application, or the flag has quietly taken a route away from it.
+# reach the router, which has no such route and says 404; a 200 would mean the
+# flag had quietly taken the path over.
 EXTRA="$EXTRA --health-check-path /healthz"
-start "$WSGI_PORT" wsgi_app:application
-HB="http://127.0.0.1:$WSGI_PORT"
+start "$PORT"
+HB="http://127.0.0.1:$PORT"
 
 is "health path answers 200"          "$(curl -sS -o /dev/null -w '%{http_code}' $HB/healthz)"      "200"
 is "health path has an empty body"    "$(curl -sS -o /dev/null -w '%{size_download}' $HB/healthz)"  "0"
 is "health path ignores the query"    "$(curl -sS -o /dev/null -w '%{http_code}' "$HB/healthz?probe=1")" "200"
 is "health path answers HEAD"         "$(curl -sS -I -o /dev/null -w '%{http_code}' $HB/healthz)"   "200"
-is "POST to it reaches the app"       "$(curl -sS -X POST -o /dev/null -w '%{http_code}' $HB/healthz)" "404"
-is "a longer path reaches the app"    "$(curl -sS -o /dev/null -w '%{http_code}' $HB/healthzz)"     "404"
-is "a prefix of it reaches the app"   "$(curl -sS -o /dev/null -w '%{http_code}' $HB/health)"       "404"
-is "the application still answers"    "$(curl -sS $HB/)"  "hello from garuda"
+is "POST to it reaches the router"    "$(curl -sS -X POST -o /dev/null -w '%{http_code}' $HB/healthz)" "404"
+is "a longer path reaches the router" "$(curl -sS -o /dev/null -w '%{http_code}' $HB/healthzz)"     "404"
+is "a prefix of it reaches the router" "$(curl -sS -o /dev/null -w '%{http_code}' $HB/health)"      "404"
+is "the router still answers"         "$(curl -sS $HB/user/still-here)"  "still-here"
 # Answering without dispatching must not break the connection for what follows.
 is "keep-alive survives a probe" \
-   "$(raw $WSGI_PORT 'GET /healthz HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'hello from garuda')" \
+   "$(raw $PORT 'GET /healthz HTTP/1.1\r\nHost: x\r\n\r\nGET /user/after-probe HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | grep -c 'after-probe')" \
    "1"
 
 # ------------------------------------------------------------- summary ------
