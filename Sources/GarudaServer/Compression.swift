@@ -24,8 +24,8 @@ import GarudaHTTP
 
 /// One response body's compressor, or nothing.
 ///
-/// A plain struct holding a C handle, so that it can live in a connection slot
-/// and a WSGI job alike. Copies share the handle; whoever holds the last one
+/// A plain struct holding a C handle, so that it can live in a connection
+/// slot. Copies share the handle; whoever holds the last one
 /// calls `destroy`.
 public struct ResponseEncoder {
     public private(set) var coding: ContentCoding = .identity
@@ -154,25 +154,5 @@ extension Worker {
         c.pointee.acceptedCoding = config.compress
             ? requestAcceptEncoding(slot).choose(codingUsable)
             : .identity
-    }
-
-    /// Compresses one ASGI body message onto the connection. False when the
-    /// compressor failed, which leaves no way to finish the message.
-    mutating func encodeBody(_ slot: Int, _ p: UnsafePointer<UInt8>?, _ n: Int,
-                             more: Bool, finishing: Bool) -> Bool {
-        let c = table[slot]
-        let chunked = c.pointee.flags.contains(.chunkedResponse)
-        var encoder = c.pointee.encoder
-        var out = c.pointee.write
-        var ok = true
-        if n > 0, let p {
-            ok = encoder.encode(p, n, flush: more && !finishing, into: &out, chunked: chunked)
-        }
-        if ok && finishing {
-            ok = encoder.finish(into: &out, chunked: chunked)
-        }
-        c.pointee.write = out
-        c.pointee.encoder = encoder
-        return ok
     }
 }

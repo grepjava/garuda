@@ -137,8 +137,7 @@ static uint64_t self_owner(void) {
 
 /* Whether the writer a claim names is gone. Only its absence counts: a
  * process that exists, or that this one may not signal, may still be
- * writing. Every thread of a free-threaded server shares one ID, and one of
- * them cannot die without the rest. */
+ * writing. */
 static int owner_gone(uint64_t owner, uint64_t self) {
     if (owner == self) return 0;
     if (owner == 0) return 1;

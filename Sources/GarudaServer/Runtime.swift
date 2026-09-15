@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 // Process model and worker start-up.
 //
-// One process per worker, each with its own interpreter and its own poller.
+// One process per worker, each with its own poller and its own connection slab.
 //
 // The supervisor creates the listening sockets and the workers inherit them
 // across fork. How many there are depends on the address family:
@@ -24,15 +24,11 @@
 // flight on it, because the kernel chooses the socket when the SYN arrives
 // rather than when accept() is called.
 //
-// Threads are not used for request handling in ASGI mode: with an event loop
-// and a GIL there is nothing for a second thread to do. WSGI is different --
-// see WSGIPool -- because a synchronous application blocks on its own I/O.
-//
-// `--free-threaded` changes that premise rather than that conclusion. On a
-// CPython built without the GIL (PEP 703) the workers become threads of one
-// process instead of processes, each still owning its own poller, connection
-// slab and event loop -- so nothing above the transport learns that it has
-// company. See FreeThreaded.swift.
+// Threads are not used for request handling. A worker answers from its own
+// poller loop: routes are matched and answered by a synchronous call
+// (Router.swift), and a handler that has to wait parks a continuation on its
+// connection slot (AsyncOps.swift) instead of holding a thread, so there is
+// nothing for a second thread to do.
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
@@ -63,8 +59,8 @@ public enum Garuda {
     static func start(_ config: ServerConfig, inherited: inout Reexec?) -> Int32 {
         Log.level = config.logLevel
         Log.pid = Int(pg_getpid())
-        // Inside python (garuda._native) the process is named "python" until
-        // told otherwise, and every worker forked from here inherits the name.
+        // The short name top and pkill match on, set once here so that every
+        // worker forked from here inherits it. See pg_set_process_name.
         pg_set_process_name("garuda")
         pg_ignore_sigpipe()
         let limit = pg_raise_nofile_limit()
@@ -190,15 +186,12 @@ public enum Garuda {
             }
         }
 
-        // Everything runs under a supervisor, including a single worker and
-        // including --free-threaded, where the supervisor has one child that
-        // holds every worker as a thread of itself.
+        // Everything runs under a supervisor, including a single worker.
         //
-        // It used to be skipped in both of those cases, which cost one process
-        // and lost SIGHUP: the reload is the supervisor replacing a child, so
-        // with no supervisor there was nothing to reload into and the signal
-        // did nothing at all. A lone worker ignores SIGHUP, and so does the
-        // free-threaded thread supervisor -- silently, in both cases, which is
+        // It used to be skipped in that case, which cost one process and lost
+        // SIGHUP: the reload is the supervisor replacing a child, so with no
+        // supervisor there was nothing to reload into and the signal did
+        // nothing at all. A lone worker ignores SIGHUP -- silently, which is
         // the worst way for a certbot deploy hook to fail.
         return runSupervisor(config,
                              workers: max(1, workerCount),
@@ -316,9 +309,7 @@ public enum Garuda {
     // MARK: - Supervisor
 
     /// `workers` is how many children the supervisor watches; `listeners` is how
-    /// many listening sockets to create. They differ under `--free-threaded`,
-    /// where one child holds every worker as a thread and therefore wants every
-    /// socket.
+    /// many listening sockets to create, one per worker slot.
     static func runSupervisor(_ config: ServerConfig, workers: Int,
                               listeners listenerCount: Int,
                               inherited: inout Reexec?) -> Int32 {
@@ -406,9 +397,7 @@ public enum Garuda {
         // Metrics slots come in pairs, so that a worker and the replacement
         // overlapping it never write to the same one -- see `pg_metrics_init`.
         // `metricsSlotOf[i]` is the slot the worker currently in `i` was given,
-        // and a handover takes the other half of the pair. Under
-        // --free-threaded it is a base rather than a slot: the child's threads
-        // take `base + their own index`.
+        // and a handover takes the other half of the pair.
         let metricsSlotOf = UnsafeMutablePointer<Int>.allocate(capacity: workers)
         defer { metricsSlotOf.deallocate() }
         for i in 0..<workers { metricsSlotOf[i] = i }
@@ -550,7 +539,7 @@ public enum Garuda {
         // replacement is actually accepting the old one is the only thing
         // serving that slot. Retiring it first does not drop connections --
         // the socket belongs to the supervisor -- but it does leave the slot's
-        // accept queue unserved for as long as an interpreter takes to boot.
+        // accept queue unserved for as long as a worker takes to start.
         var handoverSlot = -1
         var handoverOld: pid_t = 0
         var handoverReadyFD: Int32 = -1
@@ -561,7 +550,7 @@ public enum Garuda {
         ///
         /// Generous, because the wait is safe: the worker being replaced is
         /// still serving throughout it. This only bounds the case of a
-        /// replacement that is alive but never finishes importing, where the
+        /// replacement that is alive but never finishes starting, where the
         /// alternative is a reload that was asked for and never happened.
         let readyTimeoutMs: UInt64 = 60_000
 
@@ -600,10 +589,10 @@ public enum Garuda {
         /// Replaces the slot at `restartCursor`, then advances. One slot is in
         /// flight at a time: the whole point is that somebody is always
         /// listening, and that holds with one spare worker just as well as with
-        /// a second full set, at a fraction of the memory. A worker is an
-        /// interpreter with the application imported into it, so doubling the
-        /// process count for the length of a reload is not free on the kind of
-        /// application that most wants zero-downtime reloads.
+        /// a second full set, at a fraction of the memory. Every worker has
+        /// its own connection slab and buffer pool, so doubling the process
+        /// count for the length of a reload is not free on the kind of server
+        /// that most wants zero-downtime reloads.
         func advanceRestart() {
             while restartCursor >= 0 && restartCursor < workers {
                 let i = restartCursor
@@ -701,7 +690,7 @@ public enum Garuda {
         while alive > 0 {
             // A pending handover is the one thing this loop waits on that is
             // not a signal, and the wait is measured in the tens of
-            // milliseconds an interpreter takes to boot, so the idle quarter
+            // milliseconds a worker takes to start, so the idle quarter
             // second would be most of the delay it exists to remove. The same
             // goes for a --reload notification waiting for a save to settle.
             let waitMs: Int32 = handoverReadyFD >= 0 || watcher?.checkSoon == true ? 5 : 250
@@ -949,12 +938,6 @@ public enum Garuda {
 
         // Not plain fork: a signal that arrived before the child had a pipe of
         // its own was lost. See pg_fork_worker.
-        //
-        // Inside python (garuda._native) this process already has an
-        // interpreter, and a fork behind its back hands the child the parent's
-        // locks and thread states mid-flight. The hooks are the ones os.fork()
-        // calls; before an interpreter exists, as in the executable, they do
-        // nothing.
         let pid = pg_fork_worker()
         if pid < 0 {
             Log.error("fork failed")

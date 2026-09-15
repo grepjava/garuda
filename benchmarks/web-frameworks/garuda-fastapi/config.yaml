@@ -1,6 +1,0 @@
-framework:
-  website: fastapi.tiangolo.com
-  version: 0.141
-
-  engines:
-    - garuda

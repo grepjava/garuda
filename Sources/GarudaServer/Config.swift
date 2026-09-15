@@ -20,7 +20,7 @@ public struct ServerConfig {
     public var ipv6Only = false
 
     // --- concurrency ---
-    /// Worker processes. Each gets its own interpreter, its own poller and,
+    /// Worker processes. Each gets its own poller, its own connection slab and,
     /// via SO_REUSEPORT, its own accept queue -- so there is no shared lock and
     /// no thundering herd. 0 means "one per CPU".
     public var workers = 1
@@ -36,13 +36,14 @@ public struct ServerConfig {
     public var maxBodySize = 16 * 1024 * 1024
     /// Response bytes buffered before the worker starts applying backpressure.
     public var writeHighWaterMark = 512 * 1024
-    /// Buffered bytes an ASGI producer must fall back to before `await send()`
-    /// completes again. Resuming at the high water mark would wake the producer
-    /// for every single socket write; a gap gives it a whole batch to refill.
+    /// Buffered bytes a producer held at the high water mark must fall back to
+    /// before it is resumed. Resuming at the high water mark would wake the
+    /// producer for every single socket write; a gap gives it a whole batch to
+    /// refill.
     public var writeLowWaterMark = 128 * 1024
-    /// Request bytes buffered ahead of an ASGI application before the worker
-    /// stops reading the socket. An application that streams an upload without
-    /// reading it as fast as it arrives should cost TCP window, not memory.
+    /// Request bytes buffered ahead of the application before the worker stops
+    /// reading the socket. An upload that arrives faster than it is taken
+    /// should cost TCP window, not memory.
     public var bodyHighWaterMark = 256 * 1024
     /// Requests per connection before a polite close, to bound memory growth
     /// from long-lived keep-alive clients.
@@ -229,7 +230,7 @@ public struct ServerConfig {
     /// A path the server answers itself, with 200 and an empty body, or nil.
     ///
     /// For an orchestrator's liveness probe. It is answered in the worker
-    /// before anything reaches Python, which is the point: a probe that runs
+    /// before the request reaches the router, which is the point: a probe that runs
     /// through the application measures the application, so it goes unanswered
     /// exactly when every worker is busy -- and an orchestrator reads an
     /// unanswered liveness probe as a process to kill. This one says the
@@ -245,9 +246,9 @@ public struct ServerConfig {
     /// It is the header APM agents -- New Relic, Datadog, Scout -- read to
     /// report queue time, and queue time is the one part of a request's
     /// latency no middleware can measure: it is everything that happened
-    /// before the application was called. A worker busy with the request
-    /// before, a WSGI thread pool with every thread taken, an event loop
-    /// behind on callbacks -- all of it shows up here and nowhere else.
+    /// before the application was called. A worker busy with the requests
+    /// ahead of it, a connection waiting in the accept queue -- all of it
+    /// shows up here and nowhere else.
     public var requestStartHeader = false
     /// Give every request an `X-Request-ID`: hand it to the application, echo
     /// it on the response and put it in the access log, so that a line in the

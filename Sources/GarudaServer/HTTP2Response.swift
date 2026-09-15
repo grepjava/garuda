@@ -9,7 +9,7 @@
 //
 // Body bytes are not written here at all. They go into the stream's own write
 // buffer and become DATA frames in `flushStream`, which is what lets flow
-// control and the existing `await send()` backpressure apply to them.
+// control and the write high water mark apply to them.
 //===----------------------------------------------------------------------===//
 
 import CGaruda

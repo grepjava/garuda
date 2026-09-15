@@ -4,7 +4,7 @@
 // Resumable at any byte boundary, so a chunk header split across two TCP
 // segments costs nothing extra. Data is never copied here: the decoder hands
 // the caller a pointer into the read buffer and the caller decides whether that
-// becomes a Python bytes object or is streamed straight through.
+// is buffered or streamed straight through.
 //===----------------------------------------------------------------------===//
 
 import GarudaCore

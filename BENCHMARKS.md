@@ -143,12 +143,10 @@ entry and level, with every run. It needs:
 ([benchmarks/elysia-bun/](benchmarks/elysia-bun/)) as a reference. It needs
 [Bun](https://bun.sh) and port 3000.
 
-The other harnesses in `benchmarks/` predate the fork: `async_fw.sh`,
-`body_sizes.sh`, `django_fastapi.sh`, `eagercmp.sh`, `free_threaded.sh`,
-`gil_vs_ft.sh`, `granian.sh`, `memory.sh`, `run.sh`, `syscalls.sh`,
-`turbo_ab.sh`, and `frameworks.sh`'s Python frameworks, all start Python
-applications, which Garuda no longer serves. `static_files.sh` starts
-`scripts/request_id_apps.py`, which has been deleted.
+The other harnesses Peregrine had in `benchmarks/` (A/B builds, body sizes,
+memory, syscalls, static files, the Python framework comparisons) all started
+Python applications and have been removed. They come back, where still worth
+having, once the handler API can serve what they measured.
 
 ---
 

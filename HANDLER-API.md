@@ -1,6 +1,6 @@
 # Handler API: design for approval
 
-Status: proposal, 2026-09-15. Nothing here is built. Once approved, it is built in the phases at the end, each one landing with the tests it brings back from GARUDA.md's "Coverage waiting on the handler API" list.
+Status: approved 2026-09-15, with the recommended answer to each decision at the end. Phase 1 is in progress. Each phase lands with the tests it brings back from GARUDA.md's "Coverage waiting on the handler API" list.
 
 ## What it has to keep
 
@@ -106,7 +106,7 @@ A handler that cannot finish does not return a future. It asks the substrate to 
 
 ## Where it lives
 
-- **`Sources/Garuda`, a new target.** It holds the public API and is the only module applications import. The `Garuda` library product moves to it. `GarudaServer` stays the engine, with its internals `internal` or `package`.
+- **`GarudaServer`, the engine's own target.** The public API (`Routes`, `Request`, `Response`, `Garuda.serve`) lives beside the engine it drives, and the `Garuda` library product keeps pointing at it. A separate module named `Garuda` would collide with the `Garuda` enum every application calls, and splitting the API out would put a module boundary on the per-request path. The engine's own types stay `internal` wherever the API does not need them.
 - **`Sources/garuda`.** It keeps serving the-benchmarker contract, rebuilt on the public API, so the benchmark measures the API applications will use.
 - **`Sources/GarudaConformance`, a second executable.** It holds the routes the end-to-end tests need: echo, a header dump, status and header setters, streaming, a throwing route, WebSocket echo, WebTransport echo. The retired checks come back as scripts against it.
 
@@ -138,7 +138,7 @@ A phase does not land if it costs the router contract more than 5% on GARUDA.md'
 6. **WebTransport handlers.**
    - Brings back: the WebTransport half.
 
-## Decisions wanted
+## Decisions (taken: the recommended option in each)
 
 1. **Continuations now, `async`/`await` later.**
    - Recommended: handlers suspend through the continuation calls above. Calling an `async` function from the worker's synchronous loop needs a `Task`, which is the hop this design exists to avoid.

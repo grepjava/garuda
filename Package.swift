@@ -1,7 +1,7 @@
 // swift-tools-version: 6.1
 import PackageDescription
 
-// Garuda — a pure-Swift web framework. No Foundation, no CPython.
+// Garuda — a pure-Swift web framework. No Foundation.
 
 let sharedSwiftSettings: [SwiftSetting] = [
     .swiftLanguageMode(.v6),

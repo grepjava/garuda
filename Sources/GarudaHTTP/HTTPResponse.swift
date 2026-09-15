@@ -2,9 +2,9 @@
 // Response serialisation.
 //
 // Headers are emitted straight into the connection write buffer as bytes. There
-// is no intermediate header collection, no dictionary, and no String: the WSGI
-// and ASGI layers hand over pointers into Python-owned memory and those bytes
-// are memcpy-ed once into the outgoing buffer.
+// is no intermediate header collection, no dictionary, and no String: callers
+// hand over pointers and those bytes are memcpy-ed once into the outgoing
+// buffer.
 //===----------------------------------------------------------------------===//
 
 import GarudaCore
@@ -38,15 +38,6 @@ public enum HTTPResponseWriter {
         buf.writeDecimal(status)
         buf.writeByte(cSP)
         buf.write(reason(status))
-        buf.writeCRLF()
-    }
-
-    /// Status line where the application supplied its own reason phrase (WSGI
-    /// hands us `"200 OK"` as one opaque string).
-    @inlinable
-    public static func writeStatusLine(_ buf: inout ByteBuffer, raw: ByteSpan) {
-        buf.write("HTTP/1.1 ")
-        buf.write(raw)
         buf.writeCRLF()
     }
 

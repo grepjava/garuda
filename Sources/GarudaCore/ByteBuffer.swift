@@ -224,7 +224,7 @@ public struct ByteBuffer {
     }
 
     /// Records bytes written directly into `writePointer` (by read(2), or by a
-    /// memcpy out of Python-owned memory).
+    /// memcpy from memory the caller owns).
     @inlinable
     public mutating func advanceWriter(_ n: Int) { writerIndex &+= n }
 
@@ -235,7 +235,7 @@ public struct ByteBuffer {
     }
 
     /// Reserves `n` bytes and hands back the destination so a caller can write
-    /// straight into the buffer (read(2), memcpy from Python) with no staging.
+    /// straight into the buffer (read(2), memcpy) with no staging.
     @inlinable
     public mutating func withWritableBytes(_ n: Int,
                                            _ body: (UnsafeMutablePointer<UInt8>) -> Int) {

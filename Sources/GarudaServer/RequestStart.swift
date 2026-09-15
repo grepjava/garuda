@@ -4,9 +4,9 @@
 // A request's latency has two parts, and middleware can only see one of them.
 // Everything from the application being called to it returning is visible to
 // a tracer running inside it. Everything before -- the worker finishing the
-// request ahead of this one, a WSGI pool with no thread free, an event loop
-// behind on its callbacks -- happened before any of the application's code
-// ran, and is invisible to it unless the server says when it started.
+// requests ahead of this one, a connection waiting in the accept queue --
+// happened before any of the application's code ran, and is invisible to it
+// unless the server says when it started.
 //
 // `X-Request-Start: t=<microseconds>` is how a proxy traditionally says so, and
 // what New Relic, Datadog and Scout read to report queue time. The server adds

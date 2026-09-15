@@ -18,7 +18,7 @@ import GarudaCore
 public enum GarudaCLI {
 
     /// Parses `argv` and runs the server, returning the exit status rather than
-    /// exiting, so that a python hosting the server unwinds the normal way.
+    /// exiting, so that the caller decides how the process ends.
     public static func main(argc: Int,
                             argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32 {
         @inline(__always)
@@ -96,7 +96,8 @@ public enum GarudaCLI {
               --unix PATH              listen on a unix socket instead
               --workers N              worker processes, 0 = one per CPU (default 1)
               --root-path PATH         mount prefix, taken off paths before routing
-              --scheme http|https      scheme reported to the application
+              --scheme http|https      scheme taken as the request's, behind a proxy
+                                       that terminates TLS (keys --cache-size)
               --backlog N              listen backlog (default 2048)
               --max-connections N      concurrent connections per worker (default 4096)
               --max-body BYTES         largest accepted request body (default 16 MiB)
@@ -148,14 +149,15 @@ public enum GarudaCLI {
               --ws-max-message BYTES   largest accepted WebSocket message (16 MiB)
               --ws-ping-interval MS    keepalive ping period, 0 to disable (20000)
               --ws-ping-timeout MS     how long an unanswered ping may go (20000)
-              --ws-max-queue N         messages buffered for a slow app (default 32)
-              --ws-max-queue-bytes N   bytes buffered for a slow app (default 4 MiB)
+              --ws-max-queue N         messages buffered for a slow handler (default 32)
+              --ws-max-queue-bytes N   bytes buffered for a slow handler (4 MiB)
               --ws-compress            negotiate permessage-deflate with WebSocket
                                        clients that offer it
+                                       (the --ws-* settings have no effect until
+                                       WebSocket handlers exist)
               --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
-                                       without calling the application (repeatable).
-                                       A path with no file behind it still reaches
-                                       the application
+                                       before routing (repeatable). A path with no
+                                       file behind it still reaches the routes
               --rate-limit RATE        refuse a client with 429 past RATE requests, as
                                        in 100/s, 600/m or 5000/h; counted across all
                                        workers, by the forwarded address behind a
@@ -163,28 +165,29 @@ public enum GarudaCLI {
               --rate-limit-burst N     requests allowed at once before the rate
                                        applies (default: the count in RATE)
               --cache-size MIB         answer repeated GETs from a cache shared by
-                                       every worker, for responses the application
-                                       marks fresh with Cache-Control s-maxage or
-                                       max-age; read CONFIG.md first
+                                       every worker, for responses a handler marks
+                                       fresh with Cache-Control s-maxage or max-age;
+                                       read CONFIG.md first (nothing is stored yet)
               --cache-max-object KIB   largest body the cache keeps (default 1024)
               --cache-ttl-max SECONDS  longest a response is kept (default 300)
-              --compress               compress application responses (br, zstd or
-                                       gzip, as the client accepts) when their type
-                                       is text-like; read CONFIG.md about BREACH first
+              --compress               compress handler responses (br, zstd or gzip,
+                                       as the client accepts) when their type is
+                                       text-like; read CONFIG.md about BREACH first
+                                       (router responses have no type to compress yet)
               --compress-min-size N    leave bodies declared smaller than this as they
                                        are (default 1024)
               --compress-static        serve FILE.br, FILE.zst or FILE.gz beside a
                                        --static-dir file to clients that accept it
-              --request-start-header   give the application X-Request-Start: t=<usec>
-                                       for when the request arrived, for APM agents
-                                       that report queue time
+              --request-start-header   give handlers X-Request-Start: t=<usec> for
+                                       when the request arrived, for APM agents that
+                                       report queue time (no handler reads it yet)
               --request-id             give every request an X-Request-ID, echoed on
                                        the response and in the access log; one from a
                                        --forwarded-allow-ips proxy is kept
               --trace-context          record a request's W3C traceparent, its trace
                                        and parent span IDs, in the access log
-              --health-check-path P    answer P with 200 in the server, without
-                                       calling the application (e.g. /healthz)
+              --health-check-path P    answer P with 200 before routing (e.g.
+                                       /healthz)
               --access-log             log one line per request
               --access-log-format F    text (default) or json; implies --access-log
               --metrics-port PORT      serve Prometheus metrics on this port
@@ -203,7 +206,7 @@ public enum GarudaCLI {
             _ = pg_write(1, usage.utf8Start, usage.utf8CodeUnitCount)
         }
 
-        let version: StaticString = "garuda 1.1.5"
+        let version: StaticString = "garuda 0.1.0-dev"
 
         func printVersion() {
             var buf = [UInt8](repeating: 0, count: 64)

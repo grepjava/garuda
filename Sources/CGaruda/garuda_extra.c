@@ -2,13 +2,9 @@
  * HTTP-only server did not need:
  *
  *   - address parsing, for matching a peer against the trusted-proxy list;
- *   - pthread wrappers behind opaque handles, so Swift never has to see
- *     pthread_mutex_t (whose size and alignment differ per platform);
  *   - SHA-1 and base64, required by the WebSocket opening handshake;
- *   - a few file and environment helpers for --reload and virtualenv lookup.
- *
- * The pthread wrappers are the only place in the server where more than one
- * thread exists, and they exist solely for the optional WSGI thread pool.
+ *   - a few file, environment and executable helpers for --reload;
+ *   - the current worker's thread-local, and the shutdown watchdog.
  */
 
 #define _GNU_SOURCE 1
@@ -17,7 +13,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,11 +70,6 @@ int pg_parse_ip(const char *s, unsigned char out16[16], int *family) {
 int pg_unlink(const char *path) { return unlink(path); }
 
 const char *pg_getenv(const char *name) { return getenv(name); }
-
-int pg_path_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 ? 1 : 0;
-}
 
 int64_t pg_mtime_ns(const char *path) {
     struct stat st;
@@ -191,114 +181,15 @@ int pg_execv(const char *path, char *const argv[]) {
 }
 
 /* ======================================================================== */
-/* Threads                                                                  */
+/* Current worker                                                           */
 /* ======================================================================== */
 
-struct pg_mutex { pthread_mutex_t m; };
-struct pg_cond  { pthread_cond_t c; };
-
-pg_mutex *pg_mutex_new(void) {
-    pg_mutex *m = (pg_mutex *)malloc(sizeof *m);
-    if (!m) return NULL;
-    if (pthread_mutex_init(&m->m, NULL) != 0) { free(m); return NULL; }
-    return m;
-}
-void pg_mutex_free(pg_mutex *m) {
-    if (!m) return;
-    pthread_mutex_destroy(&m->m);
-    free(m);
-}
-void pg_mutex_lock(pg_mutex *m)   { pthread_mutex_lock(&m->m); }
-void pg_mutex_unlock(pg_mutex *m) { pthread_mutex_unlock(&m->m); }
-
-pg_cond *pg_cond_new(void) {
-    pg_cond *c = (pg_cond *)malloc(sizeof *c);
-    if (!c) return NULL;
-    pthread_condattr_t attr;
-    pthread_condattr_init(&attr);
-#if defined(CLOCK_MONOTONIC) && !defined(__APPLE__)
-    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-#endif
-    if (pthread_cond_init(&c->c, &attr) != 0) {
-        pthread_condattr_destroy(&attr);
-        free(c);
-        return NULL;
-    }
-    pthread_condattr_destroy(&attr);
-    return c;
-}
-void pg_cond_free(pg_cond *c) {
-    if (!c) return;
-    pthread_cond_destroy(&c->c);
-    free(c);
-}
-void pg_cond_wait(pg_cond *c, pg_mutex *m) { pthread_cond_wait(&c->c, &m->m); }
-void pg_cond_signal(pg_cond *c)            { pthread_cond_signal(&c->c); }
-void pg_cond_broadcast(pg_cond *c)         { pthread_cond_broadcast(&c->c); }
-
-struct thread_start { void (*fn)(void *); void *arg; };
-
-static void *thread_trampoline(void *raw) {
-    struct thread_start s = *(struct thread_start *)raw;
-    free(raw);
-    /* Worker threads must never take delivery of a process signal: the signal
-     * pipe belongs to the loop thread, and a handler running here would report
-     * a wakeup nobody is waiting for. */
-    sigset_t all;
-    sigfillset(&all);
-    pthread_sigmask(SIG_BLOCK, &all, NULL);
-    s.fn(s.arg);
-    return NULL;
-}
-
-int pg_thread_spawn(void (*fn)(void *), void *arg) {
-    struct thread_start *s = (struct thread_start *)malloc(sizeof *s);
-    if (!s) return -1;
-    s->fn = fn;
-    s->arg = arg;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&attr, 1u << 21);   /* 2 MiB is plenty per request */
-    pthread_t tid;
-    int rc = pthread_create(&tid, &attr, thread_trampoline, s);
-    pthread_attr_destroy(&attr);
-    if (rc != 0) { free(s); errno = rc; return -1; }
-    return 0;
-}
-
-struct pg_thread { pthread_t tid; };
-
-pg_thread *pg_thread_start(void (*fn)(void *), void *arg) {
-    pg_thread *t = (pg_thread *)malloc(sizeof *t);
-    if (!t) return NULL;
-    struct thread_start *s = (struct thread_start *)malloc(sizeof *s);
-    if (!s) { free(t); return NULL; }
-    s->fn = fn;
-    s->arg = arg;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    /* A worker thread runs an interpreter and an application, not one request
-     * frame; it gets the same 8 MiB a main thread would have. */
-    pthread_attr_setstacksize(&attr, 1u << 23);
-    int rc = pthread_create(&t->tid, &attr, thread_trampoline, s);
-    pthread_attr_destroy(&attr);
-    if (rc != 0) { free(s); free(t); errno = rc; return NULL; }
-    return t;
-}
-
-void pg_thread_join(pg_thread *t) {
-    if (!t) return;
-    pthread_join(t->tid, NULL);
-    free(t);
-}
-
-/* The current thread's Worker. See the comment in garuda_sys.h.
+/* The current Worker. See the comment in garuda_sys.h.
  *
- * initial-exec keeps that a register-relative load when the server is a shared
- * object loaded into python (garuda._native). Left to the default, a
- * dlopen()ed library reads a thread-local through a call to __tls_get_addr; in
- * an executable the two compile to the same instruction. */
+ * initial-exec keeps that a register-relative load even if this object is ever
+ * linked into a shared library, where the default model reads a thread-local
+ * through a call to __tls_get_addr; in an executable the two compile to the
+ * same instruction. */
 static _Thread_local void *g_current_worker __attribute__((tls_model("initial-exec"))) = NULL;
 
 void *pg_worker_current(void) { return g_current_worker; }
@@ -418,12 +309,11 @@ int pg_is_dir(const char *path) {
 /* Shutdown watchdog                                                        */
 /* ======================================================================== */
 
-/* Cancellation is cooperative all the way down: a task can catch
- * CancelledError, a C extension can sit in a syscall, and a third-party
- * library can block on a lock nobody will release. Every layer above this one
- * has a deadline, but a deadline is only a promise if something enforces it.
- * SIGALRM does, from outside the interpreter, with _exit rather than exit so
- * that no atexit handler or interpreter finaliser can wedge it in turn. */
+/* Shutting down is cooperative all the way down: a peer can stall a write and
+ * a library call can sit in a syscall. Every layer above this one has a
+ * deadline, but a deadline is only a promise if something enforces it. SIGALRM
+ * does, from outside the worker's own loop, with _exit rather than exit so that
+ * no atexit handler can wedge it in turn. */
 
 static int g_watchdog_code = 0;
 

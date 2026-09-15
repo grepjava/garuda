@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# Raw ASGI and WSGI applications, FastAPI, Django, Flask and BlackSheep on
-# garuda, uvicorn, granian and fastpysgi, and Elysia on Bun as a reference,
-# with the load command
-# and applications of the-benchmarker/web-frameworks at 4bb9eaa (develop,
-# 2026-09-13). The results are not comparable with the figures that site
-# publishes; BENCHMARKS.md says why.
+# garuda's router, the-benchmarker/web-frameworks' Hummingbird and Vapor
+# entries, and Elysia on Bun as a reference, under the load command of that
+# suite at 4bb9eaa (develop, 2026-09-13). The results are not comparable with
+# the figures that site publishes; BENCHMARKS.md says why.
 #
 #   bash benchmarks/frameworks.sh > results.tsv
-#   FRAMEWORKS=blacksheep SERVERS=garuda-ext bash benchmarks/frameworks.sh
+#   FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 AGG=mean bash benchmarks/frameworks.sh
 #   LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
-#   FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 bash benchmarks/frameworks.sh
 #
 # The load is the upstream collect command, flag for flag (.tasks/config.rake
 # line 149 at that revision; the --closed in the comment above it is not in the
@@ -22,44 +19,36 @@
 # That is an open-loop ramp from 1,000 to 500,000 requests a second over the
 # run (RATE), keep-alive on, latency corrected for coordinated omission, and the
 # figure reported is zrk's achieved_rate -- the number the results site
-# ranks by. The applications are the upstream python/fastapi, python/flask and
-# python/blacksheep sources, byte for byte (benchmarks/contract/), or with
-# SOURCES=upstream the suite's garuda-* entries (benchmarks/web-frameworks/).
+# ranks by.
 #
 # LOAD=closed replaces the ramp with closed-loop oha, `oha -c N -z DURATION`,
 # which measures capacity instead. The ramp offers its average rate at most,
-# so a server that keeps up with it shows that ceiling and nothing more; with
-# the old end of 100,000 that was about 96,500 req/s. PIN="0:1-3" runs the server
-# on CPU 0 and the load generator on CPUs 1-3, so the two do not take turns on
-# a core; it applies to either load.
+# so a server that keeps up with it shows that ceiling and nothing more.
+# PIN="0:1-3" runs the server on CPU 0 and the load generator on CPUs 1-3, so
+# the two do not take turns on a core; it applies to either load. SwiftNIO
+# sizes its event loops from the CPU count, not the affinity mask, so a pinned
+# Hummingbird or Vapor runs one loop per CPU on the one core it is given.
 #
 # Differences from upstream; BENCHMARKS.md lists them all:
-#   WORKERS=1  upstream starts every server with $(nproc) workers. One worker
-#              compares what each server does with a core.
+#   WORKERS=1  upstream starts every server with $(nproc) workers. WORKERS is
+#              garuda's and Elysia's; Hummingbird and Vapor are one process
+#              with SwiftNIO's default of an event loop per CPU.
 #   RUNS=3     upstream's published figures are means of three runs. Each level
-#              here runs three times and the median by achieved_rate is kept,
-#              because a shared developer machine is noisier than a dedicated
-#              benchmark host.
-#   the rest   Python, host and some servers are whatever VENV and this machine
-#              provide; upstream is Python 3.14 on 16 CPUs, with gunicorn for
-#              Flask, uvicorn for BlackSheep, and raw applications, not
-#              frameworks, for fastpysgi.
+#              here runs three times and, by default, the median by
+#              achieved_rate is kept (AGG=mean for upstream's way).
 #
 # Output, one TSV line per cell:
 #   framework server workers connections req/s p50_ms p75_ms p90_ms p99_ms errors [every run]
 #
-# Needs zrk >= 2.4 (github.com/zoxy-io/zrk), or oha for LOAD=closed, and a
-# virtualenv with fastapi flask blacksheep uvicorn[standard] granian fastpysgi.
+# Needs zrk >= 2.4 (github.com/zoxy-io/zrk), or oha for LOAD=closed, python3
+# to read their JSON, and whichever servers are asked for.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-VENV=${VENV:-$HOME/fastapi-bench-venv}
 GARUDA=${GARUDA:-$ROOT/.build/release/garuda}
-# FRAMEWORKS=swift serves the contract natively: garuda's own router, and the
-# suite's swift/hummingbird-framework and swift/vapor-framework entries built
-# as its Dockerfile builds them (swift build -c release
-# -Xswiftc -enforce-exclusivity=unchecked). Those two run as one process with
-# SwiftNIO's default of an event loop per CPU they may use; WORKERS is garuda's.
+# The suite's swift/hummingbird-framework and swift/vapor-framework entries,
+# built as its Dockerfile builds them:
+#   swift build -c release -Xswiftc -enforce-exclusivity=unchecked
 HUMMINGBIRD=${HUMMINGBIRD:-$HOME/swiftbench/hummingbird-framework/.build/release/server}
 VAPOR=${VAPOR:-$HOME/swiftbench/vapor-framework/.build/release/server}
 ZRK=${ZRK:-zrk}
@@ -75,14 +64,15 @@ RUNS=${RUNS:-3}
 AGG=${AGG:-median}
 DURATION=${DURATION:-15s}
 # zrk's open-loop ramp, requests a second from start to end of a run. Upstream
-# raised the end from 100,000 to 500,000 at 4bb9eaa (develop, 2026-09-13); the
-# old figure capped a run at about 96,500 req/s.
+# raised the end from 100,000 to 500,000 at 4bb9eaa; the old figure capped a
+# run at about 96,500 req/s.
 RATE=${RATE:-1000:500000}
-FRAMEWORKS=${FRAMEWORKS:-"fastapi flask"}
-SERVERS=${SERVERS:-"garuda-ext garuda uvicorn granian fastpysgi"}
-# FRAMEWORKS=elysia SERVERS=elysia-bun measures upstream's javascript/elysia-bun
-# (benchmarks/elysia-bun/, byte for byte) as a non-Python reference. The app
-# listens on 3000 itself, so PORT must be 3000. Needs bun on PATH or in ~/.bun.
+# swift: garuda, hummingbird and vapor answer the contract natively.
+# elysia: upstream's javascript/elysia-bun (benchmarks/elysia-bun/, byte for
+# byte), which listens on 3000 itself, so PORT must be 3000. Needs bun on PATH
+# or in ~/.bun.
+FRAMEWORKS=${FRAMEWORKS:-swift}
+SERVERS=${SERVERS:-"garuda hummingbird vapor"}
 BUN=${BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}
 # "server_cpus:load_cpus" for taskset, e.g. 0:1-3; empty runs both unpinned.
 PIN=${PIN:-}
@@ -92,18 +82,7 @@ if [ -n "$PIN" ]; then
     PIN_SERVER=(taskset -c "${PIN%%:*}")
     PIN_LOAD=(taskset -c "${PIN#*:}")
 fi
-# The applications. benchmarks/cached is the same pair marking their responses
-# fresh, for measuring --cache-size.
-CONTRACT=${CONTRACT:-$ROOT/benchmarks/contract}
-# SOURCES=upstream runs each Python framework from benchmarks/web-frameworks/,
-# the suite's garuda-* entries (Flask and BlackSheep from its flask and
-# blacksheep entries) copied as they are, instead of from CONTRACT.
-SOURCES=${SOURCES:-contract}
-BASE_PYTHONPATH=${PYTHONPATH:-}
-# Where garuda-ext loads garuda._native from: another checkout, built
-# with scripts/build-extension.sh, to compare two versions in one session.
-EXT_ROOT=${EXT_ROOT:-$ROOT}
-# Extra flags for both garuda servers, e.g. "--cache-size 64".
+# Extra flags for garuda, e.g. "--access-log".
 # shellcheck disable=SC2206 -- deliberately split into words.
 GARUDA_ARGS=(${GARUDA_EXTRA_ARGS:-})
 URL="http://127.0.0.1:$PORT/"
@@ -116,68 +95,13 @@ OUT=$(mktemp -d)
 server_trap_cleanup
 server_require_port_free "$PORT" || exit 1
 
-# The server commands are the upstream engines' (python/config.yaml), with
-# --workers taken from WORKERS rather than $(nproc).
 start() {
-    local server=$1 framework=$2 app interface appdir=$CONTRACT
-    case "$framework" in
-    asgi)       app=asgi:app;               interface=asgi ;;
-    wsgi)       app=wsgi:application;       interface=wsgi ;;
-    fastapi)    app=fastapi_app:app;        interface=asgi ;;
-    # Upstream's garuda-django entry serves Django over WSGI.
-    django)     app=django_app:application; interface=wsgi ;;
-    flask)      app=flask_app:app;          interface=wsgi ;;
-    blacksheep) app=blacksheep_app:app;     interface=asgi ;;
-    esac
-    if [ "$SOURCES" = upstream ] && [ "$framework" != elysia ]; then
-        # The suite's own directory for the entry, run under the module name
-        # its config.yaml gives.
-        appdir=$ROOT/benchmarks/web-frameworks/garuda-$framework
-        app=server:app
-        [ "$framework" = django ] && app=app.wsgi:application
-    fi
-    export PYTHONPATH="$appdir${BASE_PYTHONPATH:+:$BASE_PYTHONPATH}"
+    local server=$1 framework=$2
     case "$server" in
     garuda)
-        if [ "$framework" = swift ]; then
-            # The router answers the contract itself; there is no application.
-            server_start "${PIN_SERVER[@]}" "$GARUDA" --log-level error \
-                --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}"
-        else
-            server_start "${PIN_SERVER[@]}" "$GARUDA" --log-level error --protocol "$interface" \
-                --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}" \
-                --venv "$VENV" --python-path "$appdir" "$app"
-        fi ;;
-    garuda-ext)
-        # The same server as an extension module, run by the virtualenv python:
-        # garuda._native, from scripts/build-extension.sh -- what a wheel
-        # installs, measured beside the executable above.
-        PYTHONPATH="$EXT_ROOT/python:$PYTHONPATH" server_start "${PIN_SERVER[@]}" "$VENV/bin/python" -m garuda \
-            --log-level error --protocol "$interface" \
-            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}" \
-            --venv "$VENV" --python-path "$appdir" "$app" ;;
-    uvicorn)
-        # uvicorn[standard] picks uvloop and httptools by itself. uvicorn spells
-        # ASGI 3 as asgi3. WSGI goes through uvicorn's own --interface wsgi
-        # adapter, since upstream has no uvicorn engine for Flask.
-        local uv_interface=$interface
-        [ "$interface" = asgi ] && uv_interface=asgi3
-        server_start "${PIN_SERVER[@]}" "$VENV/bin/uvicorn" --log-level critical --interface "$uv_interface" \
-            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "$app" ;;
-    granian)
-        server_start "${PIN_SERVER[@]}" "$VENV/bin/granian" --log-level critical --interface "$interface" \
-            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "$app" ;;
-    fastpysgi)
-        # The suite's fastpysgi-asgi and fastpysgi-wsgi entries start the server
-        # from server.py with fastpysgi.run(app, host, port, workers=N), which
-        # tells ASGI from WSGI by itself. The same call serves the FastAPI and
-        # Flask applications here.
-        server_start "${PIN_SERVER[@]}" "$VENV/bin/python" -c \
-            'import importlib, sys, fastpysgi
-module, attr = sys.argv[1].split(":")
-app = getattr(importlib.import_module(module), attr)
-fastpysgi.run(app, sys.argv[2], int(sys.argv[3]), workers=int(sys.argv[4]))' \
-            "$app" 127.0.0.1 "$PORT" "$WORKERS" ;;
+        # The router answers the contract itself.
+        server_start "${PIN_SERVER[@]}" "$GARUDA" --log-level error \
+            --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${GARUDA_ARGS[@]}" ;;
     hummingbird)
         # The suite's config.yaml passes host and port through the environment.
         SERVER_HOSTNAME=127.0.0.1 SERVER_PORT=$PORT server_start "${PIN_SERVER[@]}" "$HUMMINGBIRD" ;;
@@ -197,6 +121,9 @@ fastpysgi.run(app, sys.argv[2], int(sys.argv[3]), workers=int(sys.argv[4]))' \
             NODE_ENV=production PATH="$(dirname "$BUN"):$PATH" server_start "${PIN_SERVER[@]}" "$BUN" run cluster.ts
         fi
         cd "$ROOT" ;;
+    *)
+        echo "unknown server $server"
+        return 1 ;;
     esac > "$OUT/$server-$framework.log" 2>&1
     for _ in $(seq 1 60); do
         curl -s -o /dev/null --max-time 1 "$URL" && return 0
@@ -260,14 +187,12 @@ PY
 printf 'framework\tserver\tworkers\tconnections\treq/s p50_ms p75_ms p90_ms p99_ms errors\truns\n'
 for framework in $FRAMEWORKS; do
     for server in $SERVERS; do
-        # Elysia is its own server; the Python servers don't run it.
-        [ "$framework" = elysia ] && [ "$server" != elysia-bun ] && continue
-        [ "$framework" != elysia ] && [ "$server" = elysia-bun ] && continue
-        # Likewise the Swift contract: garuda's router, Hummingbird and Vapor.
-        if [ "$framework" = swift ]; then
-            case "$server" in garuda|hummingbird|vapor) ;; *) continue ;; esac
-        fi
-        case "$server" in hummingbird|vapor) [ "$framework" = swift ] || continue ;; esac
+        # Elysia is its own server, and the Swift servers answer only the
+        # Swift contract.
+        case "$framework:$server" in
+        swift:garuda|swift:hummingbird|swift:vapor|elysia:elysia-bun) ;;
+        *) continue ;;
+        esac
         server_stop
         if ! start "$server" "$framework"; then
             printf '%s\t%s\t%s\tFAILED TO START\n' "$framework" "$server" "$WORKERS"

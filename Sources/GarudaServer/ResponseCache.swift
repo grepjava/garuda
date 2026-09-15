@@ -29,10 +29,9 @@
 // every response as it is sent, with `Cache-Status: garuda; hit` to say
 // where it came from.
 //
-// The copy is taken in one place per application interface: for ASGI as the
-// messages arrive, for WSGI in the response builder shared by the inline and
-// pooled paths. Either way it is stored only when the response ended the way
-// its head said it would.
+// The copy is fed by whatever writes the response, through `observe`,
+// `settle` and `append`, and it is stored only when the response ended the
+// way its head said it would.
 //===----------------------------------------------------------------------===//
 
 import CGaruda
@@ -78,16 +77,6 @@ public struct ResponseCapture {
         self.mark = mark
         sequence = pg_cache_begin()
         dispatchedMs = pg_monotonic_ms()
-    }
-
-    /// Carries an armed capture over to the WSGI pool job that fills it.
-    mutating func arm(continuing other: ResponseCapture) {
-        abandon()
-        active = other.active
-        ttlLimit = other.ttlLimit
-        mark = other.mark
-        sequence = other.sequence
-        dispatchedMs = other.dispatchedMs
     }
 
     /// One response header, as the application gave it.
@@ -167,15 +156,6 @@ public struct ResponseCapture {
 }
 
 extension Worker {
-
-    /// The connection's capture, for the WSGI builder, which writes through a
-    /// pointer because it is shared with pool threads that own no connection.
-    /// The table's slots do not move, so neither does this.
-    func capturePointer(_ slot: Int) -> UnsafeMutablePointer<ResponseCapture> {
-        let offset = MemoryLayout<Connection>.offset(of: \Connection.capture)!
-        return (UnsafeMutableRawPointer(table[slot]) + offset)
-            .assumingMemoryBound(to: ResponseCapture.self)
-    }
 
     // MARK: - Invalidation
 

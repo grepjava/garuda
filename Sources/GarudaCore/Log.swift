@@ -254,13 +254,6 @@ public enum Log {
     public static func warn(_ s: StaticString) { emit(.warning) { $0.str(s) } }
     @inlinable
     public static func error(_ s: StaticString) { emit(.error) { $0.str(s) } }
-
-    /// Writes an arbitrary blob (a Python traceback) straight through.
-    public static func raw(_ p: UnsafePointer<UInt8>, _ n: Int) {
-        _ = pg_write(2, p, n)
-        var nl: UInt8 = cLF
-        _ = pg_write(2, &nl, 1)
-    }
 }
 
 /// Caches the `Date:` header value, which every response must carry.

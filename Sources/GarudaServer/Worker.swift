@@ -1,30 +1,25 @@
 //===----------------------------------------------------------------------===//
-// The worker: one process, one poller, one interpreter.
+// The worker: one process, one poller, one connection slab.
 //
 // Structure of a request:
 //
 //   accept -> readingHead -> [readingBody] -> dispatching -> writing -> reuse
 //
-// The whole cycle touches the heap only for the Python objects the application
-// itself needs. Buffers come from a pool, connection records come from a slab,
-// parsing produces offsets rather than objects, and the response is serialised
-// straight into the connection write buffer.
+// The whole cycle stays off the heap. Buffers come from a pool, connection
+// records come from a slab, parsing produces offsets rather than objects, and
+// the response is serialised straight into the connection write buffer.
 //===----------------------------------------------------------------------===//
 
 import CGaruda
 import GarudaCore
 import GarudaHTTP
 
-/// The worker this thread is running. Held behind a raw pointer rather than a
-/// class so that C callbacks (the asyncio reader, ASGI send/receive) can reach
-/// it without an ARC-managed context.
+/// The worker this process is running. Held behind a raw pointer rather than a
+/// class so that it can be reached without an ARC-managed context.
 ///
-/// Thread-local, not global. With one worker per process the two are the same
-/// thing; under `--free-threaded` a process has several workers, each owning
-/// its own poller, connection table and event loop, and a callback arriving
-/// from Python has to land on the one belonging to the thread it is running on.
-/// The storage is a C `_Thread_local`, so reading it is a register-relative
-/// load rather than a lock or a `pthread_getspecific` call.
+/// There is one worker per process. The storage is a C `_Thread_local`, so
+/// reading it is a register-relative load rather than a lock or a
+/// `pthread_getspecific` call.
 public var currentWorker: UnsafeMutablePointer<Worker>? {
     @inline(__always) get {
         pg_worker_current()?.assumingMemoryBound(to: Worker.self)
@@ -54,8 +49,8 @@ public struct Worker {
     public var redirectFD: Int32 = -1
     public var signalFD: Int32 = -1
 
-    /// One shared header table: parsing and environ/scope construction happen
-    /// back to back for a single request, so there is never a second live set.
+    /// One shared header table: parsing a head and dispatching it happen back
+    /// to back for a single request, so there is never a second live set.
     public var headers: UnsafeMutablePointer<HTTPHeaderRef>
 
     /// TLS configuration, when the listener is https. One per worker.
@@ -66,8 +61,8 @@ public struct Worker {
     /// Throttle for QUIC timers, which are far finer than the once-a-second
     /// connection sweep.
     var lastQUICTick: UInt64 = 0
-    /// Tokens of the HTTP/1 connections whose ASGI responses go out at the end
-    /// of this loop iteration. A slot is queued at most once, so the table's
+    /// Tokens of the HTTP/1 connections whose finished responses go out at the
+    /// end of this event batch. A slot is queued at most once, so the table's
     /// capacity bounds it.
     var deferredFlush: UnsafeMutablePointer<UInt64>
     var deferredFlushCount = 0
@@ -92,29 +87,6 @@ public struct Worker {
     /// --cache-size: where a cached response is copied out of the shared
     /// table to be sent, grown once to the largest entry the table holds.
     var cacheScratch = ByteBuffer()
-    /// Whether this worker arms the `SIGALRM` watchdog when it starts draining.
-    ///
-    /// A worker process is the last word on its own lifetime, so it does. A
-    /// free-threaded worker thread is not: the process still has to join every
-    /// thread and run the lifespan shutdown after this worker has finished, and
-    /// a watchdog armed here would be the shorter of the two and would `_exit`
-    /// in the middle of that. The supervising thread arms one for the whole
-    /// process instead.
-    public var ownsExitWatchdog = true
-    /// Whether this worker may close its handle on `listenFD` when it drains.
-    ///
-    /// A worker *process* may: the descriptor it holds is its own copy of a
-    /// socket the supervisor created and keeps open, so closing it releases a
-    /// handle and nothing else. The socket stays bound, stays in the
-    /// `SO_REUSEPORT` group, and keeps its accept queue -- which is what lets a
-    /// replacement take the slot over without a connection being dropped.
-    ///
-    /// A free-threaded worker *thread* on a unix socket may not: there the one
-    /// descriptor is shared by every thread in the process, and closing it
-    /// would take the rest of them off the socket too. Those threads stop
-    /// polling and leave it open, which costs nothing -- they were all taking
-    /// from one queue anyway, so the threads still running keep draining it.
-    public var ownsListener = true
     /// When draining must stop being polite. A request that never completes
     /// would otherwise hold the whole process open indefinitely.
     public var drainDeadline: UInt64 = 0
@@ -190,18 +162,6 @@ public struct Worker {
 
     // MARK: - Event dispatch
 
-    /// Processes one batch of readiness events. Returns the number handled.
-    ///
-    /// Called directly by the WSGI loop, and by asyncio through the reader
-    /// callback in ASGI mode.
-    @discardableResult
-    public mutating func drain(timeoutMillis: Int32) -> Int {
-        let n = poller.wait(timeoutMillis: timeoutMillis)
-        if n <= 0 { return 0 }
-        processEvents(n)
-        return n
-    }
-
     /// Dispatches `n` events already collected by the poller.
     public mutating func processEvents(_ n: Int) {
         var i = 0
@@ -232,9 +192,8 @@ public struct Worker {
                 handleConnectionEvent(slot, mask)
             }
         }
-        // The WSGI responses this batch finished go out together. ASGI ones
-        // wait for the end of the loop iteration instead, which comes after the
-        // application steps this batch has only just scheduled.
+        // The HTTP/1 responses this batch finished go out together, now that
+        // every event in it has been handled.
         if deferredFlushCount > 0 { runDeferredFlushes() }
     }
 
@@ -591,11 +550,11 @@ public struct Worker {
 
             case .dispatching:
                 dispatch(slot)
-                // A synchronous (WSGI) dispatch has already moved on to
-                // .writing by now. An ASGI dispatch has handed the request to a
-                // task and the state is still .dispatching: the connection now
-                // belongs to that task, and looping here would dispatch it
-                // again on every turn.
+                // A route answered inline has already moved on to .writing by
+                // now. One that parked a continuation (GET /delay) is still
+                // .dispatching: the connection now belongs to that
+                // continuation, and looping here would dispatch it again on
+                // every turn.
                 if table[slot].pointee.state == .dispatching { return }
 
             default:
@@ -707,11 +666,11 @@ public struct Worker {
         let limit = config.maxBodySize
         var overflow = false
         let outcome = c.pointee.chunked.decode(base, available, consumed: &consumed) { p, n in
-            // Against everything decoded, not against what is still sitting in
-            // the buffer: ASGI takes the body as it arrives, so buffered bytes
-            // fall as fast as they rise and a paced upload of any size would
-            // never reach the limit. `decodedBytes` has not yet counted this
-            // run, which is what makes the sum the total including it.
+            // Against everything decoded, not against what is sitting in the
+            // body buffer: the two agree while the body is buffered whole, but
+            // only the first stays a limit once something takes the body as it
+            // arrives. `decodedBytes` has not yet counted this run, which is
+            // what makes the sum the total including it.
             if c.pointee.chunked.decodedBytes + n > limit { overflow = true; return }
             c.pointee.body.write(p, n)
         }
@@ -796,22 +755,19 @@ public struct Worker {
 
     // MARK: - Writing
 
-    /// How many finished WSGI responses wait for the end of an event batch
-    /// before going out anyway. Holding a response costs its client the time
-    /// the ones after it take to run, so the batch is kept small.
-    static let wsgiFlushBatch = 16
+    /// How many finished responses wait for the end of an event batch before
+    /// going out anyway. Holding a response costs its client the time the ones
+    /// after it take to answer, so the batch is kept small.
+    static let flushBatch = 16
 
     /// Sends a finished HTTP/1 response together with the others finishing
     /// around it, rather than on its own.
     ///
-    /// ASGI responses go out at the end of the event-loop iteration, which is
-    /// what uvloop does with transport writes. WSGI responses go out at the end
-    /// of the event batch, or every `wsgiFlushBatch` of them. It matters more
-    /// than it looks. A write wakes whoever reads the other end. Written one at
-    /// a time between applications taking tens of microseconds each, the
-    /// readers have gone back to sleep before every write, and every write pays
-    /// for a full cross-CPU wakeup: 18us of a FastAPI or a Flask request,
-    /// against 3.5us for uvicorn making the same single write.
+    /// Responses go out at the end of the event batch, or every `flushBatch`
+    /// of them. It matters more than it looks. A write wakes whoever reads the
+    /// other end. Written one at a time as each request is answered, the
+    /// readers have gone back to sleep before every write, and every write
+    /// pays for a full cross-CPU wakeup.
     mutating func flushSoon(_ slot: Int) {
         let c = table[slot]
         // A stream writes into its connection, which has its own pacing.
@@ -825,9 +781,7 @@ public struct Worker {
             if c.pointee.write.readableBytes >= config.readBufferSize { _ = flush(slot) }
             return
         }
-        let scheduled = true
-        if !scheduled
-            || c.pointee.write.readableBytes >= config.readBufferSize
+        if c.pointee.write.readableBytes >= config.readBufferSize
             || deferredFlushCount >= table.capacity {
             _ = flush(slot)
             return
@@ -836,7 +790,7 @@ public struct Worker {
                                                            generation: c.pointee.generation)
         deferredFlushCount += 1
         c.pointee.flags.insert(.flushQueued)
-        if deferredFlushCount >= Worker.wsgiFlushBatch
+        if deferredFlushCount >= Worker.flushBatch
             && !runningDeferredFlushes {
             runDeferredFlushes()
         }
@@ -894,9 +848,10 @@ public struct Worker {
                 if pg_err_is_intr(e) != 0 { continue }
                 if pg_err_is_again(e) != 0 {
                     // Read interest is only safe while something will actually
-                    // consume what arrives: not while a pooled request owns the
-                    // connection, and not while a websocket queue is full. A
-                    // level-triggered poller would otherwise spin on those bytes.
+                    // consume what arrives: not while a request that has its
+                    // whole body is still being answered, and not while a
+                    // websocket queue is full. A level-triggered poller would
+                    // otherwise spin on those bytes.
                     setInterest(slot, readInterestAllowed(slot)
                                 ? [.read, .write] : lingeringRead(slot).union(.write))
                     // Partially drained still counts: a producer parked at the high
@@ -932,9 +887,10 @@ public struct Worker {
         }
 
         if c.pointee.state == .writing {
-            // An ASGI response can be fully flushed while the application task
-            // is still finishing. Recycling the slot now would let a pipelined
-            // request overwrite state the task still refers to.
+            // Only a slot the route has finished writing is finished here. One
+            // in any other live state may still have a handler referring to
+            // it, and recycling it now would let a pipelined request overwrite
+            // that state.
             finishResponse(slot)
         } else if c.pointee.state != .free {
             setInterest(slot, readInterestAllowed(slot) ? .read : lingeringRead(slot))
@@ -942,14 +898,11 @@ public struct Worker {
         return table[slot].pointee.state != .free
     }
 
-    /// Read interest a request no longer needs, kept when it is already armed.
+    /// Read interest a request no longer needs, while its response is written.
     ///
-    /// Once an ASGI request's body is complete nothing more is read from the
+    /// None. Once a request's body is complete nothing more is read from the
     /// connection until its response is done, and on a level-triggered poller
     /// read interest would fire every turn for a request pipelined behind it.
-    /// But almost no client pipelines, and switching the interest off and back
-    /// on costs two epoll_ctl calls per request. So it is left armed until it
-    /// actually fires, and `handleReadable` switches it off then.
     @inline(__always)
     func lingeringRead(_ slot: Int) -> PollMask {
         _ = slot
@@ -958,10 +911,11 @@ public struct Worker {
 
     /// Whether more bytes from this peer would have anywhere to go.
     ///
-    /// They would not while a pooled request owns the connection (nothing will
-    /// look at them until it finishes) or while a websocket has queued as many
-    /// messages as it is allowed to. In both cases leaving read interest armed
-    /// on a level-triggered poller would spin.
+    /// They would not while a request that has its whole body is still being
+    /// answered (nothing will look at them until it finishes), while its body
+    /// buffer is at the high water mark, or while a websocket has queued as
+    /// many messages as it is allowed to. In each case leaving read interest
+    /// armed on a level-triggered poller would spin.
     @inline(__always)
     func readInterestAllowed(_ slot: Int) -> Bool {
         let c = table[slot]
@@ -971,51 +925,6 @@ public struct Worker {
             // poller would spin on the pipelined bytes behind it.
             if c.pointee.bodyRemaining == 0 { return false }
             return c.pointee.body.readableBytes < config.bodyHighWaterMark
-        }
-        return true
-    }
-
-    /// Re-evaluates read interest for a request whose body is still arriving.
-    mutating func updateBodyReadInterest(_ slot: Int) {
-        _ = slot
-    }
-
-    /// Blocks the worker until the socket accepts more data. Used only when a
-    /// synchronous WSGI response outgrows the high-water mark, where the choice
-    /// is between stalling this worker and buffering without bound.
-    /// Writes until the buffer is down to `target` bytes, waiting on the socket
-    /// when it will not take any more.
-    ///
-    /// `target` is the high water mark for a producer that only has to be kept
-    /// from running away with memory. It is 0 for one that has to be able to
-    /// say the block has been sent -- a WSGI `write()`, or an iterator between
-    /// yields -- because on the inline path the application runs on the loop
-    /// thread, so anything left here has nothing to send it until the
-    /// application returns. Stopping at the high water mark strands up to that
-    /// much of the block for as long as the application cares to sleep.
-    mutating func flushWithBackpressure(_ slot: Int, until target: Int? = nil) -> Bool {
-        let c = table[slot]
-        // A stream has no socket to wait on. Blocking the worker on the
-        // connection underneath would be worse than useless for HTTP/3: the
-        // acknowledgements that would let it drain arrive on the same loop
-        // that is blocked. So the bytes go to the transport, which holds them
-        // under the peer's flow control, and the producer keeps going.
-        if c.pointee.isStream { return flush(slot) }
-        let limit = target ?? config.writeHighWaterMark
-        while c.pointee.write.readableBytes > limit {
-            let n = connWrite(slot,
-                              c.pointee.write.readPointer,
-                              c.pointee.write.readableBytes)
-            if n > 0 { c.pointee.write.consume(n); continue }
-            let e = pg_errno()
-            if pg_err_is_intr(e) != 0 { continue }
-            if pg_err_is_again(e) != 0 {
-                let r = pg_poll_single(c.pointee.fd, 1, 30_000)
-                if r <= 0 { closeConnection(slot); return false }
-                continue
-            }
-            closeConnection(slot)
-            return false
         }
         return true
     }
@@ -1564,15 +1473,13 @@ public struct Worker {
         drainDeadline = config.gracefulShutdownMs > 0
             ? pg_monotonic_ms() &+ config.gracefulShutdownMs
             : 0
-        // Every deadline above this one is cooperative: a task can swallow
-        // cancellation, a C extension can sit in a syscall, and a worker with
-        // no supervisor has nobody to escalate to. This one is not -- it fires
+        // Every deadline above this one is cooperative: a peer can stall a
+        // write, a library call can sit in a syscall, and a worker with no
+        // supervisor has nobody to escalate to. This one is not -- it fires
         // from a signal handler and calls _exit. The extra margin covers the
-        // task drain, the lifespan shutdown and interpreter finalisation.
-        if ownsExitWatchdog {
-            let margin = config.gracefulShutdownMs / 1000 &+ 10
-            pg_exit_after(UInt32(truncatingIfNeeded: margin), 0)
-        }
+        // rest of the drain and the process exit.
+        let margin = config.gracefulShutdownMs / 1000 &+ 10
+        pg_exit_after(UInt32(truncatingIfNeeded: margin), 0)
         Log.info("worker draining")
         // Idle keep-alive connections have nothing in flight; drop them now.
         // Websockets are told the server is going away, which is what lets a
@@ -1604,7 +1511,7 @@ public struct Worker {
         // it polled instead would have a draining worker compete for
         // connections it is about to stop serving.
         _ = poller.modify(listenFD, [], token: PollToken.listener)
-        if ownsListener && listenFD >= 0 {
+        if listenFD >= 0 {
             _ = pg_close(listenFD)
             listenFD = -1
         }
@@ -1615,8 +1522,8 @@ public struct Worker {
         if quiescent { running = false }
     }
 
-    /// Nothing left to finish: no live connections, and no pooled request still
-    /// running on a thread whose result the loop has yet to write out.
+    /// Nothing left to finish: no live connections, and so no parked handler
+    /// whose response has yet to be written out.
     @inlinable
     public var quiescent: Bool {
         table.liveCount == 0

@@ -2,10 +2,8 @@
  * Counters shared by every worker.
  *
  * A scrape arrives on one worker and has to answer for all of them. Workers
- * are separate processes under --workers (SO_REUSEPORT, nothing shared) and
- * threads under --free-threaded, so the one thing that works for both is a
- * page mapped MAP_SHARED before the fork: children inherit the mapping, and
- * threads never had to.
+ * are separate processes (SO_REUSEPORT, nothing shared), so the counters live
+ * in a page mapped MAP_SHARED before the fork: children inherit the mapping.
  *
  * Each worker writes only its own slot, so a counter needs no read-modify-
  * write against anyone else -- the atomics here are relaxed loads and stores,
@@ -65,9 +63,8 @@ int pg_metrics_slots(void);
 void pg_metrics_add(int slot, int index, uint64_t n);
 void pg_metrics_set(int slot, int index, uint64_t v);
 
-/* Which slot the calling thread writes. Thread-local because --free-threaded
- * runs several workers in one process, and each still owns its own slot: a
- * process-wide variable would have them all writing the same counters. */
+/* Which slot the calling worker writes, set once when the worker starts. Each
+ * worker owns its own slot, so no two ever write the same counters. */
 void pg_metrics_bind(int slot);
 void pg_metrics_add_local(int index, uint64_t n);
 void pg_metrics_set_local(int index, uint64_t v);

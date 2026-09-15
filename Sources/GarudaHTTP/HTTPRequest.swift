@@ -3,8 +3,8 @@
 //
 // A parsed request owns no memory. Every field is a (offset, length) pair into
 // the connection read buffer, so parsing a request allocates exactly nothing --
-// no String, no Array, no Dictionary. The bytes are copied precisely once, when
-// they are handed to Python as a str or bytes object.
+// no String, no Array, no Dictionary. Whoever needs a value reads it through
+// its slice, and copies it only if it has to outlive the buffer.
 //===----------------------------------------------------------------------===//
 
 import GarudaCore
@@ -35,8 +35,8 @@ public struct HTTPSlice: Equatable, Sendable {
 public struct HTTPHeaderRef {
     public var name: HTTPSlice
     public var value: HTTPSlice
-    /// Cached lowercase-insensitive hash of the name, so the WSGI environ
-    /// builder can skip re-folding names it has already classified.
+    /// Cached lowercase-insensitive hash of the name, so a later pass over the
+    /// headers can skip re-folding names it has already classified.
     public var nameHash: UInt32
 
     @inlinable
@@ -72,7 +72,7 @@ public struct HTTPRequestFlags: OptionSet, Sendable {
 public struct HTTPRequestHead {
     public var method: HTTPMethod = .other
     public var methodSlice = HTTPSlice()
-    /// The raw request-target, exactly as it arrived (ASGI `raw_path`).
+    /// The raw request-target, exactly as it arrived.
     public var target = HTTPSlice()
     /// Target minus the query string, still percent-encoded.
     public var path = HTTPSlice()

@@ -433,12 +433,3 @@ int pg_udp_addr_text(const pg_udp_addr *addr, char *host, size_t host_len,
     }
     return 0;
 }
-
-int pg_udp_local_addr(int fd, char *host, size_t host_len, uint16_t *port) {
-    struct sockaddr_storage ss;
-    socklen_t len = sizeof ss;
-    if (getsockname(fd, (struct sockaddr *)&ss, &len) != 0) return -1;
-    pg_udp_addr a;
-    store_addr(&a, (struct sockaddr *)&ss, len);
-    return pg_udp_addr_text(&a, host, host_len, port);
-}

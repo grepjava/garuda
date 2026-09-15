@@ -1,5 +1,6 @@
-// WebTransport session handle kept on the connection slab. The ASGI
-// WebTransport API is gone; sessions are released without a Python task.
+// WebTransport session handle kept on the connection slab. There is no
+// application-level WebTransport API; sessions are released without reaching
+// the application.
 
 import GarudaCore
 import GarudaQUIC

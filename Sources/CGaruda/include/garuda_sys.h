@@ -17,9 +17,10 @@ extern "C" {
  * plain array of (token, mask) pairs. Doing the translation here keeps Swift
  * away from `struct epoll_event` (packed on x86-64) and `union epoll_data`.
  *
- * The poller is *level triggered* on purpose. Garuda hands its poller fd to
- * asyncio via loop.add_reader() when running ASGI apps; that outer poll only
- * works if the poller fd stays readable while events remain unconsumed.
+ * The poller is *level triggered* on purpose: an event not acted on in one pass
+ * is reported again on the next wait rather than lost, so nothing has to
+ * remember that it owes a read. The price is that interest in bytes nobody will
+ * consume has to be dropped, or the wait spins.
  * ------------------------------------------------------------------------- */
 
 #define PG_POLL_READ   0x1u
@@ -67,9 +68,6 @@ int pg_set_cloexec(int fd);
 int pg_shutdown_write(int fd);
 int pg_close(int fd);
 
-/* Local address of a listening socket, for the ASGI/WSGI `server` field. */
-int pg_local_addr(int fd, char *host, size_t host_len, uint16_t *port);
-
 ssize_t pg_read(int fd, void *buf, size_t n);
 ssize_t pg_write(int fd, const void *buf, size_t n);
 ssize_t pg_writev(int fd, const struct iovec *iov, int iovcnt);
@@ -89,9 +87,8 @@ ssize_t pg_sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
 int pg_static_open(const char *root, const char *relative,
                    long long *size, long long *mtime);
 
-/* poll(2) on a single descriptor. Used only by the synchronous WSGI path when
- * a response outgrows the high-water mark and the worker must apply
- * backpressure rather than buffer without bound. */
+/* poll(2) on a single descriptor, for a wait outside the readiness poller: the
+ * supervisor checking whether a replacement worker has reported ready. */
 int pg_poll_single(int fd, int for_write, int timeout_ms);
 
 int pg_errno(void);
@@ -150,7 +147,7 @@ int  pg_cpu_count(void);
 /* Raise RLIMIT_NOFILE to its hard limit; returns the resulting soft limit. */
 long pg_raise_nofile_limit(void);
 /* Arms a SIGALRM that _exit()s the process after `seconds`, so a shutdown
- * that wedges below the interpreter still terminates. 0 seconds disarms. */
+ * that wedges anywhere still terminates. 0 seconds disarms. */
 void pg_exit_after(unsigned seconds, int code);
 void pg_cancel_exit_timer(void);
 
@@ -168,7 +165,6 @@ int pg_parse_ip(const char *s, unsigned char out16[16], int *family);
 
 int pg_unlink(const char *path);
 const char *pg_getenv(const char *name);
-int pg_path_exists(const char *path);
 /* Modification time in nanoseconds, or -1. Used by --reload. */
 int64_t pg_mtime_ns(const char *path);
 int pg_is_dir(const char *path);
@@ -196,47 +192,12 @@ void pg_unblock_piped_signals(void);
 int pg_random_bytes(void *out, size_t n);
 
 /* ---------------------------------------------------------------------------
- * Threads
- *
- * Threads belong to the optional WSGI pool and, under --free-threaded, to the
- * workers themselves. They are exposed as opaque handles because
- * pthread_mutex_t and pthread_cond_t have platform-dependent size and alignment
- * that Swift would otherwise have to mirror exactly.
+ * The current worker
  * ------------------------------------------------------------------------- */
 
-typedef struct pg_mutex pg_mutex;
-typedef struct pg_cond pg_cond;
-
-pg_mutex *pg_mutex_new(void);
-void pg_mutex_free(pg_mutex *m);
-void pg_mutex_lock(pg_mutex *m);
-void pg_mutex_unlock(pg_mutex *m);
-
-pg_cond *pg_cond_new(void);
-void pg_cond_free(pg_cond *c);
-void pg_cond_wait(pg_cond *c, pg_mutex *m);
-void pg_cond_signal(pg_cond *c);
-void pg_cond_broadcast(pg_cond *c);
-
-/* Starts a detached thread with every signal blocked. Returns 0 on success. */
-int pg_thread_spawn(void (*fn)(void *), void *arg);
-
-/* The same, joinable, for threads whose exit the caller has to observe: under
- * --free-threaded the supervising thread must know that every worker has let go
- * of its connections before the ASGI lifespan is allowed to shut down. Returns
- * NULL on failure; the handle is freed by pg_thread_join. */
-typedef struct pg_thread pg_thread;
-pg_thread *pg_thread_start(void (*fn)(void *), void *arg);
-void pg_thread_join(pg_thread *t);
-
-/* Where the current thread's Worker lives.
- *
- * The server used to have exactly one worker per process, so this was a plain
- * global. Under --free-threaded there is one per thread, and the C callbacks
- * that need it -- the asyncio reader, ASGI send/receive -- are handed nothing
- * but a connection token, so they have to find it themselves. A thread-local is
- * the cheapest way to answer that: a register-relative load, no lock, and no
- * change to any call site. */
+/* Where this process's Worker lives. There is one worker per process; the
+ * storage is a thread-local, which reads as a register-relative load with no
+ * lock. */
 void *pg_worker_current(void);
 void pg_worker_set_current(void *worker);
 

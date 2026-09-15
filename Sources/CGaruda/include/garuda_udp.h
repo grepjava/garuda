@@ -72,12 +72,9 @@ int pg_udp_gso_supported(int fd);
  * refused, so the same datagrams should go out one at a time. */
 int pg_udp_gso_refused(int err);
 
-/* Printable form, for logging and the ASGI `client` field. */
+/* Printable form, for logging and the connection's peer address. */
 int pg_udp_addr_text(const pg_udp_addr *addr, char *host, size_t host_len,
                      uint16_t *port);
-
-/* Local address of a bound UDP socket, for the ASGI `server` field. */
-int pg_udp_local_addr(int fd, char *host, size_t host_len, uint16_t *port);
 
 #ifdef __cplusplus
 }

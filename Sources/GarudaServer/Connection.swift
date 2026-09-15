@@ -21,10 +21,11 @@ public enum ConnState: UInt8 {
     case free
     /// Accumulating the request head.
     case readingHead
-    /// Head parsed, streaming the body (WSGI buffers it, ASGI forwards it).
+    /// Head parsed, reading the body into `body`.
     case readingBody
-    /// Handed to the application; for ASGI this can last many event loop turns,
-    /// and for a pooled WSGI request it lasts until a thread reports back.
+    /// Handed to the router. Usually over within the same call; a handler that
+    /// parks a continuation (AsyncOps.swift) holds the slot here until it is
+    /// resumed.
     case dispatching
     /// The HTTP request became a WebSocket; framing is no longer HTTP.
     case websocket
@@ -59,18 +60,19 @@ public struct ConnFlags: OptionSet, Sendable {
     public static let suppressBody     = ConnFlags(rawValue: 1 << 6)
     /// The client hung up while the application was still running.
     public static let disconnected     = ConnFlags(rawValue: 1 << 7)
-    /// An ASGI disconnect message has already been delivered.
+    /// The application has already been told the client disconnected.
     public static let disconnectSent   = ConnFlags(rawValue: 1 << 8)
-    /// The final http.request message has been handed to the application.
+    /// The last of the request body has been handed to the application.
     public static let bodyDelivered    = ConnFlags(rawValue: 1 << 9)
     /// The peer has been checked against the trusted-proxy list. Checking is
     /// per connection rather than per request: the peer cannot change.
     public static let trustEvaluated   = ConnFlags(rawValue: 1 << 10)
     /// ...and it is on the list, so its forwarded headers are believed.
     public static let trustedPeer      = ConnFlags(rawValue: 1 << 11)
-    /// The request was a WebSocket upgrade, so `receive` and `send` speak the
-    /// websocket half of ASGI rather than the http half. Set before the
-    /// handshake is answered, which is why it is separate from `.websocket`.
+    /// The request was a WebSocket upgrade, so the application exchanges
+    /// WebSocket messages on it rather than an HTTP request and response. Set
+    /// before the handshake is answered, which is why it is separate from
+    /// `.websocket`.
     public static let websocketMode    = ConnFlags(rawValue: 1 << 12)
     /// HTTP/2: the END_STREAM flag has been sent, so the response is over on
     /// the wire even if the slot is still waiting for its task.
@@ -100,9 +102,9 @@ public struct ConnFlags: OptionSet, Sendable {
     /// open a new connection.
     public static let servedRequest    = ConnFlags(rawValue: 1 << 18)
 
-    /// An ASGI response is waiting in the write buffer for the end of this
-    /// event-loop iteration, when it goes out with every other response the
-    /// iteration produced. See `Worker.flushSoon`.
+    /// A finished response is waiting in the write buffer for the end of this
+    /// event batch, when it goes out with every other response the batch
+    /// produced. See `Worker.flushSoon`.
     public static let flushQueued      = ConnFlags(rawValue: 1 << 19)
 
     /// --cache-size: the request changes its target -- any method but GET,
@@ -155,15 +157,15 @@ public struct Connection {
 
     public var read = ByteBuffer()
     public var write = ByteBuffer()
-    /// Request body: buffered whole for WSGI, staged per chunk for ASGI.
+    /// Request body, buffered whole before the request is dispatched.
     public var body = ByteBuffer()
 
     public var head = HTTPRequestHead()
     /// Where the request head starts. Slices in `head` are relative to this.
     ///
-    /// The head bytes have to stay readable until the application has built its
-    /// environ or scope, which can be several event-loop turns later. Two rules
-    /// keep them alive without copying:
+    /// The head bytes have to stay readable until the request has been
+    /// answered, which for a parked handler can be several loop turns later.
+    /// Two rules keep them alive without copying:
     ///   * a Content-Length body is read straight into `body`, so nothing ever
     ///     writes over the head still sitting in `read`;
     ///   * a chunked body needs `read` for its framing, so there and only there
@@ -232,7 +234,7 @@ public struct Connection {
     /// ...and which kind, which decides how a response is framed.
     @inlinable public var isH3Stream: Bool { flags.contains(.http3Stream) }
 
-    /// Peer address bytes, filled at accept. No Python object.
+    /// Peer address bytes, filled at accept.
     public var remoteAddr = ByteBuffer()
     public var remotePort: UInt16 = 0
     /// Declared Content-Length of the response, or -1 for chunked.
@@ -258,7 +260,7 @@ public struct Connection {
     /// The hash of the target of a request that changes it, which a
     /// successful response invalidates. See `ConnFlags.invalidatesCache`.
     public var cacheMark: UInt64 = 0
-    /// The compressor for an ASGI response body being compressed.
+    /// The compressor for a response body being compressed.
     public var encoder = ResponseEncoder()
 
     /// WebSocket framing state; meaningful only in `.websocket` mode.
@@ -285,8 +287,6 @@ public struct Connection {
 public enum PollToken {
     public static let listener: UInt64 = .max
     public static let signals: UInt64 = .max - 1
-    /// The WSGI pool completion pipe, when a thread pool is running.
-    public static let pool: UInt64 = .max - 2
     /// The QUIC socket. One descriptor serves every QUIC connection, so unlike
     /// TCP there is no per-connection token.
     public static let quic: UInt64 = .max - 3

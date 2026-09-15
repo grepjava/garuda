@@ -6,7 +6,7 @@
  * primitives -- hash, HKDF, AEAD, key exchange, signing -- and the handshake
  * state machine above them is ours.
  *
- * Same rule as Python.h and OpenSSL's ssl.h: no OpenSSL header is reachable
+ * Same rule as garuda_tls.h and OpenSSL's ssl.h: no OpenSSL header is reachable
  * from anything Swift imports. Everything here is opaque pointers and byte
  * buffers.
  *

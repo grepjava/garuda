@@ -281,14 +281,6 @@ int pg_accept(int lfd, char *peer, size_t peer_len, uint16_t *peer_port) {
     return fd;
 }
 
-int pg_local_addr(int fd, char *host, size_t host_len, uint16_t *port) {
-    struct sockaddr_storage ss;
-    socklen_t slen = sizeof ss;
-    if (getsockname(fd, (struct sockaddr *)&ss, &slen) != 0) return -1;
-    fill_peer(&ss, slen, host, host_len, port);
-    return 0;
-}
-
 ssize_t pg_read(int fd, void *buf, size_t n)         { return read(fd, buf, n); }
 ssize_t pg_write(int fd, const void *buf, size_t n)  { return write(fd, buf, n); }
 ssize_t pg_writev(int fd, const struct iovec *iov, int iovcnt) { return writev(fd, iov, iovcnt); }
@@ -630,8 +622,8 @@ static void piped_signals(sigset_t *set) {
  *
  * A child inherits the supervisor's handlers along with its pipe, and the pipe
  * is the supervisor's to read. Closing it in the child and making a new one
- * only once the worker is ready to poll -- which is after the interpreter has
- * booted and the application imported, seconds on a large application --
+ * only once the worker is ready to poll -- which is after its TLS context,
+ * QUIC listener and extra listeners have been set up --
  * left a window in which a SIGTERM ran the handler, wrote to a descriptor that
  * was gone, and vanished. The worker then served on until the supervisor's
  * grace period ran out and it was killed.
@@ -703,11 +695,11 @@ pid_t pg_getpid(void) { return getpid(); }
 #include <sys/prctl.h>
 #endif
 
-/* The name top, ps -e, pgrep -x and pkill match on. The executable already has
- * it; garuda._native runs in a process the kernel calls "python", which
- * leaves `pkill garuda` matching nothing. Only the short kernel name
- * changes -- the command line still says which interpreter is running. It is
- * inherited across fork and by threads created afterwards. */
+/* The name top, ps -e, pgrep -x and pkill match on. The executable normally
+ * has it already; setting it keeps `pkill garuda` working when the file was
+ * renamed or started through a link of another name. Only the short kernel
+ * name changes -- the command line still says what was run. It is inherited
+ * across fork and by threads created afterwards. */
 void pg_set_process_name(const char *name) {
 #ifdef __linux__
     prctl(PR_SET_NAME, name, 0, 0, 0);

@@ -4,9 +4,9 @@
 // A request matching a route prefix is answered here, with the bytes going
 // from the page cache to the socket without entering this process: `flush`
 // hands the descriptor to sendfile(2) and the kernel does the copy. That is
-// the whole reason for the feature. Reaching Python to serve a CSS file means
-// an interpreter, a dictionary of CGI variables and a list of byte strings per
-// asset, and none of it changes what arrives at the client.
+// the whole reason for the feature. Reading a CSS file into the process only to
+// write it back out costs a copy per block, and none of it changes what
+// arrives at the client.
 //
 // Two transports cannot take that path and fall back to reading the file into
 // the write buffer:
@@ -20,7 +20,7 @@
 //     with everything else on the connection.
 //
 // The fallback is not a slow path in any sense that matters -- it is what a
-// framework would have done anyway, minus the interpreter -- so a route is not
+// framework would have done anyway -- so a route is not
 // refused on a connection that cannot sendfile.
 //
 // Mapping the file rather than reading it was tried for HTTP/2 and measured

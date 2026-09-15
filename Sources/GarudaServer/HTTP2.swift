@@ -9,16 +9,16 @@
 // and `fd` set to -1.
 //
 // That is what makes the rest of the server keep working unchanged. A stream
-// slot has a head, a body buffer, a write buffer, a task, a receive future and
-// a Content-Length budget, so ASGI dispatch, request-body streaming, response
-// framing, write backpressure and disconnect delivery all operate on a stream
+// slot has a head, a body buffer, a write buffer, a continuation and a
+// Content-Length budget, so dispatch, request-body buffering, response
+// framing, write backpressure and disconnect handling all operate on a stream
 // exactly as they operate on a connection. Only three operations have to know
 // the difference: writing (bytes become DATA frames on the parent rather than
 // going to a socket), read interest (a stream has no descriptor), and teardown.
 //
 // The request head is rebuilt as HTTP/1.1 text in the stream's `headStore` and
 // handed to the ordinary parser. It costs one copy and one parse per request,
-// and in exchange the scope builder, the trusted-proxy logic and the access log
+// and in exchange the router, the trusted-proxy logic and the access log
 // all keep working on the representation they were written for.
 //===----------------------------------------------------------------------===//
 
@@ -70,7 +70,7 @@ public final class H2Connection {
     /// A RST_STREAM frees the stream slot at once, so a peer that opens a
     /// stream and cancels it in the same breath never reaches the concurrency
     /// limit, while still making the server decode a header block, build a
-    /// request and start an application task for every one of them. That is
+    /// request and answer it for every one of them. That is
     /// CVE-2023-44487, and a limit on concurrency is by construction no defence
     /// against it.
     ///
@@ -521,10 +521,9 @@ extension Worker {
             s.pointee.bodyRemaining = -1
         }
 
-        // An ASGI application is started on the head, which is what lets it
-        // reject an upload at byte one. WSGI is called once with the whole
-        // body in hand, so it has to wait for the stream to end -- exactly as
-        // it does on HTTP/1.
+        // The body is buffered whole before dispatch, so a stream with one
+        // still to come waits for the stream to end -- exactly as a request
+        // does on HTTP/1.
         if !endStream {
             s.pointee.state = .readingBody
             return
@@ -551,7 +550,7 @@ extension Worker {
 
     /// Rebuilds the request as HTTP/1.1 text and parses it.
     ///
-    /// Everything downstream -- the scope builder, the forwarded-header logic,
+    /// Everything downstream -- the router, the forwarded-header logic,
     /// the access log -- reads a parsed head with slices into a base pointer,
     /// so producing one here is what lets HTTP/2 reuse all of it.
     mutating func buildRequestHead(_ streamSlot: Int, _ h2: H2Connection) -> HeaderOutcome {
@@ -971,9 +970,6 @@ extension Worker {
             closeConnection(streamSlot)
             return false
         }
-        // A WSGI response arrives here as a staged head followed by body
-        // bytes, because the thread that produced it could not touch the
-        // connection's HPACK table. Nothing may go out before the head does.
         guard let h2 = table[parent].pointee.h2 else { return false }
 
         // A --static-dir response is fed from a descriptor rather than by the
@@ -988,15 +984,13 @@ extension Worker {
                 continue
             }
             // Never let one stream queue an unbounded amount on the socket:
-            // the stream buffer is where a slow client applies its pressure,
-            // and that is what parks the application in `await send()`.
+            // the stream buffer is where a slow client applies its pressure.
             if p.pointee.write.readableBytes > config.writeHighWaterMark {
-                // Push what is queued and look again. An application-fed
-                // stream can stop here safely, because the thing that resumes
-                // it is the application being woken on drain -- but a stream
-                // fed from a file has no such producer, and if the socket then
-                // accepts everything there is no writable event coming either.
-                // It would stall with the file half sent.
+                // Push what is queued and look again rather than stopping at
+                // once. A stream fed from a file has nothing else to resume
+                // it, and if the socket then accepts everything there is no
+                // writable event coming either. It would stall with the file
+                // half sent.
                 if !flush(parent) { return false }
                 if p.pointee.write.readableBytes > config.writeHighWaterMark { break }
             }

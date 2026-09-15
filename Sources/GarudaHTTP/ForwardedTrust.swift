@@ -153,7 +153,7 @@ public struct ForwardedTrust {
 // MARK: - Reading the forwarded headers
 
 /// What a trusted proxy said about the original request. All slices point into
-/// the request head, so nothing is copied until the value reaches Python.
+/// the request head, so nothing is copied until the value is used.
 public struct ForwardedInfo {
     public var client: ByteSpan? = nil
     public var clientPort: Int = 0

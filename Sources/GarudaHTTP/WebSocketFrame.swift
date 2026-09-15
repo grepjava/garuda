@@ -269,7 +269,7 @@ public struct UTF8Validator {
             state &-= 1
             if state == 0 {
                 // Overlong encodings, surrogates and out-of-range values are
-                // all rejected here rather than passed to Python.
+                // all rejected here rather than passed on.
                 if codepoint > 0x10FFFF { return false }
                 if codepoint >= 0xD800 && codepoint <= 0xDFFF { return false }
                 if codepoint < minimum { return false }

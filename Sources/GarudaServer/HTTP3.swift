@@ -11,7 +11,7 @@
 // A QUIC connection takes a slot in the same connection table as everything
 // else, with no descriptor of its own, and every request stream takes a child
 // slot -- exactly as HTTP/2 does. The request head is rebuilt as HTTP/1.1 text
-// and re-parsed, so the scope builder, the forwarded-header logic and the
+// and re-parsed, so the router, the forwarded-header logic and the
 // access log work unchanged. Three protocols, one request path.
 //
 // The unidirectional streams are the awkward part, because their type is the
@@ -80,12 +80,12 @@ public final class H3Connection {
 }
 
 /// How many WebTransport sessions one connection may run at once. Each one
-/// costs a slot and an application task, so this is a limit on the client
+/// costs a slot, so this is a limit on the client
 /// rather than a capability.
 let wtMaxSessions = 16
 
 /// What `beginH3Request` reports when the request ran to completion before it
-/// returned, which only a synchronous application can do.
+/// returned, as a route answered inline does.
 let h3RequestFinished = -2
 
 extension Worker {

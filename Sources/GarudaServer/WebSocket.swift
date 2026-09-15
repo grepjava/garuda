@@ -1,6 +1,6 @@
-// WebSocket framing types kept on the connection slab. Application-level
-// WebSocket handling was Python/ASGI and is gone; an upgrade is 404/501 until
-// Swift handlers exist.
+// WebSocket framing types kept on the connection slab. There is no
+// application-level WebSocket handling yet: an upgrade request is routed like
+// any other request, or refused with 501 under --no-websockets.
 
 import GarudaHTTP
 

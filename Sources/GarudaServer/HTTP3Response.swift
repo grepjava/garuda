@@ -55,16 +55,12 @@ extension Worker {
             closeConnection(streamSlot)
             return false
         }
-        // A WSGI response arrives here as a staged head followed by body
-        // bytes, because the thread that produced it could not touch the
-        // connection's compressor. Nothing may go out before the head does.
         guard let h3 = table[parent].pointee.h3 else { return false }
         let streamID = s.pointee.qstreamID
 
         // A --static-dir response is fed from a descriptor rather than by the
         // application, so it refills here. Bounded per call: whatever is left
-        // goes out when this stream is writable again, which is the same
-        // signal that resumes an application parked in send().
+        // goes out when this stream is writable again.
         var sentHere = 0
         refillStreamFromFile(streamSlot)
         var pending = s.pointee.write.readableBytes

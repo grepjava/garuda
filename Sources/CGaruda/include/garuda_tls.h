@@ -1,6 +1,6 @@
 /* TLS, wrapped so that OpenSSL headers never reach the Swift side.
  *
- * Same rule as Python.h: the Swift module map imports these headers, and
+ * The Swift module map imports these headers, and
  * anything with a packed struct, a macro-heavy API or a feature-test macro of
  * its own would leak into every target that imports CGaruda. So the types
  * here are opaque and the API is the eight operations the server needs.

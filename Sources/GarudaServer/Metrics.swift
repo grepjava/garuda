@@ -13,8 +13,7 @@
 // --workers it lands on whichever worker SO_REUSEPORT gives it; a worker that
 // answered with its own numbers would report a fraction that changes between
 // scrapes. So the page is mapped MAP_SHARED before the fork, and whoever
-// answers sums every slot. The same code covers --free-threaded, where the
-// workers are threads and share the mapping because they share everything.
+// answers sums every slot.
 //
 // The scrape itself is deliberately not run through the server's own request
 // path: that path dispatches to the application, and an operator's monitoring
