@@ -63,7 +63,7 @@ let package = Package(
                           swiftSettings: sharedSwiftSettings),
 
         .target(name: "GarudaFuzzTargets",
-                dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC"],
+                dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC", "Garuda"],
                 swiftSettings: sharedSwiftSettings),
 
         .executableTarget(name: "pgfuzz",

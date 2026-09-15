@@ -1,0 +1,290 @@
+//===----------------------------------------------------------------------===//
+// The `Encoder` side of Garuda's JSON coder.
+//
+// One `JSONWriter` is shared by every encoder and container of an `encode`,
+// and each of them knows two things: the level of the container it writes
+// into, and the key to write first, if that container is an object. That is
+// enough to stream the document out in order, with no tree in between.
+//
+// The `Encoder` protocol's container methods cannot throw, so a failure they
+// find -- nesting too deep, a non-finite Double -- is recorded on the writer
+// and thrown by `finish`.
+//===----------------------------------------------------------------------===//
+
+/// An encoder for one value: written into the container at `level`, under
+/// `key` when that container is an object.
+struct JSONEncoding: Encoder {
+    let writer: JSONWriter
+    let level: Int
+    let key: String?
+    var codingPath: [any CodingKey]
+    var userInfo: [CodingUserInfoKey: Any] { [:] }
+
+    func container<Key: CodingKey>(keyedBy type: Key.Type) -> KeyedEncodingContainer<Key> {
+        let inner = writer.begin(.object, level: level, key: key)
+        return KeyedEncodingContainer(
+            JSONKeyedEncoding<Key>(writer: writer, level: inner, codingPath: codingPath))
+    }
+
+    func unkeyedContainer() -> any UnkeyedEncodingContainer {
+        let inner = writer.begin(.array, level: level, key: key)
+        return JSONUnkeyedEncoding(writer: writer, level: inner, codingPath: codingPath)
+    }
+
+    func singleValueContainer() -> any SingleValueEncodingContainer {
+        JSONSingleValueEncoding(writer: writer, level: level, key: key, codingPath: codingPath)
+    }
+}
+
+/// Encodes `value` into the container at `level` under `key`. A value that
+/// writes nothing at all still owes its parent one, and gets an empty object.
+private func encodeValue(_ value: some Encodable, writer: JSONWriter, level: Int,
+                         key: String?, codingPath: [any CodingKey]) throws {
+    let before = writer.isEmpty
+    let mark = writer.currentLevel
+    try value.encode(to: JSONEncoding(writer: writer, level: level, key: key,
+                                      codingPath: codingPath))
+    if before && writer.isEmpty && mark == writer.currentLevel {
+        writer.begin(.object, level: level, key: key)
+    }
+}
+
+private struct JSONKeyedEncoding<Key: CodingKey>: KeyedEncodingContainerProtocol {
+    let writer: JSONWriter
+    let level: Int
+    var codingPath: [any CodingKey]
+
+    private func path(_ key: Key) -> [any CodingKey] { codingPath + [key] }
+
+    mutating func encodeNil(forKey key: Key) throws {
+        writer.writeNull(level: level, key: key.stringValue)
+    }
+
+    mutating func encode(_ value: Bool, forKey key: Key) throws {
+        writer.write(value, level: level, key: key.stringValue)
+    }
+
+    mutating func encode(_ value: String, forKey key: Key) throws {
+        writer.write(value, level: level, key: key.stringValue)
+    }
+
+    mutating func encode(_ value: Double, forKey key: Key) throws {
+        writer.write(value, level: level, key: key.stringValue,
+                     path: describe(path(key)))
+    }
+
+    mutating func encode(_ value: Float, forKey key: Key) throws {
+        try encode(Double(value), forKey: key)
+    }
+
+    mutating func encode(_ value: Int, forKey key: Key) throws {
+        writer.write(Int64(value), level: level, key: key.stringValue)
+    }
+
+    mutating func encode(_ value: Int8, forKey key: Key) throws { try encode(Int(value), forKey: key) }
+    mutating func encode(_ value: Int16, forKey key: Key) throws { try encode(Int(value), forKey: key) }
+    mutating func encode(_ value: Int32, forKey key: Key) throws { try encode(Int(value), forKey: key) }
+
+    mutating func encode(_ value: Int64, forKey key: Key) throws {
+        writer.write(value, level: level, key: key.stringValue)
+    }
+
+    mutating func encode(_ value: UInt, forKey key: Key) throws {
+        writer.write(UInt64(value), level: level, key: key.stringValue)
+    }
+
+    mutating func encode(_ value: UInt8, forKey key: Key) throws { try encode(UInt(value), forKey: key) }
+    mutating func encode(_ value: UInt16, forKey key: Key) throws { try encode(UInt(value), forKey: key) }
+    mutating func encode(_ value: UInt32, forKey key: Key) throws { try encode(UInt(value), forKey: key) }
+
+    mutating func encode(_ value: UInt64, forKey key: Key) throws {
+        writer.write(value, level: level, key: key.stringValue)
+    }
+
+    mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {
+        try encodeValue(value, writer: writer, level: level, key: key.stringValue,
+                        codingPath: path(key))
+    }
+
+    mutating func nestedContainer<NestedKey: CodingKey>(
+        keyedBy keyType: NestedKey.Type, forKey key: Key
+    ) -> KeyedEncodingContainer<NestedKey> {
+        let inner = writer.begin(.object, level: level, key: key.stringValue)
+        return KeyedEncodingContainer(
+            JSONKeyedEncoding<NestedKey>(writer: writer, level: inner, codingPath: path(key)))
+    }
+
+    mutating func nestedUnkeyedContainer(forKey key: Key) -> any UnkeyedEncodingContainer {
+        let inner = writer.begin(.array, level: level, key: key.stringValue)
+        return JSONUnkeyedEncoding(writer: writer, level: inner, codingPath: path(key))
+    }
+
+    mutating func superEncoder() -> any Encoder {
+        JSONEncoding(writer: writer, level: level, key: "super", codingPath: codingPath)
+    }
+
+    mutating func superEncoder(forKey key: Key) -> any Encoder {
+        JSONEncoding(writer: writer, level: level, key: key.stringValue, codingPath: path(key))
+    }
+}
+
+private struct JSONUnkeyedEncoding: UnkeyedEncodingContainer {
+    let writer: JSONWriter
+    let level: Int
+    var codingPath: [any CodingKey]
+    private(set) var count = 0
+
+    private mutating func counted() -> [any CodingKey] {
+        let path = codingPath + [JSONKey(index: count)]
+        count += 1
+        return path
+    }
+
+    mutating func encodeNil() throws {
+        _ = counted()
+        writer.writeNull(level: level, key: nil)
+    }
+
+    mutating func encode(_ value: Bool) throws {
+        _ = counted()
+        writer.write(value, level: level, key: nil)
+    }
+
+    mutating func encode(_ value: String) throws {
+        _ = counted()
+        writer.write(value, level: level, key: nil)
+    }
+
+    mutating func encode(_ value: Double) throws {
+        let path = counted()
+        writer.write(value, level: level, key: nil, path: describe(path))
+    }
+
+    mutating func encode(_ value: Float) throws { try encode(Double(value)) }
+
+    mutating func encode(_ value: Int) throws {
+        _ = counted()
+        writer.write(Int64(value), level: level, key: nil)
+    }
+
+    mutating func encode(_ value: Int8) throws { try encode(Int(value)) }
+    mutating func encode(_ value: Int16) throws { try encode(Int(value)) }
+    mutating func encode(_ value: Int32) throws { try encode(Int(value)) }
+
+    mutating func encode(_ value: Int64) throws {
+        _ = counted()
+        writer.write(value, level: level, key: nil)
+    }
+
+    mutating func encode(_ value: UInt) throws {
+        _ = counted()
+        writer.write(UInt64(value), level: level, key: nil)
+    }
+
+    mutating func encode(_ value: UInt8) throws { try encode(UInt(value)) }
+    mutating func encode(_ value: UInt16) throws { try encode(UInt(value)) }
+    mutating func encode(_ value: UInt32) throws { try encode(UInt(value)) }
+
+    mutating func encode(_ value: UInt64) throws {
+        _ = counted()
+        writer.write(value, level: level, key: nil)
+    }
+
+    mutating func encode<T: Encodable>(_ value: T) throws {
+        let path = counted()
+        try encodeValue(value, writer: writer, level: level, key: nil, codingPath: path)
+    }
+
+    mutating func nestedContainer<NestedKey: CodingKey>(
+        keyedBy keyType: NestedKey.Type
+    ) -> KeyedEncodingContainer<NestedKey> {
+        let path = counted()
+        let inner = writer.begin(.object, level: level, key: nil)
+        return KeyedEncodingContainer(
+            JSONKeyedEncoding<NestedKey>(writer: writer, level: inner, codingPath: path))
+    }
+
+    mutating func nestedUnkeyedContainer() -> any UnkeyedEncodingContainer {
+        let path = counted()
+        let inner = writer.begin(.array, level: level, key: nil)
+        return JSONUnkeyedEncoding(writer: writer, level: inner, codingPath: path)
+    }
+
+    mutating func superEncoder() -> any Encoder {
+        let path = counted()
+        return JSONEncoding(writer: writer, level: level, key: nil, codingPath: path)
+    }
+}
+
+private struct JSONSingleValueEncoding: SingleValueEncodingContainer {
+    let writer: JSONWriter
+    let level: Int
+    let key: String?
+    var codingPath: [any CodingKey]
+
+    mutating func encodeNil() throws { writer.writeNull(level: level, key: key) }
+    mutating func encode(_ value: Bool) throws { writer.write(value, level: level, key: key) }
+    mutating func encode(_ value: String) throws { writer.write(value, level: level, key: key) }
+
+    mutating func encode(_ value: Double) throws {
+        writer.write(value, level: level, key: key, path: describe(codingPath))
+    }
+
+    mutating func encode(_ value: Float) throws { try encode(Double(value)) }
+    mutating func encode(_ value: Int) throws { writer.write(Int64(value), level: level, key: key) }
+    mutating func encode(_ value: Int8) throws { try encode(Int(value)) }
+    mutating func encode(_ value: Int16) throws { try encode(Int(value)) }
+    mutating func encode(_ value: Int32) throws { try encode(Int(value)) }
+    mutating func encode(_ value: Int64) throws { writer.write(value, level: level, key: key) }
+    mutating func encode(_ value: UInt) throws { writer.write(UInt64(value), level: level, key: key) }
+    mutating func encode(_ value: UInt8) throws { try encode(UInt(value)) }
+    mutating func encode(_ value: UInt16) throws { try encode(UInt(value)) }
+    mutating func encode(_ value: UInt32) throws { try encode(UInt(value)) }
+    mutating func encode(_ value: UInt64) throws { writer.write(value, level: level, key: key) }
+
+    mutating func encode<T: Encodable>(_ value: T) throws {
+        try encodeValue(value, writer: writer, level: level, key: key, codingPath: codingPath)
+    }
+}
+
+/// A coding key the coder makes itself: an array index, or a name read from
+/// the document.
+struct JSONKey: CodingKey {
+    var stringValue: String
+    var intValue: Int?
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+        intValue = nil
+    }
+
+    init?(intValue: Int) {
+        stringValue = String(intValue)
+        self.intValue = intValue
+    }
+
+    init(name: String) {
+        stringValue = name
+        intValue = nil
+    }
+
+    init(index: Int) {
+        stringValue = String(index)
+        intValue = index
+    }
+}
+
+/// A coding path as it reads in an error: `user.tags[0].name`.
+func describe(_ path: [any CodingKey]) -> String {
+    var text = ""
+    for key in path {
+        if let index = key.intValue {
+            text += "[\(index)]"
+        } else if text.isEmpty {
+            text += key.stringValue
+        } else {
+            text += "." + key.stringValue
+        }
+    }
+    return text
+}

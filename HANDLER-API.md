@@ -197,6 +197,14 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 - **Fork semantics, stated.** Each worker is a process: state built in `onStart` is per worker, and a mutable object captured before the fork is copied, not shared. State every worker must see lives outside the process: a database, a cache.
 - **Typed request context** for an authenticated user and tracing.
 
+#### Order of work
+
+1. **The JSON coder.** Landed: `JSON.encode` and `JSON.decode` over the standard library's `Encodable` and `Decodable`, in `Sources/Garuda/JSON*.swift`. The writer streams, closing containers as the document goes out rather than building a tree; the reader proves the document is JSON once and then reads only where the type asks, walking an object's members instead of copying them into a dictionary. Nesting is bounded at 64 both ways. 18 unit tests, and a fuzz target (`json`) whose invariant is that a document which decodes encodes again and reads back as the same value.
+2. Typed responses and errors: `send(json:)`, a typed status, text, HTML, bytes and redirects, application errors that convert to responses, and one shape for a decoding failure.
+3. Typed extraction: path parameters, query and JSON bodies, through parameter packs, with the decoding failure of 2.2 as the only way it can fail.
+4. Typed application state from `onStart`, and the fork semantics stated.
+5. Forms, then multipart.
+
 ### 3. Async handlers and real integrations
 
 - **`async throws` handlers beside synchronous ones**, registered through the overloads and run on the handler task pool that step 1 builds ([How a request runs](#how-a-request-runs)). An `await` resumes on the worker thread; a synchronous handler keeps today's path. The pool's cost, about 0.4–1 µs and no allocation per async request, is measured again on the real engine before this lands.

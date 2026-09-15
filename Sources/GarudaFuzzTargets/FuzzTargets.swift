@@ -26,6 +26,7 @@
 // from coming back.
 //===----------------------------------------------------------------------===//
 
+import Garuda
 import GarudaCore
 import GarudaHTTP
 import GarudaQUIC
@@ -36,6 +37,7 @@ public enum FuzzTarget: String, CaseIterable, Sendable {
     case hpack = "hpack"
     case websocket = "websocket"
     case quicPacket = "quic-packet"
+    case json = "json"
 }
 
 public enum Fuzz {
@@ -53,6 +55,7 @@ public enum Fuzz {
         case .hpack: return hpack(input, count)
         case .websocket: return websocket(input, count)
         case .quicPacket: return quicPacket(input, count)
+        case .json: return json(input, count)
         }
     }
 
@@ -66,6 +69,106 @@ public enum Fuzz {
         return padded.withUnsafeBufferPointer { buf in
             run(target, buf.baseAddress!, bytes.count)
         }
+    }
+
+    // MARK: - JSON
+
+    /// Any JSON document, as a value. Decoding into it uses every container
+    /// the coder has, and gives the round trip something to compare.
+    indirect enum Value: Codable, Equatable {
+        case null
+        case bool(Bool)
+        case integer(Int64)
+        case double(Double)
+        case string(String)
+        case array([Value])
+        case object([String: Value])
+
+        struct Key: CodingKey {
+            var stringValue: String
+            var intValue: Int? { nil }
+            init?(stringValue: String) { self.stringValue = stringValue }
+            init?(intValue: Int) { return nil }
+        }
+
+        init(from decoder: any Decoder) throws {
+            if var unkeyed = try? decoder.unkeyedContainer() {
+                var items: [Value] = []
+                while !unkeyed.isAtEnd { items.append(try unkeyed.decode(Value.self)) }
+                self = .array(items)
+                return
+            }
+            if let keyed = try? decoder.container(keyedBy: Key.self) {
+                var members: [String: Value] = [:]
+                for key in keyed.allKeys {
+                    members[key.stringValue] = try keyed.decode(Value.self, forKey: key)
+                }
+                self = .object(members)
+                return
+            }
+            let single = try decoder.singleValueContainer()
+            if single.decodeNil() {
+                self = .null
+            } else if let value = try? single.decode(Bool.self) {
+                self = .bool(value)
+            } else if let value = try? single.decode(Int64.self) {
+                self = .integer(value)
+            } else if let value = try? single.decode(Double.self) {
+                self = .double(value)
+            } else {
+                self = .string(try single.decode(String.self))
+            }
+        }
+
+        func encode(to encoder: any Encoder) throws {
+            switch self {
+            case .null:
+                var single = encoder.singleValueContainer()
+                try single.encodeNil()
+            case .bool(let value):
+                var single = encoder.singleValueContainer()
+                try single.encode(value)
+            case .integer(let value):
+                var single = encoder.singleValueContainer()
+                try single.encode(value)
+            case .double(let value):
+                var single = encoder.singleValueContainer()
+                try single.encode(value)
+            case .string(let value):
+                var single = encoder.singleValueContainer()
+                try single.encode(value)
+            case .array(let items):
+                var unkeyed = encoder.unkeyedContainer()
+                for item in items { try unkeyed.encode(item) }
+            case .object(let members):
+                var keyed = encoder.container(keyedBy: Key.self)
+                // In a settled order, so that the round trip compares values
+                // rather than the order a dictionary happens to hold them in.
+                for name in members.keys.sorted() {
+                    try keyed.encode(members[name]!, forKey: Key(stringValue: name)!)
+                }
+            }
+        }
+    }
+
+    /// A document that decodes must encode again, and read back as the same
+    /// value: the coder reads request bodies, which are whatever the peer
+    /// chose to send.
+    private static func json(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
+        let bytes = Array(UnsafeBufferPointer(start: base, count: n))
+        guard let value = try? JSON.decode(Value.self, from: bytes) else { return nil }
+        guard let written = try? JSON.encode(value) else {
+            return "a document that decoded could not be encoded again"
+        }
+        guard let again = try? JSON.decode(Value.self, from: written) else {
+            return "what the encoder wrote did not decode: "
+                + String(decoding: written, as: UTF8.self)
+        }
+        if again != value {
+            return "the value changed through encode and decode: "
+                + String(decoding: written, as: UTF8.self)
+        }
+        return nil
     }
 
     // MARK: - HTTP/1 request head

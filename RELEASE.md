@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 213 unit tests
+swift test                             # 231 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -96,6 +96,14 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   same loop turn as the request; closing a connection or resetting a stream
   cancels the handler's wait and returns its task to the pool. A worker that
   serves only synchronous handlers never makes one.
+- `JSON.encode` and `JSON.decode` are Garuda's own JSON coder, over the
+  standard library's `Encodable` and `Decodable`: `JSONEncoder` and
+  `JSONDecoder` are Foundation, which Garuda does not link. The writer streams
+  a value out with no tree in between; the reader proves a document is JSON
+  once and then reads only the keys the type asks for, so a request body costs
+  what the handler takes from it rather than what it contains. Objects and
+  arrays may nest 64 deep, a number that does not fit its type is an error
+  rather than a silent wrap, and the coder is fuzzed.
 - `app.run()` parses the usual flags and runs the supervisor, and
   `app.run(configuration:)` serves a `ServerConfig` instead, checked the way
   the command line is. `onWorkerStart` hooks run in each worker before it

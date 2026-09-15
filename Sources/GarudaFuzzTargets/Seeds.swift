@@ -21,7 +21,25 @@ extension Fuzz {
         case .hpack: return hpackSeeds
         case .websocket: return websocketSeeds
         case .quicPacket: return quicPacketSeeds
+        case .json: return jsonSeeds
         }
+    }
+
+    private static var jsonSeeds: [[UInt8]] {
+        [
+            text("{}"),
+            text("[]"),
+            text("null"),
+            text("true"),
+            text("-0"),
+            text("{\"a\":1,\"b\":[1,2,3],\"c\":{\"d\":null},\"e\":\"f\"}"),
+            text("[1.5e10,-2,0.0001,1e-5,9223372036854775807]"),
+            text("\"\\u00e9\\ud83d\\ude00\\n\\t\\\\\\\"\\/\""),
+            text("{\"nested\":[[[[{\"deep\":true}]]]]}"),
+            text("[\"\",\"a\",\"  \"]"),
+            text("{\"dup\":1,\"dup\":2}"),
+            text("  { \"spaced\" : [ 1 , 2 ] }  "),
+        ]
     }
 
     private static var httpHeadSeeds: [[UInt8]] {

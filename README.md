@@ -71,6 +71,11 @@ exit(app.run())
 - **`Response`** is `~Copyable` too: `status`, `addHeader`, `send(status:)`,
   `send(status:_:)` (a lent `Span` is sent without a copy), and
   `after(milliseconds:then:)`, which calls a handler again after a timer.
+- **`JSON.encode` and `JSON.decode`** are Garuda's own coder, over the standard
+  library's `Encodable` and `Decodable` — `JSONEncoder` and `JSONDecoder` are
+  Foundation, which Garuda does not link. Decoding reads only the keys a type
+  asks for, straight from the bytes the request lent it. The typed extraction
+  and responses being built on it are [step 2](HANDLER-API.md).
 - **`app.run()`** parses the flags and runs the supervisor;
   `app.run(configuration:)` serves a `ServerConfig` instead. `onWorkerStart`
   hooks run in each worker before it reports ready, and `onWorkerShutdown`
@@ -366,7 +371,7 @@ reads the forwarded client and scheme as `request.remoteAddress`,
 Unit tests, including the fuzz corpus:
 
 ```bash
-swift test                                   # 213 tests
+swift test                                   # 231 tests
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
