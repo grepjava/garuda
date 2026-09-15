@@ -62,6 +62,9 @@ extension Worker {
         c.pointee.write.write("Retry-After: ")
         c.pointee.write.writeDecimal(seconds)
         c.pointee.write.writeCRLF()
+        // A refusal is still an answer to log and correlate: the HTTP/2 and
+        // HTTP/3 paths carry these, and so does every other HTTP/1.1 answer.
+        writeServerHeaders(slot, &c.pointee.write)
         HTTPResponseWriter.writeContentLength(&c.pointee.write, body.utf8CodeUnitCount)
         HTTPResponseWriter.writeConnection(&c.pointee.write,
                                            keepAlive: c.pointee.flags.contains(.keepAlive))

@@ -73,7 +73,7 @@ server_require_port_free "$PORT" || exit 1
 
 # --- one worker ----------------------------------------------------------
 echo "one worker"
-start --rate-limit 1/m --rate-limit-burst 5 --health-check-path /healthz
+start --rate-limit 1/m --rate-limit-burst 5 --health-check-path /healthz --request-id
 is "the burst is allowed, then refused" "$(codes 8 $H/)" "200200200200200429429429"
 curl -sS --max-time 5 -D "$WORK/h" -o "$WORK/b" $H/
 RETRY=$(tr -d '\r' < "$WORK/h" | awk 'tolower($1)=="retry-after:" {print $2}')
@@ -81,6 +81,12 @@ if [ -n "$RETRY" ] && [ "$RETRY" -ge 1 ] && [ "$RETRY" -le 60 ]; then
     ok "Retry-After says when ($RETRY s)"
 else
     bad "Retry-After says when" "1..60" "${RETRY:-none}"
+fi
+REFUSED_ID=$(tr -d '\r' < "$WORK/h" | awk 'tolower($1)=="x-request-id:" {print $2}')
+if [ -n "$REFUSED_ID" ]; then
+    ok "a refusal carries its X-Request-ID"
+else
+    bad "a refusal carries its X-Request-ID" "a request ID" "none"
 fi
 is "the body says why" "$(cat "$WORK/b")" "Too Many Requests"
 is "the health probe is never refused" "$(codes 3 $H/healthz)" "200200200"
