@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/garuda-stylized-lockup.png" alt="Garuda" width="720">
+  <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/garuda-stylized-lockup-tamil5.png" alt="Garuda" width="720">
 </p>
 
 <p align="center">
