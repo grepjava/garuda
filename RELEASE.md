@@ -204,8 +204,9 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
 
 ### Connections the server makes
 
-Ground for an HTTP client and the database drivers. None of it is public API
-yet: a handler cannot open a connection or make a request of its own.
+A handler can make an HTTP request, and the database drivers will stand on the
+same ground. The connection layer itself is not public: what a handler reaches
+is `request.client`.
 
 - A worker opens outbound connections on its own poller, so a handler waiting
   on one waits the way it waits for anything else — one thread, one place
@@ -226,15 +227,23 @@ yet: a handler cannot open a connection or make a request of its own.
   fit, keeps answers for as long as their TTL allows, and refuses an answer to
   a question it did not ask. Connecting to a name tries every address the
   answer carried, in the order the server gave them.
-- The pieces an HTTP client is made of: a response-head parser, a request
-  writer, and a URL splitter. The parser frames a response body by what was
-  asked and by the status before it believes any field, so a response to HEAD
-  and a 204 carry no body whatever they declare. The writer refuses, rather
-  than escapes, anything that could split a request, and owns Host,
-  Content-Length, Transfer-Encoding and Connection rather than letting a
-  caller supply a second one. The URL splitter refuses userinfo outright:
-  `https://a@b/` names host `b` and reads as `a`, and that gap is the whole of
-  an attack.
+- `request.client` makes HTTP/1.1 requests: `try await client.get(url)`,
+  `.head`, `.post`, or `.send` for any method, each returning the status,
+  headers and body. Read it from the request before the first `await` — a
+  `Request` is a view of a connection slot and does not outlive a suspension.
+  `https` verifies the peer, names are resolved off the blocking path, and a
+  kept connection is reused for the next request to the same place.
+- A connection goes back to the pool only when the response was read whole and
+  both ends still mean to keep it. Anything else is closed: a connection handed
+  back with bytes still on it gives the next caller somebody else's answer, and
+  that surfaces far away, looking nothing like a pooling bug.
+- What the client refuses, it refuses before opening anything. A response body
+  is framed by what was asked and by the status before any field is believed,
+  so a response to HEAD and a 204 carry no body whatever they declare. A header
+  that could split the request is refused rather than escaped, and Host,
+  Content-Length, Transfer-Encoding and Connection belong to the client rather
+  than the caller. A URL carrying userinfo is refused outright: `https://a@b/`
+  names host `b` and reads as `a`, and that gap is the whole of an attack.
 
 ### Changed
 
@@ -255,10 +264,10 @@ yet: a handler cannot open a connection or make a request of its own.
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
 - The handler API's later steps: there is no middleware, no 405, no streaming
   response, and no WebSocket or WebTransport handler.
-- Nothing a handler can call reaches another service. The connections, names
-  and TLS below are the ground an HTTP client and the database drivers are
-  being built on; none of that is public API yet, and a handler cannot make a
-  request of its own.
+- No database drivers, and the HTTP client speaks HTTP/1.1 only: ALPN asks for
+  `http/1.1`, because a server that selected HTTP/2 would find a client that
+  cannot speak it. The client does not follow redirects and sends no
+  `Accept-Encoding`, since the compression shim encodes and does not decode.
 - `--compress` and `--cache-size` act on no handler response; they wait for
   streaming responses.
 - TLS is OpenSSL, not Swift.
