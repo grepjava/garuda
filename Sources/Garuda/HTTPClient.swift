@@ -62,6 +62,13 @@ public enum ClientError: Error, Equatable {
     /// ALPN settled on a protocol this client cannot speak. Not a failure of
     /// the peer's: it chose from what was offered.
     case unsupportedProtocol
+    /// The peer broke HTTP/2 framing: a frame longer than was agreed, a header
+    /// block interleaved with another frame, a stream identifier for a stream
+    /// this client never opened, a push it was told not to send.
+    case protocolError
+    /// The peer reset this stream, or went away without answering it. Carries
+    /// its error code, which is the only thing it said about why.
+    case streamReset(UInt32)
 }
 
 public struct ClientHeader: Sendable, Equatable {
@@ -126,6 +133,15 @@ public struct HTTPClient {
     var alpn: String = "http/1.1"
     /// Sent unless the caller sets its own.
     public var userAgent: String = "garuda"
+    /// Speak HTTP/2 whatever ALPN said, including on a plaintext connection.
+    ///
+    /// Internal, and only for tests. ALPN is what chooses in production, and
+    /// ALPN needs TLS -- so without this every test of the frame loop would
+    /// also be a test of OpenSSL, and a framing bug would be indistinguishable
+    /// from a handshake one. This is not RFC 9113's prior-knowledge mode:
+    /// nothing negotiates, and pointing it at an ordinary HTTP/1.1 server
+    /// sends a preface that server will read as a malformed request.
+    var forceHTTP2 = false
 
     init(worker: UnsafeMutablePointer<Worker>) {
         self.worker = worker
@@ -189,15 +205,24 @@ extension HTTPClient {
             throw .connect(error)
         }
 
-        // What was agreed, not what was asked for. A server may only select
-        // from what was offered, so with `alpn` at http/1.1 this cannot fire
-        // against anything compliant -- but writing a request line into a
-        // connection the peer believes is carrying frames is not a failure
-        // worth discovering from the far end's behaviour. The frame loop is
-        // what replaces this.
-        if socket.isHTTP2 {
-            socket.close()
-            throw .unsupportedProtocol
+        // What was agreed, not what was asked for. A request line written into
+        // a connection the peer believes is carrying frames desynchronises it
+        // immediately, so the agreement decides which of the two this is.
+        if socket.isHTTP2 || forceHTTP2 {
+            // One exchange per connection, and closed on every path out --
+            // including the one where it worked.
+            //
+            // The state that would have to persist between two exchanges on
+            // one socket, the HPACK dynamic table above all, is what makes
+            // sharing subtle, so returning it to the pool would send a second
+            // preface down a live connection. But closing only on failure is
+            // not the safe half of that: a successful exchange then leaves the
+            // record open and owned by nobody, holding a descriptor until the
+            // worker drains. `reusedConnection` would still say false, which
+            // is how it went unnoticed.
+            defer { socket.close() }
+            return try await exchangeHTTP2(socket, plan, method: method,
+                                           headers: headers, body: body)
         }
 
         do {
@@ -217,6 +242,13 @@ extension HTTPClient {
         var host: String
         var port: UInt16
         var secure: Bool
+        /// host[:port] as it belongs in a Host field or an `:authority`.
+        var authority: String
+        /// The request-target, with its leading slash already supplied.
+        var target: String
+        /// How many bytes of body follow, for the `content-length` HTTP/2
+        /// states in a field rather than in framing.
+        var bodyLength: Int
     }
 
     // MARK: Building the head
@@ -304,9 +336,19 @@ extension HTTPClient {
             HTTPRequestWriter.writeConnection(&head, keepAlive: true)
             HTTPRequestWriter.endHead(&head)
 
+            // Copied out inside the borrow, while the URL's bytes are still
+            // alive: everything the parser produced is a slice into them, and
+            // HTTP/2 needs the same three values in a different shape.
             let host = String(decoding: UnsafeBufferPointer(
                 start: base + Int(parsed.host.offset), count: parsed.host.count), as: UTF8.self)
-            return .success(Plan(host: host, port: parsed.port, secure: parsed.scheme.isSecure))
+            let authority = String(decoding: UnsafeBufferPointer(
+                start: base + Int(parsed.hostForField.offset),
+                count: parsed.hostForField.count), as: UTF8.self)
+            return .success(Plan(host: host, port: parsed.port,
+                                 secure: parsed.scheme.isSecure,
+                                 authority: authority,
+                                 target: String(decoding: target, as: UTF8.self),
+                                 bodyLength: body.count))
         }
 
         switch outcome {
@@ -329,7 +371,7 @@ extension HTTPClient {
     /// the loop: a borrow of the array cannot cross the `await` that waits for
     /// the socket to drain, and an array is free to move while nothing holds
     /// it.
-    private func writeAll(_ socket: OutboundSocket, _ bytes: [UInt8]) async throws(ClientError) {
+    func writeAll(_ socket: OutboundSocket, _ bytes: [UInt8]) async throws(ClientError) {
         var sent = 0
         while sent < bytes.count {
             let n: Int
@@ -355,8 +397,8 @@ extension HTTPClient {
         }
     }
 
-    private func writeAll(_ socket: OutboundSocket,
-                          _ base: UnsafePointer<UInt8>, _ count: Int) async throws(ClientError) {
+    func writeAll(_ socket: OutboundSocket,
+                  _ base: UnsafePointer<UInt8>, _ count: Int) async throws(ClientError) {
         var sent = 0
         while sent < count {
             let n: Int
@@ -510,8 +552,8 @@ extension HTTPClient {
     /// Waits for more and takes it. A peer that closes is `.closed`, which the
     /// close-delimited path treats as the end of the body and every other path
     /// treats as the peer giving up part way through.
-    private func readMore(_ socket: OutboundSocket,
-                          into buffer: inout ByteBuffer) async throws(ClientError) {
+    func readMore(_ socket: OutboundSocket,
+                  into buffer: inout ByteBuffer) async throws(ClientError) {
         // OpenSSL may be holding decrypted bytes the socket has already given
         // up, and no poll will ever mention those again.
         if !socket.hasBufferedInput {
