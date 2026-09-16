@@ -22,6 +22,14 @@ import GarudaHTTP
 
 public typealias Handler = (borrowing Request, inout Response) throws -> Void
 
+/// Runs before a route's handler. Returns nil to carry on to the next
+/// middleware and then the handler, or an answer to send instead of calling
+/// them. Throwing a `ResponseError` answers as well.
+///
+/// Headers it adds to the response stay on whatever the handler sends, which
+/// is how a middleware decorates responses without seeing them.
+public typealias Middleware = (borrowing Request, borrowing Response) throws -> (any ResponseConvertible)?
+
 // MARK: - Routes
 
 /// Routes as an `Application` registers them, compiled when it runs.
@@ -35,16 +43,60 @@ struct Routes {
     /// `Application.deadline(milliseconds:)` registers a group of them.
     var currentDeadline: UInt32 = 0
 
+    /// Middleware for every route, from `use` outside any group.
+    var global: [Middleware] = []
+    /// Every group opened so far, with the prefix it adds and the middleware
+    /// `use` gave it.
+    var groups: [(prefix: String, middleware: [Middleware])] = []
+    /// The groups open right now, outermost first.
+    var openGroups: [Int] = []
+    /// The groups each route was registered inside, by route number.
+    var routeGroups: [[Int]] = []
+
+    /// The prefix routes registered now are mounted under.
+    var currentPrefix: String {
+        openGroups.map { groups[$0].prefix }.joined()
+    }
+
     /// Registers `handler` for `method` and `pattern`. A pattern that cannot
     /// be served is a mistake in the program, found before the server starts.
     mutating func on(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping Handler) {
+        let prefix = currentPrefix
+        // A group's own root is the prefix itself, not the prefix and a slash.
+        let full = prefix.isEmpty ? pattern : (pattern == "/" ? prefix : prefix + pattern)
         do {
-            try table.add(method, pattern, route: Int32(handlers.count))
+            try table.add(method, full, route: Int32(handlers.count))
         } catch {
-            fatalError("route \(pattern): \(error)")
+            fatalError("route \(full): \(error)")
         }
         handlers.append(handler)
         deadlines.append(currentDeadline)
+        routeGroups.append(openGroups)
+    }
+
+    /// Each route's handler with its middleware in front, in order: global
+    /// first, then the groups from the outside in.
+    ///
+    /// Assembled here, once, when the application compiles -- never per
+    /// request -- and gathered from the groups as they stand at the end, so
+    /// middleware applies to every route in its scope whether `use` was called
+    /// before the routes were registered or after. A route with no middleware
+    /// keeps its own handler, and pays nothing.
+    func handlersWithMiddleware() -> [Handler] {
+        handlers.enumerated().map { index, handler in
+            var chain = global
+            for group in routeGroups[index] { chain += groups[group].middleware }
+            if chain.isEmpty { return handler }
+            return { request, response in
+                for middleware in chain {
+                    if let answer = try middleware(request, response) {
+                        try answer.write(to: response)
+                        return
+                    }
+                }
+                try handler(request, &response)
+            }
+        }
     }
 }
 

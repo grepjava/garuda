@@ -229,6 +229,8 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 
 ### 4. Middleware and router composition
 
+**Started 2026-09-16.** Landed: 405 with `Allow`, found by asking the router once per method so the union across routes a path can reach is exact; `group(prefix)` with nesting; `use(middleware)` scoped to the enclosing group and independent of registration order, compiled into each route's handler at start-up with routes that have none left untouched. A middleware runs before the handler and can short-circuit or add headers — it cannot await the handler or rewrite its response, because handlers answer into the sink and async ones answer later on a task. Not yet: router values to merge, custom fallbacks, and the middleware Garuda ships.
+
 - **Grouping, nesting and merging** of routers.
 - **Middleware, global and per route**, that can short-circuit, await the handler and transform its response. The chain is compiled at start-up: a request allocates no wrappers.
 - **405 with `Allow`** for a known path under the wrong method (the trie already keeps a slot per method at every node), and custom fallbacks.

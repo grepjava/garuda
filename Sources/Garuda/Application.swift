@@ -94,6 +94,48 @@ public final class Application {
         register()
     }
 
+    // MARK: Groups and middleware
+
+    /// Mounts every route registered inside `register` under `prefix`, and
+    /// scopes any `use` called inside it to those routes.
+    ///
+    ///     app.group("/api") {
+    ///         app.use(requireToken)
+    ///         app.get("/users/:id") { … }        // GET /api/users/:id
+    ///         app.group("/admin") {
+    ///             app.use(requireAdmin)
+    ///             app.delete("/users/:id") { … } // DELETE /api/admin/users/:id,
+    ///         }                                   // requireToken, then requireAdmin
+    ///     }
+    ///
+    /// Groups nest; prefixes join and middleware runs from the outside in.
+    public func group(_ prefix: String, _ register: () -> Void) {
+        precondition(compiled == nil, "group added after the application was compiled")
+        precondition(prefix.hasPrefix("/"), "a group prefix starts with /: \(prefix)")
+        var trimmed = prefix
+        while trimmed.count > 1 && trimmed.hasSuffix("/") { trimmed.removeLast() }
+        routes.groups.append((prefix: trimmed == "/" ? "" : trimmed, middleware: []))
+        routes.openGroups.append(routes.groups.count - 1)
+        defer { routes.openGroups.removeLast() }
+        register()
+    }
+
+    /// Runs `middleware` before the handler of every route in the current
+    /// scope: every route, outside a group, or every route in the group this
+    /// is called inside.
+    ///
+    /// Order of registration does not matter: a `use` after the routes it
+    /// covers applies to them as surely as one before. What does matter is
+    /// the order of `use` calls within a scope, which is the order they run.
+    public func use(_ middleware: @escaping Middleware) {
+        precondition(compiled == nil, "middleware added after the application was compiled")
+        if let group = routes.openGroups.last {
+            routes.groups[group].middleware.append(middleware)
+        } else {
+            routes.global.append(middleware)
+        }
+    }
+
     // MARK: Worker hooks
 
     /// Runs in each worker process before it accepts a connection -- a
@@ -173,7 +215,7 @@ public final class Application {
         if let compiled { return compiled }
         let count = routes.handlers.count
         let handlers = UnsafeMutablePointer<Handler>.allocate(capacity: max(1, count))
-        for (i, handler) in routes.handlers.enumerated() {
+        for (i, handler) in routes.handlersWithMiddleware().enumerated() {
             (handlers + i).initialize(to: handler)
         }
         let deadlines = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, count))

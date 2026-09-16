@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 659 unit tests
+swift test                             # 670 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -297,14 +297,26 @@ is `request.client`.
 - A path that has a route under some other method is answered 405, with an
   `Allow` header naming every method that would have matched, rather than 404.
   A path no method routes is still 404.
+- Routes can be grouped and guarded. `app.group("/api") { … }` mounts what is
+  registered inside under the prefix, and groups nest. `app.use(middleware)`
+  runs a middleware before every route in its scope — every route outside a
+  group, or the group's own routes inside one — global first, then groups from
+  the outside in. A middleware returns nil to carry on, or an answer to send
+  instead of the handler (a 401, say), and headers it adds stay on whatever the
+  handler sends. `use` covers its whole scope whether it is called before or
+  after the routes, so moving a line cannot leave a route unguarded, and it
+  guards async routes before their task starts. The chain is assembled when
+  the application compiles; a route with no middleware keeps its own handler.
 
 ### Not yet
 
 - WebSocket and WebTransport application APIs are stubs. HTTP/3 still
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
-- The handler API's later steps: there is no middleware, no router nesting or
-  custom fallback, no streaming response, and no WebSocket or WebTransport
-  handler.
+- The handler API's later steps: middleware runs only before a handler and
+  cannot await or rewrite its response; no reusable router values to merge, no
+  custom fallback, none of the shipped middleware (authentication, CORS,
+  tracing, request limits), no streaming response, and no WebSocket or
+  WebTransport handler.
 - PostgreSQL has no binary formats, no `LISTEN`, and does not
   SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
   written. The HTTP client does not follow redirects and sends no
