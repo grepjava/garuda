@@ -109,6 +109,9 @@ public struct Worker {
     /// The routes and hooks this worker serves: the running application's,
     /// or a test client's. With none, every request is answered 404.
     var application: UnsafeMutablePointer<CompiledApplication>? = nil
+    /// What this worker built at start-up, by the type it is asked for by
+    /// (State.swift). One worker is one process, so these are its own.
+    var services: [ObjectIdentifier: Any] = [:]
     static let readyDrainBudget = 64
     /// The tasks async handlers run on (HandlerTasks.swift), made on the first
     /// async request, and how many there may be.

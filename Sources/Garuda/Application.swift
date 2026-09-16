@@ -24,6 +24,10 @@ public final class Application {
     var routes = Routes()
     var startHooks: [(Int) -> Void] = []
     var shutdownHooks: [(Int) -> Void] = []
+    /// What each worker builds for itself at start-up, by the type handlers
+    /// ask for it by, and how to tear it down (State.swift).
+    var stateFactories: [(ObjectIdentifier, (Int) throws -> Any)] = []
+    var stateShutdowns: [(ObjectIdentifier, (Any) -> Void)] = []
     /// The routes and hooks as workers read them, made the first time the
     /// application runs or is tested. Nothing can be added after that.
     var compiled: UnsafeMutablePointer<CompiledApplication>? = nil
@@ -155,6 +159,8 @@ public final class Application {
             routes: routes.table.compile(),
             handlers: handlers,
             handlerCount: count,
+            stateFactories: stateFactories,
+            stateShutdowns: stateShutdowns,
             onStart: start.isEmpty ? nil : { index in for hook in start { hook(index) } },
             onShutdown: shutdown.isEmpty ? nil : { index in for hook in shutdown { hook(index) } }))
         compiled = application
@@ -168,6 +174,8 @@ struct CompiledApplication {
     let routes: CompiledRoutes
     let handlers: UnsafeMutablePointer<Handler>
     let handlerCount: Int
+    let stateFactories: [(ObjectIdentifier, (Int) throws -> Any)]
+    let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]
     let onStart: ((Int) -> Void)?
     let onShutdown: ((Int) -> Void)?
 

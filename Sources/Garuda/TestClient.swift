@@ -73,10 +73,23 @@ public final class TestClient {
         worker = UnsafeMutablePointer<Worker>.allocate(capacity: 1)
         worker.initialize(to: Worker(config: configuration, listenFD: -1, poller: poller))
         worker.pointee.application = application.compile()
+        // A test gets the state a forked worker builds, built the same way.
+        // A factory that throws stops a worker's start-up; here there is no
+        // worker to stop, so it stops the test.
+        onWorker {
+            do {
+                try worker.pointee.buildState(worker.pointee.application, index: 0)
+            } catch {
+                fatalError("a state factory threw in the test client: \(error)")
+            }
+        }
     }
 
     deinit {
-        onWorker { worker.pointee.destroy() }
+        onWorker {
+            worker.pointee.tearDownState(worker.pointee.application)
+            worker.pointee.destroy()
+        }
         worker.deinitialize(count: 1)
         worker.deallocate()
     }

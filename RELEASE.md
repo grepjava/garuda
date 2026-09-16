@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 248 unit tests
+swift test                             # 254 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -130,6 +130,16 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   will not decode answers the same way: a 400 whose body says what was wrong.
   The raw `(borrowing Request, inout Response)` handlers register through the
   same names and are unaffected.
+- Workers can build typed state. `app.state { worker in try Pool.connect() }`
+  runs once in each worker, after the fork and before it reports ready, and a
+  handler asks for it by type with `State<Pool>`, alongside the other
+  extractors. One value per type. A factory that throws stops that worker's
+  start-up with its error — the child exits 1 and the supervisor sees the
+  readiness pipe hang up — instead of serving without what it needed, and an
+  optional `shutdown:` tears the value down once the worker's loop has ended.
+  Asking for state nobody registered answers 500 naming the type. Because each
+  worker is a process, what a factory builds belongs to that worker alone; an
+  object captured before the fork is copied into each worker, not shared.
 - `app.run()` parses the usual flags and runs the supervisor, and
   `app.run(configuration:)` serves a `ServerConfig` instead, checked the way
   the command line is. `onWorkerStart` hooks run in each worker before it

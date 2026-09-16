@@ -1082,12 +1082,27 @@ enum GarudaRuntime {
         // Before the worker reports ready, so that a reload does not retire
         // the worker this one replaces until its start-up hook has returned.
         // A signal that arrives meanwhile waits in the pipe for the loop.
+        // A worker that cannot build what it serves with does not serve: the
+        // child exits 1, and the supervisor sees the readiness pipe hang up.
+        do {
+            try workerPtr.pointee.buildState(application, index: index)
+        } catch {
+            let description = String(describing: error)
+            Log.error { line in
+                line.str("worker state could not be built: ")
+                description.withCString { line.cstr($0) }
+            }
+            workerPtr.pointee.destroy()
+            currentWorker = nil
+            return false
+        }
         application?.pointee.onStart?(index)
         logReady(config)
         runSynchronousLoop(workerPtr)
         // The loop ends once in-flight requests have finished or the grace
         // period has; the exit watchdog armed at the drain bounds this too.
         application?.pointee.onShutdown?(index)
+        workerPtr.pointee.tearDownState(application)
         workerPtr.pointee.destroy()
         currentWorker = nil
         return true

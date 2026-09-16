@@ -21,8 +21,8 @@ kept. CPython, ASGI, WSGI and the Python package were removed.
 request view with its headers and whole body, one-shot responses, a timer
 continuation, Garuda's own JSON coder, typed answers and errors, and typed
 extraction of path parameters, query strings and JSON bodies. Handlers are
-still synchronous, and there is no application state, middleware, streaming,
-WebSocket or WebTransport handler yet. It is useful for evaluating the engine:
+still synchronous, and there is no middleware, streaming, WebSocket or
+WebTransport handler yet. It is useful for evaluating the engine:
 its protocols, TLS, operational behaviour and raw throughput. It is not yet a
 stable way to serve your own application. [HANDLER-API.md](HANDLER-API.md) holds the design and
 roadmap, and [GARUDA.md](GARUDA.md) is the authoritative status document.
@@ -96,6 +96,18 @@ exit(app.run())
   Returning `JSON`, `HTML`, `Text`, `Bytes`, `Redirect`, a `String`, a status —
   or an Optional whose `nil` is a 404 — writes the response. Anything that
   will not decode is one consistent 400 saying what was wrong.
+- **Typed state per worker.** `app.state { worker in try Pool.connect() }` runs
+  once in each worker after the fork, and `State<Pool>` hands it to any handler
+  that asks:
+
+  ```swift
+  app.get("/user/:id") { (id: Path<Int>, pool: State<Pool>) in JSON(pool.value.user(id.value)) }
+  ```
+
+  A factory that throws stops that worker starting rather than letting it serve
+  without what it needed, and `shutdown:` tears the value down when the
+  worker's loop ends. Each worker is a process, so what it builds is its own:
+  state every worker must see belongs outside the process.
 - **`JSONCoder.encode` and `JSONCoder.decode`** are Garuda's own coder, over the standard
   library's `Encodable` and `Decodable` — `JSONEncoder` and `JSONDecoder` are
   Foundation, which Garuda does not link. Decoding reads only the keys a type
@@ -116,8 +128,8 @@ a declared `Content-Length`. A handler that throws, or returns without
 answering or waiting, gets a 500.
 
 The API is not stable. Handlers are synchronous, and suspension is only the
-timer continuation. There is no application state, middleware, 405, streaming,
-WebSocket or WebTransport handler yet.
+timer continuation. There is no middleware, 405, streaming, WebSocket or
+WebTransport handler yet.
 [HANDLER-API.md](HANDLER-API.md) has the roadmap.
 
 ### What the binary serves
@@ -396,7 +408,7 @@ reads the forwarded client and scheme as `request.remoteAddress`,
 Unit tests, including the fuzz corpus:
 
 ```bash
-swift test                                   # 248 tests
+swift test                                   # 254 tests
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
