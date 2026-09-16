@@ -106,12 +106,27 @@ extension Worker {
                             sawName = true
                             attempt = config.attempts
                         case .truncated:
-                            // Not thrown: the catch below turns anything that
-                            // is not cancellation into "try the next server",
-                            // which would report a truncated answer as an
-                            // unreachable one and lose the whole point of
-                            // saying so. Asking again would truncate again.
-                            throw Escape.truncated
+                            // What truncation means is "ask me again over
+                            // TCP", so that is what happens rather than the
+                            // lookup failing. The same server, since it is the
+                            // one holding the answer.
+                            let whole = try await askOverTCP(worker, candidate, type: type,
+                                                             server: server,
+                                                             seconds: config.timeoutSeconds)
+                            switch whole {
+                            case .addresses(let found):
+                                return found
+                            case .noSuchName, .empty:
+                                sawName = true
+                                attempt = config.attempts
+                            case .truncated, .ignored:
+                                // Truncated over TCP is a server contradicting
+                                // itself, and there is no third transport to
+                                // try. Escaping rather than retrying: the
+                                // catch below would report this as a server
+                                // that never answered, when it answered twice.
+                                throw Escape.truncated
+                            }
                         case .empty:
                             // The name exists with no record of this type.
                             sawName = true
@@ -167,10 +182,13 @@ extension Worker {
         case ignored
     }
 
-    /// Asks one server one question, once.
-    private static func ask(_ worker: UnsafeMutablePointer<Worker>, _ name: String,
-                            type: DNSRecordType, server: String,
-                            seconds: Int) async throws(ResolveError) -> Answer {
+    /// Builds a query and the id it must be answered with.
+    ///
+    /// Shared by both transports so the TCP retry asks exactly what the
+    /// datagram asked, with a fresh id: reusing the first one would let an
+    /// answer aimed at the truncated query be taken for the retry.
+    private static func buildQuery(_ name: String,
+                                   type: DNSRecordType) throws(ResolveError) -> (UInt16, [UInt8]) {
         // Unpredictable, not merely unique: an off-path attacker who can guess
         // the id can answer before the real server does, and the first answer
         // to arrive is the one believed. So the same source QUIC draws its
@@ -184,6 +202,14 @@ extension Worker {
         } catch {
             throw .badName
         }
+        return (id, query)
+    }
+
+    /// Asks one server one question, once.
+    private static func ask(_ worker: UnsafeMutablePointer<Worker>, _ name: String,
+                            type: DNSRecordType, server: String,
+                            seconds: Int) async throws(ResolveError) -> Answer {
+        let (id, query) = try buildQuery(name, type: type)
 
         let index: Int
         switch worker.pointee.beginConnect(udp: server, port: worker.pointee.nameserverPort) {
@@ -215,6 +241,132 @@ extension Worker {
         } catch {
             throw .unanswered
         }
+    }
+
+    /// Asks the same question again over TCP, which is what a truncated answer
+    /// is telling us to do.
+    ///
+    /// The message is identical; only the framing differs, a two-byte length
+    /// in front of it. The reply arrives on a stream rather than in a
+    /// datagram, so it comes in as many pieces as TCP feels like and has to be
+    /// read to a length rather than to a boundary.
+    private static func askOverTCP(_ worker: UnsafeMutablePointer<Worker>, _ name: String,
+                                   type: DNSRecordType, server: String,
+                                   seconds: Int) async throws(ResolveError) -> Answer {
+        let (id, query) = try buildQuery(name, type: type)
+        let milliseconds = UInt64(max(1, seconds)) * 1000
+        let socket: OutboundSocket
+        do {
+            // No pool marker here, unlike the UDP path, and deliberately.
+            //
+            // A marker would keep this connection from being handed to an
+            // ordinary caller -- but it is closed below on every path and
+            // never released, so it is never in the pool to be handed to
+            // anyone. Mutation testing showed the marker could be deleted with
+            // nothing failing, and a test written to catch that passed either
+            // way, because the table is empty by the time the next caller
+            // asks. Dead code that reads as a safeguard is worse than none: it
+            // invites the next person to trust it.
+            //
+            // If this ever calls release() instead of close(), the marker has
+            // to come back, and that is the moment it becomes testable.
+            socket = try await Worker.connect(worker, host: server,
+                                              port: worker.pointee.nameserverPort,
+                                              milliseconds: milliseconds)
+        } catch {
+            throw error == .cancelled ? .cancelled : .unanswered
+        }
+        defer { socket.close() }
+
+        do {
+            var framed: [UInt8] = []
+            framed.reserveCapacity(query.count + 2)
+            framed.append(UInt8(truncatingIfNeeded: query.count >> 8))
+            framed.append(UInt8(truncatingIfNeeded: query.count))
+            framed.append(contentsOf: query)
+            try await writeAll(socket, framed, milliseconds: milliseconds)
+
+            let header = try await readExactly(socket, 2, milliseconds: milliseconds)
+            let length = Int(header[0]) << 8 | Int(header[1])
+            // A server naming a length it will not send would otherwise have
+            // this waiting until the timeout for bytes that are not coming;
+            // the read below is bounded by the same clock either way.
+            guard length > 0, length <= 65_535 else { return .ignored }
+            let body = try await readExactly(socket, length, milliseconds: milliseconds)
+            return believe(body, count: body.count, id: id, name: name, type: type)
+        } catch let error as ResolveError {
+            throw error
+        } catch {
+            throw .unanswered
+        }
+    }
+
+    /// Writes every byte, waiting for writability whenever the socket is full.
+    private static func writeAll(_ socket: OutboundSocket, _ bytes: [UInt8],
+                                 milliseconds: UInt64) async throws(ResolveError) {
+        var sent = 0
+        while sent < bytes.count {
+            let n: Int
+            do {
+                n = try bytes.withUnsafeBytes { raw in
+                    try socket.write(UnsafeRawBufferPointer(rebasing: raw[sent...]))
+                }
+            } catch {
+                // withUnsafeBytes erases the typed throw, so what arrives here
+                // is `any Error` and has to be put back before it can be
+                // compared.
+                throw (error as? OutboundError) == .cancelled ? .cancelled : .unanswered
+            }
+            sent += n
+            if sent < bytes.count {
+                do {
+                    try await socket.writable(milliseconds: milliseconds)
+                } catch {
+                    throw error == .cancelled ? .cancelled : .unanswered
+                }
+            }
+        }
+    }
+
+    /// Reads exactly `count` bytes, or fails. A stream splits where it likes,
+    /// so a short read is ordinary rather than an error.
+    ///
+    /// The loop here is **not covered by the tests**, and it is worth saying so
+    /// rather than leaving somebody to assume it is. Cutting it to a single
+    /// iteration leaves the whole suite green, because a fake nameserver on
+    /// loopback cannot be made to deliver a short read: whatever it writes has
+    /// arrived in full by the time this wakes from `readable()`, so one read
+    /// always drains it. Three attempts at forcing a split -- between the
+    /// length and the body, then inside the body -- all failed for that reason.
+    ///
+    /// It stays because a real network does split a reply across segments and
+    /// a resolver that assumed otherwise would fail intermittently against a
+    /// real server, which is the worst kind of failure to chase. But it is
+    /// unproven code, and if it is ever changed, that change is unguarded.
+    private static func readExactly(_ socket: OutboundSocket, _ count: Int,
+                                    milliseconds: UInt64) async throws(ResolveError) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: count)
+        var got = 0
+        while got < count {
+            do {
+                try await socket.readable(milliseconds: milliseconds)
+            } catch {
+                throw error == .cancelled ? .cancelled : .unanswered
+            }
+            let n: Int
+            do {
+                n = try out.withUnsafeMutableBytes { raw in
+                    try socket.read(into: UnsafeMutableRawBufferPointer(rebasing: raw[got...]))
+                }
+            } catch {
+                // The peer closing mid-message is reported as failed(0) by the
+                // socket, and half a reply is not a reply. The cast is because
+                // withUnsafeMutableBytes erases the typed throw.
+                throw (error as? OutboundError) == .cancelled ? .cancelled : .unanswered
+            }
+            got += n
+        }
+        return out
     }
 
     /// Decides whether a datagram answers the question that was asked.
