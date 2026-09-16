@@ -313,7 +313,7 @@ private func columnIndex(_ rows: PostgresRows) -> [String: Int] {
     return index
 }
 
-private func decodeAll<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows) throws -> [Row] {
+func decodeAll<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows) throws -> [Row] {
     let index = columnIndex(rows)
     var out: [Row] = []
     out.reserveCapacity(rows.count)
@@ -453,6 +453,31 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
         return text
     }
 
+    /// The cell's bytes when it came in binary as one of `types`, else nil --
+    /// which sends the caller down the text path.
+    private func binary(_ types: UInt32...) throws -> ArraySlice<UInt8>? {
+        let description = rows.columns[column]
+        guard description.binary, types.contains(description.typeOID) else { return nil }
+        guard let raw = rows.bytes(row: row, column: column) else {
+            throw PostgresDecodingError.null(column: name)
+        }
+        return raw
+    }
+
+    private func notConvertible<T>(_ type: T.Type) -> PostgresDecodingError {
+        .notConvertible(column: name, value: text ?? "null", expected: "\(type)")
+    }
+
+    private func integer<T: FixedWidthInteger & LosslessStringConvertible>(_ type: T.Type) throws -> T {
+        if let raw = try binary(PostgresType.int2, PostgresType.int4, PostgresType.int8) {
+            guard let wide = PostgresBinary.integer(raw), let value = T(exactly: wide) else {
+                throw notConvertible(type)
+            }
+            return value
+        }
+        return try scalar(type)
+    }
+
     private func scalar<T: LosslessStringConvertible>(_ type: T.Type) throws -> T {
         let text = try required()
         guard let value = T(text) else {
@@ -464,6 +489,10 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
     func decodeNil() -> Bool { text == nil }
 
     func decode(_ type: Bool.Type) throws -> Bool {
+        if let raw = try binary(PostgresType.bool) {
+            guard let value = PostgresBinary.bool(raw) else { throw notConvertible(type) }
+            return value
+        }
         // PostgreSQL's text form of a boolean is t or f.
         switch try required() {
         case "t", "true": return true
@@ -474,18 +503,34 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
     }
 
     func decode(_ type: String.Type) throws -> String { try required() }
-    func decode(_ type: Double.Type) throws -> Double { try scalar(type) }
-    func decode(_ type: Float.Type) throws -> Float { try scalar(type) }
-    func decode(_ type: Int.Type) throws -> Int { try scalar(type) }
-    func decode(_ type: Int8.Type) throws -> Int8 { try scalar(type) }
-    func decode(_ type: Int16.Type) throws -> Int16 { try scalar(type) }
-    func decode(_ type: Int32.Type) throws -> Int32 { try scalar(type) }
-    func decode(_ type: Int64.Type) throws -> Int64 { try scalar(type) }
-    func decode(_ type: UInt.Type) throws -> UInt { try scalar(type) }
-    func decode(_ type: UInt8.Type) throws -> UInt8 { try scalar(type) }
-    func decode(_ type: UInt16.Type) throws -> UInt16 { try scalar(type) }
-    func decode(_ type: UInt32.Type) throws -> UInt32 { try scalar(type) }
-    func decode(_ type: UInt64.Type) throws -> UInt64 { try scalar(type) }
+    func decode(_ type: Double.Type) throws -> Double {
+        if let raw = try binary(PostgresType.float8) {
+            guard let value = PostgresBinary.float8(raw) else { throw notConvertible(type) }
+            return value
+        }
+        // A float4 goes through its text, as it would have come: widening the
+        // Float itself would turn 0.1 into 0.10000000149011612.
+        return try scalar(type)
+    }
+
+    func decode(_ type: Float.Type) throws -> Float {
+        if let raw = try binary(PostgresType.float4) {
+            guard let value = PostgresBinary.float4(raw) else { throw notConvertible(type) }
+            return value
+        }
+        return try scalar(type)
+    }
+
+    func decode(_ type: Int.Type) throws -> Int { try integer(type) }
+    func decode(_ type: Int8.Type) throws -> Int8 { try integer(type) }
+    func decode(_ type: Int16.Type) throws -> Int16 { try integer(type) }
+    func decode(_ type: Int32.Type) throws -> Int32 { try integer(type) }
+    func decode(_ type: Int64.Type) throws -> Int64 { try integer(type) }
+    func decode(_ type: UInt.Type) throws -> UInt { try integer(type) }
+    func decode(_ type: UInt8.Type) throws -> UInt8 { try integer(type) }
+    func decode(_ type: UInt16.Type) throws -> UInt16 { try integer(type) }
+    func decode(_ type: UInt32.Type) throws -> UInt32 { try integer(type) }
+    func decode(_ type: UInt64.Type) throws -> UInt64 { try integer(type) }
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
         if T.self == [UInt8].self { return try bytes() as! T }
         return try T(from: self)
@@ -498,7 +543,9 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
             throw PostgresDecodingError.null(column: name)
         }
         let description = rows.columns[column]
-        guard description.typeOID == PostgresType.bytea, !description.binary else { return Array(raw) }
+        if description.typeOID == PostgresType.bytea && description.binary { return Array(raw) }
+        // Any other column is its text, whichever format it came in.
+        guard description.typeOID == PostgresType.bytea else { return Array((text ?? "").utf8) }
         guard let decoded = PostgresBytea.decodeHex(raw) else {
             throw PostgresDecodingError.notConvertible(column: name, value: String(decoding: raw.prefix(32), as: UTF8.self),
                                                        expected: "bytea in hex")

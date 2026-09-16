@@ -338,4 +338,49 @@ struct PostgresWireTests {
             #expect(PostgresBytea.decodeHex(ArraySlice(Array(bad.utf8))) == nil, "\(bad)")
         }
     }
+
+    // MARK: Binary values
+
+    @Test func floatsAreWrittenAsTheServerWritesThem() {
+        let float8: [(Double, String)] = [
+            (0.1, "0.1"), (1.5, "1.5"), (100, "100"), (1e14, "100000000000000"), (1e15, "1e+15"),
+            (123456789012345, "123456789012345"), (1.5e20, "1.5e+20"), (1e-4, "0.0001"), (1e-5, "1e-05"),
+            (0.000123, "0.000123"), (-2.5, "-2.5"), (0, "0"), (-0.0, "-0"), (5e-324, "5e-324"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"), (.nan, "NaN"), (.infinity, "Infinity"),
+            (-.infinity, "-Infinity"),
+        ]
+        for (value, expected) in float8 {
+            #expect(PostgresBinary.text(ArraySlice(bigEndian(value.bitPattern)), type: PostgresType.float8) == expected)
+        }
+        let float4: [(Float, String)] = [
+            (0.1, "0.1"), (123456, "123456"), (1e6, "1e+06"), (3.4e38, "3.4e+38"), (1.5e-7, "1.5e-07"),
+            (12.25, "12.25"),
+        ]
+        for (value, expected) in float4 {
+            #expect(PostgresBinary.text(ArraySlice(bigEndian(value.bitPattern)), type: PostgresType.float4) == expected)
+        }
+    }
+
+    @Test func binaryIntegersAndBooleansRead() {
+        #expect(PostgresBinary.integer(ArraySlice(bigEndian(UInt16(bitPattern: -2)))) == -2)
+        #expect(PostgresBinary.integer(ArraySlice(bigEndian(UInt32(bitPattern: Int32.min)))) == Int64(Int32.min))
+        #expect(PostgresBinary.integer(ArraySlice(bigEndian(UInt64(bitPattern: Int64.max)))) == Int64.max)
+        #expect(PostgresBinary.integer([1, 2, 3][...]) == nil)
+        #expect(PostgresBinary.bool([1][...]) == true)
+        #expect(PostgresBinary.bool([0][...]) == false)
+        #expect(PostgresBinary.bool([2][...]) == nil)
+        #expect(PostgresBinary.text([0, 0xAB][...], type: PostgresType.bytea) == "\\x00ab")
+    }
+
+    @Test func onlyDecodableColumnsAreAskedForInBinary() {
+        func column(_ type: UInt32) -> PostgresColumn {
+            PostgresColumn(name: "c", tableOID: 0, attribute: 0, typeOID: type, size: 0, modifier: 0, binary: false)
+        }
+        #expect(PostgresBinary.resultFormats([column(PostgresType.text), column(1043)]) == [])
+        #expect(PostgresBinary.resultFormats([column(PostgresType.int4), column(PostgresType.text)]) == [1, 0])
+    }
+}
+
+private func bigEndian<T: FixedWidthInteger>(_ value: T) -> [UInt8] {
+    withUnsafeBytes(of: value.bigEndian) { Array($0) }
 }

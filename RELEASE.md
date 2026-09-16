@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 716 unit tests
+swift test                             # 722 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -301,6 +301,11 @@ is `request.client`.
   longer run as planned because its table changed shape is prepared again and
   run once more, but only outside a transaction, where the failed attempt was
   rolled back whole.
+- A statement run again asks for its booleans, integers, floats and bytea in
+  binary, using the column types its last result described, and decodes them
+  without parsing text. A binary value asked for as a `String`, or through
+  `rows.text`, reads exactly as the server's text would have — checked value
+  by value against a real server, float edge cases included.
 
 ### Changed
 
@@ -354,7 +359,8 @@ is `request.client`.
   custom fallback, none of the shipped middleware (authentication, CORS,
   tracing, request limits), no streaming response, and no WebSocket or
   WebTransport handler.
-- PostgreSQL has binary parameters only for bytes, no `LISTEN`, and does not
+- PostgreSQL has binary parameters only for bytes, no UUID or timestamp
+  types, no `LISTEN`, and does not
   SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
   written. The HTTP client does not follow redirects and sends no
   `Accept-Encoding`, since the compression shim encodes and does not decode.

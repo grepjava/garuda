@@ -336,4 +336,92 @@ struct PostgresIntegrationTests {
         }
         #expect(text == "1")
     }
+
+    // MARK: Binary results
+
+    /// Every decodable type, at its edges.
+    private static let typesSQL = """
+        select b, i2, i4, i8, f4, f8, bytes, label from (values
+          (true, '32767'::int2, '2147483647'::int4, '9223372036854775807'::int8, '0.1'::float4, '0.1'::float8, '\\x00ff'::bytea, 'a'),
+          (false, '-32768'::int2, '-2147483648'::int4, '-9223372036854775808'::int8, '1e6'::float4, '1e15'::float8, ''::bytea, 'b'),
+          (null, '0'::int2, '0'::int4, '0'::int8, '3.4e38'::float4, '123456789012345'::float8, null, null),
+          (true, '1'::int2, '1'::int4, '1'::int8, 'NaN'::float4, 'Infinity'::float8, '\\x01'::bytea, 'c'),
+          (true, '1'::int2, '1'::int4, '1'::int8, '-Infinity'::float4, '1e-5'::float8, '\\x01'::bytea, 'd'),
+          (true, '1'::int2, '1'::int4, '1'::int8, '1.5e-7'::float4, '5e-324'::float8, '\\x01'::bytea, 'e'),
+          (true, '1'::int2, '1'::int4, '1'::int8, '123456'::float4, '-0'::float8, '\\x01'::bytea, 'f'),
+          (true, '1'::int2, '1'::int4, '1'::int8, '12.25'::float4, '1.7976931348623157e308'::float8, '\\x01'::bytea, 'g'),
+          (true, '1'::int2, '1'::int4, '1'::int8, '100'::float4, '0.000123'::float8, '\\x01'::bytea, 'h')
+        ) as t(b, i2, i4, i8, f4, f8, bytes, label)
+        """
+
+    struct TypeRow: Decodable, Equatable {
+        let b: Bool?
+        let i2: Int16
+        let i4: Int32
+        let i8: Int64
+        let f4: Float
+        let f8: Double
+        let bytes: [UInt8]?
+        let label: String?
+
+        static func == (a: TypeRow, b: TypeRow) -> Bool {
+            a.b == b.b && a.i2 == b.i2 && a.i4 == b.i4 && a.i8 == b.i8
+                && (a.f4 == b.f4 || (a.f4.isNaN && b.f4.isNaN))
+                && a.f8.bitPattern == b.f8.bitPattern && a.bytes == b.bytes && a.label == b.label
+        }
+    }
+
+    @Test func aRepeatedStatementComesBackInBinaryAndReadsTheSame() throws {
+        let text = try onConnection { connection in
+            let first = try await connection.query(Self.typesSQL)
+            let second = try await connection.query(Self.typesSQL)
+            let formats = second.columns.map { $0.binary ? "b" : "t" }.joined()
+            guard !first.columns.contains(where: \.binary) else { return "first run was binary" }
+            var mismatches: [String] = []
+            for row in 0..<first.count {
+                for column in 0..<first.columns.count {
+                    let a = first.text(row: row, column: column)
+                    let b = second.text(row: row, column: column)
+                    if a != b { mismatches.append("\(first.columns[column].name)[\(row)]: \(a ?? "null") vs \(b ?? "null")") }
+                }
+            }
+            let same = try decodeAll(TypeRow.self, first) == decodeAll(TypeRow.self, second)
+            return formats + "|" + mismatches.joined(separator: "; ") + "|" + String(same)
+        }
+        #expect(text == "bbbbbbbt||true")
+    }
+
+    @Test func aBinaryIntegerOutOfRangeForItsPropertyIsRefused() throws {
+        struct Small: Decodable { let n: Int8 }
+        let text = try onConnection { connection in
+            var outcomes: [String] = []
+            for _ in 0..<2 {
+                let rows = try await connection.query("select 300 as n")
+                do {
+                    _ = try decodeAll(Small.self, rows)
+                    outcomes.append("decoded")
+                } catch let error as PostgresDecodingError {
+                    outcomes.append(rows.columns[0].binary ? "binary:\(error)" : "text:\(error)")
+                }
+            }
+            return outcomes.joined(separator: "|")
+        }
+        #expect(text == #"text:notConvertible(column: "n", value: "300", expected: "Int8")|binary:notConvertible(column: "n", value: "300", expected: "Int8")"#)
+    }
+
+    @Test func aBinaryColumnReadAsAnotherTypeGoesThroughItsText() throws {
+        // Asked for as a String, or as a Double from a float4, a binary value
+        // reads as its text would have: 0.1, not 0.10000000149011612.
+        struct Loose: Decodable { let n: String; let f: Double; let raw: [UInt8] }
+        let text = try onConnection { connection in
+            var outcomes: [String] = []
+            for _ in 0..<2 {
+                let rows = try await connection.query("select 42 as n, 0.1::float4 as f, 7 as raw")
+                let value = try decodeAll(Loose.self, rows)[0]
+                outcomes.append("\(value.n),\(value.f),\(value.raw)")
+            }
+            return outcomes.joined(separator: "|")
+        }
+        #expect(text == "42,0.1,[55]|42,0.1,[55]")
+    }
 }

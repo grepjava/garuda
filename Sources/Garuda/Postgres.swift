@@ -231,12 +231,16 @@ final class PostgresConnection {
         let key = StatementKey(sql: sql, types: types)
         var name = ""
         var prepare = true
-        let formats: [Int16] = []
+        var formats: [Int16] = []
         uses &+= 1
         if configuration.statementCacheCapacity > 0 {
             if var statement = prepared[key] {
                 name = statement.name
                 prepare = false
+                // The types its last result had. Should they have changed,
+                // the server refuses the plan (0A000) before sending a row, so
+                // a format chosen for the old type never meets the new one.
+                formats = PostgresBinary.resultFormats(statement.columns)
                 statement.used = uses
                 prepared[key] = statement
             } else {

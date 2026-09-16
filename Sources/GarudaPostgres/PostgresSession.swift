@@ -205,9 +205,15 @@ public struct PostgresRows: Sendable {
 
     public var count: Int { columns.isEmpty ? 0 : cells.count / columns.count }
 
-    /// The text of a cell, or nil for NULL.
+    /// The text of a cell, or nil for NULL. A value that came in binary is
+    /// written out as the server would have written it as text.
     public func text(row: Int, column: Int) -> String? {
         guard let range = cells[row * columns.count + column] else { return nil }
+        let description = columns[column]
+        if description.binary {
+            return PostgresBinary.text(storage[range], type: description.typeOID)
+                ?? PostgresBinary.byteaText(storage[range])
+        }
         return String(decoding: storage[range], as: UTF8.self)
     }
 
