@@ -59,6 +59,9 @@ public enum PostgresClientError: Error, Equatable {
     /// cannot be trusted.
     case closed
     case timedOut
+    /// Every connection in the pool stayed in use for the pool's
+    /// `acquireTimeoutMilliseconds`.
+    case poolTimedOut
     case cancelled
     /// The protocol, authentication or the server itself refused.
     case postgres(PostgresError)

@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 695 unit tests
+swift test                             # 701 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -281,6 +281,11 @@ is `request.client`.
   on a failed transaction by quietly rolling back. A connection left inside a
   transaction, by a handler running `begin` itself, is closed rather than
   handed to the next request.
+- A statement waiting for a pooled connection gives up after
+  `acquireTimeoutMilliseconds` (the configuration's timeout unless given) with
+  `PostgresClientError.poolTimedOut`, instead of waiting as long as whoever
+  holds the connections — a transaction can await anything between its
+  statements. A wait that gives up leaves the queue at once.
 
 ### Changed
 

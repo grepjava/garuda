@@ -82,16 +82,23 @@ public enum PostgresDecodingError: Error, Equatable {
 public final class PostgresPool: @unchecked Sendable {
     public let configuration: PostgresConfiguration
     public let maxConnections: Int
+    /// How long a statement waits for a connection when every one is in use,
+    /// before failing with `poolTimedOut`.
+    public let acquireTimeoutMilliseconds: UInt64
 
     private var idle: [PostgresConnection] = []
     /// Connections that exist, idle or in use -- including one being opened.
     private var open = 0
-    private var waiting: [UnsafeContinuation<Void, Never>] = []
+    /// The timed waits of statements waiting for a connection, oldest first.
+    private var waiting: [Int32] = []
 
-    public init(_ configuration: PostgresConfiguration, maxConnections: Int = 8) {
+    /// `acquireTimeoutMilliseconds` defaults to the configuration's timeout.
+    public init(_ configuration: PostgresConfiguration, maxConnections: Int = 8,
+                acquireTimeoutMilliseconds: UInt64? = nil) {
         precondition(maxConnections > 0, "a pool needs room for at least one connection")
         self.configuration = configuration
         self.maxConnections = maxConnections
+        self.acquireTimeoutMilliseconds = acquireTimeoutMilliseconds ?? configuration.timeoutMilliseconds
     }
 
     /// Every row, decoded.
@@ -215,9 +222,25 @@ public final class PostgresPool: @unchecked Sendable {
                     throw error
                 }
             }
-            // Full. Bounded by whoever holds a connection: each of their waits
-            // has its own timeout, so a slot comes free eventually.
-            await withUnsafeContinuation { waiting.append($0) }
+            // Full. Whoever holds a connection bounds each wait on the server,
+            // but not what they do between statements: a transaction can
+            // await anything. So this wait has a deadline of its own.
+            var id: Int32 = -1
+            let outcome = await Worker.waitTimed(worker, milliseconds: acquireTimeoutMilliseconds) {
+                id = $0
+                waiting.append($0)
+            }
+            switch outcome {
+            case .woken:
+                continue
+            case .timedOut:
+                // Gone from the queue now, rather than when a release reaches
+                // it: with every connection stuck, none may come.
+                waiting.removeAll { $0 == id }
+                throw .poolTimedOut
+            case .cancelled:
+                throw .cancelled
+            }
         }
     }
 
@@ -236,12 +259,21 @@ public final class PostgresPool: @unchecked Sendable {
         wakeOne()
     }
 
+    /// Wakes the oldest wait still waiting. An id at the front may belong to a
+    /// wait whose timer has fired but whose task has not yet run to take it
+    /// out of the queue; waking it wakes nothing, and stopping there would
+    /// leave the live wait behind it asleep with a connection free.
     private func wakeOne() {
-        if !waiting.isEmpty { waiting.removeFirst().resume() }
+        guard let worker = currentWorker else { return }
+        while !waiting.isEmpty {
+            if worker.pointee.wakeTimed(waiting.removeFirst()) { return }
+        }
     }
 
     /// For tests: how many connections exist, and how many are idle.
     var counts: (open: Int, idle: Int) { (open, idle.count) }
+    /// For tests: how many statements are queued for a connection.
+    var waitingCount: Int { waiting.count }
 }
 
 /// Statements inside one transaction, all on the same connection.

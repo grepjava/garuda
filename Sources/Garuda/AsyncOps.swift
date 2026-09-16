@@ -39,6 +39,9 @@ public enum OpKind: UInt8 {
     /// an index into the outbound table, not the connection table, so it has
     /// to be recognised before anything reads a connection with it.
     case outbound
+    /// Bounds a `Worker.waitTimed` (TimedWait.swift). Its `slot` is the
+    /// wait's id, not a connection.
+    case timedWait
 }
 
 public struct AsyncOp {
@@ -468,6 +471,10 @@ extension Worker {
         asyncOps.free(index)
 
         if cancelled { return }
+        if kind == .timedWait {
+            timedWaitExpired(Int32(slot))
+            return
+        }
         if kind == .outbound {
             // `slot` indexes the outbound table. Reading a connection with it
             // would be reading an unrelated request.

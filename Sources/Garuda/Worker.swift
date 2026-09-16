@@ -152,6 +152,9 @@ public struct Worker {
     /// somewhere new each finds no connection and opens its own -- which is
     /// the exact case multiplexing exists to absorb.
     var outboundH2Connecting: [OutboundKey: [UnsafeContinuation<Void, Never>]] = [:]
+    /// Tasks in a `waitTimed`, by id (TimedWait.swift).
+    var timedWaits: [Int32: TimedWaiter] = [:]
+    var nextTimedWait: Int32 = 0
     /// How many connections this worker actually opened, as against handed
     /// back from the pool. A test cannot otherwise tell reuse from a new one.
     public var outboundOpened: UInt64 = 0
@@ -187,6 +190,9 @@ public struct Worker {
     }
 
     public mutating func destroy() {
+        // Before the tasks are ended: a task in a timed wait unwinds only once
+        // that wait is over.
+        cancelTimedWaits()
         if let pool = handlerTasks {
             // Cancelled first, so that a task waiting on the engine unwinds
             // and can be ended.

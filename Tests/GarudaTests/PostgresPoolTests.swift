@@ -42,11 +42,12 @@ struct PoolUserWithAge: Decodable {
 
 nonisolated(unsafe) private var poolForTests: PostgresPool? = nil
 
-private func crudApp(maxConnections: Int = 4) -> Application {
+private func crudApp(maxConnections: Int = 4, acquireTimeoutMilliseconds: UInt64? = nil) -> Application {
     let app = Application()
     let configuration = target!
     app.state { _ in
-        let pool = PostgresPool(configuration, maxConnections: maxConnections)
+        let pool = PostgresPool(configuration, maxConnections: maxConnections,
+                                acquireTimeoutMilliseconds: acquireTimeoutMilliseconds)
         poolForTests = pool
         return pool
     }
@@ -92,6 +93,23 @@ private func crudApp(maxConnections: Int = 4) -> Application {
 
     app.get("/slow") { (db: State<PostgresPool>) async throws -> String in
         String(try await db.value.first(Int.self, "select 1 from pg_sleep(0.05)") ?? -1)
+    }
+
+    // Holds a connection for a while, inside a transaction.
+    app.get("/hold") { (db: State<PostgresPool>) async throws -> String in
+        try await db.value.transaction { tx in
+            try await tx.execute("select pg_sleep(0.4)")
+        }
+        return "held"
+    }
+
+    // Says why a statement failed, rather than answering 500.
+    app.get("/count-why") { (db: State<PostgresPool>) async throws -> String in
+        do {
+            return String(try await db.value.first(Int.self, "select count(*) from garuda_pool_users") ?? -1)
+        } catch let error as PostgresClientError {
+            return "\(error)"
+        }
     }
 
     app.get("/pid") { (db: State<PostgresPool>) async throws -> String in
@@ -271,6 +289,32 @@ struct PostgresPoolTests {
         #expect(answers.allSatisfy { status($0) == 200 && body($0) == "1" }, "\(answers)")
         let counts = try #require(poolForTests).counts
         #expect(counts.open <= 2)
+    }
+
+    @Test func aWaitForAConnectionGivesUpAtItsDeadline() throws {
+        // One connection, held far longer than the pool lets anyone wait.
+        let client = crudApp(maxConnections: 1, acquireTimeoutMilliseconds: 50).test
+        _ = try get(client, "/setup")
+        let holder = try TestWire(client)
+        holder.send("GET /hold HTTP/1.1\r\nHost: test\r\n\r\n")
+        #expect(holder.turn(until: { poolForTests.map { $0.counts == (open: 1, idle: 0) } ?? false }, turns: 200_000))
+
+        let began = pg_monotonic_us()
+        let waiter = try TestWire(client)
+        waiter.send("GET /count-why HTTP/1.1\r\nHost: test\r\n\r\n")
+        let refused = waiter.receive(turns: 2_000_000) ?? "no response"
+        let waited = (pg_monotonic_us() &- began) / 1000
+        #expect(body(refused) == "poolTimedOut")
+        #expect(waited >= 50 && waited < 350, "waited \(waited) ms")
+        // Out of the queue as soon as it gave up, not when a release reaches
+        // it: with every connection stuck, none might.
+        #expect(poolForTests?.waitingCount == 0)
+
+        #expect(body(holder.receive(turns: 2_000_000) ?? "no response") == "held")
+        // The wait that gave up left nothing queued: the next statement gets
+        // the connection back.
+        #expect(body(try get(client, "/count-why")) == "0")
+        #expect(client.worker.pointee.timedWaits.isEmpty)
     }
 
     @Test func aConnectionTheServerClosedWhileIdleIsNotUsed() throws {
