@@ -103,6 +103,12 @@ public struct HTTPRequestHead {
 
 public enum HTTPParseError: UInt16, Sendable {
     case badRequestLine = 400
+    /// The status line of a *response* was not one: a version this is not,
+    /// a code that is not three digits, or control bytes in the reason.
+    /// Separate from `badRequestLine` because the two are read in opposite
+    /// directions and a client reporting "bad request line" about something a
+    /// server sent it sends whoever reads the log looking the wrong way.
+    case badStatusLine = 4005
     case badHeader = 4001
     case badVersion = 505
     case uriTooLong = 414
@@ -125,6 +131,11 @@ public enum HTTPParseError: UInt16, Sendable {
         case .badRequestLine, .badHeader, .conflictingFraming, .badChunk,
              .duplicateHost: return 400
         case .badVersion: return 505
+        // Nobody is owed a status for this one -- it is a client failing to
+        // understand a *server*. 502 is what this process would say if it were
+        // relaying that answer onward, which is the only sense in which a
+        // malformed response has a status at all.
+        case .badStatusLine: return 502
         case .uriTooLong: return 414
         case .headTooLarge, .tooManyHeaders: return 431
         case .unsupportedTransferEncoding: return 501
