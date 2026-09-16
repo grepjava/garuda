@@ -153,6 +153,10 @@ public struct Worker {
     /// The port this worker's nameservers listen on. Only a test moves it:
     /// resolv.conf has no syntax for a port, so in production it is 53.
     var nameserverPort: UInt16 = Worker.defaultNameserverPort
+    /// Names this worker has already looked up. Per worker and unshared: a
+    /// shared one would want a lock on the single thread this design exists to
+    /// keep unlocked, and the duplication is a few entries each.
+    var resolverCache = ResolverCache()
 
     public init(config: ServerConfig, listenFD: Int32, poller: Poller) {
         self.config = config

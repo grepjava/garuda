@@ -527,6 +527,61 @@ struct ResolverTests {
                     .hasSuffix("0:0:0:0:0:0:0:1"))
     }
 
+    /// The point of the cache: the second lookup never reaches the wire.
+    @Test func aSecondLookupIsAnsweredFromTheCache() throws {
+        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
+        server.answer = { id, name in
+            reply(id: id, name: name, records: [(type: 1, data: [10, 0, 0, 1])])
+        }
+        let client = client([server])
+        #expect(try resolve(client, [server], name: "alpha.example").hasSuffix("10.0.0.1"))
+        #expect(try resolve(client, [server], name: "alpha.example").hasSuffix("10.0.0.1"))
+        // Asked once, answered twice.
+        #expect(server.questions == ["alpha.example"])
+        #expect(client.worker.pointee.resolverCache.hits == 1)
+    }
+
+    /// And the other half: an entry past its time goes back to the wire rather
+    /// than being served for ever.
+    @Test func anExpiredEntryIsLookedUpAgain() throws {
+        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
+        server.answer = { id, name in
+            reply(id: id, name: name, records: [(type: 1, data: [10, 0, 0, 1])])
+        }
+        let client = client([server])
+        #expect(try resolve(client, [server], name: "alpha.example").hasSuffix("10.0.0.1"))
+        // Expire it by hand rather than by waiting: the smallest TTL this
+        // cache will honour is a second, and a test that sleeps for one is a
+        // test nobody runs.
+        client.worker.pointee.resolverCache.removeAll()
+        #expect(try resolve(client, [server], name: "alpha.example").hasSuffix("10.0.0.1"))
+        #expect(server.questions == ["alpha.example", "alpha.example"])
+    }
+
+    /// A name that does not exist is remembered too, or a typo in a config
+    /// file becomes a query storm at the moment something is already wrong.
+    @Test func aMissingNameIsNotAskedAboutTwice() throws {
+        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
+        server.answer = { id, name in reply(id: id, name: name, flags: 0x8183) }
+        let client = client([server], attempts: 1)
+        #expect(try resolve(client, [server], name: "nope.example").hasSuffix("noAddress"))
+        let asked = server.questions.count
+        #expect(try resolve(client, [server], name: "nope.example").hasSuffix("noAddress"))
+        #expect(server.questions.count == asked)
+    }
+
+    /// A lookup nobody answered is *not* remembered. Caching a network fault
+    /// would keep a worker failing after the network came back.
+    @Test func anUnansweredLookupIsNotCached() throws {
+        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
+        server.silent = true
+        let client = client([server], attempts: 1)
+        #expect(try resolve(client, [server], name: "alpha.example").hasSuffix("unanswered"))
+        let asked = server.questions.count
+        #expect(try resolve(client, [server], name: "alpha.example").hasSuffix("unanswered"))
+        #expect(server.questions.count > asked)
+    }
+
     /// Nothing is left behind: a resolver socket is never pooled, so the table
     /// is empty once the lookup is over.
     @Test func theSocketIsClosedAfterwards() throws {

@@ -87,6 +87,20 @@ extension Worker {
         let type: DNSRecordType = wantIPv6 ? .aaaa : .a
         var sawName = false
 
+        // Keyed on the name as asked, before the search list is applied: two
+        // callers asking for the same bare name walk the same candidates, and
+        // caching the candidate instead would miss on every one of them until
+        // the search list had been walked once per entry.
+        let key = ResolverCacheKey(name: name, type: type.rawValue)
+        let now = pg_monotonic_ms()
+        if let cached = worker.pointee.resolverCache.take(key, now: now) {
+            // An empty list is a remembered "no such name", which is worth
+            // remembering precisely because otherwise a typo in a config file
+            // becomes a query storm at the moment something is already wrong.
+            if cached.isEmpty { throw .noAddress }
+            return cached
+        }
+
         for candidate in config.candidates(for: name) {
             for server in config.nameservers {
                 var attempt = 0
@@ -97,7 +111,9 @@ extension Worker {
                                                    server: server,
                                                    seconds: config.timeoutSeconds)
                         switch answer {
-                        case .addresses(let found):
+                        case .addresses(let found, let ttl):
+                            worker.pointee.resolverCache.store(key, addresses: found,
+                                                               ttl: ttl, now: now)
                             return found
                         case .noSuchName:
                             // This candidate does not exist. Another server
@@ -114,7 +130,9 @@ extension Worker {
                                                              server: server,
                                                              seconds: config.timeoutSeconds)
                             switch whole {
-                            case .addresses(let found):
+                            case .addresses(let found, let ttl):
+                                worker.pointee.resolverCache.store(key, addresses: found,
+                                                                   ttl: ttl, now: now)
                                 return found
                             case .noSuchName, .empty:
                                 sawName = true
@@ -156,7 +174,15 @@ extension Worker {
                 }
             }
         }
-        if sawName { throw .noAddress }
+        if sawName {
+            // A name that exists with no usable record is remembered as a
+            // negative answer: asking again immediately would get the same
+            // nothing. A name nobody answered for at all is not remembered --
+            // that is a network fault, and caching it would keep a worker
+            // failing after the network came back.
+            worker.pointee.resolverCache.store(key, addresses: [], ttl: 0, now: now)
+            throw .noAddress
+        }
         throw .unanswered
     }
 
@@ -173,7 +199,10 @@ extension Worker {
 
     /// What one question to one server produced.
     private enum Answer {
-        case addresses([ResolvedAddress])
+        /// The addresses, and how long they may be kept: the smallest TTL in
+        /// the answer, because a set of records is only as fresh as its
+        /// shortest-lived one.
+        case addresses([ResolvedAddress], ttl: UInt32)
         case noSuchName
         case truncated
         /// The name exists but has no record of the type asked for.
@@ -394,16 +423,29 @@ extension Worker {
         guard parsed.responseCode == 0 else { return .ignored }
 
         var found: [ResolvedAddress] = []
+        // The shortest TTL across the records that were actually used. A CNAME
+        // in the chain counts too: an address kept past the life of the alias
+        // that led to it is an address for a name that may now point
+        // elsewhere.
+        var ttl = UInt32.max
         for record in parsed.answers {
-            if case .address(let bytes) = record.data {
+            switch record.data {
+            case .address(let bytes):
                 // A CNAME chain is followed by the server, which returns the
                 // alias and the address together; taking every address in the
                 // answer picks up the end of that chain without walking it.
                 let wants = type == .aaaa ? 16 : 4
-                if bytes.count == wants { found.append(ResolvedAddress(bytes: bytes)) }
+                if bytes.count == wants {
+                    found.append(ResolvedAddress(bytes: bytes))
+                    ttl = min(ttl, record.ttl)
+                }
+            case .canonicalName:
+                ttl = min(ttl, record.ttl)
+            case .other:
+                continue
             }
         }
-        return found.isEmpty ? .empty : .addresses(found)
+        return found.isEmpty ? .empty : .addresses(found, ttl: ttl == .max ? 0 : ttl)
     }
 
     /// Names differ only by case and by a trailing dot, both of which a server
