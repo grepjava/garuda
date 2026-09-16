@@ -4,6 +4,6 @@ import Garuda
 
 func routes(_ app: Application) {
     app.post("/") { request, response in
-        response.send(status: request.bodyBytes.count)
+        response.send("\(request.bodyBytes.count)")
     }
 }

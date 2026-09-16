@@ -7,7 +7,7 @@ func routes(_ app: Application) {
     app.post("/") { request, response in
         request.withBody { body in
             response.after(milliseconds: 1) { _, later in
-                later.send(status: body.count)
+                later.send("\(body.count)")
             }
         }
     }
