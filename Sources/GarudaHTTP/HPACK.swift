@@ -557,6 +557,60 @@ public struct HPACKEncoder {
         }
     }
 
+    /// The pseudo-headers that open a request, in the order RFC 9113 section
+    /// 8.3.1 requires: method, scheme, authority, path. A peer may reject a
+    /// block that puts a pseudo-header after an ordinary field, so they are
+    /// written together and first.
+    ///
+    /// Each one takes its cheapest form. `nameIndex` alone would find these
+    /// names in the static table, but it returns a *name* index, so
+    /// `:method GET` would cost a literal where the table has the whole pair
+    /// at entry 2 -- one byte. That is the commonest request line there is,
+    /// and paying six bytes for it on every request is the kind of waste that
+    /// never shows up as a bug.
+    public func encodeRequestPseudoHeaders(
+        method: ByteSpan, scheme: ByteSpan, authority: ByteSpan, path: ByteSpan,
+        into out: inout ByteBuffer
+    ) {
+        // :method -- entry 2 is GET, 3 is POST, and anything else is a literal
+        // under name index 2.
+        if equalsExact(method.base, method.count, "GET") {
+            hpackWriteInteger(2, prefixBits: 7, flags: 0x80, into: &out)
+        } else if equalsExact(method.base, method.count, "POST") {
+            hpackWriteInteger(3, prefixBits: 7, flags: 0x80, into: &out)
+        } else {
+            hpackWriteInteger(2, prefixBits: 4, flags: 0x00, into: &out)
+            encodeString(method.base, method.count, into: &out)
+        }
+
+        // :scheme -- entry 6 is http, 7 is https.
+        if equalsExact(scheme.base, scheme.count, "https") {
+            hpackWriteInteger(7, prefixBits: 7, flags: 0x80, into: &out)
+        } else if equalsExact(scheme.base, scheme.count, "http") {
+            hpackWriteInteger(6, prefixBits: 7, flags: 0x80, into: &out)
+        } else {
+            hpackWriteInteger(6, prefixBits: 4, flags: 0x00, into: &out)
+            encodeString(scheme.base, scheme.count, into: &out)
+        }
+
+        // :authority -- entry 1 has the name and an empty value, so this is
+        // always a literal under name index 1. Never indexed: an authority is
+        // per-connection, and adding it to the dynamic table would spend a
+        // slot on something that never repeats across peers.
+        hpackWriteInteger(1, prefixBits: 4, flags: 0x00, into: &out)
+        encodeString(authority.base, authority.count, into: &out)
+
+        // :path -- entry 4 is "/", 5 is "/index.html".
+        if equalsExact(path.base, path.count, "/") {
+            hpackWriteInteger(4, prefixBits: 7, flags: 0x80, into: &out)
+        } else if equalsExact(path.base, path.count, "/index.html") {
+            hpackWriteInteger(5, prefixBits: 7, flags: 0x80, into: &out)
+        } else {
+            hpackWriteInteger(4, prefixBits: 4, flags: 0x00, into: &out)
+            encodeString(path.base, path.count, into: &out)
+        }
+    }
+
     /// One header field as a literal without indexing.
     public func encode(name: UnsafePointer<UInt8>, nameLength: Int,
                        value: UnsafePointer<UInt8>, valueLength: Int,

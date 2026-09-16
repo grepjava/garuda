@@ -47,6 +47,98 @@ private func same(_ actual: [(String, String)], _ expected: [(String, String)]) 
 @Suite("HPACK")
 struct HPACKTests {
 
+    // MARK: Request pseudo-headers
+
+    /// Encodes the four pseudo-headers and reads them back with the real
+    /// decoder.
+    ///
+    /// A round trip rather than an assertion about bytes: checking the output
+    /// against the indices I believe are right would only restate my own
+    /// arithmetic, while decoding proves a peer reads back what was meant.
+    private func roundTripPseudo(method: String, scheme: String,
+                                 authority: String, path: String)
+        throws -> (fields: [(String, String)], bytes: Int) {
+        var out = ByteBuffer(capacity: 256)
+        defer { out.destroy() }
+        let m = Array(method.utf8), s = Array(scheme.utf8)
+        let a = Array(authority.utf8), p = Array(path.utf8)
+        m.withUnsafeBufferPointer { mp in
+            s.withUnsafeBufferPointer { sp in
+                a.withUnsafeBufferPointer { ap in
+                    p.withUnsafeBufferPointer { pp in
+                        HPACKEncoder().encodeRequestPseudoHeaders(
+                            method: ByteSpan(mp.baseAddress!, mp.count),
+                            scheme: ByteSpan(sp.baseAddress!, sp.count),
+                            authority: ByteSpan(ap.baseAddress!, ap.count),
+                            path: ByteSpan(pp.baseAddress!, pp.count),
+                            into: &out)
+                    }
+                }
+            }
+        }
+        let encoded = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
+        var decoder = HPACKDecoder()
+        defer { decoder.destroy() }
+        return (try decodeAll(&decoder, encoded), encoded.count)
+    }
+
+    @Test("request pseudo-headers round trip in the order RFC 9113 requires")
+    func pseudoHeaderOrder() throws {
+        let (fields, _) = try roundTripPseudo(method: "GET", scheme: "https",
+                                              authority: "example.com", path: "/a/b")
+        // Order is part of the contract, not an accident of encoding: a peer
+        // may reject a block that puts a pseudo-header after an ordinary
+        // field, and these have to come out as they went in.
+        #expect(same(fields, [(":method", "GET"), (":scheme", "https"),
+                              (":authority", "example.com"), (":path", "/a/b")]))
+    }
+
+    @Test("the commonest request line costs one byte per indexed pair")
+    func pseudoHeaderIndexing() throws {
+        // The reason this exists rather than leaning on nameIndex, which
+        // returns a name index and would spend a literal on every GET.
+        //
+        // :method GET and :path / are whole static entries, one byte each.
+        // :scheme https is another. :authority is a literal: name index 1 in
+        // one byte, then the encoded string.
+        let (fields, bytes) = try roundTripPseudo(method: "GET", scheme: "https",
+                                                  authority: "h", path: "/")
+        #expect(same(fields, [(":method", "GET"), (":scheme", "https"),
+                              (":authority", "h"), (":path", "/")]))
+        // 1 + 1 + 1 + (1 + 1 + 1) = 6. A regression to name-index literals
+        // would push this well past it.
+        #expect(bytes == 6)
+    }
+
+    @Test("a method and path outside the static table still round trip")
+    func pseudoHeaderLiterals() throws {
+        let (fields, _) = try roundTripPseudo(method: "DELETE", scheme: "http",
+                                              authority: "example.com:8080",
+                                              path: "/x?y=1")
+        #expect(same(fields, [(":method", "DELETE"), (":scheme", "http"),
+                              (":authority", "example.com:8080"), (":path", "/x?y=1")]))
+    }
+
+    @Test("POST and index.html take their own static entries")
+    func pseudoHeaderOtherIndexed() throws {
+        let (fields, bytes) = try roundTripPseudo(method: "POST", scheme: "http",
+                                                  authority: "h", path: "/index.html")
+        #expect(same(fields, [(":method", "POST"), (":scheme", "http"),
+                              (":authority", "h"), (":path", "/index.html")]))
+        #expect(bytes == 6)
+    }
+
+    @Test("an unknown scheme round trips as a literal")
+    func pseudoHeaderUnknownScheme() throws {
+        // Nothing in this client makes one, but an encoder that dropped it or
+        // mislabelled the name would be a connection-level protocol error at
+        // the far end rather than a bad request.
+        let (fields, _) = try roundTripPseudo(method: "GET", scheme: "ws",
+                                              authority: "h", path: "/")
+        #expect(same(fields, [(":method", "GET"), (":scheme", "ws"),
+                              (":authority", "h"), (":path", "/")]))
+    }
+
     @Test("the committed Huffman codes are the canonical ones for their lengths")
     func canonicalTable() {
         #expect(HPACKHuffman.tablesAreCanonical())
