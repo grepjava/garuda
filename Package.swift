@@ -52,7 +52,7 @@ let package = Package(
 
         // The engine and the handler API: `import Garuda`.
         .target(name: "Garuda",
-                dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC"],
+                dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC", "GarudaPostgres"],
                 swiftSettings: sharedSwiftSettings),
 
         // The `garuda` executable. Its module is not named `garuda`, which a
