@@ -116,6 +116,10 @@ int pg_tls_wants_write(pg_tls *tls);
 /* 1 when ALPN settled on HTTP/2. */
 int pg_tls_is_h2(pg_tls *tls);
 
+/* The SNI name a client sent, on a server session after its handshake, or
+ * NULL when it sent none. Owned by the session. */
+const char *pg_tls_server_name(pg_tls *tls);
+
 /* The connection negotiated acme-tls/1: an ACME CA validating a tls-alpn-01
  * challenge, which wants the handshake and nothing after it. */
 int pg_tls_is_acme(pg_tls *tls);

@@ -59,9 +59,6 @@ public enum ClientError: Error, Equatable {
     case timedOut
     /// The request that wanted it ended, or the worker is shutting down.
     case cancelled
-    /// ALPN settled on a protocol this client cannot speak. Not a failure of
-    /// the peer's: it chose from what was offered.
-    case unsupportedProtocol
     /// The peer broke HTTP/2 framing: a frame longer than was agreed, a header
     /// block interleaved with another frame, a stream identifier for a stream
     /// this client never opened, a push it was told not to send.
@@ -121,16 +118,15 @@ public struct HTTPClient {
     /// A trust store for https. Empty means the system's.
     public var caFile: String = ""
     /// What to offer over ALPN on an encrypted connection, most preferred
-    /// first.
+    /// first. The server chooses, and the client speaks whichever it chose.
     ///
-    /// Internal, and `http/1.1` alone, until the HTTP/2 path exists. ALPN
-    /// settles during the handshake and cannot be renegotiated, so offering
-    /// `h2` before this client can speak it would not be an incomplete
-    /// feature but a regression: every server supporting both would select
-    /// h2, and every one of those requests would fail where it works today.
-    /// A public knob whose only non-default value guarantees failure is a
-    /// trap, so it stays internal and the tests reach it directly.
-    var alpn: String = "http/1.1"
+    /// HTTP/2 first now that a connection is kept and shared. Before that it
+    /// would have been slower than HTTP/1.1, not faster: a pooled HTTP/1.1
+    /// connection is reused, while an HTTP/2 one used once and closed costs a
+    /// TLS handshake per request. Plaintext is always HTTP/1.1 -- there is no
+    /// ALPN without TLS, and sending the HTTP/2 preface to a server that
+    /// never agreed to it reads there as a malformed request.
+    var alpn: String = "h2,http/1.1"
     /// Sent unless the caller sets its own.
     public var userAgent: String = "garuda"
     /// Speak HTTP/2 whatever ALPN said, including on a plaintext connection.
@@ -613,27 +609,40 @@ extension HTTPClient {
     /// treats as the peer giving up part way through.
     func readMore(_ socket: OutboundSocket,
                   into buffer: inout ByteBuffer) async throws(ClientError) {
-        // OpenSSL may be holding decrypted bytes the socket has already given
-        // up, and no poll will ever mention those again.
-        if !socket.hasBufferedInput {
-            do {
-                try await socket.readable(milliseconds: timeoutMilliseconds)
-            } catch {
-                throw error == .timedOut ? .timedOut
-                    : error == .cancelled ? .cancelled : .closed
+        while true {
+            // OpenSSL may be holding decrypted bytes the socket has already
+            // given up, and no poll will ever mention those again.
+            if !socket.hasBufferedInput {
+                do {
+                    try await socket.readable(milliseconds: timeoutMilliseconds)
+                } catch {
+                    throw error == .timedOut ? .timedOut
+                        : error == .cancelled ? .cancelled : .closed
+                }
             }
+            buffer.reserve(8192)
+            let n: Int
+            do {
+                n = try socket.read(into: UnsafeMutableRawBufferPointer(
+                    start: buffer.writePointer, count: buffer.writableBytes))
+            } catch {
+                // The peer closing arrives here, as `failed(0)`, and nowhere
+                // else.
+                throw error == .cancelled ? .cancelled : .closed
+            }
+            if n > 0 {
+                buffer.advanceWriter(n)
+                return
+            }
+            // Readable, and nothing to hand over. That is not the peer going
+            // away -- the read above throws for that. Over TLS it is routine:
+            // a TLS 1.3 server sends a session ticket straight after the
+            // handshake, the socket wakes, OpenSSL consumes the ticket, and
+            // there is no application data yet. This once read that as a
+            // close, and every HTTPS/1.1 request to a server whose ticket
+            // arrived first failed as `closed`; plaintext tests never showed
+            // it, because a readable plaintext socket always has data or a
+            // real end. The ticket is consumed now, so the next wait blocks.
         }
-        buffer.reserve(8192)
-        let n: Int
-        do {
-            n = try socket.read(into: UnsafeMutableRawBufferPointer(
-                start: buffer.writePointer, count: buffer.writableBytes))
-        } catch {
-            throw error == .cancelled ? .cancelled : .closed
-        }
-        // A read that returns nothing on a readable socket is the peer having
-        // spoken and stopped; treating it as more to come would spin.
-        if n == 0 { throw .closed }
-        buffer.advanceWriter(n)
     }
 }

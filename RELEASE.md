@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 489 unit tests
+swift test                             # 578 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -227,12 +227,22 @@ is `request.client`.
   fit, keeps answers for as long as their TTL allows, and refuses an answer to
   a question it did not ask. Connecting to a name tries every address the
   answer carried, in the order the server gave them.
-- `request.client` makes HTTP/1.1 requests: `try await client.get(url)`,
-  `.head`, `.post`, or `.send` for any method, each returning the status,
-  headers and body. Read it from the request before the first `await` — a
-  `Request` is a view of a connection slot and does not outlive a suspension.
-  `https` verifies the peer, names are resolved off the blocking path, and a
-  kept connection is reused for the next request to the same place.
+- `request.client` makes HTTP requests: `try await client.get(url)`, `.head`,
+  `.post`, or `.send` for any method, each returning the status, headers and
+  body. Read it from the request before the first `await` — a `Request` is a
+  view of a connection slot and does not outlive a suspension. `https` verifies
+  the peer, names are resolved off the blocking path, and a kept connection is
+  reused for the next request to the same place.
+- Over `https` the client offers HTTP/2 and HTTP/1.1 and speaks whichever the
+  server picks. An HTTP/2 connection is shared: every request to the same place
+  runs on it at once, one stream each, and a burst of requests to somewhere new
+  opens one connection between them rather than one apiece. A stream the server
+  resets, or leaves unanswered past its timeout, fails its own request and no
+  other. Plaintext `http` is always HTTP/1.1.
+- `https://127.0.0.1/` is checked against the addresses in the certificate, and
+  sends no SNI, which may only carry a name.
+- Fixed: an HTTPS/1.1 request to a TLS 1.3 server could fail as `closed` when
+  the server's session ticket arrived before its response.
 - A connection goes back to the pool only when the response was read whole and
   both ends still mean to keep it. Anything else is closed: a connection handed
   back with bytes still on it gives the next caller somebody else's answer, and
@@ -264,9 +274,7 @@ is `request.client`.
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
 - The handler API's later steps: there is no middleware, no 405, no streaming
   response, and no WebSocket or WebTransport handler.
-- No database drivers, and the HTTP client speaks HTTP/1.1 only: ALPN asks for
-  `http/1.1`, because a server that selected HTTP/2 would find a client that
-  cannot speak it. The client does not follow redirects and sends no
+- No database drivers. The HTTP client does not follow redirects and sends no
   `Accept-Encoding`, since the compression shim encodes and does not decode.
 - `--compress` and `--cache-size` act on no handler response; they wait for
   streaming responses.

@@ -81,6 +81,7 @@ int pg_tls_pending(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_idle_ok(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_wants_write(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_is_h2(pg_tls *tls) { (void)tls; return 0; }
+const char *pg_tls_server_name(pg_tls *tls) { (void)tls; return NULL; }
 int pg_tls_is_acme(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_ctx_set_acme_dir(pg_tls_ctx *ctx, const char *dir) { (void)ctx; (void)dir; return -1; }
 void pg_tls_shutdown(pg_tls *tls) { (void)tls; }
@@ -89,6 +90,7 @@ void pg_tls_shutdown(pg_tls *tls) { (void)tls; }
 
 #include <stdio.h>
 #include <strings.h>
+#include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
@@ -639,15 +641,35 @@ pg_tls *pg_tls_client_new(pg_tls_ctx *ctx, int fd, const char *hostname) {
         return NULL;
     }
     if (hostname && *hostname) {
-        /* Which certificate to send... */
-        SSL_set_tlsext_host_name(tls->ssl, hostname);
-        /* ...and the name that certificate has to be for. Verification
-         * without this checks that the chain is trusted, not that it belongs
-         * to whoever we meant to talk to. */
-        if (SSL_set1_host(tls->ssl, hostname) != 1) {
-            SSL_free(tls->ssl);
-            free(tls);
-            return NULL;
+        unsigned char literal[16];
+        int is_address = inet_pton(AF_INET, hostname, literal) == 1
+            || inet_pton(AF_INET6, hostname, literal) == 1;
+        if (is_address) {
+            /* An address is checked against the certificate's IP addresses,
+             * which is not what SSL_set1_host does in every OpenSSL this may
+             * link: that one matches DNS names, and a literal matched as a
+             * DNS name matches nothing, so https://127.0.0.1/ would be refused
+             * however correct its certificate. Said explicitly rather than
+             * left to whichever version is installed.
+             *
+             * And no SNI: RFC 6066 section 3 allows only a DNS name there,
+             * never a literal address. */
+            if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(tls->ssl), hostname) != 1) {
+                SSL_free(tls->ssl);
+                free(tls);
+                return NULL;
+            }
+        } else {
+            /* Which certificate to send... */
+            SSL_set_tlsext_host_name(tls->ssl, hostname);
+            /* ...and the name that certificate has to be for. Verification
+             * without this checks that the chain is trusted, not that it
+             * belongs to whoever we meant to talk to. */
+            if (SSL_set1_host(tls->ssl, hostname) != 1) {
+                SSL_free(tls->ssl);
+                free(tls);
+                return NULL;
+            }
         }
     }
     SSL_set_connect_state(tls->ssl);
@@ -846,6 +868,11 @@ int pg_tls_idle_ok(pg_tls *tls) {
 int pg_tls_wants_write(pg_tls *tls) { return tls ? tls->wants_write : 0; }
 
 int pg_tls_is_h2(pg_tls *tls) { return tls ? tls->h2 : 0; }
+
+const char *pg_tls_server_name(pg_tls *tls) {
+    if (!tls || !tls->ssl) return NULL;
+    return SSL_get_servername(tls->ssl, TLSEXT_NAMETYPE_host_name);
+}
 
 int pg_tls_is_acme(pg_tls *tls) { return tls ? tls->acme : 0; }
 
