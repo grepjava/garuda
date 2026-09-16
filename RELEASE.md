@@ -27,7 +27,8 @@ and on macOS 15 with the newest installed Xcode, and fuzzes the parsers with
 `pgfuzz` for 60 s under AddressSanitizer. The end-to-end scripts are not in
 CI. Run them against the release build; each takes the binary's path as its
 first argument, defaulting to `.build/release/garuda`
-(`.build/release/garuda-conformance` for `handler-test.py`):
+(`.build/release/garuda-conformance` for `handler-test.py` and
+`webtransport-test.py`):
 
 ```bash
 swift build -c release
@@ -49,6 +50,7 @@ python3 scripts/http2-test.py          # 50
 python3 scripts/http3-test.py          # 53
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 107
+python3 scripts/webtransport-test.py   # 46
 bash scripts/cache-unit-test.sh
 ```
 
@@ -201,6 +203,44 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
 - An answer to a request that has gone is dropped rather than written, so a
   handler that finishes after its connection closed or its stream was reset
   cannot write into the next request that took the slot.
+- Async routes, `onAsync` handlers and async middleware registered from
+  `main.swift` now run. Top-level code there is on the main actor, a closure
+  written in it was isolated to the main actor, and a worker never runs the
+  main actor: every request to such a route hung. Each of those parameters is
+  now `sending`, so the closure runs on the worker. The routes in the test
+  suite were registered from test functions, which is why none of them hung.
+  A closure that captures a non-`Sendable` value from top-level code is now a
+  compile error rather than a request that never answers.
+
+### WebTransport
+
+- WebTransport sessions have handlers.
+  `app.webTransport("/room/:id") { (session: WebTransportSession, id: Path<Int>) async throws in … }`
+  serves an HTTP/3 extended CONNECT: middleware runs in front and extractors
+  run first, so either refuses a session with an ordinary status, and the
+  session is accepted when the handler is called. A session accepts the
+  streams the peer opens and opens its own, bidirectional or not; a stream
+  reads, writes, finishes and resets; datagrams go both ways; and
+  `close(code:reason:)` sends the close capsule. A session the handler leaves
+  open is closed when it returns.
+- Bytes stay in the transport until the handler reads them, so a stream nobody
+  reads slows only its sender, and a write waits above `--write-high-water`.
+  Streams that arrive before their session is accepted are held, 32 at most;
+  datagrams a handler is slow to read are dropped oldest first. Concurrent work
+  within a session uses a task group, whose tasks stay on the worker.
+- Engine code carried over from Peregrine, whose ASGI extension served
+  WebTransport on this transport before the fork, behind a Swift API in place
+  of its messages. `scripts/webtransport-test.py` is back, against aioquic,
+  with 46 checks, and runs `garuda-conformance`.
+- A QUIC stream reset before it had sent anything, and released at once, was
+  forgotten before its RESET_STREAM went out, and the stream credit it held
+  was not given back until the connection closed. A send side with nothing
+  written counted as drained. A WebTransport stream rejected because too many
+  were waiting for their session was one: the peer was never told, and enough of
+  them used up the connection's streams. A reset side now counts as finished
+  only once the reset is sent, and the stream retires when that is
+  acknowledged. This also affected session streams abandoned when their
+  session ended.
 
 ### Connections the server makes
 
@@ -363,13 +403,13 @@ is `request.client`.
 
 ### Not yet
 
-- WebSocket and WebTransport application APIs are stubs. HTTP/3 still
-  advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
+- WebSocket handlers are stubs, and WebTransport is HTTP/3 only (no
+  WebTransport over HTTP/2).
 - The handler API's later steps: middleware cannot wrap a handler's run
   (retry it, or hold a scope around it); no reusable router values to merge, no
   custom fallback, none of the shipped middleware (authentication, CORS,
-  tracing, request limits), no streaming response, and no WebSocket or
-  WebTransport handler.
+  tracing, request limits), no streaming response, and no WebSocket
+  handler.
 - PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types
   of its own (they read as text), no `LISTEN`, and does not
   SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not

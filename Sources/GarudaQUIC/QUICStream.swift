@@ -376,7 +376,11 @@ public final class QUICStream {
         if !released { return false }
         let recvDone = receive.finished || receive.finalSize != nil && receive.delivered
             || stopSendingSent
-        let sendDone = send.isDrained || send.resetSent
+        // A reset is an ending that still has to reach the peer. A send side
+        // that never wrote anything counts as drained, so without this a
+        // stream reset and released at once was forgotten before its
+        // RESET_STREAM went out.
+        let sendDone = send.resetCode != nil ? send.resetSent : send.isDrained
         return recvDone && sendDone
     }
 

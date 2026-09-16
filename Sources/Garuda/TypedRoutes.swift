@@ -84,7 +84,7 @@ extension Application {
     /// Registers an async typed handler for `method` and `pattern`.
     public func on<each E: RequestExtractor, R: ResponseConvertible>(
         _ method: HTTPMethod, _ pattern: String,
-        _ handler: @escaping (repeat each E) async throws -> R
+        _ handler: sending @escaping (repeat each E) async throws -> R
     ) {
         onAsync(method, pattern) { request, response in
             var parameter = 0
@@ -95,43 +95,43 @@ extension Application {
     }
 
     public func get<each E: RequestExtractor, R: ResponseConvertible>(
-        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+        _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
     ) {
         on(.get, pattern, handler)
     }
 
     public func head<each E: RequestExtractor, R: ResponseConvertible>(
-        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+        _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
     ) {
         on(.head, pattern, handler)
     }
 
     public func post<each E: RequestExtractor, R: ResponseConvertible>(
-        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+        _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
     ) {
         on(.post, pattern, handler)
     }
 
     public func put<each E: RequestExtractor, R: ResponseConvertible>(
-        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+        _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
     ) {
         on(.put, pattern, handler)
     }
 
     public func delete<each E: RequestExtractor, R: ResponseConvertible>(
-        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+        _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
     ) {
         on(.delete, pattern, handler)
     }
 
     public func patch<each E: RequestExtractor, R: ResponseConvertible>(
-        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+        _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
     ) {
         on(.patch, pattern, handler)
     }
 
     public func options<each E: RequestExtractor, R: ResponseConvertible>(
-        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+        _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
     ) {
         on(.options, pattern, handler)
     }

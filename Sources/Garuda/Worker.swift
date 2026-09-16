@@ -857,7 +857,10 @@ public struct Worker {
         // compressed for the client it is sent to, and after everything that
         // answers without the application, because a copy stands in for it.
         if config.cacheSizeMiB > 0 && cacheDispatch(slot) { return }
-        if table[slot].pointee.h3Protocol.readableBytes > 0 {
+        // An extended CONNECT for a protocol nothing here speaks. WebTransport
+        // goes on to the routes, where one registered with `webTransport`
+        // takes it.
+        if table[slot].pointee.h3Protocol.readableBytes > 0 && !isWebTransportRequest(slot) {
             failRequest(slot, status: 501)
             return
         }

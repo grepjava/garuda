@@ -397,10 +397,30 @@ WebTransport session limit. The frame loop recognises the WebTransport shapes:
   which is told apart from a request by its first varint alone;
 - HTTP datagrams.
 
-The handlers for all three are stubs (`WebTransport.swift`) that drop what
-they are given. A CONNECT with `:protocol` is dispatched on its head, because
-the stream never ends, and `dispatch` answers it 501. No session is ever
-created.
+A CONNECT with `:protocol` is dispatched on its head, because the stream never
+ends. `:protocol: webtransport` goes on to the routes, and any other protocol
+is answered 501. A route registered with `webTransport` answers 200 and the
+stream becomes a session (`WebTransport.swift`):
+
+- The session is found by the CONNECT stream's ID, which peer streams name
+  after their prefix and datagrams name as a quarter stream ID. Streams that
+  arrive before the session is accepted are held, 32 across the connection,
+  and past that reset with `WEBTRANSPORT_BUFFERED_STREAM_REJECTED`.
+- A session stream has no slot. Its bytes stay in the QUIC receive buffer until
+  the handler reads them, and reading is what extends its window, so a stream
+  nobody reads blocks only its own sender.
+- The CONNECT stream carries capsules. `CLOSE_WEBTRANSPORT_SESSION` records the
+  code and reason and ends the session; a FIN without one ends it too. Other
+  capsules, `DRAIN` included, are skipped.
+- Ending a session resets and stops every stream it still has with
+  `WEBTRANSPORT_SESSION_GONE`, ends every wait on it, and closes the CONNECT
+  stream's slot. A handler still running finds the session gone.
+- Datagrams queue per session up to 64 or 256 KiB, dropping the oldest.
+- Application error codes on streams are mapped into HTTP/3's reserved range
+  as the draft specifies.
+
+The handler API is in `WebTransportAPI.swift`, and
+`scripts/webtransport-test.py` drives it with aioquic.
 
 ---
 

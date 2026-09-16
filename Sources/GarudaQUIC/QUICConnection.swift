@@ -1138,6 +1138,15 @@ public final class QUICConnection {
             if stream.send.data.readableBytes < buffered { noteWritable(frame.id) }
             if stream.isFinished { retireStream(frame.id) }
         }
+        // A stream whose last word was a reset or a STOP_SENDING carries no
+        // stream frame to be acknowledged, so it retires here, once that
+        // frame has arrived -- and not sooner, so a lost one is sent again.
+        for id in packet.frames.resetStream {
+            if let stream = streams[id], stream.isFinished { retireStream(id) }
+        }
+        for id in packet.frames.stopSending {
+            if let stream = streams[id], stream.isFinished { retireStream(id) }
+        }
         if packet.frames.handshakeDone { handshakeDonePending = false }
     }
 

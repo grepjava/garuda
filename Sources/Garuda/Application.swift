@@ -64,7 +64,7 @@ public final class Application {
     /// Registers an async handler, run on one of the worker's handler tasks.
     /// An `await` resumes on the worker's own thread, so the handler sees the
     /// same request and response a synchronous one does.
-    public func onAsync(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping AsyncHandler) {
+    public func onAsync(_ method: HTTPMethod, _ pattern: String, _ handler: sending @escaping AsyncHandler) {
         precondition(compiled == nil, "route \(pattern) added after the application was compiled")
         routes.onAsync(method, pattern, handler)
     }
@@ -141,7 +141,7 @@ public final class Application {
     ///         request[context: CurrentUser.self] = user
     ///         return nil
     ///     }
-    public func use(_ middleware: @escaping AsyncMiddleware) {
+    public func use(_ middleware: sending @escaping AsyncMiddleware) {
         use(step: .async(middleware))
     }
 

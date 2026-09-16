@@ -21,7 +21,7 @@ kept. CPython, ASGI, WSGI and the Python package were removed.
 groups, synchronous and async handlers, middleware before a handler and hooks on
 its response, typed extraction and answers, per-worker state, deadlines, an HTTP
 client and a native PostgreSQL driver on the worker's poller. There is no
-streaming, WebSocket or WebTransport handler yet. [Garuda and
+streaming or WebSocket handler yet. [Garuda and
 axum](#garuda-and-axum) compares it feature by feature with the framework it
 aims to beat. It is not yet a stable way to serve your own application. [HANDLER-API.md](HANDLER-API.md) holds the design and
 roadmap, and [GARUDA.md](GARUDA.md) is the authoritative status document.
@@ -133,7 +133,7 @@ HEAD responses, adds the server's headers unless the handler set its own
 a declared `Content-Length`. A handler that throws, or returns without
 answering or waiting, gets a 500.
 
-The API is not stable. There is no streaming, WebSocket or WebTransport handler
+The API is not stable. There is no streaming or WebSocket handler
 yet, and [Garuda and axum](#garuda-and-axum) lists what else is still to come.
 [HANDLER-API.md](HANDLER-API.md) has the roadmap.
 
@@ -182,6 +182,7 @@ Tokio, feature by feature.
 | Ready-made middleware | tower-http: CORS, compression, tracing, timeouts, limits | Server flags: compression, rate limits, request IDs, trace context, access log, body limits; `app.deadline` for timeouts. No CORS or auth middleware yet | Partial (step 4) |
 | Streaming and SSE | Body streams, `Sse` | Buffered, one-shot responses only | Step 5 |
 | WebSockets | `WebSocketUpgrade` | Engine stubs, answered 501 | Step 5 |
+| WebTransport | None: hyper has no HTTP/3, so a separate stack such as `wtransport` | `app.webTransport`: sessions, streams both ways, datagrams, close codes, on the same port and routes as everything else | Delivered |
 | Outbound DNS | Tokio's resolver or hickory | A resolver on the worker's poller: UDP with TCP fallback, TTL cache | Delivered |
 | HTTP client | reqwest | `request.client` on the worker's poller: HTTP/1.1, and HTTP/2 shared per origin when TLS negotiates it | Delivered; no redirects or decompression |
 | PostgreSQL | sqlx, tokio-postgres | A native driver: SCRAM, TLS, a pool per worker with an acquire deadline, rows into `Decodable` types, transactions, prepared statements kept per connection, binary values | Delivered |
@@ -367,10 +368,9 @@ reaches that code until a later step of the handler API:
   with streaming responses. `--compress-static` does work.
 - **`--cache-size`** (and `--cache-max-object`, `--cache-ttl-max`): the cache
   never stores a handler response. That also arrives with streaming responses.
-- **WebSocket and WebTransport**: the engine has framing and session code but
-  no application API, so the `--ws-*` options have no route to apply to.
-  `--no-websockets` refuses upgrades with 501. HTTP/3 advertises extended
-  CONNECT and WebTransport in its SETTINGS, and a CONNECT is answered 501.
+- **WebSocket**: the engine has framing code but no application API, so the
+  `--ws-*` options have no route to apply to. `--no-websockets` refuses
+  upgrades with 501.
 
 [GARUDA.md](GARUDA.md) lists the end-to-end coverage that returns as the
 handler API grows.
@@ -582,7 +582,7 @@ bash scripts/compile-fail-test.sh            # 6   handler code that must not co
 The end-to-end suites run against the release binary, `.build/release/garuda`
 by default. Each takes another binary path as its first argument. They are
 answered by the binary's routes and the server's own features, so no
-application is needed. `handler-test.py` runs
+application is needed. `handler-test.py` and `webtransport-test.py` run
 `.build/release/garuda-conformance` instead
 (`swift build -c release --product garuda-conformance`), whose routes exist
 only to make engine behaviour observable to the tests; it is not benchmarked
@@ -610,6 +610,8 @@ python3 scripts/feature-test.py              # 62  shutdown, supervision, unix
                                              #     h2 and h3, headers, client,
                                              #     scheme, request IDs, framing,
                                              #     errors, lifecycle hooks
+<venv>/bin/python scripts/webtransport-test.py # 46 sessions, streams, datagrams,
+                                             #     closing, against `aioquic`
 ```
 
 The shell suites need `curl`, and some need `openssl`, `nc` or `python3`; each
@@ -635,8 +637,7 @@ not run in CI.
 
 ## Not supported
 
-- **A stable handler API.** Streaming responses, WebSocket and WebTransport
-  handlers, router values to merge, custom fallbacks, ready-made CORS and auth
+- **A stable handler API.** Streaming responses, WebSocket handlers, router values to merge, custom fallbacks, ready-made CORS and auth
   middleware, Redis, SQLite and a blocking pool are not there yet. See [HANDLER-API.md](HANDLER-API.md) and
   [GARUDA.md](GARUDA.md).
 - **Byte ranges, directory indexes and `Last-Modified` for `--static-dir`.** It

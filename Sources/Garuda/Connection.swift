@@ -289,7 +289,7 @@ public struct Connection {
     /// WebSocket-over-HTTP/3 announce themselves.
     public var h3Protocol = ByteBuffer()
     /// The WebTransport session this extended CONNECT became, if it became one.
-    public var wt: WTSession? = nil
+    var wt: WTSession? = nil
 
     /// True when this slot is one stream of a multiplexed connection rather
     /// than a connection in its own right.

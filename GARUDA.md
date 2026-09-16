@@ -50,7 +50,7 @@ The target is axum, in speed and in usability: level with Bun at least, and clea
 
 - **TLS is not pure Swift.** TCP TLS is OpenSSL (`Sources/CGaruda/garuda_tls.c`). The QUIC handshake is built in Swift from OpenSSL's crypto primitives (`garuda_crypto.c`).
 - **The public handler API is early.** An `Application`, a `~Copyable` `Request` that lends its bytes to closures and a one-shot `Response` serve the benchmark contract and `garuda-conformance` alike over HTTP/1.1, HTTP/2 and HTTP/3, and `app.test` runs them in-process. Handlers are synchronous and suspend only through `response.after(milliseconds:)`; there is no typed extraction, JSON, application state, middleware, 405 or streaming yet. A stream cancelled while its handler waits takes the timer with it (`scripts/router-streams-test.py`). [HANDLER-API.md](HANDLER-API.md) has the roadmap.
-- **WebSocket and WebTransport application APIs are stubs** until handlers for them exist. HTTP/3 still advertises extended CONNECT and WebTransport in its SETTINGS; a CONNECT is refused with 501.
+- **The WebSocket application API is a stub** until handlers for it exist. WebTransport sessions have handlers (`app.webTransport`), HTTP/3 only.
 - **Some flags have nothing to act on.** `--compress` has no response to compress (the response sink does not compress yet, and static files are served pre-compressed or not at all), and `--cache-size` never stores one. Both arrive with streaming responses.
 - **`--reload` watches the executable, not the sources.** A rebuild (`swift build` in another terminal) has the supervisor exec the new file with its listening sockets kept open, then replace the workers one slot at a time, so no connection is dropped (`scripts/reload-test.sh` rebuilds under load). A changed `--tls-cert` or `--tls-key` replaces the workers without an exec. Nothing builds for you.
 
@@ -73,7 +73,7 @@ The roadmap step that brings back each line below is in [HANDLER-API.md](HANDLER
 - **See cancellation** (step 3). A reset HTTP/2 or HTTP/3 stream stopping the handler's work, not only a parked timer.
 - **Large and streamed responses** (step 5). Chunked framing for a stream, bodies with no declared length on HTTP/2 and HTTP/3, large writes under flow control, a window update arriving mid-response, write backpressure and memory under a slow client. `--compress`: codec choice, Content-Length removal, Vary, weak ETag, no-transform, event streams, flushing pieces, the small-body exemption, HTTP/1.0 close framing, HTTP/2.
 - **Cacheable responses** (step 5). `--cache-size`: store, hit, HEAD from a GET, 304 revalidation, retirement on unsafe methods, Age and TTL, credentials and no-cache kept out, flush on reload, hit metrics.
-- **WebSocket and WebTransport handlers** (step 5). Handshake, framing, UTF-8 checks, size limits, pings and timeouts, control frames while the handler is busy, `--ws-compress`. WebTransport sessions, streams, datagrams, close capsules.
+- **WebSocket handlers** (step 5). Handshake, framing, UTF-8 checks, size limits, pings and timeouts, control frames while the handler is busy, `--ws-compress`. (WebTransport sessions, streams, datagrams and close capsules are back: `scripts/webtransport-test.py`.)
 - **A logging API** (step 4). Level applied to handler records, level mapping, multi-line records.
 
 ## First steps

@@ -243,7 +243,7 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 - **Compression and caching in the sink.** `--compress` (`ResponseEncoder`, with `Vary` and a weakened `ETag`) and `--cache-size` (`ResponseCapture`, `ResponseCachePolicy`) act on handler responses.
 - **Server-sent events.**
 - **WebSocket handlers.** The engine keeps the handshake, framing (`WebSocketCodec`), UTF-8 checks, `--ws-compress`, pings, timeouts and size limits; the handler sees whole messages.
-- **WebTransport handlers** follow on `WTSession`, replacing today's 501. HTTP/3 keeps advertising extended CONNECT and WebTransport throughout.
+- **WebTransport handlers.** Landed 2026-09-16, first in step 5 because axum cannot serve WebTransport at all. `app.webTransport(pattern) { (session, extractors…) async throws in }`: middleware and extractors run on the CONNECT, so they refuse a session with an ordinary status, and the session is accepted when the handler is called. `WebTransportSession` accepts and opens streams, sends and receives datagrams and closes with a code; `WebTransportStream` reads, writes (waiting above `--write-high-water`), finishes and resets. Waits are continuations on the session and its streams, resumed from the frame loop. The session comes first in the handler because Swift will not pass arguments after a parameter pack. The stream shape here is what streaming bodies, SSE and WebSockets should follow. The engine side is Peregrine's, restored; `scripts/webtransport-test.py` (46, aioquic) covers it.
 
 ### 6. Conformance restored, realistic axum benchmarks
 
