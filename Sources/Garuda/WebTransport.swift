@@ -30,9 +30,8 @@
 // resumed from here when the frame loop delivers what it was waiting for, or
 // when the session ends. The handler's API is in WebTransportAPI.swift.
 //
-// Carried over from Peregrine, whose ASGI extension served WebTransport on
-// this same transport before the fork; the routing, capsule and close logic
-// is its, checked by the same aioquic suite.
+// scripts/webtransport-test.py checks the routing, capsules and closing
+// against aioquic.
 //===----------------------------------------------------------------------===//
 
 import CGaruda

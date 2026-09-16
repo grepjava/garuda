@@ -46,7 +46,7 @@ let package = Package(
                 swiftSettings: sharedSwiftSettings),
 
         // Database protocols as byte-level state machines: no sockets, no
-        // poller, so each is tested against recorded exchanges and fuzzed.
+        // poller, so each is tested against recorded exchanges.
         .target(name: "GarudaPostgres", dependencies: ["GarudaCore", "CGaruda"],
                 swiftSettings: sharedSwiftSettings),
 

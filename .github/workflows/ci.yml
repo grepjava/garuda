@@ -190,12 +190,12 @@ jobs:
           cat > /tmp/consumer/Sources/consumer/main.swift <<'EOF'
           import Garuda
 
-          var routes = Routes()
-          routes.get("/") { _, response in
+          let app = Application()
+          app.get("/") { _, response in
               response.send(status: 200)
           }
           if CommandLine.arguments.contains("--serve") {
-              _ = serve(routes)
+              _ = app.run()
           }
           EOF
           cd /tmp/consumer && swift build -c release

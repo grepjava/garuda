@@ -2,8 +2,8 @@
 // garuda-conformance: the routes the end-to-end suites need a handler for.
 //
 // Not a benchmark and not an example to copy: each route exists to make one
-// engine behaviour observable from outside. The suites that use it are listed
-// in GARUDA.md, "Coverage waiting on the handler API".
+// engine behaviour observable from outside, for scripts/handler-test.py and
+// scripts/webtransport-test.py.
 //
 //   POST /echo                   the request body back, with its content-type
 //   GET  /headers                what the handler was given, as JSON

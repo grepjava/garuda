@@ -22,9 +22,8 @@
 //     caller that wants one reads Location and asks again.
 //   * No Accept-Encoding goes out. The compression shim encodes and does not
 //     decode, so asking for a coding would buy a body this cannot read.
-//   * HTTP/2 is next. This API is the one it has to fit: ALPN still asks for
-//     http/1.1 only, because a server that selected h2 would find a client
-//     that cannot speak it.
+//   * Over TLS, ALPN offers h2 and http/1.1, and an HTTP/2 connection is
+//     shared by every request to the same origin (HTTP2Client.swift).
 //===----------------------------------------------------------------------===//
 
 import CGaruda

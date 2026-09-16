@@ -26,13 +26,13 @@
 // all of it.
 //
 // A write queues its bytes and returns, unless what is still waiting to go
-// out has passed `--write-high-water`. Then it waits, on the worker, until
-// that has fallen to `--write-low-water`: a client that reads slowly slows
+// out has passed `ServerConfig.writeHighWaterMark`. Then it waits, on the
+// worker, until that has fallen to `writeLowWaterMark`: a client that reads slowly slows
 // the handler writing to it and nothing else, and a producer never buffers
 // more than the mark ahead of the network. A client that goes away ends the
 // wait with `HandlerWaitError.cancelled`, as it ends every other wait on the
 // engine; a client that stops reading altogether is closed once it has been
-// silent for `--request-head-timeout`.
+// silent for `--request-timeout`.
 //===----------------------------------------------------------------------===//
 
 import CGaruda
@@ -73,7 +73,7 @@ public final class ResponseBodyWriter: @unchecked Sendable {
 
     /// Bytes written and not yet taken by the client: queued on the
     /// connection and, over HTTP/3, sent but not yet acknowledged. A write
-    /// waits while this is above `--write-high-water`.
+    /// waits while this is above `ServerConfig.writeHighWaterMark`.
     public var queuedBytes: Int {
         onWorker()
         guard !bodyless, worker.pointee.isStreaming(slot, generation: generation, requestId: requestId)

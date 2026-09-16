@@ -15,8 +15,6 @@
 // request cancels it through `cancelOps`, which wakes a task waiting on the
 // engine: the wait throws, the handler unwinds, and the task goes back to the
 // pool. Every resume keeps its (slot, generation, request id) check.
-//
-// Async handlers are internal until step 3 registers typed ones on this.
 //===----------------------------------------------------------------------===//
 
 import CGaruda

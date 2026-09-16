@@ -5,16 +5,16 @@
 // and there is no way to interrupt it. A route with a 500 ms deadline whose
 // lookup stalls for five seconds would sail past that deadline and hold the
 // thread that was doing it. A query sent over a socket this poller owns is a
-// wait like every other wait here, so a deadline unwinds it and a drain closes
-// it.
+// wait like every other wait here, bounded by its own timeout, and it never
+// holds the thread.
 //
 // It is a stub resolver: it asks a full one to do the walking rather than
 // chasing referrals from the root. That is what every program on the machine
 // does, and it is what resolv.conf describes.
 //
-// What it does not do yet, deliberately, is fall back to TCP when an answer is
-// truncated. Truncation is reported rather than hidden, so a caller is never
-// handed half an answer believing it whole; the fallback is the next slice.
+// An answer truncated over UDP is asked for again over TCP. One that is
+// truncated there too is reported rather than hidden, so a caller is never
+// handed half an answer believing it whole.
 //===----------------------------------------------------------------------===//
 
 import CGaruda

@@ -4,177 +4,101 @@
 
 # Benchmarks
 
-Garuda next to [axum](https://github.com/tokio-rs/axum), the framework it
-aims to beat, and next to Hummingbird and Vapor, the Swift framework entries of
-[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/).
-Every entry but Garuda is that suite's own application for the same contract,
-built as its Dockerfile builds it, and the load is the suite's command. The
-machine is not the suite's, so the figures here are **not** comparable with the
-ones the site publishes; see [Relation to the published results](#relation-to-the-published-results).
+Garuda is measured against [axum](https://github.com/tokio-rs/axum), the
+framework it aims to beat, and against Hummingbird and Vapor, the Swift entries
+of [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/).
+Every entry but Garuda is that suite's own application, built as the suite
+builds it. The load is the suite's command.
 
-- **Against axum, Garuda served 1.95× on the suite's ramp and 1.72× on one
-  pinned core**, in a quick comparison of one run per pass, with no errors from
-  either. The closed-loop pass, 1.21×, is probably held down by the load
-  generator.
-- **Against the Swift frameworks, the router served 414,234 / 389,445 /
-  370,945 requests a second**, about 4× Hummingbird and 6–7× Vapor at every
-  level.
-- **Garuda answers through its public handler API** since phase 1 of
-  [HANDLER-API.md](HANDLER-API.md) ([Sources/garuda-server/main.swift](Sources/garuda-server/main.swift)).
-  The Swift-framework figures are older: they were measured on the hand-written
-  router the API replaced.
-- Figures from Peregrine, the Python server Garuda was forked from, are kept
-  at the end under [Historical: Peregrine (Python), before the fork](#historical-peregrine-python-before-the-fork).
-  They are not Garuda's.
+## What is measured, and why
 
----
+The route is hello-world: `GET /`, status 200, empty body. A handler that does
+nothing leaves only the server's own cost: parsing, dispatch, writing the
+response, and the socket calls. That is what these figures measure. They do not
+say what an application built on Garuda will serve.
 
-## Against axum, quick comparison
+The machine is not the suite's, and the path from load generator to server is
+loopback here. The figures cannot be set beside the ones the suite's site
+publishes.
 
-Measured on 2026-09-15. Garuda: phase 1 of the handler API, on top of
-0e0cbbc. axum 0.8.9 on Tokio 1.53.1 and hyper 1.11.1: the suite's `rust/axum`
-entry, byte for byte ([benchmarks/axum/](benchmarks/axum/)), built with rustc
-1.96.0 as the suite's `rust/Dockerfile` builds it (release, LTO,
-`panic = "abort"`, one codegen unit). `GET /` at 64 connections, one run per
-pass, `bash benchmarks/vs-axum.sh`, 88 s in all. Requests per second:
+## Quick comparison with axum
 
-| pass | Garuda | axum | Garuda ÷ axum |
-|---|---:|---:|---:|
-| suite ramp, 15 s | **390,324** | 200,048 | 1.95× |
-| closed loop, 10 s | **201,360** | 167,078 | 1.21× |
-| pinned, one core each, 10 s | **200,890** | 116,799 | 1.72× |
-
-Latency, p50 / p99 in milliseconds:
-
-| pass | Garuda | axum |
-|---|---:|---:|
-| suite ramp | 3.9 / 646 | 471 / 2,973 |
-| closed loop | 0.26 / 1.21 | 0.30 / 1.01 |
-| pinned | 0.27 / 1.08 | 0.53 / 2.28 |
-
-- **The passes.**
-  - *Suite ramp:* the suite's zrk command ([Method](#method)), Garuda's four
-    worker processes against axum's one process with Tokio's default of a
-    worker thread per CPU. axum's ramp latencies are queueing: it fell behind
-    the offered rate.
-  - *Closed loop:* `oha -c 64 -z 10s`, the same processes, capacity instead of
-    the ramp.
-  - *Pinned:* the server on CPU 0 and oha on CPUs 1–3. One Garuda worker
-    against one Tokio worker thread: Tokio sizes its runtime from
-    `std::thread::available_parallelism`, which reads the affinity mask.
-- **The closed-loop figure is probably oha's ceiling, not Garuda's.** Garuda
-  served the same ~201k on four workers sharing the CPUs with oha as on one
-  pinned core. Read 1.21× as a floor; the pinned 1.72× may be one too.
-- **One run each, after a 2 s warm-up.** Single runs on this machine move by
-  20–30%. The script is a check to repeat between changes. For a figure to
-  quote, run `frameworks.sh` with three runs at every level:
-  `FRAMEWORKS="swift rust" SERVERS="garuda axum" WORKERS=4 AGG=mean bash benchmarks/frameworks.sh`.
-- **rustc 1.96.0 here**; the suite's Dockerfile uses 1.98.
-
----
-
-## Results, 4 workers
-
-Measured on 2026-09-15, Garuda at 09eb178. Requests per second, `GET /`, the
-mean of three runs:
-
-| entry | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| Garuda router | **414,234** | **389,445** | **370,945** |
-| Hummingbird 2.26.0 | 88,864 | 102,399 | 99,706 |
-| Vapor 4.122.1 | 60,411 | 58,946 | 60,837 |
-
-- **No latencies.** The ramp offers far more than Hummingbird and Vapor can
-  serve, so their corrected p50s are seconds of queueing, not what a request
-  costs. Set beside the router's, they would say nothing.
-- **No pinned one-core pass.** SwiftNIO sizes its event loop group from cgroup
-  limits or the online CPU count, not from CPU affinity, so under `taskset`
-  Hummingbird and Vapor would each run four loops on one core.
-- **Compare rows within one table.** The load generator shares the server's
-  four CPUs, and figures from different sessions on this machine move by tens
-  of percent.
-
-## Method
-
-| | |
-|---|---|
-| Load generator | [zrk](https://github.com/zoxy-io/zrk), the suite's load command at [4bb9eaa](https://github.com/the-benchmarker/web-frameworks/blob/4bb9eaa/.tasks/config.rake#L149) |
-| Warm-up | `zrk -c 50 -d 5s --plain URL` |
-| Each level | `zrk --plain -c N -d 15s -m GET --format json -R1000:500000 --interval 1s --timeout 8s --latency URL` |
-| Levels | 64, 256 and 512 connections, `GET /` |
-| Figure | zrk's `achieved_rate`, in requests per second, the mean of three runs |
-| Garuda | release build at 09eb178, `garuda --log-level error --host 127.0.0.1 --port 3000 --workers 4` |
-| Hummingbird, Vapor | the suite's `swift/hummingbird-framework` and `swift/vapor-framework` entries, byte for byte, built as its Dockerfile builds them: Swift 6.3.3, `swift build -c release -Xswiftc -enforce-exclusivity=unchecked`. Each is one process with SwiftNIO 2.102.0's default of an event loop per CPU |
-| Host | WSL2, 4 CPUs of an Intel Core i9-12900KF; load generator on the same machine, sharing those CPUs |
-
-The command is an open-loop ramp from 1,000 to 500,000 requests a second over
-the 15 s of a run, keep-alive on, latency corrected for coordinated omission.
-
-### Relation to the published results
-
-The site's dataset of 2026-09-13, on 16 CPUs at 512 connections, has Vapor at
-88,435 and Hummingbird at 82,488 requests a second, and the top 15 entries in
-any language between 147k and 176k. Here, on four CPUs shared with the load
-generator, Hummingbird served 99,706 and Vapor 60,837 at 512: the host and the
-path from load generator to server (loopback here) differ too much for the two
-to be set side by side.
-
----
-
-## Before the router: the Swift path on Peregrine's engine
-
-Measured on 2026-09-14, the day of the fork, before the router existed and
-before CPython was removed. `--health-check-path /` answers in `Worker.swift`
-before dispatch, with no Python per request, so it measured what a Swift
-handler at that seam could cost; CPython was still loaded in the process.
-
-Per-request CPU for one worker pinned to CPU 0, load generator on CPUs 1–3,
-closed-loop oha for 15 s at 64 connections, the mean of three runs:
-
-| server | user µs | kernel µs | req/s |
-|---|---:|---:|---:|
-| Peregrine, `--health-check-path /` | **1.27** | 5.42 | 152,480 |
-| Elysia on Bun | 1.45 | 4.36 | 175,572 |
-| Peregrine, raw ASGI | 5.07 | 4.90 | 105,745 |
-
-- **The Swift path was already at Bun's user time**: 1.27 µs against Elysia's
-  1.45. The gap on one core was kernel time, 5.42 against 4.36.
-- Raw ASGI's extra ~3.8 µs of user time was Python and asyncio.
-- Kernel time was 4.4–5.4 µs for every server. At 5.8 µs a request, one core
-  gives about 172k requests a second, which is what Elysia delivered on one
-  pinned worker.
-
-The suite's zrk command, four workers, the mean of three runs, the same
-session, no errors:
-
-| entry | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| Peregrine, `--health-check-path /` | **330,563** | **322,119** | 291,295 |
-| Elysia on Bun | 282,771 | 321,087 | **297,502** |
-| Peregrine, raw ASGI | 216,249 | 251,656 | 247,575 |
-
-The health-check path beat or matched that session's Elysia at 64 and 256.
-Elysia was slower here than the 346k–357k of the other session that day
-([below](#historical-peregrine-python-before-the-fork)); shared-CPU noise
-between sessions is that large.
-
----
-
-## Reproduce
-
-The quick comparison against axum, under two minutes:
+[benchmarks/vs-axum.sh](benchmarks/vs-axum.sh) is a check to repeat between
+changes. It takes under two minutes.
 
 ```bash
 swift build -c release --product garuda
 bash benchmarks/vs-axum.sh
 ```
 
-[benchmarks/vs-axum.sh](benchmarks/vs-axum.sh) prints one line per pass and
-server. It runs `frameworks.sh` three times (ramp, closed loop, pinned) with
-one run at 64 connections and a 2 s warm-up, and needs what that script needs
-for Garuda and axum, below.
+It runs [frameworks.sh](#the-framework-suite) three times with
+`CONNS=64 RUNS=1 WARMUP=2s FRAMEWORKS="swift rust" SERVERS="garuda axum"`,
+Garuda then axum in each pass:
 
-Every level, three runs each:
+| pass | settings | what it shows |
+|---|---|---|
+| ramp | `WORKERS=4 DURATION=15s` | the suite's zrk ramp; Garuda's 4 workers against Tokio's default of a worker thread per CPU |
+| closed | `WORKERS=4 DURATION=10s LOAD=closed` | closed-loop oha, the same processes: capacity, not the ramp |
+| pinned | `WORKERS=1 DURATION=10s LOAD=closed PIN=0:1-3` | server on CPU 0, oha on CPUs 1–3; one Garuda worker against one Tokio thread |
+
+Tokio sizes its runtime from `std::thread::available_parallelism`, which reads
+the affinity mask, so pinned axum runs one worker thread.
+
+It prints one line per pass and server to stdout: requests a second, p50 and
+p99 in milliseconds, and errors. The last line is the total time in seconds.
+`GARUDA` points it at a binary other than `.build/release/garuda`. It needs
+what frameworks.sh needs for Garuda and axum: zrk, oha, python3, curl, cargo
+for the first axum build, and port 3000.
+
+### Recorded passes
+
+**2026-09-15.** Garuda: phase 1 of the handler API
+([HANDLER-API.md](HANDLER-API.md)), on top of 0e0cbbc. axum 0.8.9 on Tokio
+1.53.1 and hyper 1.11.1, built with rustc 1.96.0 (the suite's Dockerfile uses
+1.98). One run per pass, 88 s in all, no errors. Requests a second:
+
+| pass | Garuda | axum | Garuda ÷ axum |
+|---|---:|---:|---:|
+| ramp, 15 s | 390,324 | 200,048 | 1.95× |
+| closed loop, 10 s | 201,360 | 167,078 | 1.21× |
+| pinned, one core each, 10 s | 200,890 | 116,799 | 1.72× |
+
+Latency, p50 / p99 in milliseconds:
+
+| pass | Garuda | axum |
+|---|---:|---:|
+| ramp | 3.9 / 646 | 471 / 2,973 |
+| closed loop | 0.26 / 1.21 | 0.30 / 1.01 |
+| pinned | 0.27 / 1.08 | 0.53 / 2.28 |
+
+- axum's ramp latencies are queueing. It fell behind the offered rate.
+- The closed-loop figure is probably oha's limit, not Garuda's. Garuda served
+  the same ~201k on four workers sharing the CPUs with oha as on one pinned
+  core. Read 1.21× as a floor. The pinned 1.72× may be one too.
+
+**2026-09-16, dedicated server.** The first run on the benchmark machine: 8
+cores, Ubuntu 26.04, with the load generator on the same host. One run per pass,
+87 s in all. Requests a second:
+
+| pass | Garuda | axum | Garuda ÷ axum |
+|---|---:|---:|---:|
+| ramp, 15 s | 297,198 | 185,660 | 1.60× |
+| closed loop, 10 s | 175,475 | 148,001 | 1.19× |
+| pinned, one core each, 10 s | 126,341 | 103,965 | 1.22× |
+
+The dev machine (WSL2) is too noisy for the 5% gate: the same unchanged binary
+read between 345,250 and 377,247 requests a second across four runs there.
+Performance decisions are taken on the dedicated server.
+
+**End of handler API step 3**, on the benchmark machine, 64 connections. Only
+the ratios were recorded: Garuda served 1.71× axum's requests a second on the
+ramp, 1.22× closed-loop and 1.21× pinned to one core, with under half axum's
+closed-loop p99.
+
+## The framework suite
+
+[benchmarks/frameworks.sh](benchmarks/frameworks.sh) runs every level with
+several runs each. Use it for a figure to quote.
 
 ```bash
 swift build -c release --product garuda
@@ -186,62 +110,111 @@ FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 AGG=mean \
     bash benchmarks/frameworks.sh > swift.tsv
 ```
 
-[benchmarks/frameworks.sh](benchmarks/frameworks.sh) prints one TSV line per
-entry and level, with every run. It needs:
+### Method
 
-- **zrk** 2.4 or later on `PATH`, or `ZRK`; **python3**, which reads zrk's JSON
-  output; **curl**; and port 3000 free, or `PORT`.
-- **Garuda** at `.build/release/garuda`, or `GARUDA`. `WORKERS` is Garuda's
-  worker count (default 1); `GARUDA_EXTRA_ARGS` adds server flags.
-- **Hummingbird and Vapor** built from the suite's `swift/hummingbird-framework`
-  and `swift/vapor-framework` entries with
-  `swift build -c release -Xswiftc -enforce-exclusivity=unchecked`. The script
-  looks for their executables at
-  `~/swiftbench/hummingbird-framework/.build/release/server` and
-  `~/swiftbench/vapor-framework/.build/release/server` unless `HUMMINGBIRD`
-  and `VAPOR` say otherwise, and starts them with `SERVER_HOSTNAME` and
-  `SERVER_PORT` (Vapor with `serve` and `VAPOR_ENV=production`).
-- **axum** from [benchmarks/axum/](benchmarks/axum/), the suite's `rust/axum`
-  entry. The script builds it with `cargo` on first use, with the flags of the
-  suite's `rust/Dockerfile`, or runs `AXUM` if given. It listens on 3000 itself,
-  so `PORT` must stay 3000.
-- `AGG=mean` averages the runs, as the suite publishes; the default, `median`,
-  keeps the median run. `RUNS` (3), `CONNS` (`64 256 512`), `DURATION` (15s),
-  `WARMUP` (5s) and `RATE` (`1000:500000`) override the rest. `LOAD=closed` runs closed-loop oha
-  instead of the ramp, and `PIN=0:1-3` pins server and load generator.
+The load is the suite's collect command at
+[4bb9eaa](https://github.com/the-benchmarker/web-frameworks/blob/4bb9eaa/.tasks/config.rake#L149),
+flag for flag:
 
-`FRAMEWORKS=elysia SERVERS=elysia-bun` still runs the suite's Elysia entry
-([benchmarks/elysia-bun/](benchmarks/elysia-bun/)) as a reference. It needs
-[Bun](https://bun.sh) and port 3000.
+| step | command |
+|---|---|
+| warm-up, once per server | `zrk -c 50 -d 5s --plain URL` |
+| each run | `zrk --plain -c N -d 15s -m GET --format json -R1000:500000 --interval 1s --timeout 8s --latency URL` |
 
-The other harnesses Peregrine had in `benchmarks/` (A/B builds, body sizes,
-memory, syscalls, static files, the Python framework comparisons) all started
-Python applications and have been removed. They come back, where still worth
-having, once the handler API can serve what they measured.
+That is an open-loop ramp from 1,000 to 500,000 requests a second over the run,
+with keep-alive on and latency corrected for coordinated omission. The figure
+is zrk's `achieved_rate`, the number the suite's site ranks by.
 
----
+`LOAD=closed` replaces zrk with closed-loop `oha -c N -z DURATION` (warm-up
+`oha -z WARMUP -c 50`), which measures capacity. oha's "aborted due to
+deadline" requests are not counted as errors.
 
-## Historical: Peregrine (Python), before the fork
+The servers:
 
-**These are Peregrine's figures, not Garuda's.** Peregrine is the Python ASGI
-and WSGI server Garuda was forked from; every request below, except Elysia's,
-ran Python. They are kept for scale. The full write-up, with latencies, every
-run and the Python method, is [Peregrine's BENCHMARKS.md at v1.1.5](https://github.com/grepjava/peregrine/blob/v1.1.5/BENCHMARKS.md).
+- **Garuda**: `.build/release/garuda --log-level error --host 127.0.0.1 --port PORT --workers WORKERS`.
+- **axum**: the suite's `rust/axum` entry, byte for byte, in
+  [benchmarks/axum/](benchmarks/axum/). On first use the script builds it with
+  `cargo build --release` and the suite's `rust/Dockerfile` profile: LTO,
+  `panic = "abort"`, one codegen unit. One process, Tokio's default of a worker
+  thread per CPU. It listens on 3000 itself.
+- **Hummingbird and Vapor**: the suite's `swift/hummingbird-framework` and
+  `swift/vapor-framework` entries, byte for byte, built as its Dockerfile
+  builds them: `swift build -c release -Xswiftc -enforce-exclusivity=unchecked`.
+  Each is one process with SwiftNIO's default of an event loop per CPU. They
+  are started with `SERVER_HOSTNAME` and `SERVER_PORT`; Vapor with `serve` and
+  `VAPOR_ENV=production`.
 
-Measured on 2026-09-14 on Peregrine at b8d6ae9, the build 1.1.5 shipped: the
-suite's Python entries on Peregrine and its Elysia entry, four workers, the
-same zrk command (zrk 2.5.0), the same host. Requests per second, the mean of
-three runs, no errors:
+Variables it reads:
 
-| entry | application | 64 | 256 | 512 |
-|---|---|---:|---:|---:|
-| peregrine-wsgi | raw WSGI | **293,025** | **302,417** | 256,660 |
-| peregrine-asgi | raw ASGI | 221,826 | 271,396 | **260,155** |
-| peregrine-blacksheep | BlackSheep 2.6.3 | 179,208 | 202,141 | 197,687 |
-| peregrine-fastapi | FastAPI 0.141.1 | 57,553 | 72,306 | 76,818 |
-| peregrine-flask | Flask 3.1.3 | 49,933 | 50,423 | 50,964 |
-| peregrine-django | Django 6.1.1 | 46,058 | 47,806 | 45,806 |
-| elysia-bun, reference | Elysia 1.4.30 on Bun 1.4.2 | 346,465 | 350,622 | 356,547 |
+| variable | default | meaning |
+|---|---|---|
+| `FRAMEWORKS` | `swift` | `swift` pairs with garuda, hummingbird, vapor; `rust` with axum |
+| `SERVERS` | `garuda hummingbird vapor` | servers to run |
+| `WORKERS` | `1` | Garuda's worker count |
+| `CONNS` | `64 256 512` | connection levels |
+| `RUNS` | `3` | runs per level |
+| `AGG` | `median` | `median` keeps the median run by req/s; `mean` averages every column and sums errors, as the suite publishes |
+| `DURATION` | `15s` | length of a run |
+| `WARMUP` | `5s` | length of the warm-up |
+| `RATE` | `1000:500000` | zrk's ramp, start:end requests a second |
+| `LOAD` | `ramp` | `closed` for oha |
+| `PIN` | empty | `server_cpus:load_cpus` for `taskset`, e.g. `0:1-3` |
+| `PORT` | `3000` | must stay 3000 for axum |
+| `GARUDA_EXTRA_ARGS` | empty | extra Garuda flags, e.g. `--access-log` |
 
-In the site's dataset of 2026-09-13 (16 CPUs), raw WSGI on Peregrine 1.0
-served 130,843 requests a second at 512 connections.
+Binaries default to `.build/release/garuda`,
+`benchmarks/axum/target/release/server` (built if missing),
+`~/swiftbench/hummingbird-framework/.build/release/server` and
+`~/swiftbench/vapor-framework/.build/release/server`; `GARUDA`, `AXUM`,
+`HUMMINGBIRD` and `VAPOR` override them, and `ZRK`, `OHA` and `CARGO` the tools.
+It needs zrk 2.4 or later (oha for `LOAD=closed`), python3 to read their JSON,
+and curl. Output goes to stdout, one TSV line per server and level:
+
+```
+framework  server  workers  connections  req/s p50_ms p75_ms p90_ms p99_ms errors  [every run's req/s]
+```
+
+Server logs go to a temporary directory that is removed at the end.
+
+### Recorded run: Hummingbird and Vapor
+
+**2026-09-15**, Garuda at 09eb178 with 4 workers. `GET /`, the suite's ramp,
+the mean of three runs, no errors. Requests a second:
+
+| entry | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| Garuda router | 414,234 | 389,445 | 370,945 |
+| Hummingbird 2.26.0 | 88,864 | 102,399 | 99,706 |
+| Vapor 4.122.1 | 60,411 | 58,946 | 60,837 |
+
+- Swift 6.3.3, SwiftNIO 2.102.0. Host: WSL2, 4 CPUs of an Intel Core
+  i9-12900KF, with the load generator on the same CPUs.
+- Garuda ran on the built-in router that the handler API has since replaced.
+  The axum passes above ran through the handler API.
+- Garuda served about 4× Hummingbird and 6–7× Vapor at every level.
+- No latencies. The ramp offers far more than Hummingbird and Vapor can serve,
+  so their p50s are seconds of queueing, not the cost of a request.
+- No pinned pass. SwiftNIO sizes its event loop group from cgroup limits or the
+  online CPU count, not from CPU affinity. Under `taskset`, Hummingbird and
+  Vapor would each run four loops on one core.
+
+## Caveats
+
+- **Compare within one table.** On the shared-CPU WSL2 machine, figures from
+  different sessions move by tens of percent.
+- **Single runs need care.** Single runs there move by 20–30%. vs-axum.sh is a
+  check between changes. Quote frameworks.sh with three runs at every level.
+- **The load generator shares the server's CPUs** unless `PIN` separates them.
+  A closed-loop figure can be the load generator's limit.
+- **Use a dedicated machine** for figures that matter, with nothing else
+  running and no builds or tests alongside.
+
+## Planned
+
+Hello-world measures the server. Next, benchmarks that measure a request doing
+work:
+
+- path parameters (`GET /user/:id`)
+- JSON in and out
+- a database round trip
+- streaming response bodies

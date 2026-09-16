@@ -61,7 +61,7 @@ public enum GarudaCLI {
               --workers N              worker processes, 0 = one per CPU (default 1)
               --root-path PATH         mount prefix, taken off paths before routing
               --scheme http|https      scheme taken as the request's, behind a proxy
-                                       that terminates TLS (keys --cache-size)
+                                       that terminates TLS
               --backlog N              listen backlog (default 2048)
               --max-connections N      concurrent connections per worker (default 4096)
               --max-body BYTES         largest accepted request body (default 16 MiB)
@@ -142,9 +142,9 @@ public enum GarudaCLI {
                                        are (default 1024)
               --compress-static        serve FILE.br, FILE.zst or FILE.gz beside a
                                        --static-dir file to clients that accept it
-              --request-start-header   give handlers X-Request-Start: t=<usec> for
-                                       when the request arrived, for APM agents that
-                                       report queue time
+              --request-start-header   give handlers request.requestStart, when the
+                                       request arrived, for APM agents that report
+                                       queue time
               --request-id             give every request an X-Request-ID, echoed on
                                        the response and in the access log; one from a
                                        --forwarded-allow-ips proxy is kept

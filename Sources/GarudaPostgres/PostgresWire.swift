@@ -7,8 +7,7 @@
 // point of keeping it apart (HANDLER-API.md, step 3).
 //
 // A note on names, since both appear in this tree: the C shim's `pg_` prefix
-// is Peregrine's, the project Garuda was forked from, and has nothing to do
-// with PostgreSQL. The types here are spelled out as `Postgres` so the two are
+// is older than the driver and has nothing to do with PostgreSQL. The types here are spelled out as `Postgres` so the two are
 // never mistaken for each other.
 //
 // Every length, count and offset in a backend message is the server's claim,

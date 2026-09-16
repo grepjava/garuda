@@ -4,48 +4,52 @@
 
 # Installing Garuda
 
-Garuda is a single executable built from source with SwiftPM. There is no
-package, installer or prebuilt binary. You clone the repository, build it, and
-run `.build/release/garuda`.
-
-The `garuda` binary serves the-benchmarker's test routes through the handler
-API (see [README.md](README.md#what-the-binary-serves)). An application of your
-own is built against the `Garuda` library product; that API is early and will
-change ([HANDLER-API.md](HANDLER-API.md)).
+Garuda is built from source with SwiftPM. There are no prebuilt binaries. You
+either build the `garuda` executable from this repository, or add the `Garuda`
+library to your own package and build your application.
 
 ---
 
-## What you need
+## Requirements
 
 | | |
 |---|---|
-| **Swift** | 6.1 or newer (`swift-tools-version: 6.1`; CI uses 6.1.2). From [swift.org/install](https://swift.org/install) |
-| **OpenSSL** | development files. The build links `libssl` and `libcrypto` |
-| **zlib** | development files. The build links `libz` |
-| **An OS with epoll or kqueue** | Linux is the primary platform: development, benchmarks and the end-to-end suites run there (WSL 2). macOS 15+ builds and passes the unit tests in CI. Windows is not supported |
+| **Swift** | 6.1 or newer (`swift-tools-version: 6.1`). CI uses 6.1.2. |
+| **OS** | Linux, or macOS 15 or newer. Linux is the primary platform. Windows is not supported; WSL 2 works. |
+| **OpenSSL** | Development files. The package links `libssl` and `libcrypto`. |
+| **zlib** | Development files. The package links `libz`. |
+| **CA certificates** | The system trust store, for ACME and outbound HTTPS, unless you pass `--acme-ca-bundle`. |
+
+Nothing else is linked. The PostgreSQL driver is written in Swift and needs no
+`libpq`.
 
 ### Ubuntu and Debian
 
-CI (Ubuntu 24.04) installs the Swift toolchain's runtime dependencies alongside
-OpenSSL and zlib:
+These are the packages CI installs on Ubuntu 24.04, including the Swift
+toolchain's own runtime dependencies:
 
 ```bash
 sudo apt-get install -y --no-install-recommends \
     binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
-    libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev
-# then a Swift toolchain from https://swift.org/install
-swift --version                       # expect 6.1 or newer
+    libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev ca-certificates
+```
+
+Install a Swift toolchain from [swift.org/install](https://swift.org/install),
+then check it:
+
+```bash
+swift --version
 ```
 
 ### macOS
 
 ```bash
-xcode-select --install                # Swift ships with the Xcode tools
+xcode-select --install
 brew install pkg-config openssl@3
 ```
 
-Homebrew's OpenSSL is not on the default search path, so you pass it to the
-build (as CI does):
+Homebrew's OpenSSL is not on the default search path. Pass it to every
+`swift build` and `swift test`:
 
 ```bash
 OPENSSL_PREFIX=$(brew --prefix openssl@3)
@@ -53,23 +57,30 @@ swift build -c release \
     -Xcc -I"$OPENSSL_PREFIX/include" -Xlinker -L"$OPENSSL_PREFIX/lib"
 ```
 
-Linux-only features, such as `--ktls`, are not available there.
+Linux-only features, such as `--ktls`, are not available on macOS.
 
 ---
 
-## Building
+## Building the executables
 
 ```bash
 git clone https://github.com/grepjava/garuda
 cd garuda
-swift build -c release                # binary at .build/release/garuda
+swift build -c release
 ```
 
-The binary links OpenSSL, zlib and the Swift runtime, and no libpython. To run
-it on another machine, that machine needs those shared libraries too.
+| product | path | what it is |
+|---|---|---|
+| `garuda` | `.build/release/garuda` | the server with a small benchmark application |
+| `garuda-conformance` | `.build/release/garuda-conformance` | routes used by the end-to-end test suites |
 
-If the checkout lives on a filesystem the toolchain is slow on, such as a
-Windows drive mounted into WSL, build somewhere native:
+Build one with `swift build -c release --product garuda`.
+
+The binaries link OpenSSL, zlib and the Swift runtime dynamically. A machine
+that runs them needs those shared libraries.
+
+If the checkout is on a slow file system, such as a Windows drive under WSL,
+build somewhere else:
 
 ```bash
 swift build -c release --scratch-path ~/garuda-build
@@ -87,11 +98,44 @@ curl -i http://127.0.0.1:8000/nope        # 404
 
 ---
 
-## Certificates, for TLS and HTTP/3
+## Using Garuda in your application
 
-HTTP/2 over TLS and HTTP/3 both need a certificate. QUIC has no cleartext form,
-so `--http3` without one is refused at startup with
-`--http3 needs --tls-cert and --tls-key`.
+Add the package and depend on the `Garuda` product. It includes the handler
+API, the HTTP client and the PostgreSQL driver.
+
+```swift
+// swift-tools-version: 6.1
+import PackageDescription
+
+let package = Package(
+    name: "app",
+    platforms: [.macOS(.v15)],
+    dependencies: [
+        .package(url: "https://github.com/grepjava/garuda", branch: "main"),
+    ],
+    targets: [
+        .executableTarget(name: "app", dependencies: [
+            .product(name: "Garuda", package: "garuda"),
+        ]),
+    ]
+)
+```
+
+`Application.run()` reads the flags in [CONFIG.md](CONFIG.md), so your binary is
+started the same way as `garuda`. [README.md](README.md) has a first
+application, and [HANDLER-API.md](HANDLER-API.md) the API's roadmap.
+
+The system requirements above apply to your application's build too,
+including the OpenSSL flags on macOS.
+
+---
+
+## Certificates
+
+HTTP/2 over TLS and HTTP/3 need a certificate. `--http3` without one is refused
+at start-up.
+
+### Certificate files
 
 For local work:
 
@@ -103,56 +147,37 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
 .build/release/garuda --port 8443 --tls-cert cert.pem --tls-key key.pem --http3
 ```
 
-That setup serves two protocol families on port 8443. HTTP/1.1 and HTTP/2 run
-over TCP, negotiated by ALPN. HTTP/3 runs over UDP, advertised to TCP clients
-with an `Alt-Svc` header. `--quic-port` moves the UDP side. Whichever port it
-uses has to be open for **UDP**. That is a separate firewall rule from the TCP
-one, and it is the usual reason a working HTTP/3 server looks broken.
+That serves HTTP/1.1 and HTTP/2 on TCP port 8443 and HTTP/3 on UDP port 8443.
+Open the port for UDP as well as TCP. A missing UDP rule is the usual reason
+HTTP/3 is never used.
 
-Browsers will not use HTTP/3 against a self-signed certificate. For
-browser-facing local work use [`mkcert`](https://github.com/FiloSottile/mkcert),
-which installs a local CA the browser trusts.
+Browsers do not use HTTP/3 with an untrusted certificate. For browser testing,
+[`mkcert`](https://github.com/FiloSottile/mkcert) installs a local CA the
+browser trusts.
 
-**Several names on one port.** Repeat `--tls-cert` and `--tls-key` in pairs. The
-first pair is the default, and the others are chosen by SNI from the names
-inside each certificate.
+**Several names.** Repeat `--tls-cert` and `--tls-key` in pairs. The first
+pair is the default. The others are chosen by SNI, using the names in each
+certificate.
 
-**Kernel TLS.** `--ktls` needs the Linux `tls` module (`modprobe tls`). With
-it, `--static-dir` files are sent with `sendfile` over HTTPS as well.
+### ACME
 
-### Let's Encrypt, with ACME
-
-Garuda can obtain and renew its own certificate. It answers the tls-alpn-01
-challenge on the port it is already serving, so the CA must be able to reach
-that port. For a public site that means port 443:
+Garuda can get and renew its own certificate. It answers the `tls-alpn-01`
+challenge on the port it serves, so a public CA must reach it on port 443:
 
 ```bash
 garuda --host 0.0.0.0 --port 443 \
     --acme-domain example.com --acme-domain www.example.com \
     --acme-email ops@example.com --acme-cache /var/lib/garuda/acme \
-    --http3 --redirect-http 80 --hsts 31536000
+    --http3 --redirect-http 80
 ```
 
-Use `--acme-staging` while trying this out, so you don't hit Let's Encrypt's
-production rate limits. `--acme-directory` and `--acme-ca-bundle` point at
-another CA. The ACME client runs in a helper process. When it writes a new
-certificate, the workers are replaced exactly as on `SIGHUP`, without dropping
-connections. Keep `--acme-cache` on persistent storage: it holds the account key
-and the certificate.
+Use `--acme-staging` while testing. Keep `--acme-cache` on persistent storage;
+it holds the account key and the certificate. [CONFIG.md](CONFIG.md#acme) has
+the details.
 
 ---
 
-## Running it as a service
-
-Garuda runs as a supervisor process with worker children. The signals are:
-
-- **`SIGTERM`** drains gracefully. Add `--drain-delay` behind a load balancer,
-  so the health check fails before connections are refused.
-- **`SIGINT` / `SIGQUIT`** stop without the drain delay.
-- **`SIGHUP`** replaces the workers one at a time without refusing a
-  connection, and they re-read certificates from disk.
-
-A minimal systemd unit using those signals:
+## Running as a systemd service
 
 ```ini
 [Unit]
@@ -172,83 +197,88 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-`systemctl reload garuda` then reloads certificates with no downtime.
-systemd's default stop signal is `SIGTERM`, which is the draining one. If you
-use `--drain-delay`, keep `TimeoutStopSec` above the drain delay plus
-`--graceful-timeout`.
+- `systemctl stop` sends `SIGTERM`, which drains. Keep `TimeoutStopSec` above
+  `--drain-delay` plus `--graceful-timeout` (10 s by default).
+- `systemctl reload` sends `SIGHUP`. The workers are replaced one at a time and
+  read the certificate files again, without dropping a connection. Use it as
+  the certbot deploy hook:
 
-Behind a reverse proxy, bind to a unix socket or to loopback. Set
-`--forwarded-allow-ips` to the proxy's address (or `unix`) so its
-`X-Forwarded-*` headers are trusted. [CONFIG.md](CONFIG.md) covers the flags in
-depth.
+  ```bash
+  certbot renew --deploy-hook 'systemctl reload garuda'
+  ```
 
-### During development
+- `AmbientCapabilities=CAP_NET_BIND_SERVICE` lets a non-root user bind ports
+  below 1024.
+- With `--acme-domain`, make the `--acme-cache` directory writable by the
+  service user.
 
-`--reload` watches the executable. Leave the server running and run
-`swift build -c release` in another terminal. When the binary changes, the
-supervisor execs the new one with its listening sockets kept open and replaces
-the workers without dropping a connection. It does not build for you.
+To upgrade, `git pull`, rebuild, copy the binary into place and restart. The
+only state Garuda keeps is the `--acme-cache` directory.
 
 ---
 
-## Running the tests
+## Behind a reverse proxy
+
+Bind to loopback or a unix socket, and trust the proxy's forwarded headers:
 
 ```bash
-swift test                                    # 288 unit tests
+garuda --unix /run/garuda.sock --workers 0 --forwarded-allow-ips unix
+garuda --host 127.0.0.1 --port 8000 --workers 0 --forwarded-allow-ips 127.0.0.1
 ```
 
-The end-to-end suites in `scripts/` default to `.build/release/garuda`, so build
-the release binary first. `handler-test.py` defaults to
-`.build/release/garuda-conformance` instead, which
-`swift build -c release --product garuda-conformance` builds. The shell suites need `curl`, and some also need
-`openssl`, `nc` or `python3`. `acme-test.sh` needs a local
-[Pebble](https://github.com/letsencrypt/pebble). The HTTP/2, HTTP/3 and handler
-suites use Python as a test client only:
+- Without `--forwarded-allow-ips`, `X-Forwarded-For`, `X-Forwarded-Proto` and
+  `Forwarded` are ignored. Handlers and the rate limiter then see the proxy's
+  address.
+- A proxy that talks h2c upstream, such as Envoy or Caddy, needs
+  `--http2-only`.
+- If the proxy mounts the application under a prefix and does not strip it,
+  use `--root-path`.
+- A proxy that terminates TLS stops ACME's `tls-alpn-01` challenge from
+  reaching Garuda. Get the certificate at the proxy instead.
+
+---
+
+## Kernel TLS
+
+`--ktls` lets `--static-dir` files go out with `sendfile` over HTTPS/1.1. It
+needs Linux, the `tls` kernel module, and an OpenSSL built with kernel TLS
+support.
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install h2 aioquic
-.venv/bin/python scripts/http2-test.py
-.venv/bin/python scripts/http3-test.py
-.venv/bin/python scripts/router-streams-test.py
-.venv/bin/python scripts/handler-test.py
+sudo modprobe tls
+echo tls | sudo tee /etc/modules-load.d/tls.conf    # load it at boot
 ```
 
-[README.md](README.md#tests) has the full list with check counts.
+If either is missing, the server logs a warning at start-up that says which,
+and OpenSSL encrypts as usual.
 
 ---
 
-## When it goes wrong
+## Tests
 
-**Linker errors naming `ssl`, `crypto` or `z`.** The OpenSSL or zlib
-development files are missing: `libssl-dev` and `zlib1g-dev` on Debian and
-Ubuntu. On macOS, pass Homebrew's OpenSSL prefix as shown [above](#macos).
+```bash
+swift test
+swift build -c release
+swift build -c release --product garuda-conformance
+```
 
-**`--http3 needs --tls-cert and --tls-key`.** QUIC is encrypted from its first
-packet. Give it a certificate, or use `--acme-domain`.
-
-**HTTP/3 never gets used.** Check that UDP is open on the QUIC port, and that
-the client trusts the certificate.
-
-**`--ktls` has no effect.** Load the kernel module: `sudo modprobe tls`.
-
-**Windows.** The I/O layer is epoll and kqueue, so there is no Windows build.
-WSL 2 works and is what the project is developed on.
+The end-to-end suites in `scripts/` run those binaries. The shell suites need
+`curl`, and some need `openssl` or `nc`. The HTTP/2, HTTP/3 and handler suites
+are Python test clients that need `h2` and `aioquic`.
+[README.md](README.md#tests) lists them.
 
 ---
 
-## Upgrading and removing
+## Troubleshooting
 
-To upgrade, `git pull` and `swift build -c release` again. Copy the new binary
-into place and restart the service. A server started with `--reload` on that
-binary path picks up the rebuild itself.
-
-To remove Garuda, delete the binary and the checkout's `.build` directory. It
-installs nothing else. The only state it keeps is the `--acme-cache` directory,
-if you used one.
+| symptom | cause |
+|---|---|
+| Linker errors naming `ssl`, `crypto` or `z` | OpenSSL or zlib development files are missing; on macOS, pass the Homebrew prefix |
+| HTTP/3 is never used | UDP is closed on the QUIC port, or the client does not trust the certificate |
+| ACME never issues | the CA cannot reach port 443, or the cache directory is not writable |
 
 ---
 
-Next: [CONFIG.md](CONFIG.md) covers the flags in depth. [README.md](README.md)
-says what Garuda is and what it supports. [ARCHITECTURE.md](ARCHITECTURE.md)
-explains how it is built. [TRANSPORT.md](TRANSPORT.md) describes what each
-protocol does. [GARUDA.md](GARUDA.md) is the current status.
+Next: [CONFIG.md](CONFIG.md) covers every flag. [README.md](README.md)
+describes the handler API and current status.
+[ARCHITECTURE.md](ARCHITECTURE.md) explains how Garuda is built.
