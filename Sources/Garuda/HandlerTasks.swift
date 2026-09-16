@@ -26,10 +26,10 @@ import GarudaCore
 /// request before its first `await`: the request is a view of a connection
 /// slot, and only a wait on the engine (`Response.sleep`) checks, on resuming,
 /// that the slot still holds the same request.
-typealias AsyncHandler = (borrowing Request, inout Response) async throws -> Void
+public typealias AsyncHandler = (borrowing Request, inout Response) async throws -> Void
 
 /// Why a wait on the engine did not complete.
-enum HandlerWaitError: Error, Equatable {
+public enum HandlerWaitError: Error, Equatable {
     /// The request ended first: its connection closed, its stream was reset,
     /// or it was answered.
     case cancelled
@@ -370,7 +370,7 @@ extension Response {
     /// Waits `milliseconds` on the worker's timers, from an async handler.
     /// Throws `cancelled` if the request ends first, and `exhausted` when the
     /// worker has no room left to wait in, which is answered 503.
-    func sleep(milliseconds: UInt64) async throws(HandlerWaitError) {
+    public func sleep(milliseconds: UInt64) async throws(HandlerWaitError) {
         let worker = self.worker
         let index = try worker.pointee.armTaskWait(slot, generation: generation,
                                                    requestId: requestId,

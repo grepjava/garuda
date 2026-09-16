@@ -62,8 +62,9 @@ public final class Application {
     }
 
     /// Registers an async handler, run on one of the worker's handler tasks.
-    /// Internal until step 3 registers typed async handlers on it.
-    func onAsync(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping AsyncHandler) {
+    /// An `await` resumes on the worker's own thread, so the handler sees the
+    /// same request and response a synchronous one does.
+    public func onAsync(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping AsyncHandler) {
         precondition(compiled == nil, "route \(pattern) added after the application was compiled")
         routes.on(method, pattern) { request, _ in
             request.worker.pointee.runOnTask(request.slot, handler)

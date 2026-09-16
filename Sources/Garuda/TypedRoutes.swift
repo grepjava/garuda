@@ -71,3 +71,68 @@ extension Application {
         on(.options, pattern, handler)
     }
 }
+
+// MARK: - Async
+
+// The same names again, for a handler that awaits. A closure that does not
+// await is not async, so it takes the overloads above and keeps the
+// synchronous path; one that does runs on the worker's handler task pool,
+// where every resumption is back on the worker's own thread. Extraction still
+// happens before the handler body, in the order declared.
+
+extension Application {
+    /// Registers an async typed handler for `method` and `pattern`.
+    public func on<each E: RequestExtractor, R: ResponseConvertible>(
+        _ method: HTTPMethod, _ pattern: String,
+        _ handler: @escaping (repeat each E) async throws -> R
+    ) {
+        onAsync(method, pattern) { request, response in
+            var parameter = 0
+            let answer = try await handler(
+                repeat try (each E).extract(from: request, parameter: &parameter))
+            try answer.write(to: response)
+        }
+    }
+
+    public func get<each E: RequestExtractor, R: ResponseConvertible>(
+        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+    ) {
+        on(.get, pattern, handler)
+    }
+
+    public func head<each E: RequestExtractor, R: ResponseConvertible>(
+        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+    ) {
+        on(.head, pattern, handler)
+    }
+
+    public func post<each E: RequestExtractor, R: ResponseConvertible>(
+        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+    ) {
+        on(.post, pattern, handler)
+    }
+
+    public func put<each E: RequestExtractor, R: ResponseConvertible>(
+        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+    ) {
+        on(.put, pattern, handler)
+    }
+
+    public func delete<each E: RequestExtractor, R: ResponseConvertible>(
+        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+    ) {
+        on(.delete, pattern, handler)
+    }
+
+    public func patch<each E: RequestExtractor, R: ResponseConvertible>(
+        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+    ) {
+        on(.patch, pattern, handler)
+    }
+
+    public func options<each E: RequestExtractor, R: ResponseConvertible>(
+        _ pattern: String, _ handler: @escaping (repeat each E) async throws -> R
+    ) {
+        on(.options, pattern, handler)
+    }
+}

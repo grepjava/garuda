@@ -56,7 +56,7 @@ Checked against the code:
 
 - **Borrowed data escapes.** `Request` is `~Copyable`, but `body`, `path`, `parameter(_:)` and `header(_:)` returned `ByteSpan`, a copyable struct holding a raw pointer. A handler could keep one past the request, and read another request's bytes through it. Fixed in step 1: the bytes are lent to closures as `Span`s, and `scripts/compile-fail-test.sh` checks that storing, returning or capturing one does not compile.
 - **`RequestLocals` was a copyable raw `Connection` pointer** with no request-identity check, holding four `UInt64` words. Fixed in step 1: `request[context: Key.self]` holds typed values tagged with the request.
-- **Handlers are synchronous.** The only suspension is a timer. There is no way to await a database query or an HTTP request.
+- **Handlers are synchronous.** The only suspension is a timer. There is no way to await a database query or an HTTP request. Half fixed in step 3: a handler may now be `async throws` and runs on the worker's task pool, but until outbound I/O lands there is still nothing to await but a timer.
 - **Everything is bytes.** Parameters are positional and still percent-encoded; query strings and bodies are raw; there is no JSON. `garuda-conformance` hand-writes query decoding and JSON output.
 - **No application state.** Lifecycle hooks return nothing, and a failing `onStart` cannot stop start-up.
 - **No composition.** No middleware, nesting or merging. A known path under the wrong method gets the same 404 as an unknown path.
@@ -183,7 +183,7 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 
 ### 2. Typed extraction, responses, errors and state
 
-**Landed 2026-09-16.** All five sub-steps under [Order of work](#order-of-work-1) are in the tree: the JSON coder, typed answers and errors, typed extraction, typed per-worker state, and forms with multipart. What is left for later steps: async handlers (3), middleware and 405 (4), streaming (5).
+**Landed 2026-09-16.** All five sub-steps under [Order of work](#order-of-work-1) are in the tree: the JSON coder, typed answers and errors, typed extraction, typed per-worker state, and forms with multipart. What is left for later steps: the rest of step 3 — cancellation and deadlines, outbound connections, an HTTP client and the databases — then middleware and 405 (4), streaming (5).
 
 | Input | Output |
 |---|---|
@@ -211,7 +211,9 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 
 ### 3. Async handlers and real integrations
 
-- **`async throws` handlers beside synchronous ones**, registered through the overloads and run on the handler task pool that step 1 builds ([How a request runs](#how-a-request-runs)). An `await` resumes on the worker thread; a synchronous handler keeps today's path. The pool's cost, about 0.4–1 µs and no allocation per async request, is measured again on the real engine before this lands.
+**Started 2026-09-16.** The first item below is in the tree. The rest — cancellation and deadlines, outbound connections, the HTTP client and the databases — is not. Until outbound I/O lands, the only thing a handler can await is the worker's own timer, so an async handler is useful mainly for code that already has something to await.
+
+- **`async throws` handlers beside synchronous ones.** Landed: the same names register a handler that awaits — `app.get("/user/:id") { (id: Path<Int>) async throws in JSON(try await load(id.value)) }` — beside one that does not, with the extractors and return values of step 2 unchanged. A closure that does not await is not async, so it takes the synchronous overload and today's path; one that does runs on the handler task pool step 1 built, where every resumption is back on the worker's own thread, which the executor asserts rather than assumes. Extraction happens before the handler body, in the order declared, so a bad parameter is still the 400 it was. A thrown `ResponseError` is the answer from a task exactly as from a synchronous handler, and anything else is a 500 and a log line. `Response.sleep(milliseconds:)` waits on the worker's own timers.
 - **Cancellation and deadlines.** A reset stream or closed connection cancels the handler's task; a response after disconnect is dropped safely; per-route deadlines.
 - **Outbound connections on the worker's poller**, built once: TCP, TLS and Unix sockets, DNS, timeouts, cancellation and a per-worker pool. The HTTP client and every database driver use it; none opens sockets of its own.
 - **An outbound HTTP client** on that layer.

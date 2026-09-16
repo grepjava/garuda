@@ -317,8 +317,9 @@ rest of the engine such a request is a continuation of kind `.task`, so
 closing the connection, resetting the stream or starting the next request
 cancels it through `cancelOps`: the task's wait throws, the handler unwinds,
 and the task goes back to the pool. After warm-up, a request served this way
-allocates nothing. Async handlers themselves are internal until the typed
-handler API registers them.
+allocates nothing. An application reaches this through the ordinary route
+names: a closure that awaits takes the async overload and runs here, and one
+that does not takes the synchronous overload and never touches the pool.
 
 **`AsyncOpPool`** is a fixed-capacity slab of `AsyncOp` records (one per
 possible connection) with a free list. Each record has a generation bumped on
@@ -443,9 +444,11 @@ API does not reach them yet:
   cache policy, trace context, root path, the route table
   (`RouteTableTests`), the JSON coder (`JSONTests`), the async substrate
   (`AsyncOpsTests`), the application
-  and its test client (`ApplicationTests`), and the handler tasks
+  and its test client (`ApplicationTests`), the handler tasks
   (`HandlerTaskTests`), which counts the worker's own heap allocations through
-  `Tests/CAllocationCounter` and expects none per request once warm.
+  `Tests/CAllocationCounter` and expects none per request once warm, and the
+  async routes (`AsyncRouteTests`), which check that the synchronous and async
+  overloads do not trade places.
 - `pgfuzz` with `GarudaFuzzTargets` for the parsers and for the JSON coder,
   whose target holds a document to decoding, encoding and decoding again as
   the same value.
