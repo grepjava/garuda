@@ -25,6 +25,8 @@ final class RequestContext {
     let generation: UInt32
     let requestId: UInt32
     var values: [ObjectIdentifier: Any] = [:]
+    /// What `Response.onSend` asked to run before the response is sent.
+    var sendHooks: [SendHook] = []
 
     init(generation: UInt32, requestId: UInt32) {
         self.generation = generation
@@ -43,19 +45,15 @@ extension Request {
             return context.values[ObjectIdentifier(key)] as? Key.Value
         }
         nonmutating set {
-            let c = connection
-            let current = c.pointee.context.flatMap { context in
-                context.generation == c.pointee.generation
-                    && context.requestId == c.pointee.requestId ? context : nil
-            }
             guard let newValue else {
-                current?.values[ObjectIdentifier(key)] = nil
+                let c = connection
+                if let context = c.pointee.context, context.generation == c.pointee.generation,
+                   context.requestId == c.pointee.requestId {
+                    context.values[ObjectIdentifier(key)] = nil
+                }
                 return
             }
-            let context = current ?? RequestContext(generation: c.pointee.generation,
-                                                    requestId: c.pointee.requestId)
-            context.values[ObjectIdentifier(key)] = newValue
-            c.pointee.context = context
+            worker.pointee.requestContext(slot).values[ObjectIdentifier(key)] = newValue
         }
     }
 }

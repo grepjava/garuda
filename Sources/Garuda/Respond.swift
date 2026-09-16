@@ -320,6 +320,10 @@ extension Worker {
             Log.error("a handler answered a request that was already answered or waiting")
             return
         }
+        if let hooks = takeSendHooks(slot) {
+            respond(slot, through: hooks, status: status, body, count)
+            return
+        }
 
         // What the handler said about its own response.
         var kinds: ResponseHeaderKind = []
