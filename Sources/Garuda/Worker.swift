@@ -123,6 +123,18 @@ public struct Worker {
     /// from ever looking quiescent.
     var outbound: OutboundTable? = nil
     var outboundLimit = 256
+    /// Head of the idle list for each place this worker has connected to, so
+    /// a caller wanting somewhere it has been before is handed a connection
+    /// rather than making one. Empty for a server that never calls out.
+    var outboundIdle: [OutboundKey: Int32] = [:]
+    /// How long a connection nobody came back for is kept, and how many are
+    /// kept per place. Both bounded: idle connections cost a descriptor here
+    /// and a connection on whatever is at the other end.
+    var outboundIdleMillis: UInt64 = 30_000
+    var outboundIdlePerKey = 8
+    /// How many connections this worker actually opened, as against handed
+    /// back from the pool. A test cannot otherwise tell reuse from a new one.
+    public var outboundOpened: UInt64 = 0
 
     public init(config: ServerConfig, listenFD: Int32, poller: Poller) {
         self.config = config
@@ -1431,6 +1443,8 @@ public struct Worker {
         if now &- lastSweep < 1000 { return }
         lastSweep = now
         dates.refresh()
+        // Connections this worker made and nobody came back for.
+        if outbound != nil { sweepIdleOutbound(now: now) }
         if metricsFD >= 0 || redirectFD >= 0 { sweepScrapes(now: now) }
 
         // Past the grace period, whatever is still in flight is not going to

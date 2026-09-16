@@ -10,6 +10,9 @@ nonisolated(unsafe) private var outcome = ""
 /// the port a listener was given, so a test that wanted one would have to pick
 /// a number and hope. A path has no such problem.
 private let socketPath = "/tmp/garuda-outbound-test.sock"
+/// A second place, so a test can prove the pool keys on the destination
+/// rather than handing any idle connection to any caller.
+private let otherSocketPath = "/tmp/garuda-outbound-other.sock"
 
 private func outboundApp() -> Application {
     let app = Application()
@@ -41,6 +44,31 @@ private func outboundApp() -> Application {
         do {
             _ = try await Worker.connect(worker, host: "localhost", port: 80, milliseconds: 1_000)
             outcome = "unexpectedly open"
+        } catch {
+            outcome = "\(error)"
+        }
+        response.send(outcome)
+    }
+    // Connects and hands the connection back rather than closing it.
+    app.onAsync(.get, "/pool") { request, response in
+        let worker = request.worker
+        do {
+            let socket = try await Worker.connect(worker, path: socketPath, milliseconds: 1_000)
+            socket.release()
+            outcome = "released"
+        } catch {
+            outcome = "\(error)"
+        }
+        response.send(outcome)
+    }
+    // The same, to a different place, so the two must not share.
+    app.onAsync(.get, "/pool-other") { request, response in
+        let worker = request.worker
+        do {
+            let socket = try await Worker.connect(worker, path: otherSocketPath,
+                                                  milliseconds: 1_000)
+            socket.release()
+            outcome = "released"
         } catch {
             outcome = "\(error)"
         }
@@ -176,6 +204,86 @@ struct OutboundTests {
         #expect(wire.receive()?.hasSuffix("read hello") == true)
         #expect(client.worker.pointee.outbound?.liveCount == 0)
         #expect(client.worker.pointee.asyncOps.liveCount == 0)
+    }
+
+    /// The point of the pool: going back to the same place costs no socket.
+    @Test func aReleasedConnectionIsUsedAgain() throws {
+        let fd = listen()
+        #expect(fd >= 0)
+        defer { _ = pg_close(fd); unlink() }
+        let client = outboundApp().test
+        #expect(try client.get("/pool").text == "released")
+        let afterFirst = client.worker.pointee.outboundOpened
+        #expect(afterFirst == 1)
+        #expect(client.worker.pointee.outbound?.liveCount == 1)
+
+        for _ in 0..<5 { #expect(try client.get("/pool").text == "released") }
+        // Five more requests, no more sockets: each was handed the same one.
+        #expect(client.worker.pointee.outboundOpened == afterFirst)
+        #expect(client.worker.pointee.outbound?.liveCount == 1)
+    }
+
+    /// Keyed by where it goes. An idle connection to one place must never be
+    /// handed to a caller asking for another.
+    @Test func thePoolDoesNotMixDestinations() throws {
+        let first = listen()
+        let second = otherSocketPath.withCString { pg_listen_unix($0, 16, 1) }
+        #expect(first >= 0)
+        #expect(second >= 0)
+        defer {
+            _ = pg_close(first); _ = pg_close(second)
+            unlink(); _ = otherSocketPath.withCString { pg_unlink($0) }
+        }
+        let client = outboundApp().test
+        #expect(try client.get("/pool").text == "released")
+        #expect(try client.get("/pool-other").text == "released")
+        // Two places, two sockets, and neither was reused for the other.
+        #expect(client.worker.pointee.outboundOpened == 2)
+        #expect(client.worker.pointee.outbound?.liveCount == 2)
+        // Going back to each reuses its own.
+        #expect(try client.get("/pool").text == "released")
+        #expect(try client.get("/pool-other").text == "released")
+        #expect(client.worker.pointee.outboundOpened == 2)
+    }
+
+    /// The oldest bug in connection pooling: the far end closed while the
+    /// connection sat idle, and the next caller is handed a dead socket. It
+    /// has to be noticed and dropped instead.
+    @Test func aPeerThatWentAwayIsNotHandedOn() throws {
+        let fd = listen()
+        #expect(fd >= 0)
+        defer { _ = pg_close(fd); unlink() }
+        let client = outboundApp().test
+        #expect(try client.get("/pool").text == "released")
+        #expect(client.worker.pointee.outboundOpened == 1)
+
+        // Be the far end, and go away.
+        var peer = [CChar](repeating: 0, count: 64)
+        var port: UInt16 = 0
+        let server = pg_accept(fd, &peer, 64, &port)
+        #expect(server >= 0)
+        _ = pg_close(server)
+
+        // The next caller must get a new connection, not the dead one.
+        #expect(try client.get("/pool").text == "released")
+        #expect(client.worker.pointee.outboundOpened == 2)
+        #expect(client.worker.pointee.outbound?.liveCount == 1)
+    }
+
+    /// A connection nobody came back for does not sit there for ever.
+    @Test func anIdleConnectionIsSweptAway() throws {
+        let fd = listen()
+        #expect(fd >= 0)
+        defer { _ = pg_close(fd); unlink() }
+        let client = outboundApp().test
+        client.worker.pointee.outboundIdleMillis = 1
+        #expect(try client.get("/pool").text == "released")
+        #expect(client.worker.pointee.outbound?.liveCount == 1)
+
+        // The sweep runs at most once a second, so let it come round.
+        let started = pg_monotonic_ms()
+        while pg_monotonic_ms() - started < 1_200 { client.turn() }
+        #expect(client.worker.pointee.outbound?.liveCount == 0)
     }
 
     /// A worker that goes away with a connection still open closes it rather
