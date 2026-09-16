@@ -59,6 +59,9 @@ public enum ClientError: Error, Equatable {
     case timedOut
     /// The request that wanted it ended, or the worker is shutting down.
     case cancelled
+    /// ALPN settled on a protocol this client cannot speak. Not a failure of
+    /// the peer's: it chose from what was offered.
+    case unsupportedProtocol
 }
 
 public struct ClientHeader: Sendable, Equatable {
@@ -110,6 +113,17 @@ public struct HTTPClient {
     public var maxHeaders: Int = 100
     /// A trust store for https. Empty means the system's.
     public var caFile: String = ""
+    /// What to offer over ALPN on an encrypted connection, most preferred
+    /// first.
+    ///
+    /// Internal, and `http/1.1` alone, until the HTTP/2 path exists. ALPN
+    /// settles during the handshake and cannot be renegotiated, so offering
+    /// `h2` before this client can speak it would not be an incomplete
+    /// feature but a regression: every server supporting both would select
+    /// h2, and every one of those requests would fail where it works today.
+    /// A public knob whose only non-default value guarantees failure is a
+    /// trap, so it stays internal and the tests reach it directly.
+    var alpn: String = "http/1.1"
     /// Sent unless the caller sets its own.
     public var userAgent: String = "garuda"
 
@@ -165,7 +179,7 @@ extension HTTPClient {
         do {
             if plan.secure {
                 socket = try await Worker.connectTLS(worker, name: plan.host, port: plan.port,
-                                                     caFile: caFile,
+                                                     caFile: caFile, alpn: alpn,
                                                      milliseconds: timeoutMilliseconds)
             } else {
                 socket = try await Worker.connect(worker, name: plan.host, port: plan.port,
@@ -173,6 +187,17 @@ extension HTTPClient {
             }
         } catch {
             throw .connect(error)
+        }
+
+        // What was agreed, not what was asked for. A server may only select
+        // from what was offered, so with `alpn` at http/1.1 this cannot fire
+        // against anything compliant -- but writing a request line into a
+        // connection the peer believes is carrying frames is not a failure
+        // worth discovering from the far end's behaviour. The frame loop is
+        // what replaces this.
+        if socket.isHTTP2 {
+            socket.close()
+            throw .unsupportedProtocol
         }
 
         do {

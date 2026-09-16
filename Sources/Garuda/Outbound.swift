@@ -73,11 +73,20 @@ struct OutboundKey: Hashable {
     /// an encrypted socket it never asked to have checked at all.
     var tls: String = ""
 
-    /// The two things that decide whether a session may be reused, in one
-    /// string. NUL-separated because neither a hostname nor a path may contain
-    /// one, so no pair can spell another pair's identity.
-    static func tlsIdentity(hostname: String, caFile: String) -> String {
-        "\(hostname)\u{0}\(caFile)"
+    /// What a pooled encrypted connection has to match before it may be handed
+    /// to a caller, in one string. NUL-separated because none of the three may
+    /// contain one, so no triple can spell another triple's identity.
+    ///
+    /// The ALPN offer is part of the identity, not just the name and the trust
+    /// store. Two callers asking for different protocol sets can negotiate
+    /// different protocols with the same peer, and a connection that settled
+    /// on HTTP/1.1 handed to a caller expecting HTTP/2 is a caller writing a
+    /// frame header into a request line. Same reasoning that put `caFile`
+    /// here: what was agreed at handshake time is part of what this connection
+    /// *is*.
+    static func tlsIdentity(hostname: String, caFile: String,
+                            alpn: String = "http/1.1") -> String {
+        "\(hostname)\u{0}\(caFile)\u{0}\(alpn)"
     }
 }
 
@@ -593,6 +602,18 @@ struct OutboundSocket {
         return pg_tls_pending(tls) > 0
     }
 
+    /// Whether ALPN settled on HTTP/2.
+    ///
+    /// Only meaningful after the handshake: the shim reads the selected
+    /// protocol when `SSL_do_handshake` reports success, because that is when
+    /// OpenSSL has one to report. False on a plaintext connection, and false
+    /// on an encrypted one where the peer offered nothing in common -- which
+    /// is not an error, only an agreement to speak HTTP/1.1.
+    var isHTTP2: Bool {
+        guard let o = record, let tls = o.pointee.tls else { return false }
+        return pg_tls_is_h2(tls) != 0
+    }
+
     func readable(milliseconds: UInt64 = 10_000) async throws(OutboundError) {
         try await wait(.read, milliseconds: milliseconds)
     }
@@ -637,15 +658,24 @@ struct OutboundSocket {
 extension Worker {
     /// The client context, made on the first encrypted connection. A server
     /// that never calls out over TLS never builds one.
-    mutating func outboundTLSContext(caFile: String = "") -> OpaquePointer? {
-        if let existing = outboundTLS[caFile] { return existing }
+    mutating func outboundTLSContext(caFile: String = "",
+                                     alpn: String = "http/1.1") -> OpaquePointer? {
+        // Keyed on both, because the ALPN list is baked into the context by
+        // SSL_CTX_set_alpn_protos. Keyed on the trust store alone, the first
+        // caller's protocol list would be silently imposed on every later one
+        // wanting the same store -- and the symptom would be a negotiation
+        // nobody asked for rather than an error.
+        let key = "\(caFile)\u{0}\(alpn)"
+        if let existing = outboundTLS[key] { return existing }
         var error = [CChar](repeating: 0, count: 256)
         let made: OpaquePointer? = error.withUnsafeMutableBufferPointer { buffer in
-            if caFile.isEmpty {
-                return pg_tls_client_ctx_new(nil, "http/1.1", buffer.baseAddress, 256)
-            }
-            return caFile.withCString {
-                pg_tls_client_ctx_new($0, "http/1.1", buffer.baseAddress, 256)
+            alpn.withCString { protocols in
+                if caFile.isEmpty {
+                    return pg_tls_client_ctx_new(nil, protocols, buffer.baseAddress, 256)
+                }
+                return caFile.withCString {
+                    pg_tls_client_ctx_new($0, protocols, buffer.baseAddress, 256)
+                }
             }
         }
         guard let made else {
@@ -660,7 +690,7 @@ extension Worker {
             }
             return nil
         }
-        outboundTLS[caFile] = made
+        outboundTLS[key] = made
         return made
     }
 
@@ -669,15 +699,17 @@ extension Worker {
     /// caller is connecting to an address and knows the name it wants.
     static func connectTLS(_ worker: UnsafeMutablePointer<Worker>, host: String, port: UInt16,
                            hostname: String? = nil, caFile: String = "",
+                           alpn: String = "http/1.1",
                            milliseconds: UInt64 = 10_000) async throws(OutboundError) -> OutboundSocket {
         // The identity goes into the lookup, not just onto the record: asking
         // the pool for the plaintext key would miss every pooled session and
         // open a new socket each time -- correct, and pooling that never pools.
-        let identity = OutboundKey.tlsIdentity(hostname: hostname ?? host, caFile: caFile)
+        let identity = OutboundKey.tlsIdentity(hostname: hostname ?? host, caFile: caFile,
+                                               alpn: alpn)
         let socket = try await connect(worker, host: host, port: port, tls: identity,
                                        milliseconds: milliseconds)
         do {
-            try await socket.startTLS(hostname: hostname ?? host, caFile: caFile,
+            try await socket.startTLS(hostname: hostname ?? host, caFile: caFile, alpn: alpn,
                                       milliseconds: milliseconds)
         } catch {
             socket.close()
@@ -691,10 +723,10 @@ extension OutboundSocket {
     /// Puts TLS on a connection that is already up, and finishes the
     /// handshake before returning. A failure here closes nothing on its own:
     /// the caller decides, since an unverified peer is its business.
-    func startTLS(hostname: String, caFile: String = "",
+    func startTLS(hostname: String, caFile: String = "", alpn: String = "http/1.1",
                   milliseconds: UInt64 = 10_000) async throws(OutboundError) {
         guard isOpen, let o = worker.pointee.outbound?[index] else { throw .cancelled }
-        let identity = OutboundKey.tlsIdentity(hostname: hostname, caFile: caFile)
+        let identity = OutboundKey.tlsIdentity(hostname: hostname, caFile: caFile, alpn: alpn)
         if o.pointee.tls != nil {
             // Already encrypted: the pool handed back a session this caller
             // could have made itself. Matching identities means it did; a
@@ -704,7 +736,9 @@ extension OutboundSocket {
             guard o.pointee.key?.tls == identity else { throw .failed(0) }
             return
         }
-        guard let ctx = worker.pointee.outboundTLSContext(caFile: caFile) else { throw .failed(0) }
+        guard let ctx = worker.pointee.outboundTLSContext(caFile: caFile, alpn: alpn) else {
+            throw .failed(0)
+        }
         guard let session = hostname.withCString({ pg_tls_client_new(ctx, o.pointee.fd, $0) }) else {
             throw .failed(0)
         }
@@ -812,13 +846,14 @@ extension Worker {
     /// unnoticed. The name is what was asked for and the name is what the peer
     /// has to prove.
     static func connectTLS(_ worker: UnsafeMutablePointer<Worker>, name: String, port: UInt16,
-                           caFile: String = "", wantIPv6: Bool = false,
+                           caFile: String = "", alpn: String = "http/1.1",
+                           wantIPv6: Bool = false,
                            milliseconds: UInt64 = 10_000) async throws(OutboundError) -> OutboundSocket {
-        let identity = OutboundKey.tlsIdentity(hostname: name, caFile: caFile)
+        let identity = OutboundKey.tlsIdentity(hostname: name, caFile: caFile, alpn: alpn)
         let socket = try await connect(worker, name: name, port: port, tls: identity,
                                        wantIPv6: wantIPv6, milliseconds: milliseconds)
         do {
-            try await socket.startTLS(hostname: name, caFile: caFile,
+            try await socket.startTLS(hostname: name, caFile: caFile, alpn: alpn,
                                       milliseconds: milliseconds)
         } catch {
             socket.close()
