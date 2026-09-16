@@ -145,6 +145,14 @@ public struct Worker {
     /// How many connections this worker actually opened, as against handed
     /// back from the pool. A test cannot otherwise tell reuse from a new one.
     public var outboundOpened: UInt64 = 0
+    /// What /etc/resolv.conf said, read once at start-up rather than per
+    /// lookup: the file changes rarely, and opening it in the middle of a
+    /// request to answer a question about a hostname is the blocking this
+    /// whole layer exists to avoid. A test replaces it directly.
+    var resolverConfig = ResolverConfig()
+    /// The port this worker's nameservers listen on. Only a test moves it:
+    /// resolv.conf has no syntax for a port, so in production it is 53.
+    var nameserverPort: UInt16 = Worker.defaultNameserverPort
 
     public init(config: ServerConfig, listenFD: Int32, poller: Poller) {
         self.config = config

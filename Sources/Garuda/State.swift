@@ -62,6 +62,14 @@ extension Worker {
     /// factory throws, which stops the worker starting.
     mutating func buildState(_ application: UnsafeMutablePointer<CompiledApplication>?,
                              index: Int) throws {
+        // Before the guard, and not throwing: every worker needs to know what
+        // the system says about nameservers, including one with no application
+        // behind it, and a machine with no resolv.conf is a machine with no
+        // DNS configured rather than a reason to refuse to start. Read once
+        // here because a worker is one thread and opening a file in the middle
+        // of a request to answer a question about a hostname is the blocking
+        // this whole layer exists to avoid.
+        resolverConfig = ResolverConfig.read()
         guard let application else { return }
         for (key, make) in application.pointee.stateFactories {
             services[key] = try make(index)

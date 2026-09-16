@@ -120,6 +120,27 @@ int pg_static_open(const char *root, const char *relative,
  * Returns the descriptor, or -1 with errno set. */
 int pg_open_read(const char *path);
 
+/* A datagram socket connected to `host` and `port`, both numeric.
+ *
+ * Connected rather than bare, so the kernel refuses datagrams from anyone but
+ * the nameserver that was asked: an off-path answer has to guess the query id
+ * and the source port, and this takes the port away as something to guess.
+ *
+ * There is no in_progress here, unlike pg_connect_tcp. connect(2) on a
+ * datagram socket only records the peer, so it returns at once or not at all.
+ *
+ * Returns the descriptor, or -1 with errno set; EINVAL means the host was not
+ * an address literal. */
+int pg_connect_udp(const char *host, uint16_t port);
+
+/* The port a socket is actually bound to, which for a bind to port 0 is the
+ * one the kernel chose. Returns 0 on failure.
+ *
+ * Without this a test that needs a server of its own has to pick a number and
+ * hope nothing else on the machine holds it. The outbound tests avoided the
+ * problem by using unix sockets; a nameserver cannot be one. */
+uint16_t pg_local_port(int fd);
+
 /* poll(2) on a single descriptor, for a wait outside the readiness poller: the
  * supervisor checking whether a replacement worker has reported ready. */
 int pg_poll_single(int fd, int for_write, int timeout_ms);

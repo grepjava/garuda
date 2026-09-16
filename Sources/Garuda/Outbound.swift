@@ -180,6 +180,20 @@ extension Worker {
                            key: OutboundKey(host: host, port: port, tls: tls))
     }
 
+    /// A datagram socket connected to a nameserver.
+    ///
+    /// It takes an outbound record like everything else here, so a drain
+    /// closes it and `quiescent` accounts for it, but it is never released to
+    /// the pool: `tls` carries a marker no TCP caller can spell, so even a
+    /// caller asking for the same address and port cannot be handed this.
+    mutating func beginConnect(udp host: String, port: UInt16) -> Result<Int, OutboundError> {
+        let fd = host.withCString { pg_connect_udp($0, port) }
+        // connect(2) on a datagram socket only records the peer, so there is
+        // no in-progress state and the record is open on return.
+        return finishBegin(fd: fd, inProgress: false,
+                           key: OutboundKey(host: host, port: port, tls: "\u{0}udp"))
+    }
+
     /// The same for a unix socket.
     mutating func beginConnect(path: String, tls: String = "") -> Result<Int, OutboundError> {
         var inProgress: Int32 = 0

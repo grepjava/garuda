@@ -487,6 +487,54 @@ int pg_static_open(const char *root, const char *relative,
     return fd;
 }
 
+uint16_t pg_local_port(int fd) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    if (getsockname(fd, (struct sockaddr *)&ss, &len) != 0) return 0;
+    if (ss.ss_family == AF_INET) {
+        return ntohs(((struct sockaddr_in *)&ss)->sin_port);
+    }
+    if (ss.ss_family == AF_INET6) {
+        return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+    }
+    return 0;
+}
+
+int pg_connect_udp(const char *host, uint16_t port) {
+    if (!host || !host[0]) { errno = EINVAL; return -1; }
+
+    char portbuf[8];
+    snprintf(portbuf, sizeof portbuf, "%u", (unsigned)port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    /* The same parse-and-return as pg_connect_tcp: a nameserver address comes
+     * from resolv.conf, which cannot name one, so nothing here may ever go to
+     * a resolver and recurse into itself. */
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, portbuf, &hints, &res) != 0) { errno = EINVAL; return -1; }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { int s = errno; freeaddrinfo(res); errno = s; return -1; }
+    pg_set_nonblock(fd);
+    pg_set_cloexec(fd);
+
+    /* On a datagram socket this only records the peer, so it does not block
+     * and has no in-progress state to report. What it buys is that the kernel
+     * drops datagrams from anyone else. */
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    int saved = errno;
+    freeaddrinfo(res);
+    if (rc == 0) return fd;
+    close(fd);
+    errno = saved;
+    return -1;
+}
+
 int pg_open_read(const char *path) {
     if (!path) { errno = EINVAL; return -1; }
     /* O_NONBLOCK on the open itself: opening a fifo for reading blocks until a
