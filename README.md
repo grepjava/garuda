@@ -15,10 +15,10 @@
 ---
 
 Garuda is a web framework and the server under it, written together in Swift.
-Handlers run on the worker thread that read the request, with no scheduling
-hop before a response that can be sent at once. The aim is
-[axum](https://github.com/tokio-rs/axum): as quick to write an API in, and
-faster serving it.
+The goal is a server that stands with the best in any language: correct and
+strict on every protocol it speaks, safe by construction, pleasant to build an
+API in, and fast. Handlers run on the worker thread that read the request, with
+no scheduling hop before a response that can be sent at once.
 
 **Status: early, and the API will change.** Routes, groups and middleware,
 synchronous and async handlers, typed extraction and answers, per-worker state,
@@ -204,6 +204,10 @@ port: parsing, routing, middleware, handlers, timers and the response path.
 
 ## Garuda and axum
 
+[axum](https://github.com/tokio-rs/axum) is a mature, widely used framework, so
+it is a useful reference for what a production web framework is expected to
+offer. This is where Garuda stands, area by area.
+
 | Area | axum (Tokio) | Garuda | Status |
 |---|---|---|---|
 | Route dispatch | Every handler is a future the runtime polls | A synchronous handler is a direct call on the worker thread | Done |
@@ -229,11 +233,9 @@ port: parsing, routing, middleware, handlers, timers and the response path.
 | Blocking work | `spawn_blocking` | None | Planned |
 | Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine | Done |
 
-On the benchmark machine (`benchmarks/vs-axum.sh`, 64 connections), Garuda
-served 1.71× axum's requests a second on the suite's ramp, 1.22× closed-loop
-and 1.21× pinned to one core, with under half axum's closed-loop p99. That is a
-hello-world route, so it measures what the server adds to a request.
-[BENCHMARKS.md](BENCHMARKS.md) has the method and every run.
+For performance, [BENCHMARKS.md](BENCHMARKS.md) has the method and every run,
+including hello-world comparisons with axum that measure what the server adds to
+a request.
 
 ### Where Garuda differs, and why
 

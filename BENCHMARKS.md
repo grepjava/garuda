@@ -4,11 +4,15 @@
 
 # Benchmarks
 
-Garuda is measured against [axum](https://github.com/tokio-rs/axum), the
-framework it aims to beat, and against Hummingbird and Vapor, the Swift entries
-of [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/).
-Every entry but Garuda is that suite's own application, built as the suite
-builds it. The load is the suite's command.
+How Garuda's performance is measured, and the results so far. Benchmarks are a
+check on the engine, not its purpose: a change that makes Garuda slower should
+be noticed, and these runs are how.
+
+The reference points are [axum](https://github.com/tokio-rs/axum), a widely
+used Rust framework, and Hummingbird and Vapor, from
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/).
+Every server but Garuda runs that suite's own application, built as the suite
+builds it, under the suite's load command.
 
 ## What is measured, and why
 

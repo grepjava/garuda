@@ -7,8 +7,10 @@ to build.
 CRUD API backed by a database, without touching pointers, engine internals or
 hand-written JSON.
 
-**The measure:** [axum](https://github.com/tokio-rs/axum), in usability and in
-speed. [BENCHMARKS.md](BENCHMARKS.md) has the comparisons.
+**The standard:** a server and framework that holds up in production, to be
+chosen on its merits: correct under every protocol it speaks, safe by
+construction, pleasant to write in, and fast. The README compares it with axum
+feature by feature, and [BENCHMARKS.md](BENCHMARKS.md) has the measurements.
 
 ## Principles
 
