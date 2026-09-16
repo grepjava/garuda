@@ -247,7 +247,18 @@ public struct PostgresRows: Sendable {
 public struct PostgresQuery {
     let sql: String
     let values: [PostgresValue]
+    /// The prepared statement this runs as: "" for the unnamed one.
+    let statement: String
+    /// Whether to parse `sql` into `statement` first, or use it as it stands.
+    let prepare: Bool
+    /// A format per result column, or empty for all text.
+    let resultFormats: [Int16]
+    /// Statements to close before this one runs.
+    let closing: [String]
     public private(set) var rows = PostgresRows()
+    /// Whether the server parsed the statement. A prepared statement exists
+    /// from then on, whatever happens to the rest of the query.
+    public private(set) var parsed = false
     /// What the server's ReadyForQuery said: whether the session is left
     /// inside a transaction, and whether that transaction has failed.
     public private(set) var transactionStatus: PostgresTransactionStatus = .idle
@@ -257,21 +268,36 @@ public struct PostgresQuery {
     /// copied as they arrive, so an unbounded SELECT is an unbounded buffer.
     let maxRows: Int
 
-    public init(_ sql: String, _ values: [PostgresValue] = [], maxRows: Int = 1_000_000) {
+    public init(_ sql: String, _ values: [PostgresValue] = [], maxRows: Int = 1_000_000,
+                statement: String = "", prepare: Bool = true, resultFormats: [Int16] = [],
+                closing: [String] = []) {
         self.sql = sql
         self.values = values
+        self.statement = statement
+        self.prepare = prepare
+        self.resultFormats = resultFormats
+        self.closing = closing
         self.maxRows = maxRows
     }
 
-    /// Parse, bind, describe, execute and sync, as one write.
+    /// Close what is evicted, parse unless the statement is already prepared,
+    /// then bind, describe, execute and sync, as one write.
+    ///
+    /// The portal is described every time, even for a statement described
+    /// before: the description is what says which format each column came
+    /// in, and a column renamed since would otherwise decode by its old name.
     public func messages() throws(PostgresError) -> [UInt8] {
         var out = ByteBuffer(capacity: 256)
         defer { out.destroy() }
+        for name in closing {
+            guard PostgresFrontend.close(statement: name, into: &out) else { throw .unsendable }
+        }
         // Types are declared only when a value is binary, and then only for
         // that value: 0 leaves the rest to the server to infer, as before.
         let types = values.contains { $0.declaredType != 0 } ? values.map(\.declaredType) : []
-        guard PostgresFrontend.parse(name: "", sql: sql, parameterTypes: types, into: &out),
-              PostgresFrontend.bind(portal: "", statement: "", values: values, into: &out),
+        guard !prepare || PostgresFrontend.parse(name: statement, sql: sql, parameterTypes: types, into: &out),
+              PostgresFrontend.bind(portal: "", statement: statement, values: values,
+                                    resultFormats: resultFormats, into: &out),
               PostgresFrontend.describe(portal: "", into: &out),
               PostgresFrontend.execute(portal: "", into: &out) else {
             throw .unsendable
@@ -290,7 +316,10 @@ public struct PostgresQuery {
     public mutating func receive(_ type: UInt8, _ body: PostgresReader) throws(PostgresError) -> Bool {
         do {
             switch type {
-            case UInt8(ascii: "1"), UInt8(ascii: "2"), UInt8(ascii: "n"),
+            case UInt8(ascii: "1"):
+                parsed = true
+                return false
+            case UInt8(ascii: "2"), UInt8(ascii: "3"), UInt8(ascii: "n"),
                  UInt8(ascii: "N"), UInt8(ascii: "S"), UInt8(ascii: "I"):
                 return false
             case UInt8(ascii: "T"):

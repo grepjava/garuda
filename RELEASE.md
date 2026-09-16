@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 706 unit tests
+swift test                             # 716 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -292,6 +292,15 @@ is `request.client`.
   with `first([UInt8].self, …)`. `PostgresBindable` now returns a
   `PostgresValue` — text, binary with its type, or NULL — in place of
   `postgresText`.
+- Each connection keeps its statements prepared, by SQL and parameter types,
+  so a statement run again is bound and executed without being parsed and
+  planned again: a two-table join on one connection went from 199 to 83 µs a
+  query against a local PostgreSQL 16. The least recently used is closed past
+  `statementCacheCapacity` (256; 0 for PgBouncer's transaction pooling). A
+  statement the server no longer has — `DEALLOCATE`, `DISCARD ALL` — or can no
+  longer run as planned because its table changed shape is prepared again and
+  run once more, but only outside a transaction, where the failed attempt was
+  rolled back whole.
 
 ### Changed
 

@@ -175,4 +175,165 @@ struct PostgresIntegrationTests {
         }
         #expect(text == "tlsUnavailable" || text.hasPrefix("connect("), "got \(text)")
     }
+
+    // MARK: Prepared statements
+
+    /// Runs `body` on one connection with a statement cache of `capacity`.
+    private func onConnection(capacity: Int = 256,
+                              _ body: @escaping @Sendable (PostgresConnection) async throws -> String) throws -> String {
+        var configuration = try #require(target)
+        configuration.statementCacheCapacity = capacity
+        let settings = configuration
+        return try onWorker { worker in
+            do {
+                let connection = try await PostgresConnection.connect(worker, settings)
+                defer { connection.close() }
+                return try await body(connection)
+            } catch {
+                return describe(error)
+            }
+        }
+    }
+
+    /// What the server says this session has prepared, counting the statement
+    /// asking, which is prepared too.
+    private static func preparedOnServer(_ connection: PostgresConnection) async throws -> String {
+        try await connection.query("select count(*) from pg_prepared_statements").text(row: 0, column: 0) ?? "null"
+    }
+
+    /// The name the cache prepared `sql` under.
+    private static func nameOf(_ sql: String, _ connection: PostgresConnection) -> String {
+        connection.prepared.first { $0.key.sql == sql }?.value.name ?? "none"
+    }
+
+    @Test func aStatementRunAgainIsPreparedOnce() throws {
+        let text = try onConnection { connection in
+            var answers: [String] = []
+            for n in 1...3 {
+                let rows = try await connection.query("select $1::int + 1", [String(n)])
+                answers.append(rows.text(row: 0, column: 0) ?? "null")
+            }
+            return answers.joined(separator: ",") + "|" + (try await Self.preparedOnServer(connection))
+                + "|" + String(connection.prepared.count)
+        }
+        #expect(text == "2,3,4|2|2")
+    }
+
+    @Test func aFullCacheClosesTheLeastRecentlyUsed() throws {
+        let text = try onConnection(capacity: 3) { connection in
+            _ = try await connection.query("select 1")
+            _ = try await connection.query("select 2")
+            _ = try await connection.query("select 1")   // 2 is now the least recent
+            _ = try await connection.query("select 3")
+            let server = try await Self.preparedOnServer(connection)
+            let kept = connection.prepared.keys.map(\.sql).sorted().joined(separator: ",")
+            return server + "|" + kept
+        }
+        #expect(text == "3|select 1,select 3,select count(*) from pg_prepared_statements")
+    }
+
+    @Test func aCacheOfNothingPreparesNothing() throws {
+        let text = try onConnection(capacity: 0) { connection in
+            _ = try await connection.query("select 1")
+            return try await Self.preparedOnServer(connection) + "|" + String(connection.prepared.count)
+        }
+        #expect(text == "0|0")
+    }
+
+    @Test func discardAllEmptiesTheCache() throws {
+        let text = try onConnection { connection in
+            _ = try await connection.query("select 1")
+            _ = try await connection.query("discard all")
+            let after = connection.prepared.count
+            let rows = try await connection.query("select 1")
+            return "\(after)|" + (rows.text(row: 0, column: 0) ?? "null")
+        }
+        #expect(text == "0|1")
+    }
+
+    @Test func aStatementDeallocatedBehindTheCachesBackIsPreparedAgain() throws {
+        let text = try onConnection { connection in
+            _ = try await connection.query("select 'first'")
+            let name = Self.nameOf("select 'first'", connection)
+            _ = try await connection.query("deallocate \(name)")
+            let rows = try await connection.query("select 'first'")
+            return rows.text(row: 0, column: 0) ?? "null"
+        }
+        #expect(text == "first")
+    }
+
+    @Test func aTableThatChangesShapeUnderAStatementIsPreparedAgain() throws {
+        let text = try onConnection { connection in
+            _ = try await connection.query("create temporary table shapes (a int)")
+            _ = try await connection.query("insert into shapes values (7)")
+            let before = try await connection.query("select * from shapes")
+            _ = try await connection.query("alter table shapes add column b text default 'new'")
+            let after = try await connection.query("select * from shapes")
+            return "\(before.columns.count)|\(after.columns.count)|" + (after.text(row: 0, column: 1) ?? "null")
+        }
+        #expect(text == "1|2|new")
+    }
+
+    @Test func aStaleStatementInsideATransactionIsReportedNotRetried() throws {
+        // The refusal has already failed the transaction: running the
+        // statement again inside it could only be refused again.
+        let text = try onConnection { connection in
+            _ = try await connection.query("select 'x'")
+            let name = Self.nameOf("select 'x'", connection)
+            _ = try await connection.query("begin")
+            _ = try await connection.query("deallocate \(name)")
+            var outcome = ""
+            do {
+                _ = try await connection.query("select 'x'")
+                outcome = "ran"
+            } catch {
+                outcome = describe(error)
+            }
+            _ = try await connection.query("rollback")
+            let rows = try await connection.query("select 'x'")
+            return outcome + "|" + (rows.text(row: 0, column: 0) ?? "null")
+        }
+        #expect(text == "server:26000|x")
+    }
+
+    @Test func theSameSQLWithValuesOfAnotherTypeIsAnotherStatement() throws {
+        // Bytes declare their type when the statement is parsed. Reusing that
+        // statement for text would have the server read the text as bytea.
+        let text = try onConnection { connection in
+            let bytes = try await connection.query("select $1::text", values: [.binary(Array("hi".utf8), type: PostgresType.bytea)])
+            let words = try await connection.query("select $1::text", values: [PostgresValue("hello")])
+            return (bytes.text(row: 0, column: 0) ?? "null") + "|" + (words.text(row: 0, column: 0) ?? "null")
+        }
+        #expect(text == "\\x6869|hello")
+    }
+
+    @Test func aStatementThatFailsToParseIsNotKept() throws {
+        let text = try onConnection { connection in
+            var outcome = ""
+            do {
+                _ = try await connection.query("selec 1")
+            } catch {
+                outcome = describe(error)
+            }
+            return outcome + "|" + String(connection.prepared.count)
+        }
+        #expect(text == "server:42601|0")
+    }
+
+    @Test func onlyTheStatementThatFoundItsPreparationStaleIsRunAgain() throws {
+        // A sequence is not rolled back with the statement that advanced it,
+        // so it counts how many times a failing statement really ran.
+        let text = try onConnection { connection in
+            _ = try await connection.query("create temporary sequence attempts")
+            _ = try await connection.query("select 'stale soon'")
+            let name = Self.nameOf("select 'stale soon'", connection)
+            _ = try await connection.query("deallocate \(name)")
+            _ = try await connection.query("select 'stale soon'")        // refused once, run again
+            do {
+                _ = try await connection.query("select nextval('attempts') / 0")
+            } catch {}
+            return try await connection.query("select last_value from attempts").text(row: 0, column: 0) ?? "null"
+        }
+        #expect(text == "1")
+    }
 }

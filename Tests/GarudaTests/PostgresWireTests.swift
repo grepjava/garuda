@@ -303,6 +303,8 @@ struct PostgresWireTests {
         #expect(written { PostgresFrontend.execute(portal: "", into: &$0) }
                 == message("E", cstr("") + i32(0)))
         #expect(written { PostgresFrontend.sync(into: &$0); return true } == message("S", []))
+        #expect(written { PostgresFrontend.close(statement: "garuda_7", into: &$0) }
+                == message("C", [UInt8(ascii: "S")] + cstr("garuda_7")))
     }
 
     @Test func aNulInSQLIsRefusedRatherThanTruncatingIt() throws {

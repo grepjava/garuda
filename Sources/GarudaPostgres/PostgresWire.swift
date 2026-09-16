@@ -566,6 +566,17 @@ public enum PostgresFrontend {
         return true
     }
 
+    /// Closes a prepared statement. Closing one that does not exist is not an
+    /// error, so an eviction can never fail the statement it travels with.
+    public static func close(statement name: String, into out: inout ByteBuffer) -> Bool {
+        guard !name.utf8.contains(0) else { return false }
+        let start = begin(UInt8(ascii: "C"), &out)
+        out.writeByte(UInt8(ascii: "S"))
+        writeCString(name, into: &out)
+        endMessage(&out, start)
+        return true
+    }
+
     public static func sync(into out: inout ByteBuffer) {
         out.writeByte(UInt8(ascii: "S"))
         writeInt32(4, into: &out)

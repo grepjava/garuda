@@ -38,6 +38,11 @@ public struct PostgresConfiguration: Sendable {
     public var maxRows = 1_000_000
     /// The largest single message the server may send.
     public var maxMessageBytes = 64 * 1024 * 1024
+    /// Statements each connection keeps prepared, by SQL, so a statement run
+    /// again skips being parsed and planned. 0 prepares nothing, for a
+    /// transaction-pooling proxy such as PgBouncer, where the next statement
+    /// may reach a server session that never saw the first.
+    public var statementCacheCapacity = 256
 
     public init(host: String, port: UInt16 = 5432, user: String, password: String,
                 database: String? = nil) {
@@ -78,6 +83,29 @@ final class PostgresConnection {
     let parameters: [String: String]
     /// As the last ReadyForQuery reported it.
     private(set) var transactionStatus: PostgresTransactionStatus = .idle
+
+    /// A statement kept prepared, by the SQL and the parameter types it was
+    /// parsed with: the same SQL with a value of another declared type is
+    /// another statement.
+    struct StatementKey: Hashable {
+        let sql: String
+        let types: [UInt32]
+    }
+
+    struct PreparedStatement {
+        let name: String
+        /// The columns its last result described, for choosing formats.
+        var columns: [PostgresColumn]
+        /// When it was last used, for evicting the least recent.
+        var used: UInt64
+    }
+
+    private(set) var prepared: [StatementKey: PreparedStatement] = [:]
+    private var uses: UInt64 = 0
+    private var nextStatement = 0
+    /// Statements the server holds that the cache has let go of, closed with
+    /// the next query.
+    private var toClose: [String] = []
 
     init(socket: OutboundSocket, configuration: PostgresConfiguration,
          parameters: [String: String]) {
@@ -175,9 +203,57 @@ final class PostgresConnection {
     }
 
     /// Runs one statement, with its values sent beside it.
+    ///
+    /// A prepared statement the server no longer has, or can no longer run as
+    /// planned, is dropped and the statement run once more from its SQL -- but
+    /// only when it failed outside a transaction. There a failed statement has
+    /// been rolled back whole, so running it again cannot do anything twice;
+    /// inside one, the failure has already failed the transaction.
     func query(_ sql: String, values: [PostgresValue] = []) async throws(PostgresClientError) -> PostgresRows {
+        do {
+            return try await run(sql, values)
+        } catch {
+            guard reusedStaleStatement, transactionStatus == .idle else { throw error }
+            return try await run(sql, values)
+        }
+    }
+
+    /// Whether the last statement failed because the prepared statement it
+    /// reused was stale: 26000, gone -- `DEALLOCATE`, `DISCARD ALL` -- or
+    /// 0A000, which is what the server says when a table under a plan changed
+    /// shape ("cached plan must not change result type"). By code, not by that
+    /// message, which the server translates.
+    private var reusedStaleStatement = false
+
+    private func run(_ sql: String, _ values: [PostgresValue]) async throws(PostgresClientError) -> PostgresRows {
         let ms = configuration.timeoutMilliseconds
-        var query = PostgresQuery(sql, values, maxRows: configuration.maxRows)
+        let types = values.contains { $0.declaredType != 0 } ? values.map(\.declaredType) : []
+        let key = StatementKey(sql: sql, types: types)
+        var name = ""
+        var prepare = true
+        let formats: [Int16] = []
+        uses &+= 1
+        if configuration.statementCacheCapacity > 0 {
+            if var statement = prepared[key] {
+                name = statement.name
+                prepare = false
+                statement.used = uses
+                prepared[key] = statement
+            } else {
+                if prepared.count >= configuration.statementCacheCapacity,
+                   let oldest = prepared.min(by: { $0.value.used < $1.value.used }) {
+                    toClose.append(oldest.value.name)
+                    prepared.removeValue(forKey: oldest.key)
+                }
+                name = "garuda_\(nextStatement)"
+                nextStatement &+= 1
+            }
+        }
+        let closing = toClose
+        toClose.removeAll()
+        reusedStaleStatement = false
+        var query = PostgresQuery(sql, values, maxRows: configuration.maxRows, statement: name,
+                                  prepare: prepare, resultFormats: formats, closing: closing)
         let bytes: [UInt8]
         do { bytes = try query.messages() } catch { throw .postgres(error) }
         do {
@@ -201,6 +277,7 @@ final class PostgresConnection {
                     // refused statement inside a transaction leaves it failed,
                     // and that is exactly what must not be handed on.
                     transactionStatus = query.transactionStatus
+                    if !name.isEmpty { remember(key, name, prepare: prepare, query) }
                     switch query.result() {
                     case .success(let rows): return rows
                     // The server refused this statement and is ready for the
@@ -217,6 +294,31 @@ final class PostgresConnection {
         } catch {
             socket.close()
             throw .closed
+        }
+    }
+
+    /// Keeps what a finished query taught the cache.
+    private func remember(_ key: StatementKey, _ name: String, prepare: Bool, _ query: PostgresQuery) {
+        if !prepare, case .failure(.server(let fields)) = query.result(),
+           fields.code == "26000" || fields.code == "0A000" {
+            // Gone, or unusable as planned. The 0A000 one still exists.
+            prepared.removeValue(forKey: key)
+            if fields.code == "0A000" { toClose.append(name) }
+            reusedStaleStatement = true
+            return
+        }
+        if prepare {
+            // Refused before it was parsed -- a syntax error, a failed
+            // transaction -- and there is nothing to keep.
+            guard query.parsed else { return }
+            prepared[key] = PreparedStatement(name: name, columns: query.rows.columns, used: uses)
+        } else if !query.rows.columns.isEmpty {
+            prepared[key]?.columns = query.rows.columns
+        }
+        // Statements the session dropped wholesale. Their names would each be
+        // refused once and retried; forgetting them now saves the round trips.
+        if case .success(let rows) = query.result(), rows.tag == "DISCARD ALL" || rows.tag == "DEALLOCATE ALL" {
+            prepared.removeAll()
         }
     }
 
