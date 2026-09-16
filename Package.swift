@@ -45,6 +45,11 @@ let package = Package(
         .target(name: "GarudaQUIC", dependencies: ["GarudaCore", "GarudaHTTP"],
                 swiftSettings: sharedSwiftSettings),
 
+        // Database protocols as byte-level state machines: no sockets, no
+        // poller, so each is tested against recorded exchanges and fuzzed.
+        .target(name: "GarudaPostgres", dependencies: ["GarudaCore", "CGaruda"],
+                swiftSettings: sharedSwiftSettings),
+
         // The engine and the handler API: `import Garuda`.
         .target(name: "Garuda",
                 dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC"],
@@ -74,7 +79,7 @@ let package = Package(
         .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),
 
         .testTarget(name: "GarudaTests",
-                    dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC",
+                    dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC", "GarudaPostgres",
                                    "Garuda", "GarudaFuzzTargets", "CAllocationCounter"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
     ],
