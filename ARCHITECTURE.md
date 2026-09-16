@@ -316,8 +316,15 @@ worker, and past that the request waits its turn in the pool's queue. To the
 rest of the engine such a request is a continuation of kind `.task`, so
 closing the connection, resetting the stream or starting the next request
 cancels it through `cancelOps`: the task's wait throws, the handler unwinds,
-and the task goes back to the pool. After warm-up, a request served this way
-allocates nothing. An application reaches this through the ordinary route
+and the task goes back to the pool. A handler waiting on anything else -- a
+continuation of its own, and in time an outbound request -- is not parked
+where `cancelOps` can find it, so it is not unwound: it resumes to a request
+that ended, on a slot another request may already hold. A `Response` carries
+the generation and request id it was made for, and every `send` and
+`addHeader` is checked against them, so that late answer is dropped rather
+than sent to whoever took the slot; `response.isCancelled` lets a long
+handler notice for itself and stop early. After warm-up, a request served
+this way allocates nothing. An application reaches this through the ordinary route
 names: a closure that awaits takes the async overload and runs here, and one
 that does not takes the synchronous overload and never touches the pool.
 

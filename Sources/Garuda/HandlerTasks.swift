@@ -333,9 +333,17 @@ extension Worker {
             handlerReturned(slot, generation: generation, requestId: requestId)
             return
         }
-        if let wait = failure as? HandlerWaitError, wait == .exhausted {
-            if handlerOwes(slot, generation: generation, requestId: requestId) {
-                respond(slot, status: 503, nil, 0)
+        if let wait = failure as? HandlerWaitError {
+            switch wait {
+            case .exhausted:
+                if handlerOwes(slot, generation: generation, requestId: requestId) {
+                    respond(slot, status: 503, nil, 0)
+                }
+            case .cancelled:
+                // The request ended, or something answered for it. There is
+                // nothing to say and nobody to say it to, so this is not a
+                // fault and is not logged as one.
+                break
             }
             return
         }

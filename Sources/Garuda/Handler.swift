@@ -237,10 +237,30 @@ public struct Response: ~Copyable {
         self.requestId = requestId
     }
 
+    /// Whether the slot still holds this request. False once the connection
+    /// has closed, the stream has been reset, or the next request has begun.
+    ///
+    /// An async handler that awaits something other than the engine is not
+    /// unwound when its request is cancelled, so a long one should check this
+    /// before doing more work on the request's behalf. Answering a cancelled
+    /// request is already harmless: every `send` drops it.
+    public var isActive: Bool {
+        worker.pointee.stillHolds(slot, generation: generation, requestId: requestId)
+    }
+
+    /// The opposite of `isActive`, for handlers that read better that way.
+    public var isCancelled: Bool { !isActive }
+
     /// The status `send` uses when it is not given one. 200 to begin with.
     public var status: HTTPStatus {
-        get { HTTPStatus(Int(worker.pointee.table[slot].pointee.handlerStatus)) }
-        nonmutating set { worker.pointee.table[slot].pointee.handlerStatus = UInt16(clamping: newValue.code) }
+        get {
+            guard isActive else { return .ok }
+            return HTTPStatus(Int(worker.pointee.table[slot].pointee.handlerStatus))
+        }
+        nonmutating set {
+            guard isActive else { return }
+            worker.pointee.table[slot].pointee.handlerStatus = UInt16(clamping: newValue.code)
+        }
     }
 
     /// Whether this request has been answered, or has a continuation waiting.
@@ -251,23 +271,31 @@ public struct Response: ~Copyable {
     /// Adds a header. Returns false, and adds nothing, once the response has
     /// been sent, or for a name that is not a token, a value holding CR, LF or
     /// NUL, or a Content-Length that is not a number. The bytes are copied.
+    /// Every header goes through here, for the same reason `answer` does: a
+    /// handler whose request is gone must not touch the slot's response.
+    @inline(__always)
+    func addHeaderBytes(_ name: ByteSpan, _ value: ByteSpan) -> Bool {
+        guard isActive else { return false }
+        return worker.pointee.addResponseHeader(slot, name, value)
+    }
+
     @discardableResult
     public func addHeader(_ name: StaticString, _ value: StaticString) -> Bool {
-        worker.pointee.addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
-                                         ByteSpan(value.utf8Start, value.utf8CodeUnitCount))
+        addHeaderBytes(ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
+                       ByteSpan(value.utf8Start, value.utf8CodeUnitCount))
     }
 
     @discardableResult
     public func addHeader(_ name: StaticString, _ value: Span<UInt8>) -> Bool {
         withByteSpan(value) { v in
-            worker.pointee.addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount), v)
+            addHeaderBytes(ByteSpan(name.utf8Start, name.utf8CodeUnitCount), v)
         }
     }
 
     @discardableResult
     public func addHeader(_ name: Span<UInt8>, _ value: Span<UInt8>) -> Bool {
         withByteSpan(name) { n in
-            withByteSpan(value) { v in worker.pointee.addResponseHeader(slot, n, v) }
+            withByteSpan(value) { v in addHeaderBytes(n, v) }
         }
     }
 
@@ -277,8 +305,8 @@ public struct Response: ~Copyable {
         var value = value
         return name.withUTF8 { n in
             value.withUTF8 { v in
-                worker.pointee.addResponseHeader(slot, ByteSpan(n.baseAddress!, n.count),
-                                                 ByteSpan(v.baseAddress!, v.count))
+                addHeaderBytes(ByteSpan(n.baseAddress!, n.count),
+                               ByteSpan(v.baseAddress!, v.count))
             }
         }
     }
@@ -287,39 +315,45 @@ public struct Response: ~Copyable {
     // response sink, which frames it for the protocol, merges in the server's
     // own headers, and holds the body to any Content-Length the handler set.
 
+    /// Every one-shot answer goes through here, so that a handler whose
+    /// request is gone cannot answer whoever now holds the slot.
+    @inline(__always)
+    func answer(_ code: Int, _ base: UnsafePointer<UInt8>?, _ count: Int) {
+        guard isActive else { return }
+        worker.pointee.respond(slot, status: code, base, count)
+    }
+
     public func send(status: HTTPStatus) {
-        worker.pointee.respond(slot, status: status.code, nil, 0)
+        answer(status.code, nil, 0)
     }
 
     public func send(status: HTTPStatus? = nil, _ body: StaticString) {
-        worker.pointee.respond(slot, status: (status ?? self.status).code,
-                               body.utf8Start, body.utf8CodeUnitCount)
+        answer((status ?? self.status).code, body.utf8Start, body.utf8CodeUnitCount)
     }
 
     /// Sends bytes lent by the request, or any other span, without copying
     /// them first.
     public func send(status: HTTPStatus? = nil, _ body: Span<UInt8>) {
         let code = (status ?? self.status).code
-        withByteSpan(body) { worker.pointee.respond(slot, status: code, $0.base, $0.count) }
+        withByteSpan(body) { answer(code, $0.base, $0.count) }
     }
 
     public func send(status: HTTPStatus? = nil, _ body: String) {
         let code = (status ?? self.status).code
         var body = body
-        body.withUTF8 { worker.pointee.respond(slot, status: code, $0.baseAddress, $0.count) }
+        body.withUTF8 { answer(code, $0.baseAddress, $0.count) }
     }
 
     public func send(status: HTTPStatus? = nil, _ body: [UInt8]) {
         let code = (status ?? self.status).code
-        body.withUnsafeBufferPointer {
-            worker.pointee.respond(slot, status: code, $0.baseAddress, $0.count)
-        }
+        body.withUnsafeBufferPointer { answer(code, $0.baseAddress, $0.count) }
     }
 
     /// Calls `then` after `milliseconds`, with this request, unless the
     /// request is cancelled first. Answers 503 when the worker has no room
     /// left to wait in.
     public func after(milliseconds: UInt64, then: @escaping Handler) {
+        guard isActive else { return }
         worker.pointee.suspend(slot, milliseconds: milliseconds, then: then)
     }
 }

@@ -146,6 +146,21 @@ extension Worker {
         }
     }
 
+    /// Whether the slot still holds the very request a handler was given.
+    ///
+    /// A handler that waits on something other than the engine is not unwound
+    /// when its request is cancelled: it resumes, and by then the slot may
+    /// hold a different request. Everything a `Response` does is checked
+    /// against this first, so a late answer is dropped rather than sent to
+    /// whoever took the slot.
+    @inline(__always)
+    func stillHolds(_ slot: Int, generation: UInt32, requestId: UInt32) -> Bool {
+        let c = table[slot]
+        return c.pointee.state != .free
+            && c.pointee.generation == generation
+            && c.pointee.requestId == requestId
+    }
+
     /// Whether the request a handler was given is still the one on the slot,
     /// unanswered and not parked.
     @inline(__always)

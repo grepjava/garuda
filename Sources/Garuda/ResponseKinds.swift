@@ -14,6 +14,7 @@ extension Response {
     /// Throws what the coder throws: a value that cannot be written, such as
     /// an infinite Double, is the handler's mistake and becomes a 500.
     public func send<T: Encodable>(status: HTTPStatus? = nil, json value: T) throws {
+        guard isActive else { return }
         try worker.pointee.respond(slot, status: (status ?? self.status).code, json: value)
     }
 
