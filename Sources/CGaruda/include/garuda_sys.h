@@ -109,6 +109,17 @@ ssize_t pg_sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
 int pg_static_open(const char *root, const char *relative,
                    long long *size, long long *mtime);
 
+/* Opens an absolute path read-only, close-on-exec, for a small system file the
+ * server reads whole at start-up -- /etc/resolv.conf and nothing larger.
+ *
+ * Deliberately not pg_static_open, which resolves a relative path against a
+ * root and refuses anything outside it. That is what serving files needs and
+ * the opposite of what this needs. Only regular files open, so a path that has
+ * been swapped for a fifo cannot make start-up block for ever.
+ *
+ * Returns the descriptor, or -1 with errno set. */
+int pg_open_read(const char *path);
+
 /* poll(2) on a single descriptor, for a wait outside the readiness poller: the
  * supervisor checking whether a replacement worker has reported ready. */
 int pg_poll_single(int fd, int for_write, int timeout_ms);

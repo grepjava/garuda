@@ -487,6 +487,33 @@ int pg_static_open(const char *root, const char *relative,
     return fd;
 }
 
+int pg_open_read(const char *path) {
+    if (!path) { errno = EINVAL; return -1; }
+    /* O_NONBLOCK on the open itself: opening a fifo for reading blocks until a
+     * writer arrives, and a system file that has been replaced by one would
+     * otherwise hang start-up rather than fail it. The flag is cleared below,
+     * once the descriptor is known to be a regular file. */
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    /* A regular file is always ready, so reads never see EAGAIN; clearing it
+     * keeps the caller from having to care either way. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    return fd;
+}
+
 int pg_poll_single(int fd, int for_write, int timeout_ms) {
     struct pollfd p;
     p.fd = fd;
