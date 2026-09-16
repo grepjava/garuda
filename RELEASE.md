@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 578 unit tests
+swift test                             # 650 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -255,6 +255,26 @@ is `request.client`.
   than the caller. A URL carrying userinfo is refused outright: `https://a@b/`
   names host `b` and reads as `a`, and that gap is the whole of an attack.
 
+### PostgreSQL
+
+- A native PostgreSQL driver on the worker's poller: no libpq, no thread per
+  query. Build a pool per worker with `app.state { _ in PostgresPool(config) }`,
+  ask for it with `State<PostgresPool>`, and call `query(User.self, sql, …)`,
+  `first(User.self, sql, …)` or `execute(sql, …)`. Rows decode into
+  `Decodable` types by column name, a NULL into an `Optional`, and a value is
+  bound beside the SQL as `$1`, never written into it. A refused statement's
+  SQLSTATE is `error.sqlState`, so a unique violation can be a 409.
+- SCRAM-SHA-256 authentication, verifying the server's signature as well as
+  proving the client's. A cleartext password request is refused unless allowed,
+  and over plaintext always; MD5 is refused outright — both are how a server
+  that is not the real one harvests a password. TLS is `.require` by default,
+  with no "prefer": falling back to plaintext when a server declines lets
+  anyone on the path decline for it.
+- Every length a server sends is checked before it is believed, and a result
+  has a row limit. An idle pooled connection the server has since closed is
+  noticed before a statement is written into it, not after. Tested against
+  PostgreSQL 16 and 18.
+
 ### Changed
 
 - `--reload` watches the executable, not Python sources. Once a rebuild holds
@@ -274,7 +294,9 @@ is `request.client`.
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
 - The handler API's later steps: there is no middleware, no 405, no streaming
   response, and no WebSocket or WebTransport handler.
-- No database drivers. The HTTP client does not follow redirects and sends no
+- PostgreSQL has no transactions API, no binary formats, no `LISTEN`, and does
+  not SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
+  written. The HTTP client does not follow redirects and sends no
   `Accept-Encoding`, since the compression shim encodes and does not decode.
 - `--compress` and `--cache-size` act on no handler response; they wait for
   streaming responses.

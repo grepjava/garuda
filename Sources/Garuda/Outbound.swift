@@ -664,6 +664,19 @@ struct OutboundSocket {
         worker.pointee.closeOutbound(index)
     }
 
+    /// Whether anything has arrived that nobody has read: bytes on the socket,
+    /// a hangup, or decrypted bytes OpenSSL is holding.
+    ///
+    /// For a connection a driver keeps idle between uses. Most protocols say
+    /// nothing unasked, so input on an idle connection is usually the server
+    /// going away -- found out here, before a statement is written into it,
+    /// rather than after, when it may or may not have run.
+    var hasPendingInput: Bool {
+        guard let o = record else { return true }
+        if let tls = o.pointee.tls, pg_tls_pending(tls) > 0 { return true }
+        return pg_poll_single(o.pointee.fd, 0, 0) != 0
+    }
+
     /// Changes what a wait already in progress is woken for.
     ///
     /// The one waiter a record allows cannot be joined by a second, so a
