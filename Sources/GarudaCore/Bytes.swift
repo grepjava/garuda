@@ -27,6 +27,10 @@ public let cDash: UInt8 = 45
 public let cUnderscore: UInt8 = 95
 public let cZero: UInt8 = 48
 public let cNine: UInt8 = 57
+public let cHash: UInt8 = 35
+public let cAt: UInt8 = 64
+public let cLeftBracket: UInt8 = 91
+public let cRightBracket: UInt8 = 93
 
 /// A borrowed view of bytes we do not own. Trivial, so it never touches ARC and
 /// is passed in registers.
