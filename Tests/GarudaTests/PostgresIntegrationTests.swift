@@ -424,4 +424,82 @@ struct PostgresIntegrationTests {
         }
         #expect(text == "42,0.1,[55]|42,0.1,[55]")
     }
+
+    // MARK: UUID and Timestamp
+
+    struct Stamped: Decodable, Equatable {
+        let id: UUID
+        let at: Timestamp
+        let wall: Timestamp
+        let maybe: UUID?
+    }
+
+    @Test func uuidsAndTimestampsRoundTripInTextAndBinary() throws {
+        let id = UUID.random()
+        let instants = [Timestamp(microsecondsSinceEpoch: 1_789_591_223_196_123),
+                        Timestamp(microsecondsSinceEpoch: 0),
+                        Timestamp(microsecondsSinceEpoch: -1),                        // before 1970
+                        Timestamp(microsecondsSinceEpoch: -2_000_000_000_000_000),    // 1906, before 2000 too
+                        Timestamp("0044-03-15 12:00:00+00 BC")!]
+        let text = try onConnection { connection in
+            _ = try await connection.query("set time zone 'UTC'")
+            _ = try await connection.query("create temporary table stamps (n int, id uuid, at timestamptz, wall timestamp, maybe uuid)")
+            for (n, instant) in instants.enumerated() {
+                _ = try await connection.query("insert into stamps values ($1, $2, $3, $4, $5)",
+                                               values: [PostgresValue(String(n)), id.postgresValue,
+                                                        instant.postgresValue, instant.postgresValue, UUID?.none.postgresValue])
+            }
+            let sql = "select id, at, wall, maybe from stamps order by n"
+            let first = try await connection.query(sql)
+            let second = try await connection.query(sql)
+            let formats = second.columns.map { $0.binary ? "b" : "t" }.joined()
+            let a = try decodeAll(Stamped.self, first)
+            let b = try decodeAll(Stamped.self, second)
+            let expected = instants.map { Stamped(id: id, at: $0, wall: $0, maybe: nil) }
+            var mismatches: [String] = []
+            for row in 0..<first.count {
+                for column in 0..<first.columns.count where first.text(row: row, column: column) != second.text(row: row, column: column) {
+                    mismatches.append("\(first.text(row: row, column: column) ?? "null") vs \(second.text(row: row, column: column) ?? "null")")
+                }
+            }
+            // And the server agrees on what the bound values meant.
+            let check = try await connection.query("select $1::uuid::text, extract(epoch from $2::timestamptz)::text",
+                                                   values: [id.postgresValue, instants[0].postgresValue])
+            return formats + "|\(a == expected)|\(b == expected)|" + mismatches.joined(separator: "; ")
+                + "|" + (check.text(row: 0, column: 0) == id.description ? "id" : "id?")
+                + "," + (check.text(row: 0, column: 1) ?? "null")
+        }
+        #expect(text == "bbbb|true|true||id,1789591223.196123")
+    }
+
+    @Test func infinityIsNotATimestamp() throws {
+        struct At: Decodable { let at: Timestamp }
+        let text = try onConnection { connection in
+            var outcomes: [String] = []
+            for value in ["infinity", "-infinity"] {
+                var texts: [String] = []
+                for _ in 0..<2 {
+                    let rows = try await connection.query("select '\(value)'::timestamptz as at")
+                    texts.append(rows.text(row: 0, column: 0) ?? "null")
+                    do {
+                        _ = try decodeAll(At.self, rows)
+                        outcomes.append("decoded")
+                    } catch {
+                        outcomes.append(rows.columns[0].binary ? "binary refused" : "text refused")
+                    }
+                }
+                outcomes.append(texts.joined(separator: "="))
+            }
+            return outcomes.joined(separator: "|")
+        }
+        #expect(text == "text refused|binary refused|infinity=infinity|text refused|binary refused|-infinity=-infinity")
+    }
+
+    @Test func theSessionIsAskedForUTF8AndISODates() throws {
+        let text = try onConnection { connection in
+            let rows = try await connection.query("select current_setting('client_encoding'), current_setting('DateStyle')")
+            return (rows.text(row: 0, column: 0) ?? "") + "|" + (rows.text(row: 0, column: 1) ?? "")
+        }
+        #expect(text.hasPrefix("UTF8|ISO"))
+    }
 }

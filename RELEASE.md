@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 722 unit tests
+swift test                             # 733 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -306,6 +306,17 @@ is `request.client`.
   without parsing text. A binary value asked for as a `String`, or through
   `rows.text`, reads exactly as the server's text would have — checked value
   by value against a real server, float edge cases included.
+- `UUID` and `Timestamp`, without Foundation. `UUID.random()` is version 4
+  from the system's generator; a `UUID` reads and writes its text with or
+  without hyphens. A `Timestamp` is microseconds since 1970 in UTC, reads
+  ISO 8601 with any offset and PostgreSQL's own layout, and writes ISO 8601.
+  Both are strings in JSON. In PostgreSQL they bind in binary as `uuid` and
+  `timestamptz`, and decode from `uuid`, `timestamptz` and `timestamp`
+  columns in text or binary; infinity is refused rather than invented. Write
+  `Garuda.UUID` where Foundation's is in scope too.
+- A PostgreSQL session now asks for `client_encoding` UTF8 and `DateStyle`
+  ISO when it starts, so text always decodes as Swift strings do and a
+  timestamp sent as text is in the one layout read.
 
 ### Changed
 
@@ -359,8 +370,8 @@ is `request.client`.
   custom fallback, none of the shipped middleware (authentication, CORS,
   tracing, request limits), no streaming response, and no WebSocket or
   WebTransport handler.
-- PostgreSQL has binary parameters only for bytes, no UUID or timestamp
-  types, no `LISTEN`, and does not
+- PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types
+  of its own (they read as text), no `LISTEN`, and does not
   SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
   written. The HTTP client does not follow redirects and sends no
   `Accept-Encoding`, since the compression shim encodes and does not decode.

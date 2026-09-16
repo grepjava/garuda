@@ -81,7 +81,12 @@ public struct PostgresStartup {
     public func start() throws(PostgresError) -> [UInt8] {
         var out = ByteBuffer(capacity: 128)
         defer { out.destroy() }
-        guard PostgresFrontend.startup(user: user, database: database, into: &out) else {
+        // UTF-8, so text decodes as Swift strings do, whatever the database's
+        // own encoding. DateStyle ISO, so a timestamp that comes as text --
+        // the first time a statement runs -- is in the one layout read.
+        guard PostgresFrontend.startup(user: user, database: database,
+                                       parameters: [("client_encoding", "UTF8"), ("DateStyle", "ISO")],
+                                       into: &out) else {
             throw .unsendable
         }
         return Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))

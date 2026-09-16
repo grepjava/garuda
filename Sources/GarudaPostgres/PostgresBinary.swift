@@ -17,7 +17,8 @@ public enum PostgresBinary {
     public static func isDecodable(_ type: UInt32) -> Bool {
         switch type {
         case PostgresType.bool, PostgresType.bytea, PostgresType.int2, PostgresType.int4,
-             PostgresType.int8, PostgresType.float4, PostgresType.float8:
+             PostgresType.int8, PostgresType.float4, PostgresType.float8, PostgresType.uuid,
+             PostgresType.timestamp, PostgresType.timestamptz:
             return true
         default:
             return false
@@ -74,9 +75,28 @@ public enum PostgresBinary {
             return float4(bytes).map { floatText($0.description, significant: 6) }
         case PostgresType.bytea:
             return byteaText(bytes)
+        case PostgresType.uuid:
+            return bytes.count == 16 ? UUIDText.format(Array(bytes)) : nil
+        case PostgresType.timestamptz, PostgresType.timestamp:
+            // In UTC: what the server writes when the session's TimeZone is
+            // UTC. The binary value is the instant, whatever the zone.
+            guard let micros = timestampMicroseconds(bytes) else {
+                return integer(bytes).map { $0 > 0 ? "infinity" : "-infinity" }
+            }
+            return CivilTime.format(microseconds: micros,
+                                    type == PostgresType.timestamptz ? .postgres : .postgresWithoutZone)
         default:
             return nil
         }
+    }
+
+    /// A timestamp's microseconds since 1970, or nil for infinity and for a
+    /// value past what Int64 holds from 1970.
+    public static func timestampMicroseconds(_ bytes: ArraySlice<UInt8>) -> Int64? {
+        guard bytes.count == 8, let since2000 = integer(bytes),
+              since2000 != .max, since2000 != .min else { return nil }
+        let (micros, overflow) = since2000.addingReportingOverflow(946_684_800_000_000)
+        return overflow ? nil : micros
     }
 
     static func byteaText(_ bytes: ArraySlice<UInt8>) -> String {

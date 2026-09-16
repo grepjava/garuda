@@ -272,4 +272,12 @@ struct PostgresSessionTests {
         let query = PostgresQuery("select $1", [PostgresValue("7")])
         #expect(try query.messages().firstRange(of: cstr("select $1") + i16(0)) != nil)
     }
+
+    @Test func theStartupMessageAsksForUTF8AndISODates() throws {
+        // Text decodes as Swift strings do only if it is UTF-8, and a
+        // timestamp that comes as text is read in one layout only.
+        let bytes = try PostgresStartup(user: "garuda", password: "x", database: "app").start()
+        #expect(bytes.firstRange(of: cstr("client_encoding") + cstr("UTF8")) != nil)
+        #expect(bytes.firstRange(of: cstr("DateStyle") + cstr("ISO")) != nil)
+    }
 }

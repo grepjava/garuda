@@ -533,7 +533,33 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
     func decode(_ type: UInt64.Type) throws -> UInt64 { try integer(type) }
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
         if T.self == [UInt8].self { return try bytes() as! T }
+        if T.self == UUID.self { return try uuid() as! T }
+        if T.self == Timestamp.self { return try timestamp() as! T }
         return try T(from: self)
+    }
+
+    private func uuid() throws -> UUID {
+        if let raw = try binary(PostgresType.uuid) {
+            guard let value = UUID(bytes: Array(raw)) else { throw notConvertible(UUID.self) }
+            return value
+        }
+        let text = try required()
+        guard let value = UUID(text) else { throw notConvertible(UUID.self) }
+        return value
+    }
+
+    /// From a timestamptz or timestamp column, or text in either layout.
+    /// Infinity has no instant, and is refused.
+    private func timestamp() throws -> Timestamp {
+        if let raw = try binary(PostgresType.timestamptz, PostgresType.timestamp) {
+            guard let micros = PostgresBinary.timestampMicroseconds(raw) else {
+                throw notConvertible(Timestamp.self)
+            }
+            return Timestamp(microsecondsSinceEpoch: micros)
+        }
+        let text = try required()
+        guard let value = Timestamp(text) else { throw notConvertible(Timestamp.self) }
+        return value
     }
 
     /// The cell as bytes: a bytea's own bytes, in whichever format it came,
