@@ -30,12 +30,36 @@ public typealias Handler = (borrowing Request, inout Response) throws -> Void
 /// is how a middleware decorates responses without seeing them.
 public typealias Middleware = (borrowing Request, borrowing Response) throws -> (any ResponseConvertible)?
 
+/// A middleware that awaits: looks a session up in a database, asks another
+/// service, and then answers or lets the request through, as `Middleware`
+/// does.
+///
+/// A route behind one runs on a handler task from that middleware on. The
+/// synchronous middleware in front of it still runs first, on the worker, so
+/// a request they refuse never costs a task.
+public typealias AsyncMiddleware = (borrowing Request, borrowing Response) async throws -> (any ResponseConvertible)?
+
+/// One step of a route's middleware chain.
+enum MiddlewareStep {
+    case sync(Middleware)
+    case async(AsyncMiddleware)
+
+    var isAsync: Bool {
+        if case .async = self { return true }
+        return false
+    }
+}
+
 // MARK: - Routes
 
 /// Routes as an `Application` registers them, compiled when it runs.
 struct Routes {
     var table = RouteTable()
     var handlers: [Handler] = []
+    /// The async handler behind each route registered with `onAsync`, by
+    /// route number, and nil for the rest. Its entry in `handlers` starts a
+    /// task for it; a chain that is already on a task calls it directly.
+    var asyncHandlers: [AsyncHandler?] = []
     /// Milliseconds each route is allowed, by route number, or 0 for no
     /// deadline. Parallel to `handlers`: a route is an index into both.
     var deadlines: [UInt32] = []
@@ -44,10 +68,10 @@ struct Routes {
     var currentDeadline: UInt32 = 0
 
     /// Middleware for every route, from `use` outside any group.
-    var global: [Middleware] = []
+    var global: [MiddlewareStep] = []
     /// Every group opened so far, with the prefix it adds and the middleware
     /// `use` gave it.
-    var groups: [(prefix: String, middleware: [Middleware])] = []
+    var groups: [(prefix: String, middleware: [MiddlewareStep])] = []
     /// The groups open right now, outermost first.
     var openGroups: [Int] = []
     /// The groups each route was registered inside, by route number.
@@ -70,8 +94,18 @@ struct Routes {
             fatalError("route \(full): \(error)")
         }
         handlers.append(handler)
+        asyncHandlers.append(nil)
         deadlines.append(currentDeadline)
         routeGroups.append(openGroups)
+    }
+
+    /// Registers an async handler: a route that hands the request to one of
+    /// the worker's handler tasks.
+    mutating func onAsync(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping AsyncHandler) {
+        on(method, pattern) { request, _ in
+            request.worker.pointee.runOnTask(request.slot, handler)
+        }
+        asyncHandlers[asyncHandlers.count - 1] = handler
     }
 
     /// Each route's handler with its middleware in front, in order: global
@@ -82,19 +116,61 @@ struct Routes {
     /// middleware applies to every route in its scope whether `use` was called
     /// before the routes were registered or after. A route with no middleware
     /// keeps its own handler, and pays nothing.
+    ///
+    /// The synchronous middleware up to the first async one runs on the
+    /// worker. From that one on, the rest of the chain and the route's handler
+    /// run on a task: an async handler is awaited there rather than handed to
+    /// a second task, and a synchronous one is called there, which answers
+    /// through the same response sink.
     func handlersWithMiddleware() -> [Handler] {
         handlers.enumerated().map { index, handler in
             var chain = global
             for group in routeGroups[index] { chain += groups[group].middleware }
             if chain.isEmpty { return handler }
+            let split = chain.firstIndex { $0.isAsync } ?? chain.count
+            var onWorker: [Middleware] = []
+            for step in chain[..<split] {
+                if case .sync(let middleware) = step { onWorker.append(middleware) }
+            }
+            guard split < chain.count else {
+                return { request, response in
+                    for middleware in onWorker {
+                        if let answer = try middleware(request, response) {
+                            try answer.write(to: response)
+                            return
+                        }
+                    }
+                    try handler(request, &response)
+                }
+            }
+            let onTask = Array(chain[split...])
+            let asyncHandler = asyncHandlers[index]
+            let rest: AsyncHandler = { request, response in
+                for step in onTask {
+                    let answer: (any ResponseConvertible)?
+                    switch step {
+                    case .sync(let middleware): answer = try middleware(request, response)
+                    case .async(let middleware): answer = try await middleware(request, response)
+                    }
+                    if let answer {
+                        try answer.write(to: response)
+                        return
+                    }
+                }
+                if let asyncHandler {
+                    try await asyncHandler(request, &response)
+                } else {
+                    try handler(request, &response)
+                }
+            }
             return { request, response in
-                for middleware in chain {
+                for middleware in onWorker {
                     if let answer = try middleware(request, response) {
                         try answer.write(to: response)
                         return
                     }
                 }
-                try handler(request, &response)
+                request.worker.pointee.runOnTask(request.slot, rest)
             }
         }
     }

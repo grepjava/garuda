@@ -59,3 +59,31 @@ extension Request {
         }
     }
 }
+
+/// A value middleware stored in the request's context, asked for by its key:
+///
+///     app.use { request, _ async throws -> (any ResponseConvertible)? in
+///         request[context: CurrentUser.self] = try await sessions.user(for: request)
+///         return nil
+///     }
+///     app.get("/me") { (user: Context<CurrentUser>) in JSON(user.value) }
+///
+/// A request that reaches the handler without the value is answered 500: the
+/// middleware that should have stored it did not run, which is a fault in the
+/// program rather than the client's mistake.
+public struct Context<Key: RequestContextKey>: RequestExtractor {
+    public var value: Key.Value
+
+    public init(_ value: Key.Value) {
+        self.value = value
+    }
+
+    public static func extract(from request: borrowing Request,
+                               parameter: inout Int) throws -> Self {
+        guard let value = request[context: Key.self] else {
+            throw HTTPError(.internalServerError,
+                            "nothing stored \(Key.self) in the request's context")
+        }
+        return Context(value)
+    }
+}

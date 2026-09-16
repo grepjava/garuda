@@ -13,6 +13,20 @@ nonisolated(unsafe) private let requireToken: Middleware = { request, _ in
     request.header("authorization") == "Bearer letmein" ? nil : HTTPStatus.unauthorized
 }
 
+private enum Caller: RequestContextKey { typealias Value = String }
+
+/// Waits on the worker's timers, then answers 401 unless the request carries
+/// the right token -- the shape of a session looked up in a database.
+nonisolated(unsafe) private let lookUpToken: AsyncMiddleware = { request, response in
+    asyncMiddlewareRan += 1
+    try await response.sleep(milliseconds: 1)
+    guard request.header("authorization") == "Bearer letmein" else { return HTTPStatus.unauthorized }
+    request[context: Caller.self] = "ada"
+    return nil
+}
+
+nonisolated(unsafe) private var asyncMiddlewareRan = 0
+
 /// Leaves a mark, so a test can see which middleware ran and in what order.
 private func mark(_ name: StaticString) -> Middleware {
     { _, response in
@@ -163,5 +177,137 @@ struct MiddlewareTests {
         let allowed = try client.get("/slow", headers: [("Authorization", "Bearer letmein")])
         #expect(allowed.text == "done")
         #expect(handlerRan == 1)
+    }
+
+    // MARK: Async middleware
+
+    @Test func asyncMiddlewareRefusesAfterAwaiting() throws {
+        handlerRan = 0
+        let app = Application()
+        app.use(lookUpToken)
+        app.get("/secret") { _, response in
+            handlerRan += 1
+            response.send("s3cret")
+        }
+        let client = app.test
+        #expect(try client.get("/secret").status == 401)
+        #expect(handlerRan == 0)
+        let allowed = try client.get("/secret", headers: [("Authorization", "Bearer letmein")])
+        #expect(allowed.text == "s3cret")
+        #expect(handlerRan == 1)
+    }
+
+    @Test func whatAsyncMiddlewareStoresReachesATypedHandler() throws {
+        let app = Application()
+        app.use(lookUpToken)
+        app.get("/me") { (caller: Context<Caller>) in caller.value }
+        let response = try app.test.get("/me", headers: [("Authorization", "Bearer letmein")])
+        #expect(response.status == 200)
+        #expect(response.text == "ada")
+    }
+
+    @Test func anAsyncRouteBehindAsyncMiddlewareRunsOnTheSameTask() throws {
+        // The chain is already on a task, so the route's async handler is
+        // awaited there rather than handed to a second one: one request at a
+        // time never needs more than one task.
+        let app = Application()
+        app.use(lookUpToken)
+        app.get("/me") { (caller: Context<Caller>) async throws -> String in
+            "hello " + caller.value
+        }
+        let client = app.test
+        let response = try client.get("/me", headers: [("Authorization", "Bearer letmein")])
+        #expect(response.status == 200)
+        #expect(response.text == "hello ada")
+        let pool = try #require(client.worker.pointee.handlerTasks)
+        #expect(pool.count == 1)
+    }
+
+    @Test func aClosureThatAwaitsIsAsyncMiddleware() throws {
+        let app = Application()
+        app.use { _, response in
+            try await response.sleep(milliseconds: 1)
+            response.addHeader("x-waited", "yes")
+            return nil
+        }
+        app.get("/x") { _, response in response.send("x") }
+        let response = try app.test.get("/x")
+        #expect(response.text == "x")
+        #expect(response.header("x-waited") == "yes")
+    }
+
+    @Test func syncAndAsyncMiddlewareRunInTheOrderUsed() throws {
+        let app = Application()
+        app.use(mark("first"))
+        app.use { _, response in
+            try await response.sleep(milliseconds: 1)
+            response.addHeader("x-trace", "second")
+            return nil
+        }
+        app.use(mark("third"))
+        app.group("/api") {
+            app.use(mark("fourth"))
+            app.get("/x") { _, response in response.send("x") }
+        }
+        let response = try app.test.get("/api/x")
+        #expect(response.headers(named: "x-trace") == ["first", "second", "third", "fourth"])
+    }
+
+    @Test func syncMiddlewareInFrontRefusesBeforeTheAsyncOneRuns() throws {
+        asyncMiddlewareRan = 0
+        let app = Application()
+        app.use(requireToken)
+        app.use(lookUpToken)
+        app.get("/secret") { _, response in response.send("s3cret") }
+        let client = app.test
+        #expect(try client.get("/secret").status == 401)
+        #expect(asyncMiddlewareRan == 0)
+        // Refused on the worker: no task was ever needed.
+        #expect(client.worker.pointee.handlerTasks == nil)
+        #expect(try client.get("/secret", headers: [("Authorization", "Bearer letmein")]).text == "s3cret")
+        #expect(asyncMiddlewareRan == 1)
+    }
+
+    @Test func aResponseErrorThrownByAsyncMiddlewareIsTheAnswer() throws {
+        let app = Application()
+        app.use { _, response in
+            try await response.sleep(milliseconds: 1)
+            throw HTTPError(.forbidden, "not today")
+        }
+        app.get("/x") { _, response in response.send("x") }
+        let response = try app.test.get("/x")
+        #expect(response.status == 403)
+        #expect(response.text == #"{"error":"not today"}"#)
+    }
+
+    @Test func aHandlerThatWaitsOnATimerStillWorksBehindAsyncMiddleware() throws {
+        // `after` parks the request for the worker to resume, which takes it
+        // off the task the chain ran on.
+        let app = Application()
+        app.use(lookUpToken)
+        app.get("/later") { _, response in
+            response.after(milliseconds: 1) { _, later in later.send("later") }
+        }
+        let response = try app.test.get("/later", headers: [("Authorization", "Bearer letmein")])
+        #expect(response.status == 200)
+        #expect(response.text == "later")
+    }
+
+    @Test func aDeadlineCoversAsyncMiddleware() throws {
+        let app = Application()
+        app.deadline(milliseconds: 20) {
+            app.use { _, response in
+                try await response.sleep(milliseconds: 5_000)
+                return nil
+            }
+            app.get("/x") { _, response in response.send("x") }
+        }
+        #expect(try app.test.get("/x").status == 504)
+    }
+
+    @Test func aMissingContextValueIsTheProgramsFault() throws {
+        let app = Application()
+        app.get("/me") { (caller: Context<Caller>) in caller.value }
+        #expect(try app.test.get("/me").status == 500)
     }
 }

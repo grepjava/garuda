@@ -66,9 +66,7 @@ public final class Application {
     /// same request and response a synchronous one does.
     public func onAsync(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping AsyncHandler) {
         precondition(compiled == nil, "route \(pattern) added after the application was compiled")
-        routes.on(method, pattern) { request, _ in
-            request.worker.pointee.runOnTask(request.slot, handler)
-        }
+        routes.onAsync(method, pattern, handler)
     }
 
     /// Gives every route registered inside `register` a deadline: a request
@@ -128,11 +126,31 @@ public final class Application {
     /// covers applies to them as surely as one before. What does matter is
     /// the order of `use` calls within a scope, which is the order they run.
     public func use(_ middleware: @escaping Middleware) {
+        use(step: .sync(middleware))
+    }
+
+    /// Runs an async `middleware` before the handler of every route in the
+    /// current scope, as `use` does. A closure that does not await is not
+    /// async, and takes the synchronous `use`.
+    ///
+    ///     app.use { request, _ async throws -> (any ResponseConvertible)? in
+    ///         guard let token = request.header("authorization"),
+    ///               let user = try await sessions.user(token) else {
+    ///             return HTTPStatus.unauthorized
+    ///         }
+    ///         request[context: CurrentUser.self] = user
+    ///         return nil
+    ///     }
+    public func use(_ middleware: @escaping AsyncMiddleware) {
+        use(step: .async(middleware))
+    }
+
+    private func use(step: MiddlewareStep) {
         precondition(compiled == nil, "middleware added after the application was compiled")
         if let group = routes.openGroups.last {
-            routes.groups[group].middleware.append(middleware)
+            routes.groups[group].middleware.append(step)
         } else {
-            routes.global.append(middleware)
+            routes.global.append(step)
         }
     }
 

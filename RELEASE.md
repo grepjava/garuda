@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 670 unit tests
+swift test                             # 680 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -307,13 +307,19 @@ is `request.client`.
   after the routes, so moving a line cannot leave a route unguarded, and it
   guards async routes before their task starts. The chain is assembled when
   the application compiles; a route with no middleware keeps its own handler.
+- Middleware can await. `app.use` takes an async closure as well — to look a
+  session up in PostgreSQL before letting a request through — and what it
+  stores with `request[context: Key.self]` reaches a typed handler that asks
+  for `Context<Key>`. Synchronous middleware in front of it still runs on the
+  worker, so a request refused there never starts a task; from the first
+  async middleware on, the rest of the chain and the handler share one task.
 
 ### Not yet
 
 - WebSocket and WebTransport application APIs are stubs. HTTP/3 still
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
 - The handler API's later steps: middleware runs only before a handler and
-  cannot await or rewrite its response; no reusable router values to merge, no
+  cannot rewrite its response; no reusable router values to merge, no
   custom fallback, none of the shipped middleware (authentication, CORS,
   tracing, request limits), no streaming response, and no WebSocket or
   WebTransport handler.
