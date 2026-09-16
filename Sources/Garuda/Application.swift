@@ -71,6 +71,29 @@ public final class Application {
         }
     }
 
+    /// Gives every route registered inside `register` a deadline: a request
+    /// still unanswered `milliseconds` after it was dispatched is answered
+    /// 504, and a handler waiting on the engine for it is unwound.
+    ///
+    ///     app.deadline(milliseconds: 500) {
+    ///         app.get("/report") { … }
+    ///     }
+    ///
+    /// A deadline bounds **waiting, not computing**. A worker is one thread,
+    /// so nothing can preempt a handler that loops without awaiting: that
+    /// handler still stops its worker, deadline or no. What this covers is a
+    /// handler waiting on something that never comes back.
+    ///
+    /// Nested calls apply the innermost deadline, and restore the outer one
+    /// afterwards.
+    public func deadline(milliseconds: UInt32, _ register: () -> Void) {
+        precondition(compiled == nil, "deadline added after the application was compiled")
+        let previous = routes.currentDeadline
+        routes.currentDeadline = milliseconds
+        defer { routes.currentDeadline = previous }
+        register()
+    }
+
     // MARK: Worker hooks
 
     /// Runs in each worker process before it accepts a connection -- a
@@ -153,12 +176,17 @@ public final class Application {
         for (i, handler) in routes.handlers.enumerated() {
             (handlers + i).initialize(to: handler)
         }
+        let deadlines = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, count))
+        for (i, allowed) in routes.deadlines.enumerated() {
+            (deadlines + i).initialize(to: allowed)
+        }
         let start = startHooks
         let shutdown = shutdownHooks
         let application = UnsafeMutablePointer<CompiledApplication>.allocate(capacity: 1)
         application.initialize(to: CompiledApplication(
             routes: routes.table.compile(),
             handlers: handlers,
+            deadlines: deadlines,
             handlerCount: count,
             stateFactories: stateFactories,
             stateShutdowns: stateShutdowns,
@@ -174,6 +202,8 @@ public final class Application {
 struct CompiledApplication {
     let routes: CompiledRoutes
     let handlers: UnsafeMutablePointer<Handler>
+    /// Milliseconds each route is allowed, by route number, 0 for none.
+    let deadlines: UnsafeMutablePointer<UInt32>
     let handlerCount: Int
     let stateFactories: [(ObjectIdentifier, (Int) throws -> Any)]
     let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]
@@ -184,6 +214,8 @@ struct CompiledApplication {
         routes.destroy()
         handlers.deinitialize(count: handlerCount)
         handlers.deallocate()
+        deadlines.deinitialize(count: handlerCount)
+        deadlines.deallocate()
     }
 }
 

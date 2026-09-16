@@ -112,13 +112,22 @@ public struct ConnFlags: OptionSet, Sendable {
     /// what is cached for it. `Connection.cacheMark` says which target.
     public static let invalidatesCache = ConnFlags(rawValue: 1 << 20)
 
+    /// The request passed its route's deadline and has been answered 504.
+    ///
+    /// A deadline can fire while the handler is running, which nothing can
+    /// preempt, so the handler goes on and may still try to answer. This says
+    /// it no longer holds the request: its sends and headers are dropped in
+    /// silence rather than logged as answering twice, and `isCancelled` tells
+    /// it so if it asks.
+    public static let timedOut         = ConnFlags(rawValue: 1 << 21)
+
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
     /// one of these here would leak state across a pipelined request.
     public static let perRequest: ConnFlags = [
         .owesContinue, .chunkedResponse, .responseStarted, .responseComplete,
         .suppressBody, .disconnected, .disconnectSent, .bodyDelivered,
-        .endStreamSent, .invalidatesCache,
+        .endStreamSent, .invalidatesCache, .timedOut,
     ]
 }
 
@@ -159,6 +168,15 @@ public struct Connection {
     var contTask: Int32 = -1
     /// The async handler a request queued for a task will run.
     var contAsyncHandler: AsyncHandler? = nil
+    /// The request's deadline op in the worker's pool, or -1. A deadline
+    /// cannot share `contOp`: it has to outlast the waits a handler makes for
+    /// itself, and `armTimer` overwrites `contOp` on every one of them, which
+    /// would orphan the deadline where `cancelOps` could never free it.
+    var deadlineOp: Int32 = -1
+    /// Generation of `deadlineOp` when it was armed, so a recycled op is not
+    /// freed through a handle that outlived it.
+    var deadlineOpGeneration: UInt32 = 0
+
     /// Parked on something other than a handler running now, so no handler
     /// may answer it. A request on a task is answered by that task, from
     /// whichever wait it resumes, so it does not count.
@@ -179,6 +197,11 @@ public struct Connection {
         contHandler = nil
         contTask = -1
         contAsyncHandler = nil
+        // Only the handle. Both callers take a slot fresh from the free list,
+        // whose deadline op was freed when its last occupant closed; freeing
+        // the op itself is `disarmDeadline`, at the request boundaries.
+        deadlineOp = -1
+        deadlineOpGeneration = 0
     }
     /// The request's typed context, made when a handler first stores a value.
     var context: RequestContext? = nil

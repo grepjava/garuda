@@ -620,6 +620,9 @@ public struct Worker {
         c.pointee.headInStore = false
         c.pointee.requestCount &+= 1
         c.pointee.requestId &+= 1
+        // A deadline belongs to the request that armed it, not to the
+        // connection: the next request on a keep-alive gets its own, or none.
+        disarmDeadline(slot)
         clearContinuation(slot)
         c.pointee.flags.remove(.perRequest)
         c.pointee.body.clear()
@@ -1060,6 +1063,9 @@ public struct Worker {
         c.pointee.state = .readingHead
         c.pointee.head = HTTPRequestHead()
         c.pointee.bodyRemaining = 0
+        // Answered in time, so the net comes down now rather than being left
+        // to fire harmlessly against a request that is already over.
+        disarmDeadline(slot)
         clearContinuation(slot)
         c.pointee.flags.insert(.servedRequest)
         c.pointee.lastActivity = pg_monotonic_ms()
@@ -1289,6 +1295,9 @@ public struct Worker {
         let c = table[slot]
         if c.pointee.state == .free { return }
         cancelOps(slot: slot)
+        // Before the slot goes back on the free list: an op left armed would
+        // fire into whichever request takes the slot next.
+        disarmDeadline(slot)
         // A client that goes away part-way through a static file leaves the
         // file open otherwise, and a worker serving assets to clients that
         // navigate away runs out of descriptors rather than misbehaving

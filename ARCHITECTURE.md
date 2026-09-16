@@ -328,6 +328,16 @@ this way allocates nothing. An application reaches this through the ordinary rou
 names: a closure that awaits takes the async overload and runs here, and one
 that does not takes the synchronous overload and never touches the pool.
 
+**A route's deadline** is a second timer op on the same slot, reached through
+`Connection.deadlineOp` rather than `contOp`. It cannot share `contOp`: the
+handler overwrites that on every wait it makes for itself, which would orphan
+the deadline where `cancelOps` could never free it. So the deadline is armed
+at dispatch, given back at every request boundary, and recognised by its
+`OpKind` when it fires, before the checks that ask what the request was
+waiting for -- because the case it exists for is a handler that is not
+waiting at all. Firing answers 504 and sets `.timedOut`, which makes the
+request no longer the handler's to speak for.
+
 **`AsyncOpPool`** is a fixed-capacity slab of `AsyncOp` records (one per
 possible connection) with a free list. Each record has a generation bumped on
 allocate, and stores its slot, the `requestId` it was armed for, its kind

@@ -28,6 +28,12 @@ public typealias Handler = (borrowing Request, inout Response) throws -> Void
 struct Routes {
     var table = RouteTable()
     var handlers: [Handler] = []
+    /// Milliseconds each route is allowed, by route number, or 0 for no
+    /// deadline. Parallel to `handlers`: a route is an index into both.
+    var deadlines: [UInt32] = []
+    /// What routes registered right now are given, set while
+    /// `Application.deadline(milliseconds:)` registers a group of them.
+    var currentDeadline: UInt32 = 0
 
     /// Registers `handler` for `method` and `pattern`. A pattern that cannot
     /// be served is a mistake in the program, found before the server starts.
@@ -38,6 +44,7 @@ struct Routes {
             fatalError("route \(pattern): \(error)")
         }
         handlers.append(handler)
+        deadlines.append(currentDeadline)
     }
 }
 

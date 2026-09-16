@@ -122,6 +122,8 @@ extension Worker {
             return
         }
         c.pointee.routeOffset = Int32(truncatingIfNeeded: base - headBase)
+        let allowed = installed.pointee.deadlines[Int(route)]
+        if allowed > 0 { armDeadline(slot, ms: UInt64(allowed)) }
         runHandler(slot, installed.pointee.handlers[Int(route)])
     }
 
@@ -159,6 +161,32 @@ extension Worker {
         return c.pointee.state != .free
             && c.pointee.generation == generation
             && c.pointee.requestId == requestId
+            // Timed out: the request is still on the slot, but it has been
+            // answered 504 and is no longer this handler's to speak for.
+            && !c.pointee.flags.contains(.timedOut)
+    }
+
+    /// The request on `slot` ran past the deadline its route was given.
+    ///
+    /// The handler may be waiting, in which case it is unwound, or running,
+    /// which nothing can preempt: a worker is one thread. Either way the
+    /// client is answered now, and `.timedOut` makes everything the handler
+    /// does afterwards a no-op rather than an error in the log.
+    mutating func deadlineFired(_ slot: Int, generation: UInt32, requestId: UInt32) {
+        let c = table[slot]
+        guard c.pointee.state == .dispatching,
+              c.pointee.generation == generation,
+              c.pointee.requestId == requestId,
+              !c.pointee.flags.contains(.responseStarted) else { return }
+        Log.error("a handler passed its deadline; answering 504")
+        c.pointee.flags.insert(.timedOut)
+        let task = c.pointee.contKind == .task ? Int(c.pointee.contTask) : -1
+        // A synchronous handler parked on a timer of its own is waiting for
+        // an answer nobody wants now; a task is cancelled after the answer
+        // goes out, so its unwinding cannot answer over the top of it.
+        if task < 0 { clearContinuation(slot) }
+        respondError(slot, status: .gatewayTimeout, reason: "the handler passed its deadline")
+        if task >= 0 { handlerTasks?.cancel(task) }
     }
 
     /// Whether the request a handler was given is still the one on the slot,

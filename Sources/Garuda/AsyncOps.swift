@@ -29,6 +29,12 @@ public enum ContKind: UInt8 {
 
 public enum OpKind: UInt8 {
     case timer
+    /// A route's deadline for the whole request, armed at dispatch. It is not
+    /// the request's continuation -- the handler may be running, or waiting on
+    /// a timer of its own -- so it is reached through `Connection.deadlineOp`
+    /// rather than `contOp`, and `completeTimerOp` has to recognise it before
+    /// deciding there is nothing to resume.
+    case deadline
 }
 
 public struct AsyncOp {
@@ -398,6 +404,47 @@ extension Worker {
         return true
     }
 
+    /// Arms a route's deadline for the request on `slot`, beside whatever the
+    /// handler goes on to wait for itself. It is deliberately not the
+    /// request's continuation: the handler may be running, or parked on a
+    /// timer of its own, and the deadline has to outlast either.
+    ///
+    /// A full op pool arms nothing and says nothing. A deadline is a safety
+    /// net, and refusing to serve a request because the net could not be hung
+    /// would be a worse failure than the one it guards against.
+    mutating func armDeadline(_ slot: Int, ms: UInt64) {
+        disarmDeadline(slot)
+        let c = table[slot]
+        let deadline = pg_monotonic_us() &+ 1 &+ max(1, ms) &* 1000
+        guard let (index, generation) = asyncOps.allocate(
+            slot: slot, requestId: c.pointee.requestId, kind: .deadline,
+            deadlineUs: deadline) else {
+            return
+        }
+        timerHeap.push(
+            TimerHeap.Entry(deadlineUs: deadline, opIndex: Int32(index),
+                            opGeneration: generation),
+            into: &asyncOps)
+        c.pointee.deadlineOp = Int32(index)
+        c.pointee.deadlineOpGeneration = generation
+    }
+
+    /// Frees the deadline op for `slot`, if it still owns one. Runs at every
+    /// request boundary: a deadline belongs to one request, and an op left
+    /// armed would fire into whatever took the slot next.
+    mutating func disarmDeadline(_ slot: Int) {
+        let c = table[slot]
+        let index = Int(c.pointee.deadlineOp)
+        let generation = c.pointee.deadlineOpGeneration
+        c.pointee.deadlineOp = -1
+        c.pointee.deadlineOpGeneration = 0
+        guard index >= 0 && index < asyncOps.capacity else { return }
+        let op = asyncOps[index]
+        guard Int(op.pointee.slot) == slot, op.pointee.generation == generation else { return }
+        timerHeap.remove(opIndex: index, from: &asyncOps)
+        asyncOps.free(index)
+    }
+
     mutating func fireDueTimers() {
         let now = pg_monotonic_us()
         while let entry = timerHeap.popDue(nowUs: now, from: &asyncOps) {
@@ -412,12 +459,24 @@ extension Worker {
         let slot = Int(op.pointee.slot)
         let requestId = op.pointee.requestId
         let cancelled = op.pointee.cancelled
+        // Read before the op is freed and recycled under us.
+        let kind = op.pointee.kind
         asyncOps.free(index)
 
         if cancelled { return }
         let c = table[slot]
         if c.pointee.state == .free { return }
         if c.pointee.requestId != requestId { return }
+        if kind == .deadline {
+            // Not the request's continuation, so none of the checks below
+            // apply: the handler may be running rather than waiting, which is
+            // the case a deadline exists for.
+            guard c.pointee.deadlineOp == Int32(index) else { return }
+            c.pointee.deadlineOp = -1
+            c.pointee.deadlineOpGeneration = 0
+            deadlineFired(slot, generation: c.pointee.generation, requestId: requestId)
+            return
+        }
         if c.pointee.contState != .waiting { return }
         if c.pointee.contOp != Int32(index) {
             // Cont already moved on; nothing to resume.
