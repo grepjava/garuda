@@ -244,7 +244,7 @@ struct PostgresSessionTests {
         // statement. Here the statement goes in Parse and the value in Bind,
         // and nothing moves between them.
         let hostile = "'; drop table users; --"
-        let query = PostgresQuery("select * from users where name = $1", [hostile])
+        let query = PostgresQuery("select * from users where name = $1", [PostgresValue(hostile)])
         let bytes = try query.messages()
         let parse = cstr("select * from users where name = $1")
         #expect(bytes.starts(with: [UInt8(ascii: "P")]))
@@ -254,5 +254,22 @@ struct PostgresSessionTests {
         #expect(bytes.firstRange(of: valueBytes) != nil)
         #expect(bytes.firstRange(of: parse) != nil)
         #expect(bytes.firstRange(of: Array(("$1" + hostile).utf8)) == nil)
+    }
+
+    @Test func aBinaryValueDeclaresItsTypeAndTextValuesLeaveTheirsToTheServer() throws {
+        let query = PostgresQuery("insert into files (name, data) values ($1, $2)",
+                                  [PostgresValue("a.png"), .binary([0, 255], type: PostgresType.bytea)])
+        let bytes = try query.messages()
+        // Parse: both parameters typed, the text one as 0 (infer).
+        let parse = cstr("insert into files (name, data) values ($1, $2)") + i16(2) + i32(0) + i32(17)
+        #expect(bytes.firstRange(of: parse) != nil)
+        // Bind: a format per parameter, text then binary.
+        let formats = i16(2) + i16(0) + i16(1) + i16(2)
+        #expect(bytes.firstRange(of: formats) != nil)
+    }
+
+    @Test func aStatementOfTextValuesDeclaresNoTypes() throws {
+        let query = PostgresQuery("select $1", [PostgresValue("7")])
+        #expect(try query.messages().firstRange(of: cstr("select $1") + i16(0)) != nil)
     }
 }

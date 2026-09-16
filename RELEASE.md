@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 701 unit tests
+swift test                             # 706 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -286,6 +286,12 @@ is `request.client`.
   `PostgresClientError.poolTimedOut`, instead of waiting as long as whoever
   holds the connections — a transaction can await anything between its
   statements. A wait that gives up leaves the queue at once.
+- Bytes are values. `[UInt8]` binds as `bytea` in PostgreSQL's binary format,
+  rather than as hex text at twice the size, and a `bytea` column decodes into
+  a `[UInt8]` property, an optional one for a nullable column, or a scalar
+  with `first([UInt8].self, …)`. `PostgresBindable` now returns a
+  `PostgresValue` — text, binary with its type, or NULL — in place of
+  `postgresText`.
 
 ### Changed
 
@@ -339,7 +345,7 @@ is `request.client`.
   custom fallback, none of the shipped middleware (authentication, CORS,
   tracing, request limits), no streaming response, and no WebSocket or
   WebTransport handler.
-- PostgreSQL has no binary formats, no `LISTEN`, and does not
+- PostgreSQL has binary parameters only for bytes, no `LISTEN`, and does not
   SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
   written. The HTTP client does not follow redirects and sends no
   `Accept-Encoding`, since the compression shim encodes and does not decode.

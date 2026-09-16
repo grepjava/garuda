@@ -24,32 +24,37 @@ import GarudaPostgres
 
 /// A value that can be bound to a `$n` placeholder.
 ///
-/// Everything goes as text, which PostgreSQL parses into the placeholder's
-/// type -- one format to get right rather than one per type. A value is never
-/// written into the SQL itself, so none can become part of the statement.
+/// Most values go as text, which PostgreSQL parses into the placeholder's type
+/// -- one format to get right rather than one per type. Bytes go in binary,
+/// where text would be hex at twice the size. A value is never written into
+/// the SQL itself, so none can become part of the statement.
 public protocol PostgresBindable {
-    /// The text PostgreSQL should parse, or nil for NULL.
-    var postgresText: String? { get }
+    var postgresValue: PostgresValue { get }
 }
 
-extension String: PostgresBindable { public var postgresText: String? { self } }
-extension Substring: PostgresBindable { public var postgresText: String? { String(self) } }
-extension Int: PostgresBindable { public var postgresText: String? { String(self) } }
-extension Int8: PostgresBindable { public var postgresText: String? { String(self) } }
-extension Int16: PostgresBindable { public var postgresText: String? { String(self) } }
-extension Int32: PostgresBindable { public var postgresText: String? { String(self) } }
-extension Int64: PostgresBindable { public var postgresText: String? { String(self) } }
-extension UInt: PostgresBindable { public var postgresText: String? { String(self) } }
-extension UInt8: PostgresBindable { public var postgresText: String? { String(self) } }
-extension UInt16: PostgresBindable { public var postgresText: String? { String(self) } }
-extension UInt32: PostgresBindable { public var postgresText: String? { String(self) } }
-extension UInt64: PostgresBindable { public var postgresText: String? { String(self) } }
-extension Double: PostgresBindable { public var postgresText: String? { String(self) } }
-extension Float: PostgresBindable { public var postgresText: String? { String(self) } }
-extension Bool: PostgresBindable { public var postgresText: String? { self ? "true" : "false" } }
+extension String: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(self) } }
+extension Substring: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension Int: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension Int8: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension Int16: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension Int32: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension Int64: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension UInt: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension UInt8: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension UInt16: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension UInt32: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension UInt64: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension Double: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension Float: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
+extension Bool: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(self ? "true" : "false") } }
+
+/// Bytes, bound as `bytea` in binary.
+extension Array: PostgresBindable where Element == UInt8 {
+    public var postgresValue: PostgresValue { .binary(self, type: PostgresType.bytea) }
+}
 
 extension Optional: PostgresBindable where Wrapped: PostgresBindable {
-    public var postgresText: String? { self?.postgresText }
+    public var postgresValue: PostgresValue { self?.postgresValue ?? .null }
 }
 
 // MARK: - Errors
@@ -191,7 +196,7 @@ public final class PostgresPool: @unchecked Sendable {
         }
         let connection = try await acquire(worker)
         do {
-            let rows = try await connection.query(sql, values.map(\.postgresText))
+            let rows = try await connection.query(sql, values: values.map(\.postgresValue))
             release(connection)
             return rows
         } catch {
@@ -282,19 +287,19 @@ public struct PostgresTransaction {
 
     public func query<Row: Decodable>(_ type: Row.Type, _ sql: String,
                                       _ values: any PostgresBindable...) async throws -> [Row] {
-        try decodeAll(type, try await connection.query(sql, values.map(\.postgresText)))
+        try decodeAll(type, try await connection.query(sql, values: values.map(\.postgresValue)))
     }
 
     public func first<Row: Decodable>(_ type: Row.Type, _ sql: String,
                                       _ values: any PostgresBindable...) async throws -> Row? {
-        let rows = try await connection.query(sql, values.map(\.postgresText))
+        let rows = try await connection.query(sql, values: values.map(\.postgresValue))
         guard rows.count > 0 else { return nil }
         return try decodeRow(type, rows, 0, columnIndex(rows))
     }
 
     @discardableResult
     public func execute(_ sql: String, _ values: any PostgresBindable...) async throws -> Int {
-        try await connection.query(sql, values.map(\.postgresText)).affected
+        try await connection.query(sql, values: values.map(\.postgresValue)).affected
     }
 }
 
@@ -318,7 +323,12 @@ private func decodeAll<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows) t
 
 private func decodeRow<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows, _ row: Int,
                                        _ index: [String: Int]) throws -> Row {
-    try Row(from: PostgresRowDecoding(rows: rows, row: row, index: index))
+    let decoding = PostgresRowDecoding(rows: rows, row: row, index: index)
+    // Bytes are a scalar here, not the list of numbers Decodable makes them.
+    if Row.self == [UInt8].self {
+        return try decoding.onlyCell().decode([UInt8].self) as! Row
+    }
+    return try Row(from: decoding)
 }
 
 /// Decodes one row: properties by column name, or a single scalar from a
@@ -341,10 +351,14 @@ struct PostgresRowDecoding: Decoder {
     func singleValueContainer() throws -> any SingleValueDecodingContainer {
         // `query(Int.self, "select count(*) from users")`: a scalar is the one
         // column there is. More than one would mean guessing which.
+        try onlyCell()
+    }
+
+    func onlyCell() throws -> PostgresCell {
         guard rows.columns.count == 1 else {
             throw PostgresDecodingError.unsupported("a scalar from \(rows.columns.count) columns")
         }
-        return PostgresCell(name: rows.columns[0].name, text: rows.text(row: row, column: 0))
+        return PostgresCell(rows: rows, row: row, column: 0)
     }
 }
 
@@ -361,10 +375,10 @@ private struct PostgresRowKeyed<Key: CodingKey>: KeyedDecodingContainerProtocol 
         guard let column = index[key.stringValue] else {
             throw PostgresDecodingError.missingColumn(key.stringValue)
         }
-        return PostgresCell(name: key.stringValue, text: rows.text(row: row, column: column))
+        return PostgresCell(rows: rows, row: row, column: column)
     }
 
-    func decodeNil(forKey key: Key) throws -> Bool { try cell(key).text == nil }
+    func decodeNil(forKey key: Key) throws -> Bool { try cell(key).decodeNil() }
 
     func decode(_ type: Bool.Type, forKey key: Key) throws -> Bool { try cell(key).decode(type) }
     func decode(_ type: String.Type, forKey key: Key) throws -> String { try cell(key).decode(type) }
@@ -384,7 +398,7 @@ private struct PostgresRowKeyed<Key: CodingKey>: KeyedDecodingContainerProtocol 
     func decode<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T {
         // A type of its own over one column -- a String-backed enum, say --
         // decodes from that column's text.
-        try T(from: try cell(key))
+        try cell(key).decode(type)
     }
 
     func nestedContainer<NestedKey: CodingKey>(keyedBy type: NestedKey.Type,
@@ -405,11 +419,21 @@ private struct PostgresRowKeyed<Key: CodingKey>: KeyedDecodingContainerProtocol 
     }
 }
 
-/// One column's text, as the scalar a property asks for.
-private struct PostgresCell: Decoder, SingleValueDecodingContainer {
-    let name: String
-    let text: String?
+/// One cell, as the scalar a property asks for.
+struct PostgresCell: Decoder, SingleValueDecodingContainer {
+    let rows: PostgresRows
+    let row: Int
+    let column: Int
     var codingPath: [any CodingKey] = []
+
+    init(rows: PostgresRows, row: Int, column: Int) {
+        self.rows = rows
+        self.row = row
+        self.column = column
+    }
+
+    var name: String { rows.columns[column].name }
+    var text: String? { rows.text(row: row, column: column) }
     var userInfo: [CodingUserInfoKey: Any] { [:] }
 
     func container<Key: CodingKey>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> {
@@ -462,5 +486,23 @@ private struct PostgresCell: Decoder, SingleValueDecodingContainer {
     func decode(_ type: UInt16.Type) throws -> UInt16 { try scalar(type) }
     func decode(_ type: UInt32.Type) throws -> UInt32 { try scalar(type) }
     func decode(_ type: UInt64.Type) throws -> UInt64 { try scalar(type) }
-    func decode<T: Decodable>(_ type: T.Type) throws -> T { try T(from: self) }
+    func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        if T.self == [UInt8].self { return try bytes() as! T }
+        return try T(from: self)
+    }
+
+    /// The cell as bytes: a bytea's own bytes, in whichever format it came,
+    /// and any other column's text as UTF-8.
+    private func bytes() throws -> [UInt8] {
+        guard let raw = rows.bytes(row: row, column: column) else {
+            throw PostgresDecodingError.null(column: name)
+        }
+        let description = rows.columns[column]
+        guard description.typeOID == PostgresType.bytea, !description.binary else { return Array(raw) }
+        guard let decoded = PostgresBytea.decodeHex(raw) else {
+            throw PostgresDecodingError.notConvertible(column: name, value: String(decoding: raw.prefix(32), as: UTF8.self),
+                                                       expected: "bytea in hex")
+        }
+        return decoded
+    }
 }

@@ -360,6 +360,72 @@ public struct PostgresColumn: Equatable, Sendable {
 
 // MARK: - Writing
 
+/// The value for one `$n` placeholder, as it goes on the wire.
+public enum PostgresValue: Equatable, Sendable {
+    case null
+    /// Text PostgreSQL parses into whatever type the placeholder has.
+    case text([UInt8])
+    /// The type's binary form, with the type's OID: the statement is told the
+    /// placeholder's type, since binary bytes mean nothing without one.
+    case binary([UInt8], type: UInt32)
+
+    /// Text, or NULL for nil.
+    public init(_ text: String?) {
+        self = text.map { .text(Array($0.utf8)) } ?? .null
+    }
+
+    /// The OID Parse declares for this value, or 0 to let the server infer it.
+    public var declaredType: UInt32 {
+        if case .binary(_, let type) = self { return type }
+        return 0
+    }
+}
+
+/// bytea's text form.
+public enum PostgresBytea {
+    /// `\x` and two hex digits a byte, which is how a server has sent bytea
+    /// as text since 9.0. The older escape format, which bytea_output can still
+    /// ask for, is refused rather than misread.
+    public static func decodeHex(_ text: ArraySlice<UInt8>) -> [UInt8]? {
+        guard text.count >= 2, text.count % 2 == 0,
+              text[text.startIndex] == UInt8(ascii: "\\"),
+              text[text.startIndex + 1] == UInt8(ascii: "x") else { return nil }
+        var out: [UInt8] = []
+        out.reserveCapacity(text.count / 2 - 1)
+        var i = text.startIndex + 2
+        while i < text.endIndex {
+            guard let high = hexValue(text[i]), let low = hexValue(text[i + 1]) else { return nil }
+            out.append(high << 4 | low)
+            i += 2
+        }
+        return out
+    }
+
+    private static func hexValue(_ c: UInt8) -> UInt8? {
+        switch c {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return c - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return c - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return c - UInt8(ascii: "A") + 10
+        default: return nil
+        }
+    }
+}
+
+/// Type OIDs, as pg_type has them.
+public enum PostgresType {
+    public static let bool: UInt32 = 16
+    public static let bytea: UInt32 = 17
+    public static let int8: UInt32 = 20
+    public static let int2: UInt32 = 21
+    public static let int4: UInt32 = 23
+    public static let text: UInt32 = 25
+    public static let float4: UInt32 = 700
+    public static let float8: UInt32 = 701
+    public static let timestamp: UInt32 = 1114
+    public static let timestamptz: UInt32 = 1184
+    public static let uuid: UInt32 = 2950
+}
+
 public enum PostgresFrontend {
 
     /// Protocol 3.0, as the startup message spells it.
@@ -448,27 +514,34 @@ public enum PostgresFrontend {
         return true
     }
 
-    /// Binds values to a prepared statement. Every parameter goes as text,
-    /// every result comes back as text: PostgreSQL parses both, which is one
-    /// format to get right rather than one per type.
-    public static func bind(portal: String, statement: String, values: [[UInt8]?],
-                            into out: inout ByteBuffer) -> Bool {
+    /// Binds values to a prepared statement. Each parameter goes in its own
+    /// format; `resultFormats` is empty for every column as text, or a code
+    /// per column (0 text, 1 binary).
+    public static func bind(portal: String, statement: String, values: [PostgresValue],
+                            resultFormats: [Int16] = [], into out: inout ByteBuffer) -> Bool {
         guard !portal.utf8.contains(0), !statement.utf8.contains(0),
-              values.count <= Int(Int16.max) else { return false }
+              values.count <= Int(Int16.max), resultFormats.count <= Int(Int16.max) else { return false }
         let start = begin(UInt8(ascii: "B"), &out)
         writeCString(portal, into: &out)
         writeCString(statement, into: &out)
-        writeInt16(0, into: &out)                     // all parameters as text
+        if values.contains(where: { $0.declaredType != 0 }) {
+            writeInt16(Int16(values.count), into: &out)
+            for value in values { writeInt16(value.declaredType != 0 ? 1 : 0, into: &out) }
+        } else {
+            writeInt16(0, into: &out)                 // every parameter as text
+        }
         writeInt16(Int16(values.count), into: &out)
         for value in values {
-            guard let value else {
+            switch value {
+            case .null:
                 writeInt32(-1, into: &out)
-                continue
+            case .text(let bytes), .binary(let bytes, _):
+                writeInt32(Int32(bytes.count), into: &out)
+                bytes.withUnsafeBufferPointer { if $0.count > 0 { out.write($0.baseAddress!, $0.count) } }
             }
-            writeInt32(Int32(value.count), into: &out)
-            value.withUnsafeBufferPointer { if $0.count > 0 { out.write($0.baseAddress!, $0.count) } }
         }
-        writeInt16(0, into: &out)                     // all results as text
+        writeInt16(Int16(resultFormats.count), into: &out)
+        for format in resultFormats { writeInt16(format, into: &out) }
         endMessage(&out, start)
         return true
     }

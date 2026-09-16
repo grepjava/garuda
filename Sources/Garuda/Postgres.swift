@@ -169,8 +169,13 @@ final class PostgresConnection {
         }
     }
 
+    /// Runs one statement, with text values sent beside it.
+    func query(_ sql: String, _ values: [String?]) async throws(PostgresClientError) -> PostgresRows {
+        try await query(sql, values: values.map { PostgresValue($0) })
+    }
+
     /// Runs one statement, with its values sent beside it.
-    func query(_ sql: String, _ values: [String?] = []) async throws(PostgresClientError) -> PostgresRows {
+    func query(_ sql: String, values: [PostgresValue] = []) async throws(PostgresClientError) -> PostgresRows {
         let ms = configuration.timeoutMilliseconds
         var query = PostgresQuery(sql, values, maxRows: configuration.maxRows)
         let bytes: [UInt8]

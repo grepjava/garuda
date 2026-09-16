@@ -29,6 +29,12 @@ struct PoolUser: Codable, Equatable {
     let active: Bool
 }
 
+struct PoolFile: Decodable {
+    let name: String
+    let data: [UInt8]
+    let thumbnail: [UInt8]?
+}
+
 struct NewPoolUser: Decodable {
     let name: String
     let email: String?
@@ -110,6 +116,29 @@ private func crudApp(maxConnections: Int = 4, acquireTimeoutMilliseconds: UInt64
         } catch let error as PostgresClientError {
             return "\(error)"
         }
+    }
+
+    // Every byte value, an empty blob and a NULL, stored and read back.
+    app.get("/bytes") { (db: State<PostgresPool>) async throws -> String in
+        try await db.value.execute(
+            "create table if not exists garuda_pool_files (name text primary key, data bytea not null, thumbnail bytea)")
+        try await db.value.execute("truncate garuda_pool_files")
+        let every = (0...255).map { UInt8($0) }
+        try await db.value.execute("insert into garuda_pool_files values ($1, $2, $3)",
+                                   "every", every, [UInt8]([0, 0, 1]))
+        try await db.value.execute("insert into garuda_pool_files values ($1, $2, $3)",
+                                   "empty", [UInt8](), [UInt8]?.none)
+        let files = try await db.value.query(PoolFile.self,
+                                             "select name, data, thumbnail from garuda_pool_files order by name")
+        guard files.count == 2 else { return "count \(files.count)" }
+        guard files[0].name == "empty", files[0].data == [], files[0].thumbnail == nil else { return "empty wrong" }
+        guard files[1].data == every, files[1].thumbnail == [0, 0, 1] else { return "every wrong" }
+        // As a scalar, and measured by the server: binary, not text.
+        let alone = try await db.value.first([UInt8].self, "select data from garuda_pool_files where name = $1", "every")
+        guard alone == every else { return "scalar wrong" }
+        let length = try await db.value.first(Int.self, "select length($1)", every)
+        guard length == 256 else { return "length \(length ?? -1)" }
+        return "ok"
     }
 
     app.get("/pid") { (db: State<PostgresPool>) async throws -> String in
@@ -289,6 +318,11 @@ struct PostgresPoolTests {
         #expect(answers.allSatisfy { status($0) == 200 && body($0) == "1" }, "\(answers)")
         let counts = try #require(poolForTests).counts
         #expect(counts.open <= 2)
+    }
+
+    @Test func bytesRoundTripAsBytea() throws {
+        let client = crudApp().test
+        #expect(body(try get(client, "/bytes")) == "ok")
     }
 
     @Test func aWaitForAConnectionGivesUpAtItsDeadline() throws {

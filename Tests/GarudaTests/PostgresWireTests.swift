@@ -287,10 +287,17 @@ struct PostgresWireTests {
         #expect(written { PostgresFrontend.parse(name: "", sql: "select $1", parameterTypes: [23],
                                                  into: &$0) }
                 == message("P", cstr("") + cstr("select $1") + i16(1) + i32(23)))
-        #expect(written { PostgresFrontend.bind(portal: "", statement: "", values: [Array("7".utf8), nil],
+        #expect(written { PostgresFrontend.bind(portal: "", statement: "", values: [PostgresValue("7"), .null],
                                                 into: &$0) }
                 == message("B", cstr("") + cstr("") + i16(0) + i16(2)
                            + i32(1) + Array("7".utf8) + i32(-1) + i16(0)))
+        // A binary parameter makes the formats explicit, one per parameter,
+        // and results can be asked for per column.
+        #expect(written { PostgresFrontend.bind(portal: "p", statement: "s",
+                                                values: [PostgresValue("7"), .binary([1, 2], type: 17)],
+                                                resultFormats: [1, 0], into: &$0) }
+                == message("B", cstr("p") + cstr("s") + i16(2) + i16(0) + i16(1) + i16(2)
+                           + i32(1) + Array("7".utf8) + i32(2) + [1, 2] + i16(2) + i16(1) + i16(0)))
         #expect(written { PostgresFrontend.describe(portal: "", into: &$0) }
                 == message("D", [UInt8(ascii: "P")] + cstr("")))
         #expect(written { PostgresFrontend.execute(portal: "", into: &$0) }
@@ -312,5 +319,21 @@ struct PostgresWireTests {
                 == message("p", cstr("SCRAM-SHA-256") + i32(3) + [1, 2, 3]))
         #expect(written { PostgresFrontend.saslResponse([4, 5], into: &$0); return true }
                 == message("p", [4, 5]))
+    }
+
+    // MARK: bytea
+
+    @Test func byteaHexDecodes() {
+        #expect(PostgresBytea.decodeHex(ArraySlice(Array("\\x".utf8))) == [])
+        #expect(PostgresBytea.decodeHex(ArraySlice(Array("\\x00ff7Fa0".utf8))) == [0, 255, 127, 160])
+        // A slice that does not start at zero, as a cell in a result is.
+        let row = Array("junk\\x0102".utf8)
+        #expect(PostgresBytea.decodeHex(row[4...]) == [1, 2])
+    }
+
+    @Test func byteaThatIsNotHexIsRefused() {
+        for bad in ["", "x00", "\\x0", "\\xzz", "\\000", "/x00"] {
+            #expect(PostgresBytea.decodeHex(ArraySlice(Array(bad.utf8))) == nil, "\(bad)")
+        }
     }
 }

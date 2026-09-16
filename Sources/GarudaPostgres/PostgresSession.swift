@@ -211,6 +211,13 @@ public struct PostgresRows: Sendable {
         return String(decoding: storage[range], as: UTF8.self)
     }
 
+    /// A cell's bytes as the server sent them, in the column's format, or nil
+    /// for NULL.
+    public func bytes(row: Int, column: Int) -> ArraySlice<UInt8>? {
+        guard let range = cells[row * columns.count + column] else { return nil }
+        return storage[range]
+    }
+
     /// The number the tag ends with -- rows returned or affected.
     public var affected: Int {
         Int(tag.split(separator: " ").last ?? "") ?? 0
@@ -239,7 +246,7 @@ public struct PostgresRows: Sendable {
 /// whatever it contains.
 public struct PostgresQuery {
     let sql: String
-    let values: [String?]
+    let values: [PostgresValue]
     public private(set) var rows = PostgresRows()
     /// What the server's ReadyForQuery said: whether the session is left
     /// inside a transaction, and whether that transaction has failed.
@@ -250,7 +257,7 @@ public struct PostgresQuery {
     /// copied as they arrive, so an unbounded SELECT is an unbounded buffer.
     let maxRows: Int
 
-    public init(_ sql: String, _ values: [String?] = [], maxRows: Int = 1_000_000) {
+    public init(_ sql: String, _ values: [PostgresValue] = [], maxRows: Int = 1_000_000) {
         self.sql = sql
         self.values = values
         self.maxRows = maxRows
@@ -260,9 +267,11 @@ public struct PostgresQuery {
     public func messages() throws(PostgresError) -> [UInt8] {
         var out = ByteBuffer(capacity: 256)
         defer { out.destroy() }
-        let encoded = values.map { $0.map { Array($0.utf8) } }
-        guard PostgresFrontend.parse(name: "", sql: sql, parameterTypes: [], into: &out),
-              PostgresFrontend.bind(portal: "", statement: "", values: encoded, into: &out),
+        // Types are declared only when a value is binary, and then only for
+        // that value: 0 leaves the rest to the server to infer, as before.
+        let types = values.contains { $0.declaredType != 0 } ? values.map(\.declaredType) : []
+        guard PostgresFrontend.parse(name: "", sql: sql, parameterTypes: types, into: &out),
+              PostgresFrontend.bind(portal: "", statement: "", values: values, into: &out),
               PostgresFrontend.describe(portal: "", into: &out),
               PostgresFrontend.execute(portal: "", into: &out) else {
             throw .unsendable
