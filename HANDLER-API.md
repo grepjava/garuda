@@ -183,6 +183,8 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 
 ### 2. Typed extraction, responses, errors and state
 
+**Landed 2026-09-16.** All five sub-steps under [Order of work](#order-of-work-1) are in the tree: the JSON coder, typed answers and errors, typed extraction, typed per-worker state, and forms with multipart. What is left for later steps: async handlers (3), middleware and 405 (4), streaming (5).
+
 | Input | Output |
 |---|---|
 | Named, typed, decoded path parameters | `JSON<T: Encodable>` |
@@ -205,7 +207,7 @@ The probes behind the figures in this section are in [benchmarks/async-probes/](
 4. **Typed application state.** Landed: `app.state { worker in try Database.connect(…) }` registers a factory that runs once in each worker, after the fork and before that worker reports ready, and `State<Database>` hands what it built to any handler that asks for it — beside the other extractors, in any order. One value per type. A factory that throws stops that worker's start-up with its error: the child exits 1 and the supervisor sees the readiness pipe hang up, rather than a worker serving without what it needed. An optional `shutdown:` runs when the worker's loop has ended, newest first. Asking for state nobody registered is a 500 naming the type, since that is the program's fault and not the client's. The test client builds and tears down state exactly as a worker does, so a test exercises the same path.
 
    **Fork semantics.** Each worker is a process, so what a factory builds belongs to that worker alone: a pool per worker, not one shared between them. An object captured before the fork is copied into each worker, not shared with the others. State every worker must see lives outside the process — a database, a cache.
-5. Forms, then multipart.
+5. **Forms, then multipart.** Landed: `Form<Value>` decodes an `application/x-www-form-urlencoded` body — a query string in the body, so it goes through the same reader, with `+` a space, `%XX` undone, a repeated name a list and an absent one nil where the type allows it. `Multipart` cuts a `multipart/form-data` body into its parts, each with its name, the client's filename when it sent one, its own content type and its bytes, reachable as `form.text("title")`, `form.file("avatar")` and `form.all("tag")`. The engine has already read the body whole, up to `--max-body`, so this is a parse over bytes in hand rather than a stream, bounded by that limit and by a cap of 1,000 parts; streaming uploads wait for step 5 of the roadmap. A body sent as the wrong kind of document is a 415 rather than a 400, since sending the wrong kind is not the same as sending a malformed one.
 
 ### 3. Async handlers and real integrations
 

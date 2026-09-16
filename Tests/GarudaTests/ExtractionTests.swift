@@ -104,8 +104,7 @@ struct ExtractionTests {
         let client = extractingApp().test
         let missing = try client.get("/search")
         #expect(missing.status == .badRequest)
-        #expect(try missing.json([String: String].self)["error"]
-            == "q is missing from the query")
+        #expect(try missing.json([String: String].self)["error"] == "q is missing")
 
         let wrong = try client.get("/search?q=x&page=later")
         #expect(wrong.status == .badRequest)

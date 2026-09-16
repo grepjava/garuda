@@ -30,7 +30,7 @@ extension QueryError: ResponseError {
     public var reason: String? {
         switch self {
         case .missing(let name):
-            return "\(name) is missing from the query"
+            return "\(name) is missing"
         case .notConvertible(let name, let value, let expected):
             return "\(name)=\(value) is not \(expected)"
         case .unsupported(let what):

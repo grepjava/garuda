@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 254 unit tests
+swift test                             # 262 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -140,6 +140,15 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   Asking for state nobody registered answers 500 naming the type. Because each
   worker is a process, what a factory builds belongs to that worker alone; an
   object captured before the fork is copied into each worker, not shared.
+- Forms and uploads have types too. `Form<Value>` decodes an
+  `application/x-www-form-urlencoded` body — a query string in the body, read
+  by the same decoder — and `Multipart` cuts a `multipart/form-data` body into
+  parts, each with its name, the client's filename when it sent one, its own
+  content type and its bytes: `form.text("title")`, `form.file("avatar")`,
+  `form.all("tag")`. The body has already been read whole, up to `--max-body`,
+  so this is a parse rather than a stream, bounded by that limit and by a cap
+  of 1,000 parts. A body sent as the wrong kind of document answers 415, which
+  is not the same as the 400 a malformed one gets.
 - `app.run()` parses the usual flags and runs the supervisor, and
   `app.run(configuration:)` serves a `ServerConfig` instead, checked the way
   the command line is. `onWorkerStart` hooks run in each worker before it
