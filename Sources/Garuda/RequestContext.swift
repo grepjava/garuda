@@ -27,6 +27,8 @@ final class RequestContext {
     var values: [ObjectIdentifier: Any] = [:]
     /// What `Response.onSend` asked to run before the response is sent.
     var sendHooks: [SendHook] = []
+    /// The body a returned `StreamingBody` writes once the handler is done.
+    var streamProducer: StreamProducer? = nil
 
     init(generation: UInt32, requestId: UInt32) {
         self.generation = generation

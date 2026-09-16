@@ -271,6 +271,13 @@ final class HandlerTaskPool: @unchecked Sendable {
         var failure: (any Error)? = nil
         do {
             try await work.handler(request, &response)
+            // A handler that returned a streamed body (`StreamingBody`,
+            // `EventStream`) has had its head sent; the body is written here,
+            // still on this task.
+            if let produce = worker.pointee.takeStreamProducer(work.slot, generation: work.generation,
+                                                               requestId: work.requestId) {
+                try await produce(ResponseBodyWriter(response))
+            }
         } catch {
             failure = error
         }
@@ -329,6 +336,11 @@ extension Worker {
         c.pointee.contKind = .none
         c.pointee.contTask = -1
         c.pointee.contState = .none
+        if c.pointee.flags.contains(.streamingResponse)
+            && !c.pointee.flags.contains(.responseComplete) {
+            streamingHandlerFinished(slot, failure)
+            return
+        }
         guard let failure else {
             handlerReturned(slot, generation: generation, requestId: requestId)
             return
@@ -366,7 +378,10 @@ extension Worker {
         guard c.pointee.state == .dispatching, c.pointee.generation == generation,
               c.pointee.requestId == requestId, c.pointee.contKind == .task,
               c.pointee.contTask >= 0, c.pointee.contState == .none,
-              !c.pointee.flags.contains(.responseStarted) else {
+              // A streamed body is still being written, so its handler may
+              // still wait between writes.
+              !c.pointee.flags.contains(.responseStarted)
+                || isStreaming(slot, generation: generation, requestId: requestId) else {
             throw .cancelled
         }
         guard armTimer(slot, ms: milliseconds, kind: .task) else { throw .exhausted }

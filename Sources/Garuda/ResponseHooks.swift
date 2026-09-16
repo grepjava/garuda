@@ -49,14 +49,19 @@ public struct OutgoingResponse: ~Copyable {
     let originalCount: Int
     /// A body a hook put in place of the original, which it no longer lends.
     var replacement: [UInt8]? = nil
+    /// The body is written after the head, as the handler produces it
+    /// (`Response.stream`), so the hook sees no body. Replacing the body
+    /// sends that instead, whole, and the handler's writes are dropped.
+    public let isStreaming: Bool
 
     init(worker: UnsafeMutablePointer<Worker>, slot: Int, status: HTTPStatus,
-         body: UnsafePointer<UInt8>?, count: Int) {
+         body: UnsafePointer<UInt8>?, count: Int, isStreaming: Bool = false) {
         self.worker = worker
         self.slot = slot
         self.status = status
         originalBody = body
         originalCount = count
+        self.isStreaming = isStreaming
     }
 
     // MARK: Headers
@@ -189,18 +194,20 @@ extension Worker {
 
     /// Runs `hooks` over the response, then sends what they leave.
     mutating func respond(_ slot: Int, through hooks: [SendHook], status: Int,
-                          _ body: UnsafePointer<UInt8>?, _ count: Int) {
+                          _ body: UnsafePointer<UInt8>?, _ count: Int, streaming: Bool = false) {
         withUnsafeMutablePointer(to: &self) { worker in
             var outgoing = OutgoingResponse(worker: worker, slot: slot, status: HTTPStatus(status),
-                                            body: body, count: count)
+                                            body: body, count: count, isStreaming: streaming)
             for hook in hooks.reversed() { hook(&outgoing) }
             let code = outgoing.status.code
             if let replacement = outgoing.replacement {
+                // A hook that gives a streamed response a body of its own has
+                // answered in its place, and the handler's writes go nowhere.
                 replacement.withUnsafeBufferPointer {
                     worker.pointee.respond(slot, status: code, $0.baseAddress, $0.count)
                 }
             } else {
-                worker.pointee.respond(slot, status: code, body, count)
+                worker.pointee.respond(slot, status: code, body, count, streaming: streaming)
             }
         }
     }

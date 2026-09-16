@@ -36,6 +36,7 @@ try:
     from aioquic.h3.connection import H3Connection
     from aioquic.h3.events import DataReceived, HeadersReceived
     from aioquic.quic.configuration import QuicConfiguration
+    from aioquic.quic.events import StreamReset
 except ImportError:
     sys.stderr.write("this script needs h2 and aioquic: pip install h2 aioquic\n")
     raise SystemExit(2)
@@ -176,10 +177,12 @@ class Server:
 
 
 class Response:
-    def __init__(self, status, headers, body):
+    def __init__(self, status, headers, body, complete=True):
         self.status = status
         self.headers = headers
         self.body = body
+        # False for a chunked body the connection closed in the middle of.
+        self.complete = complete
 
     def values(self, name):
         return [v for k, v in self.headers if k == name]
@@ -240,6 +243,9 @@ class H1:
             headers.append((name.strip().lower(), value.strip()))
         if status == 100:
             return Response(status, headers, b"")
+        if (method != "HEAD" and status not in (204, 304)
+                and ("transfer-encoding", "chunked") in headers):
+            return self.chunked(status, headers)
         length = 0
         if status not in (204, 304) and method != "HEAD":
             declared = [v for k, v in headers if k == "content-length"]
@@ -255,6 +261,23 @@ class H1:
         take = len(self.buf) if length is None else length
         body, self.buf = self.buf[:take], self.buf[take:]
         return Response(status, headers, body)
+
+    def chunked(self, status, headers):
+        body = b""
+        try:
+            while True:
+                while b"\r\n" not in self.buf:
+                    self.fill()
+                line, _, self.buf = self.buf.partition(b"\r\n")
+                size = int(line.split(b";")[0], 16)
+                while len(self.buf) < size + 2:
+                    self.fill()
+                body += self.buf[:size]
+                self.buf = self.buf[size + 2:]
+                if size == 0:
+                    return Response(status, headers, body)
+        except EOFError:
+            return Response(status, headers, body, complete=False)
 
     def closed(self, timeout=3.0):
         """Whether the server closes the connection within `timeout`."""
@@ -402,6 +425,7 @@ class H3Client(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self._http = H3Connection(self._quic)
         self.status, self.headers, self.body = {}, {}, {}
+        self.reset = {}
         self._done = {}
 
     def open(self, method, path, headers=(), length=None, end_stream=False):
@@ -435,6 +459,11 @@ class H3Client(QuicConnectionProtocol):
             pass
 
     def quic_event_received(self, event):
+        if isinstance(event, StreamReset):
+            self.reset[event.stream_id] = event.error_code
+            done = self._done.get(event.stream_id)
+            if done is not None and not done.done():
+                done.set_result(None)
         for http_event in self._http.handle_event(event):
             if not isinstance(http_event, (HeadersReceived, DataReceived)):
                 continue
@@ -859,6 +888,165 @@ def framing_streams():
         run(scenario())
 
 
+# ------------------------------------------------ Streamed responses
+
+
+def pieces(n, size):
+    return b"".join(bytes([97 + i % 26]) * size for i in range(n))
+
+
+HIGH_WATER = 512 * 1024
+
+
+def queued_most(body):
+    """The figure /stream-queued ends its body with, or -1 if the body is not whole."""
+    head, _, tail = body.rpartition(b"\nqueued ")
+    if head != pieces(64, 65536) or not tail.isdigit():
+        return -1
+    return int(tail)
+
+
+EVENTS_3 = b"".join(b"id: %d\ndata: event %d\n\n" % (i, i) for i in range(3))
+
+
+def streaming_h1():
+    print("\nStreamed responses, HTTP/1.1")
+    with Server() as server:
+        conn = H1(server)
+        r = conn.request("GET", "/stream/3/5")
+        is_("a streamed body arrives whole", (r.status, r.body), (200, pieces(3, 5)))
+        is_("chunked, with no length", (r.header("transfer-encoding"), r.header("content-length")),
+            ("chunked", None))
+        is_("and the connection is kept for the next request", conn.request("GET", "/").status, 200)
+
+        r = conn.request("GET", "/stream/64/65536")
+        check("4 MiB streamed in 64 KiB writes arrives intact", r.body == pieces(64, 65536),
+              len(r.body))
+
+        r = conn.request("GET", "/stream-queued/64/65536")
+        most = queued_most(r.body)
+        check("a write waits above the high-water mark", 0 <= most <= HIGH_WATER + 65536, most)
+
+        r = conn.request("GET", "/events/3")
+        is_("server-sent events are text/event-stream", r.header("content-type"), "text/event-stream")
+        is_("and each event is framed", r.body, EVENTS_3)
+        conn.close()
+
+        # A client that does not read. The handler waits for it rather than
+        # queueing 4 MiB, and the worker goes on serving everyone else.
+        stalled = H1(server)
+        stalled.send(H1.head("GET", "/stream/64/65536"))
+        time.sleep(0.5)
+        other = H1(server)
+        started = time.monotonic()
+        is_("a stalled reader does not hold up another client", other.request("GET", "/").status, 200)
+        check("which is answered promptly", time.monotonic() - started < 1.0,
+              time.monotonic() - started)
+        other.close()
+        r = stalled.response()
+        check("and the stalled reader still gets every byte once it reads",
+              r.body == pieces(64, 65536), len(r.body))
+        stalled.close()
+
+        conn = H1(server)
+        r = conn.request("GET", "/stream-throw")
+        is_("a handler that throws part-way sends what it wrote", r.body, b"partial")
+        check("and the body is cut off rather than ended", not r.complete)
+        conn.close()
+        time.sleep(0.2)
+        check("and the failure is logged", "part-way through a streamed response" in server.output(),
+              server.output()[-300:])
+
+        old = socket.create_connection(("127.0.0.1", server.port), 10)
+        old.sendall(b"GET /stream/2/3 HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        data = b""
+        while True:
+            chunk = old.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        old.close()
+        head, _, body = data.partition(b"\r\n\r\n")
+        check("to HTTP/1.0 the body ends with the connection",
+              body == pieces(2, 3) and b"chunked" not in head.lower(), data)
+
+
+def streaming_stalled():
+    print("\nA streamed response nobody reads")
+    with Server("--request-timeout", "1000") as server:
+        stalled = H1(server)
+        stalled.send(H1.head("GET", "/stream/64/65536"))
+        time.sleep(3.5)
+        data = b""
+        stalled.sock.settimeout(5)
+        try:
+            while True:
+                chunk = stalled.sock.recv(1 << 20)
+                if not chunk:
+                    break
+                data += chunk
+        except (socket.timeout, TimeoutError, OSError):
+            data = None
+        check("is closed once the client has been silent for --request-timeout",
+              data is not None and len(data) < 4 * 1024 * 1024, None if data is None else len(data))
+        stalled.close()
+        is_("and the server goes on", get_json(server)["method"], "GET")
+
+
+def streaming_streams():
+    print("\nStreamed responses, HTTP/2 and HTTP/3")
+    with Server(http3=True) as server:
+        client = H2Client(server)
+        # On its own: bytes still waiting for window when the reset goes are
+        # dropped with the stream, and a 4 MiB neighbour would hold the window.
+        broken = client.request("GET", "/stream-throw")
+        client.collect([broken])
+        small = client.request("GET", "/stream/3/5")
+        big = client.request("GET", "/stream/64/65536")
+        events = client.request("GET", "/events/3")
+        client.collect([small, big, events], deadline=30)
+        is_("over HTTP/2 a streamed body arrives whole", client.body.get(small, b""), pieces(3, 5))
+        is_("with no length", client.value(small, "content-length"), None)
+        check("4 MiB through HTTP/2 flow control arrives intact",
+              client.body.get(big, b"") == pieces(64, 65536), len(client.body.get(big, b"")))
+        is_("events over HTTP/2", client.body.get(events, b""), EVENTS_3)
+        is_("a handler that throws part-way sends what it wrote",
+            client.body.get(broken, b""), b"partial")
+        is_("and the stream is reset rather than ended", client.reset.get(broken),
+            h2.errors.ErrorCodes.INTERNAL_ERROR)
+        after = client.request("GET", "/")
+        client.collect([after])
+        is_("and the connection goes on", client.status.get(after), 200)
+        queued = client.request("GET", "/stream-queued/64/65536")
+        client.collect([queued], deadline=30)
+        most = queued_most(client.body.get(queued, b""))
+        check("over HTTP/2 a write waits above the high-water mark", 0 <= most <= HIGH_WATER + 65536, most)
+        client.close()
+
+        async def scenario():
+            async with h3_connect(server) as h3:
+                small = h3.request("GET", "/stream/3/5")
+                big = h3.request("GET", "/stream/64/65536")
+                events = h3.request("GET", "/events/3")
+                broken = h3.request("GET", "/stream-throw")
+                await h3.collect([small, big, events, broken], timeout=30)
+                is_("over HTTP/3 a streamed body arrives whole", h3.body.get(small, b""), pieces(3, 5))
+                check("4 MiB over QUIC arrives intact", h3.body.get(big, b"") == pieces(64, 65536),
+                      len(h3.body.get(big, b"")))
+                is_("events over HTTP/3", h3.body.get(events, b""), EVENTS_3)
+                check("a handler that throws part-way resets the stream", broken in h3.reset,
+                      h3.reset)
+                queued = h3.request("GET", "/stream-queued/64/65536")
+                await h3.collect([queued], timeout=30)
+                most = queued_most(h3.body.get(queued, b""))
+                # QUIC takes the bytes at once; what it has not had acknowledged
+                # is what the client is behind by, and a write waits on that.
+                check("over HTTP/3 what QUIC holds unacknowledged counts as queued",
+                      65536 <= most <= HIGH_WATER + 65536, most)
+
+        run(scenario())
+
+
 # ------------------------------------------------ 4. Errors and lifecycle
 
 
@@ -943,8 +1131,8 @@ def main():
         return 2
     print("garuda handler tests (%s)" % BIN)
     for section in (bodies_h1, bodies_h2, bodies_h3, headers_h1, request_ids, request_start,
-                    headers_h2_h3, framing_h1, own_server_headers, framing_streams, errors,
-                    lifecycle):
+                    headers_h2_h3, framing_h1, own_server_headers, framing_streams,
+                    streaming_h1, streaming_stalled, streaming_streams, errors, lifecycle):
         try:
             section()
         except Exception as exc:  # noqa: BLE001 -- one broken section must not hide the rest

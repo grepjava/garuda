@@ -476,14 +476,15 @@ async def h3_cancellation():
 
 async def h3_extended_connect():
     print("\nHTTP/3: extended CONNECT")
-    # Nothing serves a :protocol. A CONNECT stream stays open by design, so a
-    # refusal that waited for the end of the request would never be sent.
+    # WebTransport goes to the routes, and this binary has none for it; any
+    # other :protocol is refused. A CONNECT stream stays open by design, so an
+    # answer that waited for the end of the request would never be sent.
     with Server() as server:
         async with h3_connect(server) as client:
             session = client.extended_connect("/wt", "webtransport")
             unknown = client.extended_connect("/x", "unknown-protocol")
             await client.collect([session, unknown], timeout=5.0)
-            is_("a WebTransport CONNECT is refused with 501", client.status.get(session), 501)
+            is_("a WebTransport CONNECT to no route is 404", client.status.get(session), 404)
             is_("so is an unknown :protocol", client.status.get(unknown), 501)
             after = client.request("GET", "/user/5")
             await client.collect([after])

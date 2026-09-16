@@ -32,7 +32,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 733 unit tests
+swift test                             # 752 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -49,7 +49,7 @@ python3 scripts/feature-test.py        # 62
 python3 scripts/http2-test.py          # 50
 python3 scripts/http3-test.py          # 53
 python3 scripts/router-streams-test.py # 41
-python3 scripts/handler-test.py        # 107
+python3 scripts/handler-test.py        # 136
 python3 scripts/webtransport-test.py   # 46
 bash scripts/cache-unit-test.sh
 ```
@@ -242,6 +242,39 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   acknowledged. This also affected session streams abandoned when their
   session ended.
 
+### Streaming responses and server-sent events
+
+- A response body can be written as it is produced. From an async handler,
+  `let body = response.stream(contentType:)` sends the head and returns a
+  writer; from a typed async handler, return
+  `StreamingBody { body in try await body.write(…) }`. Middleware headers and
+  `onSend` hooks apply to the head (`OutgoingResponse.isStreaming` says which
+  kind it is). The body is chunked on HTTP/1.1, ends with the connection on
+  HTTP/1.0, and goes out as DATA frames on HTTP/2 and HTTP/3. A Content-Length
+  the handler sets is kept, and the writes are held to it.
+- Returning ends the body. `finish()` ends it early. A handler that throws
+  part-way cuts the body off instead of ending it: the HTTP/1.1 connection is
+  closed and an HTTP/2 or HTTP/3 stream is reset, so no client takes half a
+  body for the whole of one.
+- Writes have backpressure. A write that leaves more than
+  `--write-high-water` queued waits until the backlog is down to
+  `--write-low-water`, so a slow client slows only its own handler, and a
+  4 MiB body to a client that is not reading never queues more than the mark.
+  A client that goes away ends the wait with `HandlerWaitError.cancelled`. One
+  that stops reading is closed after `--request-timeout`.
+  `body.sleep(milliseconds:)` waits on the worker's timers between writes, and
+  `body.queuedBytes` says how far behind the client is; over HTTP/3 that
+  includes what QUIC has sent and not had acknowledged.
+- Server-sent events: `EventStream { events in try await events.send(data,
+  event:, id:, retry:) }` or `response.eventStream()`. Data is split into one
+  `data:` line per line. A line break in an event name or ID cannot start a
+  field of its own. `comment()` sends a heartbeat, and `cache-control:
+  no-cache` is set unless the handler set its own.
+- `scripts/handler-test.py` checks all of it over HTTP/1.1, HTTP/2 and HTTP/3
+  (136 checks, up from 107): 4 MiB through HTTP/2 flow control and QUIC, a
+  stalled reader that does not hold up other clients and still gets every
+  byte, the close after `--request-timeout`, and resets on a throw.
+
 ### Connections the server makes
 
 A handler can make an HTTP request, and the database drivers will stand on the
@@ -408,15 +441,16 @@ is `request.client`.
 - The handler API's later steps: middleware cannot wrap a handler's run
   (retry it, or hold a scope around it); no reusable router values to merge, no
   custom fallback, none of the shipped middleware (authentication, CORS,
-  tracing, request limits), no streaming response, and no WebSocket
-  handler.
+  tracing, request limits), no streaming request body, and no WebSocket
+  handler. Server-sent events have no automatic keep-alive; a handler sends
+  `comment()` on its own schedule.
 - PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types
   of its own (they read as text), no `LISTEN`, and does not
   SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
   written. The HTTP client does not follow redirects and sends no
   `Accept-Encoding`, since the compression shim encodes and does not decode.
-- `--compress` and `--cache-size` act on no handler response; they wait for
-  streaming responses.
+- `--compress` and `--cache-size` act on no handler response yet, streamed or
+  not.
 - TLS is OpenSSL, not Swift.
 
 ### Tests

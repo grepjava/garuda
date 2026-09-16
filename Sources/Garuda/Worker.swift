@@ -1527,6 +1527,11 @@ public struct Worker {
                 if idle > limit { closeConnection(slot) }
             case .readingBody, .writing:
                 if idle > config.requestHeadTimeoutMs { closeConnection(slot) }
+            case .dispatching where c.pointee.writerWake != nil:
+                // A streamed response the client stopped reading. One that is
+                // merely quiet -- events a minute apart -- has nobody waiting
+                // here, and is left alone.
+                if idle > config.requestHeadTimeoutMs { closeConnection(slot) }
             case .websocket:
                 sweepWebSocket(slot, now: now)
             case .closing where c.pointee.isStream:
@@ -1669,8 +1674,12 @@ public struct Worker {
 
     // MARK: - Write backpressure
 
+    /// Wakes a handler waiting for a streamed response's backlog to drain,
+    /// once it has fallen to the low water mark. Called wherever bytes leave.
+    @inline(__always)
     mutating func resumeWriterIfDrained(_ slot: Int) {
-        _ = slot
+        if table[slot].pointee.writerWake == nil { return }
+        resumeStreamWriter(slot)
     }
 
     mutating func releaseDrainWaiter(_ slot: Int) {

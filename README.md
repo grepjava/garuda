@@ -20,8 +20,9 @@ kept. CPython, ASGI, WSGI and the Python package were removed.
 **Status: the handler API is early and will change.** In the tree: routes and
 groups, synchronous and async handlers, middleware before a handler and hooks on
 its response, typed extraction and answers, per-worker state, deadlines, an HTTP
-client and a native PostgreSQL driver on the worker's poller. There is no
-streaming or WebSocket handler yet. [Garuda and
+client, a native PostgreSQL driver on the worker's poller, streamed responses,
+server-sent events and WebTransport. There is no WebSocket handler or streamed
+request body yet. [Garuda and
 axum](#garuda-and-axum) compares it feature by feature with the framework it
 aims to beat. It is not yet a stable way to serve your own application. [HANDLER-API.md](HANDLER-API.md) holds the design and
 roadmap, and [GARUDA.md](GARUDA.md) is the authoritative status document.
@@ -133,7 +134,7 @@ HEAD responses, adds the server's headers unless the handler set its own
 a declared `Content-Length`. A handler that throws, or returns without
 answering or waiting, gets a 500.
 
-The API is not stable. There is no streaming or WebSocket handler
+The API is not stable. There is no WebSocket handler or streamed request body
 yet, and [Garuda and axum](#garuda-and-axum) lists what else is still to come.
 [HANDLER-API.md](HANDLER-API.md) has the roadmap.
 
@@ -180,7 +181,9 @@ Tokio, feature by feature.
 | Nesting and 405 | `nest`, `merge`, 405 with `Allow` | `group(prefix)`, nested; 405 with `Allow` | Partial: no router values to merge, no custom fallback (step 4) |
 | Middleware | Tower layers that wrap the handler | `use` before the handler, sync or async; `response.onSend` to change the response | Delivered, [differs](#middleware-does-not-wrap-the-handler) |
 | Ready-made middleware | tower-http: CORS, compression, tracing, timeouts, limits | Server flags: compression, rate limits, request IDs, trace context, access log, body limits; `app.deadline` for timeouts. No CORS or auth middleware yet | Partial (step 4) |
-| Streaming and SSE | Body streams, `Sse` | Buffered, one-shot responses only | Step 5 |
+| Streaming responses | `Body::from_stream` | `response.stream()` or `StreamingBody`, with a write that waits above `--write-high-water` | Delivered |
+| Server-sent events | `Sse`, with `KeepAlive` | `EventStream` / `response.eventStream()`; heartbeats are the handler's `comment()` | Delivered |
+| Streaming request bodies | `Body::into_data_stream` | Read whole, up to `--max-body` | Step 5 |
 | WebSockets | `WebSocketUpgrade` | Engine stubs, answered 501 | Step 5 |
 | WebTransport | None: hyper has no HTTP/3, so a separate stack such as `wtransport` | `app.webTransport`: sessions, streams both ways, datagrams, close codes, on the same port and routes as everything else | Delivered |
 | Outbound DNS | Tokio's resolver or hickory | A resolver on the worker's poller: UDP with TCP fallback, TTL cache | Delivered |
@@ -606,9 +609,10 @@ python3 scripts/feature-test.py              # 62  shutdown, supervision, unix
 <venv>/bin/python scripts/http2-test.py      # 50  against `h2`
 <venv>/bin/python scripts/http3-test.py      # 53  against `aioquic`
 <venv>/bin/python scripts/router-streams-test.py  # 41  routes over h2 and h3
-<venv>/bin/python scripts/handler-test.py    # 107 the handler API: bodies over h1,
+<venv>/bin/python scripts/handler-test.py    # 136 the handler API: bodies over h1,
                                              #     h2 and h3, headers, client,
                                              #     scheme, request IDs, framing,
+                                             #     streamed responses and events,
                                              #     errors, lifecycle hooks
 <venv>/bin/python scripts/webtransport-test.py # 46 sessions, streams, datagrams,
                                              #     closing, against `aioquic`
@@ -637,7 +641,7 @@ not run in CI.
 
 ## Not supported
 
-- **A stable handler API.** Streaming responses, WebSocket handlers, router values to merge, custom fallbacks, ready-made CORS and auth
+- **A stable handler API.** Streamed request bodies, WebSocket handlers, router values to merge, custom fallbacks, ready-made CORS and auth
   middleware, Redis, SQLite and a blocking pool are not there yet. See [HANDLER-API.md](HANDLER-API.md) and
   [GARUDA.md](GARUDA.md).
 - **Byte ranges, directory indexes and `Last-Modified` for `--static-dir`.** It

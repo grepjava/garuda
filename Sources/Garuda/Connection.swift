@@ -120,6 +120,9 @@ public struct ConnFlags: OptionSet, Sendable {
     /// silence rather than logged as answering twice, and `isCancelled` tells
     /// it so if it asks.
     public static let timedOut         = ConnFlags(rawValue: 1 << 21)
+    /// The head is sent and the body is still being written by the handler
+    /// (`Response.stream`). `responseComplete` joins it when the body ends.
+    public static let streamingResponse = ConnFlags(rawValue: 1 << 22)
 
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
@@ -127,7 +130,7 @@ public struct ConnFlags: OptionSet, Sendable {
     public static let perRequest: ConnFlags = [
         .owesContinue, .chunkedResponse, .responseStarted, .responseComplete,
         .suppressBody, .disconnected, .disconnectSent, .bodyDelivered,
-        .endStreamSent, .invalidatesCache, .timedOut,
+        .endStreamSent, .invalidatesCache, .timedOut, .streamingResponse,
     ]
 }
 
@@ -290,6 +293,9 @@ public struct Connection {
     public var h3Protocol = ByteBuffer()
     /// The WebTransport session this extended CONNECT became, if it became one.
     var wt: WTSession? = nil
+    /// A handler waiting for a streamed response's backlog to drain: resumed
+    /// with true when it has, false when the request ends first.
+    var writerWake: UnsafeContinuation<Bool, Never>? = nil
 
     /// True when this slot is one stream of a multiplexed connection rather
     /// than a connection in its own right.

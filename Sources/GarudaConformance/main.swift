@@ -13,6 +13,12 @@
 //   GET  /block/:ms              a handler that blocks the worker for ms
 //   GET  /stuck                  a handler that waits forever
 //   GET  /delay/:ms              200 after ms
+//   GET  /stream/:n/:size        a streamed body: n pieces of size bytes, piece
+//                                i filled with the letter i % 26 from a
+//   GET  /stream-throw           streams "partial", then throws
+//   GET  /stream-queued/:n/:size the same pieces as /stream, then a line with
+//                                the most bytes ever queued after a write
+//   GET  /events/:n              n server-sent events, "event i", 10 ms apart
 //   GET  /                       200, empty
 //
 // WebTransport, for scripts/webtransport-test.py:
@@ -290,6 +296,44 @@ app.get("/delay/:ms") { request, response in
     let ms = UInt64(min(5000, max(1, request.withParameter(0) { $0.integer } ?? 1)))
     response.after(milliseconds: ms) { _, response in
         response.send(status: 200)
+    }
+}
+
+app.get("/stream/:n/:size") { (n: Path<Int>, size: Path<Int>) async -> StreamingBody in
+    let count = min(max(n.value, 0), 4096)
+    let size = min(max(size.value, 0), 1 << 20)
+    return StreamingBody(contentType: "application/octet-stream") { body in
+        for i in 0..<count {
+            try await body.write([UInt8](repeating: UInt8(97 + i % 26), count: size))
+        }
+    }
+}
+
+app.get("/stream-queued/:n/:size") { (n: Path<Int>, size: Path<Int>) async -> StreamingBody in
+    let count = min(max(n.value, 0), 4096)
+    let size = min(max(size.value, 0), 1 << 20)
+    return StreamingBody(contentType: "application/octet-stream") { body in
+        var most = 0
+        for i in 0..<count {
+            try await body.write([UInt8](repeating: UInt8(97 + i % 26), count: size))
+            most = max(most, body.queuedBytes)
+        }
+        try await body.write("\nqueued \(most)")
+    }
+}
+
+app.onAsync(.get, "/stream-throw") { _, response in
+    try await response.stream(contentType: "text/plain").write("partial")
+    throw HandlerFailure()
+}
+
+app.get("/events/:n") { (n: Path<Int>) async -> EventStream in
+    let count = min(max(n.value, 0), 1000)
+    return EventStream { events in
+        for i in 0..<count {
+            try await events.send("event \(i)", id: "\(i)")
+            try await events.sleep(milliseconds: 10)
+        }
     }
 }
 

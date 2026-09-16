@@ -313,7 +313,13 @@ extension Worker {
 
     /// Answers the request on `slot` with `status`, the handler's headers and
     /// `count` bytes of `body`.
-    mutating func respond(_ slot: Int, status: Int, _ body: UnsafePointer<UInt8>?, _ count: Int) {
+    ///
+    /// `streaming` sends only the head, with no length unless the handler
+    /// declared one, and leaves the response open for `streamBody` to write
+    /// and `finishStreamingResponse` to end (StreamingResponse.swift). A
+    /// response that has no body to stream -- HEAD, 204, 304 -- is sent whole.
+    mutating func respond(_ slot: Int, status: Int, _ body: UnsafePointer<UInt8>?, _ count: Int,
+                          streaming: Bool = false) {
         let c = table[slot]
         guard c.pointee.state == .dispatching, !c.pointee.isParked,
               !c.pointee.flags.contains(.responseStarted) else {
@@ -321,7 +327,7 @@ extension Worker {
             return
         }
         if let hooks = takeSendHooks(slot) {
-            respond(slot, through: hooks, status: status, body, count)
+            respond(slot, through: hooks, status: status, body, count, streaming: streaming)
             return
         }
 
@@ -346,6 +352,9 @@ extension Worker {
             // A 304 keeps the length of the representation it stands for, when
             // the handler gave one; a 204 and a 1xx never have one.
             length = status == 304 ? declared : -1
+        } else if streaming {
+            // Nobody knows the length of a body that has not been written.
+            length = declared
         } else if declared >= 0 {
             length = declared
             if count > declared {
@@ -358,14 +367,19 @@ extension Worker {
         }
         // A HEAD response states the GET's length and sends none of it.
         if suppress { sending = 0 }
-        let misframed = !forbids && declared >= 0 && declared != count && !suppress
+        let misframed = !streaming && !forbids && declared >= 0 && declared != count && !suppress
+        // What a streamed body is held to as it is written, -1 for no limit.
+        let open = streaming && !forbids && !suppress
+        if open { c.pointee.responseRemaining = declared }
 
         if c.pointee.isH3Stream {
-            respondH3(slot, status: status, body, sending, length: length, short: short, kinds: kinds)
+            respondH3(slot, status: status, body, sending, length: length, short: short, kinds: kinds,
+                      open: open)
             return
         }
         if c.pointee.isStream {
-            respondH2(slot, status: status, body, sending, length: length, short: short, kinds: kinds)
+            respondH2(slot, status: status, body, sending, length: length, short: short, kinds: kinds,
+                      open: open)
             return
         }
 
@@ -387,16 +401,34 @@ extension Worker {
             if kind == .contentLength || kind == .transferEncoding || kind == .connection { return }
             _ = HTTPResponseWriter.writeHeader(&out.pointee, name: name, value: value)
         }
-        if length >= 0 { HTTPResponseWriter.writeContentLength(&out.pointee, length) }
+        if length >= 0 {
+            HTTPResponseWriter.writeContentLength(&out.pointee, length)
+        } else if open {
+            // An HTTP/1.0 client has no chunked framing, so the end of the
+            // body is the end of the connection.
+            if c.pointee.head.httpMinor >= 1 {
+                HTTPResponseWriter.writeChunkedEncoding(&out.pointee)
+                c.pointee.flags.insert(.chunkedResponse)
+            } else {
+                c.pointee.flags.remove(.keepAlive)
+            }
+        }
         HTTPResponseWriter.writeConnection(&out.pointee, keepAlive: c.pointee.flags.contains(.keepAlive))
         HTTPResponseWriter.endHead(&out.pointee)
         if sending > 0, let body { out.pointee.write(body, sending) }
+        if open {
+            // Still the handler's: the head goes now, and the body as it is
+            // written.
+            c.pointee.flags.insert(.streamingResponse)
+            _ = flush(slot)
+            return
+        }
         c.pointee.state = .writing
         _ = flush(slot)
     }
 
     mutating func respondH2(_ slot: Int, status: Int, _ body: UnsafePointer<UInt8>?, _ sending: Int,
-                            length: Int, short: Int, kinds: ResponseHeaderKind) {
+                            length: Int, short: Int, kinds: ResponseHeaderKind, open: Bool) {
         let c = table[slot]
         let parent = Int(c.pointee.parentSlot)
         guard parent >= 0, let h2 = table[parent].pointee.h2 else {
@@ -426,10 +458,15 @@ extension Worker {
                               value: value.count > 0 ? value.base : emptyH2Byte,
                               valueLength: value.count, into: &block)
         }
-        let endStream = sending == 0 && short == 0
+        let endStream = sending == 0 && short == 0 && !open
         writeHeaderBlock(slot, h2, block: &block, endStream: endStream)
         c.pointee.flags.insert(.responseStarted)
         logAccess(slot, status: status)
+        if open {
+            c.pointee.flags.insert(.streamingResponse)
+            _ = flush(parent)
+            return
+        }
         if endStream {
             c.pointee.flags.insert(.responseComplete)
             _ = flush(parent)
@@ -446,7 +483,7 @@ extension Worker {
     }
 
     mutating func respondH3(_ slot: Int, status: Int, _ body: UnsafePointer<UInt8>?, _ sending: Int,
-                            length: Int, short: Int, kinds: ResponseHeaderKind) {
+                            length: Int, short: Int, kinds: ResponseHeaderKind, open: Bool) {
         let c = table[slot]
         let parent = Int(c.pointee.parentSlot)
         guard parent >= 0, let h3 = table[parent].pointee.h3 else {
@@ -480,6 +517,11 @@ extension Worker {
         writeH3HeaderBlock(slot, h3, block: &block)
         c.pointee.flags.insert(.responseStarted)
         logAccess(slot, status: status)
+        if open {
+            c.pointee.flags.insert(.streamingResponse)
+            flushQUIC(parent)
+            return
+        }
         if sending == 0 && short == 0 {
             c.pointee.flags.insert(.responseComplete)
             c.pointee.flags.insert(.endStreamSent)
