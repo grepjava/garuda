@@ -163,6 +163,23 @@ public struct Connection {
     /// may answer it. A request on a task is answered by that task, from
     /// whichever wait it resumes, so it does not count.
     var isParked: Bool { contState == .waiting && contKind != .task }
+
+    /// Forgets every field a continuation uses, for a slot being made ready
+    /// to carry a fresh request.
+    ///
+    /// This only forgets a continuation; cancelling a live one, which has an
+    /// op to unlink and a task to unwind, is `cancelOps`. HTTP/2 and HTTP/3
+    /// make a stream slot ready by hand rather than through `beginRequest`,
+    /// so a field added to a continuation is missed by both unless it is
+    /// added here.
+    mutating func resetContinuation() {
+        contState = .none
+        contKind = .none
+        contOp = -1
+        contHandler = nil
+        contTask = -1
+        contAsyncHandler = nil
+    }
     /// The request's typed context, made when a handler first stores a value.
     var context: RequestContext? = nil
     /// The status `Response.send` uses when it is not given one.

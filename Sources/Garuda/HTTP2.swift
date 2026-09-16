@@ -908,12 +908,7 @@ extension Worker {
         s.pointee.bodyReceived = 0
         s.pointee.requestCount = 1
         s.pointee.requestId &+= 1
-        s.pointee.contState = .none
-        s.pointee.contKind = .none
-        s.pointee.contOp = -1
-        s.pointee.contHandler = nil
-        s.pointee.contTask = -1
-        s.pointee.contAsyncHandler = nil
+        s.pointee.resetContinuation()
         s.pointee.context = nil
         s.pointee.handlerStatus = 200
         s.pointee.responseHeaders = ByteBuffer()
