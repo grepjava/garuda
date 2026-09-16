@@ -117,6 +117,12 @@ public struct Worker {
     /// async request, and how many there may be.
     var handlerTasks: HandlerTaskPool? = nil
     var handlerTaskLimit = 1024
+    /// Connections this worker made rather than accepted (Outbound.swift),
+    /// made on the first one. A server that never calls out pays nothing.
+    /// Deliberately not in `table`: a pooled one would keep a draining worker
+    /// from ever looking quiescent.
+    var outbound: OutboundTable? = nil
+    var outboundLimit = 256
 
     public init(config: ServerConfig, listenFD: Int32, poller: Poller) {
         self.config = config
@@ -152,6 +158,10 @@ public struct Worker {
             handlerTasks = nil
         }
         closeScrapes()
+        // Sockets this worker made are its own to close; nothing else will.
+        closeAllOutbound()
+        outbound?.destroy()
+        outbound = nil
         quic?.destroy()
         headers.deallocate()
         deferredFlush.deallocate()
@@ -213,6 +223,12 @@ public struct Worker {
             default:
                 if let pending = PollToken.metricsPendingIndex(token) {
                     handleScrapeReadable(pending)
+                    continue
+                }
+                // A connection this worker made, not one it accepted: a
+                // different table, and no request behind it yet.
+                if PollToken.isOutbound(token) {
+                    handleOutboundEvent(token, mask)
                     continue
                 }
                 let slot = PollToken.slot(token)

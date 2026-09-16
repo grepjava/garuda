@@ -62,6 +62,28 @@ int pg_listen_unix(const char *path, int backlog, int unlink_existing);
  * printable address and `peer_port`. Returns fd, or -1 with errno. */
 int pg_accept(int lfd, char *peer, size_t peer_len, uint16_t *peer_port);
 
+/* Starts a TCP connection and returns at once. The socket is non-blocking and
+ * close-on-exec, so the caller waits for writability and then asks
+ * `pg_connect_error` how it went.
+ *
+ * `host` must be an IPv4 or IPv6 literal: this resolves nothing, because
+ * getaddrinfo blocks, and blocking a worker is the one thing an outbound
+ * connection on the event loop exists to avoid. A name is EINVAL, and naming
+ * is a layer above this one.
+ *
+ * Returns fd with *in_progress set to 1 when the connection is still being
+ * made -- the usual case -- or 0 when it completed immediately, which happens
+ * on loopback. Returns -1 with errno on a real failure. */
+int pg_connect_tcp(const char *host, uint16_t port, int *in_progress);
+
+/* The same for a unix socket, which also usually completes at once. */
+int pg_connect_unix(const char *path, int *in_progress);
+
+/* SO_ERROR: 0 when the connection is up, otherwise the errno that stopped it.
+ * A non-blocking connect reports its outcome here and nowhere else -- the
+ * socket simply becomes writable either way. */
+int pg_connect_error(int fd);
+
 int pg_set_nonblock(int fd);
 int pg_set_nodelay(int fd, int on);
 int pg_set_cloexec(int fd);

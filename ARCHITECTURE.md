@@ -338,6 +338,20 @@ waiting for -- because the case it exists for is a handler that is not
 waiting at all. Firing answers 504 and sets `.timedOut`, which makes the
 request no longer the handler's to speak for.
 
+**Connections the worker makes** (`Outbound.swift`) go on the same poller and
+the same thread as the ones it accepts, so that the HTTP client and the
+database drivers never open a socket of their own. They are a separate
+fixed-capacity slab, not connection slots: a pooled outbound connection is
+idle for minutes, and `quiescent` is `table.liveCount == 0`, so one parked
+there would keep a draining worker from ever looking finished. Their poller
+tokens carry bit 62, which a slot token never reaches -- a `UInt32` generation
+shifted up 24 stops below 2^56 -- and which the singleton tokens at `.max - n`
+do not use, so the two namespaces need nothing of each other. A connect
+reports both outcomes the same way, by becoming writable, so `SO_ERROR` is
+what says which happened. The wait is bounded by an op of its own `OpKind`,
+recognised in `completeTimerOp` before anything reads a connection with it:
+its slot is an index into the outbound table, not the connection table.
+
 **`AsyncOpPool`** is a fixed-capacity slab of `AsyncOp` records (one per
 possible connection) with a free list. Each record has a generation bumped on
 allocate, and stores its slot, the `requestId` it was armed for, its kind

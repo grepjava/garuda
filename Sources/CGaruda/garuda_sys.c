@@ -246,6 +246,74 @@ int pg_listen_unix(const char *path, int backlog, int unlink_existing) {
     return fd;
 }
 
+int pg_connect_tcp(const char *host, uint16_t port, int *in_progress) {
+    if (in_progress) *in_progress = 0;
+    if (!host || !host[0]) { errno = EINVAL; return -1; }
+
+    char portbuf[8];
+    snprintf(portbuf, sizeof portbuf, "%u", (unsigned)port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    /* NUMERICHOST is the point: with it getaddrinfo parses and returns, and
+     * never goes near the resolver, a file or the network. */
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, portbuf, &hints, &res) != 0) { errno = EINVAL; return -1; }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { int s = errno; freeaddrinfo(res); errno = s; return -1; }
+    pg_set_nonblock(fd);
+    pg_set_cloexec(fd);
+
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    int saved = errno;
+    freeaddrinfo(res);
+    if (rc == 0) return fd;
+    if (saved == EINPROGRESS || saved == EINTR) {
+        if (in_progress) *in_progress = 1;
+        return fd;
+    }
+    close(fd);
+    errno = saved;
+    return -1;
+}
+
+int pg_connect_unix(const char *path, int *in_progress) {
+    if (in_progress) *in_progress = 0;
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    size_t n = strlen(path);
+    if (n >= sizeof sa.sun_path) { errno = ENAMETOOLONG; return -1; }
+    memcpy(sa.sun_path, path, n);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    pg_set_nonblock(fd);
+    pg_set_cloexec(fd);
+
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0) return fd;
+    int saved = errno;
+    if (saved == EINPROGRESS || saved == EINTR) {
+        if (in_progress) *in_progress = 1;
+        return fd;
+    }
+    close(fd);
+    errno = saved;
+    return -1;
+}
+
+int pg_connect_error(int fd) {
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) return errno;
+    return err;
+}
+
 static void fill_peer(const struct sockaddr_storage *ss, socklen_t slen,
                       char *peer, size_t peer_len, uint16_t *port) {
     if (peer && peer_len) peer[0] = 0;

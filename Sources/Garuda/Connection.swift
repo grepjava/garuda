@@ -375,6 +375,23 @@ public enum PollToken {
         return Int(token &- metricsPendingBase)
     }
 
+    /// Marks a token as an outbound connection's rather than a slot's.
+    ///
+    /// A slot token is a `UInt32` generation shifted up 24, so it never
+    /// reaches 2^56; the singletons above sit at `.max - n`. Bit 62 is free of
+    /// both, so it tells the two namespaces apart without touching either.
+    public static let outboundBit: UInt64 = 1 << 62
+
+    @inlinable
+    public static func outbound(index: Int, generation: UInt32) -> UInt64 {
+        outboundBit | (UInt64(generation) << slotBits) | UInt64(index)
+    }
+
+    @inlinable
+    public static func isOutbound(_ token: UInt64) -> Bool {
+        token & outboundBit != 0
+    }
+
     public static let slotBits: UInt64 = 24
     public static let slotMask: UInt64 = (1 << 24) - 1
 

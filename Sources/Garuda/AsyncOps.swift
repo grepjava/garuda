@@ -35,6 +35,10 @@ public enum OpKind: UInt8 {
     /// rather than `contOp`, and `completeTimerOp` has to recognise it before
     /// deciding there is nothing to resume.
     case deadline
+    /// Bounds an outbound connection coming up (Outbound.swift). Its `slot` is
+    /// an index into the outbound table, not the connection table, so it has
+    /// to be recognised before anything reads a connection with it.
+    case outbound
 }
 
 public struct AsyncOp {
@@ -464,6 +468,20 @@ extension Worker {
         asyncOps.free(index)
 
         if cancelled { return }
+        if kind == .outbound {
+            // `slot` indexes the outbound table. Reading a connection with it
+            // would be reading an unrelated request.
+            //
+            // The handle goes first: this op has just been freed, and `free`
+            // does not bump its generation, so a disarm still holding this
+            // index would match and free it a second time.
+            if let table = outbound, slot >= 0, slot < table.capacity {
+                table[slot].pointee.timerOp = -1
+                table[slot].pointee.timerOpGeneration = 0
+            }
+            settleOutbound(slot, .timedOut)
+            return
+        }
         let c = table[slot]
         if c.pointee.state == .free { return }
         if c.pointee.requestId != requestId { return }
