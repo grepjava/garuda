@@ -17,14 +17,13 @@
 Garuda was forked from Peregrine, a Python ASGI/WSGI server. The engine was
 kept. CPython, ASGI, WSGI and the Python package were removed.
 
-**Status: the handler API is early and will change.** In the tree: routes, a
-request view with its headers and whole body, one-shot responses, a timer
-continuation, Garuda's own JSON coder, typed answers and errors, typed
-extraction of path parameters, query strings, JSON bodies, forms and multipart
-uploads, and typed per-worker state. Handlers are still synchronous, and there
-is no middleware, streaming, WebSocket or WebTransport handler yet. It is useful for evaluating the engine:
-its protocols, TLS, operational behaviour and raw throughput. It is not yet a
-stable way to serve your own application. [HANDLER-API.md](HANDLER-API.md) holds the design and
+**Status: the handler API is early and will change.** In the tree: routes and
+groups, synchronous and async handlers, middleware before a handler and hooks on
+its response, typed extraction and answers, per-worker state, deadlines, an HTTP
+client and a native PostgreSQL driver on the worker's poller. There is no
+streaming, WebSocket or WebTransport handler yet. [Garuda and
+axum](#garuda-and-axum) compares it feature by feature with the framework it
+aims to beat. It is not yet a stable way to serve your own application. [HANDLER-API.md](HANDLER-API.md) holds the design and
 roadmap, and [GARUDA.md](GARUDA.md) is the authoritative status document.
 
 ```bash
@@ -134,9 +133,8 @@ HEAD responses, adds the server's headers unless the handler set its own
 a declared `Content-Length`. A handler that throws, or returns without
 answering or waiting, gets a 500.
 
-The API is not stable. Handlers are synchronous, and suspension is only the
-timer continuation. There is no middleware, 405, streaming, WebSocket or
-WebTransport handler yet.
+The API is not stable. There is no streaming, WebSocket or WebTransport handler
+yet, and [Garuda and axum](#garuda-and-axum) lists what else is still to come.
 [HANDLER-API.md](HANDLER-API.md) has the roadmap.
 
 ### What the binary serves
@@ -160,6 +158,168 @@ prefix is taken off the path before routing.
 Server features that act before dispatch still apply in front of the routes:
 `--health-check-path`, `--rate-limit`, `--static-dir`, `--redirect-http`,
 `--hsts`, `--request-id`, `--trace-context`, the access log and metrics.
+
+## Garuda and axum
+
+Garuda's target is [axum](https://github.com/tokio-rs/axum): as quick to write
+an API in, and faster serving it. This is where it stands against axum on
+Tokio, feature by feature.
+
+| Feature area | axum (Tokio, Rust) | Garuda today | Status |
+|---|---|---|---|
+| Route dispatch | Every handler is a future the runtime polls | A synchronous handler is a direct call on the worker thread, no allocation | Delivered |
+| Async handlers | `async fn` on a work-stealing pool | `async` closures on the worker's own reused tasks; none allocated per request once warm | Delivered |
+| Typed extraction | `Path<T>`, `Query<T>`, `Json<T>` | `Path<T>`, `Query<T>`, `Body<T>` | Delivered |
+| Forms and uploads | `Form<T>`, `Multipart` | `Form<T>`, `Multipart`, read whole up to `--max-body` | Delivered; streaming uploads in step 5 |
+| Custom extractors | `FromRequestParts`, `FromRequest` | `RequestExtractor` | Delivered |
+| Application state | `State<T>`, one `Arc` shared by every thread | `State<T>`, built once in each worker process | Delivered, [differs](#one-process-per-worker) |
+| Request-scoped values | `Extension<T>` | `request[context: Key.self]`, `Context<Key>` | Delivered |
+| Errors as responses | `IntoResponse` on the error | `ResponseError`, `HTTPError` | Delivered |
+| Protocols | HTTP/1.1 and HTTP/2 through hyper | HTTP/1.1, HTTP/2 and HTTP/3 over QUIC | Delivered |
+| TLS and certificates | rustls or OpenSSL through `axum-server`; ACME from another crate | Built in, with ACME | Delivered |
+| Nesting and 405 | `nest`, `merge`, 405 with `Allow` | `group(prefix)`, nested; 405 with `Allow` | Partial: no router values to merge, no custom fallback (step 4) |
+| Middleware | Tower layers that wrap the handler | `use` before the handler, sync or async; `response.onSend` to change the response | Delivered, [differs](#middleware-does-not-wrap-the-handler) |
+| Ready-made middleware | tower-http: CORS, compression, tracing, timeouts, limits | Server flags: compression, rate limits, request IDs, trace context, access log, body limits; `app.deadline` for timeouts. No CORS or auth middleware yet | Partial (step 4) |
+| Streaming and SSE | Body streams, `Sse` | Buffered, one-shot responses only | Step 5 |
+| WebSockets | `WebSocketUpgrade` | Engine stubs, answered 501 | Step 5 |
+| Outbound DNS | Tokio's resolver or hickory | A resolver on the worker's poller: UDP with TCP fallback, TTL cache | Delivered |
+| HTTP client | reqwest | `request.client` on the worker's poller: HTTP/1.1, and HTTP/2 shared per origin when TLS negotiates it | Delivered; no redirects or decompression |
+| PostgreSQL | sqlx, tokio-postgres | A native driver: SCRAM, TLS, a pool per worker with an acquire deadline, rows into `Decodable` types, transactions, prepared statements kept per connection, binary values | Delivered |
+| UUIDs and timestamps | `uuid`, `chrono` or `time` | `UUID`, `Timestamp`, no Foundation | Delivered |
+| Redis, SQLite | redis-rs, sqlx | None yet | Step 3 |
+| Blocking work | `spawn_blocking` | None yet | Step 3 |
+| Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine over a socket pair | Delivered |
+
+Speed, on the benchmark machine at the end of step 3 (`benchmarks/vs-axum.sh`,
+64 connections): Garuda served 1.71× axum's requests a second on the suite's
+ramp, 1.22× closed-loop and 1.21× pinned to one core, at under half axum's p99
+closed-loop. [BENCHMARKS.md](BENCHMARKS.md#against-axum-quick-comparison) has the
+method.
+
+### Where Garuda differs, and why
+
+Each of these is a decision, not an omission. Each says what it costs you and
+what to do instead.
+
+#### Middleware does not wrap the handler
+
+In axum, a Tower layer receives the request and a `next`, awaits the handler,
+and gets its response back as a value to inspect or replace. Garuda's
+middleware runs **before** the handler, and sees the response through a hook:
+
+```swift
+app.use { request, response in                      // before: refuse, or carry on
+    guard request.header("authorization") != nil else { return HTTPStatus.unauthorized }
+    response.onSend { outgoing in                   // after: see and change the answer
+        outgoing.addHeader("access-control-allow-origin", "*")
+        if outgoing.status.code >= 500 { try? outgoing.replaceBody(json: ["error": "internal"]) }
+    }
+    return nil
+}
+```
+
+**Why.** A Garuda handler does not return a response value. It writes its
+answer into the engine's response path, straight into the connection's buffer,
+and an async handler does so whenever it finishes. For a `next` to hand a
+response back to the middleware, every response would first have to be built
+as an owned value and copied out later. That copy on every request is what
+Garuda's lead over axum is made of, so the hook runs instead at the one point
+every answer passes through. It runs before a byte of the head is written, and
+it sees the status, headers and body there. Routes that register no hook pay
+one pointer check.
+
+**What you get.** The hook runs for every way a request is answered: the
+handler, an async handler seconds later, a middleware's refusal, a thrown
+error, the 500 for a handler that said nothing, and a deadline's 504. That is
+what CORS, security headers, timing, access logs and a uniform error body need.
+Hooks run once, the last added first, so the middleware that ran first sees the
+response last, as layers nest.
+
+**What it costs.** A middleware cannot run the handler itself. That rules out:
+
+- retrying the handler;
+- holding a scope open around the handler's run;
+- using Tower's ecosystem, which does not exist in Swift anyway.
+
+**Instead:**
+
+- Retry inside the handler, or in the database layer. `pool.transaction` is
+  where a serialization failure should be retried, and the driver already
+  re-prepares a statement the server dropped.
+- For a timeout, use `app.deadline(milliseconds:)`, which answers 504 and
+  unwinds a waiting handler.
+- For request-scoped data, have the middleware store it with
+  `request[context: Key.self]` and the handler ask for `Context<Key>`.
+- Hooks do not run for static files, `--cache-size` hits or the 404 before any
+  route matches. Those are served by the engine, not by a route.
+
+#### Middleware covers its whole scope, wherever `use` is called
+
+In axum, a `layer` applies only to the routes added before it. Moving one line
+leaves a route unguarded, and nothing warns you. In Garuda, `use` covers every
+route in its group or the application, whether it is called before or after
+them. The order of `use` calls within a scope is the order they run.
+**Instead:** a route that must skip a middleware goes outside the group that
+uses it.
+
+#### One process per worker
+
+axum runs one process with threads that share memory, so `State<T>` is one
+value behind an `Arc`. A Garuda worker is a process with one thread. `app.state`
+builds a value in each worker after the fork, so a pool, a client or a cache
+belongs to that worker alone.
+
+**Why.** Nothing is shared, so nothing is locked, and a request never waits on
+another worker's lock. A worker that crashes takes only its own connections with
+it. The supervisor can replace workers one at a time for a zero-downtime reload.
+
+**What it costs.** A counter or cache in memory is per worker, not global. A
+database pool of 8 is 8 connections a worker.
+
+**Instead:** keep state every worker must see where it belongs anyway, in
+PostgreSQL or another store. Size `maxConnections` as the total you want
+divided by `--workers`.
+
+#### A handler that computes without awaiting holds its worker
+
+Tokio moves tasks between threads, so one busy task delays others less. A
+Garuda worker is one thread. An async handler yields at every `await`, but a
+loop that never awaits holds the worker until it ends. A deadline bounds
+*waiting*, not computing.
+
+**Why.** Staying on one thread is what lets a request run inline with no
+scheduling hop and no cross-thread handoff.
+
+**Instead:** run more workers than cores are busy, and keep CPU-heavy work
+short. A bounded pool for blocking work, like `spawn_blocking`, is on the
+roadmap (step 3).
+
+#### Request bytes are lent, not owned
+
+axum hands a handler an owned `Request`. Garuda's `Request` is `~Copyable` and
+lends its bytes to a closure as a `Span`, which the compiler keeps from being
+stored. Reading a path, header or body this way copies nothing.
+
+**Instead:** when you need to keep a value, ask for the owned copy: `path`,
+`header(_:)`, `body`. Typed extractors already produce owned values.
+
+#### No Foundation
+
+Garuda links the Swift standard library, not Foundation, so it brings its own
+JSON coder (`JSONCoder`), `UUID` and `Timestamp`. JSON decoding reads only the
+keys a type asks for, straight from the request's bytes.
+
+**Instead:** if your code imports Foundation too, write `Garuda.UUID` where both
+types are in scope.
+
+#### PostgreSQL prepares statements on its own
+
+Like sqlx, each connection keeps the statements it has run prepared, up to
+`statementCacheCapacity` (256). Unlike sqlx, you don't opt in per query. A
+statement's second run skips parsing and planning and reads bools, integers,
+floats, bytea, UUIDs and timestamps in binary. The first run is text.
+**Instead:** behind PgBouncer in transaction pooling mode, set
+`statementCacheCapacity = 0`.
 
 ---
 
@@ -475,9 +635,9 @@ not run in CI.
 
 ## Not supported
 
-- **A stable handler API.** Asynchronous handlers, typed extraction, JSON,
-  middleware, 405, streaming responses, and WebSocket or WebTransport handlers
-  are not there yet. See [HANDLER-API.md](HANDLER-API.md) and
+- **A stable handler API.** Streaming responses, WebSocket and WebTransport
+  handlers, router values to merge, custom fallbacks, ready-made CORS and auth
+  middleware, Redis, SQLite and a blocking pool are not there yet. See [HANDLER-API.md](HANDLER-API.md) and
   [GARUDA.md](GARUDA.md).
 - **Byte ranges, directory indexes and `Last-Modified` for `--static-dir`.** It
   serves assets with an `ETag`; it is not a file server.
