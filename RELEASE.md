@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 650 unit tests
+swift test                             # 659 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -173,8 +173,8 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
 - The `garuda` binary serves the-benchmarker's contract through that API:
   `GET /` → 200, empty body; `GET /user/:id` → 200, the id as the body;
   `POST /user` → 200, empty body; `GET /delay/:ms` → 200 after a timer. HEAD is
-  answered wherever GET is; anything else is 404. The hand-written router
-  (`Router.swift`) is gone.
+  answered wherever GET is; a known path under another method is 405, and any
+  other path is 404. The hand-written router (`Router.swift`) is gone.
 - `--request-start-header` is read by handlers as `request.requestStart`, and
   `--scheme` is the scheme `request.scheme` falls back to.
 - Waiting work runs on a worker-owned async substrate: request continuations
@@ -294,13 +294,17 @@ is `request.client`.
   matched as it came, as behind a proxy that has already taken the prefix off.
 - `--no-websockets` refuses an upgrade with 501 before anything else can answer
   it.
+- A path that has a route under some other method is answered 405, with an
+  `Allow` header naming every method that would have matched, rather than 404.
+  A path no method routes is still 404.
 
 ### Not yet
 
 - WebSocket and WebTransport application APIs are stubs. HTTP/3 still
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
-- The handler API's later steps: there is no middleware, no 405, no streaming
-  response, and no WebSocket or WebTransport handler.
+- The handler API's later steps: there is no middleware, no router nesting or
+  custom fallback, no streaming response, and no WebSocket or WebTransport
+  handler.
 - PostgreSQL has no binary formats, no `LISTEN`, and does not
   SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
   written. The HTTP client does not follow redirects and sends no

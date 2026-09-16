@@ -183,6 +183,25 @@ public struct CompiledRoutes {
         return walk(0, path, 0, count, Int(HTTPMethod.get.rawValue), &parameters)
     }
 
+    /// Every method `path` has a route for, in a fixed order, for the `Allow`
+    /// of a 405. Empty means no route under any method: a 404.
+    ///
+    /// Asked of `match` once per method rather than read off one trie node,
+    /// because a path can reach different routes for different methods --
+    /// `GET /users/me` may fall through a literal `/users/me` that only takes
+    /// POST to `/users/:id`, which takes GET. The union of what each method
+    /// actually matches is the only `Allow` that is true. Only a miss pays
+    /// for it.
+    public func allowedMethods(_ path: UnsafePointer<UInt8>, _ count: Int,
+                               into parameters: inout RouteParameters) -> [HTTPMethod] {
+        var allowed: [HTTPMethod] = []
+        for method in [HTTPMethod.get, .head, .post, .put, .delete, .patch, .options, .connect, .trace]
+            where match(method, path, count, into: &parameters) >= 0 {
+            allowed.append(method)
+        }
+        return allowed
+    }
+
     /// `at` is the "/" before the next segment, or `count` when the path is
     /// used up.
     @usableFromInline

@@ -118,7 +118,29 @@ extension Worker {
         if route < 0 {
             // No route is an ordinary answer, not a failure: the connection
             // stays open for the next request.
-            respond(slot, status: 404, nil, 0)
+            //
+            // A path some other method would have matched is a 405, and says
+            // which methods in Allow -- RFC 9110 requires the header, and a
+            // client told only "not found" goes looking for a URL that exists.
+            let allowed = installed.pointee.routes.allowedMethods(base, count,
+                                                                  into: &c.pointee.routeParameters)
+            guard !allowed.isEmpty else {
+                respond(slot, status: 404, nil, 0)
+                return
+            }
+            var value = ""
+            for method in allowed {
+                guard let token = method.token else { continue }
+                if !value.isEmpty { value += ", " }
+                value += "\(token)"
+            }
+            let name: StaticString = "Allow"
+            var bytes = value
+            bytes.withUTF8 { v in
+                _ = addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
+                                      ByteSpan(v.baseAddress!, v.count))
+            }
+            respond(slot, status: 405, nil, 0)
             return
         }
         c.pointee.routeOffset = Int32(truncatingIfNeeded: base - headBase)

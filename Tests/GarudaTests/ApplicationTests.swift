@@ -80,6 +80,40 @@ struct ApplicationTests {
         #expect(response.status == 404)
     }
 
+    @Test func aKnownPathUnderTheWrongMethodIs405WithAllow() throws {
+        // /echo takes POST only. Told "not found", a client goes looking for a
+        // URL that exists; told 405 and Allow, it knows what to send instead.
+        let response = try sample().test.request("DELETE", "/echo")
+        #expect(response.status == 405)
+        #expect(response.header("allow") == "POST")
+    }
+
+    @Test func allowIncludesHeadWhereGetIsRouted() throws {
+        let response = try sample().test.request("PUT", "/user/42")
+        #expect(response.status == 405)
+        #expect(response.header("allow") == "GET, HEAD")
+    }
+
+    @Test func allowIsTheUnionOfWhatEachMethodActuallyMatches() throws {
+        // PUT /users/me reaches a literal route that takes POST only, and a
+        // parameter route beside it that takes GET. A method-by-method match
+        // falls through the literal to the parameter for GET, so Allow must
+        // name both -- reading only the literal node would leave GET out and
+        // tell the client something false.
+        let app = Application()
+        app.post("/users/me") { _, response in response.send(status: 200) }
+        app.get("/users/:id") { _, response in response.send(status: 200) }
+        let response = try app.test.request("PUT", "/users/me")
+        #expect(response.status == 405)
+        #expect(response.header("allow") == "GET, HEAD, POST")
+    }
+
+    @Test func aPathNoMethodRoutesIsStill404() throws {
+        let response = try sample().test.request("DELETE", "/nowhere")
+        #expect(response.status == 404)
+        #expect(response.header("allow") == nil)
+    }
+
     @Test func headIsAnsweredWhereGetIs() throws {
         let response = try sample().test.head("/user/42")
         #expect(response.status == 200)
