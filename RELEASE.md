@@ -31,7 +31,7 @@ first argument, defaulting to `.build/release/garuda`
 
 ```bash
 swift build -c release
-swift test                             # 288 unit tests
+swift test                             # 489 unit tests
 bash scripts/compile-fail-test.sh      # 6, after swift build
 bash scripts/static-test.sh            # 42
 bash scripts/ratelimit-test.sh         # 18
@@ -186,6 +186,56 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
   its body, `/delay/:ms` after its timer. A stream cancelled while it waits
   takes its timer with it.
 
+### A handler API, second phase: handlers that wait
+
+- Handlers can await. A typed route takes an `async throws` closure under the
+  same names as a synchronous one — `app.get("/report") { (id: Path<Int>) async
+  in … }` — and `app.onAsync(.get, "/report") { request, response in … }` is
+  the raw form. An `await` resumes on the worker's own thread, so an async
+  handler sees the same request and response a synchronous one does.
+- `app.deadline(milliseconds:)` gives every route registered inside it a
+  deadline: a request still unanswered that long after dispatch is answered
+  504, and a handler waiting on the engine is unwound. It bounds **waiting,
+  not computing** — a worker is one thread, so a handler that loops without
+  awaiting still stops its worker. Nested calls apply the innermost.
+- An answer to a request that has gone is dropped rather than written, so a
+  handler that finishes after its connection closed or its stream was reset
+  cannot write into the next request that took the slot.
+
+### Connections the server makes
+
+Ground for an HTTP client and the database drivers. None of it is public API
+yet: a handler cannot open a connection or make a request of its own.
+
+- A worker opens outbound connections on its own poller, so a handler waiting
+  on one waits the way it waits for anything else — one thread, one place
+  where a descriptor becoming ready resumes a handler. They live in a slab of
+  their own rather than the connection table, because a draining worker
+  holding an idle outbound connection there would never look finished.
+- Connections are kept for the next caller wanting the same place, and watched
+  while they wait, so a peer that hangs up is noticed then rather than by the
+  unlucky caller who takes it next. A connection is only ever reused for the
+  same destination *and* the same verification identity.
+- Outbound TLS verifies the peer: the certificate is checked against the name
+  asked for, with SNI sent and the trust store configurable per connection. A
+  TLS 1.3 session ticket arriving on an idle pooled connection is recognised
+  as a ticket rather than mistaken for the peer going away.
+- Names are resolved on the poller rather than through `getaddrinfo`, which
+  blocks. Garuda reads the system's nameservers, search list and `ndots` from
+  `resolv.conf`, asks over UDP, asks again over TCP when an answer will not
+  fit, keeps answers for as long as their TTL allows, and refuses an answer to
+  a question it did not ask. Connecting to a name tries every address the
+  answer carried, in the order the server gave them.
+- The pieces an HTTP client is made of: a response-head parser, a request
+  writer, and a URL splitter. The parser frames a response body by what was
+  asked and by the status before it believes any field, so a response to HEAD
+  and a 204 carry no body whatever they declare. The writer refuses, rather
+  than escapes, anything that could split a request, and owns Host,
+  Content-Length, Transfer-Encoding and Connection rather than letting a
+  caller supply a second one. The URL splitter refuses userinfo outright:
+  `https://a@b/` names host `b` and reads as `a`, and that gap is the whole of
+  an attack.
+
 ### Changed
 
 - `--reload` watches the executable, not Python sources. Once a rebuild holds
@@ -203,9 +253,12 @@ Garuda, forked from Peregrine at 6200167 on 2026-09-14.
 
 - WebSocket and WebTransport application APIs are stubs. HTTP/3 still
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
-- The handler API's later steps: handlers are synchronous with only the timer
-  continuation to suspend on, and there is no typed extraction, JSON,
-  middleware, 405, streaming response, or WebSocket or WebTransport handler.
+- The handler API's later steps: there is no middleware, no 405, no streaming
+  response, and no WebSocket or WebTransport handler.
+- Nothing a handler can call reaches another service. The connections, names
+  and TLS below are the ground an HTTP client and the database drivers are
+  being built on; none of that is public API yet, and a handler cannot make a
+  request of its own.
 - `--compress` and `--cache-size` act on no handler response; they wait for
   streaming responses.
 - TLS is OpenSSL, not Swift.
