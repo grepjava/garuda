@@ -56,6 +56,12 @@ void pg_hash_free(pg_hash_ctx *ctx);
 int pg_hmac(int alg, const void *key, size_t key_len,
             const void *data, size_t data_len, unsigned char *out);
 
+/* PBKDF2 (RFC 8018) over HMAC with `alg`, writing `out_len` bytes. SCRAM's
+ * Hi() is exactly this with one output block. 0 on success. */
+int pg_pbkdf2(int alg, const void *password, size_t password_len,
+              const void *salt, size_t salt_len, unsigned iterations,
+              unsigned char *out, size_t out_len);
+
 /* RFC 5869. `salt` may be NULL, which means a string of zeros. Writes exactly
  * pg_hash_len(alg) bytes. */
 int pg_hkdf_extract(int alg, const void *salt, size_t salt_len,

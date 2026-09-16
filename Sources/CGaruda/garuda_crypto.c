@@ -40,6 +40,10 @@ void pg_hash_free(pg_hash_ctx *c) { (void)c; }
 int pg_hmac(int a, const void *k, size_t kl, const void *d, size_t dl, unsigned char *o) {
     (void)a; (void)k; (void)kl; (void)d; (void)dl; (void)o; return -1;
 }
+int pg_pbkdf2(int a, const void *p, size_t pl, const void *s, size_t sl, unsigned i,
+              unsigned char *o, size_t ol) {
+    (void)a; (void)p; (void)pl; (void)s; (void)sl; (void)i; (void)o; (void)ol; return -1;
+}
 int pg_hkdf_extract(int a, const void *s, size_t sl, const void *i, size_t il, unsigned char *o) {
     (void)a; (void)s; (void)sl; (void)i; (void)il; (void)o; return -1;
 }
@@ -193,6 +197,17 @@ int pg_hmac(int alg, const void *key, size_t key_len,
         return -1;
     }
     return (int)len;
+}
+
+int pg_pbkdf2(int alg, const void *password, size_t password_len,
+              const void *salt, size_t salt_len, unsigned iterations,
+              unsigned char *out, size_t out_len) {
+    const EVP_MD *md = md_for(alg);
+    if (!md || iterations == 0) return -1;
+    static const char empty = 0;
+    const char *p = password_len ? (const char *)password : &empty;
+    return PKCS5_PBKDF2_HMAC(p, (int)password_len, (const unsigned char *)salt, (int)salt_len,
+                             (int)iterations, md, (int)out_len, out) == 1 ? 0 : -1;
 }
 
 int pg_hkdf_extract(int alg, const void *salt, size_t salt_len,
