@@ -54,6 +54,13 @@ int pg_tls_ctx_names(pg_tls_ctx *ctx, int host_index, int name_index,
 }
 void pg_tls_ctx_free(pg_tls_ctx *ctx) { (void)ctx; }
 pg_tls *pg_tls_new(pg_tls_ctx *ctx, int fd) { (void)ctx; (void)fd; return NULL; }
+pg_tls_ctx *pg_tls_client_ctx_new(const char *ca_file, const char *alpn,
+                                  char *err, size_t err_len) {
+    (void)ca_file; (void)alpn; (void)err; (void)err_len; return NULL;
+}
+pg_tls *pg_tls_client_new(pg_tls_ctx *ctx, int fd, const char *hostname) {
+    (void)ctx; (void)fd; (void)hostname; return NULL;
+}
 void pg_tls_free(pg_tls *tls) { (void)tls; }
 int pg_tls_handshake(pg_tls *tls, char *err, size_t err_len) {
     (void)tls; (void)err; (void)err_len; return -2;
@@ -71,6 +78,7 @@ long pg_tls_sendfile(pg_tls *tls, int fd, long offset, long n) {
     (void)tls; (void)fd; (void)offset; (void)n; errno = EPIPE; return -1;
 }
 int pg_tls_pending(pg_tls *tls) { (void)tls; return 0; }
+int pg_tls_idle_ok(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_wants_write(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_is_h2(pg_tls *tls) { (void)tls; return 0; }
 int pg_tls_is_acme(pg_tls *tls) { (void)tls; return 0; }
@@ -547,6 +555,105 @@ void pg_tls_ctx_free(pg_tls_ctx *wrapper) {
     free(wrapper);
 }
 
+pg_tls_ctx *pg_tls_client_ctx_new(const char *ca_file, const char *alpn,
+                                  char *err, size_t err_len) {
+    struct pg_tls_ctx *wrapper = calloc(1, sizeof *wrapper);
+    if (!wrapper) {
+        if (err && err_len) snprintf(err, err_len, "out of memory");
+        return NULL;
+    }
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        last_error(err, err_len, "cannot create a TLS client context");
+        free(wrapper);
+        return NULL;
+    }
+    /* The same floor and the same modes as a served connection. Not
+     * SSL_OP_CIPHER_SERVER_PREFERENCE, which means nothing to a client. */
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE
+                          | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
+                          | SSL_MODE_RELEASE_BUFFERS);
+
+    /* Refuse a chain that does not check out, rather than reporting it and
+     * carrying on: a client that continues past a verification failure is
+     * not doing TLS, it is doing encryption against nobody in particular. */
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    if (ca_file && *ca_file) {
+        if (SSL_CTX_load_verify_locations(ctx, ca_file, NULL) != 1) {
+            last_error(err, err_len, "cannot load the CA file");
+            SSL_CTX_free(ctx);
+            free(wrapper);
+            return NULL;
+        }
+    } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        last_error(err, err_len, "cannot load the system trust store");
+        SSL_CTX_free(ctx);
+        free(wrapper);
+        return NULL;
+    }
+
+    if (alpn && *alpn) {
+        unsigned int len = 0;
+        unsigned char *wire = encode_alpn(alpn, &len);
+        if (!wire) {
+            if (err && err_len) snprintf(err, err_len, "out of memory");
+            SSL_CTX_free(ctx);
+            free(wrapper);
+            return NULL;
+        }
+        /* Inverted, unlike almost everything else here: 0 is success. */
+        if (SSL_CTX_set_alpn_protos(ctx, wire, len) != 0) {
+            last_error(err, err_len, "cannot set the ALPN list");
+            free(wire);
+            SSL_CTX_free(ctx);
+            free(wrapper);
+            return NULL;
+        }
+        wrapper->alpn = wire;
+        wrapper->alpn_len = len;
+    }
+
+    /* Kept in hosts[0] rather than only in `ctx`: pg_tls_ctx_free releases
+     * contexts through the hosts array, so a context parked anywhere else
+     * would leak. There is no certificate and no name list -- a client sends
+     * neither -- so host_count is 1 with names NULL. */
+    wrapper->hosts[0].ctx = ctx;
+    wrapper->hosts[0].names = NULL;
+    wrapper->hosts[0].name_count = 0;
+    wrapper->host_count = 1;
+    wrapper->ctx = ctx;
+    return wrapper;
+}
+
+pg_tls *pg_tls_client_new(pg_tls_ctx *ctx, int fd, const char *hostname) {
+    if (!ctx) return NULL;
+    struct pg_tls *tls = calloc(1, sizeof *tls);
+    if (!tls) return NULL;
+    tls->ssl = SSL_new(ctx->ctx);
+    if (!tls->ssl) { free(tls); return NULL; }
+    if (SSL_set_fd(tls->ssl, fd) != 1) {
+        SSL_free(tls->ssl);
+        free(tls);
+        return NULL;
+    }
+    if (hostname && *hostname) {
+        /* Which certificate to send... */
+        SSL_set_tlsext_host_name(tls->ssl, hostname);
+        /* ...and the name that certificate has to be for. Verification
+         * without this checks that the chain is trusted, not that it belongs
+         * to whoever we meant to talk to. */
+        if (SSL_set1_host(tls->ssl, hostname) != 1) {
+            SSL_free(tls->ssl);
+            free(tls);
+            return NULL;
+        }
+    }
+    SSL_set_connect_state(tls->ssl);
+    return tls;
+}
+
 pg_tls *pg_tls_new(pg_tls_ctx *ctx, int fd) {
     if (!ctx) return NULL;
     struct pg_tls *tls = calloc(1, sizeof *tls);
@@ -709,6 +816,31 @@ long pg_tls_sendfile(pg_tls *tls, int fd, long offset, long n) {
 int pg_tls_pending(pg_tls *tls) {
     if (!tls || !tls->ssl) return 0;
     return SSL_pending(tls->ssl);
+}
+
+int pg_tls_idle_ok(pg_tls *tls) {
+    if (!tls || !tls->ssl) return 0;
+    ERR_clear_error();
+    unsigned char byte;
+    /* SSL_read is what drives post-handshake messages; OpenSSL offers no way
+     * to process them without offering to read. Application data arriving on
+     * a connection nobody is using means the peer spoke out of turn, and the
+     * byte consumed here does not matter: that connection is being discarded
+     * either way. */
+    int rc = SSL_read(tls->ssl, &byte, 1);
+    if (rc > 0) return 0;
+    switch (SSL_get_error(tls->ssl, rc)) {
+    case SSL_ERROR_WANT_READ:
+    case SSL_ERROR_WANT_WRITE:
+        /* Nothing to report: whatever arrived was bookkeeping, and OpenSSL
+         * has dealt with it. */
+        return 1;
+    case SSL_ERROR_SYSCALL:
+        return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 1 : 0;
+    default:
+        /* close_notify included: a clean end is still an end. */
+        return 0;
+    }
 }
 
 int pg_tls_wants_write(pg_tls *tls) { return tls ? tls->wants_write : 0; }

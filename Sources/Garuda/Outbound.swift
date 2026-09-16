@@ -53,6 +53,23 @@ enum OutboundState: UInt8 {
 struct OutboundKey: Hashable {
     var host: String
     var port: UInt16
+    /// Empty for a plaintext connection. For an encrypted one, the name the
+    /// certificate was checked against together with the trust store it was
+    /// checked against -- so a pooled session is only ever handed back to a
+    /// caller that asked for exactly the same verification.
+    ///
+    /// Without this the pool reopens, one layer up, the hole `SSL_set1_host`
+    /// exists to close: a connection verified for one name would be handed to
+    /// a caller that asked for another, and a plaintext caller would be handed
+    /// an encrypted socket it never asked to have checked at all.
+    var tls: String = ""
+
+    /// The two things that decide whether a session may be reused, in one
+    /// string. NUL-separated because neither a hostname nor a path may contain
+    /// one, so no pair can spell another pair's identity.
+    static func tlsIdentity(hostname: String, caFile: String) -> String {
+        "\(hostname)\u{0}\(caFile)"
+    }
 }
 
 /// One connection this worker made.
@@ -82,6 +99,9 @@ struct OutboundConnection {
     var nextIdle: Int32 = -1
     /// When it went idle, for the sweep that closes ones nobody came back for.
     var idleSince: UInt64 = 0
+    /// The TLS session, when this connection is encrypted. OpenSSL owns the
+    /// descriptor from then on, so reads and writes go through it.
+    var tls: OpaquePointer? = nil
 }
 
 /// Fixed-capacity slab, threaded free list, exactly like `ConnectionTable`.
@@ -122,6 +142,7 @@ struct OutboundTable {
         slots[index].nextFree = firstFree
         slots[index].state = .free
         slots[index].fd = -1
+        slots[index].tls = nil
         slots[index].waiter = nil
         slots[index].timerOp = -1
         slots[index].interest = 0
@@ -151,19 +172,20 @@ extension Worker {
 
     /// Starts a connection to `host` (an IP literal) and `port`, and returns
     /// the index of the record following it. The caller waits on `awaitOpen`.
-    mutating func beginConnect(host: String, port: UInt16) -> Result<Int, OutboundError> {
+    mutating func beginConnect(host: String, port: UInt16,
+                               tls: String = "") -> Result<Int, OutboundError> {
         var inProgress: Int32 = 0
         let fd = host.withCString { pg_connect_tcp($0, port, &inProgress) }
         return finishBegin(fd: fd, inProgress: inProgress != 0,
-                           key: OutboundKey(host: host, port: port))
+                           key: OutboundKey(host: host, port: port, tls: tls))
     }
 
     /// The same for a unix socket.
-    mutating func beginConnect(path: String) -> Result<Int, OutboundError> {
+    mutating func beginConnect(path: String, tls: String = "") -> Result<Int, OutboundError> {
         var inProgress: Int32 = 0
         let fd = path.withCString { pg_connect_unix($0, &inProgress) }
         return finishBegin(fd: fd, inProgress: inProgress != 0,
-                           key: OutboundKey(host: path, port: 0))
+                           key: OutboundKey(host: path, port: 0, tls: tls))
     }
 
     private mutating func finishBegin(fd: Int32, inProgress: Bool,
@@ -242,6 +264,18 @@ extension Worker {
             // straight through -- the guard read as working while the event
             // path quietly did all of the catching.
             if pg_poll_single(o.pointee.fd, 0, 0) != 0 {
+                // On an encrypted connection what arrived may be nothing but a
+                // session ticket, which is not the peer going away.
+                guard let tls = o.pointee.tls, pg_tls_idle_ok(tls) != 0 else {
+                    closeOutbound(index)
+                    continue
+                }
+            }
+            // A quiet descriptor is not enough for an encrypted connection:
+            // OpenSSL can be holding decrypted bytes the socket has already
+            // given up, which no poll will ever mention again. That is a
+            // half-read response by another name.
+            if let tls = o.pointee.tls, pg_tls_pending(tls) > 0 {
                 closeOutbound(index)
                 continue
             }
@@ -380,6 +414,11 @@ extension Worker {
             // Nobody asked this connection for anything, so whatever it has
             // to say is the far end going away. Drop it now, while no caller
             // is depending on it.
+            //
+            // Except on an encrypted one: a TLS 1.3 server sends a session
+            // ticket the moment the handshake finishes, and reading that as a
+            // hangup means no encrypted connection is ever reused.
+            if let tls = o.pointee.tls, pg_tls_idle_ok(tls) != 0 { return }
             unlinkIdle(index)
             closeOutbound(index)
         }
@@ -396,6 +435,15 @@ extension Worker {
         if o.pointee.state == .idle { unlinkIdle(index) }
         let waiter = o.pointee.waiter.take()
         disarmOutboundTimer(index)
+        // Before the descriptor goes: close_notify is best-effort and never
+        // blocks, and freeing the session after the fd is closed would have
+        // OpenSSL writing into a descriptor that may already be somebody
+        // else's.
+        if let tls = o.pointee.tls {
+            pg_tls_shutdown(tls)
+            pg_tls_free(tls)
+            o.pointee.tls = nil
+        }
         if o.pointee.fd >= 0 {
             if o.pointee.interest != 0 { _ = poller.remove(o.pointee.fd) }
             _ = pg_close(o.pointee.fd)
@@ -490,7 +538,8 @@ struct OutboundSocket {
     /// be 0 when the socket is full -- then wait for `writable` and go again.
     func write(_ bytes: UnsafeRawBufferPointer) throws(OutboundError) -> Int {
         guard let o = record else { throw .cancelled }
-        let n = pg_write(o.pointee.fd, bytes.baseAddress, bytes.count)
+        let n = o.pointee.tls.map { pg_tls_write($0, bytes.baseAddress, bytes.count) }
+            ?? pg_write(o.pointee.fd, bytes.baseAddress, bytes.count)
         if n >= 0 { return n }
         let err = pg_errno()
         if pg_err_is_again(err) != 0 || pg_err_is_intr(err) != 0 { return 0 }
@@ -501,12 +550,24 @@ struct OutboundSocket {
     /// peer closing is reported as `failed(0)` so it cannot be mistaken for it.
     func read(into buffer: UnsafeMutableRawBufferPointer) throws(OutboundError) -> Int {
         guard let o = record else { throw .cancelled }
-        let n = pg_read(o.pointee.fd, buffer.baseAddress, buffer.count)
+        let n = o.pointee.tls.map { pg_tls_read($0, buffer.baseAddress, buffer.count) }
+            ?? pg_read(o.pointee.fd, buffer.baseAddress, buffer.count)
         if n > 0 { return n }
         if n == 0 { throw .failed(0) }
         let err = pg_errno()
         if pg_err_is_again(err) != 0 || pg_err_is_intr(err) != 0 { return 0 }
         throw .failed(err)
+    }
+
+    /// Decrypted bytes OpenSSL is holding that the socket no longer has.
+    ///
+    /// A record is decrypted whole, so after a read OpenSSL can have more
+    /// than the caller asked for, and a level-triggered poller will never
+    /// mention it again. A reader that waits for readability instead of
+    /// asking this waits for an event that is not coming.
+    var hasBufferedInput: Bool {
+        guard let o = record, let tls = o.pointee.tls else { return false }
+        return pg_tls_pending(tls) > 0
     }
 
     func readable(milliseconds: UInt64 = 10_000) async throws(OutboundError) {
@@ -519,6 +580,8 @@ struct OutboundSocket {
 
     private func wait(_ mask: PollMask, milliseconds: UInt64) async throws(OutboundError) {
         guard isOpen else { throw .cancelled }
+        // Already here, inside OpenSSL. Waiting would be waiting for nothing.
+        if mask.wantsRead, hasBufferedInput { return }
         let worker = self.worker
         let index = self.index
         if let refused = worker.pointee.beginOutboundWait(index, mask, milliseconds: milliseconds) {
@@ -549,22 +612,139 @@ struct OutboundSocket {
 }
 
 extension Worker {
+    /// The client context, made on the first encrypted connection. A server
+    /// that never calls out over TLS never builds one.
+    mutating func outboundTLSContext(caFile: String = "") -> OpaquePointer? {
+        if let existing = outboundTLS[caFile] { return existing }
+        var error = [CChar](repeating: 0, count: 256)
+        let made: OpaquePointer? = error.withUnsafeMutableBufferPointer { buffer in
+            if caFile.isEmpty {
+                return pg_tls_client_ctx_new(nil, "http/1.1", buffer.baseAddress, 256)
+            }
+            return caFile.withCString {
+                pg_tls_client_ctx_new($0, "http/1.1", buffer.baseAddress, 256)
+            }
+        }
+        guard let made else {
+            error.withUnsafeBufferPointer { buffer in
+                guard let base = buffer.baseAddress else { return }
+                var n = 0
+                while n < 256 && base[n] != 0 { n += 1 }
+                Log.error { line in
+                    line.str("outbound tls: ")
+                    base.withMemoryRebound(to: UInt8.self, capacity: n) { line.bytes($0, n) }
+                }
+            }
+            return nil
+        }
+        outboundTLS[caFile] = made
+        return made
+    }
+
+    /// Opens an encrypted connection to `host` and `port`, checking the
+    /// certificate against `hostname` -- which is `host` itself unless the
+    /// caller is connecting to an address and knows the name it wants.
+    static func connectTLS(_ worker: UnsafeMutablePointer<Worker>, host: String, port: UInt16,
+                           hostname: String? = nil, caFile: String = "",
+                           milliseconds: UInt64 = 10_000) async throws(OutboundError) -> OutboundSocket {
+        // The identity goes into the lookup, not just onto the record: asking
+        // the pool for the plaintext key would miss every pooled session and
+        // open a new socket each time -- correct, and pooling that never pools.
+        let identity = OutboundKey.tlsIdentity(hostname: hostname ?? host, caFile: caFile)
+        let socket = try await connect(worker, host: host, port: port, tls: identity,
+                                       milliseconds: milliseconds)
+        do {
+            try await socket.startTLS(hostname: hostname ?? host, caFile: caFile,
+                                      milliseconds: milliseconds)
+        } catch {
+            socket.close()
+            throw error
+        }
+        return socket
+    }
+}
+
+extension OutboundSocket {
+    /// Puts TLS on a connection that is already up, and finishes the
+    /// handshake before returning. A failure here closes nothing on its own:
+    /// the caller decides, since an unverified peer is its business.
+    func startTLS(hostname: String, caFile: String = "",
+                  milliseconds: UInt64 = 10_000) async throws(OutboundError) {
+        guard isOpen, let o = worker.pointee.outbound?[index] else { throw .cancelled }
+        let identity = OutboundKey.tlsIdentity(hostname: hostname, caFile: caFile)
+        if o.pointee.tls != nil {
+            // Already encrypted: the pool handed back a session this caller
+            // could have made itself. Matching identities means it did; a
+            // mismatch means the key failed to keep them apart, and putting a
+            // second session on top of an encrypted socket is not a recovery
+            // from that, it is the bug happening quietly.
+            guard o.pointee.key?.tls == identity else { throw .failed(0) }
+            return
+        }
+        guard let ctx = worker.pointee.outboundTLSContext(caFile: caFile) else { throw .failed(0) }
+        guard let session = hostname.withCString({ pg_tls_client_new(ctx, o.pointee.fd, $0) }) else {
+            throw .failed(0)
+        }
+        o.pointee.tls = session
+
+        var error = [CChar](repeating: 0, count: 256)
+        while true {
+            let outcome = error.withUnsafeMutableBufferPointer { buffer in
+                pg_tls_handshake(session, buffer.baseAddress, 256)
+            }
+            switch outcome {
+            case 1:
+                // Stamped only now. A record carrying the identity before the
+                // peer had actually been believed would be returned to the
+                // pool as a verified session by any path that closed early.
+                o.pointee.key?.tls = identity
+                return
+            case 0:
+                try await readable(milliseconds: milliseconds)
+            case -1:
+                try await writable(milliseconds: milliseconds)
+            default:
+                // Includes a certificate that does not verify, and one that
+                // verifies but is for somebody else. Both are refusals, not
+                // warnings -- and both are worth saying out loud, because
+                // "the handshake failed" is useless when the whole question
+                // is *why* the peer was not believed.
+                error.withUnsafeBufferPointer { buffer in
+                    guard let base = buffer.baseAddress, base[0] != 0 else { return }
+                    var n = 0
+                    while n < 256 && base[n] != 0 { n += 1 }
+                    Log.error { line in
+                        line.str("outbound tls: ")
+                        base.withMemoryRebound(to: UInt8.self, capacity: n) { line.bytes($0, n) }
+                    }
+                }
+                throw .failed(0)
+            }
+        }
+    }
+}
+
+extension Worker {
     /// Opens a connection to an IP literal and port, waiting at most
     /// `milliseconds` for it to come up.
+    /// `tls` is the verification identity a pooled connection must match, and
+    /// is empty for a plaintext one; `connectTLS` is what fills it in.
     static func connect(_ worker: UnsafeMutablePointer<Worker>, host: String, port: UInt16,
+                        tls: String = "",
                         milliseconds: UInt64 = 10_000) async throws(OutboundError) -> OutboundSocket {
         try await open(worker, milliseconds: milliseconds,
-                       key: OutboundKey(host: host, port: port)) {
-            $0.pointee.beginConnect(host: host, port: port)
+                       key: OutboundKey(host: host, port: port, tls: tls)) {
+            $0.pointee.beginConnect(host: host, port: port, tls: tls)
         }
     }
 
     /// The same for a unix socket.
     static func connect(_ worker: UnsafeMutablePointer<Worker>, path: String,
+                        tls: String = "",
                         milliseconds: UInt64 = 10_000) async throws(OutboundError) -> OutboundSocket {
         try await open(worker, milliseconds: milliseconds,
-                       key: OutboundKey(host: path, port: 0)) {
-            $0.pointee.beginConnect(path: path)
+                       key: OutboundKey(host: path, port: 0, tls: tls)) {
+            $0.pointee.beginConnect(path: path, tls: tls)
         }
     }
 

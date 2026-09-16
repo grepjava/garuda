@@ -66,6 +66,13 @@ public final class TestClient {
     public var timeoutMillis: UInt64 = 5_000
 
     init(application: Application, configuration: ServerConfig) {
+        // A worker must never die of a peer that went away, and a test client
+        // is a worker in every respect that matters -- but it is built here
+        // rather than through the runtime, which is the only other place this
+        // is done. Without it the first close_notify written into a socket
+        // whose far end has already gone takes the whole test process with it,
+        // and the run reads as a crash rather than as EPIPE.
+        pg_ignore_sigpipe()
         guard let poller = Poller(maxEvents: 64) else {
             fatalError("cannot create a readiness poller for the test client")
         }

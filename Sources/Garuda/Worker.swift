@@ -132,6 +132,16 @@ public struct Worker {
     /// and a connection on whatever is at the other end.
     var outboundIdleMillis: UInt64 = 30_000
     var outboundIdlePerKey = 8
+    /// TLS contexts for connections this worker makes, by the trust store
+    /// each checks against -- "" being the system one. Separate from
+    /// `tlsContext`, which is for connections it accepts: that one sends a
+    /// certificate, these check them.
+    ///
+    /// Keyed rather than single because a context's trust store is fixed when
+    /// it is built, and a process may legitimately trust different roots for
+    /// different places -- a private CA for an internal database, the system
+    /// store for everything else.
+    var outboundTLS: [String: OpaquePointer] = [:]
     /// How many connections this worker actually opened, as against handed
     /// back from the pool. A test cannot otherwise tell reuse from a new one.
     public var outboundOpened: UInt64 = 0
@@ -174,6 +184,8 @@ public struct Worker {
         closeAllOutbound()
         outbound?.destroy()
         outbound = nil
+        for (_, clientTLS) in outboundTLS { pg_tls_ctx_free(clientTLS) }
+        outboundTLS.removeAll()
         quic?.destroy()
         headers.deallocate()
         deferredFlush.deallocate()

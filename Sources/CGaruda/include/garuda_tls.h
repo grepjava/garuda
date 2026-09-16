@@ -47,6 +47,24 @@ int pg_tls_ctx_names(pg_tls_ctx *ctx, int host_index, int name_index,
 
 void pg_tls_ctx_free(pg_tls_ctx *ctx);
 
+/* A context for connections this process makes, rather than accepts.
+ *
+ * Verification is the whole point of it: the peer's chain is checked against
+ * `ca_file`, or against the system trust store when that is NULL. `alpn` is
+ * the same comma-separated list `pg_tls_ctx_new` takes, offered in order.
+ * Returns NULL and fills `err` on failure. */
+pg_tls_ctx *pg_tls_client_ctx_new(const char *ca_file, const char *alpn,
+                                  char *err, size_t err_len);
+
+/* A client session on `fd`, for `hostname`.
+ *
+ * The name is used twice, and both uses matter: as SNI, saying which
+ * certificate to send, and as the name the certificate is checked against.
+ * Without the second, verification proves only that some CA somewhere signed
+ * some certificate -- which is the quiet hole that makes TLS look like it is
+ * working while it protects nothing. */
+pg_tls *pg_tls_client_new(pg_tls_ctx *ctx, int fd, const char *hostname);
+
 pg_tls *pg_tls_new(pg_tls_ctx *ctx, int fd);
 void pg_tls_free(pg_tls *tls);
 
@@ -80,6 +98,16 @@ long pg_tls_sendfile(pg_tls *tls, int fd, long offset, long n);
  * level-triggered poller will not mention these, so anything that reads has to
  * keep asking until this is zero. */
 int pg_tls_pending(pg_tls *tls);
+
+/* An idle pooled connection had something to say. 1 when it was only
+ * post-handshake bookkeeping -- a session ticket, a key update -- and the
+ * connection is still good to hand to the next caller; 0 when application data
+ * is waiting or the session is over, neither of which belongs in a pool.
+ *
+ * A TLS 1.3 server sends a ticket straight after the handshake, so without
+ * this every pooled session looks like a peer hanging up and no encrypted
+ * connection is ever reused: a fresh handshake for every request. */
+int pg_tls_idle_ok(pg_tls *tls);
 
 /* Set when the last call could not proceed until the socket is writable,
  * which is how a renegotiation or a key update surfaces mid-read. */
