@@ -23,7 +23,16 @@ import GarudaCore
 /// Why an outbound connection did not come up, or did not stay up.
 public enum OutboundError: Error, Equatable {
     /// The address was not an IP literal, or the socket could not be made.
+    ///
+    /// This is what `connect` says about a *name*, and deliberately so: it
+    /// promises never to block, so resolving one is not its to do.
     case address
+    /// A name could not be resolved. Separate from `address` because they mean
+    /// opposite things to whoever is reading a log: `address` is a string that
+    /// was never going to work, and this is a lookup that failed -- a
+    /// nameserver that is down, or a host that has gone away. Collapsing them
+    /// would make a DNS outage read as a typo.
+    case unresolved
     /// The connection was refused, unreachable, or reset. Carries errno.
     case failed(Int32)
     /// It did not come up inside the time allowed.
@@ -750,6 +759,72 @@ extension Worker {
                        key: OutboundKey(host: host, port: port, tls: tls)) {
             $0.pointee.beginConnect(host: host, port: port, tls: tls)
         }
+    }
+
+    /// Connects to a *name*, resolving it first.
+    ///
+    /// Separate from `connect(host:)` rather than folded into it. That one
+    /// promises never to block and never to go near a resolver, which is what
+    /// lets every caller treat it as cheap; making it resolve implicitly would
+    /// give every existing caller a lookup it never asked for and quietly
+    /// retire a contract the whole layer leans on. Here the cost is at the
+    /// call site, where somebody chose it.
+    ///
+    /// Every address the answer carried is tried in order. A host whose first
+    /// A record points at something dead is otherwise a host that never works,
+    /// and the server put them in that order for a reason.
+    static func connect(_ worker: UnsafeMutablePointer<Worker>, name: String, port: UInt16,
+                        tls: String = "", wantIPv6: Bool = false,
+                        milliseconds: UInt64 = 10_000) async throws(OutboundError) -> OutboundSocket {
+        let addresses: [ResolvedAddress]
+        do {
+            addresses = try await resolve(worker, name: name, wantIPv6: wantIPv6)
+        } catch {
+            // Cancellation is the request going away, which is not a failure
+            // to resolve and must not read as one.
+            throw error == .cancelled ? .cancelled : .unresolved
+        }
+        guard !addresses.isEmpty else { throw .unresolved }
+
+        var last: OutboundError = .unresolved
+        for address in addresses {
+            do {
+                return try await connect(worker, host: address.text, port: port,
+                                         tls: tls, milliseconds: milliseconds)
+            } catch {
+                // Keep the reason from the last address tried, so a caller that
+                // fails everywhere still learns why rather than being told
+                // only that a name did not work.
+                last = error
+                if error == .cancelled { throw error }
+                continue
+            }
+        }
+        throw last
+    }
+
+    /// The same, encrypted, verifying the certificate against the **name** and
+    /// not the address it resolved to.
+    ///
+    /// That distinction is the whole point of `SSL_set1_host`: checking the
+    /// literal would ask whether the certificate was issued for `93.184.216.34`,
+    /// which nothing sane has, and a resolver that had been lied to would go
+    /// unnoticed. The name is what was asked for and the name is what the peer
+    /// has to prove.
+    static func connectTLS(_ worker: UnsafeMutablePointer<Worker>, name: String, port: UInt16,
+                           caFile: String = "", wantIPv6: Bool = false,
+                           milliseconds: UInt64 = 10_000) async throws(OutboundError) -> OutboundSocket {
+        let identity = OutboundKey.tlsIdentity(hostname: name, caFile: caFile)
+        let socket = try await connect(worker, name: name, port: port, tls: identity,
+                                       wantIPv6: wantIPv6, milliseconds: milliseconds)
+        do {
+            try await socket.startTLS(hostname: name, caFile: caFile,
+                                      milliseconds: milliseconds)
+        } catch {
+            socket.close()
+            throw error
+        }
+        return socket
     }
 
     /// The same for a unix socket.

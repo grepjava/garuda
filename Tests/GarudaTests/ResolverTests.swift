@@ -27,6 +27,20 @@ private func resolverApp() -> Application {
         }
         response.send(outcome)
     }
+    // Connects by name, which is resolve-then-connect: the reason the resolver
+    // exists at all.
+    app.onAsync(.get, "/connect-by-name") { request, response in
+        let worker = request.worker
+        do {
+            let socket = try await Worker.connect(worker, name: connectHost,
+                                                  port: connectPort, milliseconds: 2_000)
+            outcome = socket.isOpen ? "connected" : "closed"
+            socket.close()
+        } catch {
+            outcome = "\(error)"
+        }
+        response.send(outcome)
+    }
     // An ordinary caller, wanting an ordinary connection. Used to ask whether
     // a nameserver's TCP connection could be handed to one.
     app.onAsync(.get, "/connect") { request, response in
@@ -137,8 +151,8 @@ private final class FakeNameserverTCP {
     /// next pump so the reader has to come back for them.
     private var pending: [(Int32, [UInt8])] = []
 
-    init?(port: UInt16) {
-        let opened = "127.0.0.1".withCString { pg_listen_tcp($0, port, 16, 0, 0) }
+    init?(port: UInt16, host: String = "127.0.0.1") {
+        let opened = host.withCString { pg_listen_tcp($0, port, 16, 0, 0) }
         guard opened >= 0 else { return nil }
         fd = opened
     }
@@ -279,6 +293,22 @@ struct ResolverTests {
             stream?.pump()
             return !outcome.isEmpty
         }, turns: 20_000)
+        return wire.receive() ?? "no response"
+    }
+
+    /// Runs the connect-by-name route, pumping both fakes so the lookup can be
+    /// answered and the connection accepted in the same run.
+    private func byName(_ client: TestClient, _ servers: [FakeNameserver],
+                        stream: FakeNameserverTCP? = nil,
+                        turns: Int = 20_000) throws -> String {
+        outcome = ""
+        let wire = try TestWire(client)
+        wire.send("GET /connect-by-name HTTP/1.1\r\nHost: test\r\n\r\n")
+        _ = wire.turn(until: {
+            for server in servers { server.pump() }
+            stream?.pump()
+            return !outcome.isEmpty
+        }, turns: turns)
         return wire.receive() ?? "no response"
     }
 
@@ -580,6 +610,90 @@ struct ResolverTests {
         let asked = server.questions.count
         #expect(try resolve(client, [server], name: "alpha.example").hasSuffix("unanswered"))
         #expect(server.questions.count > asked)
+    }
+
+    // MARK: Connecting by name, which is what all of this was for
+
+    /// The whole path: a name is resolved, and the address it resolved to is
+    /// connected to. The nameserver's own TCP listener stands in as something
+    /// to connect to, since it is already listening on a known port.
+    @Test func aNameIsResolvedAndThenConnectedTo() throws {
+        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
+        guard let stream = FakeNameserverTCP(port: server.port) else {
+            Issue.record("no tcp listener"); return
+        }
+        server.answer = { id, name in
+            reply(id: id, name: name, records: [(type: 1, data: [127, 0, 0, 1])])
+        }
+        let client = client([server])
+        connectHost = "alpha.example"
+        connectPort = server.port
+        #expect(try byName(client, [server], stream: stream).hasSuffix("connected"))
+        #expect(server.questions == ["alpha.example"])
+    }
+
+    /// The address the resolver returned is the address connected to.
+    ///
+    /// Every other test here resolves to 127.0.0.1, which is guessable -- so
+    /// discarding the answer and hardcoding that literal passed them all, and
+    /// mutation testing said so. Loopback is a /8, so the answer here names
+    /// 127.0.0.2 and only a connection that used it reaches this listener.
+    @Test func theResolvedAddressIsTheOneConnectedTo() throws {
+        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
+        // The listener is on 127.0.0.2 and nothing is on 127.0.0.1 at this
+        // port, so a connection to the wrong address has nowhere to land.
+        guard let elsewhere = FakeNameserverTCP(port: server.port, host: "127.0.0.2") else {
+            Issue.record("no tcp listener on 127.0.0.2"); return
+        }
+        server.answer = { id, name in
+            reply(id: id, name: name, records: [(type: 1, data: [127, 0, 0, 2])])
+        }
+        let client = client([server])
+        connectHost = "alpha.example"
+        connectPort = server.port
+        #expect(try byName(client, [server], stream: elsewhere).hasSuffix("connected"))
+        #expect(server.questions == ["alpha.example"])
+    }
+
+    /// A host whose first address is dead is still a host that works. The
+    /// server put them in that order for a reason, so they are tried in it.
+    @Test func everyAddressIsTriedInOrder() throws {
+        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
+        guard let stream = FakeNameserverTCP(port: server.port) else {
+            Issue.record("no tcp listener"); return
+        }
+        // 192.0.2.1 is TEST-NET-1 and goes nowhere; the second address is the
+        // listener that is actually there.
+        server.answer = { id, name in
+            reply(id: id, name: name, records: [
+                (type: 1, data: [192, 0, 2, 1]),
+                (type: 1, data: [127, 0, 0, 1]),
+            ])
+        }
+        let client = client([server])
+        connectHost = "alpha.example"
+        connectPort = server.port
+        #expect(try byName(client, [server], stream: stream, turns: 60_000)
+                    .hasSuffix("connected"))
+    }
+
+    /// A name that does not resolve is not the same as a string that was never
+    /// an address. Reporting both as `address` would make a nameserver outage
+    /// read as a typo in a configuration file.
+    @Test func aNameThatDoesNotResolveSaysSoDistinctly() throws {
+        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
+        server.answer = { id, name in reply(id: id, name: name, flags: 0x8183) }
+        let client = client([server], attempts: 1)
+        connectHost = "nope.example"
+        connectPort = server.port
+        #expect(try byName(client, [server]).hasSuffix("unresolved"))
+
+        // And the strict entry point still refuses a name outright, without
+        // going near a resolver: that contract is what lets every other caller
+        // treat it as cheap.
+        let asked = server.questions.count
+        #expect(try connect(client, [server]).hasSuffix("address"))
+        #expect(server.questions.count == asked)
     }
 
     /// Nothing is left behind: a resolver socket is never pooled, so the table

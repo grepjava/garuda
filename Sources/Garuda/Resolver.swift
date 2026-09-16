@@ -27,8 +27,9 @@ enum ResolveError: Error, Equatable {
     case noSuchName
     /// A name was found but carried no address of a kind we can use.
     case noAddress
-    /// The answer did not fit in a datagram. Until TCP fallback exists this is
-    /// reported rather than silently treated as the whole answer.
+    /// The answer did not fit in a datagram, and the TCP retry did not settle
+    /// it either -- a server truncating over both transports is contradicting
+    /// itself, and there is no third one to try.
     case truncated
     /// The request that wanted it ended, or the worker is shutting down.
     case cancelled
