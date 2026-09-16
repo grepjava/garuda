@@ -1,65 +1,91 @@
 //===----------------------------------------------------------------------===//
-// One HTTP/2 exchange over a connection this worker made.
+// HTTP/2 over connections this worker made, shared by every request to the
+// same place.
 //
 // A frame loop of its own rather than the server's. The framing primitives are
 // shared -- H2FrameHeader, the flags, the settings, the preface, HPACK -- but
 // every frame handler next door is `extension Worker` taking a connection-table
-// slot, and an outbound connection is a different record entirely. More to the
-// point, half of H2Connection is server state: a concurrency limit it imposes
-// on a peer, the highest identifier a peer has opened, the reset budget that
-// answers CVE-2023-44487. A client opens its own identifiers and cancels its
-// own streams; none of that transfers. Refactoring working security code to
-// share the half that does would be a poor trade.
+// slot, and half of H2Connection is server state: a concurrency limit imposed
+// on a peer, the highest identifier a peer opened, the reset budget that
+// answers CVE-2023-44487. A client opens and cancels its own streams.
 //
-// One request per connection here. An h2 connection is built to carry many at
-// once, and this deliberately does not: the state that would have to persist
-// between exchanges on one socket -- the HPACK dynamic table above all -- is
-// what makes sharing subtle, and doing it properly means reference-counted
-// connections and a reader handing off to the next waiter. So a connection
-// used for one exchange is closed rather than pooled. Returning it would send
-// a second preface down a live connection and desynchronise the dynamic table,
-// which is a worse failure than not pooling at all.
+// ## Who reads
+//
+// Many requests use one connection at once, and somebody has to read its
+// frames and hand each to the stream it belongs to. Not a reader task of its
+// own: handler tasks belong to requests from end to end, and a worker shutting
+// down will not end a task suspended on something other than the engine, so a
+// connection-lifetime reader would outlive a drain.
+//
+// So the read is a baton. Whichever request is waiting for something the
+// connection has to deliver takes it if nobody holds it, waits on the socket,
+// reads, dispatches every whole frame to its stream, and puts it down. Anyone
+// else waiting parks on their own stream and is woken when that stream
+// changes. A request that leaves wakes one parked request, which takes the
+// baton if the connection still needs a reader -- so while any request is
+// waiting, one of them is reading. A dropped baton parks everyone until they
+// time out; two readers would hand the same bytes to two streams. Both are
+// what the tests are for.
+//
+// The baton is also the only right to wait on the socket at all, in either
+// direction. An outbound record holds exactly one waiter, so a writer whose
+// socket is full cannot start a wait of its own: it widens the reader's wait
+// to include writability and parks, and the reader wakes it.
+//
+// ## Who writes
+//
+// A frame must reach the wire whole, and a header block split across
+// CONTINUATION must reach it with nothing in between, so writing is under a
+// lock. Two rules keep that lock from deadlocking against the baton:
+//
+//   * DATA is written one frame per lock, and never while waiting for flow
+//     control credit -- which only a reader can deliver, and a reader may
+//     need the lock.
+//   * A reader never takes the lock for its own replies. SETTINGS and PING
+//     acknowledgements, WINDOW_UPDATEs and RST_STREAMs go into a control queue
+//     that the lock's holder flushes on its way out, or the reader flushes
+//     itself when the lock is free.
+//
+// Stream identifiers are allocated under the lock too. A new stream's id has
+// to exceed every id opened before it, so an id taken before waiting for the
+// lock could reach the wire after a larger one and be illegal on arrival.
 //===----------------------------------------------------------------------===//
 
 import CGaruda
 import GarudaCore
 import GarudaHTTP
 
-/// Per-connection HTTP/2 state for a connection this process opened.
-///
-/// A class for the same reason the server's is: allocated once per connection,
-/// holding tables, touched once per frame rather than once per byte.
+// MARK: - State
+
+/// Settings, flow control and HPACK for one connection.
 final class H2ClientConnection {
     var decoder: HPACKDecoder
-    let encoder = HPACKEncoder()
 
-    /// What the peer imposed on us, in its SETTINGS.
+    /// What the peer imposed, in its SETTINGS.
     var peerMaxFrameSize = H2FrameHeader.defaultMaxFrameSize
     var peerInitialWindowSize = H2FrameHeader.defaultInitialWindowSize
     var peerMaxHeaderListSize = Int.max
+    var peerMaxConcurrentStreams = Int.max
 
     /// What we advertised.
-    let maxFrameSize: Int
-    let initialWindowSize: Int
+    let maxFrameSize = H2FrameHeader.defaultMaxFrameSize
+    let initialWindowSize = H2FrameHeader.defaultInitialWindowSize
 
-    /// Connection-level flow control, which is separate from every stream's.
+    /// Connection-level flow control, separate from every stream's.
     var sendWindow = H2FrameHeader.defaultInitialWindowSize
-    var recvWindow: Int
+    var recvWindow = H2FrameHeader.defaultInitialWindowSize
 
     /// Client streams are odd, RFC 9113 section 5.1.1.
     var nextStreamID: UInt32 = 1
 
-    /// Header block assembly across CONTINUATION frames.
+    /// Header block assembly across CONTINUATION, which is per connection:
+    /// nothing may come between the parts, whatever stream they are for.
     var headerBlock = ByteBuffer()
+    var headerStream: UInt32 = 0
+    var headerEndsStream = false
     var expectingContinuation = false
 
-    var peerGoneAway = false
-
-    init(maxFrameSize: Int = H2FrameHeader.defaultMaxFrameSize,
-         initialWindowSize: Int = H2FrameHeader.defaultInitialWindowSize) {
-        self.maxFrameSize = maxFrameSize
-        self.initialWindowSize = initialWindowSize
-        recvWindow = initialWindowSize
+    init() {
         decoder = HPACKDecoder(maxTableSize: 4096)
     }
 
@@ -69,117 +95,262 @@ final class H2ClientConnection {
     }
 }
 
-extension HTTPClient {
+/// One request's stream.
+final class H2Stream {
+    var id: UInt32 = 0
+    let method: HTTPMethod
+    var sendWindow = 0
+    var recvWindow: Int
+    var status = 0
+    var headers: [ClientHeader] = []
+    var body: [UInt8] = []
+    var sawFinalHeaders = false
+    var done = false
+    var error: ClientError? = nil
+    /// The peer reset it, so nothing needs sending back.
+    var closedByPeer = false
+    /// When this request gives up if nothing happens. Pushed back by every
+    /// frame for the stream, so it bounds silence rather than the exchange.
+    var deadline: UInt64
+    /// The request's task, while it is parked waiting for this stream.
+    var waiter: UnsafeContinuation<Void, Never>? = nil
 
-    /// Sends one request and reads its response, as HTTP/2.
-    func exchangeHTTP2(_ socket: OutboundSocket, _ plan: Plan, method: HTTPMethod,
-                       headers: [(String, String)],
-                       body: [UInt8]) async throws(ClientError) -> ClientResponse {
+    init(method: HTTPMethod, recvWindow: Int, deadline: UInt64) {
+        self.method = method
+        self.recvWindow = recvWindow
+        self.deadline = deadline
+    }
+}
 
-        let h2 = H2ClientConnection(initialWindowSize: max(H2FrameHeader.defaultInitialWindowSize,
-                                                           maxBodyBytes > 0 ? 65535 : 65535))
-        defer { h2.destroy() }
+/// An HTTP/2 connection shared by every request to one place.
+final class H2Shared {
+    let key: OutboundKey
+    let socket: OutboundSocket
+    let conn = H2ClientConnection()
+    var streams: [UInt32: H2Stream] = [:]
 
-        let stream = h2.nextStreamID
-        h2.nextStreamID &+= 2
+    /// Bytes read and not yet dispatched. Belongs to the connection, not to
+    /// whoever read them: a reader that puts the baton down leaves a partial
+    /// frame for the next one.
+    var input = ByteBuffer(capacity: 16384)
+    /// Control frames waiting for the write lock.
+    var control = ByteBuffer(capacity: 64)
 
-        // ---- the preface, our settings, and the request ----
+    var readerActive = false
+    var writerActive = false
+    var writeQueue: [UnsafeContinuation<Void, Never>] = []
+    /// A lock holder whose socket is full, waiting for the reader to see it
+    /// writable.
+    var blockedWriter: H2Stream? = nil
+    var writableSeen = false
 
-        var out = ByteBuffer(capacity: 1024)
-        defer { out.destroy() }
+    var dead: ClientError? = nil
+    var goaway = false
+    var idleSince: UInt64
 
-        HTTP2.preface.withUnsafeBufferPointer { out.write($0.baseAddress!, $0.count) }
-        writeSettings(&out, h2)
-
-        var block = ByteBuffer(capacity: 512)
-        defer { block.destroy() }
-        switch encodeRequestBlock(h2, plan, method: method, headers: headers,
-                                  hasBody: !body.isEmpty, into: &block) {
-        case .failure(let error): throw error
-        case .success: break
-        }
-
-        // A header block larger than one frame is split, and the parts may not
-        // be interleaved with anything else -- which is what the peer checks
-        // and what the reader below checks in the other direction.
-        try writeHeaderBlock(&out, h2, stream: stream, block: block,
-                             endStream: body.isEmpty)
-        try await writeAll(socket, out.readPointer, out.readableBytes)
-        out.clear()
-
-        // ---- the body, inside both windows ----
-
-        if !body.isEmpty {
-            var streamSendWindow = h2.peerInitialWindowSize
-            var buffer = ByteBuffer(capacity: 8192)
-            defer { buffer.destroy() }
-            var sent = 0
-            while sent < body.count {
-                // Both windows have to allow it. Waiting for one and spending
-                // the other is how a peer's connection-level limit gets
-                // ignored, and it answers with a flow-control error.
-                while h2.sendWindow <= 0 || streamSendWindow <= 0 {
-                    try await pumpUntilWindow(socket, h2, &buffer, stream: stream,
-                                              streamSendWindow: &streamSendWindow)
-                }
-                var n = min(body.count - sent, h2.peerMaxFrameSize)
-                n = min(n, h2.sendWindow)
-                n = min(n, streamSendWindow)
-                let last = sent + n == body.count
-                out.clear()
-                let header = H2FrameHeader(length: n, type: .data,
-                                           flags: last ? .endStream : [], streamID: stream)
-                header.write(into: &out)
-                body.withUnsafeBufferPointer { out.write($0.baseAddress! + sent, n) }
-                try await writeAll(socket, out.readPointer, out.readableBytes)
-                h2.sendWindow -= n
-                streamSendWindow -= n
-                sent += n
-            }
-        }
-
-        // ---- the response ----
-
-        return try await readHTTP2Response(socket, h2, stream: stream, method: method)
+    init(key: OutboundKey, socket: OutboundSocket) {
+        self.key = key
+        self.socket = socket
+        idleSince = pg_monotonic_ms()
     }
 
-    // MARK: Writing
+    deinit {
+        conn.destroy()
+        input.destroy()
+        control.destroy()
+    }
 
-    private func writeSettings(_ out: inout ByteBuffer, _ h2: H2ClientConnection) {
+    /// Whether a new stream may be opened here.
+    var acceptsStreams: Bool {
+        dead == nil && !goaway && socket.isOpen
+            && streams.count < conn.peerMaxConcurrentStreams
+            && conn.nextStreamID < 0x7FFF_FFFF
+    }
+
+    /// Records that the connection is gone.
+    ///
+    /// Wakes nobody, and that is deliberate rather than an omission. A version
+    /// that woke every parked request and every lock waiter here survived
+    /// mutation testing with both removed, because nothing can reach them that
+    /// the chain does not already: whoever notices the death is the reader or
+    /// a writer, and it leaves through `abandon`, which wakes one parked
+    /// request, which finds `dead` and leaves the same way, and so on; a lock
+    /// holder always unlocks on its way out. A wake here that no input can make
+    /// necessary reads as a safeguard while providing none.
+    func markDead(_ error: ClientError) {
+        guard dead == nil else { return }
+        dead = error
+    }
+
+    func wake(_ stream: H2Stream) {
+        stream.waiter.take()?.resume()
+    }
+
+    func wakeAll() {
+        for stream in streams.values { stream.waiter.take()?.resume() }
+    }
+
+    /// Wakes one parked request, other than `except`, so that if the
+    /// connection still needs a reader, somebody takes the baton.
+    func wakeOne(except: H2Stream) {
+        for stream in streams.values where stream !== except {
+            if let k = stream.waiter.take() {
+                k.resume()
+                return
+            }
+        }
+    }
+
+    func queueControl(_ type: H2FrameType, flags: H2Flags = [], stream: UInt32,
+                      _ payload: (inout ByteBuffer) -> Void, length: Int) {
+        H2FrameHeader(length: length, type: type, flags: flags, streamID: stream)
+            .write(into: &control)
+        payload(&control)
+    }
+
+    func queueReset(_ id: UInt32, _ code: H2Error) {
+        queueControl(.rstStream, stream: id, { HTTP2.writeUInt32(code.rawValue, into: &$0) },
+                     length: 4)
+    }
+
+    func queueWindowUpdate(_ id: UInt32, _ increment: Int) {
+        guard increment > 0 else { return }
+        queueControl(.windowUpdate, stream: id,
+                     { HTTP2.writeUInt32(UInt32(increment), into: &$0) }, length: 4)
+    }
+}
+
+// MARK: - The worker's shared connections
+
+extension Worker {
+
+    /// Every shared connection is told it has gone. Sockets are not closed
+    /// here: the caller is about to close every outbound record itself, and
+    /// doing it through a handle would reach back into the worker mid-call.
+    mutating func failAllSharedH2() {
+        let all = Array(outboundH2.values)
+        outboundH2.removeAll()
+        // Closing each record is what wakes its reader, with `.cancelled`; the
+        // reader leaving through `abandon` wakes the rest in turn.
+        for shared in all { shared.markDead(.cancelled) }
+        let waiting = outboundH2Connecting.values.flatMap { $0 }
+        outboundH2Connecting.removeAll()
+        for k in waiting { k.resume() }
+    }
+
+    /// Closes shared connections nobody has used for a while, or that cannot
+    /// be used again.
+    mutating func sweepIdleH2(now: UInt64) {
+        for (key, shared) in outboundH2 {
+            guard shared.streams.isEmpty, !shared.readerActive, !shared.writerActive else {
+                continue
+            }
+            let stale = now &- shared.idleSince >= outboundIdleMillis
+            if stale || shared.dead != nil || shared.goaway || !shared.socket.isOpen {
+                outboundH2.removeValue(forKey: key)
+                shared.markDead(.closed)
+                closeOutbound(shared.socket.index)
+            }
+        }
+    }
+}
+
+// MARK: - Exchanges
+
+extension HTTPClient {
+
+    /// Whether the ALPN list offers HTTP/2 at all.
+    var offersHTTP2: Bool {
+        alpn.split(separator: ",").contains { $0.trimmingSpaces == "h2" }
+    }
+
+    /// Where a shared connection for `plan` is kept.
+    ///
+    /// Keyed on the name asked for, not the address it resolved to, so a
+    /// request finds the connection before paying for a lookup. Plaintext
+    /// HTTP/2 is only ever forced, and gets a marker no HTTP/1.1 key can spell.
+    func sharedKey(_ plan: Plan) -> OutboundKey {
+        if plan.secure {
+            return OutboundKey(host: plan.host, port: plan.port,
+                               tls: OutboundKey.tlsIdentity(hostname: plan.host,
+                                                            caFile: caFile, alpn: alpn))
+        }
+        return OutboundKey(host: plan.host, port: plan.port, tls: "\u{0}h2c")
+    }
+
+    /// A shared connection that can take another stream, or nil.
+    ///
+    /// An idle one is read first, without waiting. Nobody reads a connection
+    /// with no streams, so whatever the peer said meanwhile -- a GOAWAY, a
+    /// close, settings -- is still sitting there, and a request written into a
+    /// connection that has already been told to go away is a request that
+    /// fails for no reason of its own.
+    func reusableShared(_ key: OutboundKey) -> H2Shared? {
+        guard let shared = worker.pointee.outboundH2[key] else { return nil }
+        if shared.streams.isEmpty && !shared.readerActive && !shared.writerActive {
+            if let failure = drainWithoutWaiting(shared) {
+                retire(shared, failure)
+                return nil
+            }
+        }
+        if shared.dead != nil || shared.goaway || !shared.socket.isOpen {
+            if shared.streams.isEmpty { retire(shared, shared.dead ?? .closed) }
+            return nil
+        }
+        return shared.acceptsStreams ? shared : nil
+    }
+
+    /// Sends the preface and our settings on a fresh connection, and keeps it.
+    func startShared(_ socket: OutboundSocket, _ key: OutboundKey) async throws(ClientError) -> H2Shared {
+        var out = ByteBuffer(capacity: 128)
+        defer { out.destroy() }
+        HTTP2.preface.withUnsafeBufferPointer { out.write($0.baseAddress!, $0.count) }
         let entries: [(H2Setting, UInt32)] = [
-            (.maxFrameSize, UInt32(h2.maxFrameSize)),
-            (.initialWindowSize, UInt32(h2.initialWindowSize)),
+            (.maxFrameSize, UInt32(H2FrameHeader.defaultMaxFrameSize)),
+            (.initialWindowSize, UInt32(H2FrameHeader.defaultInitialWindowSize)),
             // Nothing here answers a promise, and saying so up front keeps a
             // server from reserving streams this client would only reset.
             (.enablePush, 0),
         ]
-        let header = H2FrameHeader(length: entries.count * 6, type: .settings,
-                                   flags: [], streamID: 0)
-        header.write(into: &out)
+        H2FrameHeader(length: entries.count * 6, type: .settings, flags: [], streamID: 0)
+            .write(into: &out)
         for (setting, value) in entries {
             out.writeByte(UInt8(truncatingIfNeeded: setting.rawValue >> 8))
             out.writeByte(UInt8(truncatingIfNeeded: setting.rawValue))
             HTTP2.writeUInt32(value, into: &out)
         }
+        // Nobody else can reach it yet, so no lock.
+        do {
+            try await writeAll(socket, out.readPointer, out.readableBytes)
+        } catch {
+            socket.close()
+            throw error
+        }
+        let shared = H2Shared(key: key, socket: socket)
+        // A connection this replaces is left to finish its streams, and closes
+        // when it has none: it is no longer where new requests are sent.
+        worker.pointee.outboundH2[key] = shared
+        return shared
     }
 
-    /// The pseudo-headers and then the ordinary fields, into `block`.
-    private func encodeRequestBlock(_ h2: H2ClientConnection, _ plan: Plan,
-                                    method: HTTPMethod, headers: [(String, String)],
-                                    hasBody: Bool,
-                                    into block: inout ByteBuffer) -> Result<Void, ClientError> {
-        guard let token = method.token else { return .failure(.refusedHeader) }
+    /// The request's header block, which does not depend on the connection:
+    /// nothing is indexed, so it encodes the same wherever it goes.
+    func encodeRequestBlock(_ plan: Plan, method: HTTPMethod, headers: [(String, String)],
+                            hasBody: Bool) throws(ClientError) -> [UInt8] {
+        guard let token = method.token else { throw .refusedHeader }
+        let encoder = HPACKEncoder()
+        var block = ByteBuffer(capacity: 512)
+        defer { block.destroy() }
         let authority = Array(plan.authority.utf8)
         let path = Array(plan.target.utf8)
-        let scheme = plan.secure ? "https" : "http"
-        let schemeBytes = Array(scheme.utf8)
+        let scheme = Array((plan.secure ? "https" : "http").utf8)
 
         UnsafeRawPointer(token.utf8Start).withMemoryRebound(
             to: UInt8.self, capacity: token.utf8CodeUnitCount) { m in
-            schemeBytes.withUnsafeBufferPointer { s in
+            scheme.withUnsafeBufferPointer { s in
                 authority.withUnsafeBufferPointer { a in
                     path.withUnsafeBufferPointer { p in
-                        h2.encoder.encodeRequestPseudoHeaders(
+                        encoder.encodeRequestPseudoHeaders(
                             method: ByteSpan(m, token.utf8CodeUnitCount),
                             scheme: ByteSpan(s.baseAddress!, s.count),
                             authority: ByteSpan(a.baseAddress!, a.count),
@@ -192,327 +363,654 @@ extension HTTPClient {
 
         var sawUserAgent = false
         for (name, value) in headers {
-            let lowered = name.lowercased()
-            let nameBytes = Array(lowered.utf8)
+            let nameBytes = Array(name.lowercased().utf8)
             let valueBytes = Array(value.utf8)
             let ok = nameBytes.withUnsafeBufferPointer { n -> Bool in
                 valueBytes.withUnsafeBufferPointer { v -> Bool in
-                    guard let np = n.baseAddress, let vp = v.baseAddress else { return false }
+                    guard let np = n.baseAddress else { return false }
+                    let empty: StaticString = ""
+                    let vp = v.baseAddress ?? empty.utf8Start
                     // Connection-specific fields have no meaning in HTTP/2 and
-                    // their presence makes a message malformed, RFC 9113
-                    // section 8.2.2. The h1 writer refuses the same names for
-                    // its own reasons; this refuses them for the peer's.
+                    // make a message malformed, RFC 9113 section 8.2.2.
                     if HTTP2.isConnectionSpecific(np, n.count) { return false }
                     if !HTTP2.validFieldName(np, n.count) { return false }
                     if !HTTP2.validFieldValue(vp, v.count) { return false }
-                    let field = ByteSpan(np, n.count)
-                    let kind = HTTPRequestWriter.classify(field)
+                    let kind = HTTPRequestWriter.classify(ByteSpan(np, n.count))
                     if kind.contains(.acceptEncoding) || kind.contains(.expect) { return false }
                     if kind.contains(.host) { return false }
                     if kind.contains(.userAgent) { sawUserAgent = true }
-                    h2.encoder.encode(name: np, nameLength: n.count,
-                                      value: vp, valueLength: v.count, into: &block)
+                    encoder.encode(name: np, nameLength: n.count,
+                                   value: vp, valueLength: v.count, into: &block)
                     return true
                 }
             }
-            guard ok else { return .failure(.refusedHeader) }
+            guard ok else { throw .refusedHeader }
         }
 
-        if !sawUserAgent, !userAgent.isEmpty {
-            let agent = Array(userAgent.utf8)
-            let name: StaticString = "user-agent"
-            agent.withUnsafeBufferPointer { a in
+        func literal(_ name: StaticString, _ value: String) {
+            let bytes = Array(value.utf8)
+            bytes.withUnsafeBufferPointer { b in
                 UnsafeRawPointer(name.utf8Start).withMemoryRebound(
                     to: UInt8.self, capacity: name.utf8CodeUnitCount) { n in
-                    h2.encoder.encode(name: n, nameLength: name.utf8CodeUnitCount,
-                                      value: a.baseAddress!, valueLength: a.count, into: &block)
+                    encoder.encode(name: n, nameLength: name.utf8CodeUnitCount,
+                                   value: b.baseAddress!, valueLength: b.count, into: &block)
                 }
             }
         }
+        if !sawUserAgent, !userAgent.isEmpty { literal("user-agent", userAgent) }
+        // HTTP/2 has no Transfer-Encoding, so a server that buffers by declared
+        // length has only this to go on.
+        if hasBody { literal("content-length", String(plan.bodyLength)) }
 
-        if hasBody {
-            // Stated even though DATA framing already bounds it: a server that
-            // buffers by declared length has nothing else to go on, and
-            // HTTP/2 has no Transfer-Encoding to fall back to.
-            let length = Array(String(plan.bodyLength).utf8)
-            let name: StaticString = "content-length"
-            length.withUnsafeBufferPointer { l in
-                UnsafeRawPointer(name.utf8Start).withMemoryRebound(
-                    to: UInt8.self, capacity: name.utf8CodeUnitCount) { n in
-                    h2.encoder.encode(name: n, nameLength: name.utf8CodeUnitCount,
-                                      value: l.baseAddress!, valueLength: l.count, into: &block)
-                }
-            }
-        }
-        return .success(())
+        return Array(UnsafeBufferPointer(start: block.readPointer, count: block.readableBytes))
     }
 
-    /// HEADERS, then CONTINUATION for whatever did not fit.
-    private func writeHeaderBlock(_ out: inout ByteBuffer, _ h2: H2ClientConnection,
-                                 stream: UInt32, block: ByteBuffer,
-                                 endStream: Bool) throws(ClientError) {
-        let total = block.readableBytes
-        let limit = h2.peerMaxFrameSize
+    /// One request on a shared connection.
+    func exchangeShared(_ shared: H2Shared, block: [UInt8], method: HTTPMethod,
+                        body: [UInt8]) async throws(ClientError) -> ClientResponse {
+        let stream = H2Stream(method: method, recvWindow: shared.conn.initialWindowSize,
+                              deadline: pg_monotonic_ms() &+ timeoutMilliseconds)
+        do {
+            try await openStream(shared, stream, block: block, endStream: body.isEmpty)
+            if !body.isEmpty { try await sendBody(shared, stream, body) }
+            try await waitFor(shared, stream) { stream.done }
+        } catch {
+            abandon(shared, stream)
+            throw error
+        }
+        finish(shared, stream)
+        let keeps = shared.dead == nil && !shared.goaway
+        return ClientResponse(status: stream.status, reason: "", headers: stream.headers,
+                              body: method == .head ? [] : stream.body,
+                              reusedConnection: keeps)
+    }
+
+    /// Allocates the stream's id and writes its HEADERS, both under the lock.
+    private func openStream(_ shared: H2Shared, _ stream: H2Stream, block: [UInt8],
+                            endStream: Bool) async throws(ClientError) {
+        try await lock(shared)
+        guard shared.dead == nil, shared.acceptsStreams else {
+            await unlock(shared, stream)
+            // Somebody else filled it, or it was told to go away, while this
+            // waited for the lock. Nothing was sent, so this is safe to retry.
+            throw shared.dead ?? .streamReset(H2Error.refusedStream.rawValue)
+        }
+        stream.id = shared.conn.nextStreamID
+        shared.conn.nextStreamID &+= 2
+        stream.sendWindow = shared.conn.peerInitialWindowSize
+        shared.streams[stream.id] = stream
+
+        var out = ByteBuffer(capacity: block.count + 32)
+        defer { out.destroy() }
+        let limit = shared.conn.peerMaxFrameSize
         var at = 0
         var first = true
         repeat {
-            let n = min(limit, total - at)
-            let last = at + n == total
+            let n = min(limit, block.count - at)
             var flags: H2Flags = []
-            if last { flags.insert(.endHeaders) }
+            if at + n == block.count { flags.insert(.endHeaders) }
             if first && endStream { flags.insert(.endStream) }
-            let header = H2FrameHeader(length: n, type: first ? .headers : .continuation,
-                                       flags: flags, streamID: stream)
-            header.write(into: &out)
-            out.write(block.readPointer + at, n)
+            H2FrameHeader(length: n, type: first ? .headers : .continuation, flags: flags,
+                          streamID: stream.id).write(into: &out)
+            block.withUnsafeBufferPointer { out.write($0.baseAddress! + at, n) }
             at += n
             first = false
-        } while at < total
+        } while at < block.count
+        let bytes = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
+        do {
+            try await writeLocked(shared, stream, bytes)
+        } catch {
+            await unlock(shared, stream)
+            throw error
+        }
+        await unlock(shared, stream)
     }
 
-    // MARK: Reading
-
-    /// Reads whole frames until this stream is done, and assembles the answer.
-    private func readHTTP2Response(_ socket: OutboundSocket, _ h2: H2ClientConnection,
-                                   stream: UInt32,
-                                   method: HTTPMethod) async throws(ClientError) -> ClientResponse {
-        var buffer = ByteBuffer(capacity: 8192)
-        defer { buffer.destroy() }
-        var status = 0
-        var headers: [ClientHeader] = []
-        var body: [UInt8] = []
-        var sawHeaders = false
-        var done = false
-
-        while !done {
-            let header = try await nextFrame(socket, h2, &buffer)
-            let payload = buffer.readPointer + H2FrameHeader.size
-
-            // A header block may not be interleaved with anything else, and
-            // the peer is not to be trusted to keep to that: a CONTINUATION
-            // that arrives after something else means the block this was
-            // assembling is now of unknown provenance.
-            if h2.expectingContinuation && header.type != H2FrameType.continuation.rawValue {
-                throw .protocolError
+    /// DATA, one frame per lock, inside both windows.
+    private func sendBody(_ shared: H2Shared, _ stream: H2Stream,
+                          _ body: [UInt8]) async throws(ClientError) {
+        var sent = 0
+        while sent < body.count {
+            // Credit only a reader can deliver, so the lock is not held while
+            // waiting for it: a reader may need the lock, and a writer holding
+            // it until credit arrives would wait for itself.
+            try await waitFor(shared, stream) {
+                stream.done || stream.error != nil
+                    || (shared.conn.sendWindow > 0 && stream.sendWindow > 0)
             }
+            if let error = stream.error { throw error }
+            // The server answered before the body was finished -- a 413, say.
+            // What it said is the answer; the rest of the body is not wanted.
+            if stream.done { return }
 
-            switch H2FrameType(rawValue: header.type) {
-            case .settings:
-                if !header.flags.contains(.ack) {
-                    try applyPeerSettings(h2, payload, header.length)
-                    try await writeAck(socket, h2)
-                }
-
-            case .windowUpdate:
-                guard header.length == 4 else { throw .protocolError }
-                let increment = Int(HTTP2.readUInt32(payload) & 0x7FFF_FFFF)
-                if increment == 0 { throw .protocolError }
-                if header.streamID == 0 { h2.sendWindow += increment }
-
-            case .ping:
-                guard header.length == 8 else { throw .protocolError }
-                if !header.flags.contains(.ack) {
-                    var pong = ByteBuffer(capacity: 32)
-                    defer { pong.destroy() }
-                    H2FrameHeader(length: 8, type: .ping, flags: .ack, streamID: 0)
-                        .write(into: &pong)
-                    pong.write(payload, 8)
-                    try await writeAll(socket, pong.readPointer, pong.readableBytes)
-                }
-
-            case .goaway:
-                guard header.length >= 8 else { throw .protocolError }
-                h2.peerGoneAway = true
-                let code = HTTP2.readUInt32(payload + 4)
-                // A GOAWAY naming a stream below this one means this request
-                // was never processed, which is worth telling apart from one
-                // that was refused on its merits.
-                let lastStream = HTTP2.readUInt32(payload) & 0x7FFF_FFFF
-                if code != 0 || lastStream < stream { throw .streamReset(code) }
-                if !sawHeaders { throw .closed }
-                done = true
-
-            case .rstStream:
-                guard header.length == 4 else { throw .protocolError }
-                if header.streamID == stream { throw .streamReset(HTTP2.readUInt32(payload)) }
-
-            case .headers, .continuation:
-                if header.streamID != stream && header.streamID != 0 {
-                    // Not ours, and with one stream in flight there is no such
-                    // thing: a block for a stream this client never opened.
-                    throw .protocolError
-                }
-                h2.headerBlock.reserve(header.length)
-                h2.headerBlock.write(payload, header.length)
-                h2.expectingContinuation = !header.flags.contains(.endHeaders)
-                if !h2.expectingContinuation {
-                    let outcome = decodeBlock(h2, into: &status, &headers)
-                    h2.headerBlock.clear()
-                    if let outcome { throw outcome }
-                    // Informational responses are followed by the real one,
-                    // exactly as in HTTP/1.1.
-                    if status >= 100 && status < 200 {
-                        status = 0
-                        headers.removeAll(keepingCapacity: true)
-                    } else {
-                        sawHeaders = true
-                        if header.flags.contains(.endStream) { done = true }
-                    }
-                }
-
-            case .data:
-                if header.streamID != stream { throw .protocolError }
-                if body.count + header.length > maxBodyBytes { throw .bodyTooLarge }
-                body.append(contentsOf: UnsafeBufferPointer(start: payload, count: header.length))
-                // Every DATA byte is spent from our window whether or not the
-                // handler wanted it, so the credit has to go back or a large
-                // response stops half way.
-                h2.recvWindow -= header.length
-                if h2.recvWindow < h2.initialWindowSize / 2 {
-                    let bump = h2.initialWindowSize - h2.recvWindow
-                    try await writeWindowUpdate(socket, stream: stream, increment: bump)
-                    h2.recvWindow = h2.initialWindowSize
-                }
-                if header.flags.contains(.endStream) { done = true }
-
-            case .priority:
-                break
-            case .pushPromise:
-                // Push was refused in our SETTINGS, so a promise is the peer
-                // ignoring what it was told.
-                throw .protocolError
-            case .none:
-                // Unknown types are ignorable by design, which is how
-                // extensions are meant to work.
-                break
+            try await lock(shared)
+            // Measured and spent under the lock, with no suspension between,
+            // so two streams cannot both spend the same connection credit.
+            var n = min(body.count - sent, shared.conn.peerMaxFrameSize)
+            n = min(n, shared.conn.sendWindow)
+            n = min(n, stream.sendWindow)
+            if n <= 0 || stream.done || shared.dead != nil {
+                await unlock(shared, stream)
+                if let dead = shared.dead { throw dead }
+                continue
             }
-
-            buffer.consume(H2FrameHeader.size + header.length)
-        }
-
-        guard sawHeaders else { throw .closed }
-        return ClientResponse(status: status, reason: "", headers: headers,
-                              body: method == .head ? [] : body, reusedConnection: false)
-    }
-
-    /// Reads until a whole frame is in the buffer, and bounds it.
-    private func nextFrame(_ socket: OutboundSocket, _ h2: H2ClientConnection,
-                           _ buffer: inout ByteBuffer) async throws(ClientError) -> H2FrameHeader {
-        while buffer.readableBytes < H2FrameHeader.size {
-            try await readMore(socket, into: &buffer)
-        }
-        let header = H2FrameHeader.parse(buffer.readPointer)
-        // Checked before a byte of it is waited for. A length beyond what we
-        // advertised is a frame we never agreed to receive, and reading it to
-        // find out would be doing what it asked.
-        guard header.length <= h2.maxFrameSize else { throw .protocolError }
-        while buffer.readableBytes < H2FrameHeader.size + header.length {
-            try await readMore(socket, into: &buffer)
-        }
-        return header
-    }
-
-    private func applyPeerSettings(_ h2: H2ClientConnection,
-                                   _ payload: UnsafePointer<UInt8>,
-                                   _ length: Int) throws(ClientError) {
-        guard length % 6 == 0 else { throw .protocolError }
-        var at = 0
-        while at < length {
-            let id = UInt16(payload[at]) << 8 | UInt16(payload[at + 1])
-            let value = HTTP2.readUInt32(payload + at + 2)
-            switch H2Setting(rawValue: id) {
-            case .maxFrameSize:
-                guard value >= 16384 && value <= 16_777_215 else { throw .protocolError }
-                h2.peerMaxFrameSize = Int(value)
-            case .initialWindowSize:
-                guard value <= UInt32(H2FrameHeader.maxWindowSize) else { throw .protocolError }
-                h2.peerInitialWindowSize = Int(value)
-            case .maxHeaderListSize:
-                h2.peerMaxHeaderListSize = Int(value)
-            case .headerTableSize:
-                h2.decoder.setPermittedMaxSize(Int(value))
-            default:
-                break
+            shared.conn.sendWindow -= n
+            stream.sendWindow -= n
+            let last = sent + n == body.count
+            var out = ByteBuffer(capacity: n + 16)
+            H2FrameHeader(length: n, type: .data, flags: last ? .endStream : [],
+                          streamID: stream.id).write(into: &out)
+            body.withUnsafeBufferPointer { out.write($0.baseAddress! + sent, n) }
+            let bytes = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
+            out.destroy()
+            do {
+                try await writeLocked(shared, stream, bytes)
+            } catch {
+                await unlock(shared, stream)
+                throw error
             }
-            at += 6
+            await unlock(shared, stream)
+            sent += n
+            stream.deadline = pg_monotonic_ms() &+ timeoutMilliseconds
         }
     }
 
-    private func writeAck(_ socket: OutboundSocket,
-                          _ h2: H2ClientConnection) async throws(ClientError) {
-        var out = ByteBuffer(capacity: 16)
-        defer { out.destroy() }
-        H2FrameHeader(length: 0, type: .settings, flags: .ack, streamID: 0).write(into: &out)
-        try await writeAll(socket, out.readPointer, out.readableBytes)
+    // MARK: Leaving
+
+    /// A stream that finished normally.
+    private func finish(_ shared: H2Shared, _ stream: H2Stream) {
+        shared.streams.removeValue(forKey: stream.id)
+        shared.wakeOne(except: stream)
+        settleIfEmpty(shared)
     }
 
-    private func writeWindowUpdate(_ socket: OutboundSocket, stream: UInt32,
-                                   increment: Int) async throws(ClientError) {
-        guard increment > 0 else { return }
-        var out = ByteBuffer(capacity: 32)
-        defer { out.destroy() }
-        // Both levels: the connection's window and the stream's are spent
-        // separately, and topping up only one leaves the other to run out.
-        H2FrameHeader(length: 4, type: .windowUpdate, flags: [], streamID: 0).write(into: &out)
-        HTTP2.writeUInt32(UInt32(increment), into: &out)
-        H2FrameHeader(length: 4, type: .windowUpdate, flags: [], streamID: stream).write(into: &out)
-        HTTP2.writeUInt32(UInt32(increment), into: &out)
-        try await writeAll(socket, out.readPointer, out.readableBytes)
+    /// A stream this request is giving up on.
+    ///
+    /// The peer is told, unless it already knows. Otherwise it goes on sending
+    /// DATA for a stream nobody will read, spending connection credit every
+    /// other stream needs.
+    private func abandon(_ shared: H2Shared, _ stream: H2Stream) {
+        if stream.id != 0, shared.streams[stream.id] === stream {
+            shared.streams.removeValue(forKey: stream.id)
+            if !stream.done && !stream.closedByPeer && shared.dead == nil {
+                shared.queueReset(stream.id, .cancel)
+            }
+        }
+        if shared.blockedWriter === stream { shared.blockedWriter = nil }
+        shared.wakeOne(except: stream)
+        settleIfEmpty(shared)
     }
 
-    /// Reads frames until the send window opens, which is the only thing that
-    /// can reopen it.
-    private func pumpUntilWindow(_ socket: OutboundSocket, _ h2: H2ClientConnection,
-                                 _ buffer: inout ByteBuffer, stream: UInt32,
-                                 streamSendWindow: inout Int) async throws(ClientError) {
-        let header = try await nextFrame(socket, h2, &buffer)
-        let payload = buffer.readPointer + H2FrameHeader.size
+    /// A connection with no streams is kept for the next request if it is
+    /// still where requests go, and closed otherwise.
+    private func settleIfEmpty(_ shared: H2Shared) {
+        guard shared.streams.isEmpty else { return }
+        shared.idleSince = pg_monotonic_ms()
+        let registered = worker.pointee.outboundH2[shared.key] === shared
+        if !registered || shared.dead != nil || shared.goaway {
+            retire(shared, shared.dead ?? .closed)
+        }
+    }
+
+    /// Takes a connection out of use for good.
+    func retire(_ shared: H2Shared, _ error: ClientError) {
+        shared.markDead(error)
+        if worker.pointee.outboundH2[shared.key] === shared {
+            worker.pointee.outboundH2.removeValue(forKey: shared.key)
+        }
+        shared.socket.close()
+    }
+
+    // MARK: The write lock
+
+    private func lock(_ shared: H2Shared) async throws(ClientError) {
+        while shared.writerActive {
+            if let dead = shared.dead { throw dead }
+            await withUnsafeContinuation { shared.writeQueue.append($0) }
+        }
+        if let dead = shared.dead { throw dead }
+        shared.writerActive = true
+    }
+
+    /// Releases the lock, flushing queued control frames first: whoever holds
+    /// the lock is the only one who may write them, and a reader may have
+    /// queued them while this held it.
+    private func unlock(_ shared: H2Shared, _ stream: H2Stream) async {
+        if shared.dead == nil, shared.control.readableBytes > 0 {
+            let bytes = Array(UnsafeBufferPointer(start: shared.control.readPointer,
+                                                  count: shared.control.readableBytes))
+            shared.control.clear()
+            // A failure here is the connection failing, which writeLocked
+            // records; the stream that happened to be flushing is not at fault.
+            try? await writeLocked(shared, stream, bytes)
+        }
+        shared.writerActive = false
+        if !shared.writeQueue.isEmpty { shared.writeQueue.removeFirst().resume() }
+    }
+
+    /// Writes all of `bytes`, holding the lock.
+    private func writeLocked(_ shared: H2Shared, _ stream: H2Stream,
+                             _ bytes: [UInt8]) async throws(ClientError) {
+        var sent = 0
+        while sent < bytes.count {
+            if let dead = shared.dead { throw dead }
+            let n: Int
+            do {
+                n = try bytes.withUnsafeBufferPointer { buffer in
+                    try shared.socket.write(UnsafeRawBufferPointer(
+                        start: buffer.baseAddress! + sent, count: buffer.count - sent))
+                }
+            } catch {
+                // withUnsafeBufferPointer erases the typed throw.
+                let failure: ClientError = (error as? OutboundError) == .cancelled ? .cancelled : .closed
+                retire(shared, failure)
+                throw failure
+            }
+            sent += n
+            guard sent < bytes.count else { break }
+            // The socket is full. Only the baton's holder may wait on it, so
+            // ask for writability through that wait rather than a second one.
+            shared.blockedWriter = stream
+            shared.writableSeen = false
+            if shared.readerActive { shared.socket.watch([.read, .write]) }
+            do {
+                try await waitFor(shared, stream) { shared.writableSeen }
+            } catch {
+                if shared.blockedWriter === stream { shared.blockedWriter = nil }
+                throw error
+            }
+            if shared.blockedWriter === stream { shared.blockedWriter = nil }
+        }
+    }
+
+    // MARK: The read baton
+
+    /// Makes the connection deliver until `ready` holds.
+    ///
+    /// Reads if nobody is reading, parks if somebody is.
+    ///
+    /// Returning does not hand the baton on; `finish` and `abandon` do. That
+    /// is enough because every way out of here either comes back in -- a body
+    /// waiting for credit, a writer waiting for the socket -- where it reads
+    /// if nobody is, or reaches one of those two. An earlier version also
+    /// woke a parked request on every return, and mutation testing showed it
+    /// changed nothing but the number of spurious wakes: one per DATA frame
+    /// sent.
+    private func waitFor(_ shared: H2Shared, _ stream: H2Stream,
+                         until ready: () -> Bool) async throws(ClientError) {
+        while !ready() {
+            if let dead = shared.dead { throw dead }
+            if let error = stream.error { throw error }
+            if pg_monotonic_ms() >= stream.deadline { throw .timedOut }
+            if shared.readerActive {
+                await withUnsafeContinuation { stream.waiter = $0 }
+                continue
+            }
+            shared.readerActive = true
+            let failure = await readSome(shared)
+            shared.readerActive = false
+            if let failure {
+                retire(shared, failure)
+                throw failure
+            }
+            // Replies the reader owes go out now if nobody holds the lock --
+            // after the baton is put down, so that a full socket here can be
+            // waited on by the ordinary route.
+            if !shared.writerActive, shared.control.readableBytes > 0, shared.dead == nil {
+                try await lock(shared)
+                await unlock(shared, stream)
+            }
+            let now = pg_monotonic_ms()
+            for other in shared.streams.values where other !== stream && now >= other.deadline {
+                shared.wake(other)
+            }
+        }
+    }
+
+    /// Dispatches whatever whole frames are buffered, or waits on the socket
+    /// for more and then dispatches. The caller holds the baton.
+    private func readSome(_ shared: H2Shared) async -> ClientError? {
+        switch dispatchBuffered(shared) {
+        case .failed(let error): return error
+        case .progressed: return nil
+        case .nothing: break
+        }
+
+        if !shared.socket.hasBufferedInput {
+            var mask: PollMask = .read
+            if shared.blockedWriter != nil { mask.insert(.write) }
+            // Woken at the earliest deadline of any stream, so a parked request
+            // that has run out of time is told even while nothing arrives.
+            let now = pg_monotonic_ms()
+            var earliest = UInt64.max
+            for s in shared.streams.values { earliest = min(earliest, s.deadline) }
+            let wait = earliest == .max ? timeoutMilliseconds
+                : max(1, earliest > now ? earliest - now : 1)
+            do {
+                try await shared.socket.wait(mask, milliseconds: wait)
+            } catch {
+                // Silence is not the connection failing: each request checks
+                // its own deadline.
+                if error == .timedOut { return nil }
+                return error == .cancelled ? .cancelled : .closed
+            }
+            if let writer = shared.blockedWriter {
+                // Which of the two fired is not reported, so the writer is
+                // told to try; a socket still full sends it back here.
+                shared.writableSeen = true
+                shared.wake(writer)
+            }
+        }
+
+        shared.input.reserve(16384)
+        do {
+            let n = try shared.socket.read(into: UnsafeMutableRawBufferPointer(
+                start: shared.input.writePointer, count: shared.input.writableBytes))
+            shared.input.advanceWriter(n)
+        } catch {
+            return error == .cancelled ? .cancelled : .closed
+        }
+
+        if case .failed(let error) = dispatchBuffered(shared) { return error }
+        return nil
+    }
+
+    /// Reads what an idle connection has without waiting, and dispatches it.
+    private func drainWithoutWaiting(_ shared: H2Shared) -> ClientError? {
+        while true {
+            shared.input.reserve(16384)
+            do {
+                let n = try shared.socket.read(into: UnsafeMutableRawBufferPointer(
+                    start: shared.input.writePointer, count: shared.input.writableBytes))
+                if n == 0 { break }
+                shared.input.advanceWriter(n)
+            } catch {
+                return error == .cancelled ? .cancelled : .closed
+            }
+            if shared.input.readableBytes > 1 << 20 { break }
+        }
+        if case .failed(let error) = dispatchBuffered(shared) { return error }
+        return nil
+    }
+
+    private enum Dispatched {
+        case nothing
+        case progressed
+        case failed(ClientError)
+    }
+
+    private func dispatchBuffered(_ shared: H2Shared) -> Dispatched {
+        var any = false
+        while shared.input.readableBytes >= H2FrameHeader.size {
+            let header = H2FrameHeader.parse(shared.input.readPointer)
+            // Bounded before a byte of the payload is waited for. A length
+            // beyond what we advertised is a frame we never agreed to take.
+            if header.length > shared.conn.maxFrameSize { return .failed(.protocolError) }
+            guard shared.input.readableBytes >= H2FrameHeader.size + header.length else { break }
+            if let error = dispatch(shared, header, shared.input.readPointer + H2FrameHeader.size) {
+                return .failed(error)
+            }
+            shared.input.consume(H2FrameHeader.size + header.length)
+            any = true
+        }
+        if shared.input.readableBytes == 0 { shared.input.clear() }
+        return any ? .progressed : .nothing
+    }
+
+    // MARK: Frames
+
+    /// Handles one frame. Returns an error only for what ends the connection;
+    /// a stream's troubles are recorded on the stream.
+    private func dispatch(_ shared: H2Shared, _ header: H2FrameHeader,
+                          _ payload: UnsafePointer<UInt8>) -> ClientError? {
+        let conn = shared.conn
+        let now = pg_monotonic_ms()
+
+        // A header block may not be interleaved with anything, and a peer
+        // that does it has left a block of unknown provenance half assembled.
+        if conn.expectingContinuation && header.type != H2FrameType.continuation.rawValue {
+            return .protocolError
+        }
+
         switch H2FrameType(rawValue: header.type) {
-        case .windowUpdate:
-            guard header.length == 4 else { throw .protocolError }
-            let increment = Int(HTTP2.readUInt32(payload) & 0x7FFF_FFFF)
-            if increment == 0 { throw .protocolError }
-            if header.streamID == 0 {
-                h2.sendWindow += increment
-            } else if header.streamID == stream {
-                streamSendWindow += increment
-            }
         case .settings:
-            if !header.flags.contains(.ack) {
-                try applyPeerSettings(h2, payload, header.length)
-                buffer.consume(H2FrameHeader.size + header.length)
-                try await writeAck(socket, h2)
-                return
+            if header.streamID != 0 || header.length % 6 != 0 { return .protocolError }
+            if header.flags.contains(.ack) { return nil }
+            var at = 0
+            while at < header.length {
+                let id = UInt16(payload[at]) << 8 | UInt16(payload[at + 1])
+                let value = HTTP2.readUInt32(payload + at + 2)
+                switch H2Setting(rawValue: id) {
+                case .maxFrameSize:
+                    guard value >= 16384 && value <= 16_777_215 else { return .protocolError }
+                    conn.peerMaxFrameSize = Int(value)
+                case .initialWindowSize:
+                    guard value <= UInt32(H2FrameHeader.maxWindowSize) else { return .protocolError }
+                    // Applies to every open stream, by the difference, and may
+                    // leave a window negative: RFC 9113 section 6.9.2.
+                    let delta = Int(value) - conn.peerInitialWindowSize
+                    conn.peerInitialWindowSize = Int(value)
+                    for stream in shared.streams.values {
+                        stream.sendWindow += delta
+                        if stream.sendWindow > H2FrameHeader.maxWindowSize { return .protocolError }
+                    }
+                case .maxConcurrentStreams:
+                    conn.peerMaxConcurrentStreams = Int(value)
+                case .maxHeaderListSize:
+                    conn.peerMaxHeaderListSize = Int(value)
+                default:
+                    // SETTINGS_HEADER_TABLE_SIZE included, deliberately. It
+                    // bounds the *peer's* decoder, which is to say our encoder,
+                    // and our encoder never indexes. The first version handed
+                    // it to our decoder, which shrinks the table we told the
+                    // peer it could use -- a server advertising 0 would then
+                    // have its valid responses refused.
+                    break
+                }
+                at += 6
             }
+            shared.queueControl(.settings, flags: .ack, stream: 0, { _ in }, length: 0)
+            shared.wakeAll()
+
+        case .windowUpdate:
+            guard header.length == 4 else { return .protocolError }
+            let increment = Int(HTTP2.readUInt32(payload) & 0x7FFF_FFFF)
+            if header.streamID == 0 {
+                if increment == 0 { return .protocolError }
+                conn.sendWindow += increment
+                if conn.sendWindow > H2FrameHeader.maxWindowSize { return .protocolError }
+                shared.wakeAll()
+            } else if let stream = shared.streams[header.streamID] {
+                if increment == 0 {
+                    failStream(shared, stream, .protocolError, reset: .protocolError)
+                } else {
+                    stream.sendWindow += increment
+                    if stream.sendWindow > H2FrameHeader.maxWindowSize {
+                        failStream(shared, stream, .protocolError, reset: .flowControlError)
+                    }
+                    stream.deadline = now &+ timeoutMilliseconds
+                    shared.wake(stream)
+                }
+            }
+
+        case .ping:
+            guard header.length == 8, header.streamID == 0 else { return .protocolError }
+            if !header.flags.contains(.ack) {
+                shared.queueControl(.ping, flags: .ack, stream: 0,
+                                    { $0.write(payload, 8) }, length: 8)
+            }
+
         case .goaway:
-            guard header.length >= 8 else { throw .protocolError }
-            throw .streamReset(header.length >= 8 ? HTTP2.readUInt32(payload + 4) : 0)
+            guard header.length >= 8, header.streamID == 0 else { return .protocolError }
+            shared.goaway = true
+            let lastStream = HTTP2.readUInt32(payload) & 0x7FFF_FFFF
+            let code = HTTP2.readUInt32(payload + 4)
+            // Streams above the last one the peer processed were never looked
+            // at, which is what makes them safe to send again elsewhere.
+            for stream in shared.streams.values where stream.id > lastStream {
+                stream.closedByPeer = true
+                stream.error = .streamReset(code == 0 ? H2Error.refusedStream.rawValue : code)
+                shared.wake(stream)
+            }
+
         case .rstStream:
-            guard header.length == 4 else { throw .protocolError }
-            if header.streamID == stream { throw .streamReset(HTTP2.readUInt32(payload)) }
-        default:
+            guard header.length == 4, header.streamID != 0 else { return .protocolError }
+            if let stream = shared.streams[header.streamID], !stream.done {
+                stream.closedByPeer = true
+                stream.error = .streamReset(HTTP2.readUInt32(payload))
+                shared.wake(stream)
+            }
+
+        case .headers, .continuation:
+            var start = 0
+            var end = header.length
+            if header.type == H2FrameType.headers.rawValue {
+                if header.streamID == 0 || header.streamID % 2 == 0 { return .protocolError }
+                if header.flags.contains(.padded) {
+                    guard header.length >= 1 else { return .protocolError }
+                    let pad = Int(payload[0])
+                    start = 1
+                    end = header.length - pad
+                }
+                if header.flags.contains(.priority) { start += 5 }
+                guard start <= end else { return .protocolError }
+                conn.headerStream = header.streamID
+                conn.headerEndsStream = header.flags.contains(.endStream)
+                conn.headerBlock.clear()
+            } else {
+                guard conn.expectingContinuation, header.streamID == conn.headerStream else {
+                    return .protocolError
+                }
+            }
+            conn.headerBlock.reserve(end - start)
+            conn.headerBlock.write(payload + start, end - start)
+            conn.expectingContinuation = !header.flags.contains(.endHeaders)
+            if conn.expectingContinuation { return nil }
+
+            // Decoded whether or not anyone still wants it. HPACK is stateful,
+            // and skipping one block decodes every later one to nonsense.
+            var status = 0
+            var fields: [ClientHeader] = []
+            guard decodeBlock(conn, &status, &fields) else {
+                return .malformedResponse(.badHeader)
+            }
+            conn.headerBlock.clear()
+            guard let stream = shared.streams[conn.headerStream], !stream.done,
+                  stream.error == nil else { return nil }
+            stream.deadline = now &+ timeoutMilliseconds
+            let endsStream = conn.headerEndsStream
+
+            if stream.sawFinalHeaders {
+                // Trailers. Read to keep HPACK in step, and not kept.
+                if !endsStream {
+                    failStream(shared, stream, .protocolError, reset: .protocolError)
+                } else {
+                    stream.done = true
+                }
+            } else if status == 0 {
+                // No :status, or one that was not three digits. Guessing 200
+                // would hand the caller a success the peer never claimed.
+                failStream(shared, stream, .malformedResponse(.badStatusLine),
+                           reset: .protocolError)
+            } else if status >= 100 && status < 200 {
+                // Informational: the real answer follows on the same stream.
+                if endsStream {
+                    failStream(shared, stream, .malformedResponse(.badStatusLine),
+                               reset: .protocolError)
+                }
+            } else {
+                stream.status = status
+                stream.headers = fields
+                stream.sawFinalHeaders = true
+                if endsStream { stream.done = true }
+            }
+            shared.wake(stream)
+
+        case .data:
+            guard header.streamID != 0 else { return .protocolError }
+            var start = 0
+            var end = header.length
+            if header.flags.contains(.padded) {
+                guard header.length >= 1 else { return .protocolError }
+                start = 1
+                end = header.length - Int(payload[0])
+                guard start <= end else { return .protocolError }
+            }
+            // Flow control counts the whole frame, padding included, and the
+            // connection's share is spent whoever the stream belongs to: DATA
+            // for a stream nobody wants any more still used the credit.
+            conn.recvWindow -= header.length
+            if conn.recvWindow < 0 { return .protocolError }
+            if conn.recvWindow < conn.initialWindowSize / 2 {
+                shared.queueWindowUpdate(0, conn.initialWindowSize - conn.recvWindow)
+                conn.recvWindow = conn.initialWindowSize
+            }
+            guard let stream = shared.streams[header.streamID], !stream.done,
+                  stream.error == nil else { return nil }
+            guard stream.sawFinalHeaders else {
+                // A body before any answer to attach it to.
+                failStream(shared, stream, .protocolError, reset: .protocolError)
+                return nil
+            }
+            stream.recvWindow -= header.length
+            if stream.recvWindow < 0 {
+                failStream(shared, stream, .protocolError, reset: .flowControlError)
+                return nil
+            }
+            let length = end - start
+            if stream.body.count + length > maxBodyBytes {
+                failStream(shared, stream, .bodyTooLarge, reset: .cancel)
+                return nil
+            }
+            stream.body.append(contentsOf: UnsafeBufferPointer(start: payload + start,
+                                                               count: length))
+            if header.flags.contains(.endStream) {
+                stream.done = true
+            } else if stream.recvWindow < conn.initialWindowSize / 2 {
+                shared.queueWindowUpdate(stream.id, conn.initialWindowSize - stream.recvWindow)
+                stream.recvWindow = conn.initialWindowSize
+            }
+            stream.deadline = now &+ timeoutMilliseconds
+            shared.wake(stream)
+
+        case .priority:
+            guard header.length == 5 else { return .protocolError }
+
+        case .pushPromise:
+            // Push was refused in our SETTINGS.
+            return .protocolError
+
+        case .none:
+            // Unknown types are ignorable by design.
             break
         }
-        buffer.consume(H2FrameHeader.size + header.length)
+        return nil
     }
 
-    /// Decodes an assembled header block into a status and fields.
-    ///
-    /// Returns the failure rather than throwing it: the decoder's throw is
-    /// erased by the closure it is called through, and putting it back at the
-    /// call site keeps the typed throw honest.
-    private func decodeBlock(_ h2: H2ClientConnection, into status: inout Int,
-                             _ headers: inout [ClientHeader]) -> ClientError? {
-        var failure: ClientError? = nil
-        var foundStatus = 0
+    /// Ends one stream, telling the peer why, without touching the others.
+    private func failStream(_ shared: H2Shared, _ stream: H2Stream, _ error: ClientError,
+                            reset code: H2Error) {
+        stream.error = error
+        shared.queueReset(stream.id, code)
+        stream.closedByPeer = true   // nothing further owed: the reset is queued
+        shared.wake(stream)
+    }
+
+    /// Decodes the assembled block. False when HPACK itself failed, which ends
+    /// the connection: its table can no longer be trusted. A missing or
+    /// malformed :status leaves `status` at 0 for the stream to refuse.
+    private func decodeBlock(_ conn: H2ClientConnection, _ status: inout Int,
+                             _ fields: inout [ClientHeader]) -> Bool {
+        var found = 0
         var collected: [ClientHeader] = []
         do {
-            try h2.decoder.decode(h2.headerBlock.readPointer, h2.headerBlock.readableBytes) { span in
+            try conn.decoder.decode(conn.headerBlock.readPointer,
+                                    conn.headerBlock.readableBytes) { span in
                 if span.nameLength > 0 && span.name[0] == UInt8(ascii: ":") {
                     if equalsExact(span.name, span.nameLength, ":status") {
                         var value = 0
-                        var i = 0
                         var digits = 0
+                        var i = 0
                         while i < span.valueLength {
                             let c = span.value[i]
                             guard c >= cZero, c <= cNine else { return }
@@ -520,7 +1018,7 @@ extension HTTPClient {
                             digits += 1
                             i += 1
                         }
-                        if digits == 3 { foundStatus = value }
+                        if digits == 3 { found = value }
                     }
                     return
                 }
@@ -533,18 +1031,19 @@ extension HTTPClient {
                                   as: UTF8.self)))
             }
         } catch {
-            failure = .malformedResponse(.badHeader)
+            return false
         }
-        if failure == nil && foundStatus == 0 {
-            // No :status, or one that was not three digits. A response
-            // without it is malformed, RFC 9113 section 8.3.2, and guessing
-            // 200 would hand the caller a success the peer never claimed.
-            failure = .malformedResponse(.badStatusLine)
-        }
-        if failure == nil {
-            status = foundStatus
-            headers = collected
-        }
-        return failure
+        status = found
+        fields = collected
+        return true
+    }
+}
+
+private extension Substring {
+    var trimmingSpaces: Substring {
+        var s = self
+        while s.first == " " { s = s.dropFirst() }
+        while s.last == " " { s = s.dropLast() }
+        return s
     }
 }

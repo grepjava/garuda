@@ -506,6 +506,10 @@ extension Worker {
     /// Closes every outbound connection. A drain does not wait for these: the
     /// requests that wanted them are already being unwound.
     mutating func closeAllOutbound() {
+        // Shared HTTP/2 connections first, so every stream parked on one is
+        // told it has gone rather than left waiting for a reader that the
+        // closes below are about to take away.
+        failAllSharedH2()
         guard let table = outbound else { return }
         var i = 0
         while i < table.capacity {
@@ -622,7 +626,13 @@ struct OutboundSocket {
         try await wait(.write, milliseconds: milliseconds)
     }
 
-    private func wait(_ mask: PollMask, milliseconds: UInt64) async throws(OutboundError) {
+    /// Parks until the socket is ready for anything in `mask`.
+    ///
+    /// Internal rather than private for HTTP/2, where one connection carries
+    /// many streams and the record has room for exactly one waiter: whoever
+    /// holds the connection's read baton waits for readability *and*, when a
+    /// writer is stuck, writability, in the single wait there is.
+    func wait(_ mask: PollMask, milliseconds: UInt64) async throws(OutboundError) {
         guard isOpen else { throw .cancelled }
         // Already here, inside OpenSSL. Waiting would be waiting for nothing.
         if mask.wantsRead, hasBufferedInput { return }
@@ -652,6 +662,17 @@ struct OutboundSocket {
     func close() {
         guard isOpen else { return }
         worker.pointee.closeOutbound(index)
+    }
+
+    /// Changes what a wait already in progress is woken for.
+    ///
+    /// The one waiter a record allows cannot be joined by a second, so a
+    /// writer that finds the socket full widens the reader's wait to include
+    /// writability rather than starting a wait of its own -- which would fail
+    /// with EBUSY.
+    func watch(_ mask: PollMask) {
+        guard isOpen else { return }
+        worker.pointee.setOutboundInterest(index, mask)
     }
 }
 

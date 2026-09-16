@@ -191,6 +191,54 @@ extension HTTPClient {
         }
         defer { request.destroy() }
 
+        // An HTTP/2 connection already open to this place takes the request as
+        // one more stream, before a lookup or a connect is paid for.
+        let mayUseHTTP2 = forceHTTP2 || (plan.secure && offersHTTP2)
+        let key = sharedKey(plan)
+        var connecting = false
+        if mayUseHTTP2 {
+            while true {
+                if let shared = reusableShared(key) {
+                    let block = try encodeRequestBlock(plan, method: method, headers: headers,
+                                                       hasBody: !body.isEmpty)
+                    return try await exchangeShared(shared, block: block, method: method, body: body)
+                }
+                // Somebody is already opening one. Wait to see whether it comes
+                // up as a connection this can join, rather than opening a second
+                // alongside it.
+                guard worker.pointee.outboundH2Connecting[key] != nil else { break }
+                let worker = self.worker
+                await withUnsafeContinuation { k in
+                    worker.pointee.outboundH2Connecting[key]?.append(k)
+                }
+            }
+            worker.pointee.outboundH2Connecting[key] = []
+            connecting = true
+        }
+        // Lets the requests that waited on this connect try again. Called the
+        // moment the outcome is known -- registered, failed, or HTTP/1.1 after
+        // all -- and not when this request finishes, which could be long after.
+        let worker = self.worker
+        func doneConnecting() {
+            guard connecting else { return }
+            connecting = false
+            let waiting = worker.pointee.outboundH2Connecting.removeValue(forKey: key) ?? []
+            for k in waiting { k.resume() }
+        }
+
+        // Forced HTTP/2 knows its protocol before connecting, so a field it
+        // cannot send is refused before anything is opened.
+        var early: [UInt8]? = nil
+        if forceHTTP2 {
+            do {
+                early = try encodeRequestBlock(plan, method: method, headers: headers,
+                                               hasBody: !body.isEmpty)
+            } catch {
+                doneConnecting()
+                throw error
+            }
+        }
+
         let socket: OutboundSocket
         do {
             if plan.secure {
@@ -198,10 +246,14 @@ extension HTTPClient {
                                                      caFile: caFile, alpn: alpn,
                                                      milliseconds: timeoutMilliseconds)
             } else {
+                // A forced HTTP/2 connection is keyed apart from plaintext
+                // HTTP/1.1, so the pool can never hand one to the other.
                 socket = try await Worker.connect(worker, name: plan.host, port: plan.port,
+                                                  tls: forceHTTP2 ? "\u{0}h2c" : "",
                                                   milliseconds: timeoutMilliseconds)
             }
         } catch {
+            doneConnecting()
             throw .connect(error)
         }
 
@@ -209,21 +261,28 @@ extension HTTPClient {
         // a connection the peer believes is carrying frames desynchronises it
         // immediately, so the agreement decides which of the two this is.
         if socket.isHTTP2 || forceHTTP2 {
-            // One exchange per connection, and closed on every path out --
-            // including the one where it worked.
-            //
-            // The state that would have to persist between two exchanges on
-            // one socket, the HPACK dynamic table above all, is what makes
-            // sharing subtle, so returning it to the pool would send a second
-            // preface down a live connection. But closing only on failure is
-            // not the safe half of that: a successful exchange then leaves the
-            // record open and owned by nobody, holding a descriptor until the
-            // worker drains. `reusedConnection` would still say false, which
-            // is how it went unnoticed.
-            defer { socket.close() }
-            return try await exchangeHTTP2(socket, plan, method: method,
-                                           headers: headers, body: body)
+            // Kept from here on, for every request to the same place. Kept
+            // before this request's fields are checked, too: a field that
+            // cannot be sent is this request's problem, not the connection's.
+            let shared: H2Shared
+            do {
+                shared = try await startShared(socket, key)
+            } catch {
+                doneConnecting()
+                throw error
+            }
+            doneConnecting()
+            let block: [UInt8]
+            if let early {
+                block = early
+            } else {
+                block = try encodeRequestBlock(plan, method: method, headers: headers,
+                                               hasBody: !body.isEmpty)
+            }
+            return try await exchangeShared(shared, block: block, method: method, body: body)
         }
+        // HTTP/1.1 after all. Anyone who waited connects for themselves.
+        doneConnecting()
 
         do {
             try await writeAll(socket, request.readPointer, request.readableBytes)

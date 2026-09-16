@@ -4,14 +4,14 @@ import GarudaCore
 import GarudaHTTP
 @testable import Garuda
 
-// Tests for one HTTP/2 exchange over a connection the worker made.
+// Tests for HTTP/2 over connections the worker made.
 //
 // The origin here speaks frames rather than text: it reads the client preface,
-// takes the SETTINGS that follow it, decodes the request's header block with a
-// real HPACK decoder, and answers with an encoded block of its own. A fake
-// that matched bytes would prove nothing about whether a server can read what
-// this client writes -- which is the only question worth asking of a protocol
-// implementation.
+// takes the SETTINGS that follow it, decodes each request's header block with a
+// real HPACK decoder -- one per connection, since HPACK is per connection --
+// and answers with encoded blocks of its own. A fake that matched bytes would
+// prove nothing about whether a server can read what this client writes, which
+// is the only question worth asking of a protocol implementation.
 //
 // Both ends are on this thread, so the origin is pumped once per turn of the
 // worker and never blocks.
@@ -26,31 +26,84 @@ nonisolated(unsafe) private var bodyLimitWanted = 8 * 1024 * 1024
 /// is the right answer in production and a tax on a suite that runs in
 /// tenths of a second.
 nonisolated(unsafe) private var timeoutWanted: UInt64 = 10_000
+/// What each of several concurrent requests saw, by the name of its route.
+nonisolated(unsafe) private var outcomes: [String: String] = [:]
+nonisolated(unsafe) private var originURL = ""
+/// A timeout for one of the concurrent routes, where the test needs requests
+/// with different patience in flight at once.
+nonisolated(unsafe) private var timeoutsWanted: [String: UInt64] = [:]
 
 /// One frame, as the origin saw it.
 private struct SeenFrame {
+    var peer: Int
     var type: UInt8
     var flags: UInt8
     var streamID: UInt32
     var payload: [UInt8]
 }
 
+/// A request the origin has read in full.
+private struct OriginRequest {
+    var peer: Int
+    var stream: UInt32
+    var fields: [(String, String)]
+    var body: [UInt8]
+
+    func field(_ name: String) -> String? {
+        for (n, v) in fields where n == name { return v }
+        return nil
+    }
+
+    var path: String { field(":path") ?? "" }
+}
+
+/// One connection the origin accepted, and the state HTTP/2 keeps for it.
+private final class OriginPeer {
+    let fd: Int32
+    var inbox: [UInt8] = []
+    var sawPreface = false
+    var decoder = HPACKDecoder()
+    var block: [UInt8] = []
+    var headerStream: UInt32 = 0
+    var headerEndsStream = false
+    var fields: [UInt32: [(String, String)]] = [:]
+    var bodies: [UInt32: [UInt8]] = [:]
+    var pending: [[UInt8]] = []
+    var closed = false
+
+    init(_ fd: Int32) { self.fd = fd }
+
+    deinit {
+        decoder.destroy()
+        if !closed { _ = pg_close(fd) }
+    }
+}
+
 /// An HTTP/2 origin the test owns, on a port the kernel chose.
 private final class FakeH2Origin {
     let fd: Int32
     let port: UInt16
-    /// Frames received, in order, after the preface.
+    private(set) var peers: [OriginPeer] = []
+    /// Frames received from every connection, in order, after each preface.
     private(set) var frames: [SeenFrame] = []
-    /// The request's decoded header fields, once its HEADERS block arrived.
-    private(set) var requestFields: [(String, String)] = []
-    /// Request DATA, reassembled.
+    /// Requests read in full, in the order they finished arriving.
+    private(set) var requests: [OriginRequest] = []
+    /// Every DATA byte received, whether or not its request ever finished.
     private(set) var requestBody: [UInt8] = []
     private(set) var accepted = 0
-    private(set) var sawPreface = false
-    /// Replies to send once the request's headers have arrived, in order.
+    /// Requests read and deliberately not answered, while `hold` is on.
+    private(set) var held: [OriginRequest] = []
+
+    /// Frames for the first request, when nothing more specific is set.
     var script: [[UInt8]] = []
-    /// Sends the scripted reply one frame per pump rather than all at once, so
-    /// the client has to come back for the rest.
+    private var scriptUsed = false
+    /// Frames for every request, built for it.
+    var respond: ((OriginRequest) -> [[UInt8]])? = nil
+    /// Keeps finished requests unanswered until the test says, so a test can
+    /// arrange what is in flight at once and answer it in any order.
+    var hold = false
+    /// Sends replies one frame per pump rather than all at once, so the client
+    /// has to come back for the rest.
     var dribble = false
     /// Returns flow-control credit as upload DATA arrives, which is what lets
     /// a body larger than the initial window finish.
@@ -67,18 +120,19 @@ private final class FakeH2Origin {
     /// itself. Real servers grant in lumps. This is the only arrangement in
     /// which that setting is observable at all.
     var creditInLump = 0
-    /// Sends SETTINGS before anything else and waits for the ack, so a setting
-    /// is in force before the client starts sending a body.
+    /// On the first upload DATA, raises SETTINGS_INITIAL_WINDOW_SIZE to this
+    /// and grants connection credit only -- so the one thing that can let the
+    /// stream carry on is the new initial window being applied to a stream
+    /// that is already open.
+    var raiseInitialWindowTo: UInt32 = 0
+    /// Settings announced to every connection the moment it is accepted, not
+    /// in reply to anything. A setting only binds what has not been sent yet,
+    /// so one that arrives late proves nothing about whether it was honoured.
+    var announce: [(H2Setting, UInt32)] = []
+    /// Shorthand for announcing SETTINGS_MAX_FRAME_SIZE, kept for the tests
+    /// written before `announce`.
     var settingsFirst = false
-    /// The frame size to advertise when `settingsFirst` is on.
     var peerMaxFrameSize: UInt32 = 16384
-    private var announced = false
-    private var open: [Int32] = []
-    private var inbox: [Int32: [UInt8]] = [:]
-    private var answered = false
-    private var pending: [[UInt8]] = []
-    private var decoder = HPACKDecoder()
-    private var block: [UInt8] = []
 
     init?() {
         let opened = "127.0.0.1".withCString { pg_listen_tcp($0, 0, 16, 0, 0) }
@@ -90,174 +144,194 @@ private final class FakeH2Origin {
     }
 
     deinit {
-        decoder.destroy()
-        for peer in open { _ = pg_close(peer) }
+        peers.removeAll()
         _ = pg_close(fd)
     }
 
     var url: String { "http://127.0.0.1:\(port)" }
+    var sawPreface: Bool { peers.contains { $0.sawPreface } }
+    /// The most recent request's fields, for the tests about one request.
+    var requestFields: [(String, String)] { requests.last?.fields ?? [] }
 
     func pump() {
-        // Whatever was owed from last time goes first.
-        if !pending.isEmpty, let peer = open.first {
-            let next = pending.removeFirst()
-            _ = next.withUnsafeBytes { pg_write(peer, $0.baseAddress, $0.count) }
+        // Whatever was owed from last time goes first, one frame per
+        // connection per pump.
+        for peer in peers where !peer.closed && !peer.pending.isEmpty {
+            let next = peer.pending.removeFirst()
+            _ = next.withUnsafeBytes { pg_write(peer.fd, $0.baseAddress, $0.count) }
         }
 
         var address = [CChar](repeating: 0, count: 64)
         var peerPort: UInt16 = 0
-        let peer = pg_accept(fd, &address, 64, &peerPort)
-        if peer >= 0 {
-            open.append(peer)
-            accepted += 1
+        let accepted = pg_accept(fd, &address, 64, &peerPort)
+        if accepted >= 0 {
+            let peer = OriginPeer(accepted)
+            peers.append(peer)
+            self.accepted += 1
+            var settings = announce
+            if settingsFirst { settings.append((.maxFrameSize, peerMaxFrameSize)) }
+            if !settings.isEmpty {
+                var payload: [UInt8] = []
+                for (setting, value) in settings {
+                    payload.append(UInt8(truncatingIfNeeded: setting.rawValue >> 8))
+                    payload.append(UInt8(truncatingIfNeeded: setting.rawValue))
+                    payload.append(contentsOf: u32(value))
+                }
+                let frame = rawFrame(type: .settings, stream: 0, payload: payload)
+                _ = frame.withUnsafeBytes { pg_write(peer.fd, $0.baseAddress, $0.count) }
+            }
         }
 
-        // Announced the moment a peer arrives, not in reply to anything. A
-        // setting only binds what has not been sent yet, so one that arrives
-        // after the client has begun its body proves nothing about whether it
-        // was honoured.
-        if settingsFirst, !announced, let peer = open.first {
-            announced = true
-            var out = ByteBuffer(capacity: 32)
-            defer { out.destroy() }
-            H2FrameHeader(length: 6, type: .settings, flags: [], streamID: 0)
-                .write(into: &out)
-            out.writeByte(0x00)
-            out.writeByte(UInt8(H2Setting.maxFrameSize.rawValue))
-            HTTP2.writeUInt32(peerMaxFrameSize, into: &out)
-            write(peer, out)
-        }
-
-        for peer in open {
+        for index in peers.indices where !peers[index].closed {
+            let peer = peers[index]
             var buffer = [UInt8](repeating: 0, count: 65536)
             let got = buffer.withUnsafeMutableBytes { raw in
-                pg_read(peer, raw.baseAddress, raw.count)
+                pg_read(peer.fd, raw.baseAddress, raw.count)
             }
-            if got > 0 {
-                inbox[peer, default: []].append(contentsOf: buffer.prefix(got))
-            }
-            consume(peer)
+            if got > 0 { peer.inbox.append(contentsOf: buffer.prefix(got)) }
+            consume(index)
         }
     }
 
     /// Takes the preface and then whole frames out of what has arrived.
-    private func consume(_ peer: Int32) {
-        var have = inbox[peer] ?? []
-        if !sawPreface {
-            guard have.count >= HTTP2.preface.count else { inbox[peer] = have; return }
-            sawPreface = Array(have.prefix(HTTP2.preface.count)) == HTTP2.preface
-            have.removeFirst(HTTP2.preface.count)
+    private func consume(_ index: Int) {
+        let peer = peers[index]
+        if !peer.sawPreface {
+            guard peer.inbox.count >= HTTP2.preface.count else { return }
+            peer.sawPreface = Array(peer.inbox.prefix(HTTP2.preface.count)) == HTTP2.preface
+            peer.inbox.removeFirst(HTTP2.preface.count)
         }
-        while have.count >= H2FrameHeader.size {
-            let header = have.withUnsafeBufferPointer { H2FrameHeader.parse($0.baseAddress!) }
-            guard have.count >= H2FrameHeader.size + header.length else { break }
-            let payload = Array(have[H2FrameHeader.size..<(H2FrameHeader.size + header.length)])
-            have.removeFirst(H2FrameHeader.size + header.length)
-            frames.append(SeenFrame(type: header.type, flags: header.flags.rawValue,
+        while peer.inbox.count >= H2FrameHeader.size {
+            let header = peer.inbox.withUnsafeBufferPointer { H2FrameHeader.parse($0.baseAddress!) }
+            guard peer.inbox.count >= H2FrameHeader.size + header.length else { break }
+            let payload = Array(peer.inbox[H2FrameHeader.size..<(H2FrameHeader.size + header.length)])
+            peer.inbox.removeFirst(H2FrameHeader.size + header.length)
+            frames.append(SeenFrame(peer: index, type: header.type, flags: header.flags.rawValue,
                                     streamID: header.streamID, payload: payload))
-            handle(peer, header, payload)
+            handle(index, header, payload)
         }
-        inbox[peer] = have
     }
 
-    private func handle(_ peer: Int32, _ header: H2FrameHeader, _ payload: [UInt8]) {
+    private func handle(_ index: Int, _ header: H2FrameHeader, _ payload: [UInt8]) {
+        let peer = peers[index]
         switch H2FrameType(rawValue: header.type) {
         case .settings:
             if header.flags.rawValue & H2Flags.ack.rawValue == 0 {
-                // Ack it, as a server must.
-                var out = ByteBuffer(capacity: 16)
-                defer { out.destroy() }
-                H2FrameHeader(length: 0, type: .settings, flags: .ack, streamID: 0)
-                    .write(into: &out)
-                write(peer, out)
+                write(peer, rawFrame(type: .settings, flags: .ack, stream: 0))
             }
         case .headers, .continuation:
-            block.append(contentsOf: payload)
+            if header.type == H2FrameType.headers.rawValue {
+                peer.headerStream = header.streamID
+                peer.headerEndsStream = header.flags.rawValue & H2Flags.endStream.rawValue != 0
+                peer.block = payload
+            } else {
+                peer.block.append(contentsOf: payload)
+            }
             if header.flags.rawValue & H2Flags.endHeaders.rawValue != 0 {
-                decodeBlock()
-                block.removeAll()
-                if header.flags.rawValue & H2Flags.endStream.rawValue != 0 { answer(peer) }
+                peer.fields[peer.headerStream] = decode(peer)
+                peer.block.removeAll()
+                if peer.headerEndsStream { complete(index, peer.headerStream) }
             }
         case .data:
             requestBody.append(contentsOf: payload)
+            peer.bodies[header.streamID, default: []].append(contentsOf: payload)
             if header.flags.rawValue & H2Flags.endStream.rawValue != 0 {
-                answer(peer)
+                complete(index, header.streamID)
             } else if credit {
                 // What a real server does as it consumes an upload: give the
                 // window back, at both levels, or the client stops at 65535
                 // bytes and waits for something that is never coming.
-                var out = ByteBuffer(capacity: 64)
-                defer { out.destroy() }
-                H2FrameHeader(length: 4, type: .windowUpdate, flags: [], streamID: 0)
-                    .write(into: &out)
-                HTTP2.writeUInt32(UInt32(payload.count), into: &out)
-                H2FrameHeader(length: 4, type: .windowUpdate, flags: [],
-                              streamID: header.streamID).write(into: &out)
-                HTTP2.writeUInt32(UInt32(payload.count), into: &out)
-                write(peer, out)
+                write(peer, windowUpdate(0, payload.count) + windowUpdate(header.streamID,
+                                                                          payload.count))
             } else if creditInLump > 0 {
                 // Once, and generously, so that after the stall the window is
                 // wide and the agreed frame size is what caps a frame.
                 let lump = creditInLump
                 creditInLump = 0
-                var out = ByteBuffer(capacity: 64)
-                defer { out.destroy() }
-                H2FrameHeader(length: 4, type: .windowUpdate, flags: [], streamID: 0)
-                    .write(into: &out)
-                HTTP2.writeUInt32(UInt32(lump), into: &out)
-                H2FrameHeader(length: 4, type: .windowUpdate, flags: [],
-                              streamID: header.streamID).write(into: &out)
-                HTTP2.writeUInt32(UInt32(lump), into: &out)
-                write(peer, out)
+                write(peer, windowUpdate(0, lump) + windowUpdate(header.streamID, lump))
+            } else if raiseInitialWindowTo > 0 {
+                let raised = raiseInitialWindowTo
+                raiseInitialWindowTo = 0
+                let settings: [UInt8] = [0x00, UInt8(H2Setting.initialWindowSize.rawValue)]
+                    + u32(raised)
+                write(peer, rawFrame(type: .settings, stream: 0, payload: settings)
+                    + windowUpdate(0, 1_000_000))
             } else if creditStreamOnly {
                 // Stream credit only. A client that keeps one counter for both
                 // windows reads this as permission to carry on, and overruns
                 // the connection allowance it was never given.
-                var out = ByteBuffer(capacity: 32)
-                defer { out.destroy() }
-                H2FrameHeader(length: 4, type: .windowUpdate, flags: [],
-                              streamID: header.streamID).write(into: &out)
-                HTTP2.writeUInt32(UInt32(payload.count), into: &out)
-                write(peer, out)
+                write(peer, windowUpdate(header.streamID, payload.count))
             }
         default:
             break
         }
     }
 
-    private func decodeBlock() {
-        let bytes = block
+    private func decode(_ peer: OriginPeer) -> [(String, String)] {
+        var fields: [(String, String)] = []
+        let bytes = peer.block
         try? bytes.withUnsafeBufferPointer { buf in
-            try decoder.decode(buf.baseAddress!, buf.count) { span in
-                let name = String(decoding: UnsafeBufferPointer(start: span.name,
-                                                                count: span.nameLength),
-                                  as: UTF8.self)
-                let value = String(decoding: UnsafeBufferPointer(start: span.value,
-                                                                 count: span.valueLength),
-                                   as: UTF8.self)
-                self.requestFields.append((name, value))
+            try peer.decoder.decode(buf.baseAddress!, buf.count) { span in
+                fields.append((
+                    String(decoding: UnsafeBufferPointer(start: span.name,
+                                                         count: span.nameLength), as: UTF8.self),
+                    String(decoding: UnsafeBufferPointer(start: span.value,
+                                                         count: span.valueLength), as: UTF8.self)))
             }
+        }
+        return fields
+    }
+
+    private func complete(_ index: Int, _ stream: UInt32) {
+        let peer = peers[index]
+        let request = OriginRequest(peer: index, stream: stream,
+                                    fields: peer.fields[stream] ?? [],
+                                    body: peer.bodies[stream] ?? [])
+        requests.append(request)
+        if hold {
+            held.append(request)
+            return
+        }
+        if let respond {
+            queue(index, respond(request))
+        } else if !scriptUsed, !script.isEmpty {
+            scriptUsed = true
+            queue(index, script)
         }
     }
 
-    private func answer(_ peer: Int32) {
-        guard !answered else { return }
-        answered = true
-        guard !script.isEmpty else { return }
+    /// Sends frames to one connection, honouring `dribble`.
+    func queue(_ peer: Int, _ frames: [[UInt8]]) {
+        guard peer < peers.count, !peers[peer].closed else { return }
         if dribble {
-            pending = script
+            peers[peer].pending.append(contentsOf: frames)
         } else {
-            for reply in script {
-                _ = reply.withUnsafeBytes { pg_write(peer, $0.baseAddress, $0.count) }
-            }
+            for frame in frames { write(peers[peer], frame) }
         }
     }
 
-    private func write(_ peer: Int32, _ buffer: ByteBuffer) {
-        _ = pg_write(peer, buffer.readPointer, buffer.readableBytes)
+    /// Answers the held requests `pick` chooses, in the order they arrived.
+    func answerHeld(_ pick: (OriginRequest) -> Bool,
+                    _ frames: (OriginRequest) -> [[UInt8]]) {
+        let chosen = held.filter(pick)
+        held.removeAll(where: pick)
+        for request in chosen { queue(request.peer, frames(request)) }
     }
 
-    /// The field a request carried, compared without case.
+    func forgetHeld() { held.removeAll() }
+
+    /// Hangs up on one connection without a word.
+    func closePeer(_ index: Int) {
+        guard index < peers.count, !peers[index].closed else { return }
+        peers[index].closed = true
+        _ = pg_close(peers[index].fd)
+    }
+
+    private func write(_ peer: OriginPeer, _ bytes: [UInt8]) {
+        _ = bytes.withUnsafeBytes { pg_write(peer.fd, $0.baseAddress, $0.count) }
+    }
+
+    /// The field the most recent request carried.
     func requestField(_ name: String) -> String? {
         for (n, v) in requestFields where n == name { return v }
         return nil
@@ -290,22 +364,14 @@ private func responseHeaders(status: Int, fields: [(String, String)] = [],
     var flags: H2Flags = []
     if endHeaders { flags.insert(.endHeaders) }
     if endStream { flags.insert(.endStream) }
-    var out = ByteBuffer(capacity: 512)
-    defer { out.destroy() }
-    H2FrameHeader(length: block.readableBytes, type: .headers, flags: flags,
-                  streamID: stream).write(into: &out)
-    out.write(block.readPointer, block.readableBytes)
-    return Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
+    return rawFrame(type: .headers, flags: flags, stream: stream,
+                    payload: Array(UnsafeBufferPointer(start: block.readPointer,
+                                                       count: block.readableBytes)))
 }
 
 private func dataFrame(_ text: String, stream: UInt32 = 1, endStream: Bool = true) -> [UInt8] {
-    let payload = Array(text.utf8)
-    var out = ByteBuffer(capacity: payload.count + 16)
-    defer { out.destroy() }
-    H2FrameHeader(length: payload.count, type: .data,
-                  flags: endStream ? .endStream : [], streamID: stream).write(into: &out)
-    payload.withUnsafeBufferPointer { out.write($0.baseAddress!, $0.count) }
-    return Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
+    rawFrame(type: .data, flags: endStream ? .endStream : [], stream: stream,
+             payload: Array(text.utf8))
 }
 
 private func rawFrame(type: H2FrameType, flags: H2Flags = [], stream: UInt32 = 1,
@@ -318,9 +384,54 @@ private func rawFrame(type: H2FrameType, flags: H2Flags = [], stream: UInt32 = 1
     return Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
 }
 
+private func windowUpdate(_ stream: UInt32, _ increment: Int) -> [UInt8] {
+    rawFrame(type: .windowUpdate, stream: stream, payload: u32(UInt32(increment)))
+}
+
+private func goaway(lastStream: UInt32, code: UInt32 = 0) -> [UInt8] {
+    rawFrame(type: .goaway, stream: 0, payload: u32(lastStream) + u32(code))
+}
+
 private func u32(_ v: UInt32) -> [UInt8] {
     [UInt8(truncatingIfNeeded: v >> 24), UInt8(truncatingIfNeeded: v >> 16),
      UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)]
+}
+
+/// A response whose `x-thing: kept` field goes into the HPACK dynamic table
+/// (`adding`) or is named only by its index there (not `adding`).
+///
+/// The second form decodes to anything at all only for a client whose table
+/// still holds what the first put in -- which is to say, one that kept the
+/// connection's HPACK state from one request to the next.
+private func indexingResponse(stream: UInt32, adding: Bool, alsoRefer: Bool = false) -> [UInt8] {
+    var block = ByteBuffer(capacity: 128)
+    defer { block.destroy() }
+    let encoder = HPACKEncoder()
+    encoder.encodeStatus(200, into: &block)
+    if adding {
+        // Literal with incremental indexing, new name.
+        hpackWriteInteger(0, prefixBits: 6, flags: 0x40, into: &block)
+        let name = Array("x-thing".utf8), value = Array("kept".utf8)
+        name.withUnsafeBufferPointer { encoder.encodeString($0.baseAddress!, $0.count, into: &block) }
+        value.withUnsafeBufferPointer { encoder.encodeString($0.baseAddress!, $0.count, into: &block) }
+    }
+    if !adding || alsoRefer {
+        // Indexed: 62 is the newest dynamic entry.
+        hpackWriteInteger(62, prefixBits: 7, flags: 0x80, into: &block)
+    }
+    return rawFrame(type: .headers, flags: [.endHeaders, .endStream], stream: stream,
+                    payload: Array(UnsafeBufferPointer(start: block.readPointer,
+                                                       count: block.readableBytes)))
+}
+
+/// A frame of `type` with the PADDED flag, `padding` zero bytes after the
+/// content, and the pad length in front of it.
+private func padded(_ type: H2FrameType, flags: H2Flags, stream: UInt32,
+                    content: [UInt8], padding: Int) -> [UInt8] {
+    var payload: [UInt8] = [UInt8(padding)]
+    payload.append(contentsOf: content)
+    payload.append(contentsOf: [UInt8](repeating: 0, count: padding))
+    return rawFrame(type: type, flags: flags.union(.padded), stream: stream, payload: payload)
 }
 
 // MARK: The application under test
@@ -377,6 +488,39 @@ private func h2ClientApp() -> Application {
         }
         response.send(outcome)
     }
+    // Several routes that differ only in what they ask for, so a test can have
+    // them in flight at once on one worker and tell their answers apart.
+    // Reports the size of what came back rather than the body itself, for
+    // bodies large enough to bury any failure message in.
+    app.onAsync(.get, "/count") { request, response in
+        var client = request.client
+        client.forceHTTP2 = true
+        client.timeoutMilliseconds = timeoutWanted
+        do {
+            let answer = try await client.get(urlWanted)
+            outcome = "\(answer.status)|\(answer.body.count)"
+        } catch {
+            outcome = "\(error)"
+        }
+        response.send(outcome)
+    }
+    for name in ["a", "b", "c"] {
+        app.onAsync(.get, "/multi/\(name)") { request, response in
+            var client = request.client
+            client.forceHTTP2 = true
+            client.timeoutMilliseconds = timeoutsWanted[name] ?? timeoutWanted
+            let result: String
+            do {
+                let answer = try await client.get(originURL + "/" + name)
+                let thing = answer.header("x-thing").map { "|" + $0 } ?? ""
+                result = "\(answer.status)|\(answer.text)\(thing)"
+            } catch {
+                result = "\(error)"
+            }
+            outcomes[name] = result
+            response.send(result)
+        }
+    }
     return app
 }
 
@@ -400,9 +544,41 @@ struct HTTP2ClientTests {
 
     private func reset() {
         outcome = ""
+        outcomes = [:]
+        timeoutsWanted = [:]
         headersWanted = []
         bodyWanted = []
         bodyLimitWanted = 8 * 1024 * 1024
+        timeoutWanted = 10_000
+    }
+
+    /// Starts one request per route on `client`'s worker, which is what makes
+    /// them share its connections.
+    private func start(_ client: TestClient, _ routes: [String]) throws -> [TestWire] {
+        try routes.map { route in
+            let wire = try TestWire(client)
+            wire.send("GET \(route) HTTP/1.1\r\nHost: test\r\n\r\n")
+            return wire
+        }
+    }
+
+    /// Turns the worker and pumps the origin until `ready`, or the turns run out.
+    @discardableResult
+    private func turn(_ client: TestClient, _ origin: FakeH2Origin, turns: Int = 20_000,
+                      until ready: () -> Bool) -> Bool {
+        for _ in 0..<turns {
+            if ready() { return true }
+            origin.pump()
+            client.turn()
+        }
+        return ready()
+    }
+
+    private func answer(_ body: String) -> (OriginRequest) -> [[UInt8]] {
+        { request in
+            [responseHeaders(status: 200, stream: request.stream),
+             dataFrame(body, stream: request.stream)]
+        }
     }
 
     // MARK: An ordinary exchange
@@ -411,29 +587,27 @@ struct HTTP2ClientTests {
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
         origin.script = [responseHeaders(status: 200), dataFrame("hello")]
-        // Never pooled: one exchange per connection while the dynamic table
-        // cannot be carried between them.
-        #expect(try run("/fetch", origin) == "200|hello|false")
+        // Kept: the connection is still good for the next request.
+        #expect(try run("/fetch", origin) == "200|hello|true")
     }
 
-    @Test func anHTTP2ConnectionIsClosedRatherThanPooled() throws {
-        // reusedConnection being false is what the client *reports*; this is
-        // what actually happened to the socket. Pooling one would send a
-        // second preface down a live connection and desynchronise the HPACK
-        // dynamic table -- and the report alone cannot tell the two apart,
-        // which is why the flag is not enough.
+    @Test func aConnectionIsKeptForTheNextRequest() throws {
+        // The socket, not the flag. reusedConnection is what the client
+        // reports; the live count is what actually happened -- and an earlier
+        // version that closed only on failure reported `false` correctly while
+        // leaking every connection that worked.
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
         origin.script = [responseHeaders(status: 200), dataFrame("hello")]
-        outcome = ""
         urlWanted = origin.url + "/x"
         let client = h2ClientApp().test
         let wire = try TestWire(client)
         wire.send("GET /fetch HTTP/1.1\r\nHost: test\r\n\r\n")
         _ = wire.turn(until: { origin.pump(); return !outcome.isEmpty }, turns: 20_000)
         _ = wire.receive()
-        #expect(outcome == "200|hello|false")
-        #expect(client.worker.pointee.outbound?.liveCount == 0)
+        #expect(outcome == "200|hello|true")
+        #expect(client.worker.pointee.outbound?.liveCount == 1)
+        #expect(client.worker.pointee.outboundH2.count == 1)
     }
 
     @Test func theConnectionOpensWithThePrefaceAndSettings() throws {
@@ -517,7 +691,22 @@ struct HTTP2ClientTests {
         origin.script = [responseHeaders(status: 200),
                          dataFrame("hello ", endStream: false),
                          dataFrame("world")]
-        #expect(try run("/fetch", origin) == "200|hello world|false")
+        #expect(try run("/fetch", origin) == "200|hello world|true")
+    }
+
+    @Test func paddedFramesAreReadWithoutTheirPadding() throws {
+        // PADDED puts a length byte in front and zeros behind, on HEADERS and
+        // DATA alike. A reader that ignored the flag would decode the length
+        // byte as HPACK and hand the zeros over as body.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        let headers = responseHeaders(status: 200, fields: [("x-thing", "padded")])
+        let block = Array(headers[H2FrameHeader.size...])
+        origin.script = [
+            padded(.headers, flags: .endHeaders, stream: 1, content: block, padding: 7),
+            padded(.data, flags: .endStream, stream: 1, content: Array("hello".utf8), padding: 3),
+        ]
+        #expect(try run("/fetch", origin) == "200|hello|true")
     }
 
     @Test func anInformationalResponseIsNotMistakenForTheAnswer() throws {
@@ -527,7 +716,7 @@ struct HTTP2ClientTests {
         origin.script = [responseHeaders(status: 103),
                          responseHeaders(status: 200),
                          dataFrame("done")]
-        #expect(try run("/fetch", origin) == "200|done|false")
+        #expect(try run("/fetch", origin) == "200|done|true")
     }
 
     @Test func anInformationalResponseIsNotAnAnswerEvenWhenNoneFollows() throws {
@@ -538,14 +727,14 @@ struct HTTP2ClientTests {
         // every assertion about the answer holds either way.
         //
         // So the case has to be one where nothing final follows. A 103 and
-        // then a body is a malformed response, and the two readings of it
-        // differ visibly: skipping the 103 leaves no status at all, which is
-        // `closed`, while treating it as the answer returns 103 and the body.
+        // then a body is a body with no answer to belong to: skipping the 103
+        // makes that a protocol error, while treating it as the answer
+        // returns 103 and the body.
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
         origin.dribble = true
         origin.script = [responseHeaders(status: 103), dataFrame("x")]
-        #expect(try run("/fetch", origin) == "closed")
+        #expect(try run("/fetch", origin) == "protocolError")
     }
 
     // MARK: Framing the peer gets wrong
@@ -568,14 +757,38 @@ struct HTTP2ClientTests {
         // assembling a block whose provenance it cannot vouch for: the bytes
         // either side of the intruder need not have come from the same
         // response at all.
+        //
+        // The intruder is a PING, which is harmless in itself. An earlier
+        // version used DATA and could not see this guard at all: DATA before
+        // any answer is refused on its own account, so the outcome was the
+        // same with the interleave check deleted. A frame that would be
+        // accepted anywhere else is the only kind that shows the check.
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
         origin.dribble = true
-        // HEADERS without END_HEADERS, then DATA where CONTINUATION belongs.
-        origin.script = [responseHeaders(status: 200, endHeaders: false),
-                         dataFrame("intruder", endStream: false),
-                         rawFrame(type: .continuation, flags: .endHeaders, stream: 1)]
+        let whole = responseHeaders(status: 200, fields: [("x-thing", "split")])
+        let block = Array(whole[H2FrameHeader.size...])
+        origin.script = [rawFrame(type: .headers, flags: .endStream, stream: 1,
+                                  payload: Array(block.prefix(1))),
+                         rawFrame(type: .ping, stream: 0, payload: [0, 0, 0, 0, 0, 0, 0, 1]),
+                         rawFrame(type: .continuation, flags: .endHeaders, stream: 1,
+                                  payload: Array(block.dropFirst(1)))]
         #expect(try run("/fetch", origin) == "protocolError")
+    }
+
+    @Test func aHeaderBlockSplitAcrossContinuationIsReassembled() throws {
+        // The same split without the intruder is an ordinary response, which
+        // is what makes the refusal above about the PING and not the split.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.dribble = true
+        let whole = responseHeaders(status: 200, fields: [("x-thing", "split")])
+        let block = Array(whole[H2FrameHeader.size...])
+        origin.script = [rawFrame(type: .headers, flags: .endStream, stream: 1,
+                                  payload: Array(block.prefix(1))),
+                         rawFrame(type: .continuation, flags: .endHeaders, stream: 1,
+                                  payload: Array(block.dropFirst(1)))]
+        #expect(try run("/header", origin) == "split")
     }
 
     @Test func aStatusThatIsNotThreeDigitsIsRefused() throws {
@@ -596,13 +809,9 @@ struct HTTP2ClientTests {
                                    valueLength: value.count, into: &block)
                 }
             }
-            var out = ByteBuffer(capacity: 128)
-            defer { out.destroy() }
-            H2FrameHeader(length: block.readableBytes, type: .headers,
-                          flags: [.endHeaders, .endStream], streamID: 1).write(into: &out)
-            out.write(block.readPointer, block.readableBytes)
-            origin.script = [Array(UnsafeBufferPointer(start: out.readPointer,
-                                                       count: out.readableBytes))]
+            origin.script = [rawFrame(type: .headers, flags: [.endHeaders, .endStream], stream: 1,
+                                      payload: Array(UnsafeBufferPointer(
+                                        start: block.readPointer, count: block.readableBytes)))]
             #expect(try run("/fetch", origin).hasPrefix("malformedResponse"),
                     "a :status of \"\(text)\" should be refused")
         }
@@ -628,23 +837,17 @@ struct HTTP2ClientTests {
         // the peer never claimed.
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
-        var block = ByteBuffer(capacity: 64)
-        defer { block.destroy() }
-        let encoder = HPACKEncoder()
-        let name = Array("x-thing".utf8), value = Array("here".utf8)
-        name.withUnsafeBufferPointer { n in
-            value.withUnsafeBufferPointer { v in
-                encoder.encode(name: n.baseAddress!, nameLength: n.count,
-                               value: v.baseAddress!, valueLength: v.count, into: &block)
-            }
-        }
-        var out = ByteBuffer(capacity: 128)
-        defer { out.destroy() }
-        H2FrameHeader(length: block.readableBytes, type: .headers,
-                      flags: [.endHeaders, .endStream], streamID: 1).write(into: &out)
-        out.write(block.readPointer, block.readableBytes)
-        origin.script = [Array(UnsafeBufferPointer(start: out.readPointer,
-                                                   count: out.readableBytes))]
+        origin.script = [Array(responseHeaders(status: 200, fields: [("x-thing", "here")],
+                                               endStream: true))]
+        // Rebuilt without :status: the static entry for 200 is the one byte
+        // after the frame header.
+        var frame = origin.script[0]
+        frame.remove(at: H2FrameHeader.size)
+        let length = frame.count - H2FrameHeader.size
+        frame[0] = UInt8(truncatingIfNeeded: length >> 16)
+        frame[1] = UInt8(truncatingIfNeeded: length >> 8)
+        frame[2] = UInt8(truncatingIfNeeded: length)
+        origin.script = [frame]
         #expect(try run("/fetch", origin).hasPrefix("malformedResponse"))
     }
 
@@ -656,7 +859,7 @@ struct HTTP2ClientTests {
         origin.dribble = true
         origin.script = [rawFrame(type: .ping, stream: 0, payload: [1, 2, 3, 4, 5, 6, 7, 8]),
                          responseHeaders(status: 200, endStream: true)]
-        #expect(try run("/fetch", origin) == "200||false")
+        #expect(try run("/fetch", origin) == "200||true")
         let pongs = origin.frames(ofType: .ping).filter {
             $0.flags & H2Flags.ack.rawValue != 0
         }
@@ -668,13 +871,10 @@ struct HTTP2ClientTests {
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
         origin.dribble = true
-        var settings = u32(0)
-        settings.removeAll()
-        settings.append(contentsOf: [0x00, 0x05])          // maxFrameSize
-        settings.append(contentsOf: u32(32768))
+        let settings: [UInt8] = [0x00, 0x05] + u32(32768)   // maxFrameSize
         origin.script = [rawFrame(type: .settings, stream: 0, payload: settings),
                          responseHeaders(status: 200, endStream: true)]
-        #expect(try run("/fetch", origin) == "200||false")
+        #expect(try run("/fetch", origin) == "200||true")
         let acks = origin.frames(ofType: .settings).filter {
             $0.flags & H2Flags.ack.rawValue != 0
         }
@@ -709,6 +909,28 @@ struct HTTP2ClientTests {
         }
     }
 
+    @Test func thePeersHeaderTableSizeDoesNotShrinkOurDecoder() throws {
+        // SETTINGS_HEADER_TABLE_SIZE bounds the table of whoever *receives*
+        // the setting's sender's blocks -- here, the server's own decoder,
+        // which this client's encoder never touches, since it never indexes.
+        // The first version handed the value to this client's decoder, so a
+        // server advertising 0 had its perfectly valid responses refused:
+        // the entry it added was not stored, and its next reference to it
+        // named nothing.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.announce = [(.headerTableSize, 0)]
+        origin.respond = { request in
+            [indexingResponse(stream: request.stream, adding: true, alsoRefer: true)]
+        }
+        originURL = origin.url
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/multi/a"])
+        #expect(turn(client, origin) { outcomes["a"] != nil })
+        #expect(outcomes["a"] == "200||kept")
+        withExtendedLifetime(wires) {}
+    }
+
     // MARK: Flow control
 
     /// A body larger than the initial window, which is the only way to reach
@@ -731,30 +953,27 @@ struct HTTP2ClientTests {
 
     @Test func aPeerFrameSizeSettingIsAppliedAndNotMerelyAcknowledged() throws {
         // Acknowledging a setting and honouring it are different things, and
-        // the ack test cannot tell them apart: a peer that asks for 1024-byte
-        // frames and gets 16384-byte ones is entitled to kill the connection.
+        // the ack test cannot tell them apart.
         //
         // The timing is the whole difficulty. A client may send as soon as it
         // has written the preface, so it cannot honour a setting it has not
         // read -- the first frames going out at 16384 is correct, not a bug.
         // The setting only binds what comes after it is read, and the one
         // moment this client reads anything mid-send is when the window shuts.
-        // So the body has to be larger than the initial window, and the
-        // frames after the stall are the ones that must have shrunk.
+        //
         // It has to grow rather than shrink, which took a failing test to
         // notice: RFC 9113 puts SETTINGS_MAX_FRAME_SIZE between 16384 and
-        // 16777215, and 16384 is also the default -- so no legal value is
-        // smaller than what this already uses, and a frame getting smaller
-        // could never be the evidence. A frame larger than the default is
-        // something only an applied setting can produce.
+        // 16777215, and 16384 is also the default, so no legal value is
+        // smaller than what this already uses.
+        //
+        // And credit has to come in one lump. It took a frame-by-frame census
+        // to see why: crediting exactly what each frame spent keeps the window
+        // as the binding constraint for the whole upload, so every frame is
+        // capped at what was just returned and the frame size never gets to be
+        // the limit. Three stalls, an applied setting, and still every frame
+        // at 16384.
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
-        // Credit in one lump rather than per frame. It took a frame-by-frame
-        // census to see why that matters: crediting exactly what each frame
-        // spent keeps the window as the binding constraint for the whole
-        // upload, so `min(n, sendWindow)` caps every frame at what was just
-        // returned and the frame size never gets to be the limit. Three
-        // stalls, an applied setting, and still every frame at 16384.
         origin.creditInLump = 300_000
         origin.settingsFirst = true
         origin.peerMaxFrameSize = 32768
@@ -763,9 +982,6 @@ struct HTTP2ClientTests {
         #expect(try run("/post", origin, turns: 400_000) == "200|ok")
         #expect(origin.requestBody.count == 200_000)
         let data = origin.frames(ofType: .data)
-        // The first frames go at the 16384 default, correctly: a client may
-        // send before it has read anything. The ones after the window stalled
-        // are where the setting can show.
         #expect(data.contains { $0.payload.count > 16384 },
                 "no frame exceeded the default, so the setting was not applied")
         #expect(data.allSatisfy { $0.payload.count <= 32768 })
@@ -788,17 +1004,12 @@ struct HTTP2ClientTests {
         // the stream's would keep sending past the connection's allowance --
         // which the peer answers with a connection-level flow-control error,
         // killing every stream on it rather than this one.
-        //
-        // The peer grants stream credit generously and connection credit not
-        // at all, so a client crediting both from one counter runs past what
-        // it was given.
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
         origin.creditStreamOnly = true
         // Proving something never arrives means waiting for it, so this waits
         // briefly rather than the production ten seconds.
         timeoutWanted = 300
-        defer { timeoutWanted = 10_000 }
         bodyWanted = Array(repeating: UInt8(ascii: "w"), count: 70_000)
         origin.script = [responseHeaders(status: 200), dataFrame("ok")]
         // It cannot finish: the connection window is never topped up, so the
@@ -821,5 +1032,378 @@ struct HTTP2ClientTests {
         let data = origin.frames(ofType: .data)
         #expect(data.count >= 5)
         #expect(data.allSatisfy { $0.payload.count <= 16384 })
+    }
+
+    // MARK: Sharing a connection
+
+    @Test func twoRequestsAtOnceShareOneConnection() throws {
+        // Answered in the opposite order to the one they were asked in, so a
+        // reader that handed each frame to the stream that opened first, or
+        // to whoever happened to be reading, gives each request the other's
+        // body.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        origin.answerHeld({ $0.path == "/b" }, answer("body-b"))
+        origin.answerHeld({ $0.path == "/a" }, answer("body-a"))
+        #expect(turn(client, origin) { outcomes.count == 2 })
+        #expect(outcomes["a"] == "200|body-a")
+        #expect(outcomes["b"] == "200|body-b")
+        #expect(origin.accepted == 1)
+        // Opened on the wire in increasing order, as RFC 9113 requires of a
+        // new stream: an id allocated before waiting for the write lock could
+        // reach the wire after a larger one.
+        #expect(origin.frames(ofType: .headers).map(\.streamID) == [1, 3])
+        withExtendedLifetime(wires) {}
+    }
+
+    /// One request finishes while another is still waiting, and nothing more
+    /// arrives until after the first has gone.
+    ///
+    /// If the first was the one reading, it has to hand the baton on as it
+    /// leaves: otherwise the second is parked on its own stream with nobody
+    /// reading the connection, and its answer arrives into a socket nobody
+    /// looks at. Which of the two is reading depends on which waited first, so
+    /// the test runs both ways round -- one of them is always the hand-off.
+    ///
+    /// And it is run with the first request leaving both ways a request can:
+    /// finishing, which hands the baton on in `finish`, and being reset, which
+    /// hands it on in `abandon`. Those are the two places the hand-off lives,
+    /// so each needs a leaving that goes through it.
+    private func handOff(first: String, second: String, byReset: Bool = false) throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        timeoutWanted = 3_000
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+
+        if byReset {
+            origin.answerHeld({ $0.path == "/" + first }) { request in
+                [rawFrame(type: .rstStream, stream: request.stream,
+                          payload: u32(H2Error.cancel.rawValue))]
+            }
+        } else {
+            origin.answerHeld({ $0.path == "/" + first }, answer("body-" + first))
+        }
+        #expect(turn(client, origin) { outcomes[first] != nil })
+        #expect(outcomes[first] == (byReset ? "streamReset(8)" : "200|body-" + first))
+
+        // Quiet turns, so the leaving request has well and truly gone before
+        // anything for the other one exists to be read.
+        turn(client, origin, turns: 200) { false }
+
+        origin.answerHeld({ $0.path == "/" + second }, answer("body-" + second))
+        #expect(turn(client, origin, turns: 60_000) { outcomes[second] != nil })
+        #expect(outcomes[second] == "200|body-" + second)
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func aReaderThatLeavesHandsTheBatonOnWhenTheFirstFinishes() throws {
+        try handOff(first: "a", second: "b")
+    }
+
+    @Test func aReaderThatLeavesHandsTheBatonOnWhenTheSecondFinishes() throws {
+        try handOff(first: "b", second: "a")
+    }
+
+    @Test func aReaderThatIsResetHandsTheBatonOnWhenTheFirstIs() throws {
+        try handOff(first: "a", second: "b", byReset: true)
+    }
+
+    @Test func aReaderThatIsResetHandsTheBatonOnWhenTheSecondIs() throws {
+        try handOff(first: "b", second: "a", byReset: true)
+    }
+
+    /// A request with little patience parked behind a reader with a lot.
+    ///
+    /// Nothing arrives for either. The reader waits on the socket until the
+    /// *earliest* deadline among everyone waiting, then wakes whoever has run
+    /// out -- without that, the impatient request would sleep until the
+    /// patient one gave up, seconds past its own limit. Which of the two reads
+    /// depends on which waited first, so both orders are run; when the
+    /// impatient one happens to be reading it times itself out, and the order
+    /// that matters is the other.
+    private func impatientBehindPatient(startingWith first: String) throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        timeoutsWanted = ["a": 300, "b": 8_000]
+        let client = h2ClientApp().test
+        let routes = first == "a" ? ["/multi/a", "/multi/b"] : ["/multi/b", "/multi/a"]
+        let wires = try start(client, routes)
+        #expect(turn(client, origin) { origin.held.count == 2 })
+
+        let began = pg_monotonic_ms()
+        while outcomes["a"] == nil && pg_monotonic_ms() &- began < 4_000 {
+            origin.pump()
+            client.turn()
+        }
+        let waited = pg_monotonic_ms() &- began
+        #expect(outcomes["a"] == "timedOut")
+        #expect(waited < 4_000, "the impatient request waited \(waited) ms for a 300 ms limit")
+        #expect(outcomes["b"] == nil, "the patient request should still be waiting")
+
+        origin.answerHeld({ $0.path == "/b" }, answer("body-b"))
+        #expect(turn(client, origin) { outcomes["b"] != nil })
+        #expect(outcomes["b"] == "200|body-b")
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func anImpatientRequestTimesOutBehindAPatientReaderStartedFirst() throws {
+        try impatientBehindPatient(startingWith: "b")
+    }
+
+    @Test func anImpatientRequestTimesOutBehindAPatientReaderStartedSecond() throws {
+        try impatientBehindPatient(startingWith: "a")
+    }
+
+    @Test func aResponseLargerThanTheWindowIsCreditedAsItArrives() throws {
+        // Receive credit, the other direction from the upload tests. Every
+        // DATA byte spends both this client's connection window and the
+        // stream's, and each has to be returned separately -- a response
+        // past 65535 bytes that returns neither stops dead, and one that
+        // resets its own count without sending the frame leaves the peer
+        // waiting for credit it was never given.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        let chunk = String(repeating: "r", count: 16_384)
+        origin.respond = { request in
+            var frames = [responseHeaders(status: 200, stream: request.stream)]
+            for i in 0..<6 {
+                frames.append(dataFrame(chunk, stream: request.stream, endStream: i == 5))
+            }
+            return frames
+        }
+        urlWanted = origin.url + "/big"
+        let client = h2ClientApp().test
+        let wire = try TestWire(client)
+        wire.send("GET /count HTTP/1.1\r\nHost: test\r\n\r\n")
+        _ = wire.turn(until: { origin.pump(); return !outcome.isEmpty }, turns: 60_000)
+        #expect(outcome == "200|\(16_384 * 6)")
+        let updates = origin.frames(ofType: .windowUpdate)
+        #expect(updates.contains { $0.streamID == 0 }, "no connection credit returned")
+        #expect(updates.contains { $0.streamID == 1 }, "no stream credit returned")
+    }
+
+    @Test func aRaisedInitialWindowAppliesToAStreamAlreadyOpen() throws {
+        // SETTINGS_INITIAL_WINDOW_SIZE changes the window of every open stream
+        // by the difference, RFC 9113 section 6.9.2 -- not only streams opened
+        // afterwards. The peer here grants connection credit and raises the
+        // initial window, and never sends the stream a WINDOW_UPDATE, so the
+        // upload finishes only if the raise reached the stream in flight.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.raiseInitialWindowTo = 131_072
+        timeoutWanted = 2_000
+        bodyWanted = Array(repeating: UInt8(ascii: "v"), count: 70_000)
+        origin.script = [responseHeaders(status: 200), dataFrame("ok")]
+        #expect(try run("/post", origin, turns: 200_000) == "200|ok")
+        #expect(origin.requestBody.count == 70_000)
+    }
+
+    @Test func dataForTwoStreamsInterleavedIsKeptApart() throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        origin.dribble = true
+        originURL = origin.url
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        guard let a = origin.held.first(where: { $0.path == "/a" }),
+              let b = origin.held.first(where: { $0.path == "/b" }) else {
+            Issue.record("both requests should have arrived")
+            return
+        }
+        origin.forgetHeld()
+        origin.queue(0, [responseHeaders(status: 200, stream: a.stream),
+                         responseHeaders(status: 200, stream: b.stream),
+                         dataFrame("a1", stream: a.stream, endStream: false),
+                         dataFrame("b1", stream: b.stream, endStream: false),
+                         dataFrame("a2", stream: a.stream),
+                         dataFrame("b2", stream: b.stream)])
+        #expect(turn(client, origin) { outcomes.count == 2 })
+        #expect(outcomes["a"] == "200|a1a2")
+        #expect(outcomes["b"] == "200|b1b2")
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func aKeptConnectionCarriesItsHPACKStateToTheNextRequest() throws {
+        // The first response adds `x-thing: kept` to the dynamic table and the
+        // second refers to it by index alone. That second one decodes only for
+        // a client that kept the table -- which is the whole difficulty of
+        // reusing an HTTP/2 connection, and why the first version would not.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.respond = { request in
+            [indexingResponse(stream: request.stream, adding: request.stream == 1)]
+        }
+        originURL = origin.url
+        let client = h2ClientApp().test
+        var wires = try start(client, ["/multi/a"])
+        #expect(turn(client, origin) { outcomes["a"] != nil })
+        wires += try start(client, ["/multi/b"])
+        #expect(turn(client, origin) { outcomes["b"] != nil })
+        #expect(outcomes["a"] == "200||kept")
+        #expect(outcomes["b"] == "200||kept")
+        #expect(origin.accepted == 1)
+        #expect(origin.frames(ofType: .headers).map(\.streamID) == [1, 3])
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func aResetStreamFailsOnlyItsOwnRequest() throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        let client = h2ClientApp().test
+        var wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        origin.answerHeld({ $0.path == "/a" }) { request in
+            [rawFrame(type: .rstStream, stream: request.stream,
+                      payload: u32(H2Error.refusedStream.rawValue))]
+        }
+        origin.answerHeld({ $0.path == "/b" }, answer("body-b"))
+        #expect(turn(client, origin) { outcomes.count == 2 })
+        #expect(outcomes["a"]?.hasPrefix("streamReset") == true)
+        #expect(outcomes["b"] == "200|body-b")
+
+        // And the connection is still good: the next request goes down it.
+        origin.hold = false
+        origin.respond = answer("body-c")
+        wires += try start(client, ["/multi/c"])
+        #expect(turn(client, origin) { outcomes["c"] != nil })
+        #expect(outcomes["c"] == "200|body-c")
+        #expect(origin.accepted == 1)
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func aConnectionThatDiesFailsEveryRequestOnIt() throws {
+        // None of them may be left parked. A request waiting on its own
+        // stream is woken only by something happening to that stream, so a
+        // connection that goes away has to wake all of them itself.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        origin.closePeer(0)
+        #expect(turn(client, origin) { outcomes.count == 2 })
+        #expect(outcomes["a"] == "closed")
+        #expect(outcomes["b"] == "closed")
+        #expect(client.worker.pointee.outboundH2.isEmpty)
+        #expect(client.worker.pointee.outbound?.liveCount == 0)
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func aGoawayRefusesOnlyTheStreamsThePeerNeverProcessed() throws {
+        // Streams above the last one a GOAWAY names were never looked at, and
+        // are refused -- which is what makes them safe to send again. Streams
+        // at or below it are finished as normal. And nothing new goes down a
+        // connection that has been told to go away.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        let client = h2ClientApp().test
+        var wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        let low = origin.held.map(\.stream).min() ?? 1
+        let lowName = origin.held.first { $0.stream == low }?.path.dropFirst() ?? "a"
+        let highName = lowName == "a" ? "b" : "a"
+        origin.queue(0, [goaway(lastStream: low)])
+        origin.answerHeld({ $0.stream == low }, answer("processed"))
+        #expect(turn(client, origin) { outcomes.count == 2 })
+        #expect(outcomes[String(lowName)] == "200|processed")
+        #expect(outcomes[highName] == "streamReset(\(H2Error.refusedStream.rawValue))")
+
+        origin.hold = false
+        origin.forgetHeld()
+        origin.respond = answer("elsewhere")
+        wires += try start(client, ["/multi/c"])
+        #expect(turn(client, origin) { outcomes["c"] != nil })
+        #expect(outcomes["c"] == "200|elsewhere")
+        #expect(origin.accepted == 2)
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func anIdleConnectionToldToGoAwayIsNotUsedAgain() throws {
+        // Nobody reads a connection with no streams, so a GOAWAY that arrives
+        // while it is idle sits unread. A request sent down it anyway fails for
+        // no reason of its own; reading what is waiting before reusing the
+        // connection is what finds out in time to go elsewhere.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.respond = answer("first")
+        originURL = origin.url
+        let client = h2ClientApp().test
+        var wires = try start(client, ["/multi/a"])
+        #expect(turn(client, origin) { outcomes["a"] != nil })
+        #expect(outcomes["a"] == "200|first")
+
+        origin.queue(0, [goaway(lastStream: 1)])
+        turn(client, origin, turns: 50) { false }
+
+        origin.respond = answer("second")
+        wires += try start(client, ["/multi/b"])
+        #expect(turn(client, origin) { outcomes["b"] != nil })
+        #expect(outcomes["b"] == "200|second")
+        #expect(origin.accepted == 2)
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func aFullConnectionSendsTheNextRequestToAnother() throws {
+        // SETTINGS_MAX_CONCURRENT_STREAMS is the peer's limit, and a stream
+        // past it is refused on arrival. So a request finding the connection
+        // full opens another rather than joining it.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.announce = [(.maxConcurrentStreams, 1)]
+        origin.hold = true
+        originURL = origin.url
+        let client = h2ClientApp().test
+        var wires = try start(client, ["/multi/a"])
+        // The setting only binds once it has been read, and the client says it
+        // has by acknowledging it.
+        #expect(turn(client, origin) {
+            origin.held.count == 1
+                && origin.frames(ofType: .settings).contains { $0.flags & H2Flags.ack.rawValue != 0 }
+        })
+        wires += try start(client, ["/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        #expect(origin.accepted == 2)
+        origin.answerHeld({ _ in true }, answer("ok"))
+        #expect(turn(client, origin) { outcomes.count == 2 })
+        #expect(outcomes["a"] == "200|ok")
+        #expect(outcomes["b"] == "200|ok")
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func oneRequestTimingOutDoesNotStopTheOthers() throws {
+        // Silence on one stream is that stream's problem. A connection that
+        // treated it as its own would fail every request sharing it.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        timeoutWanted = 400
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        origin.answerHeld({ $0.path == "/b" }, answer("body-b"))
+        #expect(turn(client, origin, turns: 400_000) { outcomes.count == 2 })
+        #expect(outcomes["a"] == "timedOut")
+        #expect(outcomes["b"] == "200|body-b")
+        withExtendedLifetime(wires) {}
     }
 }

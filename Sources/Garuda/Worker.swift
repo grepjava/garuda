@@ -142,6 +142,16 @@ public struct Worker {
     /// different places -- a private CA for an internal database, the system
     /// store for everything else.
     var outboundTLS: [String: OpaquePointer] = [:]
+    /// HTTP/2 connections kept open for more than one request, by where they
+    /// go (HTTP2Client.swift). Not in `outboundIdle`: an idle HTTP/1.1
+    /// connection is handed to one caller at a time, and one of these is used
+    /// by every caller to the same place at once.
+    var outboundH2: [OutboundKey: H2Shared] = [:]
+    /// Places an HTTP/2 connection is being opened to right now, and who is
+    /// waiting to see how that goes. Without this, a burst of requests to
+    /// somewhere new each finds no connection and opens its own -- which is
+    /// the exact case multiplexing exists to absorb.
+    var outboundH2Connecting: [OutboundKey: [UnsafeContinuation<Void, Never>]] = [:]
     /// How many connections this worker actually opened, as against handed
     /// back from the pool. A test cannot otherwise tell reuse from a new one.
     public var outboundOpened: UInt64 = 0
@@ -1469,6 +1479,7 @@ public struct Worker {
         dates.refresh()
         // Connections this worker made and nobody came back for.
         if outbound != nil { sweepIdleOutbound(now: now) }
+        if !outboundH2.isEmpty { sweepIdleH2(now: now) }
         if metricsFD >= 0 || redirectFD >= 0 { sweepScrapes(now: now) }
 
         // Past the grace period, whatever is still in flight is not going to
