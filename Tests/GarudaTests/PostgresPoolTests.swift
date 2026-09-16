@@ -118,6 +118,74 @@ private func crudApp(maxConnections: Int = 4) -> Application {
         response.send(answer)
     }
 
+    app.get("/tx/commit") { (db: State<PostgresPool>) async throws -> String in
+        try await db.value.transaction { tx in
+            try await tx.execute("insert into garuda_pool_users (name) values ($1)", "one")
+            try await tx.execute("insert into garuda_pool_users (name) values ($1)", "two")
+        }
+        return "committed"
+    }
+
+    app.get("/tx/throw") { (db: State<PostgresPool>) async throws -> String in
+        struct Abandon: Error {}
+        do {
+            try await db.value.transaction { tx in
+                try await tx.execute("insert into garuda_pool_users (name) values ($1)", "gone")
+                throw Abandon()
+            }
+            return "committed"
+        } catch is Abandon {
+            return "rolled back"
+        }
+    }
+
+    // A statement fails inside the transaction and the body swallows the
+    // error and returns as though nothing happened.
+    app.get("/tx/swallow") { (db: State<PostgresPool>) async throws -> String in
+        do {
+            try await db.value.transaction { tx in
+                try await tx.execute("insert into garuda_pool_users (name) values ($1)", "lost")
+                _ = try? await tx.execute("select * from no_such_table")
+            }
+            return "committed"
+        } catch let error as PostgresClientError {
+            return "refused:\(error.sqlState ?? "")"
+        }
+    }
+
+    // After a failure inside a transaction, every further statement is
+    // refused by the server with 25P02 -- the same code the driver uses for
+    // its own refusal, which is why the driver must not tell them apart by
+    // code.
+    app.get("/tx/aborted-statement") { (db: State<PostgresPool>) async throws -> String in
+        do {
+            try await db.value.transaction { tx in
+                _ = try? await tx.execute("select * from no_such_table")
+                try await tx.execute("insert into garuda_pool_users (name) values ($1)", "never")
+            }
+            return "committed"
+        } catch let error as PostgresClientError {
+            return "refused:\(error.sqlState ?? "")"
+        }
+    }
+
+    // Begins a transaction by hand and returns without ending it.
+    app.get("/raw-begin") { (db: State<PostgresPool>) async throws -> String in
+        try await db.value.execute("begin")
+        return "left open"
+    }
+
+    // Inside an open transaction now() is frozen at BEGIN, so after a pause the
+    // statement's own timestamp is well past it. In autocommit every statement
+    // is its own transaction and the two are microseconds apart -- not equal,
+    // which a first version assumed and which the extended protocol does not
+    // give, since they are stamped at different messages. Hence a margin.
+    app.get("/in-transaction") { (db: State<PostgresPool>) async throws -> String in
+        let stale = try await db.value.first(
+            Bool.self, "select statement_timestamp() - now() > interval '20 milliseconds'")
+        return stale == true ? "yes" : "no"
+    }
+
     app.get("/wrong-shape") { (db: State<PostgresPool>) async throws -> String in
         let rows = try await db.value.query(PoolUserWithAge.self, "select id from garuda_pool_users")
         return String(rows.count)
@@ -233,6 +301,69 @@ struct PostgresPoolTests {
         let answer = try get(client, "/count")
         #expect(status(answer) == 200, "\(answer)")
         #expect(body(answer) == "0")
+    }
+
+    // MARK: Transactions
+
+    @Test func aTransactionThatReturnsIsCommitted() throws {
+        let client = crudApp().test
+        _ = try get(client, "/setup")
+        #expect(body(try get(client, "/tx/commit")) == "committed")
+        #expect(body(try get(client, "/count")) == "2")
+    }
+
+    @Test func aTransactionThatThrowsIsRolledBack() throws {
+        let client = crudApp().test
+        _ = try get(client, "/setup")
+        #expect(body(try get(client, "/tx/throw")) == "rolled back")
+        #expect(body(try get(client, "/count")) == "0")
+    }
+
+    @Test func aFailedTransactionIsNeverReportedAsCommitted() throws {
+        // PostgreSQL answers COMMIT on a failed transaction by rolling back
+        // and saying ROLLBACK, not by failing. A body that swallowed the error
+        // and returned would be told its work was saved.
+        let client = crudApp().test
+        _ = try get(client, "/setup")
+        #expect(body(try get(client, "/tx/swallow")) == "refused:25P02")
+        #expect(body(try get(client, "/count")) == "0")
+    }
+
+    @Test func theServersOwn25P02DoesNotLoseTheConnection() throws {
+        // The server refuses a statement in an aborted transaction with
+        // 25P02. That error must go through the rollback and the release like
+        // any other -- a pool that took it for the driver's own would lose the
+        // connection for good, and with one slot, every request after it
+        // would wait forever.
+        let client = crudApp(maxConnections: 1).test
+        _ = try get(client, "/setup")
+        #expect(body(try get(client, "/tx/aborted-statement")) == "refused:25P02")
+        let after = try get(client, "/count")
+        #expect(status(after) == 200, "\(after)")
+        #expect(try #require(poolForTests).counts.open == 1)
+    }
+
+    @Test func aTransactionLeftOpenIsNotHandedToTheNextRequest() throws {
+        // A handler runs `begin` itself and returns. Reused, that connection
+        // would carry the open transaction into the next request, whose
+        // statements would run inside it. Closed instead, the server rolls
+        // it back.
+        //
+        // The first version of this test ran `begin` and then an insert as
+        // two pool calls, expecting the insert to be uncommitted. It came
+        // back committed -- correctly: the pool closed the connection `begin`
+        // left open, and the insert ran on a fresh one in autocommit. The pool
+        // never pins a connection across separate calls, which is what
+        // `transaction` is for. What can be tested is whether the *next*
+        // request finds itself inside a transaction it never began.
+        let client = crudApp(maxConnections: 1).test
+        _ = try get(client, "/setup")
+        #expect(body(try get(client, "/raw-begin")) == "left open")
+        #expect(try #require(poolForTests).counts == (open: 0, idle: 0))
+        // Long enough for a frozen now() to differ from a fresh timestamp.
+        let began = pg_monotonic_ms()
+        while pg_monotonic_ms() &- began < 30 { client.turn() }
+        #expect(body(try get(client, "/in-transaction")) == "no")
     }
 
     @Test func aRowMissingAColumnTheTypeNeedsIsAServerFault() throws {

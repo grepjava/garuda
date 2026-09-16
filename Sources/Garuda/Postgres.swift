@@ -66,11 +66,22 @@ public enum PostgresClientError: Error, Equatable {
 
 /// One session with a PostgreSQL server.
 ///
-/// Internal while the pool and the public query API settle on top of it.
-struct PostgresConnection {
+/// A class, because it carries the one piece of session state the pool must
+/// see after every statement: whether the session was left inside a
+/// transaction.
+final class PostgresConnection {
     let socket: OutboundSocket
     let configuration: PostgresConfiguration
     let parameters: [String: String]
+    /// As the last ReadyForQuery reported it.
+    private(set) var transactionStatus: PostgresTransactionStatus = .idle
+
+    init(socket: OutboundSocket, configuration: PostgresConfiguration,
+         parameters: [String: String]) {
+        self.socket = socket
+        self.configuration = configuration
+        self.parameters = parameters
+    }
 
     /// Connects, negotiates TLS if required, and authenticates.
     static func connect(_ worker: UnsafeMutablePointer<Worker>,
@@ -178,6 +189,10 @@ struct PostgresConnection {
                     guard buffer.readableBytes == 0 else {
                         throw PostgresClientError.postgres(.unexpectedMessage(buffer.readPointer[0]))
                     }
+                    // Recorded whether the statement succeeded or not: a
+                    // refused statement inside a transaction leaves it failed,
+                    // and that is exactly what must not be handed on.
+                    transactionStatus = query.transactionStatus
                     switch query.result() {
                     case .success(let rows): return rows
                     // The server refused this statement and is ready for the

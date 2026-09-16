@@ -115,6 +115,58 @@ public final class PostgresPool: @unchecked Sendable {
         try await run(sql, values).affected
     }
 
+    /// Runs `body` in a transaction on one connection: committed if `body`
+    /// returns, rolled back if it throws.
+    ///
+    /// ```
+    /// try await db.value.transaction { tx in
+    ///     try await tx.execute("update accounts set balance = balance - $1 where id = $2", amount, from)
+    ///     try await tx.execute("update accounts set balance = balance + $1 where id = $2", amount, to)
+    /// }
+    /// ```
+    ///
+    /// A transaction a statement has already failed is rolled back and
+    /// reported, never committed -- even if `body` caught the error and
+    /// returned normally. PostgreSQL answers COMMIT on a failed transaction by
+    /// rolling it back and saying ROLLBACK, not by failing, so a caller that
+    /// swallowed one error would otherwise believe work was saved that was not.
+    public func transaction<Result>(_ body: (PostgresTransaction) async throws -> Result) async throws -> Result {
+        guard let worker = currentWorker else { throw PostgresClientError.cancelled }
+        let connection = try await acquire(worker)
+        // Tracked rather than inferred from the error. An earlier draft let
+        // errors carrying 25P02 through untouched, meaning its own -- but
+        // PostgreSQL raises 25P02 itself for any statement in an aborted
+        // transaction, and that one would have skipped the rollback and the
+        // release and lost a pool slot for good.
+        var released = false
+        do {
+            _ = try await connection.query("begin")
+            let result = try await body(PostgresTransaction(connection: connection))
+            // A failed transaction needs no check of its own here. COMMIT on
+            // one comes back tagged ROLLBACK, and the tag is checked below --
+            // a separate pre-check survived mutation testing with nothing
+            // failing, because that tag check caught every case it did.
+            let rows = try await connection.query("commit")
+            release(connection)
+            released = true
+            guard rows.tag == "COMMIT" else {
+                var fields = PostgresErrorFields()
+                fields.code = "25P02"
+                fields.message = "the server rolled the transaction back instead of committing it"
+                throw PostgresClientError.postgres(.server(fields))
+            }
+            return result
+        } catch {
+            if !released {
+                if connection.isOpen && connection.transactionStatus != .idle {
+                    _ = try? await connection.query("rollback")
+                }
+                release(connection)
+            }
+            throw error
+        }
+    }
+
     /// Closes every idle connection. For `app.state`'s shutdown.
     public func close() {
         for connection in idle { connection.close() }
@@ -170,9 +222,15 @@ public final class PostgresPool: @unchecked Sendable {
     }
 
     private func release(_ connection: PostgresConnection) {
-        if connection.isOpen {
+        // Kept only if the session is back outside any transaction. A handler
+        // that ran `begin` itself and returned would otherwise hand its open
+        // transaction to the next request, whose statements would run inside
+        // it -- seeing, and committing or rolling back, work that was never
+        // theirs. Closing it makes the server roll back.
+        if connection.isOpen && connection.transactionStatus == .idle {
             idle.append(connection)
         } else {
+            if connection.isOpen { connection.close() }
             open -= 1
         }
         wakeOne()
@@ -184,6 +242,28 @@ public final class PostgresPool: @unchecked Sendable {
 
     /// For tests: how many connections exist, and how many are idle.
     var counts: (open: Int, idle: Int) { (open, idle.count) }
+}
+
+/// Statements inside one transaction, all on the same connection.
+public struct PostgresTransaction {
+    let connection: PostgresConnection
+
+    public func query<Row: Decodable>(_ type: Row.Type, _ sql: String,
+                                      _ values: any PostgresBindable...) async throws -> [Row] {
+        try decodeAll(type, try await connection.query(sql, values.map(\.postgresText)))
+    }
+
+    public func first<Row: Decodable>(_ type: Row.Type, _ sql: String,
+                                      _ values: any PostgresBindable...) async throws -> Row? {
+        let rows = try await connection.query(sql, values.map(\.postgresText))
+        guard rows.count > 0 else { return nil }
+        return try decodeRow(type, rows, 0, columnIndex(rows))
+    }
+
+    @discardableResult
+    public func execute(_ sql: String, _ values: any PostgresBindable...) async throws -> Int {
+        try await connection.query(sql, values.map(\.postgresText)).affected
+    }
 }
 
 // MARK: - Decoding

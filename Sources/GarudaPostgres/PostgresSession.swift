@@ -241,6 +241,9 @@ public struct PostgresQuery {
     let sql: String
     let values: [String?]
     public private(set) var rows = PostgresRows()
+    /// What the server's ReadyForQuery said: whether the session is left
+    /// inside a transaction, and whether that transaction has failed.
+    public private(set) var transactionStatus: PostgresTransactionStatus = .idle
     private var error: PostgresErrorFields? = nil
     private var scratch: [Range<Int>?] = []
     /// The row limit a result may reach before the query is failed. Rows are
@@ -309,7 +312,7 @@ public struct PostgresQuery {
                 error = try PostgresBackend.errorFields(body)
                 return false
             case UInt8(ascii: "Z"):
-                _ = try PostgresBackend.readyForQuery(body)
+                transactionStatus = try PostgresBackend.readyForQuery(body)
                 return true
             default:
                 throw PostgresError.unexpectedMessage(type)

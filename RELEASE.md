@@ -274,6 +274,13 @@ is `request.client`.
   has a row limit. An idle pooled connection the server has since closed is
   noticed before a statement is written into it, not after. Tested against
   PostgreSQL 16 and 18.
+- `db.transaction { tx in … }` runs its statements on one connection,
+  committed if the closure returns and rolled back if it throws. A transaction
+  a statement already failed is rolled back and reported rather than
+  committed, even if the closure caught the error — PostgreSQL answers COMMIT
+  on a failed transaction by quietly rolling back. A connection left inside a
+  transaction, by a handler running `begin` itself, is closed rather than
+  handed to the next request.
 
 ### Changed
 
@@ -294,8 +301,8 @@ is `request.client`.
   advertises extended CONNECT and WebTransport; a CONNECT is refused with 501.
 - The handler API's later steps: there is no middleware, no 405, no streaming
   response, and no WebSocket or WebTransport handler.
-- PostgreSQL has no transactions API, no binary formats, no `LISTEN`, and does
-  not SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
+- PostgreSQL has no binary formats, no `LISTEN`, and does not
+  SASLprep-normalise a non-ASCII password. Redis and SQLite drivers are not
   written. The HTTP client does not follow redirects and sends no
   `Accept-Encoding`, since the compression shim encodes and does not decode.
 - `--compress` and `--cache-size` act on no handler response; they wait for
