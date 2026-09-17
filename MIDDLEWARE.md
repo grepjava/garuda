@@ -402,7 +402,7 @@ These run in the engine, for every route, and are set on the command line
 | `--max-body BYTES` | The default body limit, 413 past it |
 | `--cache-size MIB` | A response cache shared by every worker |
 | `--health-check-path P` | Answers health probes without touching a route |
-| `--metrics-port PORT` | Prometheus metrics on a port of their own |
+| `--metrics-port PORT` | Prometheus metrics on a port of their own, server-wide and by route pattern |
 | `--forwarded-allow-ips LIST` | Which proxies' forwarded headers are believed |
 
 ## Writing your own

@@ -1303,9 +1303,9 @@ public struct Worker {
         if c.pointee.flags.contains(.invalidatesCache) { cacheResponded(slot, status: status) }
         if Metrics.enabled {
             let started = c.pointee.requestStartUs
-            Metrics.requestFinished(status: status,
-                                    micros: started == 0
-                                        ? -1 : Int(av_monotonic_us() &- started))
+            let micros = started == 0 ? -1 : Int(av_monotonic_us() &- started)
+            Metrics.requestFinished(status: status, micros: micros)
+            RouteMetrics.record(application, slot: busSlot, route: Int(c.pointee.routeIndex), status: status, micros: micros)
         }
         if let observe = application?.pointee.onResponse { reportResponse(slot, status: status, observe) }
         guard config.accessLog, Log.enabled(.info) else { return }

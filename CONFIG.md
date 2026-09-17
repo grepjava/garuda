@@ -579,6 +579,14 @@ all workers.
 | `garuda_requests_rate_limited_total` | counter |
 | `garuda_cache_hits_total`, `_misses_total`, `_stores_total` | counters, with `--cache-size` |
 | `garuda_workers` | gauge |
+| `garuda_route_requests_total{method, route, status}` | counter |
+| `garuda_route_request_duration_seconds{method, route}` | histogram |
+
+The `route` label is the pattern a route was registered with, such as
+`/users/:id`, never the path a client sent, so there is one series per route
+however many URLs it serves. A request no route matched is `route="unmatched"`
+and one a fallback answered is `route="fallback"`. A route appears once it has
+answered something. HEAD requests a GET route answers count under `GET`.
 
 `--metrics-host` defaults to `--host`, so a server on `0.0.0.0` publishes its
 metrics there too. Bind it privately:

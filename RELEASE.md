@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 713 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 716 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -324,6 +324,13 @@ The Python suites need `h2` and `aioquic`.
   for the next extractor, and the OpenAPI document describes `E`.
 - The auth example adds `SignedInUser`, an async extractor over its sessions
   table, and `GET /whoami`, which takes it as `SignedInUser?`.
+- `--metrics-port` also reports each route: `garuda_route_requests_total`
+  by method, route pattern and status class, and a
+  `garuda_route_request_duration_seconds` histogram by method and pattern.
+  The label is the registered pattern (`/users/:id`), so series are bounded by
+  the number of routes; unmatched requests and fallbacks have a series each.
+  Counted in shared memory mapped before the fork, a row per worker, with no
+  locks; nothing is counted without `--metrics-port`.
 - MIDDLEWARE.md: how middleware and `onSend` run, the order to add it in,
   every middleware Garuda ships with its options and answers, the server flags
   that act as middleware, and writing middleware and extractors of your own.

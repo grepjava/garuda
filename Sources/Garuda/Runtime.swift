@@ -137,6 +137,10 @@ enum GarudaRuntime {
                 Log.error("cannot map the shared metrics page")
                 return 1
             }
+            if !RouteMetrics.initialize(GarudaRuntime.application, slots: max(1, workerCount) * 2) {
+                Log.error("cannot map the shared metrics page for routes")
+                return 1
+            }
         }
 
         // --cache-size. Mapped here for the same reason again: a response one

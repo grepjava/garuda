@@ -268,6 +268,7 @@ public final class Application: RouteBuilder {
             onStart: start.isEmpty ? nil : { index in for hook in start { hook(index) } },
             onShutdown: shutdown.isEmpty ? nil : { index in for hook in shutdown { hook(index) } },
             routePatterns: routes.patterns,
+            routeMethods: routes.methods,
             trailingSlash: trailingSlashPolicy,
             onResponse: observers.isEmpty ? nil : { completed in for observe in observers { observe(completed) } }))
         compiled = application
@@ -302,6 +303,8 @@ struct CompiledApplication {
     let onShutdown: ((Int) -> Void)?
     /// Each route's pattern, by route number, nil for a fallback.
     let routePatterns: [String?]
+    /// Each route's method, nil for a fallback, for metrics by route.
+    let routeMethods: [HTTPMethod?]
     /// What a path with a trailing slash no route has gets.
     let trailingSlash: TrailingSlash
     /// Every `onResponse` observer, in order, or nil for none.

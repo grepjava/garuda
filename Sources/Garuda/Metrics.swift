@@ -124,6 +124,7 @@ public enum Metrics {
                "Workers sharing these counters.", UInt64(max(1, av_metrics_slots() / 2)))
 
         histogram(&out)
+        RouteMetrics.render(into: &out)
     }
 
     private static func simple(_ out: inout ByteBuffer, _ name: StaticString,
