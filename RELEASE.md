@@ -406,4 +406,6 @@ The Python suites need `h2` and `aioquic`.
 - Redis Cluster and Sentinel are not supported: the driver talks to one
   server. RESP3's streamed strings and aggregates are refused, and no command
   the driver sends is answered with them.
+- What each connector does not support yet, Redis Cluster and Sentinel among
+  them, and the plan for each, is in CONNECTORS.md.
 - TLS over TCP is OpenSSL.

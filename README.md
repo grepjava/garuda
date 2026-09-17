@@ -470,7 +470,8 @@ say) is not unwound when its request is cancelled. It resumes to find
 
 - A stable API, WebSocket over HTTP/2 and HTTP/3, and SQLite.
 - Redis Cluster and Sentinel: the driver talks to one server, and a `MOVED`
-  reply is a server error.
+  reply is a server error. [CONNECTORS.md](CONNECTORS.md) has what works and
+  the plan.
 - Resumable uploads have no `min-size` or `min-append-size` limits and no
   digests, and a completed upload is not replayed to a client that asks again.
 - Byte ranges and directory listings for static files.
@@ -487,5 +488,6 @@ say) is not unwound when its request is cancelled. It resumes to find
 | [CONFIG.md](CONFIG.md) | Every command-line flag |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine is built |
 | [TRANSPORT.md](TRANSPORT.md) | What each protocol implementation does |
+| [CONNECTORS.md](CONNECTORS.md) | The HTTP client and database drivers: limits and future work |
 | [BENCHMARKS.md](BENCHMARKS.md) | Benchmark method and results |
 | [RELEASE.md](RELEASE.md) | Changes |
