@@ -237,6 +237,10 @@ public final class Application: RouteBuilder {
         for (i, limit) in routes.bodyLimits.enumerated() {
             (bodyLimits + i).initialize(to: limit)
         }
+        let wholeBodyLimits = UnsafeMutablePointer<Int>.allocate(capacity: max(1, count))
+        for (i, limit) in routes.wholeBodyLimits.enumerated() {
+            (wholeBodyLimits + i).initialize(to: limit)
+        }
         let start = startHooks
         let shutdown = shutdownHooks
         let observers = responseObservers
@@ -246,7 +250,9 @@ public final class Application: RouteBuilder {
             handlers: handlers,
             deadlines: deadlines,
             bodyLimits: bodyLimits,
-            streamsBodies: routes.bodyLimits.contains { $0 >= 0 },
+            wholeBodyLimits: wholeBodyLimits,
+            streamsBodies: routes.bodyLimits.contains { $0 >= 0 }
+                || routes.wholeBodyLimits.contains { $0 >= 0 },
             fallbacks: CompiledFallbacks(routes.fallbacks),
             corsPolicies: (0..<count).map { routes.corsPolicy($0) },
             hasCORS: routes.cors != nil || !routes.groupCORS.isEmpty,
@@ -271,8 +277,10 @@ struct CompiledApplication {
     let deadlines: UnsafeMutablePointer<UInt32>
     /// Each route's streamed body limit, -1 for a route given its body whole.
     let bodyLimits: UnsafeMutablePointer<Int>
-    /// Whether any route streams its body, so a request with a body is
-    /// matched at its head only when one might.
+    /// Each whole-body route's own limit, -1 for `--max-body`.
+    let wholeBodyLimits: UnsafeMutablePointer<Int>
+    /// Whether any route streams its body or has a limit of its own, so a
+    /// request with a body is matched at its head only when one might.
     let streamsBodies: Bool
     /// Each scope's fallback, for a request no route matches.
     let fallbacks: CompiledFallbacks
@@ -298,6 +306,8 @@ struct CompiledApplication {
         deadlines.deallocate()
         bodyLimits.deinitialize(count: handlerCount)
         bodyLimits.deallocate()
+        wholeBodyLimits.deinitialize(count: handlerCount)
+        wholeBodyLimits.deallocate()
     }
 }
 

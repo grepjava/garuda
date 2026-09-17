@@ -47,6 +47,14 @@ public protocol RouteBuilder: AnyObject {
     /// Gives every route registered inside `register` a deadline.
     func deadline(milliseconds: UInt32, _ register: () -> Void)
 
+    /// Holds the bodies of routes registered inside `register` to `bytes`, in
+    /// place of `--max-body` (RequestLimits.swift).
+    func maxBodySize(_ bytes: Int, _ register: () -> Void)
+
+    /// Lets at most `max` handlers of the routes registered inside `register`
+    /// run at once in each worker, answering 503 past that.
+    func concurrencyLimit(_ max: Int, _ register: () -> Void)
+
     /// Runs `middleware` before the handler of every route in the current
     /// scope.
     func use(_ middleware: @escaping Middleware)
@@ -109,6 +117,8 @@ public final class Router: RouteBuilder {
         case use(MiddlewareStep)
         case group(String, [Entry])
         case deadline(UInt32, [Entry])
+        case maxBodySize(Int, [Entry])
+        case concurrencyLimit(Int, [Entry])
         case fallback(Handler)
         case asyncFallback(AsyncHandler)
         case cors(CORSPolicy)
@@ -146,9 +156,14 @@ public final class Router: RouteBuilder {
     }
 
     public func deadline(milliseconds: UInt32, _ register: () -> Void) {
+        scoped(register) { .deadline(milliseconds, $0) }
+    }
+
+    /// Records what `register` adds as one entry, made by `entry`.
+    func scoped(_ register: () -> Void, _ entry: ([Entry]) -> Entry) {
         open.append([])
         register()
-        add(.deadline(milliseconds, open.removeLast()))
+        add(entry(open.removeLast()))
     }
 
     public func use(_ middleware: @escaping Middleware) {
@@ -197,6 +212,10 @@ public final class Router: RouteBuilder {
                 builder.group(prefix) { replay(inner, into: builder) }
             case .deadline(let milliseconds, let inner):
                 builder.deadline(milliseconds: milliseconds) { replay(inner, into: builder) }
+            case .maxBodySize(let bytes, let inner):
+                builder.maxBodySize(bytes) { replay(inner, into: builder) }
+            case .concurrencyLimit(let max, let inner):
+                builder.concurrencyLimit(max) { replay(inner, into: builder) }
             case .fallback(let handler):
                 builder.fallback(handler)
             case .asyncFallback(let handler):
@@ -225,6 +244,8 @@ extension Routes {
         asyncHandlers.append(asyncHandler)
         deadlines.append(currentDeadline)
         bodyLimits.append(-1)
+        wholeBodyLimits.append(currentBodyLimit)
+        routeLimiters.append(currentLimiters)
         patterns.append(nil)
         routeGroups.append(openGroups)
     }

@@ -182,6 +182,10 @@ app.group("/api") {
 - `app.onResponse { done in … }` sees every request once it is answered: the
   matched route's pattern, status, duration, request ID and trace, and why a
   route failed. This is what per-route metrics or error reporting hang from.
+- `app.maxBodySize(64 << 20) { … }` gives a scope's routes a body limit of
+  their own in place of `--max-body`, applied before the body is read.
+  `app.concurrencyLimit(8) { … }` lets that many of a scope's handlers run at
+  once in each worker, and answers the next 503.
 
 ### PostgreSQL
 
@@ -339,7 +343,7 @@ offer. This is where Garuda stands, area by area.
 | TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
 | Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
-| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: `request.log` and `app.onResponse` in code; no request limits in code |
+| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: `request.log`, `app.onResponse`, `app.maxBodySize` and `app.concurrencyLimit` in code; no cookies or sessions |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
 | Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` | Done |
 | Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay | Done |
@@ -450,7 +454,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 661 unit tests, and the fuzz corpus
+swift test                                   # 667 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

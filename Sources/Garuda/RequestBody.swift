@@ -199,8 +199,9 @@ extension Application {
 // MARK: - The engine side
 
 extension Worker {
-    /// Marks the request on `slot` as streaming its body when its route does.
-    /// Called at the head, before any of the body is read.
+    /// Marks the request on `slot` as streaming its body when its route does,
+    /// and holds it to its route's limit when that has one of its own. Called
+    /// at the head, before any of the body is read.
     mutating func beginStreamedBody(_ slot: Int) {
         guard let installed = application else { return }
         let c = table[slot]
@@ -210,7 +211,11 @@ extension Worker {
                                                    into: &c.pointee.routeParameters)
         guard route >= 0 else { return }
         let limit = installed.pointee.bodyLimits[Int(route)]
-        guard limit >= 0 else { return }
+        guard limit >= 0 else {
+            let whole = installed.pointee.wholeBodyLimits[Int(route)]
+            if whole >= 0 { c.pointee.bodyLimit = whole }
+            return
+        }
         c.pointee.flags.insert(.bodyStreaming)
         c.pointee.bodyLimit = limit
         c.pointee.bodyStream = RequestBodyState()

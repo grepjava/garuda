@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 661 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 667 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -197,6 +197,17 @@ The Python suites need `h2` and `aioquic`.
   a metric label. `done.failure` says why a route answered 5xx on its own
   account: a throw, a handler that returned without answering, or its
   deadline.
+- `app.maxBodySize(bytes) { … }` holds the bodies of the routes registered
+  inside it to `bytes` instead of `--max-body`, larger or smaller. A declared
+  length past it is 413 before the body is read, and a chunked, HTTP/2 or
+  HTTP/3 body is refused as it grows past it. Nested scopes apply the
+  innermost, and a streaming route keeps its own `maxBodySize:`.
+- `app.concurrencyLimit(max) { … }` lets at most `max` handlers of its routes
+  run at once in each worker process, and answers one more 503 without
+  running it. Middleware is not counted, so a request authentication refuses
+  takes no place. A streamed response holds its place until it is written,
+  a request that goes away gives its place back, and nested limits all apply.
+  Both work on a `Router` too.
 
 ### Streaming responses and server-sent events
 

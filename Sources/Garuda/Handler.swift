@@ -72,6 +72,15 @@ struct Routes {
     /// What routes registered right now are given, set while
     /// `Application.deadline(milliseconds:)` registers a group of them.
     var currentDeadline: UInt32 = 0
+    /// The body limit of each route given its body whole, by route number, or
+    /// -1 for `--max-body`; and what routes registered now are given, set by
+    /// `maxBodySize`.
+    var wholeBodyLimits: [Int] = []
+    var currentBodyLimit = -1
+    /// The concurrency limits each route counts against, by route number, and
+    /// those open now, outermost first (RequestLimits.swift).
+    var routeLimiters: [[ConcurrencyLimiter]] = []
+    var currentLimiters: [ConcurrencyLimiter] = []
 
     /// Middleware for every route, from `use` outside any group.
     var global: [MiddlewareStep] = []
@@ -110,6 +119,8 @@ struct Routes {
         asyncHandlers.append(nil)
         deadlines.append(currentDeadline)
         bodyLimits.append(-1)
+        wholeBodyLimits.append(currentBodyLimit)
+        routeLimiters.append(currentLimiters)
         patterns.append(full)
         routeGroups.append(openGroups)
     }
@@ -139,6 +150,7 @@ struct Routes {
     /// through the same response sink.
     func handlersWithMiddleware() -> [Handler] {
         handlers.enumerated().map { index, handler in
+            let (handler, asyncHandler) = limited(index, handler, asyncHandlers[index])
             var chain = global
             for group in routeGroups[index] { chain += groups[group].middleware }
             if let policy = corsPolicy(index) { chain.insert(.sync(policy.step), at: 0) }
@@ -160,7 +172,6 @@ struct Routes {
                 }
             }
             let onTask = Array(chain[split...])
-            let asyncHandler = asyncHandlers[index]
             let rest: AsyncHandler = { request, response in
                 for step in onTask {
                     let answer: (any ResponseConvertible)?

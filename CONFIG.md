@@ -93,7 +93,8 @@ for `/user/7`.
   server raises its descriptor limit, and warns if `ulimit -n` is still too low.
 - **`--max-body`** is checked against a declared `Content-Length` before the
   body is read, and against the bytes received for a chunked, HTTP/2 or HTTP/3
-  body.
+  body. Routes inside `app.maxBodySize(bytes) { … }` use that limit instead,
+  checked the same way.
 - **`--max-header-size`** bounds the HTTP/1.1 head and chunked trailers. It is
   also the HTTP/2 header list size and the HTTP/3 field section size the server
   advertises.
