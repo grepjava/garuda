@@ -115,6 +115,16 @@ written, whoever answered. `use` covers its whole scope regardless of where it
 is called. The cost: middleware cannot retry a handler or hold a scope around
 its run.
 
+### CORS is a policy of a scope, not a middleware in order
+
+`app.cors` does not take a place among the `use` calls. The innermost scope's
+policy runs in front of all of a route's middleware. A browser's preflight
+carries no credentials, so authentication in front of it would refuse every
+preflight. And a 401 from that authentication needs Access-Control-Allow-Origin,
+or the page cannot read it. A preflight to a path routed only for other methods
+is answered from the 405 branch of dispatch, using the policy of one of the
+routes the path does have, so a CORS route needs no OPTIONS route of its own.
+
 ### Deadlines return 504
 
 `app.deadline` answers 504, not 503. Garuda already uses 503 for "this worker is
@@ -201,7 +211,7 @@ wait once.
 | 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | PostgreSQL done; Redis, SQLite and the blocking pool to do |
-| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | Shipped middleware to do |
+| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS and authentication done; tracing and request limits to do |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, request bodies, SSE, WebSockets over HTTP/1.1, resumable uploads and WebTransport done |
 | 6 | Examples and realistic benchmarks | To do |
 
@@ -216,8 +226,7 @@ wait once.
   SASLprep.
 
 **Step 4**
-- Middleware Garuda ships: authentication, CORS, tracing with a logging API,
-  request limits.
+- Middleware Garuda ships: tracing with a logging API, request limits.
 
 **Step 5**
 - `--compress` and `--cache-size` acting on handler responses in the sink.

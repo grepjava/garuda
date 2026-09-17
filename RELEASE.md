@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 532 unit tests
+swift test                             # 545 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -137,6 +137,26 @@ The Python suites need `h2` and `aioquic`.
   answered, and can change its status, headers and body. Hooks run last-added
   first. They do not run for static files, cache hits, or answers given before
   a route is chosen.
+- `app.cors(CORSPolicy(origins: […]))` sets the CORS policy of a scope: the
+  application, a group or a router, the innermost winning. Origins are any, a
+  list, or a closure's decision; methods and request headers are a list or
+  what the path is routed for and the preflight asks for; exposed headers,
+  credentials and max age are set with it. Any origin with credentials is
+  refused when the policy is made.
+- The policy answers a preflight 204 whether or not the path has an OPTIONS
+  route, so a path routed only for GET no longer answers a preflight 405. It
+  runs in front of the scope's middleware, so a preflight skips
+  authentication, and a refusal or thrown error from an allowed origin carries
+  Access-Control-Allow-Origin. `Vary` names what the answer depends on.
+- `app.authenticate(bearer: Key.self) { token in … }` and
+  `app.authenticate(basic: Key.self, realm:) { username, password in … }`
+  read the Authorization header, keep what the closure returns under `Key` in
+  the request's context, and answer 401 with the WWW-Authenticate challenge for
+  a missing, malformed or refused one. The closure may be async, and a throw
+  answers as a handler's does.
+- `BearerToken` and `BasicCredentials` extract the same credentials in a
+  handler, and `constantTimeEquals` compares a secret in time that does not
+  depend on where it differs.
 
 ### Streaming responses and server-sent events
 
@@ -297,8 +317,7 @@ The Python suites need `h2` and `aioquic`.
 
 ### Not yet
 
-- WebSocket over HTTP/2 and HTTP/3, and shipped
-  middleware for authentication, CORS and tracing.
+- WebSocket over HTTP/2 and HTTP/3, and shipped middleware for tracing.
   Middleware cannot wrap a handler's run.
 - `--compress` and `--cache-size` do not act on handler responses.
 - WebTransport is HTTP/3 only.

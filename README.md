@@ -136,8 +136,9 @@ names on the worker's poller and keeps connections for reuse.
 app.state { _ in PostgresPool(PostgresConfiguration(host: "db", user: "app", password: secret)) }
 
 app.group("/api") {
+    app.cors(CORSPolicy(origins: ["https://app.example.com"], allowCredentials: true))
+    app.authenticate(bearer: CurrentUser.self) { token in try await sessions.user(token) }
     app.use { request, response in
-        guard request.header("authorization") != nil else { return HTTPStatus.unauthorized }
         response.onSend { outgoing in outgoing.addHeader("cache-control", "no-store") }
         return nil
     }
@@ -154,6 +155,14 @@ app.group("/api") {
   response, whoever answered.
 - `request[context: Key.self]` carries values from middleware to the handler,
   which reads them with `Context<Key>`.
+- `app.cors` sets the scope's CORS policy. It answers preflights, including to
+  paths routed only for other methods, and runs ahead of the scope's
+  middleware, so a preflight never meets authentication and a 401 still
+  reaches the page.
+- `app.authenticate(bearer:)` and `app.authenticate(basic:)` read the
+  Authorization header and keep who it belongs to in the context, or answer
+  401 with the challenge. `BearerToken` and `BasicCredentials` are the same as
+  extractors, and `constantTimeEquals` compares secrets.
 
 ### PostgreSQL
 
@@ -259,7 +268,7 @@ offer. This is where Garuda stands, area by area.
 | TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
 | Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
-| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline` | Partial: no CORS or auth middleware |
+| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: no tracing API or request limits in code |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
 | Server-sent events | `Sse` | `EventStream` | Done |
 | Streaming request bodies | `Body::into_data_stream` | `onStreamingBody`, with a limit per route and flow control back to the client | Done |
@@ -365,7 +374,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 532 unit tests, and the fuzz corpus
+swift test                                   # 545 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
@@ -423,8 +432,8 @@ say) is not unwound when its request is cancelled. It resumes to find
 ### Not supported
 
 
-- A stable API, WebSocket over HTTP/2 and HTTP/3,
-  CORS and auth middleware, Redis, SQLite and a blocking pool.
+- A stable API, WebSocket over HTTP/2 and HTTP/3, Redis, SQLite and a blocking
+  pool.
 - Resumable uploads have no `min-size` or `min-append-size` limits and no
   digests, and a completed upload is not replayed to a client that asks again.
 - A body over its limit is answered 413 on HTTP/1.1 and HTTP/3, and refused

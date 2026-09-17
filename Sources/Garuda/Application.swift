@@ -246,6 +246,8 @@ public final class Application: RouteBuilder {
             bodyLimits: bodyLimits,
             streamsBodies: routes.bodyLimits.contains { $0 >= 0 },
             fallbacks: CompiledFallbacks(routes.fallbacks),
+            corsPolicies: (0..<count).map { routes.corsPolicy($0) },
+            hasCORS: routes.cors != nil || !routes.groupCORS.isEmpty,
             handlerCount: count,
             stateFactories: stateFactories,
             stateShutdowns: stateShutdowns,
@@ -270,6 +272,10 @@ struct CompiledApplication {
     let streamsBodies: Bool
     /// Each scope's fallback, for a request no route matches.
     let fallbacks: CompiledFallbacks
+    /// Each route's CORS policy, by route number, for a preflight to a path
+    /// routed only for other methods.
+    let corsPolicies: [CORSPolicy?]
+    let hasCORS: Bool
     let handlerCount: Int
     let stateFactories: [(ObjectIdentifier, (Int) throws -> Any)]
     let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]

@@ -138,6 +138,9 @@ extension Worker {
                 runHandler(slot, installed.pointee.handlers[Int(fallback)])
                 return
             }
+            if c.pointee.head.method == .options && answerPreflight(slot, allowed: allowed, base, count) {
+                return
+            }
             var value = ""
             for method in allowed {
                 guard let token = method.token else { continue }

@@ -62,6 +62,12 @@ public protocol RouteBuilder: AnyObject {
 
     /// An async fallback, as `fallback` with a synchronous one.
     func fallback(_ handler: sending @escaping AsyncHandler)
+
+    /// Sets the CORS policy of the current scope: the routes of the
+    /// application, group or router it is called in, and the groups inside
+    /// it that set none of their own. It answers preflights and runs in front
+    /// of the scope's middleware, wherever it is called.
+    func cors(_ policy: CORSPolicy)
 }
 
 extension RouteBuilder {
@@ -105,6 +111,7 @@ public final class Router: RouteBuilder {
         case deadline(UInt32, [Entry])
         case fallback(Handler)
         case asyncFallback(AsyncHandler)
+        case cors(CORSPolicy)
     }
 
     /// What has been registered, innermost open group last.
@@ -160,6 +167,10 @@ public final class Router: RouteBuilder {
         add(.asyncFallback(handler))
     }
 
+    public func cors(_ policy: CORSPolicy) {
+        add(.cors(policy))
+    }
+
     /// Registers every entry on `builder`, in the order they were made.
     func replay(into builder: some RouteBuilder) {
         precondition(open.count == 1, "a router was merged from inside one of its own groups")
@@ -191,6 +202,8 @@ public final class Router: RouteBuilder {
             case .asyncFallback(let handler):
                 nonisolated(unsafe) let handler = handler
                 builder.fallback(handler)
+            case .cors(let policy):
+                builder.cors(policy)
             }
         }
     }
@@ -217,6 +230,11 @@ extension Routes {
 }
 
 extension Application {
+    public func cors(_ policy: CORSPolicy) {
+        precondition(compiled == nil, "CORS policy set after the application was compiled")
+        routes.setCORS(policy)
+    }
+
     public func fallback(_ handler: @escaping Handler) {
         precondition(compiled == nil, "fallback added after the application was compiled")
         routes.fallback(handler, async: nil)

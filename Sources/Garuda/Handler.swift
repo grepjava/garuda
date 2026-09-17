@@ -82,6 +82,10 @@ struct Routes {
     var fallbacks: [(prefix: String, route: Int32)] = []
     /// The groups each route was registered inside, by route number.
     var routeGroups: [[Int]] = []
+    /// The CORS policy set outside any group, and those set in groups, by
+    /// group.
+    var cors: CORSPolicy? = nil
+    var groupCORS: [Int: CORSPolicy] = [:]
 
     /// The prefix routes registered now are mounted under.
     var currentPrefix: String {
@@ -133,6 +137,7 @@ struct Routes {
         handlers.enumerated().map { index, handler in
             var chain = global
             for group in routeGroups[index] { chain += groups[group].middleware }
+            if let policy = corsPolicy(index) { chain.insert(.sync(policy.step), at: 0) }
             if chain.isEmpty { return handler }
             let split = chain.firstIndex { $0.isAsync } ?? chain.count
             var onWorker: [Middleware] = []
@@ -179,6 +184,28 @@ struct Routes {
                 }
                 request.worker.pointee.runOnTask(request.slot, rest)
             }
+        }
+    }
+}
+
+extension Routes {
+    /// The policy of the innermost scope route `index` was registered in
+    /// that has one.
+    func corsPolicy(_ index: Int) -> CORSPolicy? {
+        for group in routeGroups[index].reversed() {
+            if let policy = groupCORS[group] { return policy }
+        }
+        return cors
+    }
+
+    /// Sets the current scope's CORS policy.
+    mutating func setCORS(_ policy: CORSPolicy) {
+        if let group = openGroups.last {
+            precondition(groupCORS[group] == nil, "a second CORS policy for \(groups[group].prefix)")
+            groupCORS[group] = policy
+        } else {
+            precondition(cors == nil, "a second CORS policy for the application")
+            cors = policy
         }
     }
 }
