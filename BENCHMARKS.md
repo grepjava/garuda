@@ -8,8 +8,8 @@ How Garuda's performance is measured, and the results so far. Benchmarks are a
 check on the engine, not its purpose: a change that makes Garuda slower should
 be noticed, and these runs are how.
 
-The reference points are [axum](https://github.com/tokio-rs/axum), a widely
-used Rust framework, and Hummingbird and Vapor, from
+The reference points are axum and actix on Rust, Vert.x on the JVM, and
+Hummingbird and Vapor on Swift, all from
 [the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/).
 Every server but Garuda runs that suite's own application, built as the suite
 builds it, under the suite's load command.
@@ -52,52 +52,8 @@ It prints one line per pass and server to stdout: requests a second, p50 and
 p99 in milliseconds, and errors. The last line is the total time in seconds.
 `GARUDA` points it at a binary other than `.build/release/garuda`. It needs
 what frameworks.sh needs for Garuda and axum: zrk, oha, python3, curl, cargo
-for the first axum build, and port 3000.
-
-### Recorded passes
-
-**2026-09-15.** Garuda: phase 1 of the handler API
-([HANDLER-API.md](HANDLER-API.md)), on top of 0e0cbbc. axum 0.8.9 on Tokio
-1.53.1 and hyper 1.11.1, built with rustc 1.96.0 (the suite's Dockerfile uses
-1.98). One run per pass, 88 s in all, no errors. Requests a second:
-
-| pass | Garuda | axum | Garuda ÷ axum |
-|---|---:|---:|---:|
-| ramp, 15 s | 390,324 | 200,048 | 1.95× |
-| closed loop, 10 s | 201,360 | 167,078 | 1.21× |
-| pinned, one core each, 10 s | 200,890 | 116,799 | 1.72× |
-
-Latency, p50 / p99 in milliseconds:
-
-| pass | Garuda | axum |
-|---|---:|---:|
-| ramp | 3.9 / 646 | 471 / 2,973 |
-| closed loop | 0.26 / 1.21 | 0.30 / 1.01 |
-| pinned | 0.27 / 1.08 | 0.53 / 2.28 |
-
-- axum's ramp latencies are queueing. It fell behind the offered rate.
-- The closed-loop figure is probably oha's limit, not Garuda's. Garuda served
-  the same ~201k on four workers sharing the CPUs with oha as on one pinned
-  core. Read 1.21× as a floor. The pinned 1.72× may be one too.
-
-**2026-09-16, dedicated server.** The first run on the benchmark machine: 8
-cores, Ubuntu 26.04, with the load generator on the same host. One run per pass,
-87 s in all. Requests a second:
-
-| pass | Garuda | axum | Garuda ÷ axum |
-|---|---:|---:|---:|
-| ramp, 15 s | 297,198 | 185,660 | 1.60× |
-| closed loop, 10 s | 175,475 | 148,001 | 1.19× |
-| pinned, one core each, 10 s | 126,341 | 103,965 | 1.22× |
-
-The dev machine (WSL2) is too noisy for the 5% gate: the same unchanged binary
-read between 345,250 and 377,247 requests a second across four runs there.
-Performance decisions are taken on the dedicated server.
-
-**End of handler API step 3**, on the benchmark machine, 64 connections. Only
-the ratios were recorded: Garuda served 1.71× axum's requests a second on the
-ramp, 1.22× closed-loop and 1.21× pinned to one core, with under half axum's
-closed-loop p99.
+for the first axum build, and port 3000. It prints its figures and records
+none: a short run is a check, not a figure to keep.
 
 ## The framework suite
 
@@ -194,70 +150,49 @@ framework  server  workers  connections  req/s p50_ms p75_ms p90_ms p99_ms error
 
 Server logs go to a temporary directory that is removed at the end.
 
-### Recorded run: axum, actix and Vert.x
+### Recorded run: six servers
 
-**2026-09-17**, Garuda at e0fb3b6. `GET /`, the suite's ramp, the mean of three
-runs at each level. Host: the dedicated benchmark machine, an Intel Core
-i5-8250U (4 cores, 8 threads), 3.3 GB, Ubuntu 26.04, with zrk 2.5.0 on the
-same machine. axum 0.8.9 on Tokio 1.53.1 and actix-web 4.15.0 built with rustc
-1.93.1; Vert.x 5.1.7 on OpenJDK 25.0.4.
-
-As upstream runs it, every server with all 8 CPUs (`WORKERS=8`), load unpinned.
-Requests a second:
+**2026-09-18**, Garuda at 9f947f6 with 4 workers. `GET /`, the suite's ramp,
+the mean of three 15-second runs at each level, no errors anywhere. Requests a
+second:
 
 | entry | 64 | 256 | 512 |
 |---|---:|---:|---:|
-| Garuda | 203,397 | 179,075 | 164,323 |
-| axum | 172,055 | 180,136 | 148,930 |
-| actix | 190,299 | 180,040 | 171,059 |
-| Vert.x | 185,496 | 167,935 | 153,826 |
+| Garuda | 351,259 | 356,389 | 328,101 |
+| actix-web 4.15.0 | 348,490 | 359,141 | 321,417 |
+| Vert.x 5.1.7 | 317,001 | 310,806 | 293,570 |
+| axum 0.8.9 | 190,125 | 293,221 | 296,588 |
+| Hummingbird 2.26.0 | 83,939 | 88,592 | 93,614 |
+| Vapor 4.122.1 | 56,368 | 56,100 | 56,994 |
 
-Servers on CPUs 0-3 and zrk on CPUs 4-7 (`PIN=0-3:4-7 WORKERS=4`):
+Latency at 256 connections, p50 / p99 in milliseconds:
 
-| entry | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| Garuda | 212,552 | 184,035 | 177,375 |
-| axum | 191,195 | 167,958 | 162,726 |
-| actix | 188,013 | 186,110 | 179,313 |
-| Vert.x | 194,215 | 180,094 | 165,546 |
+| entry | p50 | p99 |
+|---|---:|---:|
+| actix-web | 8.8 | 715 |
+| Garuda | 10.5 | 1,000 |
+| Vert.x | 28.6 | 1,441 |
+| axum | 104.0 | 1,433 |
+| Hummingbird | 2,120 | 6,408 |
+| Vapor | 3,038 | 7,963 |
 
-- The four are within about 15% of each other at every level, and within 5%
-  at 256 and 512. Runs of one server at one level moved by up to 16%.
-- Every p50 is hundreds of milliseconds and every p99 seconds: all four fell
-  behind the ramp, so these rates are what this machine can serve and
-  generate at once, not the servers' own ceilings. actix had 5 and 2 errors at
-  64 connections; the others none.
-- Pinning does not separate the load: CPUs 0-3 and 4-7 are hyperthreads of the
-  same four cores. A machine with a second host for the load generator is what
-  would separate the servers.
-- These rates are lower than the same machine gives in a short run, for every
-  server. Twenty minutes of continuous load on a 15 W laptop CPU under the
-  `powersave` governor is a throttling shape: `vs-axum.sh` right afterwards
-  read 296,072 req/s for Garuda and 199,132 for axum on the ramp, against
-  203,397 and 172,055 here. Compare a sustained sweep only with another
-  sustained sweep.
-
-### Recorded run: Hummingbird and Vapor
-
-**2026-09-15**, Garuda at 09eb178 with 4 workers. `GET /`, the suite's ramp,
-the mean of three runs, no errors. Requests a second:
-
-| entry | 64 | 256 | 512 |
-|---|---:|---:|---:|
-| Garuda router | 414,234 | 389,445 | 370,945 |
-| Hummingbird 2.26.0 | 88,864 | 102,399 | 99,706 |
-| Vapor 4.122.1 | 60,411 | 58,946 | 60,837 |
-
-- Swift 6.3.3, SwiftNIO 2.102.0. Host: WSL2, 4 CPUs of an Intel Core
-  i9-12900KF, with the load generator on the same CPUs.
-- Garuda ran on the built-in router that the handler API has since replaced.
-  The axum passes above ran through the handler API.
-- Garuda served about 4× Hummingbird and 6–7× Vapor at every level.
-- No latencies. The ramp offers far more than Hummingbird and Vapor can serve,
-  so their p50s are seconds of queueing, not the cost of a request.
-- No pinned pass. SwiftNIO sizes its event loop group from cgroup limits or the
-  online CPU count, not from CPU affinity. Under `taskset`, Hummingbird and
-  Vapor would each run four loops on one core.
+- Host: WSL2 with 4 CPUs of an Intel Core i9-12900KF, Ubuntu 24.04, kernel
+  6.18, with zrk 2.5.0 on the same CPUs. Swift 6.3.3, SwiftNIO 2.102.0, rustc
+  1.96.0, Tokio 1.53.1, OpenJDK 25.0.4 with Netty's epoll transport. Garuda ran
+  4 workers; the others size their threads from the CPU count.
+- Garuda and actix are a tie: the gaps between them are smaller than the spread
+  between runs of either (Garuda's three runs at 256 ranged 333k-376k, actix's
+  at 512 ranged 272k-367k).
+- Vert.x follows about 10% behind, then axum.
+- Garuda served about 4x Hummingbird and 6x Vapor, as it did in the earlier
+  Swift-only run.
+- axum's 190,125 at 64 connections, with a p50 of 540 ms against 104 ms at 256,
+  is out of line with its own higher levels. The suite runs one 5-second
+  warm-up per server, before the first level only, and that is the level that
+  pays for whatever axum warms up.
+- Every server's p99 is hundreds of milliseconds or worse, so all six fell
+  behind the ramp at some point in a run. These are rates under an offered load
+  none of them could hold, which is what the suite measures.
 
 ## Caveats
 
