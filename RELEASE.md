@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 680 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 683 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -250,6 +250,14 @@ The Python suites need `h2` and `aioquic`.
   migration) and moves a session's expiry once half of the timeout has gone,
   so reads rarely write. `deleteExpired()` clears expired rows. A store of
   your own implements `SessionStore`'s load, save and delete.
+- `app.csrfProtection(trustedOrigins:)` refuses cross-site request forgery
+  in its scope without tokens. A request other than GET, HEAD or OPTIONS is
+  answered 403 when Sec-Fetch-Site says `cross-site` or `same-site`, or, from
+  a browser that sends no Sec-Fetch-Site, when Origin names a host other than
+  the request's Host or `:authority` (`:80` and `:443` aside) or is `null`.
+  `same-origin`, `none`, and a request with neither header, which no browser
+  page made, pass. An origin in `trustedOrigins` passes whatever the headers
+  say. This is the check Go's net/http added in 1.25.
 
 ### Streaming responses and server-sent events
 

@@ -196,6 +196,10 @@ app.group("/api") {
   `try await session.set("user", id)` writes it to the store before it returns.
   `session.renew()` moves it to a new ID at login, and `session.destroy()`
   deletes it and its cookie.
+- `app.csrfProtection()` refuses, with 403, a POST, PUT, PATCH or DELETE that
+  the browser says another site's page started, from Sec-Fetch-Site or else
+  Origin against Host. It needs no tokens in forms. `trustedOrigins` lets a
+  front end on another origin through.
 
 ### PostgreSQL
 
@@ -353,7 +357,7 @@ offer. This is where Garuda stands, area by area.
 | TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
 | Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
-| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, signed or encrypted cookies and sessions in code; no CSRF |
+| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, signed or encrypted cookies, sessions and CSRF protection in code |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
 | Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` | Done |
 | Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay | Done |
@@ -464,7 +468,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 680 unit tests, and the fuzz corpus
+swift test                                   # 683 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

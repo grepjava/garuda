@@ -127,6 +127,16 @@ that changes several keys uses `session.update { … }` for one write, and the
 cookie for a new ID is added by a send hook, which is why the session changes
 before the answer.
 
+### CSRF protection reads Fetch Metadata, not tokens
+
+`app.csrfProtection` decides from Sec-Fetch-Site, and from Origin against Host
+when a browser sends no Sec-Fetch-Site. Every current browser sends one or the
+other on a request that changes something. A synchronizer token needs a
+session and a field in every form; a double-submit cookie needs both. Either
+way the server does work to check what the browser already says. A request
+with neither header was not made by a browser page and passes: the attack is
+a page using the browser's cookies, not a client that has them.
+
 ### CORS is a policy of a scope, not a middleware in order
 
 `app.cors` does not take a place among the `use` calls. The innermost scope's
@@ -261,7 +271,7 @@ wait once.
 | 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | Done |
-| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS, authentication, the application log, response observers, request limits, cookies and sessions done; CSRF to do |
+| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS, authentication, the application log, response observers, request limits, cookies, sessions and CSRF protection done; security headers and path normalization to do |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Done |
 | 6 | Examples and realistic benchmarks | Examples done; benchmarks to do |
 
@@ -272,8 +282,8 @@ wait once.
   SASLprep.
 
 **Step 4**
-- Middleware Garuda ships: CSRF protection, security headers, path
-  normalization.
+- Middleware Garuda ships: security headers, path normalization, request
+  decompression, a host allow-list and IP filter.
 
 **Step 6**
 - Benchmarks past hello-world against axum: path parameters, JSON in and out, a
