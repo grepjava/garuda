@@ -166,6 +166,13 @@ drain.
   reused whenever a command may have changed its session, which is simpler to
   get right than restoring it.
 - SQLite through a bounded blocking pool, since it is a library doing disk I/O.
+  The system's libsqlite3 is loaded with dlopen, as brotli and zstd are, rather
+  than vendoring its source. A statement runs whole on a pool thread and its
+  rows are copied out, so the worker decodes them without touching SQLite, and a
+  connection is used by one thread at a time. One writer and several readers
+  per worker, because SQLite has one writer per file; transactions begin
+  IMMEDIATE because the lock upgrade a deferred one needs fails at once instead
+  of waiting.
 - Any other database through an async bridge to an existing Swift driver, at a
   thread hop per call.
 - Not postgres-nio: it brings SwiftNIO's threads into every worker and a thread
@@ -241,7 +248,7 @@ wait once.
 |---|---|---|
 | 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
-| 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | PostgreSQL, Redis and the blocking pool done; SQLite to do |
+| 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | Done |
 | 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS and authentication done; tracing and request limits to do |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, request bodies, SSE with keep-alive and replay, broadcast across workers, WebSockets over HTTP/1.1, resumable uploads and WebTransport done |
 | 6 | Examples and realistic benchmarks | To do |
@@ -249,7 +256,6 @@ wait once.
 ### Still to build
 
 **Step 3**
-- SQLite on the blocking pool.
 - PostgreSQL: `date`, `time`, `interval`, `numeric` and `json` types, `LISTEN`,
   SASLprep.
 

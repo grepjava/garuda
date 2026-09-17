@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>A Swift web framework with its own HTTP engine.</b><br>
-  HTTP/1.1, HTTP/2 and HTTP/3, TLS and ACME, typed handlers, PostgreSQL, Redis, streaming, WebTransport.<br>
+  HTTP/1.1, HTTP/2 and HTTP/3, TLS and ACME, typed handlers, PostgreSQL, Redis, SQLite, streaming, WebTransport.<br>
   No Foundation, no SwiftNIO.
 </p>
 
@@ -22,7 +22,7 @@ no scheduling hop before a response that can be sent at once.
 
 **Status: early, and the API will change.** Routes, groups and middleware,
 synchronous and async handlers, typed extraction and answers, per-worker state,
-deadlines, an HTTP client, PostgreSQL and Redis drivers, streamed responses and request
+deadlines, an HTTP client, PostgreSQL, Redis and SQLite drivers, streamed responses and request
 bodies, server-sent events, WebSockets, resumable uploads and WebTransport all
 work and are tested. Nothing has been released.
 [HANDLER-API.md](HANDLER-API.md) has the roadmap, and [Status](#status) below
@@ -193,6 +193,28 @@ with typed replies (`get`, `set` with expiry and NX/XX, hashes, lists, sets,
 round trip, `session` holds one connection for WATCH, and `subscribe` listens
 to channels and patterns on a connection of its own.
 
+### SQLite
+
+```swift
+app.state { _ in
+    let db = try SQLiteDatabase(SQLiteConfiguration(path: "/var/lib/app/app.db"))
+    try db.migrate(["create table notes (id integer primary key, text text not null)"])
+    return db
+}
+
+app.get("/note/:id") { (id: Path<Int>, db: State<SQLiteDatabase>) async throws in
+    try await db.value.first(Note.self, "select id, text from notes where id = ?", id.value).map { JSON($0) }
+}
+```
+
+The system's libsqlite3 is loaded at run time, and every statement runs on the
+worker's blocking pool, so a worker keeps serving while SQLite reads the disk
+or waits for another process's lock. Each worker has one connection that
+writes and up to four that read, in write-ahead-log mode; a statement moves to
+a reader once SQLite has said it cannot write. Rows decode into `Decodable`
+types, `transaction` begins IMMEDIATE, and `migrate` brings the schema up to
+date by `user_version` when each worker starts.
+
 ### Streaming, server-sent events, WebSockets and WebTransport
 
 ```swift
@@ -311,7 +333,7 @@ offer. This is where Garuda stands, area by area.
 | HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression | Done |
 | PostgreSQL | sqlx, tokio-postgres | Native driver on the poller | Done |
 | Redis | redis-rs, fred | Native driver on the poller: RESP3 and RESP2, TLS, ACL, pipelines, transactions, pub/sub | Done |
-| SQLite | sqlx, rusqlite | None | Planned |
+| SQLite | sqlx, rusqlite | The system's libsqlite3 on the blocking pool: a writer and readers per worker, WAL, migrations | Done |
 | Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker | Done |
 | Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine | Done |
 
@@ -410,7 +432,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 613 unit tests, and the fuzz corpus
+swift test                                   # 640 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
@@ -468,7 +490,7 @@ say) is not unwound when its request is cancelled. It resumes to find
 ### Not supported
 
 
-- A stable API, WebSocket over HTTP/2 and HTTP/3, and SQLite.
+- A stable API, and WebSocket over HTTP/2 and HTTP/3.
 - Redis Cluster and Sentinel: the driver talks to one server, and a `MOVED`
   reply is a server error. [CONNECTORS.md](CONNECTORS.md) has what works and
   the plan.

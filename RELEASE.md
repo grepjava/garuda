@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 613 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 640 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -352,6 +352,34 @@ The Python suites need `h2` and `aioquic`.
   patterns can be added and removed.
 - The reply parser is a `pgfuzz` target, `resp`.
 
+### SQLite
+
+- `SQLiteDatabase`, built by `app.state`: the system's libsqlite3, loaded at
+  run time, so building needs no SQLite headers. Where it cannot be loaded,
+  opening a database throws `SQLiteClientError.unavailable`.
+- Every statement runs on the worker's blocking pool, prepared or taken from
+  the connection's cache, stepped to the end and copied out; rows decode into
+  `Decodable` types on the worker. `query`, `first`, `execute` and `rows`.
+- Each worker has one writer and up to `maxReaders` (4) readers, opened as they
+  are needed. A statement moves to a reader once SQLite has said, on the writer,
+  that it cannot write. `:memory:` uses the writer alone.
+- Files open in write-ahead-log mode with `synchronous=NORMAL` and foreign keys
+  enforced, each configurable. Another worker's lock is waited for up to
+  `busyTimeoutMilliseconds` (5000) on the blocking thread.
+- `transaction` holds the writer from BEGIN IMMEDIATE to COMMIT, so a
+  transaction that reads before it writes never fails to upgrade its lock. A
+  statement outside it that leaves a transaction open is rolled back and
+  refused with `transactionLeftOpen`.
+- `migrate` runs the scripts past the database's `user_version` in one
+  transaction, once across every worker, and refuses a database migrated by a
+  newer program.
+- SQL holding more than one statement is refused, and results are held to
+  `maxRows` and `maxResultBytes`. A refusal carries SQLite's extended code as
+  `sqliteCode`, and `isConstraintViolation` says whether a constraint failed.
+- `Bool` binds as 0 or 1, `UUID` as text, and `Timestamp` as UTC text of one
+  width, `2026-09-17 06:19:31.123456`, which sorts in order and which SQLite's
+  date functions read. `UInt` and `UInt64` do not bind.
+
 ### Server
 
 - `--compress` compresses handler responses, whoever answered them, with the
@@ -402,7 +430,10 @@ The Python suites need `h2` and `aioquic`.
   Retry-After. Expired uploads are removed when uploads are created.
 - PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types of
   its own (they read as text), no `LISTEN`, and no SASLprep for non-ASCII
-  passwords. No SQLite driver.
+  passwords.
+- SQLite statements cannot be interrupted once on a blocking thread: a request
+  cancelled meanwhile finds out when the statement returns. No `sqlite3_backup`,
+  custom functions or extensions.
 - Redis Cluster and Sentinel are not supported: the driver talks to one
   server. RESP3's streamed strings and aggregates are refused, and no command
   the driver sends is answered with them.

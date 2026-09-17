@@ -1,10 +1,11 @@
 # Connectors
 
-Garuda talks to other services through connectors that run on the worker's
-poller: an HTTP client, a PostgreSQL driver and a Redis driver. Each one keeps a
-pool per worker process, built after the fork. No connector blocks a worker's
-thread, and none wraps a client library such as libpq or hiredis. A SQLite
-connector is planned.
+Garuda talks to other services through connectors: an HTTP client, a PostgreSQL
+driver and a Redis driver that run on the worker's poller, and SQLite on the
+worker's blocking pool. Each one keeps its connections per worker process,
+built after the fork, and none blocks a worker's thread. The network drivers
+are written in Swift and wrap no client library such as libpq or hiredis;
+SQLite is the system's own library, loaded at run time.
 
 This file covers what each connector supports, what it does not, and the work
 planned for each one. How to use them is in [README.md](README.md), and every
@@ -15,7 +16,7 @@ change is in [RELEASE.md](RELEASE.md).
 | [HTTP client](#http-client) | Done | HTTP/3, proxies |
 | [PostgreSQL](#postgresql) | Done | Some types, `LISTEN`, `COPY`, unix sockets, several hosts |
 | [Redis](#redis) | Done | **Cluster, Sentinel**, sharded pub/sub, client-side caching |
-| [SQLite](#sqlite) | Planned | Everything, for now |
+| [SQLite](#sqlite) | Done | Interrupting a statement, backups, custom functions |
 
 ## HTTP client
 
@@ -142,6 +143,32 @@ for keys whose hash slots that node holds:
 
 ## SQLite
 
-SQLite is next. It will run on the blocking pool, since SQLite's C library
-blocks the thread that calls it, and queries will decode rows into `Decodable`
-types, as the PostgreSQL driver does.
+`SQLiteDatabase` loads the system's libsqlite3 at run time and runs every
+statement on the worker's blocking pool. Each worker has one connection that
+writes and up to four that read, in write-ahead-log mode. It decodes rows into
+`Decodable` types, runs transactions that begin IMMEDIATE, and migrates the
+schema by `user_version`.
+
+### Not supported
+
+- Interrupting a statement. Once it is on a blocking thread it runs to the end,
+  and a request cancelled or past its deadline meanwhile finds out when it
+  returns.
+- A vendored SQLite. The system's library decides the version and compile
+  options: Ubuntu 24.04 has 3.45. A library
+  built without thread support is refused.
+- The online backup API, custom SQL functions, loadable extensions, `ATTACH`
+  managed by the pool, and incremental blob I/O.
+- Streaming a result. Rows are copied out whole, up to `maxRows` and
+  `maxResultBytes`.
+- Session settings changed by a statement. A `PRAGMA` run through the pool
+  changes only the connection it happened to run on; settings belong in
+  `SQLiteConfiguration`.
+
+### Future work
+
+- Interrupting a statement with `sqlite3_interrupt` when its request is
+  cancelled or its deadline passes.
+- Backups with `sqlite3_backup`, run on the blocking pool.
+- Custom SQL functions written in Swift.
+- Returning rows a batch at a time, for results too large to copy at once.

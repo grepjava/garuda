@@ -20,8 +20,10 @@ library to your own package and build your application.
 | **zlib** | Development files. The package links `libz`. |
 | **CA certificates** | The system trust store, for ACME and outbound HTTPS, unless you pass `--acme-ca-bundle`. |
 
-Nothing else is linked. The PostgreSQL driver is written in Swift and needs no
-`libpq`.
+Nothing else is linked. The PostgreSQL and Redis drivers are written in Swift
+and need no client libraries. SQLite is the system's `libsqlite3`, loaded when
+the first database opens, so it needs no headers to build: install
+`libsqlite3-0` (below) where an application uses it. macOS has it.
 
 ### Ubuntu and Debian
 
