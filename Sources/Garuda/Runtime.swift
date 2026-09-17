@@ -1003,10 +1003,13 @@ enum GarudaRuntime {
     // MARK: - Worker
 
     /// Builds one worker: poller, connection slab, TLS, QUIC listener.
+    /// `listening: false` leaves the sockets unwatched, for a worker that has
+    /// `app.prepare` to run first.
     static func makeWorker(_ config: ServerConfig,
                            listenFD: Int32,
                            controlFD: Int32,
-                           metricsSlot: Int = 0) -> UnsafeMutablePointer<Worker>? {
+                           metricsSlot: Int = 0,
+                           listening: Bool = true) -> UnsafeMutablePointer<Worker>? {
         guard let poller = Poller(maxEvents: 256) else {
             Log.error("cannot create the readiness poller")
             return nil
@@ -1057,11 +1060,64 @@ enum GarudaRuntime {
             workerPtr.pointee.quic = listener
         }
 
-        guard workerPtr.pointee.registerListener() else { return nil }
-        guard workerPtr.pointee.registerMetricsListener() else { return nil }
-        guard workerPtr.pointee.registerRedirectListener() else { return nil }
-        guard workerPtr.pointee.registerQUIC() else { return nil }
+        if listening {
+            guard startListening(workerPtr) else { return nil }
+        }
         return workerPtr
+    }
+
+    /// Watches the sockets the worker serves on. Held back until after
+    /// `app.prepare` has run, so a worker that is not ready yet leaves what
+    /// arrives in the backlog instead of answering it.
+    static func startListening(_ workerPtr: UnsafeMutablePointer<Worker>) -> Bool {
+        workerPtr.pointee.registerListener()
+            && workerPtr.pointee.registerMetricsListener()
+            && workerPtr.pointee.registerRedirectListener()
+            && workerPtr.pointee.registerQUIC()
+    }
+
+    /// What an application's preparation ended as, read only on the worker's
+    /// own thread.
+    private final class Preparation: @unchecked Sendable {
+        var done = false
+        var failure: String? = nil
+    }
+
+    /// Runs `prepare` on the worker's executor, turning `turn` until it
+    /// finishes or the time runs out. False means the worker must not serve.
+    static func runPreparation(_ worker: UnsafeMutablePointer<Worker>, index: Int,
+                               prepare: @escaping (WorkerStartup) async throws -> Void,
+                               timeoutMilliseconds: UInt64, turn: () -> Void) -> Bool {
+        let outcome = Preparation()
+        nonisolated(unsafe) let work = prepare
+        nonisolated(unsafe) let me = worker
+        let pool = worker.pointee.handlerTasks ?? worker.pointee.makeHandlerTasks()
+        let task = Task(executorPreference: pool.executor) {
+            do {
+                try await work(WorkerStartup(index: index, worker: me))
+            } catch {
+                outcome.failure = String(describing: error)
+            }
+            outcome.done = true
+        }
+        let deadline = av_monotonic_us() &+ max(1, timeoutMilliseconds) &* 1000
+        while !outcome.done {
+            if av_monotonic_us() >= deadline {
+                task.cancel()
+                Log.error("worker start-up did not finish in time; see app.prepare")
+                return false
+            }
+            turn()
+        }
+        if let failure = outcome.failure {
+            let description = failure
+            Log.error { line in
+                line.str("worker start-up failed: ")
+                description.withCString { line.cstr($0) }
+            }
+            return false
+        }
+        return true
     }
 
     /// The write end of the readiness pipe, in a worker process.
@@ -1093,7 +1149,8 @@ enum GarudaRuntime {
                           index: Int = 0, metricsSlot: Int = 0) -> Bool {
         guard let workerPtr = makeWorker(config, listenFD: listenFD,
                                          controlFD: av_signal_pipe_init(),
-                                         metricsSlot: metricsSlot) else {
+                                         metricsSlot: metricsSlot,
+                                         listening: application?.pointee.onPrepare == nil) else {
             return false
         }
         // Before the worker reports ready, so that a reload does not retire
@@ -1112,6 +1169,24 @@ enum GarudaRuntime {
             workerPtr.pointee.destroy()
             currentWorker = nil
             return false
+        }
+        if let prepare = application?.pointee.onPrepare {
+            let allowed = application?.pointee.prepareTimeoutMilliseconds ?? 30_000
+            let ready = runPreparation(workerPtr, index: index, prepare: prepare,
+                                       timeoutMilliseconds: allowed) {
+                let n = workerPtr.pointee.poller.wait(timeoutMillis: 10)
+                if n > 0 { workerPtr.pointee.processEvents(n) }
+                workerPtr.pointee.fireDueTimers()
+                workerPtr.pointee.drainReadyQueue()
+                workerPtr.pointee.runHandlerTasks()
+                workerPtr.pointee.quicTick()
+            }
+            guard ready, startListening(workerPtr) else {
+                workerPtr.pointee.tearDownState(application)
+                workerPtr.pointee.destroy()
+                currentWorker = nil
+                return false
+            }
         }
         application?.pointee.onStart?(index)
         logReady(config)

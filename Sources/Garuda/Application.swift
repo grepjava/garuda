@@ -23,6 +23,7 @@ import AvianHTTP
 public final class Application: RouteBuilder {
     var routes = Routes()
     var startHooks: [(Int) -> Void] = []
+    var prepareHooks: [(timeout: UInt64, hook: (WorkerStartup) async throws -> Void)] = []
     var shutdownHooks: [(Int) -> Void] = []
     var responseObservers: [(CompletedRequest) -> Void] = []
     var trailingSlashPolicy = TrailingSlash.strict
@@ -160,6 +161,30 @@ public final class Application: RouteBuilder {
         startHooks.append(hook)
     }
 
+    /// Runs in each worker before it accepts anything, with the worker's
+    /// index, and may await: a schema to migrate, a cache to warm, a secret to
+    /// fetch. Hooks run in the order they were added.
+    ///
+    /// ```
+    /// app.state { _ in PostgresPool(configuration) }
+    /// app.prepare { start in
+    ///     try await start.state(PostgresPool.self).migrate(migrations)
+    /// }
+    /// ```
+    ///
+    /// The worker's state is built first, and its listening socket is
+    /// registered only once every hook has returned, so a connection that
+    /// arrives meanwhile waits in the backlog rather than reaching a worker
+    /// that is not ready. A hook that throws or outstays
+    /// `timeoutMilliseconds` stops the worker, which the supervisor reports as
+    /// a worker that would not start.
+    public func prepare(timeoutMilliseconds: UInt64 = 30_000,
+                        _ hook: @escaping (_ start: WorkerStartup) async throws -> Void) {
+        precondition(compiled == nil, "a prepare hook added after the application was compiled")
+        precondition(timeoutMilliseconds > 0, "a prepare hook needs time to run in")
+        prepareHooks.append((timeoutMilliseconds, hook))
+    }
+
     /// Runs in each worker process once its in-flight requests have finished
     /// or --graceful-timeout has run out, with the worker's index.
     public func onWorkerShutdown(_ hook: @escaping (_ worker: Int) -> Void) {
@@ -248,6 +273,7 @@ public final class Application: RouteBuilder {
             (wholeBodyLimits + i).initialize(to: limit)
         }
         let start = startHooks
+        let prepare = prepareHooks
         let shutdown = shutdownHooks
         let observers = responseObservers
         let application = UnsafeMutablePointer<CompiledApplication>.allocate(capacity: 1)
@@ -265,6 +291,10 @@ public final class Application: RouteBuilder {
             handlerCount: count,
             stateFactories: stateFactories,
             stateShutdowns: stateShutdowns,
+            onPrepare: prepare.isEmpty ? nil : { start in
+                for entry in prepare { try await entry.hook(start) }
+            },
+            prepareTimeoutMilliseconds: prepare.reduce(0) { $0 + $1.timeout },
             onStart: start.isEmpty ? nil : { index in for hook in start { hook(index) } },
             onShutdown: shutdown.isEmpty ? nil : { index in for hook in shutdown { hook(index) } },
             routePatterns: routes.patterns,
@@ -299,6 +329,10 @@ struct CompiledApplication {
     let handlerCount: Int
     let stateFactories: [(ObjectIdentifier, (Int) throws -> Any)]
     let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]
+    /// Async start-up work, run before the worker accepts anything.
+    let onPrepare: ((WorkerStartup) async throws -> Void)?
+    /// How long every prepare hook together may take.
+    let prepareTimeoutMilliseconds: UInt64
     let onStart: ((Int) -> Void)?
     let onShutdown: ((Int) -> Void)?
     /// Each route's pattern, by route number, nil for a fallback.

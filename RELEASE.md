@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 747 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 758 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -377,6 +377,19 @@ The Python suites need `h2` and `aioquic`.
   store's index of a subject's families only ever has its expiry pushed out, so
   two logins arriving at once cannot leave `revokeAll(subject:)` blind to a
   family that is still good.
+- `app.prepare { start in ... }` runs async start-up work in each worker --
+  a schema to migrate, a cache to warm -- after its state is built and before
+  its listening socket is watched, so a connection that arrives meanwhile
+  waits in the backlog instead of reaching a worker that is not ready.
+  `start.state(_:)` gives the hook what `app.state` built, and
+  `start.index` says which worker it is. A hook that throws or outstays
+  `timeoutMilliseconds` (30 seconds by default, per hook) stops the worker.
+  `app.test` runs the hooks too.
+- `PostgresConfiguration(url:)` reads a `postgres://` connection URL, which is
+  how a deployment usually passes one: credentials percent-decoded, an
+  optional port and database, IPv6 in brackets, and the `sslmode`,
+  `sslrootcert` and `connect_timeout` parameters. `sslmode=prefer` and
+  `allow` are refused, because falling back to plaintext lets the path decide.
 - `pool.migrate(_:table:)` brings a PostgreSQL schema up to date from an
   ordered list of migrations, each the statements it needs, applied in one
   transaction and counted in a version table. Workers starting together

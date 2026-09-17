@@ -46,9 +46,14 @@ their closure throws.
 
 `pool.migrate([[String]])` brings a schema up to date: an ordered list that
 only ever grows, each migration the statements it needs, run together in one
-transaction and counted in a version table. Every worker calls it as it starts;
+transaction and counted in a version table. Every worker calls it as it starts, from `app.prepare`;
 an advisory lock means the first migrates and the rest wait and find nothing to
-do. A database further ahead than the build is `unknownSchemaVersion`, not a
+do.
+
+```swift
+app.state { _ in PostgresPool(try PostgresConfiguration(url: databaseURL)) }
+app.prepare { start in try await start.state(PostgresPool.self).migrate(migrations) }
+``` A database further ahead than the build is `unknownSchemaVersion`, not a
 migration backwards.
 
 ### Not supported

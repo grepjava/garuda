@@ -96,6 +96,16 @@ public final class TestClient {
                 fatalError("a state factory threw in the test client: \(error)")
             }
         }
+        // app.prepare runs here as it does in a worker, so a test exercises
+        // the schema the application migrates for itself.
+        if let prepare = worker.pointee.application?.pointee.onPrepare {
+            let allowed = worker.pointee.application?.pointee.prepareTimeoutMilliseconds ?? 30_000
+            let ready = onWorker {
+                GarudaRuntime.runPreparation(worker, index: 0, prepare: prepare,
+                                       timeoutMilliseconds: allowed) { self.turn() }
+            }
+            if !ready { fatalError("app.prepare did not finish in the test client") }
+        }
     }
 
     static let broadcastRing: Bool = av_bus_enabled() != 0 || av_bus_init(4 * 1024 * 1024, 1) == 0

@@ -95,3 +95,21 @@ extension Worker {
         services.removeAll()
     }
 }
+
+/// What an `app.prepare` hook is handed: which worker it is running in, and
+/// the state that worker has already built.
+public struct WorkerStartup {
+    /// 0 for the first worker, and so on.
+    public let index: Int
+    let worker: UnsafeMutablePointer<Worker>
+
+    /// What `app.state` built for `Value` in this worker.
+    public func state<Value>(_ type: Value.Type) throws -> Value {
+        guard let stored = worker.pointee.services[ObjectIdentifier(Value.self)],
+              let value = stored as? Value else {
+            throw HTTPError(.internalServerError,
+                            "no \(Value.self) was registered with app.state")
+        }
+        return value
+    }
+}

@@ -12,8 +12,9 @@
 //          "create index users_created_at on users (created_at)"],
 //     ]
 //
-//     app.state { _ in PostgresPool(configuration) } start: { pool in
-//         try await pool.migrate(migrations)
+//     app.state { _ in PostgresPool(configuration) }
+//     app.prepare { start in
+//         try await start.state(PostgresPool.self).migrate(migrations)
 //     }
 //
 // Each migration is the statements it needs, run together in one transaction,
