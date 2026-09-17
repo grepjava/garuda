@@ -2,6 +2,7 @@ import Testing
 import CAvian
 import AvianCore
 import CGarudaSQLite
+import GarudaPostgres
 @testable import Garuda
 import AvianHTTP
 
@@ -260,6 +261,42 @@ struct RefreshTokenStoreTests {
         let client = app.test
         client.timeoutMillis = 15_000
         #expect(try client.get("/run").text == storeExpectation)
+    }
+
+    @Test(.enabled(if: av_getenv("GARUDA_POSTGRES") != nil, "set GARUDA_POSTGRES to run"))
+    func postgres() throws {
+        let parts = String(cString: av_getenv("GARUDA_POSTGRES")!).split(separator: ":",
+                                                                        omittingEmptySubsequences: false)
+        try #require(parts.count == 5)
+        var configuration = PostgresConfiguration(host: String(parts[0]), port: UInt16(parts[1])!,
+                                                  user: String(parts[2]), password: String(parts[3]),
+                                                  database: String(parts[4]))
+        configuration.tls = .disable
+        let settled = configuration
+        let app = Application()
+        app.state { _ in PostgresPool(settled, maxConnections: 2) }
+        app.get("/run") { (db: State<PostgresPool>) async -> String in
+            do {
+                let table = "garuda_test_refresh"
+                let store = PostgresRefreshTokenStore(db.value, table: table)
+                for statement in ["drop table if exists \(table)", "drop table if exists \(table)_families"] {
+                    try await db.value.execute(statement)
+                }
+                try await store.createTables()
+                let result = try await exerciseStore(store)
+                _ = try await store.deleteExpired()
+                for statement in ["drop table if exists \(table)", "drop table if exists \(table)_families"] {
+                    try await db.value.execute(statement)
+                }
+                return result
+            } catch {
+                return "threw \(error)"
+            }
+        }
+        let client = app.test
+        client.timeoutMillis = 20_000
+        let text = try client.get("/run").text
+        #expect(text == storeExpectation, "\(text)")
     }
 
     @Test(.enabled(if: av_getenv("GARUDA_REDIS") != nil, "set GARUDA_REDIS to run"))

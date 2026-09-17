@@ -44,6 +44,13 @@ pools connections with an acquire timeout, keeps statements prepared on each
 connection, reads values in binary, and runs transactions that roll back when
 their closure throws.
 
+`pool.migrate([[String]])` brings a schema up to date: an ordered list that
+only ever grows, each migration the statements it needs, run together in one
+transaction and counted in a version table. Every worker calls it as it starts;
+an advisory lock means the first migrates and the rest wait and find nothing to
+do. A database further ahead than the build is `unknownSchemaVersion`, not a
+migration backwards.
+
 ### Not supported
 
 - `date`, `time`, `interval`, `numeric` and `json` have no Swift types of their

@@ -272,9 +272,10 @@ app.post("/logout") { (body: Body<RefreshRequest>, issuer: State<TokenIssuer<Use
   for example.
 - A refused refresh is 400 `{"error":"invalid_grant"}` whatever the reason.
 - **Stores:** `MemoryRefreshTokenStore` for `--workers 1` and tests,
-  `RedisRefreshTokenStore`, and `SQLiteRefreshTokenStore` (`createTables()` or
-  `schema()`, and `deleteExpired()` now and then). Spending a token is atomic
-  in each, so two workers refreshing one token at once cannot both succeed.
+  `RedisRefreshTokenStore`, and `PostgresRefreshTokenStore` and
+  `SQLiteRefreshTokenStore` (`createTables()` or `schema()`, and
+  `deleteExpired()` now and then). Spending a token is atomic in each, so two
+  workers refreshing one token at once cannot both succeed.
 
 #### Tokens from an identity provider
 

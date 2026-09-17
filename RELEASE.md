@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 745 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 747 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -371,12 +371,17 @@ The Python suites need `h2` and `aioquic`.
   `revokeAll(subject:)` every family of a user. A refused refresh is 400
   `invalid_grant`.
 - Stores: `MemoryRefreshTokenStore`, `RedisRefreshTokenStore` (spending with
-  `SET NX`) and `SQLiteRefreshTokenStore` (spending with a conditional
-  `UPDATE`), each atomic across workers. The memory store locks its state, so
+  `SET NX`), and `PostgresRefreshTokenStore` and `SQLiteRefreshTokenStore`
+  (spending with a conditional `UPDATE`), each atomic across workers. The memory store locks its state, so
   it is safe to reach from the blocking pool or a thread of your own. The Redis
   store's index of a subject's families only ever has its expiry pushed out, so
   two logins arriving at once cannot leave `revokeAll(subject:)` blind to a
   family that is still good.
+- `pool.migrate(_:table:)` brings a PostgreSQL schema up to date from an
+  ordered list of migrations, each the statements it needs, applied in one
+  transaction and counted in a version table. Workers starting together
+  serialise on an advisory lock, and a database ahead of the build is
+  `PostgresMigrationError.unknownSchemaVersion`.
 - COMPATIBILITY.md: what an application may depend on -- the public Swift API,
   the flags, what goes over the wire, the schemas Garuda writes -- and what a
   release may change. Before 1.0 a minor release may break what is covered; a
