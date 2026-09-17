@@ -377,6 +377,11 @@ The Python suites need `h2` and `aioquic`.
   store's index of a subject's families only ever has its expiry pushed out, so
   two logins arriving at once cannot leave `revokeAll(subject:)` blind to a
   family that is still good.
+- COMPATIBILITY.md: what an application may depend on -- the public Swift API,
+  the flags, what goes over the wire, the schemas Garuda writes -- and what a
+  release may change. Before 1.0 a minor release may break what is covered; a
+  patch release may not. Deprecations warn for a release before anything is
+  removed, and what must be true before 1.0 is listed.
 - MIDDLEWARE.md: how middleware and `onSend` run, the order to add it in,
   every middleware Garuda ships with its options and answers, the server flags
   that act as middleware, and writing middleware and extractors of your own.

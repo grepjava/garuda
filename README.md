@@ -554,10 +554,13 @@ A handler waiting on something other than the engine (its own continuation,
 say) is not unwound when its request is cancelled. It resumes to find
 `response.isCancelled` set, and anything it sends is dropped.
 
+Garuda is before 1.0, so a minor release may still break the public API.
+What that covers, how much notice a change gets, and what has to be true
+before 1.0 are in [COMPATIBILITY.md](COMPATIBILITY.md). Pin with
+`.upToNextMinor(from:)` until then.
+
 ### Not supported
 
-
-- A stable API.
 - Redis Cluster and Sentinel: the driver talks to one server, and a `MOVED`
   reply is a server error. [CONNECTORS.md](CONNECTORS.md) has what works and
   the plan.
@@ -582,4 +585,5 @@ say) is not unwound when its request is cancelled. It resumes to find
 | [Examples/README.md](Examples/README.md) | Four runnable applications and how they are laid out |
 | [CONNECTORS.md](CONNECTORS.md) | The HTTP client and database drivers: limits and future work |
 | [BENCHMARKS.md](BENCHMARKS.md) | Benchmark method and results |
+| [COMPATIBILITY.md](COMPATIBILITY.md) | What an application may depend on, and what a release may change |
 | [RELEASE.md](RELEASE.md) | Changes |
