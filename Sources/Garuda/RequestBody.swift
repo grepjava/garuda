@@ -207,8 +207,13 @@ extension Worker {
         let c = table[slot]
         let path = c.pointee.head.path
         let (base, count) = rootPath.strip(c.pointee.headBase() + Int(path.offset), path.count)
-        let route = installed.pointee.routes.match(c.pointee.head.method, base, count,
+        var route = installed.pointee.routes.match(c.pointee.head.method, base, count,
                                                    into: &c.pointee.routeParameters)
+        if route < 0, installed.pointee.trailingSlash == .ignore,
+           let trimmed = pathWithoutTrailingSlash(installed, base, count, &c.pointee.routeParameters) {
+            route = installed.pointee.routes.match(c.pointee.head.method, base, trimmed,
+                                                   into: &c.pointee.routeParameters)
+        }
         guard route >= 0 else { return }
         let limit = installed.pointee.bodyLimits[Int(route)]
         guard limit >= 0 else {

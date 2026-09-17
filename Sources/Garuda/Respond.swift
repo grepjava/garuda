@@ -112,9 +112,20 @@ extension Worker {
         // --root-path: routes are matched on the path within the mount. A
         // path outside it is matched as it came, as behind a proxy that has
         // already taken the prefix off.
-        let (base, count) = rootPath.strip(headBase + Int(path.offset), path.count)
-        let route = installed.pointee.routes.match(c.pointee.head.method, base, count,
+        let stripped = rootPath.strip(headBase + Int(path.offset), path.count)
+        let base = stripped.0
+        var count = stripped.1
+        var route = installed.pointee.routes.match(c.pointee.head.method, base, count,
                                                    into: &c.pointee.routeParameters)
+        if route < 0, let trimmed = pathWithoutTrailingSlash(installed, base, count, &c.pointee.routeParameters) {
+            if installed.pointee.trailingSlash == .redirect {
+                if redirectWithoutTrailingSlash(slot) { return }
+            } else {
+                count = trimmed
+                route = installed.pointee.routes.match(c.pointee.head.method, base, count,
+                                                       into: &c.pointee.routeParameters)
+            }
+        }
         if route < 0 {
             // No route is an ordinary answer, not a failure: the connection
             // stays open for the next request.

@@ -25,6 +25,7 @@ public final class Application: RouteBuilder {
     var startHooks: [(Int) -> Void] = []
     var shutdownHooks: [(Int) -> Void] = []
     var responseObservers: [(CompletedRequest) -> Void] = []
+    var trailingSlashPolicy = TrailingSlash.strict
     /// What each worker builds for itself at start-up, by the type handlers
     /// ask for it by, and how to tear it down (State.swift).
     var stateFactories: [(ObjectIdentifier, (Int) throws -> Any)] = []
@@ -262,6 +263,7 @@ public final class Application: RouteBuilder {
             onStart: start.isEmpty ? nil : { index in for hook in start { hook(index) } },
             onShutdown: shutdown.isEmpty ? nil : { index in for hook in shutdown { hook(index) } },
             routePatterns: routes.patterns,
+            trailingSlash: trailingSlashPolicy,
             onResponse: observers.isEmpty ? nil : { completed in for observe in observers { observe(completed) } }))
         compiled = application
         return application
@@ -295,6 +297,8 @@ struct CompiledApplication {
     let onShutdown: ((Int) -> Void)?
     /// Each route's pattern, by route number, nil for a fallback.
     let routePatterns: [String?]
+    /// What a path with a trailing slash no route has gets.
+    let trailingSlash: TrailingSlash
     /// Every `onResponse` observer, in order, or nil for none.
     let onResponse: ((CompletedRequest) -> Void)?
 

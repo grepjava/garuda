@@ -56,7 +56,7 @@ struct SecurityHeadersTests {
         var config = ServerConfig()
         config.maxConnections = 16
         #expect("127.0.0.1".withCString { config.trust.parse($0) })
-        let client = try app().testClient(configuration: config)
+        let client = app().testClient(configuration: config)
         #expect(try client.get("/site/page").headers(named: "strict-transport-security").isEmpty)
         let https = try client.get("/site/page", headers: [("x-forwarded-proto", "https")])
         #expect(sent(https) == ["strict-transport-security: max-age=31536000; includeSubDomains"] + defaults)

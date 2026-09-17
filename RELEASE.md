@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 687 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 692 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -266,6 +266,13 @@ The Python suites need `h2` and `aioquic`.
   on answers to HTTPS requests, a trusted proxy's included. Each is a field to
   change or set to nil; `contentSecurityPolicy` and `permissionsPolicy` are
   there to fill. A header the response already carries is not replaced.
+- `app.trailingSlash(.redirect)` answers a path whose trailing slashes no
+  route has, such as `/users/` when `/users` is routed for any method, with
+  308 and the path without them, query kept. `.ignore` serves it from that
+  route instead, a streaming body's own limit included. `.strict`, the
+  default, leaves routes matching exactly. A path that matches as it came is
+  never touched, so this costs a matched request nothing, and a redirect whose
+  Location would start with `//` is not sent.
 
 ### Streaming responses and server-sent events
 
