@@ -94,8 +94,11 @@ struct AuthExampleTests {
 
         let bearer = [("authorization", "Bearer \(token)")]
         #expect(try client.get("/me", headers: bearer).json(User.self) == User(id: 1, username: "ada"))
+        #expect(try client.get("/whoami", headers: bearer).text == "signed in as ada")
+        #expect(try client.get("/whoami").text == "not signed in")
         #expect(try client.post("/logout", headers: bearer).status == .noContent)
         #expect(try client.get("/me", headers: bearer).status == .unauthorized)
+        #expect(try client.get("/whoami", headers: bearer).text == "not signed in")
     }
 
     @Test func wrongCredentialsLookTheSame() throws {

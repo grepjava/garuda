@@ -22,6 +22,7 @@ extension RouteBuilder {
         _ method: HTTPMethod, _ pattern: String,
         _ handler: @escaping (repeat each E) throws -> R
     ) -> OpenAPIOperation {
+        repeat requireSynchronousExtractor((each E).self, method, pattern)
         on(method, pattern) { request, response in
             var parameter = 0
             let answer = try handler(
@@ -99,7 +100,7 @@ extension RouteBuilder {
         onAsync(method, pattern) { request, response in
             var parameter = 0
             let answer = try await handler(
-                repeat try (each E).extract(from: request, parameter: &parameter))
+                repeat try await extractForAsyncRoute((each E).self, request, &parameter, response))
             try answer.write(to: response)
         }
         return documented(method, pattern, (repeat each E).self, R.self)

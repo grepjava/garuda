@@ -86,8 +86,11 @@ app.post("/login") { (form: Form<Credentials>) in Redirect(to: "/") }
 
 - **Extractors:** `Path<T>` (the next path parameter, percent-decoded),
   `Query<T>`, `Body<T>` (JSON), `Form<T>`, `Multipart`, `State<T>`,
-  `Context<Key>`, or your own `RequestExtractor`. A value that will not decode
-  is a 400 that says what was wrong.
+  `Context<Key>`, or your own `RequestExtractor`. An `AsyncRequestExtractor`
+  may await, to load the signed-in user from a database, for an async handler.
+  `E?` is nil where `E` would refuse, and `Result<E, any Error>` hands the
+  handler the refusal. A value that will not decode is a 400 that says what
+  was wrong.
 - **Answers:** `JSON`, `HTML`, `Text`, `Bytes`, `Redirect`, a `String`, an
   `HTTPStatus`, or an Optional whose `nil` is a 404.
 - **Errors:** a thrown `ResponseError` is the response.
@@ -377,7 +380,7 @@ offer. This is where Garuda stands, area by area.
 | Route dispatch | Every handler is a future the runtime polls | A synchronous handler is a direct call on the worker thread | Done |
 | Async handlers | `async fn` on a work-stealing pool | Reused tasks on the worker's own executor, no allocation per request | Done |
 | Typed extraction | `Path`, `Query`, `Json`, `Form`, `Multipart` | `Path`, `Query`, `Body`, `Form`, `Multipart` | Done |
-| Custom extractors | `FromRequestParts`, `FromRequest` | `RequestExtractor` | Done |
+| Custom extractors | `FromRequestParts`, `FromRequest`, `Option<T>`, `Result<T, E>` | `RequestExtractor`, `AsyncRequestExtractor`, `E?`, `Result<E, any Error>` | Done |
 | OpenAPI | utoipa or aide, with derive macros | `app.openAPI`, `app.swaggerUI`; schemas read from `Decodable` types | Done |
 | State | `State<T>`, one `Arc` shared by every thread | `State<T>`, built in each worker process | Done, [differs](#one-process-per-worker) |
 | Request-scoped values | `Extension<T>` | `request[context:]`, `Context<Key>` | Done |
@@ -497,7 +500,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 709 unit tests, and the fuzz corpus
+swift test                                   # 713 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

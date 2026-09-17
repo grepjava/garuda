@@ -361,6 +361,7 @@ extension RouteBuilder {
         _ pattern: String,
         _ handler: sending @escaping (WebTransportSession, repeat each E) async throws -> Void
     ) {
+        repeat requireSynchronousExtractor((each E).self, .connect, pattern)
         onAsync(.connect, pattern) { request, _ in
             try WebTransportSession.refuseUnlessSession(request)
             var parameter = 0

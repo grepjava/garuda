@@ -5,6 +5,7 @@
 //   POST /login    {"username", "password"}   200 {"token", "expiresAt"}, or 401
 //   GET  /me       Authorization: Bearer ...  200 {"id", "username"}, or 401
 //   POST /logout   Authorization: Bearer ...  204
+//   GET  /whoami   Authorization optional     200 "signed in as ada" or "not signed in"
 //
 // What it shows:
 //
@@ -17,6 +18,8 @@
 //   password, so timing does not say which usernames exist.
 // - `authenticate(bearer:state:)` guarding a group of routes, with the user it
 //   found handed to handlers through the request's context.
+// - `SignedInUser`, an extractor of its own that awaits the database, taken
+//   as `SignedInUser?` by a route that answers anyone.
 //
 // Run it behind TLS, and with `--rate-limit`: every login attempt costs a
 // thread of CPU.
@@ -57,6 +60,33 @@ let migrations = [
     create index sessions_user on sessions (user_id);
     """,
 ]
+
+/// The user a request's bearer token belongs to, looked up in the database
+/// while the request is extracted. A handler that takes it must be async.
+struct SignedInUser: AsyncRequestExtractor {
+    let user: User
+
+    static func extract(from request: borrowing Request, parameter: inout Int) async throws -> SignedInUser {
+        // Everything read from the request is read before the first await.
+        guard let token = try? BearerToken.extract(from: request, parameter: &parameter) else {
+            throw HTTPError.unauthorized
+        }
+        let db = try request.state(SQLiteDatabase.self)
+        guard let user = try await findUser(token: token.token, db) else { throw HTTPError.unauthorized }
+        return SignedInUser(user: user)
+    }
+}
+
+/// The user whose live session `token` is, or nil.
+func findUser(token: String, _ db: SQLiteDatabase) async throws -> User? {
+    try await db.first(
+        User.self,
+        """
+        select users.id, users.username from sessions join users on users.id = sessions.user_id
+        where sessions.token_digest = ? and sessions.expires_at > ?
+        """,
+        Tokens.digest(token), Timestamp.now)
+}
 
 /// How long a session lasts.
 let sessionSeconds: Int64 = 7 * 24 * 3600
@@ -158,13 +188,7 @@ public func authApp(databasePath path: String, iterations: Int = Passwords.defau
 
     app.group("/") {
         app.authenticate(bearer: CurrentUser.self, state: SQLiteDatabase.self) { token, db in
-            try await db.first(
-                User.self,
-                """
-                select users.id, users.username from sessions join users on users.id = sessions.user_id
-                where sessions.token_digest = ? and sessions.expires_at > ?
-                """,
-                Tokens.digest(token), Timestamp.now)
+            try await findUser(token: token, db)
         }
 
         app.get("/me") { (user: Context<CurrentUser>) in
@@ -175,6 +199,10 @@ public func authApp(databasePath path: String, iterations: Int = Passwords.defau
             try await db.value.execute("delete from sessions where token_digest = ?", Tokens.digest(token.token))
             return .noContent
         }
+    }
+
+    app.get("/whoami") { (me: SignedInUser?) async -> String in
+        me.map { "signed in as \($0.user.username)" } ?? "not signed in"
     }
 
     return app

@@ -267,6 +267,7 @@ extension RouteBuilder {
         subprotocols: [String] = [],
         _ handler: sending @escaping (WebSocket, repeat each E) async throws -> Void
     ) -> OpenAPIOperation {
+        repeat requireSynchronousExtractor((each E).self, .get, pattern)
         let handler = VariadicHandler<repeat each E>(call: handler)
         onAsync(.get, pattern) { request, response in
             let offer: WebSocketOffer

@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 709 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 713 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -313,6 +313,17 @@ The Python suites need `h2` and `aioquic`.
   JSON type) and `security`. An extractor or response type of your own
   conforms to `OpenAPIExtractorDescribing` or `OpenAPIResponseDescribing`.
   `RouteBuilder` gains a `document(_:)` requirement.
+- `AsyncRequestExtractor` is an extractor that awaits: a database, a session
+  store, another service. Async handlers await it in order with the others,
+  and a request that ended while it waited stops before the extractors after
+  it read the request. A synchronous handler, WebSocket or WebTransport route
+  that takes one stops the program when it is registered, not on a request.
+- An optional extractor, `E?`, is nil where `E` would have refused the
+  request, and `Result<E, any Error>` gives the handler the error to answer
+  as it likes. Either way the path parameters `E` would have taken are left
+  for the next extractor, and the OpenAPI document describes `E`.
+- The auth example adds `SignedInUser`, an async extractor over its sessions
+  table, and `GET /whoami`, which takes it as `SignedInUser?`.
 
 ### Streaming responses and server-sent events
 
