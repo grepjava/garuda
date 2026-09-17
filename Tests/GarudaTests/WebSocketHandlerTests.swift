@@ -143,4 +143,13 @@ struct WebSocketHandlerTests {
         for i in 0..<20 { try ws.send("m\(i)") }
         #expect(try ws.receive() == .text("20"))
     }
+
+    @Test func aRoutersWebSocketTakesThePrefix() throws {
+        let router = Router()
+        router.webSocket("/live") { (ws: WebSocket) async throws in try await ws.send("live") }
+        let app = Application()
+        app.nest("/v1", router)
+        let ws = try app.test.webSocket("/v1/live")
+        #expect(try ws.receive() == .text("live"))
+    }
 }

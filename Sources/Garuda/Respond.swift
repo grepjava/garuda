@@ -125,7 +125,17 @@ extension Worker {
             let allowed = installed.pointee.routes.allowedMethods(base, count,
                                                                   into: &c.pointee.routeParameters)
             guard !allowed.isEmpty else {
-                respond(slot, status: 404, nil, 0)
+                let fallback = installed.pointee.fallbacks.isEmpty
+                    ? -1 : installed.pointee.fallbacks.match(base, count)
+                guard fallback >= 0 else {
+                    respond(slot, status: 404, nil, 0)
+                    return
+                }
+                c.pointee.routeParameters = RouteParameters()
+                c.pointee.routeOffset = Int32(truncatingIfNeeded: base - headBase)
+                let allowedMs = installed.pointee.deadlines[Int(fallback)]
+                if allowedMs > 0 { armDeadline(slot, ms: UInt64(allowedMs)) }
+                runHandler(slot, installed.pointee.handlers[Int(fallback)])
                 return
             }
             var value = ""

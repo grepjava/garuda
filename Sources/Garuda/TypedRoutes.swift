@@ -15,7 +15,7 @@
 
 import AvianHTTP
 
-extension Application {
+extension RouteBuilder {
     /// Registers a typed handler for `method` and `pattern`.
     public func on<each E: RequestExtractor, R: ResponseConvertible>(
         _ method: HTTPMethod, _ pattern: String,
@@ -80,7 +80,7 @@ extension Application {
 // where every resumption is back on the worker's own thread. Extraction still
 // happens before the handler body, in the order declared.
 
-extension Application {
+extension RouteBuilder {
     /// Registers an async typed handler for `method` and `pattern`.
     public func on<each E: RequestExtractor, R: ResponseConvertible>(
         _ method: HTTPMethod, _ pattern: String,

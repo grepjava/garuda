@@ -201,7 +201,7 @@ wait once.
 | 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | PostgreSQL done; Redis, SQLite and the blocking pool to do |
-| 4 | Groups, 405, middleware, response hooks, shipped middleware | Shipped middleware and router merging to do |
+| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | Shipped middleware to do |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, request bodies, SSE, WebSockets over HTTP/1.1, resumable uploads and WebTransport done |
 | 6 | Examples and realistic benchmarks | To do |
 
@@ -216,8 +216,6 @@ wait once.
   SASLprep.
 
 **Step 4**
-- Router values that can be built separately and merged.
-- Custom fallbacks for unmatched routes.
 - Middleware Garuda ships: authentication, CORS, tracing with a logging API,
   request limits.
 

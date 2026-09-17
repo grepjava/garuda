@@ -189,7 +189,7 @@ extension Application {
     /// than being given it whole. The body is held to `maxBodySize` instead
     /// of `--max-body`; past it the request is answered 413 and the reader
     /// throws `tooLarge`.
-    public func onStreamingBody(_ method: HTTPMethod, _ pattern: String, maxBodySize: Int = .max,
+    public func onStreamingBody(_ method: HTTPMethod, _ pattern: String, maxBodySize: Int,
                                 _ handler: sending @escaping StreamingBodyHandler) {
         precondition(compiled == nil, "route \(pattern) added after the application was compiled")
         routes.onStreamingBody(method, pattern, maxBodySize: maxBodySize, handler)

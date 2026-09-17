@@ -257,7 +257,7 @@ offer. This is where Garuda stands, area by area.
 | Errors as responses | `IntoResponse` | `ResponseError`, `HTTPError` | Done |
 | Protocols | HTTP/1.1 and HTTP/2 through hyper | HTTP/1.1, HTTP/2 and HTTP/3 | Done |
 | TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
-| Nesting and 405 | `nest`, `merge`, 405 with `Allow` | `group`, nested; 405 with `Allow` | Partial: no router values to merge, no custom fallback |
+| Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
 | Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline` | Partial: no CORS or auth middleware |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
@@ -365,7 +365,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 520 unit tests, and the fuzz corpus
+swift test                                   # 532 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
@@ -423,7 +423,7 @@ say) is not unwound when its request is cancelled. It resumes to find
 ### Not supported
 
 
-- A stable API, WebSocket over HTTP/2 and HTTP/3, router values to merge, custom fallbacks,
+- A stable API, WebSocket over HTTP/2 and HTTP/3,
   CORS and auth middleware, Redis, SQLite and a blocking pool.
 - Resumable uploads have no `min-size` or `min-append-size` limits and no
   digests, and a completed upload is not replayed to a client that asks again.

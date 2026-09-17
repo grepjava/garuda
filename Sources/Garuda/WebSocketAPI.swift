@@ -244,7 +244,7 @@ private struct Carried<T>: @unchecked Sendable {
 
 // MARK: - Registration
 
-extension Application {
+extension RouteBuilder {
     /// Serves WebSockets on `pattern`, with extractors. Every extractor runs
     /// before the upgrade is accepted, so one that refuses the request
     /// refuses the WebSocket with an ordinary status.

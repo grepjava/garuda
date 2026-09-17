@@ -77,6 +77,9 @@ struct Routes {
     var groups: [(prefix: String, middleware: [MiddlewareStep])] = []
     /// The groups open right now, outermost first.
     var openGroups: [Int] = []
+    /// The fallback of each scope that has one, by the prefix of the scope,
+    /// and the route number its handler was given.
+    var fallbacks: [(prefix: String, route: Int32)] = []
     /// The groups each route was registered inside, by route number.
     var routeGroups: [[Int]] = []
 

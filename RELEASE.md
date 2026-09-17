@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 520 unit tests
+swift test                             # 532 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -61,6 +61,16 @@ The Python suites need `h2` and `aioquic`.
   `onWorkerStart` and `onWorkerShutdown` hooks run in each worker.
 - `app.group("/api") { … }` mounts routes under a prefix, and groups nest.
   `--root-path` is the mount every route is matched within.
+- `Router` holds routes, middleware, groups, deadlines and fallbacks built on
+  their own. `app.nest("/users", router)` mounts one under a prefix and
+  `app.merge(router)` registers it where the call is, inside the open group,
+  whose middleware runs in front of the router's. Routers nest, and one router
+  can be mounted twice. Every registration API, typed routes, WebSockets,
+  WebTransport and resumable uploads included, works on both.
+- `app.fallback { request, response in … }` answers requests no route matches,
+  in place of 404, with the middleware of its scope. Inside a group or a
+  nested router it answers only under that prefix, and the most specific
+  scope wins. A path routed under other methods is still 405.
 - `app.test` serves the application from a worker in the test process over a
   socket pair: `try app.test.get("/user/42")` returns the status, headers and
   body.
@@ -287,7 +297,7 @@ The Python suites need `h2` and `aioquic`.
 
 ### Not yet
 
-- WebSocket over HTTP/2 and HTTP/3, router values to merge, custom fallbacks, and shipped
+- WebSocket over HTTP/2 and HTTP/3, and shipped
   middleware for authentication, CORS and tracing.
   Middleware cannot wrap a handler's run.
 - `--compress` and `--cache-size` do not act on handler responses.

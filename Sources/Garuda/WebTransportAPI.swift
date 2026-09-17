@@ -337,7 +337,7 @@ func parkOnWorker(_ worker: UnsafeMutablePointer<Worker>,
 /// A WebTransport handler over the raw request.
 public typealias WebTransportHandler = (borrowing Request, WebTransportSession) async throws -> Void
 
-extension Application {
+extension RouteBuilder {
     /// Serves WebTransport sessions on `pattern`: an HTTP/3 extended CONNECT
     /// with `:protocol: webtransport`. Middleware runs in front, as for any
     /// route; the session is accepted when the handler is called.

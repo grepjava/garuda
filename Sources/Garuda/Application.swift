@@ -20,7 +20,7 @@ import CAvian
 import AvianCore
 import AvianHTTP
 
-public final class Application {
+public final class Application: RouteBuilder {
     var routes = Routes()
     var startHooks: [(Int) -> Void] = []
     var shutdownHooks: [(Int) -> Void] = []
@@ -43,14 +43,6 @@ public final class Application {
     }
 
     // MARK: Routes
-
-    public func get(_ pattern: String, _ handler: @escaping Handler) { on(.get, pattern, handler) }
-    public func head(_ pattern: String, _ handler: @escaping Handler) { on(.head, pattern, handler) }
-    public func post(_ pattern: String, _ handler: @escaping Handler) { on(.post, pattern, handler) }
-    public func put(_ pattern: String, _ handler: @escaping Handler) { on(.put, pattern, handler) }
-    public func delete(_ pattern: String, _ handler: @escaping Handler) { on(.delete, pattern, handler) }
-    public func patch(_ pattern: String, _ handler: @escaping Handler) { on(.patch, pattern, handler) }
-    public func options(_ pattern: String, _ handler: @escaping Handler) { on(.options, pattern, handler) }
 
     /// Registers `handler` for `method` and `pattern`: literal segments,
     /// `:param` segments and a trailing `*rest`. A pattern that cannot be
@@ -253,6 +245,7 @@ public final class Application {
             deadlines: deadlines,
             bodyLimits: bodyLimits,
             streamsBodies: routes.bodyLimits.contains { $0 >= 0 },
+            fallbacks: CompiledFallbacks(routes.fallbacks),
             handlerCount: count,
             stateFactories: stateFactories,
             stateShutdowns: stateShutdowns,
@@ -275,6 +268,8 @@ struct CompiledApplication {
     /// Whether any route streams its body, so a request with a body is
     /// matched at its head only when one might.
     let streamsBodies: Bool
+    /// Each scope's fallback, for a request no route matches.
+    let fallbacks: CompiledFallbacks
     let handlerCount: Int
     let stateFactories: [(ObjectIdentifier, (Int) throws -> Any)]
     let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]

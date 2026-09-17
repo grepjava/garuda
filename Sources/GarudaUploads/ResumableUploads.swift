@@ -102,7 +102,7 @@ public typealias UploadCompletion = (CompletedUpload) async throws -> any Respon
 /// The draft iteration this implements (Appendix B).
 public let uploadDraftInteropVersion = 9
 
-extension Application {
+extension RouteBuilder {
     /// Serves resumable uploads to `pattern`, keeping them in `store` and
     /// calling `onComplete` once each has all its bytes. `uploads` is the path
     /// each upload's own URL is made under, and has to be as the client sees
