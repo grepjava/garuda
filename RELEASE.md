@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 573 unit tests
+swift test                             # 613 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -324,6 +324,34 @@ The Python suites need `h2` and `aioquic`.
   `timestamptz`, and decode from text or binary, without Foundation.
 - Sessions start with `client_encoding` UTF8 and `DateStyle` ISO.
 
+### Redis
+
+- A native driver on the worker's poller. A `RedisPool` per worker, built by
+  `app.state`, with an acquire timeout like PostgreSQL's.
+- HELLO 3 with the credentials and client name, so replies are RESP3; a server
+  without HELLO is spoken to in RESP2 with AUTH. Valkey works the same. TLS is
+  required by default and verifies the server's name; ACL users, a database
+  other than 0 and unix sockets are configured on `RedisConfiguration`.
+- Replies are parsed as they arrive, resuming where the last read ended, and
+  held to `maxBulkBytes` and `maxReplyElements`. A reply past either, or one
+  that is not RESP, closes the connection.
+- Typed commands: `get`, `getBytes`, `set` with expiry and a condition, `del`,
+  `exists`, `pexpire`, `pttl`, `incr`, `hset`, `hget`, `hgetall`, `hdel`,
+  `lpush`, `rpush`, `lpop`, `rpop`, `lrange`, `sadd`, `srem`, `smembers`,
+  `publish`, `getJSON` and `setJSON`. `send` runs any command, and a refusal
+  throws `RedisClientError.server` with its code.
+- `pipeline` sends commands in one write and returns every reply, refusals
+  among them. `transaction` runs MULTI, the commands and EXEC in one round
+  trip. `session` holds one connection, for WATCH followed by a transaction
+  that returns nil when a watched key changed.
+- A connection left in MULTI or WATCH, on another database, or changed by
+  CLIENT REPLY, TRACKING or SETNAME is closed rather than handed to the next
+  request. An idle connection with input waiting is replaced before use.
+- `subscribe(channels:patterns:)` listens on a connection of its own;
+  `next(timeoutMilliseconds:)` returns each message, and more channels and
+  patterns can be added and removed.
+- The reply parser is a `pgfuzz` target, `resp`.
+
 ### Server
 
 - `--compress` compresses handler responses, whoever answered them, with the
@@ -374,5 +402,8 @@ The Python suites need `h2` and `aioquic`.
   Retry-After. Expired uploads are removed when uploads are created.
 - PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types of
   its own (they read as text), no `LISTEN`, and no SASLprep for non-ASCII
-  passwords. No Redis or SQLite driver.
+  passwords. No SQLite driver.
+- Redis Cluster and Sentinel are not supported: the driver talks to one
+  server. RESP3's streamed strings and aggregates are refused, and no command
+  the driver sends is answered with them.
 - TLS over TCP is OpenSSL.

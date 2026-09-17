@@ -4,7 +4,7 @@
 // Every parser here reads bytes chosen by whoever is on the other end of a
 // socket, which is the definition of untrusted input: the request head, the
 // chunked framing under it, an HPACK block, a WebSocket frame header, a QUIC
-// packet header. A crash in any of them is reachable from the network.
+// packet header -- or, from a database the server connects to, a Redis reply. A crash in any of them is reachable from the network.
 //
 // "Does not crash" is the weakest thing a fuzzer can check and the easiest to
 // pass by accident, so each target also states an invariant that a corrupted
@@ -38,6 +38,7 @@ public enum FuzzTarget: String, CaseIterable, Sendable {
     case websocket = "websocket"
     case quicPacket = "quic-packet"
     case json = "json"
+    case resp = "resp"
 }
 
 public enum Fuzz {
@@ -56,6 +57,7 @@ public enum Fuzz {
         case .websocket: return websocket(input, count)
         case .quicPacket: return quicPacket(input, count)
         case .json: return json(input, count)
+        case .resp: return resp(input, count)
         }
     }
 
@@ -69,6 +71,74 @@ public enum Fuzz {
         return padded.withUnsafeBufferPointer { buf in
             run(target, buf.baseAddress!, bytes.count)
         }
+    }
+
+    // MARK: - RESP
+
+    /// Limits far below a connection's, so short inputs reach every one of them.
+    private static var respLimits: RedisParser.Limits {
+        var limits = RedisParser.Limits()
+        limits.maxBulkBytes = 64
+        limits.maxElements = 32
+        limits.maxDepth = 4
+        limits.maxLineBytes = 48
+        return limits
+    }
+
+    private enum RespRun: Equatable {
+        case values([RedisValue], consumed: Int, pending: Bool)
+        /// How far a failed parse got is not compared: a connection is closed
+        /// on the error, and a call that throws has consumed what it consumed
+        /// without saying so.
+        case failed(RedisProtocolError)
+    }
+
+    /// Every reply in `n` bytes, offered `step` more bytes at a time.
+    private static func respReplies(_ base: UnsafePointer<UInt8>, _ n: Int, step: Int) -> RespRun? {
+        var parser = RedisParser(limits: respLimits)
+        var values: [RedisValue] = []
+        var start = 0
+        var end = 0
+        while end < n {
+            end = min(n, end &+ step)
+            while start < end {
+                let outcome: RedisParser.Outcome
+                let consumed: Int
+                do {
+                    (outcome, consumed) = try parser.parse(base + start, end - start)
+                } catch {
+                    return .failed(error)
+                }
+                if consumed < 0 || consumed > end - start { return nil }
+                start += consumed
+                guard case .value(let value) = outcome else { break }
+                values.append(value)
+            }
+        }
+        return .values(values, consumed: start, pending: parser.isMidReply)
+    }
+
+    private static func resp(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
+        guard let whole = respReplies(base, n, step: n == 0 ? 1 : n) else {
+            return "a parse consumed more than it was given"
+        }
+        // Where a read splits a reply is the server's and the network's choice.
+        guard let piecewise = respReplies(base, n, step: 1) else {
+            return "a one-byte parse consumed more than it was given"
+        }
+        if whole != piecewise {
+            return "whole, \(whole); byte by byte, \(piecewise)"
+        }
+        // A reply read from a longer buffer reads the same from exactly the
+        // bytes it consumed: that is what lets the next reply start there.
+        var parser = RedisParser(limits: respLimits)
+        if let (outcome, consumed) = try? parser.parse(base, n), case .value(let value) = outcome {
+            var again = RedisParser(limits: respLimits)
+            guard let (exact, used) = try? again.parse(base, consumed), exact == .value(value), used == consumed else {
+                return "a reply of \(consumed) bytes does not read the same from its own bytes"
+            }
+        }
+        return nil
     }
 
     // MARK: - JSON

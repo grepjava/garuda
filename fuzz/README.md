@@ -15,6 +15,7 @@ mutation fuzzer in this package. The targets live in
 | `websocket` | the WebSocket frame header parser |
 | `quic-packet` | the QUIC packet header parser |
 | `json` | the JSON decoder and encoder |
+| `resp` | the Redis reply parser, whole and a byte at a time |
 
 Not crashing is only part of the check. Each target also tests an invariant
 that a wrong parse breaks even when nothing traps:

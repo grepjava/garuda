@@ -37,11 +37,13 @@ let package = Package(
         // poller, so each is tested against recorded exchanges.
         .target(name: "GarudaPostgres", dependencies: [avian("CAvian"), avian("AvianCore")],
                 swiftSettings: sharedSwiftSettings),
+        .target(name: "GarudaRedis", dependencies: [avian("AvianCore")],
+                swiftSettings: sharedSwiftSettings),
 
         // The engine and the handler API: `import Garuda`.
         .target(name: "Garuda",
                 dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
-                               "GarudaPostgres"],
+                               "GarudaPostgres", "GarudaRedis"],
                 swiftSettings: sharedSwiftSettings),
 
         // Resumable uploads (draft-ietf-httpbis-resumable-upload), built on the
@@ -74,7 +76,7 @@ let package = Package(
 
         .testTarget(name: "GarudaTests",
                     dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
-                                   "GarudaPostgres", "Garuda", "GarudaFuzzTargets", "CAllocationCounter"],
+                                   "GarudaPostgres", "GarudaRedis", "Garuda", "GarudaFuzzTargets", "CAllocationCounter"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "GarudaUploadsTests",
                     dependencies: [avian("CAvian"), avian("AvianHTTP"), "Garuda", "GarudaUploads"],

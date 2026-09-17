@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>A Swift web framework with its own HTTP engine.</b><br>
-  HTTP/1.1, HTTP/2 and HTTP/3, TLS and ACME, typed handlers, PostgreSQL, streaming, WebTransport.<br>
+  HTTP/1.1, HTTP/2 and HTTP/3, TLS and ACME, typed handlers, PostgreSQL, Redis, streaming, WebTransport.<br>
   No Foundation, no SwiftNIO.
 </p>
 
@@ -22,7 +22,7 @@ no scheduling hop before a response that can be sent at once.
 
 **Status: early, and the API will change.** Routes, groups and middleware,
 synchronous and async handlers, typed extraction and answers, per-worker state,
-deadlines, an HTTP client, a PostgreSQL driver, streamed responses and request
+deadlines, an HTTP client, PostgreSQL and Redis drivers, streamed responses and request
 bodies, server-sent events, WebSockets, resumable uploads and WebTransport all
 work and are tested. Nothing has been released.
 [HANDLER-API.md](HANDLER-API.md) has the roadmap, and [Status](#status) below
@@ -175,6 +175,24 @@ into `Decodable` types by column name. `db.transaction { tx in … }` commits or
 rolls back. Statements stay prepared on each connection, and values are read in
 binary after the first run. `UUID` and `Timestamp` come without Foundation.
 
+### Redis
+
+```swift
+app.state { _ in RedisPool(RedisConfiguration(host: "cache", password: secret)) }
+
+app.get("/visits/:page") { (page: Path<String>, redis: State<RedisPool>) async throws in
+    String(try await redis.value.incr("visits:\(page.value)"))
+}
+```
+
+A native driver runs on the worker's poller, speaking RESP3 through HELLO and
+RESP2 to servers older than Redis 6; Valkey works the same. TLS is required by
+default, and ACL users, databases and unix sockets are supported. Commands come
+with typed replies (`get`, `set` with expiry and NX/XX, hashes, lists, sets,
+`getJSON`), and `send` takes any other. `pipeline` and `transaction` go in one
+round trip, `session` holds one connection for WATCH, and `subscribe` listens
+to channels and patterns on a connection of its own.
+
 ### Streaming, server-sent events, WebSockets and WebTransport
 
 ```swift
@@ -292,7 +310,8 @@ offer. This is where Garuda stands, area by area.
 | WebTransport | None in hyper | `app.webTransport` | Done |
 | HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression | Done |
 | PostgreSQL | sqlx, tokio-postgres | Native driver on the poller | Done |
-| Redis, SQLite | redis-rs, sqlx | None | Planned |
+| Redis | redis-rs, fred | Native driver on the poller: RESP3 and RESP2, TLS, ACL, pipelines, transactions, pub/sub | Done |
+| SQLite | sqlx, rusqlite | None | Planned |
 | Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker | Done |
 | Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine | Done |
 
@@ -391,7 +410,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 573 unit tests, and the fuzz corpus
+swift test                                   # 613 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
@@ -449,7 +468,9 @@ say) is not unwound when its request is cancelled. It resumes to find
 ### Not supported
 
 
-- A stable API, WebSocket over HTTP/2 and HTTP/3, Redis and SQLite.
+- A stable API, WebSocket over HTTP/2 and HTTP/3, and SQLite.
+- Redis Cluster and Sentinel: the driver talks to one server, and a `MOVED`
+  reply is a server error.
 - Resumable uploads have no `min-size` or `min-append-size` limits and no
   digests, and a completed upload is not replayed to a client that asks again.
 - Byte ranges and directory listings for static files.

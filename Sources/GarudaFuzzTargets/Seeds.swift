@@ -22,6 +22,7 @@ extension Fuzz {
         case .websocket: return websocketSeeds
         case .quicPacket: return quicPacketSeeds
         case .json: return jsonSeeds
+        case .resp: return respSeeds
         }
     }
 
@@ -88,6 +89,20 @@ extension Fuzz {
             hex("828684418cf1e3c2e5f23a6ba0ab90f4ff"),
             // A dynamic table size update followed by a field.
             hex("3fe11f82"),
+        ]
+    }
+
+    private static var respSeeds: [[UInt8]] {
+        [
+            text("+OK\r\n"),
+            text("-ERR unknown command\r\n:42\r\n"),
+            text("$5\r\nhello\r\n$-1\r\n*-1\r\n"),
+            text("*3\r\n:1\r\n*2\r\n+a\r\n$0\r\n\r\n_\r\n"),
+            text("%2\r\n+k\r\n#t\r\n$1\r\nv\r\n,1.5e3\r\n"),
+            text("~2\r\n(12345678901234567890\r\n,-inf\r\n"),
+            text(">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$2\r\nhi\r\n"),
+            text("|1\r\n+ttl\r\n:9\r\n*1\r\n=7\r\ntxt:abc\r\n"),
+            text("!9\r\nERR nope!\r\n*1\r\n*1\r\n*1\r\n:0\r\n"),
         ]
     }
 
