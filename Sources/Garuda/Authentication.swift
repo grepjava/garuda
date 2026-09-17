@@ -156,6 +156,55 @@ extension RouteBuilder {
     }
 }
 
+extension RouteBuilder {
+    /// `authenticate(bearer:)` with what `app.state` built for `Service` in
+    /// the worker -- the database the sessions are in -- handed to `verify`.
+    ///
+    /// ```
+    /// app.authenticate(bearer: CurrentUser.self, state: SQLiteDatabase.self) { token, db in
+    ///     try await db.first(User.self, "select ... where token_digest = ?", Tokens.digest(token))
+    /// }
+    /// ```
+    public func authenticate<Key: RequestContextKey, Service>(
+        bearer key: Key.Type, state service: Service.Type,
+        _ verify: sending @escaping (_ token: String, _ state: Service) async throws -> Key.Value?
+    ) {
+        nonisolated(unsafe) let verify = verify
+        use { request, _ async throws -> (any ResponseConvertible)? in
+            let state = try request.state(Service.self)
+            guard let header = request.header("authorization"), let token = parseBearer(header) else {
+                return Challenge("Bearer")
+            }
+            nonisolated(unsafe) let unsafeState = state
+            guard let who = try await verify(token, unsafeState) else { return Challenge("Bearer") }
+            request[context: key] = who
+            return nil
+        }
+    }
+
+    /// `authenticate(basic:)` with what `app.state` built for `Service` in the
+    /// worker handed to `verify`.
+    public func authenticate<Key: RequestContextKey, Service>(
+        basic key: Key.Type, realm: String = "restricted", state service: Service.Type,
+        _ verify: sending @escaping (_ username: String, _ password: String, _ state: Service) async throws -> Key.Value?
+    ) {
+        let challenge = basicChallenge(realm)
+        nonisolated(unsafe) let verify = verify
+        use { request, _ async throws -> (any ResponseConvertible)? in
+            let state = try request.state(Service.self)
+            guard let header = request.header("authorization"), let credentials = parseBasic(header) else {
+                return Challenge(challenge)
+            }
+            nonisolated(unsafe) let unsafeState = state
+            guard let who = try await verify(credentials.username, credentials.password, unsafeState) else {
+                return Challenge(challenge)
+            }
+            request[context: key] = who
+            return nil
+        }
+    }
+}
+
 /// A 401 with its challenge.
 struct Challenge: ResponseConvertible {
     let value: String

@@ -294,7 +294,10 @@ final class SQLiteConnection: @unchecked Sendable {
         _ = gsq_busy_timeout(handle, max(0, configuration.busyTimeoutMilliseconds))
         do throws(SQLiteClientError) {
             if !readOnly && configuration.writeAheadLog && !configuration.isMemory {
-                let mode = try connection.run("PRAGMA journal_mode=WAL", [], cached: false)
+                let mode = try connection.whileBusy(configuration.busyTimeoutMilliseconds) {
+                    () throws(SQLiteClientError) -> SQLiteRows in
+                    try connection.run("PRAGMA journal_mode=WAL", [], cached: false)
+                }
                 guard mode.count == 1, case .text(let name) = mode.value(row: 0, column: 0),
                       name.lowercased() == "wal" else {
                     throw .open(SQLiteFailure(extendedCode: GSQ_ERROR,
@@ -312,6 +315,27 @@ final class SQLiteConnection: @unchecked Sendable {
     }
 
     var isOpen: Bool { db != nil }
+
+    /// Runs `body` again while SQLite says the database is busy, for up to
+    /// `milliseconds`. Switching a file to WAL takes an exclusive lock that
+    /// SQLite does not wait for through the busy timeout, so workers starting
+    /// together on a new file would otherwise fail all but one of them.
+    func whileBusy<T>(_ milliseconds: Int32, _ body: () throws(SQLiteClientError) -> T) throws(SQLiteClientError) -> T {
+        var waited: Int32 = 0
+        var pause: Int32 = 1
+        while true {
+            do {
+                return try body()
+            } catch {
+                guard case .sqlite(let failure) = error,
+                      failure.code == GSQ_BUSY || failure.code == GSQ_LOCKED,
+                      waited < milliseconds else { throw error }
+                gsq_sleep(pause)
+                waited += pause
+                pause = min(pause * 2, 50)
+            }
+        }
+    }
 
     /// Inside a transaction: one begun and not yet committed or rolled back.
     var inTransaction: Bool {

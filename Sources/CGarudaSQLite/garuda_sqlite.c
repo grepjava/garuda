@@ -22,6 +22,7 @@ static struct {
     int64_t (*changes64)(gsq_db *);
     int64_t (*last_insert_rowid)(gsq_db *);
     void (*interrupt)(gsq_db *);
+    int (*sleep)(int);
     int (*prepare_v2)(gsq_db *, const char *, int, gsq_stmt **, const char **);
     int (*step)(gsq_stmt *);
     int (*reset)(gsq_stmt *);
@@ -80,6 +81,7 @@ static void load(void) {
     REQUIRE(changes, "sqlite3_changes");
     REQUIRE(last_insert_rowid, "sqlite3_last_insert_rowid");
     REQUIRE(interrupt, "sqlite3_interrupt");
+    REQUIRE(sleep, "sqlite3_sleep");
     REQUIRE(prepare_v2, "sqlite3_prepare_v2");
     REQUIRE(step, "sqlite3_step");
     REQUIRE(reset, "sqlite3_reset");
@@ -139,6 +141,7 @@ int64_t gsq_changes(gsq_db *db) {
 
 int64_t gsq_last_insert_rowid(gsq_db *db) { return lib.last_insert_rowid(db); }
 void gsq_interrupt(gsq_db *db) { lib.interrupt(db); }
+void gsq_sleep(int milliseconds) { (void)lib.sleep(milliseconds); }
 
 int gsq_prepare(gsq_db *db, const char *sql, int bytes, gsq_stmt **stmt, const char **tail) {
     return lib.prepare_v2(db, sql, bytes, stmt, tail);

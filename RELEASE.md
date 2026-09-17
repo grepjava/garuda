@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 640 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 650 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -170,6 +170,16 @@ The Python suites need `h2` and `aioquic`.
 - `BearerToken` and `BasicCredentials` extract the same credentials in a
   handler, and `constantTimeEquals` compares a secret in time that does not
   depend on where it differs.
+- `app.authenticate(bearer:state:)` and `app.authenticate(basic:realm:state:)`
+  hand the check what `app.state` built for a type in the worker, such as the
+  database sessions are kept in. `request.state(T.self)` reads it in any
+  middleware.
+- `Passwords.hash` stores a password as `$pbkdf2-sha256$i=600000$salt$hash`,
+  PBKDF2-HMAC-SHA256 with a random salt, computed on the blocking pool.
+  `Passwords.verify` compares in constant time, and `Passwords.needsRehash`
+  says when a stored hash used fewer iterations than asked for now.
+- `Tokens.random()` is 32 random bytes in base64url, and `Tokens.digest` their
+  SHA-256 in hex, to store and look up instead of the token.
 
 ### Streaming responses and server-sent events
 
@@ -373,12 +383,23 @@ The Python suites need `h2` and `aioquic`.
 - `migrate` runs the scripts past the database's `user_version` in one
   transaction, once across every worker, and refuses a database migrated by a
   newer program.
+- Workers opening a new file at the same moment all start: switching it to
+  WAL is retried while another holds the lock, for up to the busy timeout,
+  where SQLite itself does not wait.
 - SQL holding more than one statement is refused, and results are held to
   `maxRows` and `maxResultBytes`. A refusal carries SQLite's extended code as
   `sqliteCode`, and `isConstraintViolation` says whether a constraint failed.
 - `Bool` binds as 0 or 1, `UUID` as text, and `Timestamp` as UTC text of one
   width, `2026-09-17 06:19:31.123456`, which sorts in order and which SQLite's
   date functions read. `UInt` and `UInt64` do not bind.
+
+### Examples
+
+- `Examples/` is a package of four applications on the public API, each with
+  tests through `app.test`: a todo CRUD API on SQLite; sign-up, login and
+  sessions with hashed passwords; server-sent events, a streamed CSV export and
+  uploads written to disk as they arrive; and chat rooms over WebSockets and
+  event streams, heard across every worker.
 
 ### Server
 

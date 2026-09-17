@@ -26,14 +26,23 @@ public struct State<Value>: RequestExtractor {
 
     public static func extract(from request: borrowing Request,
                                parameter: inout Int) throws -> Self {
-        guard let stored = request.worker.pointee.services[ObjectIdentifier(Value.self)],
+        State(try request.state(Value.self))
+    }
+}
+
+extension Request {
+    /// What `app.state` built for `Value` in this worker: for middleware,
+    /// which takes no extractors. Read it before the first await, as any
+    /// other part of the request.
+    public func state<Value>(_ type: Value.Type) throws -> Value {
+        guard let stored = worker.pointee.services[ObjectIdentifier(Value.self)],
               let value = stored as? Value else {
             // The program never registered it: that is a fault here, not the
             // client's mistake.
             throw HTTPError(.internalServerError,
                             "no \(Value.self) was registered with app.state")
         }
-        return State(value)
+        return value
     }
 }
 

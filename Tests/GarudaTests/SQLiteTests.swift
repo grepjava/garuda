@@ -691,6 +691,43 @@ struct SQLiteDatabaseTests {
         other.db.close()
     }
 
+    @Test func workersOpeningANewFileTogetherAllStart() throws {
+        // Every worker opens the database as it starts, at the same moment.
+        // Switching a new file to WAL takes an exclusive lock SQLite does not
+        // wait for through the busy timeout; without retrying, all but one of
+        // the opens could fail with SQLITE_BUSY and their workers not start.
+        let app = Application()
+        app.get("/open/:name") { (name: Path<String>) async -> String in
+            let file = TemporaryDatabase("together-\(name.value)")
+            let configuration = SQLiteConfiguration(path: file.path)
+            final class Box: @unchecked Sendable { let c: SQLiteConnection; init(_ c: SQLiteConnection) { self.c = c } }
+            var opened = 0
+            var failures: [String] = []
+            await withTaskGroup(of: Result<Box, any Error>.self) { group in
+                for _ in 0..<8 {
+                    group.addTask {
+                        do {
+                            return .success(Box(try await blocking { try SQLiteConnection.open(configuration, readOnly: false) }))
+                        } catch {
+                            return .failure(error)
+                        }
+                    }
+                }
+                for await result in group {
+                    switch result {
+                    case .success(let box): opened += 1; box.c.close()
+                    case .failure(let error): failures.append("\(error)")
+                    }
+                }
+            }
+            return failures.isEmpty ? "\(opened)" : failures.joined(separator: ",")
+        }
+        let client = app.test
+        for round in 0..<10 {
+            #expect(try client.get("/open/\(round)").text == "8")
+        }
+    }
+
     @Test func aReadOnlyDatabaseRefusesWrites() throws {
         let file = TemporaryDatabase("read-only")
         do {

@@ -63,6 +63,8 @@ int gsq_get_autocommit(gsq_db *db);
 int64_t gsq_changes(gsq_db *db);
 int64_t gsq_last_insert_rowid(gsq_db *db);
 void gsq_interrupt(gsq_db *db);
+/* Sleeps the calling thread for at least `milliseconds`. */
+void gsq_sleep(int milliseconds);
 
 /* `tail` is where the first statement ended, within `sql`. */
 int gsq_prepare(gsq_db *db, const char *sql, int bytes, gsq_stmt **stmt, const char **tail);

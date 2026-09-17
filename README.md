@@ -63,6 +63,10 @@ exit(app.run())
 or newer, on Linux or macOS 15. [INSTALLATION.md](INSTALLATION.md) lists the
 system packages, certificates and running as a service.
 
+[Examples/](Examples/README.md) has four complete applications to run and copy
+from: a CRUD API on SQLite, accounts with hashed passwords and sessions,
+streaming both ways, and chat rooms over WebSockets across workers.
+
 ## Writing handlers
 
 ### Routes and typed handlers
@@ -164,8 +168,13 @@ app.group("/api") {
   reaches the page.
 - `app.authenticate(bearer:)` and `app.authenticate(basic:)` read the
   Authorization header and keep who it belongs to in the context, or answer
-  401 with the challenge. `BearerToken` and `BasicCredentials` are the same as
-  extractors, and `constantTimeEquals` compares secrets.
+  401 with the challenge. With `state:`, the check is handed what `app.state`
+  built, such as the database sessions live in. `BearerToken` and
+  `BasicCredentials` are the same as extractors, and `constantTimeEquals`
+  compares secrets.
+- `Passwords.hash` and `Passwords.verify` use PBKDF2-HMAC-SHA256 on the
+  blocking pool. `Tokens.random()` makes a session token and `Tokens.digest`
+  what to store in its place.
 
 ### PostgreSQL
 
@@ -432,7 +441,8 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 640 unit tests, and the fuzz corpus
+swift test                                   # 650 unit tests, and the fuzz corpus
+(cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
@@ -510,6 +520,7 @@ say) is not unwound when its request is cancelled. It resumes to find
 | [CONFIG.md](CONFIG.md) | Every command-line flag |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine is built |
 | [TRANSPORT.md](TRANSPORT.md) | What each protocol implementation does |
+| [Examples/README.md](Examples/README.md) | Four runnable applications and how they are laid out |
 | [CONNECTORS.md](CONNECTORS.md) | The HTTP client and database drivers: limits and future work |
 | [BENCHMARKS.md](BENCHMARKS.md) | Benchmark method and results |
 | [RELEASE.md](RELEASE.md) | Changes |
