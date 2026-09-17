@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 683 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 687 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -258,6 +258,14 @@ The Python suites need `h2` and `aioquic`.
   `same-origin`, `none`, and a request with neither header, which no browser
   page made, pass. An origin in `trustedOrigins` passes whatever the headers
   say. This is the check Go's net/http added in 1.25.
+- `app.securityHeaders(SecurityHeaders())` adds, to every answer in its scope
+  including errors and middleware refusals, `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: no-referrer`, and
+  `same-origin` Cross-Origin-Opener-Policy and Cross-Origin-Resource-Policy.
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains` goes only
+  on answers to HTTPS requests, a trusted proxy's included. Each is a field to
+  change or set to nil; `contentSecurityPolicy` and `permissionsPolicy` are
+  there to fill. A header the response already carries is not replaced.
 
 ### Streaming responses and server-sent events
 
