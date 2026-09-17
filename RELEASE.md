@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 672 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 680 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -226,6 +226,30 @@ The Python suites need `h2` and `aioquic`.
   `CookieKey(secret:previous:)` takes a secret of at least 32 bytes and the
   ones it replaced, derives separate signing and encryption keys with HKDF,
   and reads cookies made with any of them. `CookieKey.randomSecret()` makes one.
+- `app.sessions(store:)` gives every route in its scope a `Session`, which a
+  handler takes as an extractor. A request whose cookie names a live session
+  has it loaded before the handler runs, and its idle timeout
+  (`idleTimeoutSeconds`, a day by default) starts again. A request without one
+  costs the store nothing.
+- `session["key"]` and `session.value(T.self, "key")` read it.
+  `session.set`, `session.set(_:json:)` and `session.update { … }` write the
+  change to the store before they return, so the client's next request sees
+  it. The first change makes the ID, 32 random bytes, and the cookie that
+  carries it goes out with the response: change the session before answering.
+- An ID the server did not make is never used: a cookie naming no live session
+  is ignored, and the first change makes a fresh ID. `session.renew()` moves
+  the data to a new ID, for a login. `session.destroy()`, or emptying the
+  session, deletes it and expires the cookie.
+- `SessionConfiguration` names the cookie (`id` by default) and sets its path,
+  domain, SameSite and the rest. With a Max-Age the cookie is sent again each
+  time the session loads, so it lasts as long as the session does.
+- Stores: `MemorySessionStore`, for `--workers 1` and tests, since each
+  worker is a process with its own memory. `RedisSessionStore` keeps each
+  session as JSON with a PX expiry, extended with GETEX (Redis 6.2 or later).
+  `SQLiteSessionStore` keeps a table (`createTable()`, or `schema` in a
+  migration) and moves a session's expiry once half of the timeout has gone,
+  so reads rarely write. `deleteExpired()` clears expired rows. A store of
+  your own implements `SessionStore`'s load, save and delete.
 
 ### Streaming responses and server-sent events
 

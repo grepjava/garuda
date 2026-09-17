@@ -251,30 +251,38 @@ extension Response {
     }
 
     func setCookieHeader(_ cookie: Cookie, value: String) -> String? {
-        guard isCookieName(cookie.name), isCookieValue(value) else { return nil }
-        var header = cookie.name + "=" + value
-        if let path = cookie.path {
-            guard isAttributeValue(path) else { return nil }
-            header += "; Path=" + path
-        }
-        if let domain = cookie.domain {
-            guard isAttributeValue(domain), !domain.isEmpty else { return nil }
-            header += "; Domain=" + domain
-        }
-        if let maxAge = cookie.maxAge { header += "; Max-Age=\(max(0, maxAge))" }
-        if let expires = cookie.expires {
-            var date = [CChar](repeating: 0, count: 30)
-            let seconds = expires.microsecondsSinceEpoch / 1_000_000
-            _ = date.withUnsafeMutableBufferPointer { av_http_date($0.baseAddress!, seconds) }
-            header += "; Expires=" + String(decoding: date.prefix(29).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-        }
-        let secure = cookie.secure ?? (String(describing: worker.pointee.requestScheme(slot)) == "https")
-        if secure || cookie.sameSite == Cookie.SameSite.none { header += "; Secure" }
-        if cookie.httpOnly { header += "; HttpOnly" }
-        if let sameSite = cookie.sameSite { header += "; SameSite=" + sameSite.rawValue }
-        if cookie.partitioned { header += "; Partitioned" }
-        return header
+        let https = String(describing: worker.pointee.requestScheme(slot)) == "https"
+        return Garuda.setCookieHeader(cookie, value: value, https: https)
     }
+}
+
+/// The Set-Cookie header for `cookie` holding `value`, or nil when the name,
+/// value, path or domain cannot be sent. `https` is whether the request came
+/// over HTTPS, which a cookie whose `secure` is nil follows.
+func setCookieHeader(_ cookie: Cookie, value: String, https: Bool) -> String? {
+    guard isCookieName(cookie.name), isCookieValue(value) else { return nil }
+    var header = cookie.name + "=" + value
+    if let path = cookie.path {
+        guard isAttributeValue(path) else { return nil }
+        header += "; Path=" + path
+    }
+    if let domain = cookie.domain {
+        guard isAttributeValue(domain), !domain.isEmpty else { return nil }
+        header += "; Domain=" + domain
+    }
+    if let maxAge = cookie.maxAge { header += "; Max-Age=\(max(0, maxAge))" }
+    if let expires = cookie.expires {
+        var date = [CChar](repeating: 0, count: 30)
+        let seconds = expires.microsecondsSinceEpoch / 1_000_000
+        _ = date.withUnsafeMutableBufferPointer { av_http_date($0.baseAddress!, seconds) }
+        header += "; Expires=" + String(decoding: date.prefix(29).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+    let secure = cookie.secure ?? https
+    if secure || cookie.sameSite == Cookie.SameSite.none { header += "; Secure" }
+    if cookie.httpOnly { header += "; HttpOnly" }
+    if let sameSite = cookie.sameSite { header += "; SameSite=" + sameSite.rawValue }
+    if cookie.partitioned { header += "; Partitioned" }
+    return header
 }
 
 // MARK: - Checks and protection

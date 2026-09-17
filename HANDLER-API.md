@@ -115,6 +115,18 @@ written, whoever answered. `use` covers its whole scope regardless of where it
 is called. The cost: middleware cannot retry a handler or hold a scope around
 its run.
 
+### Sessions write when they change
+
+A session change is written to the store when the handler makes it:
+`try await session.set(…)` returns once the store holds it. Saving once at the
+end, as tower-sessions does after the inner service returns, needs a point
+after the handler where the server can wait before sending, and a handler
+answers by writing, whenever it is done. A save after the response instead
+could land after the client's next request had read the old data. So a handler
+that changes several keys uses `session.update { … }` for one write, and the
+cookie for a new ID is added by a send hook, which is why the session changes
+before the answer.
+
 ### CORS is a policy of a scope, not a middleware in order
 
 `app.cors` does not take a place among the `use` calls. The innermost scope's
@@ -249,7 +261,7 @@ wait once.
 | 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | Done |
-| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS, authentication, the application log, response observers, request limits and cookies done; sessions and CSRF to do |
+| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS, authentication, the application log, response observers, request limits, cookies and sessions done; CSRF to do |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Done |
 | 6 | Examples and realistic benchmarks | Examples done; benchmarks to do |
 
@@ -260,7 +272,7 @@ wait once.
   SASLprep.
 
 **Step 4**
-- Middleware Garuda ships: sessions, CSRF protection, security headers, path
+- Middleware Garuda ships: CSRF protection, security headers, path
   normalization.
 
 **Step 6**
