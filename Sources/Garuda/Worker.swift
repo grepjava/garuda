@@ -112,6 +112,9 @@ public struct Worker {
     /// What this worker built at start-up, by the type it is asked for by
     /// (State.swift). One worker is one process, so these are its own.
     var services: [ObjectIdentifier: Any] = [:]
+    /// Why a route failed, by slot, until its answer is reported to
+    /// `onResponse` observers. Only kept while there are observers.
+    var handlerFailures: [Int: (generation: UInt32, requestId: UInt32, description: String)] = [:]
     static let readyDrainBudget = 64
     /// The tasks async handlers run on (HandlerTasks.swift), made on the first
     /// async request, and how many there may be.
@@ -736,6 +739,7 @@ public struct Worker {
         // What the last request's handler set is not this one's.
         c.pointee.context = nil
         c.pointee.handlerStatus = 200
+        c.pointee.routeIndex = -1
         c.pointee.responseHeaders.clear()
         // An inactive capture holds nothing: whatever deactivates one frees it.
         if c.pointee.capture.active { c.pointee.capture.abandon() }
@@ -857,7 +861,8 @@ public struct Worker {
     }
 
     mutating func dispatch(_ slot: Int) {
-        if config.accessLog || Metrics.enabled {
+        table[slot].pointee.routeIndex = -1
+        if config.accessLog || Metrics.enabled || observesResponses {
             table[slot].pointee.requestStartUs = av_monotonic_us()
         }
         // Everything below reads the header table, and a request whose body
@@ -1302,6 +1307,7 @@ public struct Worker {
                                     micros: started == 0
                                         ? -1 : Int(av_monotonic_us() &- started))
         }
+        if let observe = application?.pointee.onResponse { reportResponse(slot, status: status, observe) }
         guard config.accessLog, Log.enabled(.info) else { return }
         let base = c.pointee.headBase()
         let method = c.pointee.head.methodSlice

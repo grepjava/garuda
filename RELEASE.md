@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 650 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 661 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -181,6 +181,22 @@ The Python suites need `h2` and `aioquic`.
   says when a stored hash used fewer iterations than asked for now.
 - `Tokens.random()` is 32 random bytes in base64url, and `Tokens.digest` their
   SHA-256 in hex, to store and look up instead of the token.
+- `request.log` writes the application log at debug, info, warning or error,
+  held to `--log-level`. Each line carries the request's method, path,
+  request ID and trace context, and fields given as
+  `["order": "\(id)", "cents": 1250]`. `log.with([…])` adds fields to every
+  line, and a logger outlives an `await`. `AppLog` writes the same lines
+  outside a request.
+- `--log-format json` writes those lines as one JSON object each, and sets the
+  access log's format unless `--access-log-format` is given. A line is one
+  write of at most 4096 bytes: a longer one is cut and marked `truncated`.
+  Nothing in a message or field can start a new line.
+- `app.onResponse { done in … }` is called with every request once its
+  response head is settled: a route's answer, a 404, a 429, a static file, a
+  cache hit or a WebSocket's 101. `done.route` is the matched pattern, safe as
+  a metric label. `done.failure` says why a route answered 5xx on its own
+  account: a throw, a handler that returned without answering, or its
+  deadline.
 
 ### Streaming responses and server-sent events
 
@@ -452,8 +468,8 @@ The Python suites need `h2` and `aioquic`.
 
 ### Not yet
 
-- Shipped middleware for tracing.
-  Middleware cannot wrap a handler's run.
+- Middleware cannot wrap a handler's run. The server's own log lines stay
+  text under `--log-format json`.
 - WebTransport is HTTP/3 only.
 - Resumable uploads have no `min-size` or `min-append-size` and no digests,
   and a completed upload is not replayed. A request still appending on

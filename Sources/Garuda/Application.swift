@@ -24,6 +24,7 @@ public final class Application: RouteBuilder {
     var routes = Routes()
     var startHooks: [(Int) -> Void] = []
     var shutdownHooks: [(Int) -> Void] = []
+    var responseObservers: [(CompletedRequest) -> Void] = []
     /// What each worker builds for itself at start-up, by the type handlers
     /// ask for it by, and how to tear it down (State.swift).
     var stateFactories: [(ObjectIdentifier, (Int) throws -> Any)] = []
@@ -238,6 +239,7 @@ public final class Application: RouteBuilder {
         }
         let start = startHooks
         let shutdown = shutdownHooks
+        let observers = responseObservers
         let application = UnsafeMutablePointer<CompiledApplication>.allocate(capacity: 1)
         application.initialize(to: CompiledApplication(
             routes: routes.table.compile(),
@@ -252,7 +254,9 @@ public final class Application: RouteBuilder {
             stateFactories: stateFactories,
             stateShutdowns: stateShutdowns,
             onStart: start.isEmpty ? nil : { index in for hook in start { hook(index) } },
-            onShutdown: shutdown.isEmpty ? nil : { index in for hook in shutdown { hook(index) } }))
+            onShutdown: shutdown.isEmpty ? nil : { index in for hook in shutdown { hook(index) } },
+            routePatterns: routes.patterns,
+            onResponse: observers.isEmpty ? nil : { completed in for observe in observers { observe(completed) } }))
         compiled = application
         return application
     }
@@ -281,6 +285,10 @@ struct CompiledApplication {
     let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]
     let onStart: ((Int) -> Void)?
     let onShutdown: ((Int) -> Void)?
+    /// Each route's pattern, by route number, nil for a fallback.
+    let routePatterns: [String?]
+    /// Every `onResponse` observer, in order, or nil for none.
+    let onResponse: ((CompletedRequest) -> Void)?
 
     func destroy() {
         routes.destroy()

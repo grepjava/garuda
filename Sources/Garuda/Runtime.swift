@@ -59,6 +59,7 @@ enum GarudaRuntime {
     static func start(_ config: ServerConfig, inherited: inout Reexec?) -> Int32 {
         Log.level = config.logLevel
         Log.pid = Int(av_getpid())
+        AppLogOutput.json = config.logJSON
         // The short name top and pkill match on, set once here so that every
         // worker forked from here inherits it. See av_set_process_name.
         av_set_process_name("garuda")

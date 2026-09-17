@@ -163,6 +163,8 @@ public enum GarudaCLI {
                                        /healthz)
               --access-log             log one line per request
               --access-log-format F    text (default) or json; implies --access-log
+              --log-format F           text (default) or json, for request.log and
+                                       AppLog lines, and the access log's default
               --metrics-port PORT      serve Prometheus metrics on this port
               --metrics-host HOST      what the metrics port binds (default --host)
               --log-level LEVEL        debug, info, warning, error, silent
@@ -212,6 +214,7 @@ public enum GarudaCLI {
 
         var i = 1
         var failed = false
+        var accessLogFormatGiven = false
 
         while i < argc {
             guard let raw = argv[i] else { break }
@@ -513,12 +516,24 @@ public enum GarudaCLI {
                 // Asking for a format is asking for the log: the alternative is a
                 // flag that silently does nothing without a second one beside it.
                 config.accessLog = true
+                accessLogFormatGiven = true
                 if matches(v, "text") {
                     config.accessLogJSON = false
                 } else if matches(v, "json") {
                     config.accessLogJSON = true
                 } else {
                     Log.error("unknown --access-log-format; use text or json")
+                    failed = true
+                    break
+                }
+            } else if matches(arg, "--log-format") {
+                guard let v = next("--log-format needs a value") else { break }
+                if matches(v, "text") {
+                    config.logJSON = false
+                } else if matches(v, "json") {
+                    config.logJSON = true
+                } else {
+                    Log.error("unknown --log-format; use text or json")
                     failed = true
                     break
                 }
@@ -554,6 +569,8 @@ public enum GarudaCLI {
         if failed {
             return .exit(2)
         }
+        // One format for everything a collector reads, unless asked otherwise.
+        if !accessLogFormatGiven { config.accessLogJSON = config.logJSON }
 
         let inputs = ConfigurationInputs(tlsCerts: tlsCerts, tlsKeys: tlsKeys,
                                          staticRoutes: staticRoutes, schemeGiven: schemeGiven,

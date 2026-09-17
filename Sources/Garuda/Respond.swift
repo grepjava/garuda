@@ -133,6 +133,7 @@ extension Worker {
                 }
                 c.pointee.routeParameters = RouteParameters()
                 c.pointee.routeOffset = Int32(truncatingIfNeeded: base - headBase)
+                c.pointee.routeIndex = fallback
                 let allowedMs = installed.pointee.deadlines[Int(fallback)]
                 if allowedMs > 0 { armDeadline(slot, ms: UInt64(allowedMs)) }
                 runHandler(slot, installed.pointee.handlers[Int(fallback)])
@@ -157,6 +158,7 @@ extension Worker {
             return
         }
         c.pointee.routeOffset = Int32(truncatingIfNeeded: base - headBase)
+        c.pointee.routeIndex = route
         let allowed = installed.pointee.deadlines[Int(route)]
         if allowed > 0 { armDeadline(slot, ms: UInt64(allowed)) }
         runHandler(slot, installed.pointee.handlers[Int(route)])
@@ -214,6 +216,7 @@ extension Worker {
               c.pointee.requestId == requestId,
               !c.pointee.flags.contains(.responseStarted) else { return }
         Log.error("a handler passed its deadline; answering 504")
+        noteHandlerFailure(slot, "the handler passed its deadline")
         c.pointee.flags.insert(.timedOut)
         let task = c.pointee.contKind == .task ? Int(c.pointee.contTask) : -1
         // A synchronous handler parked on a timer of its own is waiting for
@@ -245,6 +248,7 @@ extension Worker {
         guard table[slot].pointee.contKind != .task,
               handlerOwes(slot, generation: generation, requestId: requestId) else { return }
         Log.error("a handler returned without answering or waiting; answering 500")
+        noteHandlerFailure(slot, "the handler returned without answering")
         respond(slot, status: 500, nil, 0)
     }
 
@@ -258,6 +262,7 @@ extension Worker {
                 line.str("handler threw: ")
                 description.withCString { line.cstr($0) }
             }
+            noteHandlerFailure(slot, "handler threw: " + description)
         }
         let c = table[slot]
         guard c.pointee.state != .free, c.pointee.generation == generation,

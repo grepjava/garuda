@@ -294,6 +294,10 @@ public struct ServerConfig {
     /// Emit the access log as one JSON object per line, for a collector that
     /// would otherwise be handed a regex.
     public var accessLogJSON = false
+    /// Write the application log -- `request.log` and `AppLog` -- as one JSON
+    /// object per line. The command line has the access log follow it unless
+    /// --access-log-format says otherwise.
+    public var logJSON = false
     /// Port for the Prometheus scrape listener, or 0 for none. A port of its
     /// own rather than a path on the service port: the application owns its
     /// own routes, and monitoring must not be reachable through them.

@@ -66,6 +66,9 @@ struct Routes {
     /// The body limit of each route that reads its body as it arrives, by
     /// route number, or -1 for a route given its body whole.
     var bodyLimits: [Int] = []
+    /// Each route's pattern with its group prefixes, by route number, or nil
+    /// for a fallback.
+    var patterns: [String?] = []
     /// What routes registered right now are given, set while
     /// `Application.deadline(milliseconds:)` registers a group of them.
     var currentDeadline: UInt32 = 0
@@ -107,6 +110,7 @@ struct Routes {
         asyncHandlers.append(nil)
         deadlines.append(currentDeadline)
         bodyLimits.append(-1)
+        patterns.append(full)
         routeGroups.append(openGroups)
     }
 

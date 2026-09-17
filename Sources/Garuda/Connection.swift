@@ -217,6 +217,8 @@ public struct Connection {
     /// the head, so a resumed handler can read them again.
     public var routeParameters = RouteParameters()
     public var routeOffset: Int32 = 0
+    /// The route number that answered, for `onResponse`; -1 for none.
+    var routeIndex: Int32 = -1
     /// Headers the handler added. See `forEachHeaderRecord`.
     public var responseHeaders = ByteBuffer()
     public var state: ConnState = .free

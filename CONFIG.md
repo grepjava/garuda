@@ -506,6 +506,7 @@ request headers.
 |---|---|---|
 | `--access-log` | off | one line per request to stderr |
 | `--access-log-format F` | `text` | `text` or `json`; implies `--access-log` |
+| `--log-format F` | `text` | `text` or `json` for `request.log` and `AppLog`, and the access log unless `--access-log-format` is given |
 | `--log-level LEVEL` | `info` | `debug`, `info`, `warning`, `error` or `silent` |
 | `--health-check-path P` | none | answer GET and HEAD for P with 200 |
 | `--metrics-port PORT` | none | serve Prometheus metrics on a separate port |
@@ -531,6 +532,28 @@ request headers.
   `"truncated":true`. Every line is a complete object.
 
 `--log-level` also accepts `warn` and `none`.
+
+### Application log
+
+`request.log` and `AppLog` write to the same stderr, at the same levels:
+
+```
+[info]  pid=8961 order placed order=42 cents=1250 method=POST path=/orders request_id=5f0c…
+```
+
+```json
+{"level":"info","pid":8961,"msg":"order placed","method":"POST","path":"/orders","request_id":"5f0c…","order":"42","cents":1250}
+```
+
+- A request's lines carry `method` and `path`, `request_id` with
+  `--request-id`, and `trace_id` and `parent_id` with `--trace-context`: the
+  fields the access log has, under the JSON access log's names.
+- In text, a value with a space, quote, `=` or control character is quoted,
+  and newlines are escaped in both formats.
+- A line is one write of at most 4096 bytes, so workers sharing a pipe do not
+  interleave. A longer one is cut and ends `truncated=true`, or
+  `"truncated":true` in JSON.
+- The server's own messages, such as a handler that threw, stay text.
 
 ### Health check
 
@@ -711,6 +734,7 @@ Most fields share the flag's name. These do not:
 | `--forwarded-allow-ips` | `trust`, filled with `trust.parse(_:)` |
 | `--health-check-path` | `healthPath` |
 | `--access-log-format json` | `accessLog = true` and `accessLogJSON = true` |
+| `--log-format json` | `logJSON = true`, and `accessLogJSON = true` unless `--access-log-format` is given |
 | `--reload-interval` | `reloadIntervalMs` |
 
 The command line clamps some values (the `--max-header-size` minimum, the

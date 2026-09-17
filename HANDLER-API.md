@@ -249,7 +249,7 @@ wait once.
 | 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | Done |
-| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS and authentication done; tracing and request limits to do |
+| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS, authentication, the application log and response observers done; request limits to do |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Done |
 | 6 | Examples and realistic benchmarks | Examples done; benchmarks to do |
 
@@ -260,7 +260,7 @@ wait once.
   SASLprep.
 
 **Step 4**
-- Middleware Garuda ships: tracing with a logging API, request limits.
+- Middleware Garuda ships: request limits.
 
 **Step 6**
 - Benchmarks past hello-world against axum: path parameters, JSON in and out, a

@@ -225,6 +225,7 @@ extension Routes {
         asyncHandlers.append(asyncHandler)
         deadlines.append(currentDeadline)
         bodyLimits.append(-1)
+        patterns.append(nil)
         routeGroups.append(openGroups)
     }
 }

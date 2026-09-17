@@ -175,6 +175,13 @@ app.group("/api") {
 - `Passwords.hash` and `Passwords.verify` use PBKDF2-HMAC-SHA256 on the
   blocking pool. `Tokens.random()` makes a session token and `Tokens.digest`
   what to store in its place.
+- `request.log.info("order placed", ["order": "\(id)"])` writes to the
+  application log with the request's method, path, request ID and trace
+  context on the line. `AppLog` is the same log outside a request.
+  `--log-format json` makes every line one JSON object.
+- `app.onResponse { done in … }` sees every request once it is answered: the
+  matched route's pattern, status, duration, request ID and trace, and why a
+  route failed. This is what per-route metrics or error reporting hang from.
 
 ### PostgreSQL
 
@@ -332,7 +339,7 @@ offer. This is where Garuda stands, area by area.
 | TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
 | Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
-| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: no tracing API or request limits in code |
+| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: `request.log` and `app.onResponse` in code; no request limits in code |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
 | Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` | Done |
 | Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay | Done |
@@ -443,7 +450,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 650 unit tests, and the fuzz corpus
+swift test                                   # 661 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
@@ -486,15 +493,6 @@ by hand. It builds and runs the unit tests on Ubuntu 24.04 and macOS 15, and
 fuzzes for 60 seconds under AddressSanitizer.
 
 ## Status
-
-### Engine code with nothing to act on yet
-
-Some engine features are built but not yet reachable from handlers, so their
-end-to-end tests wait on the handler API step that connects them:
-
-| Waiting for | Engine feature and the checks it brings back |
-|---|---|
-| A logging API | Levels applied to handler log records |
 
 A handler waiting on something other than the engine (its own continuation,
 say) is not unwound when its request is cancelled. It resumes to find
