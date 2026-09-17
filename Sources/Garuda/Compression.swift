@@ -147,6 +147,53 @@ extension Worker {
         return accept
     }
 
+    /// The coding for a response the application has just answered with, or
+    /// identity. Says `Vary: Accept-Encoding` for any response a client that
+    /// asked differently might have had compressed, whatever this client
+    /// gets.
+    mutating func chooseCoding(_ slot: Int, status: Int, count: Int, declared: Int, streaming: Bool,
+                               forbids: Bool, suppress: Bool, misframed: Bool) -> ContentCoding {
+        let c = table[slot]
+        var eligibility = CompressionEligibility()
+        forEachHeaderRecord(c.pointee.responseHeaders) { name, value in
+            eligibility.observe(name, value)
+        }
+        if eligibility.mayVary(status: status) && !eligibility.varyCovered {
+            addHeader(slot, "vary", "Accept-Encoding")
+        }
+        // A HEAD response describes the GET without a body to encode, and a
+        // body that disagrees with its own length is sent as it is.
+        guard !suppress, !misframed else { return .identity }
+        return eligibility.choose(offered: c.pointee.acceptedCoding, status: status,
+                                  bodyAllowed: !forbids,
+                                  declaredLength: streaming ? declared : count,
+                                  minimumLength: config.compressMinimumLength)
+    }
+
+    /// Says the response is in `coding`: Content-Encoding, no Content-Length
+    /// of the unencoded body, and its strong ETags made weak, since the
+    /// encoded bytes are not the ones they name.
+    mutating func announceCoding(_ slot: Int, _ coding: ContentCoding) {
+        let c = table[slot]
+        var tags: [String] = []
+        forEachHeaderRecord(c.pointee.responseHeaders) { name, value in
+            if EntityTag.isName(name) && EntityTag.isStrong(value) { tags.append(value.string) }
+        }
+        let contentLength: StaticString = "content-length"
+        UnsafeRawPointer(contentLength.utf8Start).withMemoryRebound(
+            to: UInt8.self, capacity: contentLength.utf8CodeUnitCount) {
+            removeResponseHeaders(slot, named: UnsafeBufferPointer(start: $0, count: contentLength.utf8CodeUnitCount))
+        }
+        if !tags.isEmpty {
+            let etag: StaticString = "etag"
+            UnsafeRawPointer(etag.utf8Start).withMemoryRebound(to: UInt8.self, capacity: 4) {
+                removeResponseHeaders(slot, named: UnsafeBufferPointer(start: $0, count: 4))
+            }
+            for tag in tags { addHeader(slot, "etag", "W/" + tag) }
+        }
+        addHeader(slot, "content-encoding", "\(coding.token)")
+    }
+
     /// Settles which coding a response to this request may use, if the
     /// response turns out to be one worth compressing.
     mutating func negotiateCoding(_ slot: Int) {

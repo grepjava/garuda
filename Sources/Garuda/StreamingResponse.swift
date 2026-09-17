@@ -269,7 +269,17 @@ extension Worker {
             c.pointee.responseRemaining -= take
         }
         if take > 0 {
-            if c.pointee.flags.contains(.chunkedResponse) {
+            if c.pointee.capture.active { c.pointee.capture.append(p, take) }
+            let chunked = c.pointee.flags.contains(.chunkedResponse)
+            if c.pointee.encoder.active {
+                // Flushed with each write, so what the handler sent is what
+                // the client can read now.
+                if !c.pointee.encoder.encode(p, take, flush: true, into: &c.pointee.write, chunked: chunked) {
+                    Log.error("compressing a streamed response failed; ending the connection")
+                    failStreamedResponse(slot)
+                    return false
+                }
+            } else if chunked {
                 HTTPResponseWriter.writeChunk(&c.pointee.write, p, take)
             } else {
                 c.pointee.write.write(p, take)
@@ -312,6 +322,16 @@ extension Worker {
             Log.error("a streamed response ended short of its Content-Length")
             if !c.pointee.isStream { c.pointee.flags.remove(.keepAlive) }
         }
+        if c.pointee.capture.active {
+            cacheCaptureFinish(slot, complete: c.pointee.responseRemaining <= 0)
+        }
+        if c.pointee.encoder.active
+            && !c.pointee.encoder.finish(into: &c.pointee.write,
+                                         chunked: c.pointee.flags.contains(.chunkedResponse)) {
+            Log.error("compressing a streamed response failed; ending the connection")
+            failStreamedResponse(slot)
+            return
+        }
         if c.pointee.flags.contains(.chunkedResponse) {
             HTTPResponseWriter.writeLastChunk(&c.pointee.write)
         }
@@ -331,9 +351,16 @@ extension Worker {
             line.str("handler threw part-way through a streamed response: ")
             description.withCString { line.cstr($0) }
         }
-        // Half a body cannot be ended honestly. After the head, these reset
-        // the stream, and HTTP/1.1 has only the close.
+        failStreamedResponse(slot)
+    }
+
+    /// Ends a streamed response that cannot be finished: half a body cannot
+    /// be ended honestly. After the head, these reset the stream, and
+    /// HTTP/1.1 has only the close.
+    mutating func failStreamedResponse(_ slot: Int) {
         let c = table[slot]
+        c.pointee.capture.abandon()
+        c.pointee.encoder.destroy()
         if c.pointee.isH3Stream {
             h3FailRequest(slot, status: 500)
         } else if c.pointee.isStream {

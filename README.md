@@ -363,7 +363,9 @@ These work without any handler code, set by flags:
 - **Unix sockets**, multiple **workers**, and **trusted proxy headers**
   (`--forwarded-allow-ips`).
 
-`--compress` and `--cache-size` exist but do not act on handler responses yet.
+- **Compression** of handler responses (`--compress`) and a **response cache**
+  shared by the workers (`--cache-size`).
+
 `garuda --help` lists every
 flag, and [CONFIG.md](CONFIG.md) explains them.
 
@@ -390,7 +392,8 @@ its first argument. Most use `.build/release/garuda`; `handler-test.py`,
 ```bash
 bash scripts/integration-test.sh             # 36  HTTP/1.1 framing and smuggling defences
 bash scripts/static-test.sh                  # 42  --static-dir
-bash scripts/compress-test.sh                # 28  --compress-static
+bash scripts/compress-test.sh                # 76  --compress, --compress-static
+bash scripts/cache-test.sh                   # 85  --cache-size
 bash scripts/ratelimit-test.sh               # 18  --rate-limit
 bash scripts/redirect-test.sh                # 22  --redirect-http, --hsts
 bash scripts/sni-test.sh                     # 11  certificates by SNI
@@ -425,8 +428,6 @@ end-to-end tests wait on the handler API step that connects them:
 
 | Waiting for | Engine feature and the checks it brings back |
 |---|---|
-| Compression in the response path | `--compress`: codec choice, `Content-Length` removal, `Vary`, weak `ETag`, `no-transform`, event streams, the small-body exemption |
-| Caching in the response path | `--cache-size`: storing, HEAD from GET, 304 revalidation, retirement on unsafe methods, `Age` and TTL, credentials kept out, flush on reload |
 | A logging API | Levels applied to handler log records |
 
 A handler waiting on something other than the engine (its own continuation,

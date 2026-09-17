@@ -274,8 +274,8 @@ with 501.
 |---|---|---|
 | `--static-dir P=DIR` | none | serve URL prefix P from DIR; repeatable |
 | `--compress-static` | off | serve `FILE.br`, `FILE.zst` or `FILE.gz` beside a static file when accepted |
-| `--compress` | off | not applied to handler responses yet |
-| `--compress-min-size N` | `1024` | not applied yet |
+| `--compress` | off | compress handler responses with brotli, zstd or gzip, as the client accepts |
+| `--compress-min-size N` | `1024` | leave a body declared smaller than this uncompressed |
 
 ### `--static-dir`
 
@@ -312,12 +312,29 @@ risk.
 
 ### `--compress`
 
-`--compress` and `--compress-min-size` are parsed, but handler responses are
-not compressed yet, streamed or not. Before turning `--compress` on once it
-does act, read about BREACH: a compressed TLS response that puts a secret next
-to text the client controls lets an observer of response sizes recover the
-secret. brotli and zstd are loaded at run time from `libbrotlienc` and
-`libzstd` when present; gzip uses zlib.
+`--compress` compresses what handlers answer with, whoever answered: the
+handler, a middleware, an error. The coding is the one the client rates highest
+of brotli, zstd and gzip, brotli first when it rates them equally. brotli and
+zstd are loaded at run time from `libbrotlienc` and `libzstd` when present; gzip
+uses zlib.
+
+- Only text and the formats that are text in all but name are compressed:
+  `text/*` except `text/event-stream`, JSON, JavaScript, XML, SVG, WebAssembly
+  and a few fonts. An image, an event stream, a body the handler encoded
+  itself, `Cache-Control: no-transform`, a partial response and a body
+  declared shorter than `--compress-min-size` go out as they are.
+- A body sent whole is compressed whole and states its compressed
+  `Content-Length`. A streamed body is compressed as it is written, each write
+  flushed through so the client can read it at once, and is chunked on
+  HTTP/1.1. A declared `Content-Length` is still held to the bytes the handler
+  writes.
+- Any response that could be compressed for some client says
+  `Vary: Accept-Encoding`, unless the handler's own `Vary` covers it. A strong
+  `ETag` on a compressed response is sent weak. HEAD is not encoded.
+
+Before turning it on, read about BREACH: a compressed TLS response that puts a
+secret next to text the client controls lets an observer of response sizes
+recover the secret.
 
 ---
 
@@ -325,14 +342,33 @@ secret. brotli and zstd are loaded at run time from `libbrotlienc` and
 
 | flag | default | what it does |
 |---|---|---|
-| `--cache-size MIB` | `0` (off) | shared response cache; stores nothing yet |
-| `--cache-max-object KIB` | `1024` | largest body the cache would keep; 1 to 65536 |
-| `--cache-ttl-max SECONDS` | `300` | longest a response would be kept |
+| `--cache-size MIB` | `0` (off) | a response cache shared by every worker |
+| `--cache-max-object KIB` | `1024` | largest body the cache keeps; 1 to 65536 |
+| `--cache-ttl-max SECONDS` | `300` | longest a response is kept |
 
-The cache is meant for handler responses marked fresh with
-`Cache-Control: s-maxage` or `max-age`. It does not store handler responses
-yet. `--cache-size` still maps the shared memory before the workers fork and
-logs its size, and the `garuda_cache_*` metrics stay at zero. Leave it off.
+The cache answers a GET or HEAD from a copy of an earlier handler response to
+the same URL, without calling the handler. The memory is mapped before the
+workers fork, so a copy one worker stores, every worker serves.
+
+- **What is kept:** a response marked fresh with `Cache-Control: s-maxage` or
+  `max-age`, for no longer than it has left or `--cache-ttl-max`. A 200, 204,
+  404 and the other statuses RFC 9110 calls cacheable by default are kept; a
+  body streamed in pieces is kept whole.
+- **What is not:** `private`, `no-store`, `Set-Cookie`, a `Vary` on anything
+  but `Accept-Encoding`, a response already past its lifetime by its own
+  `Age` or `Date`, a body larger than `--cache-max-object`, and a body that
+  disagrees with its `Content-Length`. Nor is a response to a request with
+  `Authorization` or a cookie, and such a request is never answered from a
+  copy. `Cache-Control: no-cache` or `max-age=0` on a request goes to the
+  handler.
+- **Serving:** a copy carries `Age` and `Cache-Status: garuda; hit; ttl=N`,
+  gets its own request ID, and is compressed afresh for each client when
+  `--compress` is on. `If-None-Match` and `If-Modified-Since` are answered 304
+  from the copy; `If-Match`, `If-Unmodified-Since` and `If-Range` go to the
+  handler.
+- **Retiring:** a POST, PUT, PATCH or DELETE to a URL that succeeds retires its
+  copies, including a GET still being answered at the time. A refused one
+  retires nothing. A reload starts with an empty cache.
 
 ---
 
@@ -485,7 +521,7 @@ all workers.
 | `garuda_connections_active`, `garuda_connection_slots` | gauges |
 | `garuda_buffer_pool_hits_total`, `garuda_buffer_pool_misses_total` | counters |
 | `garuda_requests_rate_limited_total` | counter |
-| `garuda_cache_hits_total`, `_misses_total`, `_stores_total` | counters; zero until the cache stores |
+| `garuda_cache_hits_total`, `_misses_total`, `_stores_total` | counters, with `--cache-size` |
 | `garuda_workers` | gauge |
 
 `--metrics-host` defaults to `--host`, so a server on `0.0.0.0` publishes its

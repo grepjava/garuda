@@ -623,4 +623,7 @@ app.onWorkerShutdown { index in
     }
 }
 
+addCompressionRoutes(app)
+addCacheRoutes(app)
+
 exit(app.run())

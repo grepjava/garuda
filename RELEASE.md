@@ -25,7 +25,8 @@ swift test                             # 561 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
-bash scripts/compress-test.sh          # 28
+bash scripts/compress-test.sh          # 76, and garuda-conformance
+bash scripts/cache-test.sh             # 85, runs garuda-conformance
 bash scripts/ratelimit-test.sh         # 18
 bash scripts/redirect-test.sh          # 22
 bash scripts/sni-test.sh               # 11
@@ -309,6 +310,17 @@ The Python suites need `h2` and `aioquic`.
 
 ### Server
 
+- `--compress` compresses handler responses, whoever answered them, with the
+  coding the client rates highest. A whole body states its compressed length,
+  and a streamed one is compressed as it is written, flushed with each write.
+  It says Vary, sends a strong ETag weak, and leaves alone images, event
+  streams, bodies the handler encoded, `no-transform`, HEAD and bodies declared
+  under `--compress-min-size`.
+- `--cache-size` stores handler responses marked fresh in memory every worker
+  shares, and answers later GETs and HEADs from them, compressed afresh for
+  each client, with 304 for a matching validator. A successful unsafe request
+  retires a URL's copies. Responses with cookies, `private`, `no-store` or an
+  unusual Vary, and requests with credentials, stay out.
 - `--reload` watches the executable. When a rebuild holds still and answers
   `--version`, the supervisor execs it with its listening sockets open and
   replaces the workers one at a time. A changed `--tls-cert` or `--tls-key`
@@ -339,7 +351,6 @@ The Python suites need `h2` and `aioquic`.
 
 - WebSocket over HTTP/2 and HTTP/3, and shipped middleware for tracing.
   Middleware cannot wrap a handler's run.
-- `--compress` and `--cache-size` do not act on handler responses.
 - WebTransport is HTTP/3 only.
 - Resumable uploads have no `min-size` or `min-append-size` and no digests,
   and a completed upload is not replayed. A request still appending on

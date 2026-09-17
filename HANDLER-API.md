@@ -240,7 +240,6 @@ wait once.
 - Middleware Garuda ships: tracing with a logging API, request limits.
 
 **Step 5**
-- `--compress` and `--cache-size` acting on handler responses in the sink.
 - WebSocket over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220).
 - Broadcasting to many WebSockets and event streams, across workers.
 

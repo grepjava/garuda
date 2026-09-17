@@ -333,6 +333,8 @@ extension Worker {
     /// response that has no body to stream -- HEAD, 204, 304 -- is sent whole.
     mutating func respond(_ slot: Int, status: Int, _ body: UnsafePointer<UInt8>?, _ count: Int,
                           streaming: Bool = false) {
+        var body = body
+        var count = count
         let c = table[slot]
         guard c.pointee.state == .dispatching, !c.pointee.isParked,
               !c.pointee.flags.contains(.responseStarted) else {
@@ -382,8 +384,50 @@ extension Worker {
         if suppress { sending = 0 }
         let misframed = !streaming && !forbids && declared >= 0 && declared != count && !suppress
         // What a streamed body is held to as it is written, -1 for no limit.
+        // Counted in the application's bytes, before any compression.
         let open = streaming && !forbids && !suppress
         if open { c.pointee.responseRemaining = declared }
+
+        // --cache-size: the copy is of the response as the application made
+        // it, and is compressed afresh for each client it is served to.
+        if c.pointee.capture.active {
+            captureResponseHead(slot, status: status)
+            if !open {
+                if sending > 0, let body { c.pointee.capture.append(body, sending) }
+                cacheCaptureFinish(slot, complete: short == 0 && !misframed)
+            }
+        }
+
+        // --compress. A buffered body is compressed whole and states its
+        // compressed length; a streamed one is compressed as it is written.
+        var encoded = ByteBuffer()
+        defer { encoded.destroy() }
+        if config.compress {
+            switch chooseCoding(slot, status: status, count: count, declared: declared,
+                                streaming: open, forbids: forbids, suppress: suppress, misframed: misframed) {
+            case .identity:
+                break
+            case let coding where open:
+                if c.pointee.encoder.start(coding) {
+                    announceCoding(slot, coding)
+                    length = -1
+                }
+            case let coding:
+                var encoder = ResponseEncoder()
+                if encoder.start(coding), let source = body,
+                   encoder.encode(source, sending, flush: false, into: &encoded, chunked: false),
+                   encoder.finish(into: &encoded, chunked: false) {
+                    announceCoding(slot, coding)
+                    body = UnsafePointer(encoded.readPointer)
+                    count = encoded.readableBytes
+                    sending = count
+                    length = count
+                } else {
+                    encoder.destroy()
+                    encoded.clear()
+                }
+            }
+        }
 
         if c.pointee.isH3Stream {
             respondH3(slot, status: status, body, sending, length: length, short: short, kinds: kinds,

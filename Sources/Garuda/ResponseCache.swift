@@ -617,6 +617,16 @@ extension Worker {
         _ = flush(slot)
     }
 
+    /// The head of a response being copied: its headers as the application
+    /// gave them, and whether it may be kept at all.
+    mutating func captureResponseHead(_ slot: Int, status: Int) {
+        let c = table[slot]
+        forEachHeaderRecord(c.pointee.responseHeaders) { name, value in
+            c.pointee.capture.observe(name, value)
+        }
+        c.pointee.capture.settle(status: status)
+    }
+
     /// The response ended. A complete one is stored, anything else dropped.
     mutating func cacheCaptureFinish(_ slot: Int, complete: Bool) {
         let c = table[slot]
