@@ -477,6 +477,7 @@ extension Worker {
             // Still the handler's: the head goes now, and the body as it is
             // written.
             c.pointee.flags.insert(.streamingResponse)
+            c.pointee.eventKeepAliveMs = 0
             _ = flush(slot)
             return
         }
@@ -521,6 +522,7 @@ extension Worker {
         logAccess(slot, status: status)
         if open {
             c.pointee.flags.insert(.streamingResponse)
+            c.pointee.eventKeepAliveMs = 0
             _ = flush(parent)
             return
         }
@@ -576,6 +578,7 @@ extension Worker {
         logAccess(slot, status: status)
         if open {
             c.pointee.flags.insert(.streamingResponse)
+            c.pointee.eventKeepAliveMs = 0
             flushQUIC(parent)
             return
         }

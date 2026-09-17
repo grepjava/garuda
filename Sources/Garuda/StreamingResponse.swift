@@ -269,6 +269,9 @@ extension Worker {
             c.pointee.responseRemaining -= take
         }
         if take > 0 {
+            if c.pointee.eventKeepAliveMs != 0 {
+                c.pointee.eventKeepAliveDue = av_monotonic_ms() &+ UInt64(c.pointee.eventKeepAliveMs)
+            }
             if c.pointee.capture.active { c.pointee.capture.append(p, take) }
             let chunked = c.pointee.flags.contains(.chunkedResponse)
             if c.pointee.encoder.active {

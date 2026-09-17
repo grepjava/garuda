@@ -350,6 +350,12 @@ public struct Connection {
     /// Free-list link; -1 when in use.
     public var nextFree: Int32 = -1
 
+    /// An event stream's keep-alive: how long it may go without a write before
+    /// a comment is sent, 0 for never, and when the next is due. At the end,
+    /// clear of the fields every request touches.
+    var eventKeepAliveMs: UInt32 = 0
+    var eventKeepAliveDue: UInt64 = 0
+
     @inlinable public init() {}
 
     @inlinable
@@ -377,6 +383,8 @@ public enum PollToken {
     public static let redirect: UInt64 = .max - 5
     /// The read end of the blocking pool's pipe, when the pool has started.
     public static let blocking: UInt64 = .max - 6
+    /// The broadcast ring's wake descriptor, once something has subscribed.
+    public static let broadcast: UInt64 = .max - 7
     /// Scrapes and redirects whose request has not finished arriving. One token
     /// per pending slot, so an event names its slot without a search. Kept
     /// clear of the singletons above and far below any slot token.

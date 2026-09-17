@@ -354,7 +354,11 @@ buffer, plus on HTTP/3 the bytes QUIC has not had acknowledged.
   connection or resets the stream.
 
 Server-sent events use the HTML event-stream format: one `data:` line per line
-of data, with line breaks in event names and IDs replaced.
+of data, with line breaks in event names and IDs replaced. The worker's
+once-a-second sweep sends `:` and a blank line to an event stream that has
+been quiet for `--sse-keep-alive`, unless a writer is already waiting on its
+backlog. Each write moves the next one along, and the stream starts and ends
+on whole events, so a comment never splits one.
 
 ---
 

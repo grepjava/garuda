@@ -186,6 +186,12 @@ final class HandlerTaskPool: @unchecked Sendable {
         executor.drain()
     }
 
+    /// Resumes the task waiting on the engine for a request, to carry on,
+    /// when the worker next drains the executor rather than here.
+    func resume(_ index: Int) {
+        records[index].wake.take()?.resume(returning: true)
+    }
+
     /// Resumes the task waiting on the engine for a request, to throw
     /// `cancelled`. It runs when the worker next drains the executor, not
     /// here: the caller is part-way through closing the request.

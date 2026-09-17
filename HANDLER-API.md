@@ -179,6 +179,20 @@ one writer waits at a time; another finds it waiting and returns, its bytes
 queued behind. A stalled reader is closed after `--request-timeout`.
 `EventStream` is built on the writer.
 
+A `Topic` has to reach clients held by every worker process, so a message goes
+into a ring mapped before the fork (`avian_bus.c`) and every worker, the
+publisher included, reads it back from there. No lock is held across processes:
+one writer claims the ring by compare-and-swap for the copy of one message, and
+a claim whose process has died is taken over. Readers take no claim; they copy
+a message and then check the writer has not come round to it. The ring keeps
+what it has room for, not only what is unread, and that is what serves
+`Last-Event-ID` from any worker. A worker with subscribers arms a wake before
+it sleeps; a publisher writes to the eventfd of each armed worker and disarms
+it, so a burst costs one wake per worker. A subscriber waits the way a sleeping
+handler does, on its request's slot or its WebSocket's timed waits, so the
+connection closing ends the wait. A subscriber's queue is bounded, and what
+does not fit becomes a single `.missed`.
+
 A route registered with `onStreamingBody` has its own body limit, kept beside
 the routes, and is dispatched when its head arrives instead of after its body.
 The body stays in the connection's buffer until the handler reads it. Reading
@@ -225,7 +239,7 @@ wait once.
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | PostgreSQL and the blocking pool done; Redis and SQLite to do |
 | 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS and authentication done; tracing and request limits to do |
-| 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, request bodies, SSE, WebSockets over HTTP/1.1, resumable uploads and WebTransport done |
+| 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, request bodies, SSE with keep-alive and replay, broadcast across workers, WebSockets over HTTP/1.1, resumable uploads and WebTransport done |
 | 6 | Examples and realistic benchmarks | To do |
 
 ### Still to build

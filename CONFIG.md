@@ -83,6 +83,9 @@ for `/user/7`.
 | `--drain-delay MS` | `0` | on SIGTERM, keep serving this long with the health check failing |
 | `--blocking-threads N` | `16` | threads per worker that `blocking` work runs on |
 | `--blocking-queue N` | `1024` | `blocking` work waiting for a thread, per worker, before it is refused 503 |
+| `--broadcast-size MIB` | `4` | the ring published messages cross workers in; `0` turns `Topic` off |
+| `--broadcast-queue N` | `1024` | messages a subscriber may fall behind by before it is told it missed some |
+| `--sse-keep-alive S` | `15` | seconds an event stream may be quiet before it is sent a comment; `0` sends none |
 
 - **`--max-connections`** is per worker. A connection that arrives at a full
   table is answered `503` and closed, and counted in
@@ -103,6 +106,20 @@ for `/user/7`.
   up to **`--blocking-queue`** pieces, and past that `blocking` throws
   `BlockingPoolError.full`, answered 503. Each worker has its own pool, so the
   process count multiplies both.
+- **`--broadcast-size`** is memory every worker maps before the fork. A message
+  published on a `Topic` goes into it and every worker reads it from there, so
+  it reaches subscribers on all of them. It also holds the recent past: a
+  client that reconnects with `Last-Event-ID` is sent what it missed as long as
+  newer messages have not written over it. A message may be up to a quarter of
+  the ring. With `0`, publishing and subscribing throw
+  `BroadcastError.unavailable`, answered 503.
+- **`--broadcast-queue`** is per subscriber. One that falls further behind --
+  a client reading slowly, a handler busy elsewhere -- is given `.missed` in
+  place of what it could not keep, rather than holding the rest in memory.
+- **`--sse-keep-alive`** is kept by the worker, whatever the handler is waiting
+  on, so a proxy that closes idle connections sees traffic and a client that has
+  gone is found when the write fails. `EventStream(keepAlive:)` sets it for one
+  stream.
 
 `--drain-delay` and `--graceful-timeout` are described under
 [Reload and signals](#reload-and-signals).

@@ -73,6 +73,18 @@ public struct ServerConfig {
     /// `blocking` throws `BlockingPoolError.full`.
     public var blockingQueue = 1024
 
+    // --- broadcast and event streams ---
+    /// The ring every worker's published messages go through, in MiB, and
+    /// what a reconnecting client can be sent again from. 0 turns `Topic`
+    /// off.
+    public var broadcastSizeMiB = 4
+    /// Messages a subscriber may fall behind by before it is told it missed
+    /// some.
+    public var broadcastQueue = 1024
+    /// How long an event stream may go without a write before a comment is
+    /// sent to keep proxies from closing it. 0 sends none.
+    public var eventKeepAliveMs: UInt64 = 15_000
+
     public var rootPath: UnsafePointer<CChar> = staticCString("")
     public var scheme: UnsafePointer<CChar> = staticCString("http")
     public var serverName: UnsafePointer<CChar> = staticCString("localhost")

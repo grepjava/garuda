@@ -120,6 +120,17 @@ public struct Worker {
     /// The threads `blocking` runs work on (BlockingPool.swift), started the
     /// first time it is called.
     var blockingThreads: BlockingPool? = nil
+    /// This worker's side of the broadcast ring (Broadcast.swift), attached
+    /// the first time something subscribes.
+    var broadcast: BroadcastHub? = nil
+    /// Something was published on this worker's thread, which reads the ring
+    /// again before it next sleeps rather than being woken.
+    var broadcastPending = false
+    /// The ring's wake slot, which is the worker's metrics slot.
+    var busSlot = 0
+    /// Whether the ring's descriptor is watched. A test client looks at the
+    /// ring on every turn instead.
+    var pollsBroadcast = true
     /// Connections this worker made rather than accepted (Outbound.swift),
     /// made on the first one. A server that never calls out pays nothing.
     /// Deliberately not in `table`: a pooled one would keep a draining worker
@@ -197,6 +208,12 @@ public struct Worker {
         // that wait is over.
         cancelTimedWaits()
         stopBlockingPool()
+        if let hub = broadcast {
+            // The descriptor is shared with every process holding the ring,
+            // and closes with this one.
+            if pollsBroadcast { _ = poller.remove(hub.fd, last: .read) }
+            broadcast = nil
+        }
         if let pool = handlerTasks {
             // Cancelled first, so that a task waiting on the engine unwinds
             // and can be ended.
@@ -278,6 +295,8 @@ public struct Worker {
                 acceptRedirects()
             case PollToken.blocking:
                 handleBlockingFinished()
+            case PollToken.broadcast:
+                handleBroadcastWake()
             default:
                 if let pending = PollToken.metricsPendingIndex(token) {
                     handleScrapeReadable(pending)
@@ -1557,6 +1576,9 @@ public struct Worker {
             defer { slot += 1 }
             guard c.pointee.state != .free else { continue }
             let idle = now &- c.pointee.lastActivity
+            if c.pointee.eventKeepAliveMs != 0 && now >= c.pointee.eventKeepAliveDue {
+                sendEventKeepAlive(slot)
+            }
             switch c.pointee.state {
             case .readingHead:
                 let limit = c.pointee.read.isEmpty

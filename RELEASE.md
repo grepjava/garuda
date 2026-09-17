@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 561 unit tests
+swift test                             # 573 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -43,6 +43,7 @@ python3 scripts/handler-test.py        # 143, runs garuda-conformance
 python3 scripts/websocket-test.py      # 104, runs garuda-conformance
 python3 scripts/webtransport-test.py   # 46, runs garuda-conformance
 python3 scripts/upload-test.py         # 35, runs garuda-conformance
+python3 scripts/broadcast-test.py      # 35, runs garuda-conformance
 ```
 
 The Python suites need `h2` and `aioquic`.
@@ -183,6 +184,17 @@ The Python suites need `h2` and `aioquic`.
   split into one `data:` line per line, a line break cannot start a field in an
   event name or ID, and `cache-control: no-cache` is set unless the handler set
   its own.
+- A quiet event stream is sent a comment every `--sse-keep-alive` seconds (15),
+  by the worker, whatever the handler is waiting on. `EventStream(keepAlive:)`
+  sets it per stream.
+- `Topic("name").publish(...)` sends a message to every subscriber on every
+  worker, through a ring the workers share (`--broadcast-size`, 4 MiB).
+  `events.subscribe`, `ws.subscribe` and `response.subscribe` hear it, and
+  `events.forward(topic, after: lastEventID)` sends each message as an event
+  whose `id` is its number. A client reconnecting with `Last-Event-ID` is sent
+  what it missed from the ring, on whichever worker it reaches. What cannot be
+  sent -- written over, or more than `--broadcast-queue` behind -- arrives as
+  `.missed`.
 
 ### Streamed request bodies, interim responses and resumable uploads
 

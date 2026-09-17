@@ -82,6 +82,10 @@ public final class TestClient {
         worker = UnsafeMutablePointer<Worker>.allocate(capacity: 1)
         worker.initialize(to: Worker(config: configuration, listenFD: -1, poller: poller))
         worker.pointee.application = application.compile()
+        // One ring for the process, as a server has one for its workers, and
+        // looked at on every turn rather than watched.
+        _ = TestClient.broadcastRing
+        worker.pointee.pollsBroadcast = false
         // A test gets the state a forked worker builds, built the same way.
         // A factory that throws stops a worker's start-up; here there is no
         // worker to stop, so it stops the test.
@@ -93,6 +97,8 @@ public final class TestClient {
             }
         }
     }
+
+    static let broadcastRing: Bool = av_bus_enabled() != 0 || av_bus_init(4 * 1024 * 1024, 1) == 0
 
     deinit {
         onWorker {
@@ -236,6 +242,10 @@ public final class TestClient {
             worker.pointee.fireDueTimers()
             worker.pointee.drainReadyQueue()
             worker.pointee.runHandlerTasks()
+            if let hub = worker.pointee.broadcast,
+               worker.pointee.broadcastPending || av_bus_next() > hub.cursor {
+                worker.pointee.deliverBroadcasts()
+            }
             worker.pointee.sweepTimeouts()
         }
     }

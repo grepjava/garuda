@@ -76,6 +76,12 @@ public enum GarudaCLI {
               --blocking-threads N     threads per worker for blocking work (default 16)
               --blocking-queue N       blocking work waiting per worker, past which it
                                        is refused with 503 (default 1024)
+              --broadcast-size MIB     the ring published messages cross workers in, and
+                                       are sent again from (default 4; 0 turns it off)
+              --broadcast-queue N      messages a subscriber may fall behind by before
+                                       it is told it missed some (default 1024)
+              --sse-keep-alive S       send an event stream a comment after S quiet
+                                       seconds (default 15; 0 sends none)
               --forwarded-allow-ips L  proxies whose X-Forwarded-* headers are trusted:
                                        a comma-separated list of addresses or CIDR
                                        blocks, "unix", or "*" for every peer
@@ -334,6 +340,15 @@ public enum GarudaCLI {
             } else if matches(arg, "--blocking-queue") {
                 guard let v = next("--blocking-queue needs a count") else { break }
                 config.blockingQueue = max(0, parseInt(v))
+            } else if matches(arg, "--broadcast-size") {
+                guard let v = next("--broadcast-size needs MiB") else { break }
+                config.broadcastSizeMiB = max(0, parseInt(v))
+            } else if matches(arg, "--broadcast-queue") {
+                guard let v = next("--broadcast-queue needs a count") else { break }
+                config.broadcastQueue = max(1, parseInt(v))
+            } else if matches(arg, "--sse-keep-alive") {
+                guard let v = next("--sse-keep-alive needs seconds") else { break }
+                config.eventKeepAliveMs = UInt64(max(0, parseInt(v))) * 1000
             } else if matches(arg, "--reload") {
                 config.reload = true
             } else if matches(arg, "--reload-interval") {

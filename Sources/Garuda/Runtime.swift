@@ -162,6 +162,17 @@ enum GarudaRuntime {
             }
         }
 
+        // --broadcast-size. Mapped here too: a message published by one
+        // worker is for the subscribers every other worker holds. A slot per
+        // metrics slot, for the same overlap at a reload.
+        if config.broadcastSizeMiB > 0 {
+            if av_bus_init(UInt64(config.broadcastSizeMiB) * 1024 * 1024,
+                           UInt32(max(1, workerCount) * 2)) != 0 {
+                Log.error("cannot map the broadcast ring")
+                return 1
+            }
+        }
+
         // --rate-limit. Mapped here for the same reason as the metrics page:
         // it has to exist before the first fork for every worker to share it.
         if config.rateLimitCount > 0 {
@@ -1005,6 +1016,7 @@ enum GarudaRuntime {
             workerPtr.pointee.tlsContext = context
         }
         workerPtr.pointee.signalFD = controlFD
+        workerPtr.pointee.busSlot = metricsSlot
 
         if config.metricsPort != 0 {
             Metrics.bind(slot: metricsSlot)
@@ -1116,6 +1128,7 @@ enum GarudaRuntime {
             worker.pointee.fireDueTimers()
             worker.pointee.drainReadyQueue()
             worker.pointee.runHandlerTasks()
+            if worker.pointee.broadcastPending { worker.pointee.deliverBroadcasts() }
             worker.pointee.quicTick()
             worker.pointee.sweepTimeouts()
             if worker.pointee.draining && worker.pointee.quiescent {

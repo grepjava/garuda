@@ -194,6 +194,16 @@ app.webSocket("/chat/:room") { (ws: WebSocket, room: Path<String>) async throws 
     for try await message in ws { try await ws.send(message) }   // whole messages
 }
 
+struct Said: Codable { var text: String }
+let lobby = Topic("lobby")
+app.post("/say") { (said: Body<Said>) in
+    try lobby.publish(said.value.text, event: "said")   // heard by subscribers on every worker
+    return HTTPStatus.noContent
+}
+app.get("/lobby") { (last: LastEventID) async in
+    EventStream { events in try await events.forward(lobby, after: last) }   // replays what a reconnect missed
+}
+
 app.webTransport("/room/:id") { (session: WebTransportSession, id: Path<Int>) async throws in
     while let stream = try await session.acceptStream() { /* read and write */ }
 }
@@ -273,7 +283,8 @@ offer. This is where Garuda stands, area by area.
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
 | Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: no tracing API or request limits in code |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
-| Server-sent events | `Sse` | `EventStream` | Done |
+| Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` | Done |
+| Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay | Done |
 | Streaming request bodies | `Body::into_data_stream` | `onStreamingBody`, with a limit per route and flow control back to the client | Done |
 | Resumable uploads | None built in; tus through other crates | `GarudaUploads`: the IETF resumable upload protocol | Done |
 | Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints | Done |
@@ -380,13 +391,13 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 561 unit tests, and the fuzz corpus
+swift test                                   # 573 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
 The end-to-end suites run against a release build. Each takes a binary path as
 its first argument. Most use `.build/release/garuda`; `handler-test.py`,
-`websocket-test.py`, `webtransport-test.py` and `upload-test.py` use
+`websocket-test.py`, `webtransport-test.py`, `upload-test.py` and `broadcast-test.py` use
 `.build/release/garuda-conformance`, whose routes exist only for the tests.
 
 ```bash
@@ -410,6 +421,7 @@ python3 scripts/handler-test.py              # 143 the handler API over all thre
 python3 scripts/websocket-test.py            # 104 handshake, framing violations, closing, pings, deflate
 python3 scripts/webtransport-test.py         # 46  sessions, streams, datagrams
 python3 scripts/upload-test.py               # 35  streamed request bodies, 1xx, resumable uploads
+python3 scripts/broadcast-test.py            # 35  topics across workers, Last-Event-ID, keep-alive
 ```
 
 The shell suites need `curl` and `openssl`. The Python suites are clients only,
