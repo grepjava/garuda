@@ -21,6 +21,7 @@ let package = Package(
         .executable(name: "garuda", targets: ["garuda-server"]),
         .executable(name: "garuda-conformance", targets: ["garuda-conformance"]),
         .library(name: "Garuda", targets: ["Garuda"]),
+        .library(name: "GarudaUploads", targets: ["GarudaUploads"]),
     ],
     targets: [
         .target(
@@ -55,6 +56,11 @@ let package = Package(
                 dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC", "GarudaPostgres"],
                 swiftSettings: sharedSwiftSettings),
 
+        // Resumable uploads (draft-ietf-httpbis-resumable-upload), built on the
+        // public handler API alone: `import GarudaUploads`.
+        .target(name: "GarudaUploads", dependencies: ["GarudaHTTP", "Garuda"],
+                swiftSettings: sharedSwiftSettings),
+
         // The `garuda` executable. Its module is not named `garuda`, which a
         // case-insensitive file system would take for the `Garuda` module.
         .executableTarget(name: "garuda-server", dependencies: ["Garuda"],
@@ -63,7 +69,7 @@ let package = Package(
 
         // The routes the end-to-end suites need a handler for.
         .executableTarget(name: "garuda-conformance",
-                          dependencies: ["GarudaCore", "GarudaHTTP", "Garuda"],
+                          dependencies: ["GarudaCore", "GarudaHTTP", "Garuda", "GarudaUploads"],
                           path: "Sources/GarudaConformance",
                           swiftSettings: sharedSwiftSettings),
 
@@ -81,6 +87,9 @@ let package = Package(
         .testTarget(name: "GarudaTests",
                     dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC", "GarudaPostgres",
                                    "Garuda", "GarudaFuzzTargets", "CAllocationCounter"],
+                    swiftSettings: [.swiftLanguageMode(.v6)]),
+        .testTarget(name: "GarudaUploadsTests",
+                    dependencies: ["GarudaHTTP", "Garuda", "GarudaUploads"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
     ],
     cLanguageStandard: .gnu11

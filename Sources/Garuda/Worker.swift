@@ -531,6 +531,10 @@ public struct Worker {
                 setInterest(slot, PollMask(rawValue: c.pointee.interest).subtracting(.read))
                 return
             }
+            if c.pointee.flags.contains(.bodyStreaming) {
+                pumpStreamedBody(slot)
+                return
+            }
         }
 
         let s = table[slot]
@@ -661,6 +665,12 @@ public struct Worker {
 
             case .dispatching:
                 dispatch(slot)
+                // A streaming route is running with its body still to come:
+                // whatever of it is already here is its to read.
+                if table[slot].pointee.state == .dispatching
+                    && table[slot].pointee.flags.contains(.bodyStreaming) {
+                    pumpStreamedBody(slot)
+                }
                 // A route answered inline has already moved on to .writing by
                 // now. One that parked a continuation (GET /delay) is still
                 // .dispatching: the connection now belongs to that
@@ -725,7 +735,15 @@ public struct Worker {
         }
         if c.pointee.head.method == .head { c.pointee.flags.insert(.suppressBody) }
 
-        if c.pointee.head.contentLength > config.maxBodySize {
+        // A route that reads its body as it arrives is dispatched at the head,
+        // and holds the body to its own limit.
+        if c.pointee.bodyStream != nil { detachStreamedBody(slot) }
+        c.pointee.bodyLimit = config.maxBodySize
+        if (c.pointee.head.isChunked || c.pointee.head.contentLength > 0)
+            && application?.pointee.streamsBodies == true {
+            beginStreamedBody(slot)
+        }
+        if c.pointee.head.contentLength > c.pointee.bodyLimit {
             failRequest(slot, status: 413)
             return false
         }
@@ -748,9 +766,10 @@ public struct Worker {
             if !flush(slot) { return false }
         }
 
+        let streamed = c.pointee.flags.contains(.bodyStreaming)
         if c.pointee.head.isChunked {
             c.pointee.bodyRemaining = -1
-            c.pointee.state = .readingBody
+            c.pointee.state = streamed ? .dispatching : .readingBody
         } else if c.pointee.head.contentLength > 0 {
             let total = c.pointee.head.contentLength
             // Anything of the body already buffered moves out of `read` now, so
@@ -762,7 +781,7 @@ public struct Worker {
                 c.pointee.read.consume(have)
             }
             c.pointee.bodyRemaining = total - have
-            c.pointee.state = c.pointee.bodyRemaining == 0 ? .dispatching : .readingBody
+            c.pointee.state = c.pointee.bodyRemaining == 0 || streamed ? .dispatching : .readingBody
         } else {
             c.pointee.bodyRemaining = 0
             c.pointee.state = .dispatching
@@ -781,7 +800,7 @@ public struct Worker {
         }
         var consumed = 0
         let base = UnsafePointer(c.pointee.read.readPointer)
-        let limit = config.maxBodySize
+        let limit = c.pointee.bodyLimit
         var overflow = false
         let outcome = c.pointee.chunked.decode(base, available, consumed: &consumed) { p, n in
             // Against everything decoded, not against what is sitting in the
@@ -794,6 +813,7 @@ public struct Worker {
         }
         c.pointee.read.consume(consumed)
         if overflow {
+            c.pointee.bodyStream?.failure = .tooLarge
             failRequest(slot, status: 413)
             return false
         }
@@ -871,6 +891,10 @@ public struct Worker {
     /// DATA into the body buffer and call this; HTTP/1 waits in `processInput`.
     mutating func onBodyProgress(_ slot: Int) {
         let c = table[slot]
+        if c.pointee.flags.contains(.bodyStreaming) {
+            c.pointee.bodyStream?.wake()
+            return
+        }
         guard c.pointee.bodyRemaining == 0,
               c.pointee.state == .readingBody else { return }
         c.pointee.state = .dispatching
@@ -1366,6 +1390,8 @@ public struct Worker {
         let c = table[slot]
         if c.pointee.state == .free { return }
         cancelOps(slot: slot)
+        // A streaming route's reader keeps what arrived before the end.
+        if c.pointee.bodyStream != nil { detachStreamedBody(slot) }
         // Before the slot goes back on the free list: an op left armed would
         // fire into whichever request takes the slot next.
         disarmDeadline(slot)
@@ -1527,10 +1553,11 @@ public struct Worker {
                 if idle > limit { closeConnection(slot) }
             case .readingBody, .writing:
                 if idle > config.requestHeadTimeoutMs { closeConnection(slot) }
-            case .dispatching where c.pointee.writerWake != nil:
-                // A streamed response the client stopped reading. One that is
-                // merely quiet -- events a minute apart -- has nobody waiting
-                // here, and is left alone.
+            case .dispatching where c.pointee.writerWake != nil
+                                 || c.pointee.bodyStream?.waiter != nil:
+                // A streamed response the client stopped reading, or a body
+                // it stopped sending. One that is merely quiet -- events a
+                // minute apart -- has nobody waiting here, and is left alone.
                 if idle > config.requestHeadTimeoutMs { closeConnection(slot) }
             case .websocket:
                 sweepWebSocket(slot, now: now)

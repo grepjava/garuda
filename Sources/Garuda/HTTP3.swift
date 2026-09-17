@@ -491,7 +491,7 @@ extension Worker {
 
     // MARK: - Request streams
 
-    private mutating func readRequestStream(_ slot: Int, _ h3: H3Connection,
+    mutating func readRequestStream(_ slot: Int, _ h3: H3Connection,
                                             _ streamID: UInt64) {
         guard let stream = h3.quic.stream(streamID) else { return }
         // A request before the peer's SETTINGS is not fatal on its own -- the
@@ -534,6 +534,9 @@ extension Worker {
             let available = stream.receive.ready.readableBytes
             if available == 0 { break }
             let s = streamSlot >= 0 ? table[streamSlot] : nil
+            // A route reading its body as it arrives needs no limit here: its
+            // stream's window grows only by what the handler has read, so what
+            // it leaves unread is never more than one window.
 
             // Mid-frame: DATA continues into whatever arrived.
             if let s, s.pointee.h3FrameRemaining > 0 {
@@ -650,9 +653,15 @@ extension Worker {
         } else if streamSlot >= 0 {
             onBodyProgress(streamSlot)
         }
-        // Reading is what opens the window again.
+        // Reading is what opens the window again. For a route reading as it
+        // goes, only what it has taken counts as read.
         if streamSlot >= 0 {
-            h3.quic.extendStreamWindow(streamID, consumed: stream.receive.received)
+            var consumed = stream.receive.received
+            let s = table[streamSlot]
+            if s.pointee.state != .free && s.pointee.flags.contains(.bodyStreaming) {
+                consumed -= UInt64(stream.receive.ready.readableBytes + s.pointee.body.readableBytes)
+            }
+            h3.quic.extendStreamWindow(streamID, consumed: consumed)
         }
     }
 
@@ -680,7 +689,8 @@ extension Worker {
         }
         // Cumulative, as on the other two: `bodyReceived` has already been
         // advanced by this run, and is what the upload actually totals.
-        if s.pointee.bodyReceived > config.maxBodySize {
+        if s.pointee.bodyReceived > s.pointee.bodyLimit {
+            s.pointee.bodyStream?.failure = .tooLarge
             failRequest(streamSlot, status: 413)
             return false
         }
@@ -728,7 +738,15 @@ extension Worker {
         }
         // The handler runs once the whole request is in: the frame loop
         // reads the DATA frames that follow, and the end of the stream is what
-        // dispatches it.
+        // dispatches it. Unless its route reads the body as it arrives.
+        if application?.pointee.streamsBodies == true {
+            beginStreamedBody(streamSlot)
+            if s.pointee.flags.contains(.bodyStreaming) {
+                s.pointee.state = .dispatching
+                dispatch(streamSlot)
+                return table[streamSlot].pointee.state == .free ? -1 : streamSlot
+            }
+        }
         s.pointee.state = .readingBody
         return streamSlot
     }
@@ -757,6 +775,8 @@ extension Worker {
         s.pointee.chunked = ChunkedDecoder()
         s.pointee.bodyRemaining = -1
         s.pointee.bodyReceived = 0
+        s.pointee.bodyStream = nil
+        s.pointee.bodyLimit = config.maxBodySize
         s.pointee.requestCount = 1
         s.pointee.requestId &+= 1
         s.pointee.resetContinuation()

@@ -240,6 +240,10 @@ public final class Application {
         for (i, allowed) in routes.deadlines.enumerated() {
             (deadlines + i).initialize(to: allowed)
         }
+        let bodyLimits = UnsafeMutablePointer<Int>.allocate(capacity: max(1, count))
+        for (i, limit) in routes.bodyLimits.enumerated() {
+            (bodyLimits + i).initialize(to: limit)
+        }
         let start = startHooks
         let shutdown = shutdownHooks
         let application = UnsafeMutablePointer<CompiledApplication>.allocate(capacity: 1)
@@ -247,6 +251,8 @@ public final class Application {
             routes: routes.table.compile(),
             handlers: handlers,
             deadlines: deadlines,
+            bodyLimits: bodyLimits,
+            streamsBodies: routes.bodyLimits.contains { $0 >= 0 },
             handlerCount: count,
             stateFactories: stateFactories,
             stateShutdowns: stateShutdowns,
@@ -264,6 +270,11 @@ struct CompiledApplication {
     let handlers: UnsafeMutablePointer<Handler>
     /// Milliseconds each route is allowed, by route number, 0 for none.
     let deadlines: UnsafeMutablePointer<UInt32>
+    /// Each route's streamed body limit, -1 for a route given its body whole.
+    let bodyLimits: UnsafeMutablePointer<Int>
+    /// Whether any route streams its body, so a request with a body is
+    /// matched at its head only when one might.
+    let streamsBodies: Bool
     let handlerCount: Int
     let stateFactories: [(ObjectIdentifier, (Int) throws -> Any)]
     let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]
@@ -276,6 +287,8 @@ struct CompiledApplication {
         handlers.deallocate()
         deadlines.deinitialize(count: handlerCount)
         deadlines.deallocate()
+        bodyLimits.deinitialize(count: handlerCount)
+        bodyLimits.deallocate()
     }
 }
 

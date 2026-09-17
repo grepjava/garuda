@@ -241,7 +241,7 @@ class H1:
         for line in lines[1:]:
             name, _, value = line.partition(":")
             headers.append((name.strip().lower(), value.strip()))
-        if status == 100:
+        if 100 <= status < 200:
             return Response(status, headers, b"")
         if (method != "HEAD" and status not in (204, 304)
                 and ("transfer-encoding", "chunked") in headers):

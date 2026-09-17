@@ -123,6 +123,9 @@ public struct ConnFlags: OptionSet, Sendable {
     /// The head is sent and the body is still being written by the handler
     /// (`Response.stream`). `responseComplete` joins it when the body ends.
     public static let streamingResponse = ConnFlags(rawValue: 1 << 22)
+    /// The request's route reads its body as it arrives (`onStreamingBody`),
+    /// so it was dispatched at its head and the body is still coming.
+    public static let bodyStreaming = ConnFlags(rawValue: 1 << 23)
 
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
@@ -130,7 +133,7 @@ public struct ConnFlags: OptionSet, Sendable {
     public static let perRequest: ConnFlags = [
         .owesContinue, .chunkedResponse, .responseStarted, .responseComplete,
         .suppressBody, .disconnected, .disconnectSent, .bodyDelivered,
-        .endStreamSent, .invalidatesCache, .timedOut, .streamingResponse,
+        .endStreamSent, .invalidatesCache, .timedOut, .streamingResponse, .bodyStreaming,
     ]
 }
 
@@ -296,6 +299,15 @@ public struct Connection {
     /// A handler waiting for a streamed response's backlog to drain: resumed
     /// with true when it has, false when the request ends first.
     var writerWake: UnsafeContinuation<Bool, Never>? = nil
+    /// The body a streaming route is reading as it arrives, shared with its
+    /// reader so what arrived survives the slot closing.
+    var bodyStream: RequestBodyState? = nil
+    /// The most body this request may send: `--max-body`, or its route's own
+    /// limit when the route streams its body.
+    var bodyLimit: Int = 0
+    /// How much of an HTTP/2 streaming body has been given back to the
+    /// stream's window.
+    var bodyNoted: Int = 0
 
     /// True when this slot is one stream of a multiplexed connection rather
     /// than a connection in its own right.

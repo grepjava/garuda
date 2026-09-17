@@ -63,6 +63,9 @@ struct Routes {
     /// Milliseconds each route is allowed, by route number, or 0 for no
     /// deadline. Parallel to `handlers`: a route is an index into both.
     var deadlines: [UInt32] = []
+    /// The body limit of each route that reads its body as it arrives, by
+    /// route number, or -1 for a route given its body whole.
+    var bodyLimits: [Int] = []
     /// What routes registered right now are given, set while
     /// `Application.deadline(milliseconds:)` registers a group of them.
     var currentDeadline: UInt32 = 0
@@ -96,6 +99,7 @@ struct Routes {
         handlers.append(handler)
         asyncHandlers.append(nil)
         deadlines.append(currentDeadline)
+        bodyLimits.append(-1)
         routeGroups.append(openGroups)
     }
 

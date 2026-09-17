@@ -19,6 +19,16 @@
 //   GET  /stream-queued/:n/:size the same pieces as /stream, then a line with
 //                                the most bytes ever queued after a write
 //   GET  /events/:n              n server-sent events, "event i", 10 ms apart
+//   POST /body-stream            reads the body as it arrives, answers
+//                                "<bytes> <fnv-1a hex>"; ?slow=1 waits 1 ms
+//                                every 64 KiB read, ?hold=1 waits 1.5 s before
+//                                reading anything
+//   POST /body-limited           /body-stream, held to 1 KiB
+//   POST /interim                a 103 with a Link, then 200
+//   POST /files                  resumable uploads (scripts/upload-test.py),
+//                                kept in $GARUDA_UPLOAD_DIR; a finished one is
+//                                answered 201 "<bytes> <fnv-1a hex>"
+//   HEAD, PATCH, DELETE /uploads/:id   the uploads themselves
 //   GET  /                       200, empty
 //
 // WebTransport, for scripts/webtransport-test.py:
@@ -53,6 +63,7 @@ import Darwin
 import GarudaCore
 import GarudaHTTP
 import Garuda
+import GarudaUploads
 
 /// The worker index onStart ran with in this process, or -1.
 nonisolated(unsafe) var startedWorker = -1
@@ -334,6 +345,69 @@ app.get("/events/:n") { (n: Path<Int>) async -> EventStream in
             try await events.send("event \(i)", id: "\(i)")
             try await events.sleep(milliseconds: 10)
         }
+    }
+}
+
+/// FNV-1a over bytes, in pieces: enough to tell a body that arrived intact
+/// from one that did not, without keeping it.
+struct Checksum {
+    var value: UInt64 = 0xcbf29ce484222325
+    var count = 0
+    mutating func add(_ bytes: [UInt8]) {
+        for byte in bytes {
+            value ^= UInt64(byte)
+            value &*= 0x100000001b3
+        }
+        count += bytes.count
+    }
+    var text: String {
+        let hex = String(value, radix: 16)
+        return "\(count) " + String(repeating: "0", count: 16 - hex.count) + hex
+    }
+}
+
+app.onStreamingBody(.post, "/body-limited", maxBodySize: 1024) { _, response, body in
+    var sum = Checksum()
+    while let bytes = try await body.read() { sum.add(bytes) }
+    response.send(sum.text)
+}
+
+app.onStreamingBody(.post, "/body-stream") { request, response, body in
+    let slow = request.query.contains("slow=1")
+    if request.query.contains("hold=1") { try await response.sleep(milliseconds: 1500) }
+    var sum = Checksum()
+    var sinceWait = 0
+    while let bytes = try await body.read() {
+        sum.add(bytes)
+        sinceWait += bytes.count
+        if slow && sinceWait >= 64 * 1024 {
+            sinceWait = 0
+            try await response.sleep(milliseconds: 1)
+        }
+    }
+    response.send(sum.text)
+}
+
+app.onAsync(.post, "/interim") { _, response in
+    response.sendInterim(status: HTTPStatus(103), headers: [("Link", "</style.css>; rel=preload")])
+    response.send("final")
+}
+
+if let directory = environment("GARUDA_UPLOAD_DIR"), let store = try? FileUploadStore(directory: directory) {
+    app.resumableUploads("/files", store: store, progressInterval: 1 << 20) { upload in
+        var sum = Checksum()
+        let fd = open(upload.path, O_RDONLY)
+        if fd >= 0 {
+            var chunk = [UInt8](repeating: 0, count: 1 << 16)
+            while true {
+                let n = chunk.withUnsafeMutableBufferPointer { read(fd, $0.baseAddress!, $0.count) }
+                if n <= 0 { break }
+                sum.add(Array(chunk[0..<n]))
+            }
+            close(fd)
+        }
+        try upload.remove()
+        return Text(sum.text, status: .created)
     }
 }
 

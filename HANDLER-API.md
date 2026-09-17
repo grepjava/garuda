@@ -156,6 +156,20 @@ one writer waits at a time; another finds it waiting and returns, its bytes
 queued behind. A stalled reader is closed after `--request-timeout`.
 `EventStream` is built on the writer.
 
+A route registered with `onStreamingBody` has its own body limit, kept beside
+the routes, and is dispatched when its head arrives instead of after its body.
+The body stays in the connection's buffer until the handler reads it. Reading
+is what lets more in: on HTTP/1.1 it restores read interest, on HTTP/2 it
+returns window, and on HTTP/3 the stream window grows only by what was read, so
+one window bounds what a slow handler leaves unread. The reader's state lives
+apart from the connection slot, so when a connection closes, what arrived is
+handed to the reader before it throws `incomplete`. That is what makes an
+interrupted upload resumable.
+
+Resumable uploads are a separate target, `GarudaUploads`, like `GarudaPostgres`:
+a file store locked with `flock`, the draft's routes, and limits enforced in the
+handler rather than by the engine, so a 413 can carry `Upload-Limit`.
+
 WebTransport sessions and streams use the same shape: waits are continuations
 on the session and stream, resumed from the frame loop. The session comes first
 in a WebTransport handler because Swift will not pass arguments after a
@@ -188,7 +202,7 @@ wait once.
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | PostgreSQL done; Redis, SQLite and the blocking pool to do |
 | 4 | Groups, 405, middleware, response hooks, shipped middleware | Shipped middleware and router merging to do |
-| 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, SSE and WebTransport done |
+| 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, request bodies, SSE, resumable uploads and WebTransport done |
 | 6 | Examples and realistic benchmarks | To do |
 
 ### Still to build
@@ -208,8 +222,6 @@ wait once.
   request limits.
 
 **Step 5**
-- Streamed request bodies with backpressure, per-route body limits, and early
-  responses without buffering the whole upload.
 - `--compress` and `--cache-size` acting on handler responses in the sink.
 - WebSocket handlers over the engine's existing handshake, framing, UTF-8
   checks, pings, size limits and `--ws-compress`. The handler sees whole

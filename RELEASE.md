@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 752 unit tests
+swift test                             # 796 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -41,6 +41,7 @@ python3 scripts/http3-test.py          # 53
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 136, runs garuda-conformance
 python3 scripts/webtransport-test.py   # 46, runs garuda-conformance
+python3 scripts/upload-test.py         # 35, runs garuda-conformance
 ```
 
 The Python suites need `h2` and `aioquic`.
@@ -145,6 +146,41 @@ The Python suites need `h2` and `aioquic`.
   event name or ID, and `cache-control: no-cache` is set unless the handler set
   its own.
 
+### Streamed request bodies, interim responses and resumable uploads
+
+- `app.onStreamingBody(.post, "/upload", maxBodySize:) { request, response, body in … }`
+  runs when the request's head arrives. `body.read(maxBytes:)` returns the next
+  piece, or nil at the end, and `readAll(maxBytes:)` the rest. `maxBodySize`
+  replaces `--max-body` for that route and is unlimited if left out.
+- Reading is flow control. Unread bytes hold back an HTTP/1.1 connection's
+  reads, the HTTP/2 stream window and the QUIC stream window, so a handler
+  that writes to a slow disk slows only its own client.
+- A body that ends short throws `RequestBodyError.incomplete`, but only after
+  everything that did arrive has been read. `body.cancel()` ends the request.
+  Two reads at once throw `concurrentRead`.
+- `response.sendInterim(status:headers:)` sends a 1xx before the answer, such
+  as 103 Early Hints, on HTTP/1.1, HTTP/2 and HTTP/3. It does nothing on
+  HTTP/1.0 or once the answer has started.
+- A new module, `GarudaUploads`, implements resumable uploads
+  (draft-ietf-httpbis-resumable-upload-12, interop version 9):
+  `app.resumableUploads("/files", store: FileUploadStore(directory:)) { upload in … }`.
+  A client that is cut off asks for the offset with HEAD or GET, and appends
+  the rest with PATCH. Creation can be POST, PUT or PATCH.
+  - Only a client that sends `Upload-Draft-Interop-Version: 9` gets 104
+    responses, as the draft requires.
+  - `UploadLimits` sets `max-size`, `max-append-size` and `max-age`, advertised
+    in `Upload-Limit` and enforced as the body arrives, including bodies with no
+    declared length.
+  - A wrong offset or inconsistent length is answered with the draft's problem
+    documents.
+  - Only one request appends to an upload at a time, across worker processes,
+    through a file lock. A client that resumes on the same worker while its old
+    request is still open ends the old one, keeping what it received.
+- `scripts/upload-test.py` (35 checks) covers streamed bodies, flow control,
+  per-route limits, interim responses and uploads over HTTP/1.1, HTTP/2 and
+  HTTP/3, including resuming after a dropped connection and a reset QUIC
+  stream.
+
 ### WebTransport
 
 - `app.webTransport("/room/:id") { (session: WebTransportSession, id: Path<Int>) async throws in … }`
@@ -214,11 +250,17 @@ The Python suites need `h2` and `aioquic`.
 
 ### Not yet
 
-- WebSocket handlers, streamed request bodies, router values to merge, custom
-  fallbacks, and shipped middleware for authentication, CORS and tracing.
+- WebSocket handlers, router values to merge, custom fallbacks, and shipped
+  middleware for authentication, CORS and tracing.
   Middleware cannot wrap a handler's run.
 - `--compress` and `--cache-size` do not act on handler responses.
 - WebTransport is HTTP/3 only.
+- Resumable uploads have no `min-size` or `min-append-size` and no digests,
+  and a completed upload is not replayed. A request still appending on
+  another worker is waited for briefly, then the new request gets 409 with
+  Retry-After. Expired uploads are removed when uploads are created.
+- A body over its limit is refused with a stream reset on HTTP/2, where
+  HTTP/1.1 and HTTP/3 answer 413.
 - PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types of
   its own (they read as text), no `LISTEN`, and no SASLprep for non-ASCII
   passwords. No Redis or SQLite driver, and no pool for blocking work.

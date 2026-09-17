@@ -163,6 +163,8 @@ public enum HTTPResponseWriter {
         switch code {
         case 100: return "Continue"
         case 101: return "Switching Protocols"
+        case 103: return "Early Hints"
+        case 104: return "Upload Resumption Supported"
         case 200: return "OK"
         case 201: return "Created"
         case 202: return "Accepted"

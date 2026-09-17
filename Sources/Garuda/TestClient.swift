@@ -24,6 +24,8 @@ public struct TestResponse {
     /// Every header as received, in order and with repeats.
     public let headers: [(name: String, value: String)]
     public let body: [UInt8]
+    /// The informational (1xx) responses that came before this one, in order.
+    public internal(set) var interim: [(status: HTTPStatus, headers: [(name: String, value: String)])] = []
 
     /// The body as text, with invalid UTF-8 repaired.
     public var text: String { String(decoding: body, as: UTF8.self) }
@@ -267,6 +269,12 @@ extension TestResponse {
     /// The first final response in `bytes`, or nil while it is incomplete.
     static func parse(_ bytes: [UInt8], bodyless: Bool, closed: Bool) throws -> TestResponse? {
         var start = 0
+        var interim: [(status: HTTPStatus, headers: [(name: String, value: String)])] = []
+        func final(_ response: TestResponse) -> TestResponse {
+            var response = response
+            response.interim = interim
+            return response
+        }
         while true {
             guard let end = headEnd(bytes, from: start) else { return nil }
             let text = String(decoding: bytes[start..<end], as: UTF8.self)
@@ -287,6 +295,7 @@ extension TestResponse {
             let bodyStart = end + 4
             // An interim response: the final one follows it.
             if status >= 100 && status < 200 {
+                interim.append((HTTPStatus(status), headers))
                 start = bodyStart
                 continue
             }
@@ -294,20 +303,20 @@ extension TestResponse {
                 headers.first { $0.name.lowercased() == name }?.value
             }
             if bodyless || status == 204 || status == 304 {
-                return TestResponse(status: HTTPStatus(status), headers: headers, body: [])
+                return final(TestResponse(status: HTTPStatus(status), headers: headers, body: []))
             }
             if let length = value("content-length").flatMap({ Int($0) }) {
                 guard bytes.count - bodyStart >= length else { return nil }
-                return TestResponse(status: HTTPStatus(status), headers: headers,
-                                    body: Array(bytes[bodyStart..<(bodyStart + length)]))
+                return final(TestResponse(status: HTTPStatus(status), headers: headers,
+                                          body: Array(bytes[bodyStart..<(bodyStart + length)])))
             }
             if value("transfer-encoding")?.lowercased() == "chunked" {
                 guard let body = try dechunk(bytes, from: bodyStart) else { return nil }
-                return TestResponse(status: HTTPStatus(status), headers: headers, body: body)
+                return final(TestResponse(status: HTTPStatus(status), headers: headers, body: body))
             }
             // Neither: the body runs to the close.
             guard closed else { return nil }
-            return TestResponse(status: HTTPStatus(status), headers: headers, body: Array(bytes[bodyStart...]))
+            return final(TestResponse(status: HTTPStatus(status), headers: headers, body: Array(bytes[bodyStart...])))
         }
     }
 

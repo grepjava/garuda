@@ -22,9 +22,9 @@ no scheduling hop before a response that can be sent at once.
 
 **Status: early, and the API will change.** Routes, groups and middleware,
 synchronous and async handlers, typed extraction and answers, per-worker state,
-deadlines, an HTTP client, a PostgreSQL driver, streamed responses, server-sent
-events and WebTransport all work and are tested. WebSocket handlers and
-streamed request bodies do not exist yet. Nothing has been released.
+deadlines, an HTTP client, a PostgreSQL driver, streamed responses and request
+bodies, server-sent events, resumable uploads and WebTransport all work and are
+tested. WebSocket handlers do not exist yet. Nothing has been released.
 [HANDLER-API.md](HANDLER-API.md) has the roadmap, and [Status](#status) below
 lists what is tested and what is missing.
 
@@ -189,6 +189,36 @@ stream rather than ending it cleanly. WebTransport runs over HTTP/3 on the same
 port and routes, with bidirectional and unidirectional streams, datagrams and
 close codes.
 
+### Streamed request bodies and resumable uploads
+
+```swift
+app.onStreamingBody(.put, "/files/:name", maxBodySize: 10 << 30) { request, response, body in
+    while let bytes = try await body.read() { try file.write(bytes) }   // as it arrives
+    response.send(status: .created)
+}
+
+import GarudaUploads
+
+app.resumableUploads("/uploads", store: try FileUploadStore(directory: "/var/lib/app/uploads"),
+                     limits: UploadLimits(maxSize: 10 << 30)) { upload in
+    try moveIntoPlace(upload.path)
+    try upload.remove()
+    return HTTPStatus.created
+}
+```
+
+A route registered with `onStreamingBody` runs as soon as the request's head
+arrives, and reads the body as it comes, with its own size limit. Reading is
+flow control: bytes the handler has not read hold back the client over
+HTTP/1.1, HTTP/2 and HTTP/3, so a slow disk slows only its own upload. If the
+client goes away part-way, the handler still reads everything that arrived and
+then gets `RequestBodyError.incomplete`.
+
+`GarudaUploads` implements the IETF resumable upload protocol
+(draft-ietf-httpbis-resumable-upload, interop version 9). A client cut off
+mid-upload asks how much arrived and sends the rest, over any protocol and on
+any worker. `response.sendInterim` sends 1xx responses such as 103 Early Hints.
+
 ### Testing
 
 ```swift
@@ -224,7 +254,9 @@ offer. This is where Garuda stands, area by area.
 | Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline` | Partial: no CORS or auth middleware |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
 | Server-sent events | `Sse` | `EventStream` | Done |
-| Streaming request bodies | `Body::into_data_stream` | Read whole, up to `--max-body` | Planned |
+| Streaming request bodies | `Body::into_data_stream` | `onStreamingBody`, with a limit per route and flow control back to the client | Done |
+| Resumable uploads | None built in; tus through other crates | `GarudaUploads`: the IETF resumable upload protocol | Done |
+| Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints | Done |
 | WebSockets | `WebSocketUpgrade` | Refused with 501 | Planned |
 | WebTransport | None in hyper | `app.webTransport` | Done |
 | HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2 | Done; no redirects or decompression |
@@ -325,13 +357,13 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 752 unit tests, and the fuzz corpus
+swift test                                   # 796 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
 The end-to-end suites run against a release build. Each takes a binary path as
 its first argument. Most use `.build/release/garuda`; `handler-test.py` and
-`webtransport-test.py` use `.build/release/garuda-conformance`, whose routes
+`webtransport-test.py` and `upload-test.py` use `.build/release/garuda-conformance`, whose routes
 exist only for the tests.
 
 ```bash
@@ -352,6 +384,7 @@ python3 scripts/http3-test.py                # 53  against aioquic
 python3 scripts/router-streams-test.py       # 41  routes over HTTP/2 and HTTP/3
 python3 scripts/handler-test.py              # 136 the handler API over all three protocols
 python3 scripts/webtransport-test.py         # 46  sessions, streams, datagrams
+python3 scripts/upload-test.py               # 35  streamed request bodies, 1xx, resumable uploads
 ```
 
 The shell suites need `curl` and `openssl`. The Python suites are clients only,
@@ -373,7 +406,6 @@ end-to-end tests wait on the handler API step that connects them:
 | Compression in the response path | `--compress`: codec choice, `Content-Length` removal, `Vary`, weak `ETag`, `no-transform`, event streams, the small-body exemption |
 | Caching in the response path | `--cache-size`: storing, HEAD from GET, 304 revalidation, retirement on unsafe methods, `Age` and TTL, credentials kept out, flush on reload |
 | WebSocket handlers | Handshake, framing, UTF-8 checks, size limits, pings and timeouts, `--ws-compress` |
-| Streamed request bodies | Backpressure on uploads, answering before an upload finishes |
 | A logging API | Levels applied to handler log records |
 
 A handler waiting on something other than the engine (its own continuation,
@@ -383,9 +415,12 @@ say) is not unwound when its request is cancelled. It resumes to find
 ### Not supported
 
 
-- A stable API, WebSocket handlers, streamed request bodies, router values to
-  merge, custom fallbacks, CORS and auth middleware, Redis, SQLite and a
-  blocking pool.
+- A stable API, WebSocket handlers, router values to merge, custom fallbacks,
+  CORS and auth middleware, Redis, SQLite and a blocking pool.
+- Resumable uploads have no `min-size` or `min-append-size` limits and no
+  digests, and a completed upload is not replayed to a client that asks again.
+- A body over its limit is answered 413 on HTTP/1.1 and HTTP/3, and refused
+  with a stream reset (ENHANCE_YOUR_CALM) on HTTP/2.
 - Byte ranges and directory listings for static files.
 - QUIC session resumption and 0-RTT.
 - TLS over TCP in Swift: it is OpenSSL.

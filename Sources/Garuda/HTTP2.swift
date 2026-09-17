@@ -306,16 +306,21 @@ extension Worker {
                 // Cumulative, not buffered: an application reading as the
                 // body arrives keeps the buffer small, and a limit measured
                 // there is no limit on the upload at all.
-                if s.pointee.bodyReceived > config.maxBodySize {
+                if s.pointee.bodyReceived > s.pointee.bodyLimit {
+                    s.pointee.bodyStream?.failure = .tooLarge
                     streamError(slot, h2, header.streamID, .enhanceYourCalm)
                     return
                 }
                 s.pointee.body.write(payload + offset, length)
-                // A handler is given the whole body before it runs, so a
-                // byte buffered is a byte consumed. Holding the window back
-                // until a handler read it would stall every upload larger than
-                // the window; --max-body above is what bounds the buffer.
-                h2NoteConsumed(streamSlot, length)
+                // A handler given the whole body before it runs has, in
+                // effect, consumed a byte once it is buffered. Holding the
+                // window back until a handler read it would stall every upload
+                // larger than the window; --max-body above bounds the buffer.
+                // A route reading as it goes consumes as it reads, and the
+                // window is what bounds its buffer.
+                if !s.pointee.flags.contains(.bodyStreaming) {
+                    h2NoteConsumed(streamSlot, length)
+                }
             }
         }
 
@@ -523,8 +528,17 @@ extension Worker {
 
         // The body is buffered whole before dispatch, so a stream with one
         // still to come waits for the stream to end -- exactly as a request
-        // does on HTTP/1.
+        // does on HTTP/1. Unless its route reads the body as it arrives.
         if !endStream {
+            if application?.pointee.streamsBodies == true {
+                beginStreamedBody(streamSlot)
+                if s.pointee.flags.contains(.bodyStreaming) {
+                    s.pointee.state = .dispatching
+                    dispatch(streamSlot)
+                    if table[slot].pointee.state == .http2 { _ = flush(slot) }
+                    return
+                }
+            }
             s.pointee.state = .readingBody
             return
         }
@@ -906,6 +920,9 @@ extension Worker {
         s.pointee.chunked = ChunkedDecoder()
         s.pointee.bodyRemaining = -1
         s.pointee.bodyReceived = 0
+        s.pointee.bodyStream = nil
+        s.pointee.bodyLimit = config.maxBodySize
+        s.pointee.bodyNoted = 0
         s.pointee.requestCount = 1
         s.pointee.requestId &+= 1
         s.pointee.resetContinuation()
