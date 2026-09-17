@@ -103,6 +103,7 @@ extension Worker {
     /// or answers 404.
     mutating func dispatchRoute(_ slot: Int) {
         guard let installed = application else {
+            if serveSPAFallback(slot) { return }
             respond(slot, status: 404, nil, 0)
             return
         }
@@ -139,6 +140,7 @@ extension Worker {
                 let fallback = installed.pointee.fallbacks.isEmpty
                     ? -1 : installed.pointee.fallbacks.match(base, count)
                 guard fallback >= 0 else {
+                    if serveSPAFallback(slot) { return }
                     respond(slot, status: 404, nil, 0)
                     return
                 }

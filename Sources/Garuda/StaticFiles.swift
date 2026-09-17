@@ -245,6 +245,40 @@ extension Worker {
         return false
     }
 
+    /// Serves a `--spa-fallback` page for a GET or HEAD that no file, route
+    /// or scope fallback answered, when it is under the fallback's prefix and
+    /// accepts `text/html`: a browser navigating to a client-side route. A
+    /// request for a missing script or image, or an API call, does not ask for
+    /// HTML, and keeps its 404.
+    mutating func serveSPAFallback(_ slot: Int) -> Bool {
+        if config.spaFallbacks.isEmpty { return false }
+        let c = table[slot]
+        let method = c.pointee.head.method
+        guard method == .get || method == .head else { return false }
+        guard let accept = requestHeader(slot, "accept", 6), acceptsHTML(accept) else { return false }
+        let path = c.pointee.head.path.span(in: c.pointee.headBase())
+        for fallback in config.spaFallbacks {
+            let prefixLength = Int(strlen(fallback.prefix))
+            // "/" covers every path; any other prefix, whole segments of it.
+            if prefixLength > 1 {
+                guard path.count >= prefixLength else { continue }
+                var i = 0
+                while i < prefixLength && path.base[i] == UInt8(bitPattern: fallback.prefix[i]) { i += 1 }
+                guard i == prefixLength, path.count == prefixLength || path.base[prefixLength] == 0x2F else { continue }
+            }
+            var size: Int64 = 0
+            var mtime: Int64 = 0
+            let fd = av_static_open(fallback.directory, fallback.file, &size, &mtime)
+            if fd < 0 { continue }
+            var name = Array(UnsafeBufferPointer(start: UnsafeRawPointer(fallback.file).assumingMemoryBound(to: UInt8.self),
+                                                 count: Int(strlen(fallback.file)))) + [0]
+            sendFile(slot, fd: fd, size: Int(size), mtime: Int(mtime), coding: .identity,
+                     nameLength: name.count - 1, name: &name)
+            return true
+        }
+        return false
+    }
+
     /// Writes the response head for an open file, then arms the body.
     private mutating func sendFile(_ slot: Int, fd: Int32, size: Int, mtime: Int,
                                    coding: ContentCoding,
@@ -800,4 +834,21 @@ private func contentType(nameLength: Int, name: inout [UInt8]) -> StaticString {
     if ext("mp3")   { return "audio/mpeg" }
     if ext("zip")   { return "application/zip" }
     return "application/octet-stream"
+}
+
+/// Whether an Accept value names `text/html` or `application/xhtml+xml`,
+/// without regard to case. `*/*` alone does not count: that is what `fetch`
+/// and most clients send, and they want the 404.
+func acceptsHTML(_ accept: ByteSpan) -> Bool {
+    let needles: [[UInt8]] = [Array("text/html".utf8), Array("application/xhtml+xml".utf8)]
+    for needle in needles where accept.count >= needle.count {
+        var start = 0
+        while start + needle.count <= accept.count {
+            var i = 0
+            while i < needle.count && asciiLower(accept.base[start + i]) == needle[i] { i += 1 }
+            if i == needle.count { return true }
+            start += 1
+        }
+    }
+    return false
 }

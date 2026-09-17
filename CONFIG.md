@@ -306,9 +306,29 @@ with 501.
 | flag | default | what it does |
 |---|---|---|
 | `--static-dir P=DIR` | none | serve URL prefix P from DIR; repeatable |
+| `--spa-fallback P=FILE` | none | answer a browser navigation under P that nothing else answers with FILE; repeatable |
 | `--compress-static` | off | serve `FILE.br`, `FILE.zst` or `FILE.gz` beside a static file when accepted |
 | `--compress` | off | compress handler responses with brotli, zstd or gzip, as the client accepts |
 | `--compress-min-size N` | `1024` | leave a body declared smaller than this uncompressed |
+
+### `--spa-fallback`
+
+A single-page application routes in the browser, so a reload or a shared link
+asks the server for a path like `/settings/profile` that only the page knows.
+
+```bash
+garuda --static-dir /assets=/srv/app/dist/assets --spa-fallback /=/srv/app/dist/index.html
+```
+
+- The file is sent, 200 with its ETag, for a `GET` or `HEAD` under the prefix
+  that no `--static-dir` file, route, 405 or scope fallback answered.
+- Only when the request's `Accept` names `text/html` or
+  `application/xhtml+xml`, as a browser's navigation does. A missing script, an
+  image or an API call sends `*/*` or a type of its own and keeps its 404, so a
+  broken asset link is not answered with a page that fails to parse as
+  JavaScript.
+- The prefix matches whole segments, and the longest wins. The file must be
+  readable when the server starts.
 
 ### `--static-dir`
 

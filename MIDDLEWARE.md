@@ -401,6 +401,7 @@ These run in the engine, for every route, and are set on the command line
 | `--access-log` | One line per request, text or JSON |
 | `--max-body BYTES` | The default body limit, 413 past it |
 | `--cache-size MIB` | A response cache shared by every worker |
+| `--static-dir P=DIR`, `--spa-fallback P=FILE` | Files from disk, and a single-page application's page for navigations nothing else answers |
 | `--health-check-path P` | Answers health probes without touching a route |
 | `--metrics-port PORT` | Prometheus metrics on a port of their own, server-wide and by route pattern |
 | `--forwarded-allow-ips LIST` | Which proxies' forwarded headers are believed |

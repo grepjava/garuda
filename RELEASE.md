@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 716 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 721 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -331,6 +331,11 @@ The Python suites need `h2` and `aioquic`.
   the number of routes; unmatched requests and fallbacks have a series each.
   Counted in shared memory mapped before the fork, a row per worker, with no
   locks; nothing is counted without `--metrics-port`.
+- `--spa-fallback PREFIX=FILE` serves a single-page application's page for a
+  browser navigation under PREFIX that no static file, route, 405 or scope
+  fallback answered: `GET` or `HEAD` whose `Accept` names `text/html`. Other
+  requests, such as a missing asset or an API call, keep their 404. The file
+  goes out as a static file does, with its ETag and 304.
 - MIDDLEWARE.md: how middleware and `onSend` run, the order to add it in,
   every middleware Garuda ships with its options and answers, the server flags
   that act as middleware, and writing middleware and extractors of your own.

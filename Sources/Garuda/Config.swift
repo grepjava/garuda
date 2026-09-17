@@ -253,6 +253,13 @@ public struct ServerConfig {
     /// one covering the same paths.
     public var staticRoutes: [(prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>)] = []
 
+    /// A single-page application's page, served for browser navigations no
+    /// route answers: `--spa-fallback /app=/srv/app/index.html`. `file` is
+    /// the file's name under `directory`, with a leading `/`. Longest prefix
+    /// first.
+    public var spaFallbacks: [(prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>,
+                               file: UnsafePointer<CChar>)] = []
+
     /// A path the server answers itself, with 200 and an empty body, or nil.
     ///
     /// For an orchestrator's liveness probe. It is answered in the worker

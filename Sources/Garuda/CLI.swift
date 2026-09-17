@@ -131,6 +131,9 @@ public enum GarudaCLI {
               --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
                                        before routing (repeatable). A path with no
                                        file behind it still reaches the routes
+              --spa-fallback P=FILE    answer a browser navigation under P that no
+                                       route or file answers with FILE, as a
+                                       single-page application's index.html
               --rate-limit RATE        refuse a client with 429 past RATE requests, as
                                        in 100/s, 600/m or 5000/h; counted across all
                                        workers, by the forwarded address behind a
@@ -435,6 +438,20 @@ public enum GarudaCLI {
                 }
                 UnsafeMutablePointer(mutating: v)[at] = 0
                 staticRoutes.append((prefix: v, directory: v + at + 1))
+            } else if matches(arg, "--spa-fallback") {
+                guard let v = next("--spa-fallback needs PREFIX=FILE") else { break }
+                var at = 0
+                while v[at] != 0 && v[at] != 61 { at += 1 }   // '='
+                if v[at] == 0 || at == 0 || v[0] != 47 || v[at + 1] == 0 {
+                    Log.error("--spa-fallback takes PREFIX=FILE, as in /=/srv/app/index.html")
+                    failed = true
+                    break
+                }
+                guard let fallback = spaFallback(prefix: v, at: at) else {
+                    failed = true
+                    break
+                }
+                config.spaFallbacks.append(fallback)
             } else if matches(arg, "--rate-limit") {
                 guard let v = next("--rate-limit needs a rate, as in 100/s") else { break }
                 var count = 0
@@ -613,6 +630,7 @@ public enum GarudaCLI {
         // ignoring the remainder would serve the wrong certificate for a name, which
         // shows up as a browser warning rather than as an error here.
         config.staticRoutes = staticRoutes.sorted { strlen($0.prefix) > strlen($1.prefix) }
+        config.spaFallbacks.sort { strlen($0.prefix) > strlen($1.prefix) }
 
         if tlsCerts.count != tlsKeys.count {
             Log.error("--tls-cert and --tls-key go together, one key per certificate")
@@ -781,4 +799,24 @@ private func makeHSTS(seconds: Int) -> (UnsafePointer<UInt8>, Int) {
     let out = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
     out.update(from: buf.readPointer, count: n)
     return (UnsafePointer(out), n)
+}
+
+/// `--spa-fallback PREFIX=FILE`, split in place at `at` (the `=`): the prefix,
+/// the file's directory and its name with a leading `/`. Nil, with the reason
+/// logged, when the file cannot be read.
+private func spaFallback(prefix v: UnsafePointer<CChar>, at: Int)
+    -> (prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>, file: UnsafePointer<CChar>)? {
+    let path = String(cString: v + at + 1)
+    guard access(v + at + 1, R_OK) == 0 else {
+        Log.error { line in
+            line.str("--spa-fallback: cannot read ")
+            path.withCString { line.cstr($0) }
+        }
+        return nil
+    }
+    UnsafeMutablePointer(mutating: v)[at] = 0
+    let slash = path.lastIndex(of: "/")
+    let directory = slash.map { $0 == path.startIndex ? "/" : String(path[..<$0]) } ?? "."
+    let name = slash.map { String(path[$0...]) } ?? "/" + path
+    return (prefix: v, directory: UnsafePointer(strdup(directory)!), file: UnsafePointer(strdup(name)!))
 }
