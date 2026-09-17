@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 667 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 672 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -208,6 +208,24 @@ The Python suites need `h2` and `aioquic`.
   takes no place. A streamed response holds its place until it is written,
   a request that goes away gives its place back, and nested limits all apply.
   Both work on a `Router` too.
+- `request.cookie(name)`, `request.cookies` and the `Cookies` extractor read
+  every Cookie header, HTTP/2's one-per-cookie included, and take the first
+  value of a repeated name.
+- `response.setCookie(Cookie(name, value))` adds a Set-Cookie header with
+  `Path=/`, `HttpOnly`, `SameSite=Lax`, and `Secure` when the request came
+  over HTTPS, directly or through a trusted proxy. Max-Age, Expires, Domain
+  and Partitioned are there to set. `SameSite=None` is always `Secure`.
+  A name that is not a token, a value outside RFC 6265's cookie characters, or
+  a path or domain holding `;` is refused rather than sent.
+  `response.removeCookie(name)` expires one.
+- `response.setCookie(cookie, key: key, .signed)` signs the value with
+  HMAC-SHA256, and `.encrypted` seals it with AES-256-GCM. The cookie's name
+  is bound in, and either way the value may be any string.
+  `request.cookie(name, key: key, .signed)` returns nil for a cookie that
+  was changed, moved from another name, or made with another secret.
+  `CookieKey(secret:previous:)` takes a secret of at least 32 bytes and the
+  ones it replaced, derives separate signing and encryption keys with HKDF,
+  and reads cookies made with any of them. `CookieKey.randomSecret()` makes one.
 
 ### Streaming responses and server-sent events
 

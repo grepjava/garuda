@@ -186,6 +186,11 @@ app.group("/api") {
   their own in place of `--max-body`, applied before the body is read.
   `app.concurrencyLimit(8) { … }` lets that many of a scope's handlers run at
   once in each worker, and answers the next 503.
+- `request.cookie("theme")` and `response.setCookie(Cookie("theme", "dark"))`
+  read and set cookies. A cookie is `Path=/`, `HttpOnly` and `SameSite=Lax`
+  unless it says otherwise, and `Secure` over HTTPS. With a `CookieKey`, a
+  cookie is signed (HMAC-SHA256) or encrypted (AES-256-GCM), and one that was
+  tampered with reads as absent. The key takes previous secrets for rotation.
 
 ### PostgreSQL
 
@@ -343,7 +348,7 @@ offer. This is where Garuda stands, area by area.
 | TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
 | Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
-| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: `request.log`, `app.onResponse`, `app.maxBodySize` and `app.concurrencyLimit` in code; no cookies or sessions |
+| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit` and signed or encrypted cookies in code; no sessions or CSRF |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
 | Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` | Done |
 | Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay | Done |
@@ -454,7 +459,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 667 unit tests, and the fuzz corpus
+swift test                                   # 672 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
