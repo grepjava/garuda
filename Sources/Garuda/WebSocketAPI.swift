@@ -261,11 +261,12 @@ extension RouteBuilder {
     /// them apart. A request to the route that is not a WebSocket upgrade is
     /// answered 426 with `Upgrade: websocket` (400 on HTTP/2 and HTTP/3), and
     /// one asking for another version 426 with `Sec-WebSocket-Version: 13`.
+    @discardableResult
     public func webSocket<each E: RequestExtractor>(
         _ pattern: String,
         subprotocols: [String] = [],
         _ handler: sending @escaping (WebSocket, repeat each E) async throws -> Void
-    ) {
+    ) -> OpenAPIOperation {
         let handler = VariadicHandler<repeat each E>(call: handler)
         onAsync(.get, pattern) { request, response in
             let offer: WebSocketOffer
@@ -300,6 +301,12 @@ extension RouteBuilder {
                 socket.worker.pointee.webSocketHandlerFinished(socket.slot, socket.channel, failure)
             }
         }
+        let operation = OpenAPIOperation(.get, pattern)
+        repeat operation.describeExtractor((each E).self)
+        operation.response(.switchingProtocols, "The connection becomes a WebSocket")
+        operation.response(HTTPStatus(426), "Not a WebSocket upgrade")
+        document(operation)
+        return operation
     }
 }
 

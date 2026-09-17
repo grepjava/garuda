@@ -76,16 +76,49 @@ public protocol RouteBuilder: AnyObject {
     /// it that set none of their own. It answers preflights and runs in front
     /// of the scope's middleware, wherever it is called.
     func cors(_ policy: CORSPolicy)
+
+    /// Gives the route registered last its entry in the OpenAPI document.
+    /// The route methods call it.
+    func document(_ operation: OpenAPIOperation)
 }
 
 extension RouteBuilder {
-    public func get(_ pattern: String, _ handler: @escaping Handler) { on(.get, pattern, handler) }
-    public func head(_ pattern: String, _ handler: @escaping Handler) { on(.head, pattern, handler) }
-    public func post(_ pattern: String, _ handler: @escaping Handler) { on(.post, pattern, handler) }
-    public func put(_ pattern: String, _ handler: @escaping Handler) { on(.put, pattern, handler) }
-    public func delete(_ pattern: String, _ handler: @escaping Handler) { on(.delete, pattern, handler) }
-    public func patch(_ pattern: String, _ handler: @escaping Handler) { on(.patch, pattern, handler) }
-    public func options(_ pattern: String, _ handler: @escaping Handler) { on(.options, pattern, handler) }
+    @discardableResult
+    public func get(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        raw(.get, pattern, handler)
+    }
+    @discardableResult
+    public func head(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        raw(.head, pattern, handler)
+    }
+    @discardableResult
+    public func post(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        raw(.post, pattern, handler)
+    }
+    @discardableResult
+    public func put(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        raw(.put, pattern, handler)
+    }
+    @discardableResult
+    public func delete(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        raw(.delete, pattern, handler)
+    }
+    @discardableResult
+    public func patch(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        raw(.patch, pattern, handler)
+    }
+    @discardableResult
+    public func options(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        raw(.options, pattern, handler)
+    }
+
+    private func raw(_ method: HTTPMethod, _ pattern: String,
+                     _ handler: @escaping Handler) -> OpenAPIOperation {
+        on(method, pattern, handler)
+        let operation = OpenAPIOperation(method, pattern)
+        document(operation)
+        return operation
+    }
 
     /// A streaming route with no limit of its own on the body.
     public func onStreamingBody(_ method: HTTPMethod, _ pattern: String,
@@ -122,6 +155,7 @@ public final class Router: RouteBuilder {
         case fallback(Handler)
         case asyncFallback(AsyncHandler)
         case cors(CORSPolicy)
+        case document(OpenAPIOperation)
     }
 
     /// What has been registered, innermost open group last.
@@ -186,6 +220,10 @@ public final class Router: RouteBuilder {
         add(.cors(policy))
     }
 
+    func addDocumentation(_ operation: OpenAPIOperation) {
+        add(.document(operation))
+    }
+
     /// Registers every entry on `builder`, in the order they were made.
     func replay(into builder: some RouteBuilder) {
         precondition(open.count == 1, "a router was merged from inside one of its own groups")
@@ -223,6 +261,8 @@ public final class Router: RouteBuilder {
                 builder.fallback(handler)
             case .cors(let policy):
                 builder.cors(policy)
+            case .document(let operation):
+                builder.document(operation)
             }
         }
     }
@@ -247,6 +287,8 @@ extension Routes {
         wholeBodyLimits.append(currentBodyLimit)
         routeLimiters.append(currentLimiters)
         patterns.append(nil)
+        methods.append(nil)
+        operations.append(nil)
         routeGroups.append(openGroups)
     }
 }

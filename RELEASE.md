@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 702 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 709 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -288,6 +288,31 @@ The Python suites need `h2` and `aioquic`.
   addresses, CIDR blocks, `unix` and `*`. The address is `request.remoteAddress`,
   a proxy's forwarded one when `--forwarded-allow-ips` trusts the peer, and an
   IPv4 client on an IPv6 socket (`::ffff:a.b.c.d`) matches as IPv4.
+- `app.openAPI(OpenAPIInfo(...), path: "/openapi.json")` serves an OpenAPI
+  3.1 document of every route, built once when the application compiles, and
+  `app.openAPIDocument(_:)` and `app.openAPIJSON(_:)` return it for a build
+  step. `app.swaggerUI(path: "/docs")` serves Swagger UI, loaded from jsDelivr,
+  reading the document by a relative URL so it works under `--root-path`.
+- A typed route describes itself: `Path<T>` is a typed path parameter,
+  `Query<T>` a query parameter per field, `Body<T>` a JSON request body,
+  `Form<T>` and `Multipart` form bodies, `BearerToken` and `BasicCredentials`
+  security schemes with a 401, `LastEventID` a header, and `JSON<T>`, `String`,
+  `HTML`, `Bytes`, `EventStream` and an optional (with its 404) the response.
+  A raw route is listed with its path parameters; a WebSocket route with 101.
+  Routes in groups and nested routers carry their full paths.
+- Schemas come from decoding each `Decodable` type once with a decoder that
+  records what it is asked: properties, which are required, integers and
+  numbers with their formats, `UUID` and `Timestamp` as `uuid` and
+  `date-time` strings, arrays, sets, string-keyed dictionaries, and enums
+  with `CaseIterable` raw values. A named type is a component under
+  `$ref`, and a type that contains itself refers to itself.
+  `OpenAPISchemaDescribing` lets a type write its own.
+- Route methods (`get`, `post`, `on`, `webSocket` and the rest) now return
+  the route's `OpenAPIOperation`, discardable, with `summary`, `description`,
+  `tags`, `operationID`, `deprecated`, `hidden`, `response` (with or without a
+  JSON type) and `security`. An extractor or response type of your own
+  conforms to `OpenAPIExtractorDescribing` or `OpenAPIResponseDescribing`.
+  `RouteBuilder` gains a `document(_:)` requirement.
 
 ### Streaming responses and server-sent events
 

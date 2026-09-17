@@ -26,6 +26,8 @@ public final class Application: RouteBuilder {
     var shutdownHooks: [(Int) -> Void] = []
     var responseObservers: [(CompletedRequest) -> Void] = []
     var trailingSlashPolicy = TrailingSlash.strict
+    /// The OpenAPI documents `openAPI` serves, written when the application compiles.
+    var openAPIDocuments: [OpenAPIDocumentBox] = []
     /// What each worker builds for itself at start-up, by the type handlers
     /// ask for it by, and how to tear it down (State.swift).
     var stateFactories: [(ObjectIdentifier, (Int) throws -> Any)] = []
@@ -225,6 +227,9 @@ public final class Application: RouteBuilder {
 
     func compile() -> UnsafeMutablePointer<CompiledApplication> {
         if let compiled { return compiled }
+        for box in openAPIDocuments {
+            box.json = Array(writeOpenAPIJSON(routes.openAPIDocument(box.info), indent: true).utf8)
+        }
         let count = routes.handlers.count
         let handlers = UnsafeMutablePointer<Handler>.allocate(capacity: max(1, count))
         for (i, handler) in routes.handlersWithMiddleware().enumerated() {

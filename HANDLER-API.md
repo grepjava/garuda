@@ -137,6 +137,17 @@ way the server does work to check what the browser already says. A request
 with neither header was not made by a browser page and passes: the attack is
 a page using the browser's cookies, not a client that has them.
 
+### OpenAPI schemas are read by decoding, not by macros
+
+utoipa and aide derive schemas with macros on each type. Garuda gets them from
+the `Decodable` conformance the route already needs: a recording decoder
+decodes the type once with placeholders and writes down which keys it asked
+for, of which types, and which with `decodeIfPresent`. Nothing is annotated,
+and the schema cannot drift from what the route actually decodes. What decoding
+cannot show -- a custom `init(from:)` that parses a string -- a type states
+with `OpenAPISchemaDescribing`. Route methods return an `OpenAPIOperation`
+for the rest, so a summary sits beside the route it describes.
+
 ### CORS is a policy of a scope, not a middleware in order
 
 `app.cors` does not take a place among the `use` calls. The innermost scope's

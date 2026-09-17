@@ -17,57 +17,66 @@ import AvianHTTP
 
 extension RouteBuilder {
     /// Registers a typed handler for `method` and `pattern`.
+    @discardableResult
     public func on<each E: RequestExtractor, R: ResponseConvertible>(
         _ method: HTTPMethod, _ pattern: String,
         _ handler: @escaping (repeat each E) throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(method, pattern) { request, response in
             var parameter = 0
             let answer = try handler(
                 repeat try (each E).extract(from: request, parameter: &parameter))
             try answer.write(to: response)
         }
+        return documented(method, pattern, (repeat each E).self, R.self)
     }
 
+    @discardableResult
     public func get<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: @escaping (repeat each E) throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.get, pattern, handler)
     }
 
+    @discardableResult
     public func head<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: @escaping (repeat each E) throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.head, pattern, handler)
     }
 
+    @discardableResult
     public func post<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: @escaping (repeat each E) throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.post, pattern, handler)
     }
 
+    @discardableResult
     public func put<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: @escaping (repeat each E) throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.put, pattern, handler)
     }
 
+    @discardableResult
     public func delete<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: @escaping (repeat each E) throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.delete, pattern, handler)
     }
 
+    @discardableResult
     public func patch<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: @escaping (repeat each E) throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.patch, pattern, handler)
     }
 
+    @discardableResult
     public func options<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: @escaping (repeat each E) throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.options, pattern, handler)
     }
 }
@@ -82,57 +91,80 @@ extension RouteBuilder {
 
 extension RouteBuilder {
     /// Registers an async typed handler for `method` and `pattern`.
+    @discardableResult
     public func on<each E: RequestExtractor, R: ResponseConvertible>(
         _ method: HTTPMethod, _ pattern: String,
         _ handler: sending @escaping (repeat each E) async throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         onAsync(method, pattern) { request, response in
             var parameter = 0
             let answer = try await handler(
                 repeat try (each E).extract(from: request, parameter: &parameter))
             try answer.write(to: response)
         }
+        return documented(method, pattern, (repeat each E).self, R.self)
     }
 
+    @discardableResult
     public func get<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.get, pattern, handler)
     }
 
+    @discardableResult
     public func head<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.head, pattern, handler)
     }
 
+    @discardableResult
     public func post<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.post, pattern, handler)
     }
 
+    @discardableResult
     public func put<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.put, pattern, handler)
     }
 
+    @discardableResult
     public func delete<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.delete, pattern, handler)
     }
 
+    @discardableResult
     public func patch<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.patch, pattern, handler)
     }
 
+    @discardableResult
     public func options<each E: RequestExtractor, R: ResponseConvertible>(
         _ pattern: String, _ handler: sending @escaping (repeat each E) async throws -> R
-    ) {
+    ) -> OpenAPIOperation {
         on(.options, pattern, handler)
+    }
+}
+
+extension RouteBuilder {
+    /// The operation for a typed route, filled in from its extractors and
+    /// answer, and given to the route registered last.
+    func documented<each E: RequestExtractor, R: ResponseConvertible>(
+        _ method: HTTPMethod, _ pattern: String, _ extractors: (repeat each E).Type, _ answer: R.Type
+    ) -> OpenAPIOperation {
+        let operation = OpenAPIOperation(method, pattern)
+        repeat operation.describeExtractor((each E).self)
+        operation.describeResponse(R.self)
+        document(operation)
+        return operation
     }
 }

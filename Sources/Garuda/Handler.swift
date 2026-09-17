@@ -69,6 +69,10 @@ struct Routes {
     /// Each route's pattern with its group prefixes, by route number, or nil
     /// for a fallback.
     var patterns: [String?] = []
+    /// Each route's method, nil for a fallback, for the OpenAPI document.
+    var methods: [HTTPMethod?] = []
+    /// What each route has been told about itself for the OpenAPI document.
+    var operations: [OpenAPIOperation?] = []
     /// What routes registered right now are given, set while
     /// `Application.deadline(milliseconds:)` registers a group of them.
     var currentDeadline: UInt32 = 0
@@ -122,6 +126,8 @@ struct Routes {
         wholeBodyLimits.append(currentBodyLimit)
         routeLimiters.append(currentLimiters)
         patterns.append(full)
+        methods.append(method)
+        operations.append(nil)
         routeGroups.append(openGroups)
     }
 

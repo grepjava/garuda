@@ -213,6 +213,22 @@ app.group("/api") {
   for any other Host, and `app.addressFilter(allow: ["10.0.0.0/8"])` answers
   403 to a client address outside the list or on a `deny` list.
 
+### OpenAPI
+
+`app.openAPI(OpenAPIInfo(title: "Shop", version: "1.0.0"))` serves an OpenAPI
+3.1 document at `/openapi.json`, and `app.swaggerUI()` serves Swagger UI at
+`/docs`. The document comes from the routes: a typed route's extractors and
+return type give its parameters, request body, security and response, with
+JSON Schemas read from the `Decodable` types, so nothing needs annotating.
+Every route method returns an `OpenAPIOperation` for what types cannot say:
+
+```swift
+app.get("/orders/:id") { (id: Path<Int>) async throws in JSON(try await order(id.value)) }
+    .summary("An order by its number")
+    .tags("orders")
+    .response(.notFound, "No order has that number")
+```
+
 ### PostgreSQL
 
 A native driver runs on the worker's poller. It supports SCRAM-SHA-256, TLS
@@ -362,6 +378,7 @@ offer. This is where Garuda stands, area by area.
 | Async handlers | `async fn` on a work-stealing pool | Reused tasks on the worker's own executor, no allocation per request | Done |
 | Typed extraction | `Path`, `Query`, `Json`, `Form`, `Multipart` | `Path`, `Query`, `Body`, `Form`, `Multipart` | Done |
 | Custom extractors | `FromRequestParts`, `FromRequest` | `RequestExtractor` | Done |
+| OpenAPI | utoipa or aide, with derive macros | `app.openAPI`, `app.swaggerUI`; schemas read from `Decodable` types | Done |
 | State | `State<T>`, one `Arc` shared by every thread | `State<T>`, built in each worker process | Done, [differs](#one-process-per-worker) |
 | Request-scoped values | `Extension<T>` | `request[context:]`, `Context<Key>` | Done |
 | Errors as responses | `IntoResponse` | `ResponseError`, `HTTPError` | Done |
@@ -480,7 +497,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 702 unit tests, and the fuzz corpus
+swift test                                   # 709 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
