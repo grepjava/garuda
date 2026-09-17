@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 758 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 763 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -377,6 +377,12 @@ The Python suites need `h2` and `aioquic`.
   store's index of a subject's families only ever has its expiry pushed out, so
   two logins arriving at once cannot leave `revokeAll(subject:)` blind to a
   family that is still good.
+- `app.runOnce { start in ... }` runs one piece of async work against an
+  application's state with nothing served: a migration, a backfill or a seed
+  from the command line. A worker is built in the process with no listening
+  socket, the work runs on its thread, and the state is torn down afterwards.
+  It reports `RunOnceError.failed`, `.timedOut` or `.workerCouldNotBeBuilt`,
+  so a command can exit non-zero.
 - `app.prepare { start in ... }` runs async start-up work in each worker --
   a schema to migrate, a cache to warm -- after its state is built and before
   its listening socket is watched, so a connection that arrives meanwhile
