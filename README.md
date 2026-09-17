@@ -264,7 +264,9 @@ stream rather than ending it cleanly. A WebSocket handler sees whole messages:
 the engine joins fragments, checks UTF-8, answers pings, sends keepalive pings,
 runs the close handshake and, with `--ws-compress`, permessage-deflate. Messages
 the handler has not read wait in a bounded queue, and past it the socket is not
-read, so a fast sender is slowed by TCP. WebTransport runs over HTTP/3 on the same
+read, so a fast sender is slowed. The same route serves WebSockets over
+HTTP/1.1, HTTP/2 and HTTP/3; on the last two, flow control slows just that
+stream. WebTransport runs over HTTP/3 on the same
 port and routes, with bidirectional and unidirectional streams, datagrams and
 close codes.
 
@@ -337,7 +339,7 @@ offer. This is where Garuda stands, area by area.
 | Streaming request bodies | `Body::into_data_stream` | `onStreamingBody`, with a limit per route and flow control back to the client | Done |
 | Resumable uploads | None built in; tus through other crates | `GarudaUploads`: the IETF resumable upload protocol | Done |
 | Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints | Done |
-| WebSockets | `WebSocketUpgrade` | `app.webSocket`, whole messages, pings and permessage-deflate by the engine | Done, HTTP/1.1 only |
+| WebSockets | `WebSocketUpgrade` | `app.webSocket`, whole messages, pings and permessage-deflate by the engine | Done, over HTTP/1.1, HTTP/2 and HTTP/3 |
 | WebTransport | None in hyper | `app.webTransport` | Done |
 | HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression | Done |
 | PostgreSQL | sqlx, tokio-postgres | Native driver on the poller | Done |
@@ -470,6 +472,7 @@ python3 scripts/http3-test.py                # 53  against aioquic
 python3 scripts/router-streams-test.py       # 41  routes over HTTP/2 and HTTP/3
 python3 scripts/handler-test.py              # 143 the handler API over all three protocols
 python3 scripts/websocket-test.py            # 104 handshake, framing violations, closing, pings, deflate
+python3 scripts/websocket-streams-test.py    # 94  WebSocket over HTTP/2 and HTTP/3
 python3 scripts/webtransport-test.py         # 46  sessions, streams, datagrams
 python3 scripts/upload-test.py               # 35  streamed request bodies, 1xx, resumable uploads
 python3 scripts/broadcast-test.py            # 35  topics across workers, Last-Event-ID, keep-alive
@@ -500,7 +503,7 @@ say) is not unwound when its request is cancelled. It resumes to find
 ### Not supported
 
 
-- A stable API, and WebSocket over HTTP/2 and HTTP/3.
+- A stable API.
 - Redis Cluster and Sentinel: the driver talks to one server, and a `MOVED`
   reply is a server error. [CONNECTORS.md](CONNECTORS.md) has what works and
   the plan.

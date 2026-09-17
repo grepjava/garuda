@@ -634,7 +634,17 @@ extension Worker {
             }
         }
 
-        if stream.receive.finished && streamSlot >= 0 {
+        if streamSlot >= 0 && table[streamSlot].pointee.state == .free { return }
+        if stream.receive.finished && streamSlot >= 0 && isStreamWebSocketRequest(streamSlot) {
+            if table[streamSlot].pointee.h3FrameRemaining > 0 {
+                h3.quic.close(HTTP3Error.frameError, application: true)
+                return
+            }
+            // FIN is the peer's END_STREAM: its half of the tunnel is done.
+            if table[streamSlot].pointee.bodyRemaining != 0 {
+                receiveStreamWebSocketData(streamSlot, nil, 0, ended: true)
+            }
+        } else if stream.receive.finished && streamSlot >= 0 {
             let s = table[streamSlot]
             if s.pointee.h3FrameRemaining > 0 {
                 h3.quic.close(HTTP3Error.frameError, application: true)
@@ -655,14 +665,25 @@ extension Worker {
         }
         // Reading is what opens the window again. For a route reading as it
         // goes, only what it has taken counts as read.
-        if streamSlot >= 0 {
-            var consumed = stream.receive.received
-            let s = table[streamSlot]
-            if s.pointee.state != .free && s.pointee.flags.contains(.bodyStreaming) {
-                consumed -= UInt64(stream.receive.ready.readableBytes + s.pointee.body.readableBytes)
-            }
-            h3.quic.extendStreamWindow(streamID, consumed: consumed)
+        if streamSlot >= 0 && table[streamSlot].pointee.state != .free {
+            extendH3RequestWindow(streamSlot, h3, stream)
         }
+    }
+
+    /// Opens the stream's window by what has been read. For a route reading
+    /// as it goes, and for a WebSocket, only what it has taken counts: bytes
+    /// waiting in its buffers hold the peer back.
+    mutating func extendH3RequestWindow(_ streamSlot: Int, _ h3: H3Connection, _ stream: QUICStream) {
+        var consumed = stream.receive.received
+        let s = table[streamSlot]
+        if s.pointee.flags.contains(.bodyStreaming) {
+            let held = UInt64(stream.receive.ready.readableBytes + s.pointee.body.readableBytes)
+            consumed = consumed > held ? consumed - held : 0
+        } else if s.pointee.connectProtocol.readableBytes > 0 {
+            let held = UInt64(stream.receive.ready.readableBytes + s.pointee.wsUncredited)
+            consumed = consumed > held ? consumed - held : 0
+        }
+        h3.quic.extendStreamWindow(s.pointee.qstreamID, consumed: consumed)
     }
 
     private mutating func appendH3Body(_ streamSlot: Int,
@@ -672,6 +693,10 @@ extension Worker {
         // no descriptor and so never sees a poller event. See the same note in
         // HTTP2.handleDataFrame.
         s.pointee.lastActivity = av_monotonic_ms()
+        if isStreamWebSocketRequest(streamSlot) {
+            receiveStreamWebSocketData(streamSlot, p, n, ended: false)
+            return table[streamSlot].pointee.state != .free
+        }
         s.pointee.bodyReceived += n
         if s.pointee.head.flags.contains(.hasContentLength)
             && s.pointee.bodyReceived > s.pointee.head.contentLength {
@@ -727,7 +752,7 @@ extension Worker {
 
         let s = table[streamSlot]
         s.pointee.bodyRemaining = -1
-        if s.pointee.h3Protocol.readableBytes > 0 {
+        if s.pointee.connectProtocol.readableBytes > 0 {
             // Extended CONNECT. The stream stays open as the session it asks
             // for, so waiting for the end of its body would wait forever and
             // the client would never hear back. Dispatch now: nothing serves a
@@ -760,6 +785,7 @@ extension Worker {
         s.pointee.parentSlot = Int32(parent)
         s.pointee.qstreamID = streamID
         s.pointee.streamID = 0
+        s.pointee.wsUncredited = 0
         s.pointee.state = .readingBody
         s.pointee.interest = 0
         s.pointee.flags = p.pointee.flags.intersection([.trustEvaluated, .trustedPeer])
@@ -898,7 +924,13 @@ extension Worker {
 
         var head = ByteBuffer()
         defer { head.destroy() }
-        head.write(base0 + methodAt.0, methodAt.1)
+        // A WebSocket (RFC 9220) is routed as the GET it is over HTTP/1.1, to
+        // the route `app.webSocket` registered. WebTransport stays a CONNECT.
+        if isConnect && equalsExact(base0 + protocolAt.0, protocolAt.1, "websocket") {
+            head.write("GET")
+        } else {
+            head.write(base0 + methodAt.0, methodAt.1)
+        }
         head.writeByte(cSP)
         head.write(base0 + pathAt.0, pathAt.1)
         head.write(" HTTP/1.1\r\n")
@@ -933,8 +965,8 @@ extension Worker {
         if parsed.method == .head { s.pointee.flags.insert(.suppressBody) }
         s.pointee.h2Scheme = equalsLowercased(base0 + schemeAt.0, schemeAt.1, "https")
         if sawProtocol {
-            s.pointee.h3Protocol = ByteBuffer()
-            s.pointee.h3Protocol.write(base0 + protocolAt.0, protocolAt.1)
+            s.pointee.connectProtocol = ByteBuffer()
+            s.pointee.connectProtocol.write(base0 + protocolAt.0, protocolAt.1)
         }
         return .ok
     }

@@ -247,6 +247,7 @@ garuda --ktls --tls-cert cert.pem --tls-key key.pem --static-dir /static=/srv/ap
 | `--http3` | off | also serve HTTP/3 over QUIC; needs TLS; not with `--unix` |
 | `--quic-port PORT` | `--port` | UDP port for HTTP/3 |
 | `--no-websockets` | off | refuse WebSocket upgrade requests with 501 |
+| `--websocket-protocols L` | `http1,http2,http3` | which protocols carry WebSockets; the others refuse them |
 | `--ws-max-message BYTES` | 16 MiB | largest message accepted, joined or inflated; a larger one is closed with 1009 |
 | `--ws-ping-interval MS` | `20000` | ping a WebSocket quiet this long; `0` sends none |
 | `--ws-ping-timeout MS` | `20000` | close one whose ping, or whose close, has gone unanswered this long |
@@ -276,8 +277,22 @@ curl -k --http3 https://127.0.0.1:8443/     # needs a curl built with HTTP/3
 **WebSocket.** An upgrade is routed like any other request, and a route
 registered with `app.webSocket` accepts it. `--no-websockets` refuses every
 upgrade with 501 before anything else answers. The `--ws-*` flags bound what a
-WebSocket may send and how long it may go quiet. WebSockets are served over
-HTTP/1.1, with or without TLS.
+WebSocket may send and how long it may go quiet.
+
+WebSockets are served over all three protocols: HTTP/1.1 by upgrade, HTTP/2 by
+extended CONNECT (RFC 8441) and HTTP/3 the same way (RFC 9220). The same route
+and handler serve all three. `--websocket-protocols` narrows the list:
+
+- Leaving out `http1` answers an upgrade with 501.
+- Leaving out `http2` stops sending `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so a
+  client asking anyway gets `RST_STREAM(PROTOCOL_ERROR)`.
+- Leaving out `http3` answers the CONNECT with 501.
+
+A browser that has negotiated HTTP/2 or HTTP/3 opens a WebSocket on that
+connection only if the server offers it, and otherwise opens a separate
+HTTP/1.1 connection. It does not retry one that was refused. So
+`--websocket-protocols http3` alone breaks browsers that reach the server over
+HTTP/2 or HTTP/1.1. Leave `http1` in unless every client is known.
 
 **WebTransport** has no flag. It needs `--http3`, and a route registered with
 `app.webTransport` takes the session. Any other extended CONNECT is refused
@@ -682,6 +697,7 @@ Most fields share the flag's name. These do not:
 | `--http2-only` | `http2Only` |
 | `--http3` | `http3Enabled` |
 | `--no-websockets` | `websocketsEnabled = false` |
+| `--websocket-protocols` | `websocketOverHTTP1`, `websocketOverHTTP2`, `websocketOverHTTP3` |
 | `--ws-max-message` | `maxWebsocketMessageSize` |
 | `--ws-ping-interval`, `--ws-ping-timeout` | `websocketPingIntervalMs`, `websocketPingTimeoutMs` |
 | `--ws-max-queue`, `--ws-max-queue-bytes` | `maxWebsocketQueue`, `maxWebsocketQueueBytes` |

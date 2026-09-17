@@ -116,7 +116,7 @@ extension Worker {
     /// Whether the request on `slot` asks for a WebTransport session.
     func isWebTransportRequest(_ slot: Int) -> Bool {
         let c = table[slot]
-        let p = c.pointee.h3Protocol
+        let p = c.pointee.connectProtocol
         return c.pointee.isH3Stream && p.readableBytes == 12
             && equalsExact(UnsafePointer(p.readPointer), 12, "webtransport")
     }

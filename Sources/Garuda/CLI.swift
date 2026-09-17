@@ -119,6 +119,8 @@ public enum GarudaCLI {
               --http3                  also serve HTTP/3 over QUIC (needs TLS)
               --quic-port PORT         UDP port for HTTP/3 (default: the TCP port)
               --no-websockets          reject WebSocket upgrades with 501
+              --websocket-protocols L  which of http1,http2,http3 carry WebSockets
+                                       (default: all three)
               --ws-max-message BYTES   largest accepted WebSocket message (16 MiB)
               --ws-ping-interval MS    keepalive ping period, 0 to disable (20000)
               --ws-ping-timeout MS     how long an unanswered ping may go (20000)
@@ -378,6 +380,22 @@ public enum GarudaCLI {
                 config.http2Enabled = true
             } else if matches(arg, "--no-websockets") {
                 config.websocketsEnabled = false
+            } else if matches(arg, "--websocket-protocols") {
+                guard let v = next("--websocket-protocols needs a list: http1, http2, http3") else { break }
+                var http1 = false, http2 = false, http3 = false
+                for name in String(cString: v).split(separator: ",", omittingEmptySubsequences: false) {
+                    switch name {
+                    case "http1": http1 = true
+                    case "http2": http2 = true
+                    case "http3": http3 = true
+                    default:
+                        Log.error("--websocket-protocols takes http1, http2 and http3, separated by commas")
+                        return .exit(2)
+                    }
+                }
+                config.websocketOverHTTP1 = http1
+                config.websocketOverHTTP2 = http2
+                config.websocketOverHTTP3 = http3
             } else if matches(arg, "--ws-max-message") {
                 guard let v = next("--ws-max-message needs a byte count") else { break }
                 config.maxWebsocketMessageSize = max(1024, parseInt(v))

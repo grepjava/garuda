@@ -155,7 +155,7 @@ extension Worker {
             // We never push, and saying so up front keeps a client from
             // reserving anything on our behalf.
             (.enablePush, 0),
-        ]
+        ] + (http2WebSocketsAdvertised ? [(.enableConnectProtocol, 1)] : [])
         writeFrame(slot, length: entries.count * 6, type: .settings, flags: [], streamID: 0) { out in
             for (setting, value) in entries {
                 out.writeByte(UInt8(truncatingIfNeeded: setting.rawValue >> 8))
@@ -286,6 +286,12 @@ extension Worker {
         if s.pointee.bodyRemaining == 0 {
             // Data after END_STREAM.
             streamError(slot, h2, header.streamID, .streamClosed)
+            return
+        }
+        if s.pointee.connectProtocol.readableBytes > 0 {
+            receiveStreamWebSocketData(streamSlot, payload + offset, length,
+                                       ended: header.flags.contains(.endStream))
+            if table[slot].pointee.state == .http2 { _ = flush(slot) }
             return
         }
 
@@ -512,6 +518,21 @@ extension Worker {
         }
 
         let s = table[streamSlot]
+        if s.pointee.connectProtocol.readableBytes > 0 {
+            // The stream is the tunnel, so it cannot be over before it begins,
+            // and it will not end for the handler to be called. Dispatched now.
+            if endStream {
+                closeStream(streamSlot, resetWith: nil)
+                writeRstStream(slot, streamID, .protocolError)
+                _ = flush(slot)
+                return
+            }
+            s.pointee.bodyRemaining = -1
+            s.pointee.state = .dispatching
+            dispatch(streamSlot)
+            if table[slot].pointee.state == .http2 { _ = flush(slot) }
+            return
+        }
         if endStream {
             s.pointee.bodyRemaining = 0
             if s.pointee.head.flags.contains(.hasContentLength)
@@ -607,8 +628,8 @@ extension Worker {
         // fields straight into the header text.
         var pseudo = ByteBuffer()
         defer { pseudo.destroy() }
-        var methodAt = (0, 0), pathAt = (0, 0), schemeAt = (0, 0), authorityAt = (0, 0)
-        var sawMethod = false, sawPath = false, sawScheme = false, sawAuthority = false
+        var methodAt = (0, 0), pathAt = (0, 0), schemeAt = (0, 0), authorityAt = (0, 0), protocolAt = (0, 0)
+        var sawMethod = false, sawPath = false, sawScheme = false, sawAuthority = false, sawProtocol = false
         var malformed = false
         var sawRegular = false
 
@@ -641,6 +662,10 @@ extension Worker {
                 } else if equalsExact(span.name, span.nameLength, ":authority") {
                     if sawAuthority { malformed = true; return }
                     sawAuthority = true; authorityAt = stash(span)
+                } else if equalsExact(span.name, span.nameLength, ":protocol") && http2WebSocketsAdvertised {
+                    // RFC 8441 section 4: only from a peer we told it may.
+                    if sawProtocol { malformed = true; return }
+                    sawProtocol = true; protocolAt = stash(span)
                 } else {
                     malformed = true      // unknown pseudo-header
                 }
@@ -668,15 +693,26 @@ extension Worker {
         }
         if failed { return .compression }
         if malformed { return .malformed }
-        // CONNECT is only meaningful with the extended form, which arrives with
-        // the rest of WebTransport; a plain one has no target here.
+        // A plain CONNECT has no target here, and an extended one (RFC 8441)
+        // carries :scheme, :path and :authority like any request.
         if !sawMethod || !sawScheme || !sawPath { return .malformed }
         if pathAt.1 == 0 || methodAt.1 == 0 { return .malformed }
 
         let base0 = UnsafePointer(pseudo.pointer(at: 0))
+        let isConnect = equalsExact(base0 + methodAt.0, methodAt.1, "CONNECT")
+        if sawProtocol != isConnect { return .malformed }
+        if isConnect && (!sawAuthority || authorityAt.1 == 0 || protocolAt.1 == 0) { return .malformed }
+        // A WebSocket is routed as the GET it is over HTTP/1.1, to the route
+        // `app.webSocket` registered. Any other protocol stays a CONNECT,
+        // which dispatch refuses.
+        let webSocket = sawProtocol && equalsExact(base0 + protocolAt.0, protocolAt.1, "websocket")
         var head = ByteBuffer()
         defer { head.destroy() }
-        head.write(base0 + methodAt.0, methodAt.1)
+        if webSocket {
+            head.write("GET")
+        } else {
+            head.write(base0 + methodAt.0, methodAt.1)
+        }
         head.writeByte(cSP)
         head.write(base0 + pathAt.0, pathAt.1)
         head.write(" HTTP/1.1\r\n")
@@ -716,6 +752,10 @@ extension Worker {
         if parsed.method == .head { s.pointee.flags.insert(.suppressBody) }
         // The scheme the client asked for outranks the server default.
         s.pointee.h2Scheme = equalsLowercased(base0 + schemeAt.0, schemeAt.1, "https")
+        if sawProtocol {
+            s.pointee.connectProtocol = ByteBuffer()
+            s.pointee.connectProtocol.write(base0 + protocolAt.0, protocolAt.1)
+        }
         return .ok
     }
 
@@ -955,6 +995,7 @@ extension Worker {
         s.pointee.bodyStream = nil
         s.pointee.bodyLimit = config.maxBodySize
         s.pointee.bodyNoted = 0
+        s.pointee.wsUncredited = 0
         s.pointee.requestCount = 1
         s.pointee.requestId &+= 1
         s.pointee.resetContinuation()
@@ -1092,9 +1133,20 @@ extension Worker {
 
         if !flush(parent) { return false }
         resumeWriterIfDrained(streamSlot)
+        if s.pointee.state == .websocket && s.pointee.write.isEmpty {
+            closeWebSocketIfDone(streamSlot)
+            return s.pointee.state != .free
+        }
 
         if s.pointee.flags.contains(.endStreamSent) && s.pointee.write.isEmpty {
             if s.pointee.state == .writing {
+                closeStream(streamSlot, resetWith: nil)
+                return false
+            }
+            // A WebSocket that finished while the peer had not: its end has
+            // gone now, and the peer's END_STREAM releases it.
+            if s.pointee.state == .closing && s.pointee.flags.contains(.peerClosed)
+                && s.pointee.connectProtocol.readableBytes > 0 {
                 closeStream(streamSlot, resetWith: nil)
                 return false
             }

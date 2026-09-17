@@ -250,7 +250,7 @@ wait once.
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | Done |
 | 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS and authentication done; tracing and request limits to do |
-| 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, request bodies, SSE with keep-alive and replay, broadcast across workers, WebSockets over HTTP/1.1, resumable uploads and WebTransport done |
+| 5 | Streaming, server-sent events, WebSockets, WebTransport | Done |
 | 6 | Examples and realistic benchmarks | Examples done; benchmarks to do |
 
 ### Still to build
@@ -261,9 +261,6 @@ wait once.
 
 **Step 4**
 - Middleware Garuda ships: tracing with a logging API, request limits.
-
-**Step 5**
-- WebSocket over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220).
 
 **Step 6**
 - Benchmarks past hello-world against axum: path parameters, JSON in and out, a

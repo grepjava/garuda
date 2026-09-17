@@ -14,7 +14,7 @@ Flags are in [CONFIG.md](CONFIG.md).
 | HTTP/2 | `h2` over TLS via ALPN, `h2c` with prior knowledge |
 | HTTP/3 | with `--http3`, over Garuda's own QUIC |
 | WebTransport | over HTTP/3, through `app.webTransport` routes |
-| WebSocket | HTTP/1.1, cleartext and TLS, through `app.webSocket` routes |
+| WebSocket | HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220), through `app.webSocket` routes |
 
 ---
 
@@ -218,7 +218,7 @@ signatures.
 | 9369 | QUIC version 2 |
 | 9114 | HTTP/3 frames, control and QPACK streams |
 | 9204 | QPACK, static table and Huffman only |
-| 9221, 9297, 9220 | datagrams, capsules, extended CONNECT (for WebTransport) |
+| 9221, 9297, 9220 | datagrams, capsules, extended CONNECT (for WebTransport and WebSocket) |
 
 ### Handshake
 
@@ -367,11 +367,12 @@ on whole events, so a comment never splits one.
 
 ## WebSocket
 
-RFC 6455 over HTTP/1.1, with permessage-deflate (RFC 7692) under
-`--ws-compress`. Framing, UTF-8 validation and deflate are aviancore's
-(`WebSocketFrame.swift`, `WebSocketDeflate.swift`, `avian_wsdeflate.c`); the
-handshake, the connection state and the handler API are Garuda's
-(`WebSocket.swift`, `WebSocketAPI.swift`).
+RFC 6455 over HTTP/1.1, over HTTP/2 streams (RFC 8441) and over HTTP/3
+streams (RFC 9220), with permessage-deflate (RFC 7692) under `--ws-compress`.
+Framing, UTF-8 validation and deflate are aviancore's (`WebSocketFrame.swift`,
+`WebSocketDeflate.swift`, `avian_wsdeflate.c`). The handshake, the connection
+state and the handler API are Garuda's (`WebSocket.swift`, `WebSocketAPI.swift`,
+and `WebSocketStreams.swift` for what differs on a stream).
 
 - **Handshake.** A GET with `Upgrade: websocket`, `Connection: Upgrade`,
   version 13 and a 16-byte key. A plain GET to a WebSocket route is 426 with
@@ -379,6 +380,13 @@ handshake, the connection state and the handler API are Garuda's
   a missing or malformed key is 400. Middleware and extractors run first, and
   headers middleware adds go out with the 101. The route's subprotocols are
   matched against the client's offer in the route's order of preference.
+- **On a stream.** HTTP/2 connections send `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
+  A CONNECT with `:protocol: websocket`, `:scheme`, `:path`, `:authority` and
+  version 13 is routed as the GET it would be on HTTP/1.1, and answered 200
+  with no key. The stream is dispatched on its HEADERS, and DATA carries the
+  frames. `:protocol` on an HTTP/2 connection that did not offer it, or with
+  END_STREAM on the HEADERS, is `RST_STREAM(PROTOCOL_ERROR)`. A plain GET to the
+  route is 400. Any other `:protocol` that is not WebTransport is 501.
 - **Frames.** A frame is decoded once its whole payload is buffered, so a
   connection holds at most `--ws-max-message` plus a header. Unmasked client
   frames, RSV bits nothing negotiated, unknown opcodes, fragmented or oversized
@@ -395,16 +403,25 @@ handshake, the connection state and the handler API are Garuda's
   1006 when the connection ended without a close). A close the server sends
   first waits `--ws-ping-timeout` for the answer. A handler that returns
   without closing closes with 1000, one that throws with 1011, and a draining
-  worker with 1001.
+  worker with 1001. On a stream the peer's END_STREAM or FIN stands for the
+  socket closing. Once the closes are exchanged the server ends its side the
+  same way, and a WebSocket that is abandoned is reset with
+  `RST_STREAM(CANCEL)` or `H3_REQUEST_CANCELLED`. Other streams on the
+  connection carry on either way.
 - **Flow.** Up to `--ws-max-queue` messages and `--ws-max-queue-bytes` bytes wait
-  for a handler that is not reading; past that the socket is not read, so the
-  sender is slowed by TCP. A send waits while more than `writeHighWaterMark` is
-  queued for a slow reader.
+  for a handler that is not reading. Past that, HTTP/1.1 stops reading the
+  socket and TCP slows the sender. On a stream, bytes stop being credited back,
+  so flow control stops that one stream and leaves the rest of the connection
+  alone. A send waits while more than `writeHighWaterMark` is queued for a slow
+  reader.
 - **Deflate** contexts are made on the first compressed message in each
   direction, and messages under 64 bytes go out uncompressed.
 
 `scripts/websocket-test.py` drives all of this with a client built from a
 socket, and checks the `websockets` library against it.
+`scripts/websocket-streams-test.py` runs the same checks over HTTP/2 (`h2`) and
+HTTP/3 (`aioquic`), along with flow control, several WebSockets on one
+connection, and `--websocket-protocols`.
 
 ---
 
@@ -415,6 +432,7 @@ Each protocol is tested against implementations that share none of its code:
 `scripts/http3-test.py` and `scripts/webtransport-test.py` (`aioquic`),
 `scripts/router-streams-test.py` (routes, delays and cancellation on HTTP/2 and
 HTTP/3), `scripts/handler-test.py` (handler framing on all three) and
-`scripts/websocket-test.py` (WebSocket, with `websockets` for interoperability).
+`scripts/websocket-test.py` (WebSocket, with `websockets` for interoperability)
+and `scripts/websocket-streams-test.py` (WebSocket over HTTP/2 and HTTP/3).
 `swift test` covers the parser, HPACK, QUIC packet protection and streams, and
 WebSocket framing. The parsers are fuzzed ([fuzz/README.md](fuzz/README.md)).

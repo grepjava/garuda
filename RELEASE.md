@@ -41,6 +41,7 @@ python3 scripts/http3-test.py          # 53
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 143, runs garuda-conformance
 python3 scripts/websocket-test.py      # 104, runs garuda-conformance
+python3 scripts/websocket-streams-test.py # 94, runs garuda-conformance
 python3 scripts/webtransport-test.py   # 46, runs garuda-conformance
 python3 scripts/upload-test.py         # 35, runs garuda-conformance
 python3 scripts/broadcast-test.py      # 35, runs garuda-conformance
@@ -251,6 +252,15 @@ The Python suites need `h2` and `aioquic`.
   serves RFC 6455 over HTTP/1.1, cleartext or TLS. Middleware and extractors
   run before the upgrade and can refuse it with an ordinary status; headers
   middleware adds go out with the 101. A plain request to the route is 426.
+- The same route serves WebSockets over HTTP/2 (RFC 8441) and HTTP/3
+  (RFC 9220), on by default. HTTP/2 connections advertise
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`, and an extended CONNECT is answered 200.
+  A handler that is not reading holds back flow-control credit for its stream
+  alone. The peer's END_STREAM or FIN is 1006, and an abandoned WebSocket
+  resets only its own stream.
+- `--websocket-protocols http1,http2,http3` chooses which protocols carry
+  WebSockets. The others refuse them: 501 for an HTTP/1.1 upgrade or an HTTP/3
+  CONNECT, and no advertisement on HTTP/2.
 - The handler sees whole messages: `receive()`, or `for try await message in ws`,
   and `send` of text or bytes, which waits while the peer reads slowly.
   `close(code:reason:)` starts the close handshake, `closeCode` and
@@ -442,7 +452,7 @@ The Python suites need `h2` and `aioquic`.
 
 ### Not yet
 
-- WebSocket over HTTP/2 and HTTP/3, and shipped middleware for tracing.
+- Shipped middleware for tracing.
   Middleware cannot wrap a handler's run.
 - WebTransport is HTTP/3 only.
 - Resumable uploads have no `min-size` or `min-append-size` and no digests,

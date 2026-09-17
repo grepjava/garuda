@@ -157,6 +157,12 @@ public struct ServerConfig {
 
     // --- websockets ---
     public var websocketsEnabled = true
+    /// --websocket-protocols: which protocols carry WebSockets. Over HTTP/1.1
+    /// an upgrade; over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) an extended
+    /// CONNECT on one stream of a connection the client already has.
+    public var websocketOverHTTP1 = true
+    public var websocketOverHTTP2 = true
+    public var websocketOverHTTP3 = true
     public var maxWebsocketMessageSize = 16 * 1024 * 1024
     /// Idle time before the server sends a ping. 0 disables keepalive pings.
     public var websocketPingIntervalMs: UInt64 = 20_000

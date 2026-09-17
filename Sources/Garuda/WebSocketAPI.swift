@@ -256,9 +256,11 @@ extension RouteBuilder {
     /// the first one the client offered is agreed. A client that offered none
     /// of them is still accepted, with `ws.subprotocol` nil.
     ///
-    /// A request to the route that is not a WebSocket upgrade is answered 426
-    /// with `Upgrade: websocket`, and an upgrade to another version 426 with
-    /// `Sec-WebSocket-Version: 13`.
+    /// The route serves an HTTP/1.1 upgrade, and on HTTP/2 and HTTP/3 an
+    /// extended CONNECT with `:protocol: websocket`; the handler cannot tell
+    /// them apart. A request to the route that is not a WebSocket upgrade is
+    /// answered 426 with `Upgrade: websocket` (400 on HTTP/2 and HTTP/3), and
+    /// one asking for another version 426 with `Sec-WebSocket-Version: 13`.
     public func webSocket<each E: RequestExtractor>(
         _ pattern: String,
         subprotocols: [String] = [],
@@ -321,7 +323,8 @@ extension WebSocket {
         case .malformed:
             response.send(status: .badRequest, "the WebSocket handshake is incomplete\n")
         case .multiplexed:
-            response.send(status: .badRequest, "WebSocket is served over HTTP/1.1 only\n")
+            response.send(status: .badRequest,
+                          "a WebSocket over HTTP/2 or HTTP/3 starts with an extended CONNECT\n")
         }
     }
 }

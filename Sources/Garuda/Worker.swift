@@ -867,9 +867,18 @@ public struct Worker {
         // a probe, a 429, a static file -- is logged with its ID.
         if config.requestID { assignRequestID(slot) }
         if config.traceContext { assignTraceContext(slot) }
-        // --no-websockets. Refused before anything else can answer, so an
-        // upgrade is never mistaken for an ordinary request to its path.
-        if !config.websocketsEnabled && isWebSocketUpgrade(slot) {
+        // --no-websockets, and --websocket-protocols without http1. Refused
+        // before anything else can answer, so an upgrade is never mistaken for
+        // an ordinary request to its path.
+        if !(config.websocketsEnabled && config.websocketOverHTTP1) && isWebSocketUpgrade(slot) {
+            failRequest(slot, status: 501)
+            return
+        }
+        // An extended CONNECT opens a WebSocket or a WebTransport session
+        // rather than asking for a resource. One for a protocol not served
+        // here is refused, and none is answered from a file or the cache.
+        let extendedConnect = table[slot].pointee.connectProtocol.readableBytes > 0
+        if extendedConnect && !isWebTransportRequest(slot) && !streamWebSocketAllowed(slot) {
             failRequest(slot, status: 501)
             return
         }
@@ -894,21 +903,14 @@ public struct Worker {
         // --static-dir. Returns false for anything it does not have a file
         // for, including a path under its own prefix, so a route never takes
         // a URL away from the application.
-        if serveStatic(slot) { return }
+        if !extendedConnect && serveStatic(slot) { return }
         // --compress. Read now because the request head is in hand now; the
         // response it applies to may not start for several loop turns.
-        if config.compress { negotiateCoding(slot) }
+        if config.compress && !extendedConnect { negotiateCoding(slot) }
         // --cache-size. After the coding is settled, because a copy is
         // compressed for the client it is sent to, and after everything that
         // answers without the application, because a copy stands in for it.
-        if config.cacheSizeMiB > 0 && cacheDispatch(slot) { return }
-        // An extended CONNECT for a protocol nothing here speaks. WebTransport
-        // goes on to the routes, where one registered with `webTransport`
-        // takes it.
-        if table[slot].pointee.h3Protocol.readableBytes > 0 && !isWebTransportRequest(slot) {
-            failRequest(slot, status: 501)
-            return
-        }
+        if config.cacheSizeMiB > 0 && !extendedConnect && cacheDispatch(slot) { return }
         dispatchRoute(slot)
     }
 
@@ -1477,7 +1479,7 @@ public struct Worker {
             if let quic { quic.close(connection, nowMs: av_monotonic_ms()) }
             c.pointee.quicRef = nil
         }
-        c.pointee.h3Protocol.destroy()
+        c.pointee.connectProtocol.destroy()
         c.pointee.responseHeaders.destroy()
         c.pointee.context = nil
 

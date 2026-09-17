@@ -293,7 +293,7 @@ public struct Connection {
     public var h3FrameRemaining: Int = 0
     /// The `:protocol` of an extended CONNECT, which is how WebTransport and
     /// WebSocket-over-HTTP/3 announce themselves.
-    public var h3Protocol = ByteBuffer()
+    public var connectProtocol = ByteBuffer()
     /// The WebTransport session this extended CONNECT became, if it became one.
     var wt: WTSession? = nil
     /// A handler waiting for a streamed response's backlog to drain: resumed
@@ -355,6 +355,9 @@ public struct Connection {
     /// clear of the fields every request touches.
     var eventKeepAliveMs: UInt32 = 0
     var eventKeepAliveDue: UInt64 = 0
+    /// A WebSocket on a stream: bytes received and not yet credited back to
+    /// the peer, held while the handler's queue is full.
+    var wsUncredited: Int = 0
 
     @inlinable public init() {}
 

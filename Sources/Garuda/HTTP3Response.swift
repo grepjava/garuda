@@ -103,6 +103,10 @@ extension Worker {
         }
         flushQUIC(parent)
         resumeWriterIfDrained(streamSlot)
+        if s.pointee.state == .websocket && s.pointee.write.isEmpty {
+            closeWebSocketIfDone(streamSlot)
+            return s.pointee.state != .free
+        }
 
         // Once the ending is on the wire and nothing is left to write, the
         // slot exists only for a task that has not returned yet.

@@ -107,11 +107,13 @@ struct WebSocketOffer {
         case version
         /// An upgrade missing what it needs: 400.
         case malformed
-        /// A WebSocket over HTTP/2 or HTTP/3, which is not spoken yet.
+        /// A request on an HTTP/2 or HTTP/3 stream that is not an extended
+        /// CONNECT for a WebSocket served here.
         case multiplexed
     }
 
-    var key: ByteSpan
+    /// Sec-WebSocket-Key: HTTP/1.1 only.
+    var key: ByteSpan?
     var subprotocols: [String]
     var extensions: [ByteSpan]
 }
@@ -123,7 +125,10 @@ extension Worker {
     /// Reads the WebSocket handshake from the request on `slot`.
     mutating func websocketOffer(_ slot: Int) -> Result<WebSocketOffer, WebSocketOffer.Problem> {
         let c = table[slot]
-        if c.pointee.isStream { return .failure(.multiplexed) }
+        let stream = c.pointee.isStream
+        // On HTTP/2 and HTTP/3 a WebSocket is an extended CONNECT, and a plain
+        // GET to its route is not one.
+        if stream && !streamWebSocketAllowed(slot) { return .failure(.multiplexed) }
         ensureHeaders(slot)
         let head = c.pointee.head
         let base = c.pointee.headBase()
@@ -161,11 +166,18 @@ extension Worker {
                 break
             }
         }
+        if stream {
+            // RFC 8441 section 5: no key and no Upgrade, since the stream is
+            // the tunnel; the version is still sent.
+            guard version == 13 else { return .failure(.version) }
+            return .success(WebSocketOffer(key: nil, subprotocols: subprotocols, extensions: extensions))
+        }
         guard head.method == .get, sawUpgrade, sawConnection else { return .failure(.notUpgrade) }
         guard head.httpMinor == 1 else { return .failure(.malformed) }
         guard version == 13 else { return .failure(.version) }
         // A key is 16 random bytes in base64: 24 characters.
         guard let key, key.count == 24 else { return .failure(.malformed) }
+        _ = key
         return .success(WebSocketOffer(key: key, subprotocols: subprotocols, extensions: extensions))
     }
 
@@ -175,8 +187,9 @@ extension Worker {
     mutating func acceptWebSocket(_ slot: Int, _ offer: WebSocketOffer,
                                   subprotocol: String?) -> WSChannel? {
         let c = table[slot]
+        if c.pointee.isStream { return acceptStreamWebSocket(slot, offer, subprotocol: subprotocol) }
         guard c.pointee.state == .dispatching, !c.pointee.flags.contains(.responseStarted),
-              !c.pointee.flags.contains(.timedOut) else { return nil }
+              !c.pointee.flags.contains(.timedOut), let key = offer.key else { return nil }
         // A deadline bounds a request, and this is no longer one.
         disarmDeadline(slot)
 
@@ -191,7 +204,7 @@ extension Worker {
         out.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n")
         out.write("Connection: Upgrade\r\nSec-WebSocket-Accept: ")
         withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 28) { accept in
-            computeAcceptKey(offer.key, into: accept.baseAddress!)
+            computeAcceptKey(key, into: accept.baseAddress!)
             out.write(UnsafePointer(accept.baseAddress!), 28)
         }
         out.writeCRLF()
@@ -266,6 +279,13 @@ extension Worker {
     /// Decodes every buffered frame: control frames are answered now, and
     /// complete data messages are queued for the handler.
     mutating func pumpWebSocket(_ slot: Int) {
+        pumpWebSocketFrames(slot)
+        if table[slot].pointee.isStream && table[slot].pointee.state == .websocket {
+            releaseStreamWebSocketCredit(slot)
+        }
+    }
+
+    private mutating func pumpWebSocketFrames(_ slot: Int) {
         let c = table[slot]
         guard c.pointee.state == .websocket, c.pointee.ws.accepted else { return }
         let limit = config.maxWebsocketMessageSize
@@ -445,7 +465,8 @@ extension Worker {
     /// Reads while the queue has room, and writes while bytes are queued.
     mutating func updateWebSocketReadInterest(_ slot: Int) {
         let c = table[slot]
-        guard c.pointee.state == .websocket else { return }
+        // A stream has no descriptor: flow control is its read interest.
+        guard c.pointee.state == .websocket, !c.pointee.isStream else { return }
         var mask: PollMask = websocketQueueFull(slot) || c.pointee.ws.closeReceived ? [] : .read
         if !c.pointee.write.isEmpty { mask.insert(.write) }
         setInterest(slot, mask)
@@ -578,7 +599,19 @@ extension Worker {
 
     /// What the connection has queued and the peer has not taken yet.
     func websocketBacklog(_ slot: Int) -> Int {
-        table[slot].pointee.write.readableBytes
+        // On HTTP/3 bytes go to the transport at once; what counts is what it
+        // holds unacknowledged.
+        streamBacklog(slot)
+    }
+
+    /// Ends the WebSocket's connection, or on HTTP/2 and HTTP/3 its stream:
+    /// cleanly once the closes are done, or abandoned.
+    mutating func endWebSocket(_ slot: Int, clean: Bool) {
+        if table[slot].pointee.isStream {
+            endStreamWebSocket(slot, clean: clean)
+        } else {
+            closeConnection(slot)
+        }
     }
 
     /// Queues a close frame. Once the peer's close has also come, the
@@ -603,7 +636,7 @@ extension Worker {
         guard c.pointee.state == .websocket, c.pointee.write.isEmpty else { return }
         if (c.pointee.ws.closeSent && c.pointee.ws.closeReceived)
             || c.pointee.flags.contains(.peerClosed) {
-            closeConnection(slot)
+            endWebSocket(slot, clean: true)
         }
     }
 
@@ -622,7 +655,7 @@ extension Worker {
            c.pointee.state == .websocket, !c.pointee.ws.closeSent {
             c.pointee.ws.pendingFailure = code
             c.pointee.ws.pendingFailureAt = av_monotonic_ms()
-            setInterest(slot, c.pointee.write.isEmpty ? [] : .write)
+            if !c.pointee.isStream { setInterest(slot, c.pointee.write.isEmpty ? [] : .write) }
             return
         }
         applyWebSocketFailure(slot, code: code)
@@ -683,7 +716,7 @@ extension Worker {
             return
         }
         if c.pointee.ws.closeSent {
-            if now &- c.pointee.ws.closeSentAt > config.websocketPingTimeoutMs { closeConnection(slot) }
+            if now &- c.pointee.ws.closeSentAt > config.websocketPingTimeoutMs { endWebSocket(slot, clean: false) }
             return
         }
         let interval = config.websocketPingIntervalMs
@@ -691,7 +724,7 @@ extension Worker {
         if c.pointee.ws.pingSentAt != 0 {
             // No pong came back: the peer is gone even if the socket has not
             // noticed, which is what pings are for.
-            if now &- c.pointee.ws.pingSentAt > config.websocketPingTimeoutMs { closeConnection(slot) }
+            if now &- c.pointee.ws.pingSentAt > config.websocketPingTimeoutMs { endWebSocket(slot, clean: false) }
             return
         }
         if now &- c.pointee.lastActivity < interval { return }
@@ -705,7 +738,7 @@ extension Worker {
     mutating func resumeWebSocketWriter(_ slot: Int) {
         let c = table[slot]
         guard let channel = c.pointee.ws.channel, channel.writeWaiter != nil,
-              c.pointee.write.readableBytes <= config.writeLowWaterMark else { return }
+              streamBacklog(slot) <= config.writeLowWaterMark else { return }
         channel.writeWaiter.take()?.resume()
     }
 
