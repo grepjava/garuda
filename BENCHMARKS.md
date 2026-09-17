@@ -230,6 +230,12 @@ Servers on CPUs 0-3 and zrk on CPUs 4-7 (`PIN=0-3:4-7 WORKERS=4`):
 - Pinning does not separate the load: CPUs 0-3 and 4-7 are hyperthreads of the
   same four cores. A machine with a second host for the load generator is what
   would separate the servers.
+- These rates are lower than the same machine gives in a short run, for every
+  server. Twenty minutes of continuous load on a 15 W laptop CPU under the
+  `powersave` governor is a throttling shape: `vs-axum.sh` right afterwards
+  read 296,072 req/s for Garuda and 199,132 for axum on the ramp, against
+  203,397 and 172,055 here. Compare a sustained sweep only with another
+  sustained sweep.
 
 ### Recorded run: Hummingbird and Vapor
 
@@ -263,6 +269,11 @@ the mean of three runs, no errors. Requests a second:
   A closed-loop figure can be the load generator's limit.
 - **Use a dedicated machine** for figures that matter, with nothing else
   running and no builds or tests alongside.
+- **A long sweep and a short run are different measurements.** On the bench
+  box a full `frameworks.sh` sweep takes about 20 minutes and its rates settle
+  some 30% below what `vs-axum.sh` reads in 87 seconds, for every server
+  alike: the CPU cannot hold its clocks that long. Never read a sweep's figure
+  against a short run's.
 
 ## Planned
 
