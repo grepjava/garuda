@@ -3,7 +3,8 @@
 Garuda talks to other services through connectors that run on the worker's
 poller: an HTTP client, a PostgreSQL driver and a Redis driver. Each one keeps a
 pool per worker process, built after the fork. No connector blocks a worker's
-thread, and none wraps a client library such as libpq or hiredis. A SQLite connector is planned.
+thread, and none wraps a client library such as libpq or hiredis. A SQLite
+connector is planned.
 
 This file covers what each connector supports, what it does not, and the work
 planned for each one. How to use them is in [README.md](README.md), and every
@@ -99,7 +100,9 @@ for keys whose hash slots that node holds:
   primary, or a managed service's single endpoint.
 - A stable address that follows the primary through a failover, such as a DNS
   name or a proxy that speaks the single-server protocol. A connection the
-  failover broke is closed, and the next one reaches the new primary.
+  failover broke is closed, and the next one reaches the new primary. With a
+  DNS name, a connection still open to a demoted primary keeps getting
+  `READONLY` until it closes, so a proxy is the safer choice.
 
 ### Future work
 
