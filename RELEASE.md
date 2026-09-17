@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 692 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 697 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -273,6 +273,12 @@ The Python suites need `h2` and `aioquic`.
   default, leaves routes matching exactly. A path that matches as it came is
   never touched, so this costs a matched request nothing, and a redirect whose
   Location would start with `//` is not sent.
+- `app.requestDecompression()` decodes the request bodies of its scope whose
+  Content-Encoding is gzip, deflate, br or zstd, several stacked included,
+  before the middleware after it and the handler read them. The decoded size
+  is held to `app.maxBodySize` or `--max-body` as it grows: 413 past it, 400
+  for bytes the coding did not make, and 415 with Accept-Encoding for a coding
+  that cannot be decoded. A streaming route's body is left as it came.
 
 ### Streaming responses and server-sent events
 

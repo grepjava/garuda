@@ -271,7 +271,7 @@ wait once.
 | 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | Done |
-| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS, authentication, the application log, response observers, request limits, cookies, sessions, CSRF protection and security headers and trailing slashes done; decompression and host and IP filters to do |
+| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS, authentication, the application log, response observers, request limits, cookies, sessions, CSRF protection and security headers, trailing slashes and request decompression done; host and IP filters to do |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Done |
 | 6 | Examples and realistic benchmarks | Examples done; benchmarks to do |
 
@@ -282,8 +282,7 @@ wait once.
   SASLprep.
 
 **Step 4**
-- Middleware Garuda ships: request decompression, a host allow-list and IP
-  filter.
+- Middleware Garuda ships: a host allow-list and IP filter.
 
 **Step 6**
 - Benchmarks past hello-world against axum: path parameters, JSON in and out, a
