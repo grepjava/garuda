@@ -14,7 +14,7 @@ Flags are in [CONFIG.md](CONFIG.md).
 | HTTP/2 | `h2` over TLS via ALPN, `h2c` with prior knowledge |
 | HTTP/3 | with `--http3`, over Garuda's own QUIC |
 | WebTransport | over HTTP/3, through `app.webTransport` routes |
-| WebSocket | framing code only; no handshake or handler API |
+| WebSocket | HTTP/1.1, cleartext and TLS, through `app.webSocket` routes |
 
 ---
 
@@ -360,10 +360,44 @@ of data, with line breaks in event names and IDs replaced.
 
 ## WebSocket
 
-Framing and UTF-8 validation (`WebSocketFrame.swift`) and permessage-deflate
-(`WebSocketDeflate.swift`, `avian_wsdeflate.c`) exist with unit tests. There
-is no handshake path. `--no-websockets` refuses an upgrade with 501; otherwise
-it goes to the routes like any request.
+RFC 6455 over HTTP/1.1, with permessage-deflate (RFC 7692) under
+`--ws-compress`. Framing, UTF-8 validation and deflate are aviancore's
+(`WebSocketFrame.swift`, `WebSocketDeflate.swift`, `avian_wsdeflate.c`); the
+handshake, the connection state and the handler API are Garuda's
+(`WebSocket.swift`, `WebSocketAPI.swift`).
+
+- **Handshake.** A GET with `Upgrade: websocket`, `Connection: Upgrade`,
+  version 13 and a 16-byte key. A plain GET to a WebSocket route is 426 with
+  `Upgrade: websocket`; another version is 426 with `Sec-WebSocket-Version: 13`;
+  a missing or malformed key is 400. Middleware and extractors run first, and
+  headers middleware adds go out with the 101. The route's subprotocols are
+  matched against the client's offer in the route's order of preference.
+- **Frames.** A frame is decoded once its whole payload is buffered, so a
+  connection holds at most `--ws-max-message` plus a header. Unmasked client
+  frames, RSV bits nothing negotiated, unknown opcodes, fragmented or oversized
+  control frames, a continuation with no message and a new message during one
+  are closed with 1002. Text is checked for UTF-8 frame by frame, and fails
+  with 1007 at the frame that breaks it. A message over the limit, joined or
+  inflated, is 1009.
+- **Control frames** are answered as they arrive, whatever the handler is
+  doing: a ping is answered with a pong carrying its payload, and a close with
+  a close carrying its code. A WebSocket quiet for `--ws-ping-interval` is
+  pinged, and closed if the pong does not come within `--ws-ping-timeout`.
+- **Closing.** A close from the peer ends the handler's `receive` once every
+  message before it has been read, with the code (1005 when there was none,
+  1006 when the connection ended without a close). A close the server sends
+  first waits `--ws-ping-timeout` for the answer. A handler that returns
+  without closing closes with 1000, one that throws with 1011, and a draining
+  worker with 1001.
+- **Flow.** Up to `--ws-max-queue` messages and `--ws-max-queue-bytes` bytes wait
+  for a handler that is not reading; past that the socket is not read, so the
+  sender is slowed by TCP. A send waits while more than `writeHighWaterMark` is
+  queued for a slow reader.
+- **Deflate** contexts are made on the first compressed message in each
+  direction, and messages under 64 bytes go out uncompressed.
+
+`scripts/websocket-test.py` drives all of this with a client built from a
+socket, and checks the `websockets` library against it.
 
 ---
 
@@ -373,6 +407,7 @@ Each protocol is tested against implementations that share none of its code:
 `scripts/http2-test.py` (`h2`, each check cleartext and over TLS),
 `scripts/http3-test.py` and `scripts/webtransport-test.py` (`aioquic`),
 `scripts/router-streams-test.py` (routes, delays and cancellation on HTTP/2 and
-HTTP/3) and `scripts/handler-test.py` (handler framing on all three).
+HTTP/3), `scripts/handler-test.py` (handler framing on all three) and
+`scripts/websocket-test.py` (WebSocket, with `websockets` for interoperability).
 `swift test` covers the parser, HPACK, QUIC packet protection and streams, and
 WebSocket framing. The parsers are fuzzed ([fuzz/README.md](fuzz/README.md)).

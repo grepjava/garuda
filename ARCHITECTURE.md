@@ -457,9 +457,6 @@ task pool, the supervisor's state.
 
 ## Not wired to handlers yet
 
-- **WebSocket**: framing, UTF-8 validation and permessage-deflate exist in
-  `AvianHTTP` with unit tests. There is no handshake path; `WebSocket.swift`
-  holds stubs.
 - **Response compression and the response cache** do not apply to handler
   responses. Pre-compressed static files (`--compress-static`) are served.
 

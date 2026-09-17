@@ -1040,6 +1040,12 @@ public struct Worker {
             // it, and recycling it now would let a pipelined request overwrite
             // that state.
             finishResponse(slot)
+        } else if c.pointee.state == .websocket {
+            // Both closes exchanged, or the peer gone: the last frame is out.
+            closeWebSocketIfDone(slot)
+            if table[slot].pointee.state == .websocket {
+                setInterest(slot, readInterestAllowed(slot) ? .read : [])
+            }
         } else if c.pointee.state != .free {
             setInterest(slot, readInterestAllowed(slot) ? .read : lingeringRead(slot))
         }
@@ -1067,7 +1073,9 @@ public struct Worker {
     @inline(__always)
     func readInterestAllowed(_ slot: Int) -> Bool {
         let c = table[slot]
-        if c.pointee.state == .websocket { return !websocketQueueFull(slot) }
+        if c.pointee.state == .websocket {
+            return !c.pointee.ws.closeReceived && !websocketQueueFull(slot)
+        }
         if c.pointee.state == .dispatching {
             // Nothing left to read for this request, and a level-triggered
             // poller would spin on the pipelined bytes behind it.
@@ -1470,10 +1478,8 @@ public struct Worker {
 
         releaseWebTransport(slot)
 
-        if let k = c.pointee.ws.acceptKey { k.deallocate(); c.pointee.ws.acceptKey = nil }
-        if let z = c.pointee.ws.deflater { av_ws_deflate_free(z); c.pointee.ws.deflater = nil }
-        if let z = c.pointee.ws.inflater { av_ws_inflate_free(z); c.pointee.ws.inflater = nil }
-        c.pointee.ws.deflate = nil
+        // Wakes a handler still waiting on it, which then finds it ended.
+        if c.pointee.flags.contains(.websocketMode) { releaseWebSocket(slot) }
         c.pointee.remoteAddr.destroy()
 
         endTLS(slot)
@@ -1705,8 +1711,12 @@ public struct Worker {
     /// once it has fallen to the low water mark. Called wherever bytes leave.
     @inline(__always)
     mutating func resumeWriterIfDrained(_ slot: Int) {
-        if table[slot].pointee.writerWake == nil { return }
-        resumeStreamWriter(slot)
+        let c = table[slot]
+        if c.pointee.writerWake != nil {
+            resumeStreamWriter(slot)
+        } else if c.pointee.state == .websocket {
+            resumeWebSocketWriter(slot)
+        }
     }
 
     mutating func releaseDrainWaiter(_ slot: Int) {

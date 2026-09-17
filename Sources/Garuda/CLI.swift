@@ -117,8 +117,6 @@ public enum GarudaCLI {
               --ws-max-queue-bytes N   bytes buffered for a slow handler (4 MiB)
               --ws-compress            negotiate permessage-deflate with WebSocket
                                        clients that offer it
-                                       (the --ws-* settings have no effect until
-                                       WebSocket handlers exist)
               --static-dir P=DIR       serve URL prefix P from DIR with sendfile,
                                        before routing (repeatable). A path with no
                                        file behind it still reaches the routes

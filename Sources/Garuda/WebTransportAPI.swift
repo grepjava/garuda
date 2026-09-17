@@ -91,7 +91,7 @@ public final class WebTransportSession: @unchecked Sendable {
             }
             if state.gone { return nil }
             guard state.acceptWaiter == nil else { throw WebTransportError.busy }
-            try await park(worker, { self.state.acceptWaiter = $0 }, { self.state.acceptWaiter.take() })
+            try await parkOnWorker(worker, { self.state.acceptWaiter = $0 }, { self.state.acceptWaiter.take() })
         }
     }
 
@@ -130,7 +130,7 @@ public final class WebTransportSession: @unchecked Sendable {
             }
             if state.gone { return nil }
             guard state.datagramWaiter == nil else { throw WebTransportError.busy }
-            try await park(worker, { self.state.datagramWaiter = $0 }, { self.state.datagramWaiter.take() })
+            try await parkOnWorker(worker, { self.state.datagramWaiter = $0 }, { self.state.datagramWaiter.take() })
         }
     }
 
@@ -229,7 +229,7 @@ public final class WebTransportStream: @unchecked Sendable {
                 return nil
             }
             guard state.readWaiter == nil else { throw WebTransportError.busy }
-            try await park(session.worker, { self.state.readWaiter = $0 }, { self.state.readWaiter.take() })
+            try await parkOnWorker(session.worker, { self.state.readWaiter = $0 }, { self.state.readWaiter.take() })
         }
     }
 
@@ -260,7 +260,7 @@ public final class WebTransportStream: @unchecked Sendable {
             if quic.send.data.readableBytes <= highWater { return }
             guard state.writable else { throw WebTransportError.notWritable }
             guard state.writeWaiter == nil else { throw WebTransportError.busy }
-            try await park(session.worker, { self.state.writeWaiter = $0 }, { self.state.writeWaiter.take() })
+            try await parkOnWorker(session.worker, { self.state.writeWaiter = $0 }, { self.state.writeWaiter.take() })
         }
     }
 
@@ -318,7 +318,7 @@ public final class WebTransportStream: @unchecked Sendable {
 /// so only a cancel on the worker's own thread -- a task group cancelling its
 /// children -- wakes the wait at once. One from elsewhere is noticed when the
 /// wait next ends.
-private func park(_ worker: UnsafeMutablePointer<Worker>,
+func parkOnWorker(_ worker: UnsafeMutablePointer<Worker>,
                   _ store: (UnsafeContinuation<Void, Never>) -> Void,
                   _ take: @escaping @Sendable () -> UnsafeContinuation<Void, Never>?) async throws {
     try Task.checkCancellation()

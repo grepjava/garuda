@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 512 unit tests
+swift test                             # 520 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -39,6 +39,7 @@ python3 scripts/http2-test.py          # 50
 python3 scripts/http3-test.py          # 53
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 136, runs garuda-conformance
+python3 scripts/websocket-test.py      # 104, runs garuda-conformance
 python3 scripts/webtransport-test.py   # 46, runs garuda-conformance
 python3 scripts/upload-test.py         # 35, runs garuda-conformance
 ```
@@ -180,6 +181,35 @@ The Python suites need `h2` and `aioquic`.
   HTTP/3, including resuming after a dropped connection and a reset QUIC
   stream.
 
+### WebSockets
+
+- `app.webSocket("/chat/:room", subprotocols: ["chat.v2"]) { (ws: WebSocket, room: Path<String>) async throws in … }`
+  serves RFC 6455 over HTTP/1.1, cleartext or TLS. Middleware and extractors
+  run before the upgrade and can refuse it with an ordinary status; headers
+  middleware adds go out with the 101. A plain request to the route is 426.
+- The handler sees whole messages: `receive()`, or `for try await message in ws`,
+  and `send` of text or bytes, which waits while the peer reads slowly.
+  `close(code:reason:)` starts the close handshake, `closeCode` and
+  `closeReason` say how the peer ended it, and `sleep(milliseconds:)` waits on
+  the worker between sends.
+- The engine joins fragments, checks UTF-8 as frames arrive, answers pings and
+  closes, sends keepalive pings, and refuses protocol violations with the close
+  code RFC 6455 gives them, whether or not the handler is reading. With
+  `--ws-compress`, permessage-deflate is agreed and a message that inflates past
+  `--ws-max-message` is refused.
+- Messages a handler has not read wait in a queue bounded by `--ws-max-queue`
+  and `--ws-max-queue-bytes`; past that the socket is not read.
+- A handler that returns closes with 1000, one that throws with 1011, and a
+  draining worker closes its WebSockets with 1001.
+- Each WebSocket's handler runs on a task of its own, so open WebSockets do not
+  take tasks from the pool ordinary requests use.
+- The Autobahn testsuite's 517 cases pass: none fail, and the three marked
+  non-strict (6.4.2 to 6.4.4) check UTF-8 inside a frame, which the engine
+  checks once the frame has arrived.
+- `app.test.webSocket("/path")` opens a WebSocket in a test: `send`, `receive`,
+  `ping` and `close`, with the 101 or the refusal in `response` and the
+  server's close in `closeCode` and `closeReason`.
+
 ### WebTransport
 
 - `app.webTransport("/room/:id") { (session: WebTransportSession, id: Path<Int>) async throws in … }`
@@ -257,7 +287,7 @@ The Python suites need `h2` and `aioquic`.
 
 ### Not yet
 
-- WebSocket handlers, router values to merge, custom fallbacks, and shipped
+- WebSocket over HTTP/2 and HTTP/3, router values to merge, custom fallbacks, and shipped
   middleware for authentication, CORS and tracing.
   Middleware cannot wrap a handler's run.
 - `--compress` and `--cache-size` do not act on handler responses.

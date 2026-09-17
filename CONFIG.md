@@ -223,12 +223,12 @@ garuda --ktls --tls-cert cert.pem --tls-key key.pem --static-dir /static=/srv/ap
 | `--http3` | off | also serve HTTP/3 over QUIC; needs TLS; not with `--unix` |
 | `--quic-port PORT` | `--port` | UDP port for HTTP/3 |
 | `--no-websockets` | off | refuse WebSocket upgrade requests with 501 |
-| `--ws-max-message BYTES` | 16 MiB | not used yet |
-| `--ws-ping-interval MS` | `20000` | not used yet |
-| `--ws-ping-timeout MS` | `20000` | not used yet |
-| `--ws-max-queue N` | `32` | not used yet |
-| `--ws-max-queue-bytes N` | 4 MiB | not used yet |
-| `--ws-compress` | off | not used yet |
+| `--ws-max-message BYTES` | 16 MiB | largest message accepted, joined or inflated; a larger one is closed with 1009 |
+| `--ws-ping-interval MS` | `20000` | ping a WebSocket quiet this long; `0` sends none |
+| `--ws-ping-timeout MS` | `20000` | close one whose ping, or whose close, has gone unanswered this long |
+| `--ws-max-queue N` | `32` | messages held for a handler that is not reading, before the socket stops being read |
+| `--ws-max-queue-bytes N` | 4 MiB | the same, in bytes; one message always fits |
+| `--ws-compress` | off | agree permessage-deflate with a client that offers it |
 
 With no flags, the TCP port serves HTTP/1.1 and HTTP/2 prior knowledge in the
 clear. With a certificate, ALPN offers `h2` and `http/1.1`.
@@ -249,10 +249,11 @@ curl -k --http2 https://127.0.0.1:8443/
 curl -k --http3 https://127.0.0.1:8443/     # needs a curl built with HTTP/3
 ```
 
-**WebSocket.** There are no WebSocket handlers yet. An upgrade request is
-routed like any other request. `--no-websockets` refuses it with 501 before
-anything else answers. The `--ws-*` flags are parsed and stored in
-`ServerConfig`, but nothing reads them until WebSocket handlers exist.
+**WebSocket.** An upgrade is routed like any other request, and a route
+registered with `app.webSocket` accepts it. `--no-websockets` refuses every
+upgrade with 501 before anything else answers. The `--ws-*` flags bound what a
+WebSocket may send and how long it may go quiet. WebSockets are served over
+HTTP/1.1, with or without TLS.
 
 **WebTransport** has no flag. It needs `--http3`, and a route registered with
 `app.webTransport` takes the session. Any other extended CONNECT is refused
