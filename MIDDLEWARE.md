@@ -431,8 +431,9 @@ Keep in mind:
   connection slot; after a wait the client may have gone.
 - **Register `onSend` hooks before the first `await`** too, and keep them fast:
   they run on the worker thread for every response in scope.
-- **Refuse with an answer rather than throwing**, when the refusal is expected:
-  the answer is explicit, and a thrown error is reported as a failure.
+- **Refuse with an answer, or throw a `ResponseError`** such as `HTTPError`,
+  when the refusal is expected. Any other error is logged as a failure, shows
+  in `onResponse`, and is answered 500.
 
 ### Extractors instead of middleware
 
