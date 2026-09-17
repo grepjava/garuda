@@ -68,7 +68,8 @@ public enum JWTAlgorithm: String, Sendable, CaseIterable, Codable {
         }
     }
 
-    var isHMAC: Bool { self == .HS256 || self == .HS384 || self == .HS512 }
+    /// Whether this is HS256, HS384 or HS512, signed with a shared secret.
+    public var isHMAC: Bool { self == .HS256 || self == .HS384 || self == .HS512 }
 
     /// The key type a key for this algorithm must be.
     var keyType: Int32 {
@@ -412,7 +413,14 @@ public final class JWTKeys: @unchecked Sendable {
     /// Seconds since the epoch; tests set their own.
     var clock: @Sendable () -> Int64 = { Timestamp.now.secondsSinceEpoch }
 
-    public init(_ keys: [JWTKey], validation: JWTValidation = JWTValidation()) throws(JWTError) {
+    /// Keys as given, unchecked: a published set may repeat or omit a `kid`,
+    /// and the first key that matches a token is the one tried.
+    init(uncheckedKeys keys: [JWTKey], validation: JWTValidation) {
+        self.keys = keys
+        self.validation = validation
+    }
+
+    public convenience init(_ keys: [JWTKey], validation: JWTValidation = JWTValidation()) throws(JWTError) {
         guard !keys.isEmpty else { throw .invalidKey("a key set needs a key") }
         var seen: Set<String> = []
         for key in keys {
@@ -421,8 +429,7 @@ public final class JWTKeys: @unchecked Sendable {
         if keys.count > 1 && keys.contains(where: { $0.keyID == nil }) {
             throw .invalidKey("with more than one key, every key needs a kid")
         }
-        self.keys = keys
-        self.validation = validation
+        self.init(uncheckedKeys: keys, validation: validation)
     }
 
     /// The public keys as a JWK Set, for other services to verify with.

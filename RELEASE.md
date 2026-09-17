@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 728 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 735 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -350,6 +350,13 @@ The Python suites need `h2` and `aioquic`.
   one of every request in a scope. Failures are 401 with
   `WWW-Authenticate: Bearer error="invalid_token"`. `keys.publicJWKS` is the
   public key set to publish.
+- `JWKSVerifier(url:validation:)` verifies tokens from an identity provider
+  against its JWK Set. The set is fetched on first use and kept for
+  `maxAgeSeconds`. An unknown `kid` fetches it again, and requests during a
+  fetch share it. Fetches happen at most once per `minimumRefetchSeconds`, and
+  keys in hand survive a failed fetch; with none, the answer is 503. Only
+  asymmetric keys for `algorithms` are trusted: `oct` and `use: enc` keys are
+  skipped. Google's and Microsoft's sets load.
 - MIDDLEWARE.md: how middleware and `onSend` run, the order to add it in,
   every middleware Garuda ships with its options and answers, the server flags
   that act as middleware, and writing middleware and extractors of your own.

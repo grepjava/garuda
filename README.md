@@ -178,6 +178,7 @@ app.group("/api") {
 - `JWT<Claims>` takes a verified JSON Web Token (HS, RS, PS, ES or EdDSA),
   keys from PEM, JWK or a secret, with `exp`, `nbf`, `iss` and `aud` checked;
   `keys.sign(claims)` issues one and `keys.publicJWKS` publishes the key set.
+  `JWKSVerifier` checks tokens from an identity provider against its JWK Set.
 - `Passwords.hash` and `Passwords.verify` use PBKDF2-HMAC-SHA256 on the
   blocking pool. `Tokens.random()` makes a session token and `Tokens.digest`
   what to store in its place.
@@ -503,7 +504,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 728 unit tests, and the fuzz corpus
+swift test                                   # 735 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

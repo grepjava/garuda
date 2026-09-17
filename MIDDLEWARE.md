@@ -228,6 +228,29 @@ app.get("/.well-known/jwks.json") { JSON(keys.publicJWKS) }
 - `keys.publicJWKS` is the public half of every asymmetric key, to publish for
   other services. HMAC secrets are never included.
 
+#### Tokens from an identity provider
+
+```swift
+app.jwtVerifier { _ in
+    JWKSVerifier(url: "https://auth.example.com/.well-known/jwks.json",
+                 validation: JWTValidation(issuer: "https://auth.example.com/", audience: "shop"))
+}
+app.get("/me") { (jwt: JWT<UserClaims>) async in jwt.claims.sub }
+```
+
+- `JWKSVerifier` fetches the provider's JWK Set on the first token, keeps it
+  for `maxAgeSeconds` (an hour), then fetches it again.
+- A token naming a `kid` the set lacks triggers a fetch, since that is how a
+  key rotation shows.
+- It never fetches more than once per `minimumRefetchSeconds` (a minute), so
+  made-up key IDs or a provider outage cannot turn into a flood of requests.
+- Requests that arrive during a fetch wait for it. If a fetch fails, the keys
+  already in hand keep working; with none yet, the answer is 503.
+- Only asymmetric algorithms are trusted: `oct` keys and `use: enc` keys are
+  ignored, and `algorithms` narrows the list further. An RSA key without `alg`
+  counts as RS256.
+- Checked against Google's and Microsoft's published sets.
+
 ### Sessions
 
 ```swift
