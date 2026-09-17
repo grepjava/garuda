@@ -308,7 +308,7 @@ extension Worker {
                 // there is no limit on the upload at all.
                 if s.pointee.bodyReceived > s.pointee.bodyLimit {
                     s.pointee.bodyStream?.failure = .tooLarge
-                    streamError(slot, h2, header.streamID, .enhanceYourCalm)
+                    refuseBody(streamSlot)
                     return
                 }
                 s.pointee.body.write(payload + offset, length)
@@ -532,6 +532,15 @@ extension Worker {
         if !endStream {
             if application?.pointee.streamsBodies == true {
                 beginStreamedBody(streamSlot)
+            }
+            // As on HTTP/1.1: a declared length past the limit is refused
+            // before a byte of the body is taken.
+            if s.pointee.head.flags.contains(.hasContentLength)
+                && s.pointee.head.contentLength > s.pointee.bodyLimit {
+                refuseBody(streamSlot)
+                return
+            }
+            if application?.pointee.streamsBodies == true {
                 if s.pointee.flags.contains(.bodyStreaming) {
                     s.pointee.state = .dispatching
                     dispatch(streamSlot)
@@ -545,6 +554,29 @@ extension Worker {
         s.pointee.state = .dispatching
         dispatch(streamSlot)
         if table[slot].pointee.state == .http2 { _ = flush(slot) }
+    }
+
+    /// A request body past its limit. Answered 413, as on HTTP/1.1 and HTTP/3,
+    /// and the stream then reset with NO_ERROR, which tells the client to stop
+    /// sending the rest without calling the request malformed (RFC 9113
+    /// section 8.1). A handler already answering cannot be given a status, so
+    /// its stream is reset as a refusal.
+    mutating func refuseBody(_ streamSlot: Int) {
+        let s = table[streamSlot]
+        let parent = Int(s.pointee.parentSlot)
+        let streamID = s.pointee.streamID
+        guard parent >= 0, table[parent].pointee.h2 != nil else {
+            closeConnection(streamSlot)
+            return
+        }
+        if s.pointee.flags.contains(.responseStarted) {
+            closeStream(streamSlot, resetWith: nil)
+            writeRstStream(parent, streamID, .enhanceYourCalm)
+        } else {
+            h2FailRequest(streamSlot, status: 413)
+            writeRstStream(parent, streamID, .noError)
+        }
+        _ = flush(parent)
     }
 
     /// Runs the HPACK decoder over the assembled block.

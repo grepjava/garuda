@@ -535,7 +535,19 @@ def test_body_limit():
         check("a paced upload cannot walk past --max-body",
               killed is not None and sent <= 2048,
               "sent %d bytes with no complaint" % sent)
-        is_("and the stream is not answered 200", c.status.get(stream), None)
+        c.step(timeout=0.5)
+        is_("it is answered 413, as on HTTP/1.1 and HTTP/3", c.status.get(stream), 413)
+        is_("and reset with NO_ERROR, so the client stops sending",
+            c.reset.get(stream), h2.errors.ErrorCodes.NO_ERROR)
+        c.close()
+
+        # A declared length past the limit is refused before the body.
+        c = Client(server)
+        declared = c.request(method="POST", path="/user",
+                             extra=[("content-length", "4096")], end=False)
+        c.collect([declared], deadline=5.0)
+        is_("a declared Content-Length past --max-body is answered 413 at once",
+            c.status.get(declared), 413)
         c.close()
 
         # Under the limit, everything still works.

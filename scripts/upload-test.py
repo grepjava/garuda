@@ -305,9 +305,10 @@ def streams():
             sent += n
         limited = client.request("POST", "/body-limited", body=payload(4096, 1))
         client.collect([limited], deadline=20)
-        # HTTP/2 refuses a body past its limit by resetting the stream.
+        # Answered 413, as on the other two, and the stream then reset with
+        # NO_ERROR so the client stops sending.
         ht.is_("over HTTP/2 a route's own body limit applies",
-               client.reset.get(limited), h2.errors.ErrorCodes.ENHANCE_YOUR_CALM)
+               client.status.get(limited), 413)
         ht.check("over HTTP/2 a body nobody has read yet holds the client to a window",
                  sent <= 1 << 20, sent)
         client.send_body(held, big[sent:], end_stream=True)

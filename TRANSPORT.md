@@ -177,8 +177,11 @@ and WINDOW_UPDATE goes out once half the initial window has accumulated. DATA
 for a closed stream still returns its bytes to the connection window.
 
 **Body length.** A body longer or shorter than its `Content-Length` is
-`RST_STREAM(PROTOCOL_ERROR)` (RFC 9113 8.1.1). Past `--max-body`:
-`RST_STREAM(ENHANCE_YOUR_CALM)`. If the response finishes first, a remaining
+`RST_STREAM(PROTOCOL_ERROR)` (RFC 9113 8.1.1). Past `--max-body`, or a
+route's own limit, declared or as it arrives: a 413 response, then
+`RST_STREAM(NO_ERROR)` so the client stops sending (RFC 9113 8.1); a handler
+that has already begun its response gets `RST_STREAM(ENHANCE_YOUR_CALM)`
+instead. If the response finishes first, a remaining
 upload up to the body high-water mark is still received and counted in
 `closing`; a larger one gets `RST_STREAM(NO_ERROR)`. A response short of its
 declared length is reset with `INTERNAL_ERROR`.

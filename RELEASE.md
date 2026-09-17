@@ -36,7 +36,7 @@ bash scripts/trace-context-test.sh     # 17
 bash scripts/drain-test.sh             # 14
 bash scripts/reload-test.sh            # 7
 python3 scripts/feature-test.py        # 62
-python3 scripts/http2-test.py          # 50
+python3 scripts/http2-test.py          # 54
 python3 scripts/http3-test.py          # 53
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 143, runs garuda-conformance
@@ -125,6 +125,10 @@ The Python suites need `h2` and `aioquic`.
   its deadline, and unwinds a handler waiting on the engine. It bounds waiting,
   not computing.
 - A closed connection or reset stream cancels a handler waiting on the engine.
+- A request body over its limit is answered 413 on HTTP/2 too, then its stream
+  is reset with NO_ERROR, where it used to get only a reset. A declared
+  `Content-Length` over the limit is refused before the body is read, as on
+  HTTP/1.1.
   An answer to a request that has gone is dropped rather than written into the
   next request on the slot.
 - Handlers registered from `main.swift` take `sending` closures, so they run on
@@ -368,8 +372,6 @@ The Python suites need `h2` and `aioquic`.
   and a completed upload is not replayed. A request still appending on
   another worker is waited for briefly, then the new request gets 409 with
   Retry-After. Expired uploads are removed when uploads are created.
-- A body over its limit is refused with a stream reset on HTTP/2, where
-  HTTP/1.1 and HTTP/3 answer 413.
 - PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types of
   its own (they read as text), no `LISTEN`, and no SASLprep for non-ASCII
   passwords. No Redis or SQLite driver.

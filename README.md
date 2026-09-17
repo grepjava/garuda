@@ -414,7 +414,7 @@ bash scripts/trace-context-test.sh           # 17  --trace-context
 bash scripts/drain-test.sh                   # 14  --drain-delay
 bash scripts/reload-test.sh                  #  7  SIGHUP under load
 python3 scripts/feature-test.py              # 62  shutdown, supervision, unix sockets, slow clients
-python3 scripts/http2-test.py                # 50  against the h2 library
+python3 scripts/http2-test.py                # 54  against the h2 library
 python3 scripts/http3-test.py                # 53  against aioquic
 python3 scripts/router-streams-test.py       # 41  routes over HTTP/2 and HTTP/3
 python3 scripts/handler-test.py              # 143 the handler API over all three protocols
@@ -452,8 +452,6 @@ say) is not unwound when its request is cancelled. It resumes to find
 - A stable API, WebSocket over HTTP/2 and HTTP/3, Redis and SQLite.
 - Resumable uploads have no `min-size` or `min-append-size` limits and no
   digests, and a completed upload is not replayed to a client that asks again.
-- A body over its limit is answered 413 on HTTP/1.1 and HTTP/3, and refused
-  with a stream reset (ENHANCE_YOUR_CALM) on HTTP/2.
 - Byte ranges and directory listings for static files.
 - QUIC session resumption and 0-RTT.
 - TLS over TCP in Swift: it is OpenSSL.
