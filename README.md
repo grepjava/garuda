@@ -128,7 +128,10 @@ app.deadline(milliseconds: 500) {
 A request still unanswered at its deadline is answered 504. A closed connection
 or reset stream cancels a handler waiting on the engine. `request.client`
 speaks HTTP/1.1, and HTTP/2 over TLS when the server offers it. It resolves
-names on the worker's poller and keeps connections for reuse.
+names on the worker's poller and keeps connections for reuse. It asks for
+gzip, deflate, brotli and zstd and decodes what comes back, and it follows
+redirects only when `client.redirects` says to: `.sameOrigin()`, `.any()` or
+`.matching { url in … }`.
 
 ### State, groups and middleware
 
@@ -276,7 +279,7 @@ offer. This is where Garuda stands, area by area.
 | Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints | Done |
 | WebSockets | `WebSocketUpgrade` | `app.webSocket`, whole messages, pings and permessage-deflate by the engine | Done, HTTP/1.1 only |
 | WebTransport | None in hyper | `app.webTransport` | Done |
-| HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2 | Done; no redirects or decompression |
+| HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression | Done |
 | PostgreSQL | sqlx, tokio-postgres | Native driver on the poller | Done |
 | Redis, SQLite | redis-rs, sqlx | None | Planned |
 | Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker | Done |
@@ -375,7 +378,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 549 unit tests, and the fuzz corpus
+swift test                                   # 561 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 

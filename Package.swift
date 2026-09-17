@@ -30,7 +30,7 @@ let package = Package(
     dependencies: [
         // The protocol and systems layers: syscalls, TLS, buffers, the poller,
         // HTTP/1.1, HTTP/2, HTTP/3 and QUIC.
-        .package(url: "https://github.com/grepjava/aviancore", from: "0.1.1"),
+        .package(url: "https://github.com/grepjava/aviancore", from: "0.2.0"),
     ],
     targets: [
         // Database protocols as byte-level state machines: no sockets, no

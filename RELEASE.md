@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 549 unit tests
+swift test                             # 561 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -271,6 +271,19 @@ The Python suites need `h2` and `aioquic`.
   cached for their TTL. Every address in an answer is tried in order.
 - Headers that could split a request are refused, and so are URLs with
   userinfo. A response to HEAD and a 204 carry no body whatever they declare.
+- The client sends Accept-Encoding with the codings it can decode (gzip and
+  deflate, brotli and zstd when their libraries load) and decodes the body,
+  removing Content-Encoding and Content-Length. The decoded body is held to
+  `maxBodyBytes` as it grows, and a corrupt one is `undecodableBody`. A coding
+  it cannot decode is returned as it came. With `decompress = false` the caller
+  may send its own Accept-Encoding.
+- `client.redirects` follows redirects: `.none` (the default), `.sameOrigin()`,
+  `.any()` or `.matching { url in … }`, each with a limit (10), past which is
+  `tooManyRedirects`. 303, and 301 or 302 after a POST, become a GET without
+  the body; 307 and 308 repeat the request. Leaving the origin drops
+  Authorization, Cookie and Proxy-Authorization, and https is never left for
+  http. A redirect the policy does not follow is the response.
+  `ClientResponse.url` is where the request ended up.
 
 ### PostgreSQL
 
@@ -337,5 +350,4 @@ The Python suites need `h2` and `aioquic`.
 - PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types of
   its own (they read as text), no `LISTEN`, and no SASLprep for non-ASCII
   passwords. No Redis or SQLite driver.
-- The HTTP client does not follow redirects or decompress.
 - TLS over TCP is OpenSSL.

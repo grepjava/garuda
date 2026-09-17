@@ -413,16 +413,6 @@ struct HTTPClientTests {
         #expect(origin.accepted == 0)
     }
 
-    @Test func anAcceptEncodingIsRefusedWhileNothingCanDecodeIt() throws {
-        // The compression shim encodes and does not decode, so asking for a
-        // coding would buy a body this cannot read.
-        reset()
-        guard let origin = FakeOrigin() else { Issue.record("no socket"); return }
-        headersWanted = [("Accept-Encoding", "gzip")]
-        origin.script = [bytes("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")]
-        #expect(try run("/fetch", origin) == "refusedHeader")
-    }
-
     @Test func aHeaderValueThatCouldSplitTheRequestIsRefused() throws {
         reset()
         guard let origin = FakeOrigin() else { Issue.record("no socket"); return }

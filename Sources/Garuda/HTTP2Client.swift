@@ -376,7 +376,7 @@ extension HTTPClient {
                     if !HTTP2.validFieldName(np, n.count) { return false }
                     if !HTTP2.validFieldValue(vp, v.count) { return false }
                     let kind = HTTPRequestWriter.classify(ByteSpan(np, n.count))
-                    if kind.contains(.acceptEncoding) || kind.contains(.expect) { return false }
+                    if (decompress && kind.contains(.acceptEncoding)) || kind.contains(.expect) { return false }
                     if kind.contains(.host) { return false }
                     if kind.contains(.userAgent) { sawUserAgent = true }
                     encoder.encode(name: np, nameLength: n.count,
@@ -397,6 +397,7 @@ extension HTTPClient {
                 }
             }
         }
+        if decompress { literal("accept-encoding", ContentDecoder.acceptEncoding) }
         if !sawUserAgent, !userAgent.isEmpty { literal("user-agent", userAgent) }
         // HTTP/2 has no Transfer-Encoding, so a server that buffers by declared
         // length has only this to go on.

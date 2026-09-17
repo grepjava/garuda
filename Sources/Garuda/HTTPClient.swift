@@ -14,14 +14,14 @@
 // one request answering another -- far from here, and looking nothing like a
 // pooling bug.
 //
-// Not here yet, deliberately:
+// Around the exchange (HTTPClientRedirects.swift):
 //
-//   * Redirects are not followed. A redirect chosen by the peer is a request
-//     to somewhere this process did not choose, and following one by default
-//     is how a client reaches 169.254.169.254 on somebody else's say-so. A
-//     caller that wants one reads Location and asks again.
-//   * No Accept-Encoding goes out. The compression shim encodes and does not
-//     decode, so asking for a coding would buy a body this cannot read.
+//   * Redirects are followed only as `redirects` allows, and not at all by
+//     default. A redirect chosen by the peer is a request to somewhere this
+//     process did not choose, and following one by default is how a client
+//     reaches 169.254.169.254 on somebody else's say-so.
+//   * Accept-Encoding names what this process can decode, and the body is
+//     decoded before it is returned, unless `decompress` is off.
 //   * Over TLS, ALPN offers h2 and http/1.1, and an HTTP/2 connection is
 //     shared by every request to the same origin (HTTP2Client.swift).
 //===----------------------------------------------------------------------===//
@@ -56,6 +56,11 @@ public enum ClientError: Error, Equatable {
     case bodyTooLarge
     /// It did not finish inside the time allowed.
     case timedOut
+    /// The body was not what its Content-Encoding said: corrupt, or cut
+    /// short.
+    case undecodableBody
+    /// More redirects in a row than `redirects` allows.
+    case tooManyRedirects
     /// The request that wanted it ended, or the worker is shutting down.
     case cancelled
     /// The peer broke HTTP/2 framing: a frame longer than was agreed, a header
@@ -83,6 +88,9 @@ public struct ClientResponse: Sendable {
     /// Whether the connection was fit to keep. False says nothing about
     /// whether the response is good -- only that this one is not coming back.
     public let reusedConnection: Bool
+    /// The URL this response answered: the one asked for, or where the
+    /// redirects followed led.
+    public internal(set) var url: String = ""
 
     public var text: String { String(decoding: body, as: UTF8.self) }
 
@@ -128,6 +136,14 @@ public struct HTTPClient {
     var alpn: String = "h2,http/1.1"
     /// Sent unless the caller sets its own.
     public var userAgent: String = "garuda"
+    /// Asks for compressed responses with the codings this process can
+    /// decode, and decodes the body before returning it, removing
+    /// Content-Encoding and Content-Length. The decoded body is held to
+    /// `maxBodyBytes` too. Off, the caller may send its own Accept-Encoding
+    /// and gets the body as it came.
+    public var decompress = true
+    /// Which redirects to follow. None by default.
+    public var redirects: RedirectPolicy = .none
     /// Speak HTTP/2 whatever ALPN said, including on a plaintext connection.
     ///
     /// Internal, and only for tests. ALPN is what chooses in production, and
@@ -167,10 +183,11 @@ extension HTTPClient {
         return try await send(.post, url, headers: all, body: body)
     }
 
-    /// One exchange.
-    public func send(_ method: HTTPMethod, _ url: String,
-                     headers: [(String, String)] = [],
-                     body: [UInt8] = []) async throws(ClientError) -> ClientResponse {
+    /// One exchange, as it goes over the wire: no redirect followed and no
+    /// body decoded.
+    func exchange(_ method: HTTPMethod, _ url: String,
+                  headers: [(String, String)],
+                  body: [UInt8]) async throws(ClientError) -> ClientResponse {
 
         // The head is built first and entirely, while the URL's bytes are
         // still alive: everything the parser produced is a slice into them.
@@ -355,10 +372,10 @@ extension HTTPClient {
                         let kind = HTTPRequestWriter.classify(field)
                         // Two this client refuses beyond the ones the writer
                         // owns, and both because it would be promising
-                        // something it does not do: it cannot decode a coding
-                        // it asked for, and it does not wait for a 100 before
-                        // sending a body.
-                        if kind.contains(.acceptEncoding) || kind.contains(.expect) {
+                        // something it does not do: with `decompress` on it
+                        // names the codings itself and decodes only those, and
+                        // it does not wait for a 100 before sending a body.
+                        if (decompress && kind.contains(.acceptEncoding)) || kind.contains(.expect) {
                             return false
                         }
                         if kind.contains(.userAgent) { sawUserAgent = true }
@@ -367,6 +384,18 @@ extension HTTPClient {
                     }
                 }
                 guard allowed else { return .failure(.refusedHeader) }
+            }
+
+            if decompress {
+                let offered = Array(ContentDecoder.acceptEncoding.utf8)
+                let wrote = offered.withUnsafeBufferPointer { a -> Bool in
+                    let name: StaticString = "Accept-Encoding"
+                    return HTTPRequestWriter.writeHeader(
+                        &head,
+                        name: ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
+                        value: ByteSpan(a.baseAddress!, a.count))
+                }
+                guard wrote else { return .failure(.refusedHeader) }
             }
 
             if !sawUserAgent, !userAgent.isEmpty {
