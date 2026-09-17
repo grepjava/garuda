@@ -117,6 +117,9 @@ public struct Worker {
     /// async request, and how many there may be.
     var handlerTasks: HandlerTaskPool? = nil
     var handlerTaskLimit = 1024
+    /// The threads `blocking` runs work on (BlockingPool.swift), started the
+    /// first time it is called.
+    var blockingThreads: BlockingPool? = nil
     /// Connections this worker made rather than accepted (Outbound.swift),
     /// made on the first one. A server that never calls out pays nothing.
     /// Deliberately not in `table`: a pooled one would keep a draining worker
@@ -193,6 +196,7 @@ public struct Worker {
         // Before the tasks are ended: a task in a timed wait unwinds only once
         // that wait is over.
         cancelTimedWaits()
+        stopBlockingPool()
         if let pool = handlerTasks {
             // Cancelled first, so that a task waiting on the engine unwinds
             // and can be ended.
@@ -272,6 +276,8 @@ public struct Worker {
                 acceptMetricsScrapes()
             case PollToken.redirect:
                 acceptRedirects()
+            case PollToken.blocking:
+                handleBlockingFinished()
             default:
                 if let pending = PollToken.metricsPendingIndex(token) {
                     handleScrapeReadable(pending)

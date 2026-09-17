@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 545 unit tests
+swift test                             # 549 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -38,7 +38,7 @@ python3 scripts/feature-test.py        # 62
 python3 scripts/http2-test.py          # 50
 python3 scripts/http3-test.py          # 53
 python3 scripts/router-streams-test.py # 41
-python3 scripts/handler-test.py        # 136, runs garuda-conformance
+python3 scripts/handler-test.py        # 143, runs garuda-conformance
 python3 scripts/websocket-test.py      # 104, runs garuda-conformance
 python3 scripts/webtransport-test.py   # 46, runs garuda-conformance
 python3 scripts/upload-test.py         # 35, runs garuda-conformance
@@ -127,6 +127,13 @@ The Python suites need `h2` and `aioquic`.
   next request on the slot.
 - Handlers registered from `main.swift` take `sending` closures, so they run on
   the worker rather than being isolated to the main actor.
+- `try await blocking { … }` runs a call that would block the worker -- a C
+  library, disk I/O, a long computation -- on a thread of the worker's blocking
+  pool, and resumes the handler on the worker with what it returns or throws.
+  Threads start as work arrives, up to `--blocking-threads` (16) per worker;
+  work beyond them waits, up to `--blocking-queue` (1024), and past that is
+  refused with `BlockingPoolError.full`, a 503. The closure is `@Sendable`, and
+  `Path`, `Query` and `Body` are `Sendable` when their values are.
 
 ### Middleware
 
@@ -329,6 +336,6 @@ The Python suites need `h2` and `aioquic`.
   HTTP/1.1 and HTTP/3 answer 413.
 - PostgreSQL has no `date`, `time`, `interval`, `numeric` or `json` types of
   its own (they read as text), no `LISTEN`, and no SASLprep for non-ASCII
-  passwords. No Redis or SQLite driver, and no pool for blocking work.
+  passwords. No Redis or SQLite driver.
 - The HTTP client does not follow redirects or decompress.
 - TLS over TCP is OpenSSL.

@@ -279,7 +279,7 @@ offer. This is where Garuda stands, area by area.
 | HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2 | Done; no redirects or decompression |
 | PostgreSQL | sqlx, tokio-postgres | Native driver on the poller | Done |
 | Redis, SQLite | redis-rs, sqlx | None | Planned |
-| Blocking work | `spawn_blocking` | None | Planned |
+| Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker | Done |
 | Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine | Done |
 
 For performance, [BENCHMARKS.md](BENCHMARKS.md) has the method and every run,
@@ -323,8 +323,9 @@ the total divided by `--workers`.
 
 A worker is one thread, and staying on it is what removes the scheduling hop. A
 loop that never awaits holds the worker until it ends. A deadline bounds
-waiting, not computing. Run more workers than busy cores and keep CPU-heavy
-work short. A pool for blocking work is planned.
+waiting, not computing. Run more workers than busy cores, and hand a call that
+blocks or computes for long to `try await blocking { … }`, which runs it on the
+worker's blocking pool while the worker serves other requests.
 
 #### No Foundation
 
@@ -374,7 +375,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 545 unit tests, and the fuzz corpus
+swift test                                   # 549 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 
@@ -399,7 +400,7 @@ python3 scripts/feature-test.py              # 62  shutdown, supervision, unix s
 python3 scripts/http2-test.py                # 50  against the h2 library
 python3 scripts/http3-test.py                # 53  against aioquic
 python3 scripts/router-streams-test.py       # 41  routes over HTTP/2 and HTTP/3
-python3 scripts/handler-test.py              # 136 the handler API over all three protocols
+python3 scripts/handler-test.py              # 143 the handler API over all three protocols
 python3 scripts/websocket-test.py            # 104 handshake, framing violations, closing, pings, deflate
 python3 scripts/webtransport-test.py         # 46  sessions, streams, datagrams
 python3 scripts/upload-test.py               # 35  streamed request bodies, 1xx, resumable uploads
@@ -432,8 +433,7 @@ say) is not unwound when its request is cancelled. It resumes to find
 ### Not supported
 
 
-- A stable API, WebSocket over HTTP/2 and HTTP/3, Redis, SQLite and a blocking
-  pool.
+- A stable API, WebSocket over HTTP/2 and HTTP/3, Redis and SQLite.
 - Resumable uploads have no `min-size` or `min-append-size` limits and no
   digests, and a completed upload is not replayed to a client that asks again.
 - A body over its limit is answered 413 on HTTP/1.1 and HTTP/3, and refused

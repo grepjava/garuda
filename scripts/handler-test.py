@@ -1062,6 +1062,67 @@ def errors():
         check("and the server is still running", server.alive())
 
 
+def blocking_pool():
+    print("\nThe blocking pool")
+    with Server("--blocking-threads", "8") as server:
+        result = {}
+
+        def slow():
+            conn = H1(server)
+            response = conn.request("GET", "/blocking/sleep/800")
+            result["slow"] = (response.status, response.body)
+            conn.close()
+
+        requester = threading.Thread(target=slow)
+        requester.start()
+        time.sleep(0.2)
+        conn = H1(server)
+        began = time.monotonic()
+        status = conn.request("GET", "/").status
+        took = time.monotonic() - began
+        is_("the worker answers while blocking work runs", status, 200)
+        check("at once", took < 0.3, "took %.3f s" % took)
+        requester.join(5)
+        is_("and the blocking work's answer arrives", result.get("slow"), (200, b"slept"))
+        is_("work that throws answers with its error", conn.request("GET", "/blocking/throw").status, 409)
+        conn.close()
+
+        statuses = []
+
+        def one():
+            c = H1(server)
+            statuses.append(c.request("GET", "/blocking/sleep/400").status)
+            c.close()
+
+        began = time.monotonic()
+        threads = [threading.Thread(target=one) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        took = time.monotonic() - began
+        is_("eight pieces of work all answer", sorted(statuses), [200] * 8)
+        check("side by side on eight threads", took < 1.6, "took %.3f s" % took)
+
+    with Server("--blocking-threads", "1", "--blocking-queue", "1") as server:
+        statuses = {}
+
+        def ask(name, delay):
+            time.sleep(delay)
+            c = H1(server)
+            statuses[name] = c.request("GET", "/blocking/sleep/600").status
+            c.close()
+
+        threads = [threading.Thread(target=ask, args=(name, delay))
+                   for name, delay in (("running", 0), ("queued", 0.15), ("refused", 0.3))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        is_("past --blocking-queue work is refused 503",
+            (statuses.get("running"), statuses.get("queued"), statuses.get("refused")), (200, 200, 503))
+
+
 def lifecycle():
     print("\nStart-up and shutdown hooks")
     marker = tempfile.mktemp(prefix="garuda-hooks-")
@@ -1132,7 +1193,8 @@ def main():
     print("garuda handler tests (%s)" % BIN)
     for section in (bodies_h1, bodies_h2, bodies_h3, headers_h1, request_ids, request_start,
                     headers_h2_h3, framing_h1, own_server_headers, framing_streams,
-                    streaming_h1, streaming_stalled, streaming_streams, errors, lifecycle):
+                    streaming_h1, streaming_stalled, streaming_streams, errors, blocking_pool,
+                    lifecycle):
         try:
             section()
         except Exception as exc:  # noqa: BLE001 -- one broken section must not hide the rest

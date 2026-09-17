@@ -133,3 +133,7 @@ func percentDecoded(_ text: String) -> String {
     }
     return String(decoding: out, as: UTF8.self)
 }
+
+extension Path: Sendable where Value: Sendable {}
+extension Query: Sendable where Value: Sendable {}
+extension Body: Sendable where Value: Sendable {}

@@ -65,6 +65,14 @@ public struct ServerConfig {
     /// reload does not either.
     public var drainDelayMs: UInt64 = 0
 
+    // --- the blocking pool ---
+    /// The most threads each worker runs `blocking` work on. They start as
+    /// work arrives, not before.
+    public var blockingThreads = 16
+    /// Work waiting for a busy pool's threads, per worker, past which
+    /// `blocking` throws `BlockingPoolError.full`.
+    public var blockingQueue = 1024
+
     public var rootPath: UnsafePointer<CChar> = staticCString("")
     public var scheme: UnsafePointer<CChar> = staticCString("http")
     public var serverName: UnsafePointer<CChar> = staticCString("localhost")

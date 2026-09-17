@@ -132,6 +132,19 @@ out of capacity" (drain, health probes, pool exhaustion), and a slow route is
 not that. A deadline bounds waiting, not computing: nothing preempts a handler
 that loops without awaiting.
 
+### Blocking work on threads of each worker's own
+
+`blocking { … }` runs its closure on a pool of threads that belongs to the
+worker process, started when first used, and brings the result back through a
+pipe on the worker's poller. The waiting task resumes on its worker, so the rest
+of the handler keeps every guarantee a handler has. The pool is per worker
+because workers are processes. Threads are bounded by `--blocking-threads` and
+waiting work by `--blocking-queue`, past which the work is refused 503 rather
+than queued without limit. The closure is `@Sendable`: it runs concurrently with
+the worker's other requests, so the compiler checks what it captures. Work
+cannot be interrupted, so a cancelled request learns of it only when its work
+returns.
+
 ### Outbound I/O on the worker's poller
 
 Outbound connections, the DNS resolver, TLS, the HTTP client and PostgreSQL all
@@ -210,7 +223,7 @@ wait once.
 |---|---|---|
 | 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
 | 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
-| 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | PostgreSQL done; Redis, SQLite and the blocking pool to do |
+| 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | PostgreSQL and the blocking pool done; Redis and SQLite to do |
 | 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | CORS and authentication done; tracing and request limits to do |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Responses, request bodies, SSE, WebSockets over HTTP/1.1, resumable uploads and WebTransport done |
 | 6 | Examples and realistic benchmarks | To do |
@@ -219,9 +232,7 @@ wait once.
 
 **Step 3**
 - A Redis driver on the poller.
-- SQLite on a bounded blocking pool.
-- The blocking pool itself, so an unavoidable blocking call does not stall its
-  worker.
+- SQLite on the blocking pool.
 - PostgreSQL: `date`, `time`, `interval`, `numeric` and `json` types, `LISTEN`,
   SASLprep.
 

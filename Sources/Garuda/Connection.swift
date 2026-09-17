@@ -375,6 +375,8 @@ public enum PollToken {
     public static let metrics: UInt64 = .max - 4
     /// The --redirect-http listener, when one is bound.
     public static let redirect: UInt64 = .max - 5
+    /// The read end of the blocking pool's pipe, when the pool has started.
+    public static let blocking: UInt64 = .max - 6
     /// Scrapes and redirects whose request has not finished arriving. One token
     /// per pending slot, so an event names its slot without a search. Kept
     /// clear of the singletons above and far below any slot token.

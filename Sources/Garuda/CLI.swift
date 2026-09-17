@@ -73,6 +73,9 @@ public enum GarudaCLI {
                                        check answering 503, so a load balancer stops
                                        routing here before connections are refused
                                        (default 0; SIGINT and SIGQUIT do not wait)
+              --blocking-threads N     threads per worker for blocking work (default 16)
+              --blocking-queue N       blocking work waiting per worker, past which it
+                                       is refused with 503 (default 1024)
               --forwarded-allow-ips L  proxies whose X-Forwarded-* headers are trusted:
                                        a comma-separated list of addresses or CIDR
                                        blocks, "unix", or "*" for every peer
@@ -325,6 +328,12 @@ public enum GarudaCLI {
             } else if matches(arg, "--drain-delay") {
                 guard let v = next("--drain-delay needs milliseconds") else { break }
                 config.drainDelayMs = UInt64(max(0, parseInt(v)))
+            } else if matches(arg, "--blocking-threads") {
+                guard let v = next("--blocking-threads needs a thread count") else { break }
+                config.blockingThreads = max(1, parseInt(v))
+            } else if matches(arg, "--blocking-queue") {
+                guard let v = next("--blocking-queue needs a count") else { break }
+                config.blockingQueue = max(0, parseInt(v))
             } else if matches(arg, "--reload") {
                 config.reload = true
             } else if matches(arg, "--reload-interval") {

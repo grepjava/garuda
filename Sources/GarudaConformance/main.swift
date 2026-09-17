@@ -310,6 +310,20 @@ app.get("/delay/:ms") { request, response in
     }
 }
 
+// Work on the blocking pool: a sleep that would stop the worker, and work
+// that throws.
+app.get("/blocking/sleep/:ms") { (ms: Path<Int>) async throws -> String in
+    let micros = UInt32(min(5000, max(1, ms.value))) * 1000
+    return try await blocking {
+        usleep(micros)
+        return "slept"
+    }
+}
+
+app.get("/blocking/throw") { () async throws -> String in
+    try await blocking { throw HTTPError.conflict("from the pool") }
+}
+
 app.get("/stream/:n/:size") { (n: Path<Int>, size: Path<Int>) async -> StreamingBody in
     let count = min(max(n.value, 0), 4096)
     let size = min(max(size.value, 0), 1 << 20)

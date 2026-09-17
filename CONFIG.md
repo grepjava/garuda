@@ -81,6 +81,8 @@ for `/user/7`.
 | `--request-timeout MS` | `30000` | how long a request may stall part-way through |
 | `--graceful-timeout MS` | `10000` | time in-flight requests get on shutdown |
 | `--drain-delay MS` | `0` | on SIGTERM, keep serving this long with the health check failing |
+| `--blocking-threads N` | `16` | threads per worker that `blocking` work runs on |
+| `--blocking-queue N` | `1024` | `blocking` work waiting for a thread, per worker, before it is refused 503 |
 
 - **`--max-connections`** is per worker. A connection that arrives at a full
   table is answered `503` and closed, and counted in
@@ -96,6 +98,11 @@ for `/user/7`.
   an idle HTTP/2 connection and sets the QUIC idle timeout.
 - **`--request-timeout`** covers a request head, a request body, or a response
   being written, when the connection makes no progress.
+- **`--blocking-threads`** threads start only as `blocking` work arrives, so a
+  worker that never calls it starts none. Work that finds them all busy waits,
+  up to **`--blocking-queue`** pieces, and past that `blocking` throws
+  `BlockingPoolError.full`, answered 503. Each worker has its own pool, so the
+  process count multiplies both.
 
 `--drain-delay` and `--graceful-timeout` are described under
 [Reload and signals](#reload-and-signals).
