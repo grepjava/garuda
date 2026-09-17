@@ -228,6 +228,54 @@ app.get("/.well-known/jwks.json") { JSON(keys.publicJWKS) }
 - `keys.publicJWKS` is the public half of every asymmetric key, to publish for
   other services. HMAC secrets are never included.
 
+#### Refresh tokens
+
+```swift
+struct RefreshRequest: Decodable { let refresh_token: String }
+
+app.state { _ in
+    let db = try SQLiteDatabase(SQLiteConfiguration(path: "auth.db"))
+    return TokenIssuer(keys: keys, store: SQLiteRefreshTokenStore(db)) { subject, lifetime in
+        UserClaims(sub: subject, exp: lifetime.expiresAt, role: try await users.role(of: subject))
+    }
+}
+app.post("/login") { (login: Body<Login>, issuer: State<TokenIssuer<UserClaims>>) async throws in
+    JSON(try await issuer.value.issue(subject: try await users.check(login.value)))
+}
+app.post("/token/refresh") { (body: Body<RefreshRequest>, issuer: State<TokenIssuer<UserClaims>>) async throws in
+    JSON(try await issuer.value.refresh(body.value.refresh_token))
+}
+app.post("/logout") { (body: Body<RefreshRequest>, issuer: State<TokenIssuer<UserClaims>>) async throws -> HTTPStatus in
+    try await issuer.value.revoke(body.value.refresh_token)
+    return .noContent
+}
+```
+
+- `issue` answers a login with a `TokenPair`, which encodes as an OAuth 2.0
+  token response: `access_token`, `token_type`, `expires_in`, `refresh_token`,
+  `refresh_expires_in`.
+- The access token is a JWT lasting `accessTokenSeconds` (15 minutes), and its
+  claims come from your closure at login and at every refresh. A role taken
+  away is gone within one access token's life.
+- The refresh token is 32 random bytes, stored only as its SHA-256. Every
+  refresh spends it and returns a new pair in the same **family**, the chain
+  that began at one login.
+- **Reuse is theft.** A spent token presented again revokes its whole family,
+  so both the thief and the client must sign in again. Within
+  `reuseGraceSeconds` (10) it is refused without revoking anything, so two
+  browser tabs refreshing at once do not sign the user out.
+- A refresh token unused for `refreshTokenSeconds` (14 days) expires. A family
+  ends `maximumSessionSeconds` (90 days) after the login however often it is
+  refreshed.
+- `revoke(token)` ends one family, as a logout does, and is safe to repeat.
+  `revokeAll(subject:)` ends every family of a user, after a password change
+  for example.
+- A refused refresh is 400 `{"error":"invalid_grant"}` whatever the reason.
+- **Stores:** `MemoryRefreshTokenStore` for `--workers 1` and tests,
+  `RedisRefreshTokenStore`, and `SQLiteRefreshTokenStore` (`createTables()` or
+  `schema()`, and `deleteExpired()` now and then). Spending a token is atomic
+  in each, so two workers refreshing one token at once cannot both succeed.
+
 #### Tokens from an identity provider
 
 ```swift

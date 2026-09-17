@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 735 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 744 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -357,6 +357,20 @@ The Python suites need `h2` and `aioquic`.
   keys in hand survive a failed fetch; with none, the answer is 503. Only
   asymmetric keys for `algorithms` are trusted: `oct` and `use: enc` keys are
   skipped. Google's and Microsoft's sets load.
+- `TokenIssuer` issues short-lived JWT access tokens with rotating refresh
+  tokens. `issue(subject:)` answers a login with a `TokenPair`, encoded as an
+  OAuth 2.0 token response, and `refresh(_:)` spends a refresh token for a new
+  pair in the same family, with claims rebuilt by your closure. A spent token
+  presented again revokes its family, the reuse detection RFC 9700 recommends,
+  except within `reuseGraceSeconds`, where it is only refused.
+- Refresh tokens are 32 random bytes stored as SHA-256 digests. They expire
+  after `refreshTokenSeconds` unused, and families after
+  `maximumSessionSeconds`. `revoke(_:)` logs out one family and
+  `revokeAll(subject:)` every family of a user. A refused refresh is 400
+  `invalid_grant`.
+- Stores: `MemoryRefreshTokenStore`, `RedisRefreshTokenStore` (spending with
+  `SET NX`) and `SQLiteRefreshTokenStore` (spending with a conditional
+  `UPDATE`), each atomic across workers.
 - MIDDLEWARE.md: how middleware and `onSend` run, the order to add it in,
   every middleware Garuda ships with its options and answers, the server flags
   that act as middleware, and writing middleware and extractors of your own.
