@@ -37,3 +37,8 @@ graphify-out/
 # What cargo builds and resolves for benchmarks/axum; upstream keeps no lockfile.
 benchmarks/axum/target/
 benchmarks/axum/Cargo.lock
+
+# What cargo and maven build for benchmarks/actix and benchmarks/vertx.
+benchmarks/actix/target/
+benchmarks/actix/Cargo.lock
+benchmarks/vertx/target/

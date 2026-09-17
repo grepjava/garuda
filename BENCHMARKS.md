@@ -112,6 +112,8 @@ HUMMINGBIRD=/path/to/hummingbird-framework/.build/release/server \
 VAPOR=/path/to/vapor-framework/.build/release/server \
 FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 AGG=mean \
     bash benchmarks/frameworks.sh > swift.tsv
+FRAMEWORKS="swift rust java" SERVERS="garuda axum actix vertx" WORKERS=$(nproc) AGG=mean \
+    bash benchmarks/frameworks.sh > four.tsv
 ```
 
 ### Method
@@ -141,6 +143,15 @@ The servers:
   `cargo build --release` and the suite's `rust/Dockerfile` profile: LTO,
   `panic = "abort"`, one codegen unit. One process, Tokio's default of a worker
   thread per CPU. It listens on 3000 itself.
+- **actix**: the suite's `rust/actix` entry, byte for byte, in
+  [benchmarks/actix/](benchmarks/actix/), built the same way as axum. One
+  process with actix-web's default of a worker per CPU. It listens on 3000
+  itself.
+- **Vert.x**: the suite's `java/vertx` entry, byte for byte, in
+  [benchmarks/vertx/](benchmarks/vertx/), built with `mvn package` and run as
+  its `config.yaml` runs it: `java -jar target/server.jar -instances WORKERS`
+  (upstream passes `$(nproc)`). It needs JDK 25 and Maven, uses Netty's epoll
+  transport, and listens on 3000 itself.
 - **Hummingbird and Vapor**: the suite's `swift/hummingbird-framework` and
   `swift/vapor-framework` entries, byte for byte, built as its Dockerfile
   builds them: `swift build -c release -Xswiftc -enforce-exclusivity=unchecked`.
@@ -152,9 +163,9 @@ Variables it reads:
 
 | variable | default | meaning |
 |---|---|---|
-| `FRAMEWORKS` | `swift` | `swift` pairs with garuda, hummingbird, vapor; `rust` with axum |
+| `FRAMEWORKS` | `swift` | `swift` pairs with garuda, hummingbird, vapor; `rust` with axum and actix; `java` with vertx |
 | `SERVERS` | `garuda hummingbird vapor` | servers to run |
-| `WORKERS` | `1` | Garuda's worker count |
+| `WORKERS` | `1` | Garuda's worker count, and Vert.x's `-instances` |
 | `CONNS` | `64 256 512` | connection levels |
 | `RUNS` | `3` | runs per level |
 | `AGG` | `median` | `median` keeps the median run by req/s; `mean` averages every column and sums errors, as the suite publishes |
@@ -163,14 +174,17 @@ Variables it reads:
 | `RATE` | `1000:500000` | zrk's ramp, start:end requests a second |
 | `LOAD` | `ramp` | `closed` for oha |
 | `PIN` | empty | `server_cpus:load_cpus` for `taskset`, e.g. `0:1-3` |
-| `PORT` | `3000` | must stay 3000 for axum |
+| `PORT` | `3000` | must stay 3000 for axum, actix and Vert.x |
 | `GARUDA_EXTRA_ARGS` | empty | extra Garuda flags, e.g. `--access-log` |
 
 Binaries default to `.build/release/garuda`,
-`benchmarks/axum/target/release/server` (built if missing),
+`benchmarks/axum/target/release/server` and
+`benchmarks/actix/target/release/server` (built if missing),
+`benchmarks/vertx/target/server.jar` (built if missing),
 `~/swiftbench/hummingbird-framework/.build/release/server` and
 `~/swiftbench/vapor-framework/.build/release/server`; `GARUDA`, `AXUM`,
-`HUMMINGBIRD` and `VAPOR` override them, and `ZRK`, `OHA` and `CARGO` the tools.
+`ACTIX`, `VERTX`, `HUMMINGBIRD` and `VAPOR` override them, and `ZRK`, `OHA`,
+`CARGO`, `JAVA` and `MVN` the tools.
 It needs zrk 2.4 or later (oha for `LOAD=closed`), python3 to read their JSON,
 and curl. Output goes to stdout, one TSV line per server and level:
 
@@ -179,6 +193,43 @@ framework  server  workers  connections  req/s p50_ms p75_ms p90_ms p99_ms error
 ```
 
 Server logs go to a temporary directory that is removed at the end.
+
+### Recorded run: axum, actix and Vert.x
+
+**2026-09-17**, Garuda at e0fb3b6. `GET /`, the suite's ramp, the mean of three
+runs at each level. Host: the dedicated benchmark machine, an Intel Core
+i5-8250U (4 cores, 8 threads), 3.3 GB, Ubuntu 26.04, with zrk 2.5.0 on the
+same machine. axum 0.8.9 on Tokio 1.53.1 and actix-web 4.15.0 built with rustc
+1.93.1; Vert.x 5.1.7 on OpenJDK 25.0.4.
+
+As upstream runs it, every server with all 8 CPUs (`WORKERS=8`), load unpinned.
+Requests a second:
+
+| entry | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| Garuda | 203,397 | 179,075 | 164,323 |
+| axum | 172,055 | 180,136 | 148,930 |
+| actix | 190,299 | 180,040 | 171,059 |
+| Vert.x | 185,496 | 167,935 | 153,826 |
+
+Servers on CPUs 0-3 and zrk on CPUs 4-7 (`PIN=0-3:4-7 WORKERS=4`):
+
+| entry | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| Garuda | 212,552 | 184,035 | 177,375 |
+| axum | 191,195 | 167,958 | 162,726 |
+| actix | 188,013 | 186,110 | 179,313 |
+| Vert.x | 194,215 | 180,094 | 165,546 |
+
+- The four are within about 15% of each other at every level, and within 5%
+  at 256 and 512. Runs of one server at one level moved by up to 16%.
+- Every p50 is hundreds of milliseconds and every p99 seconds: all four fell
+  behind the ramp, so these rates are what this machine can serve and
+  generate at once, not the servers' own ceilings. actix had 5 and 2 errors at
+  64 connections; the others none.
+- Pinning does not separate the load: CPUs 0-3 and 4-7 are hyperthreads of the
+  same four cores. A machine with a second host for the load generator is what
+  would separate the servers.
 
 ### Recorded run: Hummingbird and Vapor
 

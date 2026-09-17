@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# garuda, the-benchmarker/web-frameworks' axum, Hummingbird and Vapor entries,
-# and Elysia on Bun as a reference, under the load command of that suite at
+# garuda, the-benchmarker/web-frameworks' axum, actix, Vert.x, Hummingbird and
+# Vapor entries, and Elysia on Bun as a reference, under the load command of that suite at
 # 4bb9eaa (develop, 2026-09-13). The results are not comparable with the
 # figures that site publishes; BENCHMARKS.md says why.
 #
 #   bash benchmarks/frameworks.sh > results.tsv
 #   FRAMEWORKS="swift rust" SERVERS="garuda axum" WORKERS=4 AGG=mean bash benchmarks/frameworks.sh
+#   FRAMEWORKS="swift rust java" SERVERS="garuda axum actix vertx" WORKERS=8 AGG=mean bash benchmarks/frameworks.sh
 #   FRAMEWORKS=swift SERVERS="garuda hummingbird vapor" WORKERS=4 AGG=mean bash benchmarks/frameworks.sh
 #   LOAD=closed PIN=0:1-3 FRAMEWORKS=elysia SERVERS=elysia-bun bash benchmarks/frameworks.sh
 #
@@ -34,9 +35,11 @@
 #
 # Differences from upstream; BENCHMARKS.md lists them all:
 #   WORKERS=1  upstream starts every server with $(nproc) workers. WORKERS is
-#              garuda's and Elysia's; Hummingbird and Vapor are one process
-#              with SwiftNIO's default of an event loop per CPU, and axum one
-#              process with Tokio's default of a worker thread per CPU.
+#              garuda's, Elysia's and Vert.x's (-instances); Hummingbird and
+#              Vapor are one process with SwiftNIO's default of an event loop
+#              per CPU, axum one process with Tokio's default of a worker
+#              thread per CPU, and actix one process with its default of a
+#              worker per CPU.
 #   RUNS=3     upstream's published figures are means of three runs. Each level
 #              here runs three times and, by default, the median by
 #              achieved_rate is kept (AGG=mean for upstream's way).
@@ -58,6 +61,13 @@ VAPOR=${VAPOR:-$HOME/swiftbench/vapor-framework/.build/release/server}
 # The suite's rust/axum entry (benchmarks/axum/, byte for byte), built as
 # rust/Dockerfile builds it; built on first use when AXUM is not given.
 AXUM=${AXUM:-$ROOT/benchmarks/axum/target/release/server}
+# The suite's rust/actix entry (benchmarks/actix/), built the same way.
+ACTIX=${ACTIX:-$ROOT/benchmarks/actix/target/release/server}
+# The suite's java/vertx entry (benchmarks/vertx/), built with `mvn package`
+# and run as java/vertx/config.yaml runs it, on the JDK that JAVA names.
+VERTX=${VERTX:-$ROOT/benchmarks/vertx/target/server.jar}
+JAVA=${JAVA:-java}
+MVN=${MVN:-mvn}
 CARGO=${CARGO:-$(command -v cargo || echo "$HOME/.cargo/bin/cargo")}
 ZRK=${ZRK:-zrk}
 OHA=${OHA:-oha}
@@ -78,7 +88,9 @@ WARMUP=${WARMUP:-5s}
 # run at about 96,500 req/s.
 RATE=${RATE:-1000:500000}
 # swift: garuda, hummingbird and vapor answer the contract natively.
-# rust: axum, which listens on 0.0.0.0:3000 itself, so PORT must be 3000.
+# rust: axum and actix, which listen on 0.0.0.0:3000 themselves, so PORT must
+# be 3000.
+# java: vertx, which listens on 3000 itself, so PORT must be 3000.
 # elysia: upstream's javascript/elysia-bun (benchmarks/elysia-bun/, byte for
 # byte), which listens on 3000 itself, so PORT must be 3000. Needs bun on PATH
 # or in ~/.bun.
@@ -119,16 +131,25 @@ start() {
     vapor)
         SERVER_HOSTNAME=127.0.0.1 SERVER_PORT=$PORT VAPOR_ENV=production \
             server_start "${PIN_SERVER[@]}" "$VAPOR" serve ;;
-    axum)
-        [ "$PORT" = 3000 ] || { echo "axum listens on 3000; PORT=$PORT"; return 1; }
-        if [ ! -x "$AXUM" ]; then
+    axum|actix)
+        [ "$PORT" = 3000 ] || { echo "$server listens on 3000; PORT=$PORT"; return 1; }
+        local binary=$AXUM
+        [ "$server" = actix ] && binary=$ACTIX
+        if [ ! -x "$binary" ]; then
             # rust/Dockerfile's build command; the profile repeats Cargo.toml's.
-            (cd "$ROOT/benchmarks/axum" && "$CARGO" build --release \
+            (cd "$ROOT/benchmarks/$server" && "$CARGO" build --release \
                 --config 'profile.release.lto=true' \
                 --config 'profile.release.panic="abort"' \
                 --config 'profile.release.codegen-units=1') || return 1
         fi
-        server_start "${PIN_SERVER[@]}" "$AXUM" ;;
+        server_start "${PIN_SERVER[@]}" "$binary" ;;
+    vertx)
+        [ "$PORT" = 3000 ] || { echo "vertx listens on 3000; PORT=$PORT"; return 1; }
+        if [ ! -f "$VERTX" ]; then
+            (cd "$ROOT/benchmarks/vertx" && "$MVN" -q package) || return 1
+        fi
+        # Upstream passes -instances $(nproc): one verticle per event loop.
+        server_start "${PIN_SERVER[@]}" "$JAVA" -jar "$VERTX" -instances "$WORKERS" ;;
     elysia-bun)
         # Upstream runs cluster.ts, which spawns one `bun ./app.ts` per CPU.
         # One worker is app.ts itself; cluster.ts only when WORKERS is every CPU.
@@ -210,7 +231,7 @@ for framework in $FRAMEWORKS; do
     for server in $SERVERS; do
         # Each framework pairs only with its own servers.
         case "$framework:$server" in
-        swift:garuda|swift:hummingbird|swift:vapor|rust:axum|elysia:elysia-bun) ;;
+        swift:garuda|swift:hummingbird|swift:vapor|rust:axum|rust:actix|java:vertx|elysia:elysia-bun) ;;
         *) continue ;;
         esac
         server_stop
