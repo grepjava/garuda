@@ -324,6 +324,13 @@ The Python suites need `h2` and `aioquic`.
   for the next extractor, and the OpenAPI document describes `E`.
 - The auth example adds `SignedInUser`, an async extractor over its sessions
   table, and `GET /whoami`, which takes it as `SignedInUser?`.
+- MIDDLEWARE.md: how middleware and `onSend` run, the order to add it in,
+  every middleware Garuda ships with its options and answers, the server flags
+  that act as middleware, and writing middleware and extractors of your own.
+- EXAMPLES.md: the four runnable applications, and recipes for a first
+  server, a JSON API, errors, routers, databases, sign-in with sessions, custom
+  extractors, OpenAPI, server-sent events, WebSockets, testing and production
+  flags, each compiled against the public API.
 
 ### Streaming responses and server-sent events
 

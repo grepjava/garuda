@@ -569,6 +569,8 @@ say) is not unwound when its request is cancelled. It resumes to find
 | [HANDLER-API.md](HANDLER-API.md) | The handler API's design, decisions and roadmap |
 | [INSTALLATION.md](INSTALLATION.md) | Building, dependencies, certificates, deployment |
 | [CONFIG.md](CONFIG.md) | Every command-line flag |
+| [MIDDLEWARE.md](MIDDLEWARE.md) | How middleware runs, every piece Garuda ships, and writing your own |
+| [EXAMPLES.md](EXAMPLES.md) | The runnable applications, and recipes for common tasks |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine is built |
 | [TRANSPORT.md](TRANSPORT.md) | What each protocol implementation does |
 | [Examples/README.md](Examples/README.md) | Four runnable applications and how they are laid out |
