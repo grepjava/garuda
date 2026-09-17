@@ -30,6 +30,9 @@
 // - A spent token presented again means two parties hold it: the client and
 //   whoever copied it. Which is which cannot be known, so the whole family is
 //   revoked, and both must sign in again.
+// - The family is checked again once the new pair is built, so a logout that
+//   lands while the claims are being made -- a database round trip, in most
+//   applications -- does not hand back a working access token.
 // - Except within `reuseGraceSeconds` of its use, when it is refused without
 //   revoking anything: a browser with two tabs refreshing at once is not an
 //   attack, and the tab that lost the race uses the other's tokens.
@@ -52,6 +55,7 @@
 import CAvian
 import AvianCore
 import GarudaRedis
+import Synchronization
 
 /// The times an access token is issued for.
 public struct TokenLifetime: Sendable {
@@ -194,8 +198,15 @@ public final class TokenIssuer<Claims: Encodable & Sendable>: @unchecked Sendabl
             try await refuseReuse(record, usedAt: now, now: now)
             throw RefreshTokenError.alreadyRotated
         }
-        return try await pair(subject: record.subject, family: record.family,
-                              familyExpiresAt: record.familyExpiresAt, now: now)
+        let issued = try await pair(subject: record.subject, family: record.family,
+                                    familyExpiresAt: record.familyExpiresAt, now: now)
+        // `revoke` or `revokeAll` can land while the claims are being built.
+        // The new refresh token is in the revoked family and so already dead,
+        // but an access token cannot be taken back, so it is not handed out.
+        guard try await store.find(digest: record.digest)?.revoked == false else {
+            throw RefreshTokenError.revoked
+        }
+        return issued
     }
 
     /// Ends the family `refreshToken` belongs to: a logout. An unknown token
@@ -235,40 +246,57 @@ public final class TokenIssuer<Claims: Encodable & Sendable>: @unchecked Sendabl
 // MARK: - Stores
 
 /// Refresh tokens in the worker's memory: for --workers 1 and tests.
-public final class MemoryRefreshTokenStore: RefreshTokenStore, @unchecked Sendable {
-    private var tokens: [String: RefreshTokenRecord] = [:]
-    private var families: [String: (subject: String, expiresAt: Int64, revoked: Bool)] = [:]
+///
+/// A worker runs its handlers on its one thread, so in the ordinary case
+/// nothing here is reached from two threads. A store is a public type though,
+/// and user code can reach one from the blocking pool or a thread of its own,
+/// and what it holds decides whether a session is still valid -- so the state
+/// is behind a lock. A login or a refresh takes a handful of these calls, so
+/// the lock costs nothing that can be measured.
+public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
+    private struct State {
+        var tokens: [String: RefreshTokenRecord] = [:]
+        var families: [String: (subject: String, expiresAt: Int64, revoked: Bool)] = [:]
+    }
+
+    private let state = Mutex(State())
 
     public init() {}
 
     public func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
-        families[family] = (subject, expiresAt, false)
+        state.withLock { $0.families[family] = (subject, expiresAt, false) }
     }
 
     public func insert(_ record: RefreshTokenRecord) async throws {
-        tokens[record.digest] = record
+        state.withLock { $0.tokens[record.digest] = record }
     }
 
     public func find(digest: String) async throws -> RefreshTokenRecord? {
-        guard var record = tokens[digest] else { return nil }
-        record.revoked = families[record.family]?.revoked ?? true
-        return record
+        state.withLock {
+            guard var record = $0.tokens[digest] else { return nil }
+            record.revoked = $0.families[record.family]?.revoked ?? true
+            return record
+        }
     }
 
     public func markUsed(digest: String, at: Int64) async throws -> Bool {
-        guard var record = tokens[digest], record.usedAt == nil else { return false }
-        record.usedAt = at
-        tokens[digest] = record
-        return true
+        state.withLock {
+            guard var record = $0.tokens[digest], record.usedAt == nil else { return false }
+            record.usedAt = at
+            $0.tokens[digest] = record
+            return true
+        }
     }
 
     public func revokeFamily(_ family: String) async throws {
-        families[family]?.revoked = true
+        state.withLock { $0.families[family]?.revoked = true }
     }
 
     public func revokeSubject(_ subject: String) async throws {
-        for (family, value) in families where value.subject == subject {
-            families[family]?.revoked = true
+        state.withLock {
+            for (family, value) in $0.families where value.subject == subject {
+                $0.families[family]?.revoked = true
+            }
         }
     }
 }
@@ -293,8 +321,16 @@ public struct RedisRefreshTokenStore: RefreshTokenStore {
         _ = try await redis.pipeline([
             RedisCommand("SET", prefix + "f:" + family, "active", "PX", ttl(expiresAt)),
             RedisCommand("SADD", prefix + "s:" + subject, family),
-            // A family begun later ends later, so the newest decides.
-            RedisCommand("PEXPIRE", prefix + "s:" + subject, ttl(expiresAt)),
+            // The index must outlive the family that ends last, so its expiry
+            // only ever grows: two logins can reach Redis in either order, and
+            // an index that went first would lose `revokeSubject` a family
+            // that is still good. `PEXPIRE GT` says this in one word, but that
+            // is Redis 7; this works on 6 as well, and is atomic either way.
+            RedisCommand("EVAL", "local left = redis.call('PTTL', KEYS[1]) "
+                + "local want = tonumber(ARGV[1]) "
+                + "if left < want then redis.call('PEXPIRE', KEYS[1], want) end "
+                + "return redis.call('PTTL', KEYS[1])",
+                         1, prefix + "s:" + subject, ttl(expiresAt)),
         ])
     }
 

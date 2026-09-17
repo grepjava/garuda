@@ -148,6 +148,39 @@ struct RefreshTokensTests {
         await #expect(throws: RefreshTokenError.alreadyRotated) { try await issuer.refresh(login.refreshToken) }
     }
 
+    @Test func aLogoutWhileARefreshIsInFlightWinsTheRace() async throws {
+        /// A store where a logout lands while the refresh is writing its new
+        /// token -- what a slow `claims` closure leaves room for.
+        final class LoggingOutStore: RefreshTokenStore, @unchecked Sendable {
+            let inner = MemoryRefreshTokenStore()
+            var logOutOnNextInsert = false
+            func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
+                try await inner.createFamily(family, subject: subject, expiresAt: expiresAt)
+            }
+            func insert(_ record: RefreshTokenRecord) async throws {
+                try await inner.insert(record)
+                if logOutOnNextInsert {
+                    logOutOnNextInsert = false
+                    try await inner.revokeFamily(record.family)
+                }
+            }
+            func find(digest: String) async throws -> RefreshTokenRecord? { try await inner.find(digest: digest) }
+            func markUsed(digest: String, at: Int64) async throws -> Bool {
+                try await inner.markUsed(digest: digest, at: at)
+            }
+            func revokeFamily(_ family: String) async throws { try await inner.revokeFamily(family) }
+            func revokeSubject(_ subject: String) async throws { try await inner.revokeSubject(subject) }
+        }
+        let store = LoggingOutStore()
+        let (issuer, _) = try issuer(store)
+        let login = try await issuer.issue(subject: "ada")
+        store.logOutOnNextInsert = true
+        // No access token comes back from a refresh the logout overtook.
+        await #expect(throws: RefreshTokenError.revoked) { try await issuer.refresh(login.refreshToken) }
+        // Nor does the family live on through the token that refresh wrote.
+        await #expect(throws: RefreshTokenError.revoked) { try await issuer.refresh(login.refreshToken) }
+    }
+
     @Test func aRefreshRouteAnswersInvalidGrant() throws {
         struct RefreshRequest: Decodable {
             let refresh_token: String
@@ -240,7 +273,18 @@ struct RefreshTokenStoreTests {
         app.state { _ in RedisPool(settled, maxConnections: 2) }
         app.get("/run") { (redis: State<RedisPool>) async -> String in
             do {
-                return try await exerciseStore(RedisRefreshTokenStore(redis.value, prefix: "garuda-test:refresh:"))
+                let prefix = "garuda-test:refresh:"
+                let store = RedisRefreshTokenStore(redis.value, prefix: prefix)
+                let result = try await exerciseStore(store)
+                // A second login with less of a session left must not shorten
+                // the subject's index: `revokeSubject` reads it while the
+                // first family is still good.
+                let now = Timestamp.now.secondsSinceEpoch
+                let subject = "ttl-" + Tokens.random(bytes: 16)
+                try await store.createFamily("long-" + subject, subject: subject, expiresAt: now + 3600)
+                try await store.createFamily("short-" + subject, subject: subject, expiresAt: now + 30)
+                let left = try await redis.value.send("PTTL", prefix + "s:" + subject).string.flatMap { Int64($0) }
+                return result + " \((left ?? -1) > 3_000_000)"
             } catch {
                 return "threw \(error)"
             }
@@ -248,6 +292,6 @@ struct RefreshTokenStoreTests {
         let client = app.test
         client.timeoutMillis = 15_000
         let text = try client.get("/run").text
-        #expect(text == storeExpectation, "\(text)")
+        #expect(text == storeExpectation + " true", "\(text)")
     }
 }

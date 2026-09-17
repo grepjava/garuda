@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 744 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 745 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -362,7 +362,9 @@ The Python suites need `h2` and `aioquic`.
   OAuth 2.0 token response, and `refresh(_:)` spends a refresh token for a new
   pair in the same family, with claims rebuilt by your closure. A spent token
   presented again revokes its family, the reuse detection RFC 9700 recommends,
-  except within `reuseGraceSeconds`, where it is only refused.
+  except within `reuseGraceSeconds`, where it is only refused. The family is
+  checked again once the new pair is built, so a logout that lands while the
+  claims are being made does not hand back a working access token.
 - Refresh tokens are 32 random bytes stored as SHA-256 digests. They expire
   after `refreshTokenSeconds` unused, and families after
   `maximumSessionSeconds`. `revoke(_:)` logs out one family and
@@ -370,7 +372,11 @@ The Python suites need `h2` and `aioquic`.
   `invalid_grant`.
 - Stores: `MemoryRefreshTokenStore`, `RedisRefreshTokenStore` (spending with
   `SET NX`) and `SQLiteRefreshTokenStore` (spending with a conditional
-  `UPDATE`), each atomic across workers.
+  `UPDATE`), each atomic across workers. The memory store locks its state, so
+  it is safe to reach from the blocking pool or a thread of your own. The Redis
+  store's index of a subject's families only ever has its expiry pushed out, so
+  two logins arriving at once cannot leave `revokeAll(subject:)` blind to a
+  family that is still good.
 - MIDDLEWARE.md: how middleware and `onSend` run, the order to add it in,
   every middleware Garuda ships with its options and answers, the server flags
   that act as middleware, and writing middleware and extractors of your own.
