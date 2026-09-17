@@ -209,6 +209,9 @@ app.group("/api") {
   match exactly by default.
 - `app.requestDecompression()` decodes a gzip, deflate, br or zstd request body
   before the handler reads it, held to the route's body limit as it inflates.
+- `app.allowedHosts(["example.com", "*.example.com"])` answers 400 to a request
+  for any other Host, and `app.addressFilter(allow: ["10.0.0.0/8"])` answers
+  403 to a client address outside the list or on a `deny` list.
 
 ### PostgreSQL
 
@@ -366,7 +369,7 @@ offer. This is where Garuda stands, area by area.
 | TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
 | Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
-| Ready-made middleware | tower-http | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate` | Partial: `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, signed or encrypted cookies, sessions, CSRF protection, security headers, trailing-slash handling and request decompression in code |
+| Ready-made middleware | tower-http, tower-sessions, axum-extra | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate`, `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, cookies, `app.sessions`, `app.csrfProtection`, `app.securityHeaders`, `app.trailingSlash`, `app.requestDecompression`, `app.allowedHosts`, `app.addressFilter` | Done |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
 | Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` | Done |
 | Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay | Done |
@@ -477,7 +480,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 697 unit tests, and the fuzz corpus
+swift test                                   # 702 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

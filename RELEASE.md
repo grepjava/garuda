@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 697 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 702 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -279,6 +279,15 @@ The Python suites need `h2` and `aioquic`.
   is held to `app.maxBodySize` or `--max-body` as it grows: 413 past it, 400
   for bytes the coding did not make, and 415 with Accept-Encoding for a coding
   that cannot be decoded. A streaming route's body is left as it came.
+- `app.allowedHosts(_:)` answers 400 to a request in its scope whose Host or
+  `:authority`, port aside, is not listed, or that has none. An entry is a
+  host, an IP literal (`[::1]` for IPv6), or `*.example.com` for the names
+  under a domain, which does not include the domain itself.
+- `app.addressFilter(allow:deny:)` answers 403 to a client whose address is
+  on `deny`, or is not on a non-empty `allow`; deny is read first. Entries are
+  addresses, CIDR blocks, `unix` and `*`. The address is `request.remoteAddress`,
+  a proxy's forwarded one when `--forwarded-allow-ips` trusts the peer, and an
+  IPv4 client on an IPv6 socket (`::ffff:a.b.c.d`) matches as IPv4.
 
 ### Streaming responses and server-sent events
 
