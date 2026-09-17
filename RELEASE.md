@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 721 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 728 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -336,6 +336,20 @@ The Python suites need `h2` and `aioquic`.
   fallback answered: `GET` or `HEAD` whose `Accept` names `text/html`. Other
   requests, such as a missing asset or an API call, keep their 404. The file
   goes out as a static file does, with its ETag and 304.
+- JSON Web Tokens: `JWTKeys` signs and verifies HS256/384/512, RS256/384/512,
+  PS256/384/512, ES256/384/512 and EdDSA, with keys from HMAC secrets, PEM
+  (public keys, certificates, private keys), JWK, or generated. Verifying
+  checks the signature, `exp` and `nbf` with leeway, and `iss` and `aud`
+  when asked. It refuses `alg: none`, `crit`, tokens over 16 KiB, RSA keys under
+  2048 bits and short HMAC secrets. Each key is bound to one algorithm, which
+  rules out HS256 signed with an RSA public key. Signatures use the system's
+  libcrypto through a small C target; tokens interoperate with PyJWT in both
+  directions for every algorithm.
+- `JWT<Claims>` extracts a verified bearer token with its claims decoded, from
+  what `app.jwtVerifier` registered. `app.authenticate(jwt:verifier:)` requires
+  one of every request in a scope. Failures are 401 with
+  `WWW-Authenticate: Bearer error="invalid_token"`. `keys.publicJWKS` is the
+  public key set to publish.
 - MIDDLEWARE.md: how middleware and `onSend` run, the order to add it in,
   every middleware Garuda ships with its options and answers, the server flags
   that act as middleware, and writing middleware and extractors of your own.

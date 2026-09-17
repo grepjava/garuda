@@ -41,11 +41,14 @@ let package = Package(
                 swiftSettings: sharedSwiftSettings),
         // The system's libsqlite3, opened with dlopen: no headers to build.
         .target(name: "CGarudaSQLite"),
+        // JSON Web Token signatures over the system's libcrypto, which the TLS
+        // layer already links: RSA, ECDSA, EdDSA and HMAC-SHA-512.
+        .target(name: "CGarudaJWT", linkerSettings: [.linkedLibrary("crypto")]),
 
         // The engine and the handler API: `import Garuda`.
         .target(name: "Garuda",
                 dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
-                               "GarudaPostgres", "GarudaRedis", "CGarudaSQLite"],
+                               "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT"],
                 swiftSettings: sharedSwiftSettings),
 
         // Resumable uploads (draft-ietf-httpbis-resumable-upload), built on the
@@ -78,7 +81,7 @@ let package = Package(
 
         .testTarget(name: "GarudaTests",
                     dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
-                                   "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "Garuda", "GarudaFuzzTargets",
+                                   "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT", "Garuda", "GarudaFuzzTargets",
                                    "CAllocationCounter"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "GarudaUploadsTests",

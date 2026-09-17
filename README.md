@@ -175,6 +175,9 @@ app.group("/api") {
   built, such as the database sessions live in. `BearerToken` and
   `BasicCredentials` are the same as extractors, and `constantTimeEquals`
   compares secrets.
+- `JWT<Claims>` takes a verified JSON Web Token (HS, RS, PS, ES or EdDSA),
+  keys from PEM, JWK or a secret, with `exp`, `nbf`, `iss` and `aud` checked;
+  `keys.sign(claims)` issues one and `keys.publicJWKS` publishes the key set.
 - `Passwords.hash` and `Passwords.verify` use PBKDF2-HMAC-SHA256 on the
   blocking pool. `Tokens.random()` makes a session token and `Tokens.digest`
   what to store in its place.
@@ -389,7 +392,7 @@ offer. This is where Garuda stands, area by area.
 | TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
 | Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
 | Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
-| Ready-made middleware | tower-http, tower-sessions, axum-extra | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate`, `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, cookies, `app.sessions`, `app.csrfProtection`, `app.securityHeaders`, `app.trailingSlash`, `app.requestDecompression`, `app.allowedHosts`, `app.addressFilter` | Done |
+| Ready-made middleware | tower-http, tower-sessions, axum-extra | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate`, `JWT<Claims>`, `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, cookies, `app.sessions`, `app.csrfProtection`, `app.securityHeaders`, `app.trailingSlash`, `app.requestDecompression`, `app.allowedHosts`, `app.addressFilter` | Done |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
 | Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` | Done |
 | Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay | Done |
@@ -500,7 +503,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 721 unit tests, and the fuzz corpus
+swift test                                   # 728 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

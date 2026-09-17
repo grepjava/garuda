@@ -128,6 +128,7 @@ a position:
 |---|---|---|
 | [`app.cors`](#cors) | Cross-origin resource sharing, preflights included | 204 to a preflight |
 | [`app.authenticate`](#authentication) | Bearer tokens and Basic credentials | 401 with a challenge |
+| [`JWT<Claims>`, `authenticate(jwt:)`](#json-web-tokens) | Signed tokens checked without a lookup | 401 with `error="invalid_token"` |
 | [`app.sessions`](#sessions) | Server-side sessions in memory, Redis or SQLite | 500 if the store fails |
 | [`app.csrfProtection`](#csrf-protection) | Refuses cross-site request forgery | 403 |
 | [`app.securityHeaders`](#security-headers) | nosniff, framing, referrer, cross-origin policies, HSTS | nothing refused |
@@ -182,6 +183,50 @@ app.group("/account") {
 - `Passwords.hash` and `Passwords.verify` store passwords as PBKDF2-SHA256 on
   the blocking pool; `Tokens.random` and `Tokens.digest` make session tokens
   worth storing only as digests.
+
+### JSON Web Tokens
+
+```swift
+struct UserClaims: Codable, Sendable {
+    let sub: String
+    let exp: Int
+    let role: String
+}
+
+let keys = try JWTKeys([.pem(privateKeyPEM, algorithm: .ES256, keyID: "2026")],
+                       validation: JWTValidation(issuer: "https://auth.example.com", audience: "shop"))
+app.jwtVerifier { _ in keys }
+
+app.post("/token") { (login: Body<Login>) async throws -> JSON<[String: String]> in
+    let user = try await users.check(login.value)
+    let token = try keys.sign(UserClaims(sub: "\(user.id)", exp: Int(Timestamp.now.secondsSinceEpoch) + 900, role: user.role))
+    return JSON(["access_token": token, "token_type": "Bearer"])
+}
+app.get("/me") { (jwt: JWT<UserClaims>) async in "user \(jwt.claims.sub)" }
+app.group("/admin") {
+    app.authenticate(jwt: UserClaims.self, verifier: keys)
+    app.get("/stats") { (jwt: JWT<UserClaims>) async in "stats for \(jwt.claims.sub)" }
+}
+app.get("/.well-known/jwks.json") { JSON(keys.publicJWKS) }
+```
+
+- **Algorithms:** HS256/384/512, RS256/384/512, PS256/384/512, ES256/384/512
+  and EdDSA (Ed25519). Keys come from `JWTKey.hmac`, `.pem` (public key,
+  certificate or private key), `.jwk`, or `.generate`.
+- **Checks:** the signature; `exp` and `nbf` with `leewaySeconds` (60); and
+  `iss` and `aud` when the validation names them. A token without `exp` is
+  refused unless `requireExpiration` is off.
+- **Refused outright:** `alg: none`, a `crit` header, tokens over 16 KiB, RSA
+  keys under 2048 bits, and HMAC secrets shorter than the hash.
+- **Keys are bound to one algorithm.** A token is checked only with a key of
+  its `alg`, chosen by `kid` or as the only key of that algorithm. That rules
+  out signing with HS256 and an RSA public key as the secret.
+- **Failures are all a 401** with `WWW-Authenticate: Bearer error="invalid_token"`
+  and the same body, so a client learns nothing about which check failed.
+- `JWT<Claims>` verifies on its own with what `app.jwtVerifier` registered, or
+  uses the token `authenticate(jwt:)` already verified.
+- `keys.publicJWKS` is the public half of every asymmetric key, to publish for
+  other services. HMAC secrets are never included.
 
 ### Sessions
 
