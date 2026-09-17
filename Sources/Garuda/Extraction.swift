@@ -11,7 +11,7 @@
 // wrong, rather than each handler inventing its own.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// Something a handler can ask for by declaring it as a parameter.
 public protocol RequestExtractor {

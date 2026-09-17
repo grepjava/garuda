@@ -25,9 +25,9 @@
 // an upload that can be resumed and one that has to start again.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// Why a request body could not be read to its end.
 public enum RequestBodyError: Error, Equatable, Sendable {
@@ -101,7 +101,7 @@ public final class RequestBodyStream: @unchecked Sendable {
     /// Nil at the end. Throws `incomplete` once everything that arrived has
     /// been read, if the request ended before the body did.
     public func read(maxBytes: Int = 64 * 1024) async throws(RequestBodyError) -> [UInt8]? {
-        precondition(pg_worker_current() == UnsafeMutableRawPointer(worker),
+        precondition(av_worker_current() == UnsafeMutableRawPointer(worker),
                      "a request body was read off its worker's thread")
         let limit = max(1, maxBytes)
         while true {
@@ -149,7 +149,7 @@ public final class RequestBodyStream: @unchecked Sendable {
     /// request that another has superseded, such as an upload being resumed
     /// on a new connection while the old one is still open.
     public func cancel() {
-        precondition(pg_worker_current() == UnsafeMutableRawPointer(worker),
+        precondition(av_worker_current() == UnsafeMutableRawPointer(worker),
                      "a request was cancelled off its worker's thread")
         let c = worker.pointee.table[slot]
         guard c.pointee.state != .free, c.pointee.generation == generation,

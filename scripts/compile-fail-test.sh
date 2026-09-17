@@ -14,12 +14,15 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=${BUILD:-$ROOT/.build/debug}
 SWIFTC=${SWIFTC:-swiftc}
+# aviancore's C headers: SwiftPM's checkout, or a local copy beside this one.
+AVIAN=${AVIAN:-$ROOT/.build/checkouts/aviancore}
+[ -d "$AVIAN" ] || AVIAN=$ROOT/../aviancore
 
 compile() {
     "$SWIFTC" -parse-as-library -swift-version 6 -emit-sil -o /dev/null \
         -I "$BUILD/Modules" \
-        -Xcc -fmodule-map-file="$BUILD/CGaruda.build/module.modulemap" \
-        -Xcc -I"$ROOT/Sources/CGaruda/include" \
+        -Xcc -fmodule-map-file="$BUILD/CAvian.build/module.modulemap" \
+        -Xcc -I"$AVIAN/Sources/CAvian/include" \
         "$1" 2>&1
 }
 

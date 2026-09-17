@@ -3,9 +3,9 @@
 //
 // A GET the application marked fresh -- `Cache-Control: s-maxage` or
 // `max-age` -- is copied as it is sent, and stored in a table every worker
-// shares (garuda_cache.c). A later request for the same URL, on any worker
+// shares (avian_cache.c). A later request for the same URL, on any worker
 // and over any protocol, is answered from that copy until it expires. What may
-// be kept is decided in GarudaHTTP's ResponseCachePolicy, conservatively:
+// be kept is decided in AvianHTTP's ResponseCachePolicy, conservatively:
 // the thing this must never do is hand one user's response to another.
 //
 // The key is the scheme, the host and the whole request target, plus the
@@ -34,9 +34,9 @@
 // way its head said it would.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// The largest block of headers kept with a cached response.
 let responseCacheMaxHead = 16 * 1024
@@ -75,8 +75,8 @@ public struct ResponseCapture {
         active = true
         self.ttlLimit = ttlLimit
         self.mark = mark
-        sequence = pg_cache_begin()
-        dispatchedMs = pg_monotonic_ms()
+        sequence = av_cache_begin()
+        dispatchedMs = av_monotonic_ms()
     }
 
     /// One response header, as the application gave it.
@@ -90,12 +90,12 @@ public struct ResponseCapture {
     /// Every header has been seen: the response is kept or it is not, and how
     /// old it already is decides for how long.
     public mutating func settle(status: Int) {
-        let now = pg_monotonic_ms()
+        let now = av_monotonic_ms()
         let delay = now > dispatchedMs ? Int(now - dispatchedMs) : 0
-        guard head.readableBytes <= Int(pg_cache_max_head()),
+        guard head.readableBytes <= Int(av_cache_max_head()),
               let kept = policy.storage(status: status, limitSeconds: ttlLimit,
                                         responseDelayMs: delay,
-                                        nowSeconds: Int(pg_unix_seconds())) else {
+                                        nowSeconds: Int(av_unix_seconds())) else {
             abandon()
             return
         }
@@ -107,7 +107,7 @@ public struct ResponseCapture {
 
     /// Body bytes as the application produced them, before any compression.
     public mutating func append(_ p: UnsafePointer<UInt8>, _ n: Int) {
-        if body.readableBytes + n > Int(pg_cache_max_body()) {
+        if body.readableBytes + n > Int(av_cache_max_body()) {
             abandon()
             return
         }
@@ -121,7 +121,7 @@ public struct ResponseCapture {
         guard active, status > 0, keyLength > 0 else { return false }
         // Sending the body took time, and that time is part of the copy's age
         // as it would be for a copy a client kept.
-        let now = pg_monotonic_ms()
+        let now = av_monotonic_ms()
         let sent = now > settledMs ? Int(now - settledMs) : 0
         guard sent < keepMs else { return false }
         let keyPointer = UnsafePointer(key.readPointer)
@@ -129,7 +129,7 @@ public struct ResponseCapture {
         let bodyLength = body.readableBytes
         // An empty buffer may never have been given storage; any valid pointer
         // does for a length of zero.
-        let stored = pg_cache_put(keyPointer, keyLength, mark, sequence, now,
+        let stored = av_cache_put(keyPointer, keyLength, mark, sequence, now,
                                   UInt64(ageMs + sent), UInt64(keepMs - sent), UInt16(status),
                                   headLength > 0 ? UnsafePointer(head.readPointer) : keyPointer,
                                   headLength,
@@ -168,7 +168,7 @@ extension Worker {
     mutating func cacheResponded(_ slot: Int, status: Int) {
         let c = table[slot]
         c.pointee.flags.remove(.invalidatesCache)
-        if status >= 200 && status < 400 { pg_cache_invalidate(c.pointee.cacheMark) }
+        if status >= 200 && status < 400 { av_cache_invalidate(c.pointee.cacheMark) }
     }
 
     // MARK: - Lookup
@@ -186,7 +186,7 @@ extension Worker {
             // a session rather than changing what its path names.
             if method != .options && method != .trace && method != .connect {
                 let target = c.pointee.head.target.span(in: base)
-                c.pointee.cacheMark = pg_cache_target_hash(target.base, target.count)
+                c.pointee.cacheMark = av_cache_target_hash(target.base, target.count)
                 c.pointee.flags.insert(.invalidatesCache)
             }
             return false
@@ -249,21 +249,21 @@ extension Worker {
             if forwarded.count > 0 { c.pointee.cacheKey.write(forwarded) }
         }
         let keyLength = c.pointee.cacheKey.readableBytes
-        guard keyLength <= Int(PG_CACHE_MAX_KEY) else { return false }
+        guard keyLength <= Int(AV_CACHE_MAX_KEY) else { return false }
 
-        let capacity = Int(pg_cache_max_head()) + Int(pg_cache_max_body())
+        let capacity = Int(av_cache_max_head()) + Int(av_cache_max_body())
         cacheScratch.reserve(capacity)
         var headLength: UInt32 = 0
         var bodyLength: UInt32 = 0
         var status: UInt16 = 0
         var ageMs: UInt64 = 0
         var ttlMs: UInt64 = 0
-        let hit = pg_cache_get(UnsafePointer(c.pointee.cacheKey.readPointer), keyLength,
-                               pg_monotonic_ms(), cacheScratch.writePointer,
+        let hit = av_cache_get(UnsafePointer(c.pointee.cacheKey.readPointer), keyLength,
+                               av_monotonic_ms(), cacheScratch.writePointer,
                                cacheScratch.writableBytes, &headLength, &bodyLength,
                                &status, &ageMs, &ttlMs)
         if hit == 1 {
-            if Metrics.enabled { Metrics.add(PG_M_CACHE_HITS) }
+            if Metrics.enabled { Metrics.add(AV_M_CACHE_HITS) }
             let p = UnsafePointer(cacheScratch.writePointer)
             var entry = CachedEntry(status: Int(status),
                                     head: ByteSpan(p, Int(headLength)),
@@ -290,12 +290,12 @@ extension Worker {
             }
             return true
         }
-        if Metrics.enabled { Metrics.add(PG_M_CACHE_MISSES) }
+        if Metrics.enabled { Metrics.add(AV_M_CACHE_MISSES) }
         // Only a GET has a body worth keeping.
         if method == .get {
             let target = c.pointee.head.target.span(in: base)
             c.pointee.capture.arm(ttlLimit: config.cacheTTLMaxSeconds,
-                                  mark: pg_cache_target_hash(target.base, target.count))
+                                  mark: av_cache_target_hash(target.base, target.count))
         }
         return false
     }
@@ -625,7 +625,7 @@ extension Worker {
             return
         }
         if c.pointee.capture.store(key: c.pointee.cacheKey) && Metrics.enabled {
-            Metrics.add(PG_M_CACHE_STORES)
+            Metrics.add(AV_M_CACHE_STORES)
         }
     }
 }

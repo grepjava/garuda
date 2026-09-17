@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 import GarudaPostgres
 @testable import Garuda
 
@@ -19,7 +19,7 @@ nonisolated(unsafe) private var outcome = ""
 nonisolated(unsafe) private var run: (@Sendable (UnsafeMutablePointer<Worker>) async -> String)? = nil
 
 private let target: PostgresConfiguration? = {
-    guard let raw = pg_getenv("GARUDA_POSTGRES") else { return nil }
+    guard let raw = av_getenv("GARUDA_POSTGRES") else { return nil }
     let parts = String(cString: raw).split(separator: ":", omittingEmptySubsequences: false)
     guard parts.count == 5, let port = UInt16(parts[1]) else { return nil }
     var configuration = PostgresConfiguration(host: String(parts[0]), port: port,

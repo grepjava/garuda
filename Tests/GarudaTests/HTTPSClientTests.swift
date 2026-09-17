@@ -1,7 +1,7 @@
 import Testing
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 @testable import Garuda
 
 #if canImport(Glibc)
@@ -75,12 +75,12 @@ private final class TLSPeer {
     }
 
     deinit {
-        pg_tls_free(tls)
-        _ = pg_close(fd)
+        av_tls_free(tls)
+        _ = av_close(fd)
     }
 
     func write(_ bytes: [UInt8]) {
-        _ = bytes.withUnsafeBytes { pg_tls_write(tls, $0.baseAddress, $0.count) }
+        _ = bytes.withUnsafeBytes { av_tls_write(tls, $0.baseAddress, $0.count) }
     }
 }
 
@@ -101,21 +101,21 @@ private final class TLSOrigin {
     private var error = [CChar](repeating: 0, count: 256)
 
     init?(alpn: String, address: String = "127.0.0.1") {
-        let opened = address.withCString { pg_listen_tcp($0, 0, 16, 0, 0) }
+        let opened = address.withCString { av_listen_tcp($0, 0, 16, 0, 0) }
         guard opened >= 0 else { return nil }
-        let got = pg_local_port(opened)
+        let got = av_local_port(opened)
         var made = [CChar](repeating: 0, count: 256)
         let context: OpaquePointer? = certPath.withCString { cert in
             keyPath.withCString { key in
                 alpn.withCString { protocols in
                     made.withUnsafeMutableBufferPointer {
-                        pg_tls_ctx_new(cert, key, protocols, nil, $0.baseAddress, 256)
+                        av_tls_ctx_new(cert, key, protocols, nil, $0.baseAddress, 256)
                     }
                 }
             }
         }
         guard got != 0, let context else {
-            _ = pg_close(opened)
+            _ = av_close(opened)
             return nil
         }
         fd = opened
@@ -125,33 +125,33 @@ private final class TLSOrigin {
 
     deinit {
         peers.removeAll()
-        pg_tls_ctx_free(ctx)
-        _ = pg_close(fd)
+        av_tls_ctx_free(ctx)
+        _ = av_close(fd)
     }
 
     func pump() {
         var address = [CChar](repeating: 0, count: 64)
         var peerPort: UInt16 = 0
-        let client = pg_accept(fd, &address, 64, &peerPort)
+        let client = av_accept(fd, &address, 64, &peerPort)
         if client >= 0 {
-            if let session = pg_tls_new(ctx, client) {
+            if let session = av_tls_new(ctx, client) {
                 peers.append(TLSPeer(fd: client, tls: session))
                 accepted += 1
             } else {
-                _ = pg_close(client)
+                _ = av_close(client)
             }
         }
 
         for peer in peers where !peer.failed {
             if !peer.handshaken {
                 let step = error.withUnsafeMutableBufferPointer {
-                    pg_tls_handshake(peer.tls, $0.baseAddress, 256)
+                    av_tls_handshake(peer.tls, $0.baseAddress, 256)
                 }
                 if step == 1 {
                     peer.handshaken = true
-                    peer.http2 = pg_tls_is_h2(peer.tls) != 0
+                    peer.http2 = av_tls_is_h2(peer.tls) != 0
                     negotiated.append(peer.http2 ? "h2" : "http/1.1")
-                    serverNames.append(pg_tls_server_name(peer.tls).map { String(cString: $0) } ?? "")
+                    serverNames.append(av_tls_server_name(peer.tls).map { String(cString: $0) } ?? "")
                 } else if step == -2 {
                     peer.failed = true
                 }
@@ -159,7 +159,7 @@ private final class TLSOrigin {
             }
             var buffer = [UInt8](repeating: 0, count: 16384)
             while true {
-                let n = buffer.withUnsafeMutableBytes { pg_tls_read(peer.tls, $0.baseAddress, $0.count) }
+                let n = buffer.withUnsafeMutableBytes { av_tls_read(peer.tls, $0.baseAddress, $0.count) }
                 if n <= 0 { break }
                 peer.inbox.append(contentsOf: buffer.prefix(Int(n)))
             }
@@ -252,7 +252,7 @@ struct HTTPSClientTests {
     private func pretend(_ client: TestClient, _ name: String, is address: [UInt8]) {
         client.worker.pointee.resolverCache.store(
             ResolverCacheKey(name: name, type: DNSRecordType.a.rawValue),
-            addresses: [ResolvedAddress(bytes: address)], ttl: 3_600, now: pg_monotonic_ms())
+            addresses: [ResolvedAddress(bytes: address)], ttl: 3_600, now: av_monotonic_ms())
     }
 
     private func get(_ client: TestClient, _ origin: TLSOrigin, _ url: String) throws -> String {

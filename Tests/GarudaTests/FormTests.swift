@@ -1,5 +1,5 @@
 import Testing
-import GarudaCore
+import AvianCore
 @testable import Garuda
 
 private struct Credentials: Codable, Equatable {

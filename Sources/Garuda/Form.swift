@@ -12,7 +12,7 @@
 // a malformed one.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// A `application/x-www-form-urlencoded` body, decoded into a type.
 public struct Form<Value: Decodable>: RequestExtractor {

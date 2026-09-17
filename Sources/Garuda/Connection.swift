@@ -12,10 +12,10 @@
 // instead of touching a recycled slot.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
-import GarudaQUIC
+import CAvian
+import AvianCore
+import AvianHTTP
+import AvianQUIC
 
 public enum ConnState: UInt8 {
     case free

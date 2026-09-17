@@ -14,9 +14,9 @@
 // never heard of its connection; it recovers by making a new one.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaQUIC
+import CAvian
+import AvianCore
+import AvianQUIC
 
 public final class QUICListener {
     /// How many datagrams to take from the socket per syscall.
@@ -41,7 +41,7 @@ public final class QUICListener {
     static let maxSegments = 32
 
     var receiveBuffer: UnsafeMutablePointer<UInt8>
-    var messages: UnsafeMutablePointer<pg_udp_msg>
+    var messages: UnsafeMutablePointer<av_udp_msg>
     /// Outgoing datagrams, back to back, waiting to go out as one send.
     var sendBuffer: UnsafeMutablePointer<UInt8>
     /// For version negotiation, which is written while receiving and must not
@@ -54,8 +54,8 @@ public final class QUICListener {
     var pendingLength = 0
     var pendingSegment = 0
     var pendingCount = 0
-    var pendingPeer = pg_udp_addr()
-    var pendingLocal = pg_udp_addr()
+    var pendingPeer = av_udp_addr()
+    var pendingLocal = av_udp_addr()
     /// Set when the socket refused a datagram; cleared when it takes one.
     public private(set) var blocked = false
     /// Connections that saw traffic in the last batch, in arrival order and
@@ -74,10 +74,10 @@ public final class QUICListener {
         let stride = QUICListener.datagramSize
         receiveBuffer = UnsafeMutablePointer<UInt8>.allocate(
             capacity: stride * QUICListener.batchSize)
-        messages = UnsafeMutablePointer<pg_udp_msg>.allocate(capacity: QUICListener.batchSize)
+        messages = UnsafeMutablePointer<av_udp_msg>.allocate(capacity: QUICListener.batchSize)
         sendBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: stride * QUICListener.maxSegments)
         negotiationBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: stride)
-        gso = pg_udp_gso_supported(fd) != 0
+        gso = av_udp_gso_supported(fd) != 0
     }
 
     deinit {
@@ -90,7 +90,7 @@ public final class QUICListener {
     public func destroy() {
         connections.removeAll()
         live.removeAll()
-        _ = pg_close(fd)
+        _ = av_close(fd)
     }
 
     // MARK: - Receiving
@@ -101,7 +101,7 @@ public final class QUICListener {
     public func readable(nowMs: UInt64) -> Int {
         var total = 0
         while true {
-            let n = Int(pg_udp_recv_batch(fd, receiveBuffer, QUICListener.datagramSize,
+            let n = Int(av_udp_recv_batch(fd, receiveBuffer, QUICListener.datagramSize,
                                           messages, Int32(QUICListener.batchSize)))
             if n <= 0 { break }
             for i in 0..<n {
@@ -128,7 +128,7 @@ public final class QUICListener {
     }
 
     private func route(_ p: UnsafeMutablePointer<UInt8>, _ length: Int,
-                       _ message: pg_udp_msg, nowMs: UInt64) -> QUICConnection? {
+                       _ message: av_udp_msg, nowMs: UInt64) -> QUICConnection? {
         let header = QUICPacket.parseHeader(p, length, localCIDLength: quicLocalCIDLength)
         if !header.isValid { return nil }
 
@@ -168,7 +168,7 @@ public final class QUICListener {
     }
 
     private func accept(_ p: UnsafeMutablePointer<UInt8>, _ length: Int,
-                        _ message: pg_udp_msg, header: QUICPacketHeader,
+                        _ message: av_udp_msg, header: QUICPacketHeader,
                         nowMs: UInt64) -> QUICConnection? {
         let localCID = QUICConnectionID.random()
         guard let connection = QUICConnection(config: config, version: header.version,
@@ -192,7 +192,7 @@ public final class QUICListener {
     /// Tells a client which versions this server speaks. The packet is not
     /// protected and carries no state; a server that kept state here would be
     /// one an attacker could fill up.
-    private func sendVersionNegotiation(to message: pg_udp_msg,
+    private func sendVersionNegotiation(to message: av_udp_msg,
                                         dcid: QUICConnectionID, scid: QUICConnectionID) {
         var offset = 0
         // The first byte's low bits are arbitrary, but the high bit must be
@@ -218,7 +218,7 @@ public final class QUICListener {
         offset += 4
         var peer = message.peer
         var local = message.local
-        _ = pg_udp_send(fd, out, offset, &peer, &local, 0)
+        _ = av_udp_send(fd, out, offset, &peer, &local, 0)
     }
 
     // MARK: - Sending
@@ -300,18 +300,18 @@ public final class QUICListener {
         // A run built before GSO turned out to be refused.
         if !gso && pendingCount > 1 { return sendPendingOneByOne() }
         let segment = pendingCount > 1 ? UInt16(pendingSegment) : 0
-        let sent = pg_udp_send_segments(fd, sendBuffer, pendingLength, segment,
+        let sent = av_udp_send_segments(fd, sendBuffer, pendingLength, segment,
                                         &pendingPeer, &pendingLocal, 0)
         if sent >= 0 {
             clearPending()
             return true
         }
-        let error = pg_errno()
-        if pg_err_is_again(error) != 0 {
+        let error = av_errno()
+        if av_err_is_again(error) != 0 {
             blocked = true
             return false
         }
-        if segment > 0 && pg_udp_gso_refused(error) != 0 {
+        if segment > 0 && av_udp_gso_refused(error) != 0 {
             // The kernel or the device will not segment. Nothing was wrong
             // with the datagrams, so they go out one at a time, and so does
             // everything after them.
@@ -328,8 +328,8 @@ public final class QUICListener {
         var offset = 0
         while offset < pendingLength {
             let n = min(pendingSegment, pendingLength - offset)
-            let sent = pg_udp_send(fd, sendBuffer + offset, n, &pendingPeer, &pendingLocal, 0)
-            if sent < 0 && pg_err_is_again(pg_errno()) != 0 {
+            let sent = av_udp_send(fd, sendBuffer + offset, n, &pendingPeer, &pendingLocal, 0)
+            if sent < 0 && av_err_is_again(av_errno()) != 0 {
                 // Keep what has not gone, at the front, for the next flush.
                 let rest = pendingLength - offset
                 sendBuffer.update(from: sendBuffer + offset, count: rest)

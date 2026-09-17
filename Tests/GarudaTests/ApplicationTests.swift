@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 private struct HandlerFailure: Error {}
@@ -141,11 +141,11 @@ struct ApplicationTests {
 
     @Test func aHandlerCanWaitOnATimer() throws {
         let client = sample().test
-        let started = pg_monotonic_ms()
+        let started = av_monotonic_ms()
         let response = try client.get("/later/30")
         #expect(response.status == 202)
         #expect(response.text == "late")
-        #expect(pg_monotonic_ms() - started >= 25)
+        #expect(av_monotonic_ms() - started >= 25)
     }
 
     @Test func oneClientServesRequestAfterRequest() throws {
@@ -172,8 +172,8 @@ struct ApplicationTests {
         // A new request, very likely on the same slot, before the old deadline.
         #expect(try client.get("/user/5").text == "5")
         // Past the old deadline: nothing resumes into the reused slot.
-        let started = pg_monotonic_ms()
-        while pg_monotonic_ms() - started < 80 { client.turn() }
+        let started = av_monotonic_ms()
+        while av_monotonic_ms() - started < 80 { client.turn() }
         #expect(client.worker.pointee.table.liveCount == 0)
         #expect(try client.get("/user/6").text == "6")
     }

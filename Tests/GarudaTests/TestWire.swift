@@ -1,4 +1,4 @@
-import CGaruda
+import CAvian
 @testable import Garuda
 
 /// One connection to a test client's worker, driven directly.
@@ -37,19 +37,19 @@ final class TestWire {
     func close() {
         guard !closed else { return }
         closed = true
-        _ = pg_close(fd)
+        _ = av_close(fd)
     }
 
     func send(_ request: String) {
         var request = request
-        request.withUTF8 { _ = pg_write(fd, $0.baseAddress!, $0.count) }
+        request.withUTF8 { _ = av_write(fd, $0.baseAddress!, $0.count) }
     }
 
     /// Bytes waiting now, without turning the worker.
     @discardableResult
     func pending() -> Int {
         while got < capacity {
-            let n = pg_read(fd, buffer + got, capacity - got)
+            let n = av_read(fd, buffer + got, capacity - got)
             if n <= 0 { break }
             got += n
         }

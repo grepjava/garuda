@@ -16,9 +16,9 @@
 // what a request reads -- is in Respond.swift.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 public typealias Handler = (borrowing Request, inout Response) throws -> Void
 

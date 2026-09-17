@@ -14,8 +14,8 @@
 // already resumed it.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 /// How a timed wait ended.
 enum TimedWaitOutcome {
@@ -48,7 +48,7 @@ extension Worker {
             let id = worker.pointee.nextTimedWait
             worker.pointee.nextTimedWait = id == Int32.max ? 0 : id + 1
             var waiter = TimedWaiter(continuation: continuation, op: -1, opGeneration: 0)
-            let deadline = pg_monotonic_us() &+ 1 &+ max(1, milliseconds) &* 1000
+            let deadline = av_monotonic_us() &+ 1 &+ max(1, milliseconds) &* 1000
             if let (op, generation) = worker.pointee.asyncOps.allocate(
                 slot: Int(id), requestId: 0, kind: .timedWait, deadlineUs: deadline) {
                 worker.pointee.timerHeap.push(

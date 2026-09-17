@@ -15,8 +15,8 @@
 // machine does not have.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 /// The parts of resolv.conf a stub resolver acts on.
 ///
@@ -89,14 +89,14 @@ extension ResolverConfig {
     /// and a path that has grown to a gigabyte is not one this should read
     /// into a worker.
     private static func slurp(_ path: String, limit: Int = 64 * 1024) -> [UInt8]? {
-        let fd = path.withCString { pg_open_read($0) }
+        let fd = path.withCString { av_open_read($0) }
         guard fd >= 0 else { return nil }
-        defer { _ = pg_close(fd) }
+        defer { _ = av_close(fd) }
         var bytes = [UInt8]()
         var chunk = [UInt8](repeating: 0, count: 4096)
         while bytes.count < limit {
             let got = chunk.withUnsafeMutableBytes { buffer -> Int in
-                pg_read(fd, buffer.baseAddress, min(buffer.count, limit - bytes.count))
+                av_read(fd, buffer.baseAddress, min(buffer.count, limit - bytes.count))
             }
             if got > 0 {
                 bytes.append(contentsOf: chunk[0..<got])

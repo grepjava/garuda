@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 // `Worker.waitTimed`: a wait that whoever holds its id ends early, and that

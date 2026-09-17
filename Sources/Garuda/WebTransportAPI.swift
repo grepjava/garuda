@@ -29,10 +29,10 @@
 // touching a session from one stops the worker with a message saying so.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaQUIC
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianQUIC
+import AvianHTTP
 
 /// Why a WebTransport operation did not complete.
 public enum WebTransportError: Error, Equatable, Sendable {
@@ -174,7 +174,7 @@ public final class WebTransportSession: @unchecked Sendable {
     }
 
     func onWorker() {
-        precondition(pg_worker_current() == UnsafeMutableRawPointer(worker),
+        precondition(av_worker_current() == UnsafeMutableRawPointer(worker),
                      "a WebTransport session was used off its worker's thread; use a task group, not Task { }")
     }
 }
@@ -327,7 +327,7 @@ private func park(_ worker: UnsafeMutablePointer<Worker>,
     await withTaskCancellationHandler {
         await withUnsafeContinuation { store($0) }
     } onCancel: {
-        if pg_worker_current() == workerAddress { take()?.resume() }
+        if av_worker_current() == workerAddress { take()?.resume() }
     }
     try Task.checkCancellation()
 }

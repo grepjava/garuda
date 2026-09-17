@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 /// What the handler under test saw, read back by the test.
@@ -119,17 +119,17 @@ struct OutboundTests {
     /// A listening socket that never accepts. connect(2) completes into the
     /// backlog, which is all these tests need a peer for.
     private func listen() -> Int32 {
-        socketPath.withCString { pg_listen_unix($0, 16, 1) }
+        socketPath.withCString { av_listen_unix($0, 16, 1) }
     }
 
     private func unlink() {
-        _ = socketPath.withCString { pg_unlink($0) }
+        _ = socketPath.withCString { av_unlink($0) }
     }
 
     @Test func aUnixConnectOpensAndIsGivenBack() throws {
         let fd = listen()
         #expect(fd >= 0)
-        defer { _ = pg_close(fd); unlink() }
+        defer { _ = av_close(fd); unlink() }
         outcome = ""
         let client = outboundApp().test
         #expect(try client.get("/connect-unix").text == "open")
@@ -166,7 +166,7 @@ struct OutboundTests {
     @Test func aWaitThatNeverReadiesTimesOut() throws {
         let fd = listen()
         #expect(fd >= 0)
-        defer { _ = pg_close(fd); unlink() }
+        defer { _ = av_close(fd); unlink() }
         outcome = ""
         let client = outboundApp().test
         #expect(try client.get("/read-timeout").text == "timedOut")
@@ -182,7 +182,7 @@ struct OutboundTests {
     @Test func aPeerThatWritesWakesTheWaitingHandler() throws {
         let fd = listen()
         #expect(fd >= 0)
-        defer { _ = pg_close(fd); unlink() }
+        defer { _ = av_close(fd); unlink() }
         outcome = ""
         let client = outboundApp().test
         let wire = try TestWire(client)
@@ -195,11 +195,11 @@ struct OutboundTests {
         // Now be the peer: accept the connection and write to it.
         var peer = [CChar](repeating: 0, count: 64)
         var port: UInt16 = 0
-        let server = pg_accept(fd, &peer, 64, &port)
+        let server = av_accept(fd, &peer, 64, &port)
         #expect(server >= 0)
-        defer { _ = pg_close(server) }
+        defer { _ = av_close(server) }
         let payload: StaticString = "hello"
-        #expect(pg_write(server, payload.utf8Start, payload.utf8CodeUnitCount) == 5)
+        #expect(av_write(server, payload.utf8Start, payload.utf8CodeUnitCount) == 5)
 
         #expect(wire.receive()?.hasSuffix("read hello") == true)
         #expect(client.worker.pointee.outbound?.liveCount == 0)
@@ -210,7 +210,7 @@ struct OutboundTests {
     @Test func aReleasedConnectionIsUsedAgain() throws {
         let fd = listen()
         #expect(fd >= 0)
-        defer { _ = pg_close(fd); unlink() }
+        defer { _ = av_close(fd); unlink() }
         let client = outboundApp().test
         #expect(try client.get("/pool").text == "released")
         let afterFirst = client.worker.pointee.outboundOpened
@@ -227,12 +227,12 @@ struct OutboundTests {
     /// handed to a caller asking for another.
     @Test func thePoolDoesNotMixDestinations() throws {
         let first = listen()
-        let second = otherSocketPath.withCString { pg_listen_unix($0, 16, 1) }
+        let second = otherSocketPath.withCString { av_listen_unix($0, 16, 1) }
         #expect(first >= 0)
         #expect(second >= 0)
         defer {
-            _ = pg_close(first); _ = pg_close(second)
-            unlink(); _ = otherSocketPath.withCString { pg_unlink($0) }
+            _ = av_close(first); _ = av_close(second)
+            unlink(); _ = otherSocketPath.withCString { av_unlink($0) }
         }
         let client = outboundApp().test
         #expect(try client.get("/pool").text == "released")
@@ -252,7 +252,7 @@ struct OutboundTests {
     @Test func aPeerThatWentAwayIsNotHandedOn() throws {
         let fd = listen()
         #expect(fd >= 0)
-        defer { _ = pg_close(fd); unlink() }
+        defer { _ = av_close(fd); unlink() }
         let client = outboundApp().test
         #expect(try client.get("/pool").text == "released")
         #expect(client.worker.pointee.outboundOpened == 1)
@@ -260,9 +260,9 @@ struct OutboundTests {
         // Be the far end, and go away.
         var peer = [CChar](repeating: 0, count: 64)
         var port: UInt16 = 0
-        let server = pg_accept(fd, &peer, 64, &port)
+        let server = av_accept(fd, &peer, 64, &port)
         #expect(server >= 0)
-        _ = pg_close(server)
+        _ = av_close(server)
 
         // The next caller must get a new connection, not the dead one.
         #expect(try client.get("/pool").text == "released")
@@ -274,15 +274,15 @@ struct OutboundTests {
     @Test func anIdleConnectionIsSweptAway() throws {
         let fd = listen()
         #expect(fd >= 0)
-        defer { _ = pg_close(fd); unlink() }
+        defer { _ = av_close(fd); unlink() }
         let client = outboundApp().test
         client.worker.pointee.outboundIdleMillis = 1
         #expect(try client.get("/pool").text == "released")
         #expect(client.worker.pointee.outbound?.liveCount == 1)
 
         // The sweep runs at most once a second, so let it come round.
-        let started = pg_monotonic_ms()
-        while pg_monotonic_ms() - started < 1_200 { client.turn() }
+        let started = av_monotonic_ms()
+        while av_monotonic_ms() - started < 1_200 { client.turn() }
         #expect(client.worker.pointee.outbound?.liveCount == 0)
     }
 
@@ -291,7 +291,7 @@ struct OutboundTests {
     @Test func shutdownClosesWhatIsStillOpen() throws {
         let fd = listen()
         #expect(fd >= 0)
-        defer { _ = pg_close(fd); unlink() }
+        defer { _ = av_close(fd); unlink() }
         outcome = ""
         let client = outboundApp().test
         #expect(try client.get("/connect-unix").text == "open")

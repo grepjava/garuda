@@ -29,8 +29,8 @@
 // and an answer the engine gives before any route is chosen, like a 404.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
-import GarudaHTTP
+import AvianCore
+import AvianHTTP
 
 /// Sees the response a request is about to send, and may change it.
 public typealias SendHook = (inout OutgoingResponse) -> Void

@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 // `onStreamingBody`: a request body read as it arrives. And `sendInterim`.
@@ -276,8 +276,8 @@ struct RequestBodyTests {
         let (socket, _, _) = try client.connect()
         let bytes = Array("POST /stalled HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".utf8) + pattern(10)
         _ = bytes.withUnsafeBufferPointer { write(socket, $0.baseAddress!, $0.count) }
-        let deadline = pg_monotonic_ms() + 3000
-        while bodyEvents.isEmpty && pg_monotonic_ms() < deadline { client.turn() }
+        let deadline = av_monotonic_ms() + 3000
+        while bodyEvents.isEmpty && av_monotonic_ms() < deadline { client.turn() }
         #expect(bodyEvents == ["incomplete"])
         _ = close(socket)
     }

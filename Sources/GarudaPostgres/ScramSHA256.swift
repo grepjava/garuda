@@ -22,7 +22,7 @@
 // will not authenticate. Said here so it is found here.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
+import CAvian
 
 public enum ScramError: Error, Equatable, Sendable {
     /// A server message that is not the shape SCRAM gives it.
@@ -68,7 +68,7 @@ public struct ScramSHA256Client {
     /// separates attributes.
     public static func randomNonce() -> String {
         var bytes = [UInt8](repeating: 0, count: 18)
-        _ = bytes.withUnsafeMutableBytes { pg_random_bytes($0.baseAddress, 18) }
+        _ = bytes.withUnsafeMutableBytes { av_random_bytes($0.baseAddress, 18) }
         return Base64.encode(bytes)
     }
 
@@ -158,7 +158,7 @@ public struct ScramSHA256Client {
         let n = key.withUnsafeBytes { k in
             data.withUnsafeBytes { d in
                 out.withUnsafeMutableBytes { o in
-                    pg_hmac(PG_SHA256, k.baseAddress, k.count, d.baseAddress, d.count,
+                    av_hmac(AV_SHA256, k.baseAddress, k.count, d.baseAddress, d.count,
                             o.baseAddress!.assumingMemoryBound(to: UInt8.self))
                 }
             }
@@ -171,7 +171,7 @@ public struct ScramSHA256Client {
         var out = [UInt8](repeating: 0, count: 32)
         let n = data.withUnsafeBytes { d in
             out.withUnsafeMutableBytes { o in
-                pg_hash(PG_SHA256, d.baseAddress, d.count,
+                av_hash(AV_SHA256, d.baseAddress, d.count,
                         o.baseAddress!.assumingMemoryBound(to: UInt8.self))
             }
         }
@@ -185,7 +185,7 @@ public struct ScramSHA256Client {
         let ok = password.withUnsafeBytes { p in
             salt.withUnsafeBytes { s in
                 out.withUnsafeMutableBytes { o in
-                    pg_pbkdf2(PG_SHA256, p.baseAddress, p.count, s.baseAddress, s.count,
+                    av_pbkdf2(AV_SHA256, p.baseAddress, p.count, s.baseAddress, s.count,
                               UInt32(iterations),
                               o.baseAddress!.assumingMemoryBound(to: UInt8.self), 32)
                 }

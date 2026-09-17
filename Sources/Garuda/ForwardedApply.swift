@@ -8,9 +8,9 @@
 // alone leaves an application unable to tell who its callers are.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 extension Worker {
 

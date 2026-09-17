@@ -21,7 +21,7 @@
 // and the protocol framing are the same as for any streamed response.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// The events of one `text/event-stream` response.
 public final class EventSink: @unchecked Sendable {

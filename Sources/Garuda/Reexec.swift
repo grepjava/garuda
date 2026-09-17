@@ -22,8 +22,8 @@ import Glibc
 import Darwin
 #endif
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 struct Reexec {
     static let variable = "GARUDA_REEXEC"
@@ -36,7 +36,7 @@ struct Reexec {
     /// The record the previous image left, removed from the environment so
     /// that nothing started from here inherits it.
     static func take() -> Reexec? {
-        guard let raw = pg_getenv(variable) else { return nil }
+        guard let raw = av_getenv(variable) else { return nil }
         let text = String(cString: raw)
         unsetenv(variable)
         let halves = text.split(separator: ";", omittingEmptySubsequences: false)
@@ -69,12 +69,12 @@ struct Reexec {
     /// stopped and waited for, and the sockets closed, rather than left behind
     /// with no supervisor.
     func release() {
-        for pid in workers where pid > 0 { _ = pg_kill(pid, SIGQUIT) }
+        for pid in workers where pid > 0 { _ = av_kill(pid, SIGQUIT) }
         var status: Int32 = 0
-        for pid in workers where pid > 0 { _ = pg_waitpid(pid, &status, 0) }
+        for pid in workers where pid > 0 { _ = av_waitpid(pid, &status, 0) }
         var closed: [Int32] = []
         for fd in listeners where fd >= 0 && !closed.contains(fd) {
-            _ = pg_close(fd)
+            _ = av_close(fd)
             closed.append(fd)
         }
     }

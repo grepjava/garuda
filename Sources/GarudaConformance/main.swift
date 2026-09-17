@@ -60,8 +60,8 @@ import Glibc
 import Darwin
 #endif
 
-import GarudaCore
-import GarudaHTTP
+import AvianCore
+import AvianHTTP
 import Garuda
 import GarudaUploads
 

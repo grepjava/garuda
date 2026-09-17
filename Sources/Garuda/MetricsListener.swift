@@ -29,8 +29,8 @@
 // rather than anything starting to queue.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 /// A scrape, or a --redirect-http request, whose request is still on its way.
 /// The two share these places: both are one request, one response and a
@@ -70,7 +70,7 @@ extension Worker {
             var port: UInt16 = 0
             var peer = [CChar](repeating: 0, count: 48)
             let fd = peer.withUnsafeMutableBufferPointer { raw in
-                pg_accept(metricsFD, raw.baseAddress!, 48, &port)
+                av_accept(metricsFD, raw.baseAddress!, 48, &port)
             }
             if fd < 0 { return }
             beginOneShot(fd, redirect: false)
@@ -86,7 +86,7 @@ extension Worker {
             buf.destroy()
         case .gone:
             buf.destroy()
-            _ = pg_close(fd)
+            _ = av_close(fd)
         case .partial:
             // Nowhere to wait: the place held longest gives way. Its peer has
             // had the most time to finish, so it is answered from what it has
@@ -102,7 +102,7 @@ extension Worker {
                 return
             }
             scrapes[index].fd = fd
-            scrapes[index].deadlineMs = pg_monotonic_ms() &+ scrapeDeadlineMs
+            scrapes[index].deadlineMs = av_monotonic_ms() &+ scrapeDeadlineMs
             scrapes[index].buf = buf
             scrapes[index].redirect = redirect
         }
@@ -200,7 +200,7 @@ extension Worker {
         scrapes[index].fd = -1
         scrapes[index].deadlineMs = 0
         scrapes[index].redirect = false
-        if close && fd >= 0 { _ = pg_close(fd) }
+        if close && fd >= 0 { _ = av_close(fd) }
     }
 
     private enum ScrapeRead {
@@ -215,7 +215,7 @@ extension Worker {
         while true {
             if buf.readableBytes >= scrapeMaxRequest { return .complete }
             buf.reserve(1024)
-            let n = pg_read(fd, buf.writePointer, min(1024, buf.writableBytes))
+            let n = av_read(fd, buf.writePointer, min(1024, buf.writableBytes))
             if n > 0 {
                 buf.advanceWriter(n)
                 if headEnded(buf) { return .complete }
@@ -226,9 +226,9 @@ extension Worker {
                 // it is not sending more, so this is as complete as it gets.
                 return buf.readableBytes > 0 ? .complete : .gone
             }
-            let e = pg_errno()
-            if pg_err_is_intr(e) != 0 { continue }
-            if pg_err_is_again(e) != 0 { return .partial }
+            let e = av_errno()
+            if av_err_is_intr(e) != 0 { continue }
+            if av_err_is_again(e) != 0 { return .partial }
             return .gone
         }
     }
@@ -256,11 +256,11 @@ extension Worker {
     /// refusing the second would be a configuration error waiting to happen
     /// rather than a security boundary.
     private mutating func serveScrape(_ fd: Int32) {
-        defer { _ = pg_close(fd) }
+        defer { _ = av_close(fd) }
 
         // This worker's own gauge, which the accept and close paths keep
         // true for every other worker.
-        Metrics.set(PG_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount))
+        Metrics.set(AV_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount))
 
         var body = ByteBuffer()
         defer { body.destroy() }
@@ -291,10 +291,10 @@ extension Worker {
         var attempts = 16
         while sent < n && attempts > 0 {
             attempts -= 1
-            let k = pg_write(fd, p + sent, n - sent)
+            let k = av_write(fd, p + sent, n - sent)
             if k > 0 { sent += k; continue }
-            let e = pg_errno()
-            if pg_err_is_intr(e) != 0 { continue }
+            let e = av_errno()
+            if av_err_is_intr(e) != 0 { continue }
             return
         }
     }

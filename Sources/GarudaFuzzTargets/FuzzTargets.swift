@@ -27,9 +27,9 @@
 //===----------------------------------------------------------------------===//
 
 import Garuda
-import GarudaCore
-import GarudaHTTP
-import GarudaQUIC
+import AvianCore
+import AvianHTTP
+import AvianQUIC
 
 public enum FuzzTarget: String, CaseIterable, Sendable {
     case httpHead = "http-head"

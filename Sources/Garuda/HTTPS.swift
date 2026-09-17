@@ -15,9 +15,9 @@
 // where anyone in the path could have added it.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 extension Worker {
 
@@ -40,7 +40,7 @@ extension Worker {
             var port: UInt16 = 0
             var peer = [CChar](repeating: 0, count: 48)
             let fd = peer.withUnsafeMutableBufferPointer { raw in
-                pg_accept(redirectFD, raw.baseAddress!, 48, &port)
+                av_accept(redirectFD, raw.baseAddress!, 48, &port)
             }
             if fd < 0 { return }
             beginOneShot(fd, redirect: true)
@@ -51,14 +51,14 @@ extension Worker {
     mutating func closeRedirectListener() {
         guard redirectFD >= 0 else { return }
         _ = poller.remove(redirectFD)
-        _ = pg_close(redirectFD)
+        _ = av_close(redirectFD)
         redirectFD = -1
     }
 
     /// Answers one plain request with the https URL it should have used, or
     /// with 400 when it gives no usable host, and closes the connection.
     mutating func serveRedirect(_ fd: Int32, _ request: ByteBuffer) {
-        defer { _ = pg_close(fd) }
+        defer { _ = av_close(fd) }
         var status = 400
         var location = ByteBuffer()
         defer { location.destroy() }

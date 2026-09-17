@@ -35,9 +35,9 @@
 // silent for `--request-timeout`.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// Writes the body of a response that has already been started.
 ///
@@ -162,7 +162,7 @@ public final class ResponseBodyWriter: @unchecked Sendable {
 
     @inline(__always)
     private func onWorker() {
-        precondition(pg_worker_current() == UnsafeMutableRawPointer(worker),
+        precondition(av_worker_current() == UnsafeMutableRawPointer(worker),
                      "a response body was written off its worker's thread")
     }
 }

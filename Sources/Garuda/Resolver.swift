@@ -17,8 +17,8 @@
 // handed half an answer believing it whole.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 enum ResolveError: Error, Equatable {
     /// No nameserver answered, across every server and every attempt.
@@ -93,7 +93,7 @@ extension Worker {
         // caching the candidate instead would miss on every one of them until
         // the search list had been walked once per entry.
         let key = ResolverCacheKey(name: name, type: type.rawValue)
-        let now = pg_monotonic_ms()
+        let now = av_monotonic_ms()
         if let cached = worker.pointee.resolverCache.take(key, now: now) {
             // An empty list is a remembered "no such name", which is worth
             // remembering precisely because otherwise a typo in a config file
@@ -224,7 +224,7 @@ extension Worker {
         // to arrive is the one believed. So the same source QUIC draws its
         // connection ids from, not a counter and not the clock.
         var idBytes: [UInt8] = [0, 0]
-        _ = idBytes.withUnsafeMutableBytes { pg_random_bytes($0.baseAddress, 2) }
+        _ = idBytes.withUnsafeMutableBytes { av_random_bytes($0.baseAddress, 2) }
         let id = UInt16(idBytes[0]) << 8 | UInt16(idBytes[1])
         var query: [UInt8] = []
         do {
@@ -469,7 +469,7 @@ extension Worker {
         var family: Int32 = 0
         let ok = name.withCString { host in
             bytes.withUnsafeMutableBytes { out in
-                pg_parse_ip(host, out.baseAddress?.assumingMemoryBound(to: UInt8.self), &family)
+                av_parse_ip(host, out.baseAddress?.assumingMemoryBound(to: UInt8.self), &family)
             }
         }
         guard ok == 0 else { return nil }

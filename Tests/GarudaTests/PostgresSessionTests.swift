@@ -1,5 +1,5 @@
 import Testing
-@testable import GarudaCore
+@testable import AvianCore
 @testable import GarudaPostgres
 
 // The session and query machines against scripted servers. Mostly servers that

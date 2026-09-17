@@ -18,9 +18,9 @@
 // report or a long poll is until it is too late.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// One response body's compressor, or nothing.
 ///
@@ -42,7 +42,7 @@ public struct ResponseEncoder {
     public mutating func start(_ coding: ContentCoding) -> Bool {
         destroy()
         guard coding != .identity,
-              let h = pg_enc_new(Int32(coding.rawValue)) else { return false }
+              let h = av_enc_new(Int32(coding.rawValue)) else { return false }
         handle = h
         self.coding = coding
         return true
@@ -54,18 +54,18 @@ public struct ResponseEncoder {
     /// the compressor keeps what it likes for a better ratio.
     public mutating func encode(_ p: UnsafePointer<UInt8>, _ n: Int, flush: Bool,
                                 into out: inout ByteBuffer, chunked: Bool) -> Bool {
-        run(p, n, flush ? PG_ENC_FLUSH : PG_ENC_CONTINUE, into: &out, chunked: chunked)
+        run(p, n, flush ? AV_ENC_FLUSH : AV_ENC_CONTINUE, into: &out, chunked: chunked)
     }
 
     /// Ends the compressed stream and releases the compressor.
     public mutating func finish(into out: inout ByteBuffer, chunked: Bool) -> Bool {
-        let ok = run(nil, 0, PG_ENC_FINISH, into: &out, chunked: chunked)
+        let ok = run(nil, 0, AV_ENC_FINISH, into: &out, chunked: chunked)
         destroy()
         return ok
     }
 
     public mutating func destroy() {
-        if let handle { pg_enc_free(handle) }
+        if let handle { av_enc_free(handle) }
         handle = nil
         coding = .identity
         scratch.destroy()
@@ -101,7 +101,7 @@ public struct ResponseEncoder {
             out.reserve(max(1024, min(n - offset, 256 * 1024) + 64))
             var consumed = 0
             var produced = 0
-            let rc = pg_enc_run(handle, p.map { $0 + offset }, n - offset, mode,
+            let rc = av_enc_run(handle, p.map { $0 + offset }, n - offset, mode,
                                 out.writePointer, out.writableBytes,
                                 &consumed, &produced)
             offset += consumed
@@ -123,7 +123,7 @@ public struct ResponseEncoder {
 /// Whether this process can produce `coding`.
 @inline(__always)
 func codingUsable(_ coding: ContentCoding) -> Bool {
-    coding != .identity && pg_enc_available(Int32(coding.rawValue)) == 1
+    coding != .identity && av_enc_available(Int32(coding.rawValue)) == 1
 }
 
 extension Worker {

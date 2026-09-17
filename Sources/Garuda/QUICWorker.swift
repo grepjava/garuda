@@ -9,9 +9,9 @@
 // every connection put out what it owes.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaQUIC
+import CAvian
+import AvianCore
+import AvianQUIC
 
 extension Worker {
     public mutating func registerQUIC() -> Bool {
@@ -30,7 +30,7 @@ extension Worker {
         if !readyQueue.isEmpty { return 0 }
         var wait = base
         if let quic {
-            let now = pg_monotonic_ms()
+            let now = av_monotonic_ms()
             if let at = quic.nextTimeout(nowMs: now) {
                 if at <= now { return 0 }
                 let q = at - now
@@ -38,7 +38,7 @@ extension Worker {
             }
         }
         if let at = timerHeap.nextDeadlineUs {
-            let now = pg_monotonic_us()
+            let now = av_monotonic_us()
             if at <= now { return 0 }
             // Rounded up: waking before the deadline would only spin the loop.
             let t = (at - now + 999) / 1000
@@ -49,7 +49,7 @@ extension Worker {
 
     mutating func handleQUICEvent(_ mask: PollMask) {
         guard let quic else { return }
-        let now = pg_monotonic_ms()
+        let now = av_monotonic_ms()
         if mask.wantsRead { quic.readable(nowMs: now) }
         serviceQUIC(nowMs: now)
     }
@@ -75,7 +75,7 @@ extension Worker {
     /// cannot wait that long.
     mutating func quicTick() {
         guard let quic else { return }
-        let now = pg_monotonic_ms()
+        let now = av_monotonic_ms()
         // Fine enough for an acknowledgement deadline, coarse enough that an
         // idle worker is not walking its connection list per millisecond.
         if now &- lastQUICTick < 4 && !quic.blocked { return }

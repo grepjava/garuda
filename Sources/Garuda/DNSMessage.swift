@@ -28,7 +28,7 @@
 // that is about to be reused.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// Why a message could not be built, or could not be believed.
 enum DNSError: Error, Equatable {

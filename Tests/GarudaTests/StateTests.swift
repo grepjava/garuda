@@ -1,5 +1,5 @@
 import Testing
-import GarudaCore
+import AvianCore
 @testable import Garuda
 
 /// A service with identity, so a test can see how often it was built.

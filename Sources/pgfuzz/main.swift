@@ -25,7 +25,7 @@
 // replays it on every `swift test`, and a fixed crash stays fixed.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
+import CAvian
 import GarudaFuzzTargets
 
 #if canImport(Glibc)
@@ -172,7 +172,7 @@ func fail(_ target: FuzzTarget, _ reason: String, _ input: [UInt8], seed: UInt64
 
 var targets: [FuzzTarget] = []
 var seconds = 5.0
-var seed = UInt64(pg_monotonic_ms())
+var seed = UInt64(av_monotonic_ms())
 var corpusRoot = "fuzz/corpus"
 var maxLength = 4096
 var corpusOnly = false
@@ -240,8 +240,8 @@ for target in targets {
 
     if !corpusOnly {
         var rng = Rng(seed: seed &+ UInt64(target.rawValue.utf8.reduce(0) { $0 &* 31 &+ UInt64($1) }))
-        let deadline = pg_monotonic_ms() &+ UInt64(seconds * 1000)
-        while pg_monotonic_ms() < deadline {
+        let deadline = av_monotonic_ms() &+ UInt64(seconds * 1000)
+        while av_monotonic_ms() < deadline {
             // Time is checked every so often rather than every run: the check
             // is a syscall on some platforms and the parses are microseconds.
             for _ in 0..<512 {

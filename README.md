@@ -357,7 +357,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 796 unit tests, and the fuzz corpus
+swift test                                   # 512 unit tests, and the fuzz corpus
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
 

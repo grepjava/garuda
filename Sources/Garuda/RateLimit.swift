@@ -2,7 +2,7 @@
 // --rate-limit: turning a client away with 429 before the application runs.
 //
 // The accounting lives in C, in a table every worker shares; see
-// garuda_ratelimit.h for why it has to. What is here is deciding who the
+// avian_ratelimit.h for why it has to. What is here is deciding who the
 // client is, and saying no.
 //
 // Who the client is follows the same rule as everything else about forwarded
@@ -12,9 +12,9 @@
 // any client pick a fresh bucket per request.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 extension Worker {
 
@@ -22,16 +22,16 @@ extension Worker {
     /// send another, or 0 when this one is allowed.
     mutating func rateLimitWait(_ slot: Int) -> UInt64 {
         let c = table[slot]
-        let now = pg_monotonic_us()
+        let now = av_monotonic_us()
         if !config.trust.isEmpty {
             let info = forwardedInfo(slot, base: c.pointee.headBase())
             if let client = info.client {
-                return pg_ratelimit_check(client.base, client.count, now)
+                return av_ratelimit_check(client.base, client.count, now)
             }
         }
         let n = c.pointee.remoteAddr.readableBytes
         guard n > 0 else { return 0 }
-        return pg_ratelimit_check(UnsafePointer(c.pointee.remoteAddr.readPointer), n, now)
+        return av_ratelimit_check(UnsafePointer(c.pointee.remoteAddr.readPointer), n, now)
     }
 
     /// 429, with `Retry-After` saying when a request would next be allowed.
@@ -40,7 +40,7 @@ extension Worker {
     /// being disconnected, and a keep-alive connection it has to reopen costs
     /// the server a handshake for nothing.
     mutating func respondRateLimited(_ slot: Int, waitUs: UInt64) {
-        Metrics.add(PG_M_RATE_LIMITED)
+        Metrics.add(AV_M_RATE_LIMITED)
         // Whole seconds, rounded up: rounding down would tell a client to come
         // back at a moment it would still be refused.
         let seconds = Int(max(1, (waitUs + 999_999) / 1_000_000))

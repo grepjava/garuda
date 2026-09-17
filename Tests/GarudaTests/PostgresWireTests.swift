@@ -1,5 +1,5 @@
 import Testing
-@testable import GarudaCore
+@testable import AvianCore
 @testable import GarudaPostgres
 
 // The PostgreSQL wire codec. Every length and count a backend message carries

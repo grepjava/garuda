@@ -10,9 +10,9 @@
 // the response is serialised straight into the connection write buffer.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// The worker this process is running. Held behind a raw pointer rather than a
 /// class so that it can be reached without an ARC-managed context.
@@ -22,10 +22,10 @@ import GarudaHTTP
 /// `pthread_getspecific` call.
 public var currentWorker: UnsafeMutablePointer<Worker>? {
     @inline(__always) get {
-        pg_worker_current()?.assumingMemoryBound(to: Worker.self)
+        av_worker_current()?.assumingMemoryBound(to: Worker.self)
     }
     @inline(__always) set {
-        pg_worker_set_current(UnsafeMutableRawPointer(newValue))
+        av_worker_set_current(UnsafeMutableRawPointer(newValue))
     }
 }
 
@@ -212,7 +212,7 @@ public struct Worker {
         closeAllOutbound()
         outbound?.destroy()
         outbound = nil
-        for (_, clientTLS) in outboundTLS { pg_tls_ctx_free(clientTLS) }
+        for (_, clientTLS) in outboundTLS { av_tls_ctx_free(clientTLS) }
         outboundTLS.removeAll()
         quic?.destroy()
         headers.deallocate()
@@ -298,7 +298,7 @@ public struct Worker {
 
     mutating func handleConnectionEvent(_ slot: Int, _ mask: PollMask) {
         let c = table[slot]
-        c.pointee.lastActivity = pg_monotonic_ms()
+        c.pointee.lastActivity = av_monotonic_ms()
 
         if mask.contains(.error) {
             closeConnection(slot)
@@ -353,16 +353,16 @@ public struct Worker {
                         Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0))
             var port: UInt16 = 0
             let fd: Int32 = withUnsafeMutableBytes(of: &peer) { raw in
-                pg_accept(listenFD, raw.baseAddress!.assumingMemoryBound(to: CChar.self),
+                av_accept(listenFD, raw.baseAddress!.assumingMemoryBound(to: CChar.self),
                           48, &port)
             }
             if fd < 0 {
-                let e = pg_errno()
-                if pg_err_is_again(e) != 0 || pg_err_is_intr(e) != 0 { return }
+                let e = av_errno()
+                if av_err_is_again(e) != 0 || av_err_is_intr(e) != 0 { return }
                 if e == EMFILE || e == ENFILE {
                     // Descriptor exhaustion: stop asking for a moment rather
                     // than spinning on a listener that stays readable.
-                    Metrics.add(PG_M_CONNECTIONS_REJECTED)
+                    Metrics.add(AV_M_CONNECTIONS_REJECTED)
                     Log.warn("out of file descriptors; pausing accepts")
                     _ = poller.modify(listenFD, [], token: PollToken.listener)
                     acceptSuspended = true
@@ -392,8 +392,8 @@ public struct Worker {
             rejectOverCapacity(fd)
             return -1
         }
-        Metrics.add(PG_M_CONNECTIONS_ACCEPTED)
-        Metrics.set(PG_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount))
+        Metrics.add(AV_M_CONNECTIONS_ACCEPTED)
+        Metrics.set(AV_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount))
         let c = table[slot]
         c.pointee.fd = fd
         c.pointee.state = .readingHead
@@ -409,13 +409,13 @@ public struct Worker {
         c.pointee.chunked = ChunkedDecoder()
         c.pointee.bodyRemaining = 0
         c.pointee.requestCount = 0
-        c.pointee.lastActivity = pg_monotonic_ms()
+        c.pointee.lastActivity = av_monotonic_ms()
         c.pointee.remoteAddr.clear()
         c.pointee.remotePort = 0
         c.pointee.responseRemaining = -1
         c.pointee.tls = nil
 
-        if config.tcpNoDelay { _ = pg_set_nodelay(fd, 1) }
+        if config.tcpNoDelay { _ = av_set_nodelay(fd, 1) }
 
         c.pointee.remoteAddr.write(address, addressLength)
         c.pointee.remotePort = port
@@ -450,12 +450,12 @@ public struct Worker {
 
     /// Table is full: answer honestly and hang up instead of queueing.
     func rejectOverCapacity(_ fd: Int32) {
-        Metrics.add(PG_M_CONNECTIONS_REJECTED)
+        Metrics.add(AV_M_CONNECTIONS_REJECTED)
         let msg: StaticString = """
         HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 19\r\n\r\nService Unavailable
         """
-        _ = pg_write(fd, msg.utf8Start, msg.utf8CodeUnitCount)
-        _ = pg_close(fd)
+        _ = av_write(fd, msg.utf8Start, msg.utf8CodeUnitCount)
+        _ = av_close(fd)
     }
 
     // MARK: - Reading
@@ -497,18 +497,18 @@ public struct Worker {
                 // and that difference is what the header is for.
                 c.pointee.read.reserve(config.readBufferSize)
                 var arrived: UInt64 = 0
-                let n = pg_read_stamped(c.pointee.fd, c.pointee.read.writePointer,
+                let n = av_read_stamped(c.pointee.fd, c.pointee.read.writePointer,
                                         c.pointee.read.writableBytes, &arrived)
                 if n > 0 {
                     c.pointee.read.advanceWriter(n)
-                    c.pointee.headStartUs = arrived > 0 ? arrived : pg_realtime_us()
+                    c.pointee.headStartUs = arrived > 0 ? arrived : av_realtime_us()
                 }
             }
             if !fill(slot, .read, limit: config.maxHeadSize) { return }
             // Over TLS the reads are OpenSSL's, so the best available moment is
             // the one the decrypted request reached this worker.
             if fresh && c.pointee.tls != nil && c.pointee.read.readableBytes > 0 {
-                c.pointee.headStartUs = pg_realtime_us()
+                c.pointee.headStartUs = av_realtime_us()
             }
             processInput(slot)
         case .readingBody:
@@ -582,9 +582,9 @@ public struct Worker {
                 }
             }
             if n == 0 { closed = true; break }
-            let e = pg_errno()
-            if pg_err_is_again(e) != 0 { break }
-            if pg_err_is_intr(e) != 0 { continue }
+            let e = av_errno()
+            if av_err_is_again(e) != 0 { break }
+            if av_err_is_intr(e) != 0 { continue }
             closeConnection(slot)
             return false
         }
@@ -833,7 +833,7 @@ public struct Worker {
 
     mutating func dispatch(_ slot: Int) {
         if config.accessLog || Metrics.enabled {
-            table[slot].pointee.requestStartUs = pg_monotonic_us()
+            table[slot].pointee.requestStartUs = av_monotonic_us()
         }
         // Everything below reads the header table, and a request whose body
         // arrived over several loop turns may find another request's there.
@@ -992,9 +992,9 @@ public struct Worker {
                     c.pointee.write.consume(n)
                     continue
                 }
-                let e = pg_errno()
-                if pg_err_is_intr(e) != 0 { continue }
-                if pg_err_is_again(e) != 0 {
+                let e = av_errno()
+                if av_err_is_intr(e) != 0 { continue }
+                if av_err_is_again(e) != 0 {
                     // Read interest is only safe while something will actually
                     // consume what arrives: not while a request that has its
                     // whole body is still being answered, and not while a
@@ -1163,13 +1163,13 @@ public struct Worker {
         disarmDeadline(slot)
         clearContinuation(slot)
         c.pointee.flags.insert(.servedRequest)
-        c.pointee.lastActivity = pg_monotonic_ms()
+        c.pointee.lastActivity = av_monotonic_ms()
         setInterest(slot, .read)
         // A pipelined request may already be sitting in the read buffer.
         if c.pointee.read.readableBytes > 0 {
             // It arrived no later than now, and when exactly is not
             // recoverable; now is the honest lower bound on its wait.
-            if config.requestStartHeader { c.pointee.headStartUs = pg_realtime_us() }
+            if config.requestStartHeader { c.pointee.headStartUs = av_realtime_us() }
             processInput(slot)
         }
     }
@@ -1245,7 +1245,7 @@ public struct Worker {
         dates.refresh()
         c.pointee.write.clear()
         HTTPResponseWriter.writeError(&c.pointee.write, status: status,
-                                      closeConnection: true, dateCache: dates,
+                                      closeConnection: true, dateCache: dates, serverName: "garuda",
                                       omitBody: c.pointee.head.method.hasNoResponseBody)
         c.pointee.state = .writing
         _ = flush(slot)
@@ -1265,7 +1265,7 @@ public struct Worker {
             let started = c.pointee.requestStartUs
             Metrics.requestFinished(status: status,
                                     micros: started == 0
-                                        ? -1 : Int(pg_monotonic_us() &- started))
+                                        ? -1 : Int(av_monotonic_us() &- started))
         }
         guard config.accessLog, Log.enabled(.info) else { return }
         let base = c.pointee.headBase()
@@ -1275,7 +1275,7 @@ public struct Worker {
         // not to the last byte of the body, which for a streaming response is
         // the client's pace rather than the application's.
         let micros = c.pointee.requestStartUs == 0
-            ? 0 : Int(pg_monotonic_us() &- c.pointee.requestStartUs)
+            ? 0 : Int(av_monotonic_us() &- c.pointee.requestStartUs)
         // Checked when it was assigned: visible ASCII with nothing a log line
         // or a JSON string would need escaped.
         // An empty buffer may never have been given storage, and has no pointer
@@ -1402,11 +1402,11 @@ public struct Worker {
         if c.pointee.fileFD >= 0 { finishFile(slot) }
         // Likewise a compressor for a response that never finished.
         c.pointee.encoder.destroy()
-        Metrics.add(PG_M_CONNECTIONS_CLOSED)
+        Metrics.add(AV_M_CONNECTIONS_CLOSED)
         // Written here rather than only when this worker happens to serve a
         // scrape: a gauge nobody updates is a number from whenever it last was
         // true, which for the other workers is never.
-        Metrics.set(PG_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount &- 1))
+        Metrics.set(AV_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount &- 1))
 
         // An HTTP/2 connection takes its streams with it. Detaching each one
         // first stops it from trying to tidy up a parent that is going away.
@@ -1441,7 +1441,7 @@ public struct Worker {
         if c.pointee.wt != nil { releaseWebTransport(slot) }
         if let connection = c.pointee.quicRef {
             connection.applicationSlot = -1
-            if let quic { quic.close(connection, nowMs: pg_monotonic_ms()) }
+            if let quic { quic.close(connection, nowMs: av_monotonic_ms()) }
             c.pointee.quicRef = nil
         }
         c.pointee.h3Protocol.destroy()
@@ -1471,15 +1471,15 @@ public struct Worker {
         releaseWebTransport(slot)
 
         if let k = c.pointee.ws.acceptKey { k.deallocate(); c.pointee.ws.acceptKey = nil }
-        if let z = c.pointee.ws.deflater { pg_ws_deflate_free(z); c.pointee.ws.deflater = nil }
-        if let z = c.pointee.ws.inflater { pg_ws_inflate_free(z); c.pointee.ws.inflater = nil }
+        if let z = c.pointee.ws.deflater { av_ws_deflate_free(z); c.pointee.ws.deflater = nil }
+        if let z = c.pointee.ws.inflater { av_ws_inflate_free(z); c.pointee.ws.inflater = nil }
         c.pointee.ws.deflate = nil
         c.pointee.remoteAddr.destroy()
 
         endTLS(slot)
         if c.pointee.fd >= 0 {
             _ = poller.remove(c.pointee.fd)
-            _ = pg_close(c.pointee.fd)
+            _ = av_close(c.pointee.fd)
             c.pointee.fd = -1
         }
         // A stream never took a buffer from the pool.
@@ -1506,7 +1506,7 @@ public struct Worker {
     // MARK: - Timeouts
 
     mutating func sweepTimeouts() {
-        let now = pg_monotonic_ms()
+        let now = av_monotonic_ms()
         // Ahead of the once-a-second throttle, so a delay ends when it says.
         if drainAt != 0 && now >= drainAt { beginDraining() }
         if now &- lastSweep < 1000 { return }
@@ -1594,7 +1594,7 @@ public struct Worker {
         var buf = (UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0))
         while true {
             let n = withUnsafeMutableBytes(of: &buf) { raw in
-                pg_read(signalFD, raw.baseAddress!, 8)
+                av_read(signalFD, raw.baseAddress!, 8)
             }
             if n <= 0 { break }
             withUnsafeBytes(of: &buf) { raw in
@@ -1628,7 +1628,7 @@ public struct Worker {
             return
         }
         unready = true
-        drainAt = pg_monotonic_ms() &+ config.drainDelayMs
+        drainAt = av_monotonic_ms() &+ config.drainDelayMs
         Log.info("worker failing its health check; draining when --drain-delay is up")
     }
 
@@ -1638,7 +1638,7 @@ public struct Worker {
         unready = true
         drainAt = 0
         drainDeadline = config.gracefulShutdownMs > 0
-            ? pg_monotonic_ms() &+ config.gracefulShutdownMs
+            ? av_monotonic_ms() &+ config.gracefulShutdownMs
             : 0
         // Every deadline above this one is cooperative: a peer can stall a
         // write, a library call can sit in a syscall, and a worker with no
@@ -1646,7 +1646,7 @@ public struct Worker {
         // from a signal handler and calls _exit. The extra margin covers the
         // rest of the drain and the process exit.
         let margin = config.gracefulShutdownMs / 1000 &+ 10
-        pg_exit_after(UInt32(truncatingIfNeeded: margin), 0)
+        av_exit_after(UInt32(truncatingIfNeeded: margin), 0)
         Log.info("worker draining")
         // Idle keep-alive connections have nothing in flight; drop them now.
         // Websockets are told the server is going away, which is what lets a
@@ -1679,7 +1679,7 @@ public struct Worker {
         // connections it is about to stop serving.
         _ = poller.modify(listenFD, [], token: PollToken.listener)
         if listenFD >= 0 {
-            _ = pg_close(listenFD)
+            _ = av_close(listenFD)
             listenFD = -1
         }
         // The redirect port too: this worker's socket leaves the SO_REUSEPORT

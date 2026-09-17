@@ -22,9 +22,9 @@
 // all keep working on the representation they were written for.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// Per-connection HTTP/2 state.
 ///
@@ -277,7 +277,7 @@ extension Worker {
         // way one refreshes an HTTP/1 connection. Arriving body bytes are what
         // progress looks like here, and without this the request timeout is an
         // absolute cap on the upload rather than a check for a stalled one.
-        s.pointee.lastActivity = pg_monotonic_ms()
+        s.pointee.lastActivity = av_monotonic_ms()
         s.pointee.recvWindow -= header.length
         if s.pointee.recvWindow < 0 {
             streamError(slot, h2, header.streamID, .flowControlError)
@@ -929,7 +929,7 @@ extension Worker {
         s.pointee.context = nil
         s.pointee.handlerStatus = 200
         s.pointee.responseHeaders = ByteBuffer()
-        s.pointee.lastActivity = pg_monotonic_ms()
+        s.pointee.lastActivity = av_monotonic_ms()
         s.pointee.h2 = nil
         s.pointee.responseRemaining = -1
         // A recycled slot must not inherit a static response: the next request
@@ -938,7 +938,7 @@ extension Worker {
         s.pointee.fileOffset = 0
         s.pointee.fileRemaining = 0
         // A stream opens with its HEADERS frame, which is its first byte.
-        s.pointee.headStartUs = config.requestStartHeader ? pg_realtime_us() : 0
+        s.pointee.headStartUs = config.requestStartHeader ? av_realtime_us() : 0
         s.pointee.sendWindow = h2.peerInitialWindowSize
         s.pointee.recvWindow = h2.initialWindowSize
         s.pointee.pendingRecvUpdate = 0
@@ -1025,7 +1025,7 @@ extension Worker {
             // too, so a large response to a slow reader is not cut off part
             // way through. A window the peer never opens is still a stall, and
             // still times out, because nothing is written in that case.
-            s.pointee.lastActivity = pg_monotonic_ms()
+            s.pointee.lastActivity = av_monotonic_ms()
             s.pointee.write.consume(n)
             s.pointee.sendWindow -= n
             h2.sendWindow -= n

@@ -10,7 +10,7 @@
 // query is short, and a handler that asks for one usually wants most of it.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// Why a query string could not become the type asked for.
 public enum QueryError: Error, Equatable {

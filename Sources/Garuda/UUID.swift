@@ -9,8 +9,8 @@
 // `Garuda.UUID` wherever Foundation's is also in scope.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 import GarudaPostgres
 
 public struct UUID: Hashable, Comparable, Sendable {
@@ -40,7 +40,7 @@ public struct UUID: Hashable, Comparable, Sendable {
     /// A version 4 UUID: 122 random bits from the system's generator.
     public static func random() -> UUID {
         var bytes = [UInt8](repeating: 0, count: 16)
-        let filled = bytes.withUnsafeMutableBytes { pg_random_bytes($0.baseAddress, 16) }
+        let filled = bytes.withUnsafeMutableBytes { av_random_bytes($0.baseAddress, 16) }
         // An identifier that might repeat is worse than none: a system that
         // cannot hand out random bytes is not one to keep running on.
         precondition(filled == 0, "the system's random generator failed")

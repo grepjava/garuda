@@ -17,7 +17,7 @@
 // reply -- is a crash in the worker that every other request on it shares.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// Why a backend message could not be read.
 public enum PostgresProtocolError: Error, Equatable, Sendable {

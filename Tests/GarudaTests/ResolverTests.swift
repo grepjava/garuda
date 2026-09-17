@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 /// What the handler under test saw, read back by the test.
@@ -62,7 +62,7 @@ private func resolverApp() -> Application {
 ///
 /// Bound to port 0 and read back rather than given a fixed number: a test that
 /// picks a port is a test that fails when something else on the machine holds
-/// it, which is exactly why pg_local_port exists.
+/// it, which is exactly why av_local_port exists.
 private final class FakeNameserver {
     let fd: Int32
     let port: UInt16
@@ -75,15 +75,15 @@ private final class FakeNameserver {
     var answer: (UInt16, String) -> [UInt8] = { _, _ in [] }
 
     init?() {
-        let opened = "127.0.0.1".withCString { pg_bind_udp($0, 0, 0, 0) }
+        let opened = "127.0.0.1".withCString { av_bind_udp($0, 0, 0, 0) }
         guard opened >= 0 else { return nil }
-        let got = pg_local_port(opened)
-        guard got != 0 else { _ = pg_close(opened); return nil }
+        let got = av_local_port(opened)
+        guard got != 0 else { _ = av_close(opened); return nil }
         fd = opened
         port = got
     }
 
-    deinit { _ = pg_close(fd) }
+    deinit { _ = av_close(fd) }
 
     /// Reads any waiting query and replies. Called once per turn of the
     /// worker, since both ends are on this thread.
@@ -93,9 +93,9 @@ private final class FakeNameserver {
     func pump() {
         let stride = 1500
         var buffer = [UInt8](repeating: 0, count: stride)
-        var message = pg_udp_msg()
+        var message = av_udp_msg()
         let count = buffer.withUnsafeMutableBytes { raw in
-            Int(pg_udp_recv_batch(fd, raw.baseAddress, stride, &message, 1))
+            Int(av_udp_recv_batch(fd, raw.baseAddress, stride, &message, 1))
         }
         guard count == 1 else { return }
         let got = Int(message.len)
@@ -112,7 +112,7 @@ private final class FakeNameserver {
         var peer = message.peer
         var local = message.local
         _ = payload.withUnsafeBytes { raw in
-            pg_udp_send(fd, raw.baseAddress, raw.count, &peer, &local, 0)
+            av_udp_send(fd, raw.baseAddress, raw.count, &peer, &local, 0)
         }
     }
 
@@ -152,14 +152,14 @@ private final class FakeNameserverTCP {
     private var pending: [(Int32, [UInt8])] = []
 
     init?(port: UInt16, host: String = "127.0.0.1") {
-        let opened = host.withCString { pg_listen_tcp($0, port, 16, 0, 0) }
+        let opened = host.withCString { av_listen_tcp($0, port, 16, 0, 0) }
         guard opened >= 0 else { return nil }
         fd = opened
     }
 
     deinit {
-        for peer in open { _ = pg_close(peer) }
-        _ = pg_close(fd)
+        for peer in open { _ = av_close(peer) }
+        _ = av_close(fd)
     }
 
     /// Accepts anything waiting and serves whatever has arrived on it.
@@ -169,18 +169,18 @@ private final class FakeNameserverTCP {
         let owed = pending
         pending.removeAll()
         for (peer, body) in owed {
-            _ = body.withUnsafeBytes { pg_write(peer, $0.baseAddress, $0.count) }
+            _ = body.withUnsafeBytes { av_write(peer, $0.baseAddress, $0.count) }
         }
 
         var address = [CChar](repeating: 0, count: 64)
         var port: UInt16 = 0
-        let peer = pg_accept(fd, &address, 64, &port)
+        let peer = av_accept(fd, &address, 64, &port)
         if peer >= 0 { open.append(peer) }
 
         for peer in open {
             var buffer = [UInt8](repeating: 0, count: 1500)
             let got = buffer.withUnsafeMutableBytes { raw in
-                pg_read(peer, raw.baseAddress, raw.count)
+                av_read(peer, raw.baseAddress, raw.count)
             }
             // Two bytes of length in front of the message, unlike UDP.
             guard got > 14 else { continue }
@@ -204,13 +204,13 @@ private final class FakeNameserverTCP {
                 // inside one call, which means inside the body.
                 var head = prefix
                 head.append(payload[0])
-                _ = head.withUnsafeBytes { pg_write(peer, $0.baseAddress, $0.count) }
+                _ = head.withUnsafeBytes { av_write(peer, $0.baseAddress, $0.count) }
                 pending.append((peer, Array(payload.dropFirst())))
             } else {
                 var framed = prefix
                 framed.append(contentsOf: payload)
                 _ = framed.withUnsafeBytes { raw in
-                    pg_write(peer, raw.baseAddress, raw.count)
+                    av_write(peer, raw.baseAddress, raw.count)
                 }
             }
         }

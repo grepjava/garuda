@@ -39,9 +39,9 @@
 // says nothing about a file that changed twice in a second.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// What one turn of the static-file pump achieved.
 public enum FilePump {
@@ -63,18 +63,18 @@ extension Worker {
 
         // Over kernel TLS the kernel encrypts, so the file can go from the
         // page cache to the socket just as it does in the clear.
-        if let tls = c.pointee.tls, pg_tls_ktls_send(tls) != 0 {
+        if let tls = c.pointee.tls, av_tls_ktls_send(tls) != 0 {
             while c.pointee.fileRemaining > 0 {
-                let n = pg_tls_sendfile(tls, c.pointee.fileFD, c.pointee.fileOffset,
+                let n = av_tls_sendfile(tls, c.pointee.fileFD, c.pointee.fileOffset,
                                         c.pointee.fileRemaining)
                 if n > 0 {
                     c.pointee.fileOffset += n
                     c.pointee.fileRemaining -= n
                     continue
                 }
-                let e = pg_errno()
-                if pg_err_is_intr(e) != 0 { continue }
-                if pg_err_is_again(e) != 0 {
+                let e = av_errno()
+                if av_err_is_intr(e) != 0 { continue }
+                if av_err_is_again(e) != 0 {
                     setInterest(slot, readInterestAllowed(slot) ? [.read, .write] : [.write])
                     return .again
                 }
@@ -91,7 +91,7 @@ extension Worker {
         if c.pointee.tls != nil {
             let want = min(c.pointee.fileRemaining, config.readBufferSize)
             c.pointee.write.reserve(want)
-            let got = pg_read(c.pointee.fileFD, c.pointee.write.writePointer, want)
+            let got = av_read(c.pointee.fileFD, c.pointee.write.writePointer, want)
             if got <= 0 {
                 // The file was truncated or the read failed after a
                 // Content-Length had already been promised. There is no honest
@@ -112,16 +112,16 @@ extension Worker {
 
         while c.pointee.fileRemaining > 0 {
             var offset = off_t(c.pointee.fileOffset)
-            let n = pg_sendfile(c.pointee.fd, c.pointee.fileFD, &offset,
+            let n = av_sendfile(c.pointee.fd, c.pointee.fileFD, &offset,
                                 c.pointee.fileRemaining)
             if n > 0 {
                 c.pointee.fileOffset = Int(offset)
                 c.pointee.fileRemaining -= Int(n)
                 continue
             }
-            let e = pg_errno()
-            if pg_err_is_intr(e) != 0 { continue }
-            if pg_err_is_again(e) != 0 {
+            let e = av_errno()
+            if av_err_is_intr(e) != 0 { continue }
+            if av_err_is_again(e) != 0 {
                 setInterest(slot, readInterestAllowed(slot) ? [.read, .write] : [.write])
                 return .again
             }
@@ -136,7 +136,7 @@ extension Worker {
     /// Releases the descriptor a response was reading from.
     mutating func finishFile(_ slot: Int) {
         let c = table[slot]
-        if c.pointee.fileFD >= 0 { _ = pg_close(c.pointee.fileFD) }
+        if c.pointee.fileFD >= 0 { _ = av_close(c.pointee.fileFD) }
         c.pointee.fileFD = -1
         c.pointee.fileRemaining = 0
         c.pointee.fileOffset = 0
@@ -199,7 +199,7 @@ extension Worker {
             var fd: Int32 = decoded.withUnsafeBufferPointer { buffer in
                 let relative = buffer.baseAddress! + prefixLength
                 return relative.withMemoryRebound(to: CChar.self, capacity: n - prefixLength + 1) {
-                    pg_static_open(route.directory, $0, &size, &mtime)
+                    av_static_open(route.directory, $0, &size, &mtime)
                 }
             }
             if fd < 0 { continue }
@@ -224,11 +224,11 @@ extension Worker {
                         let relative = buffer.baseAddress! + prefixLength
                         return relative.withMemoryRebound(
                             to: CChar.self, capacity: n + suffixLength - prefixLength + 1) {
-                            pg_static_open(route.directory, $0, &altSize, &altMtime)
+                            av_static_open(route.directory, $0, &altSize, &altMtime)
                         }
                     }
                     if altFD >= 0 {
-                        _ = pg_close(fd)
+                        _ = av_close(fd)
                         fd = altFD
                         size = altSize
                         mtime = altMtime
@@ -290,14 +290,14 @@ extension Worker {
         // If-Match first, and one that fails is the answer whatever else the
         // request asked.
         if requestFailsIfMatch(slot, etag: &etag, length: etagLength) {
-            _ = pg_close(fd)
+            _ = av_close(fd)
             logAccess(slot, status: 412)
             dates.refresh()
             sendBodiless(slot, status: 412, etag: &etag, etagLength: etagLength, vary: vary)
             return
         }
         if requestHasMatchingETag(slot, etag: &etag, length: etagLength) {
-            _ = pg_close(fd)
+            _ = av_close(fd)
             logAccess(slot, status: 304)
             dates.refresh()
             sendBodiless(slot, status: 304, etag: &etag, etagLength: etagLength, vary: vary)
@@ -336,7 +336,7 @@ extension Worker {
         HTTPResponseWriter.endHead(&c.pointee.write)
 
         if head || size == 0 {
-            _ = pg_close(fd)
+            _ = av_close(fd)
         } else if size <= Worker.inlineFileBytes {
             // Small enough to go out with its head in one write. Handing a
             // kilobyte of CSS to sendfile costs a second system call for the
@@ -345,11 +345,11 @@ extension Worker {
             c.pointee.write.reserve(size)
             var got = 0
             while got < size {
-                let r = pg_read(fd, c.pointee.write.writePointer + got, size - got)
+                let r = av_read(fd, c.pointee.write.writePointer + got, size - got)
                 if r <= 0 { break }
                 got += r
             }
-            _ = pg_close(fd)
+            _ = av_close(fd)
             if got < size {
                 // Truncated since it was opened, after a Content-Length was
                 // promised: there is no honest way to finish the message.
@@ -499,7 +499,7 @@ extension Worker {
         if c.pointee.isH3Stream {
             let parent = Int(c.pointee.parentSlot)
             guard parent >= 0, let h3 = table[parent].pointee.h3 else {
-                _ = pg_close(fd)
+                _ = av_close(fd)
                 closeConnection(slot)
                 return
             }
@@ -524,7 +524,7 @@ extension Worker {
         } else {
             let parent = Int(c.pointee.parentSlot)
             guard parent >= 0, let h2 = table[parent].pointee.h2 else {
-                _ = pg_close(fd)
+                _ = av_close(fd)
                 closeConnection(slot)
                 return
             }
@@ -550,7 +550,7 @@ extension Worker {
         c.pointee.flags.insert(.responseStarted)
 
         if empty {
-            _ = pg_close(fd)
+            _ = av_close(fd)
             // Read before finishing: that retires the stream, and a retired
             // slot no longer knows which connection it belonged to.
             let owner = Int(c.pointee.parentSlot)
@@ -586,7 +586,7 @@ extension Worker {
         guard c.pointee.fileRemaining > 0, c.pointee.write.readableBytes == 0 else { return }
         let want = min(c.pointee.fileRemaining, config.readBufferSize)
         c.pointee.write.reserve(want)
-        let got = pg_read(c.pointee.fileFD, c.pointee.write.writePointer, want)
+        let got = av_read(c.pointee.fileFD, c.pointee.write.writePointer, want)
         if got <= 0 {
             // Truncated under us after a length was promised. Marking the
             // response complete with bytes still owed is what makes the

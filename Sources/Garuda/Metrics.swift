@@ -22,33 +22,33 @@
 // machine -- bounded work, once every scrape interval.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 public enum Metrics {
 
     /// Binds this thread to its slot of the shared page. Called once per
     /// worker before its loop starts.
-    public static func bind(slot: Int) { pg_metrics_bind(Int32(slot)) }
+    public static func bind(slot: Int) { av_metrics_bind(Int32(slot)) }
 
     @inlinable
-    public static var enabled: Bool { pg_metrics_enabled() != 0 }
+    public static var enabled: Bool { av_metrics_enabled() != 0 }
 
     /// Indices arrive from C as `Int`; the conversion is a no-op the
     /// optimiser removes.
     @inlinable
     public static func add(_ index: Int, _ n: UInt64 = 1) {
-        pg_metrics_add_local(Int32(index), n)
+        av_metrics_add_local(Int32(index), n)
     }
 
     @inlinable
     public static func set(_ index: Int, _ v: UInt64) {
-        pg_metrics_set_local(Int32(index), v)
+        av_metrics_set_local(Int32(index), v)
     }
 
     @inlinable
     public static func sum(_ index: Int) -> UInt64 {
-        pg_metrics_sum(Int32(index))
+        av_metrics_sum(Int32(index))
     }
 
     /// One finished request: its status class, and how long it took.
@@ -56,22 +56,22 @@ public enum Metrics {
     public static func requestFinished(status: Int, micros: Int) {
         let bucketed: Int
         switch status / 100 {
-        case 2: bucketed = PG_M_REQUESTS_2XX
-        case 3: bucketed = PG_M_REQUESTS_3XX
-        case 4: bucketed = PG_M_REQUESTS_4XX
-        case 5: bucketed = PG_M_REQUESTS_5XX
-        default: bucketed = PG_M_REQUESTS_1XX
+        case 2: bucketed = AV_M_REQUESTS_2XX
+        case 3: bucketed = AV_M_REQUESTS_3XX
+        case 4: bucketed = AV_M_REQUESTS_4XX
+        case 5: bucketed = AV_M_REQUESTS_5XX
+        default: bucketed = AV_M_REQUESTS_1XX
         }
         add(bucketed)
         if micros < 0 { return }
         let us = UInt64(micros)
-        add(PG_M_DURATION_COUNT)
-        add(PG_M_DURATION_SUM_US, us)
-        let bucket = pg_metrics_bucket(us)
+        add(AV_M_DURATION_COUNT)
+        add(AV_M_DURATION_SUM_US, us)
+        let bucket = av_metrics_bucket(us)
         // +Inf is not stored: it is the count, and storing it twice is one
         // more thing that can disagree with itself.
-        if Int(bucket) < PG_METRIC_BUCKETS {
-            add(PG_M_BUCKET0 + Int(bucket))
+        if Int(bucket) < AV_METRIC_BUCKETS {
+            add(AV_M_BUCKET0 + Int(bucket))
         }
     }
 
@@ -84,44 +84,44 @@ public enum Metrics {
     public static func render(into out: inout ByteBuffer) {
         counter(&out, "garuda_requests_total",
                 "Responses sent, by status class.",
-                labels: [("1xx", PG_M_REQUESTS_1XX), ("2xx", PG_M_REQUESTS_2XX),
-                         ("3xx", PG_M_REQUESTS_3XX), ("4xx", PG_M_REQUESTS_4XX),
-                         ("5xx", PG_M_REQUESTS_5XX)],
+                labels: [("1xx", AV_M_REQUESTS_1XX), ("2xx", AV_M_REQUESTS_2XX),
+                         ("3xx", AV_M_REQUESTS_3XX), ("4xx", AV_M_REQUESTS_4XX),
+                         ("5xx", AV_M_REQUESTS_5XX)],
                 label: "status")
 
         simple(&out, "garuda_connections_accepted_total", "counter",
-               "Connections accepted.", sum(PG_M_CONNECTIONS_ACCEPTED))
+               "Connections accepted.", sum(AV_M_CONNECTIONS_ACCEPTED))
         simple(&out, "garuda_connections_closed_total", "counter",
-               "Connections closed.", sum(PG_M_CONNECTIONS_CLOSED))
+               "Connections closed.", sum(AV_M_CONNECTIONS_CLOSED))
         simple(&out, "garuda_connections_rejected_total", "counter",
                "Connections refused for want of a slot or a descriptor.",
-               sum(PG_M_CONNECTIONS_REJECTED))
+               sum(AV_M_CONNECTIONS_REJECTED))
         simple(&out, "garuda_connections_active", "gauge",
-               "Connections open right now.", sum(PG_M_CONNECTIONS_ACTIVE))
+               "Connections open right now.", sum(AV_M_CONNECTIONS_ACTIVE))
         simple(&out, "garuda_connection_slots", "gauge",
                "Connection table capacity, summed over workers.",
-               sum(PG_M_SLOTS_CAPACITY))
+               sum(AV_M_SLOTS_CAPACITY))
         simple(&out, "garuda_buffer_pool_hits_total", "counter",
                "Read buffers taken from the pool's free list.",
-               sum(PG_M_POOL_HITS))
+               sum(AV_M_POOL_HITS))
         simple(&out, "garuda_buffer_pool_misses_total", "counter",
                "Read buffers that had to be allocated.",
-               sum(PG_M_POOL_MISSES))
+               sum(AV_M_POOL_MISSES))
         simple(&out, "garuda_requests_rate_limited_total", "counter",
-               "Requests refused with 429 by --rate-limit.", sum(PG_M_RATE_LIMITED))
-        if pg_cache_enabled() != 0 {
+               "Requests refused with 429 by --rate-limit.", sum(AV_M_RATE_LIMITED))
+        if av_cache_enabled() != 0 {
             simple(&out, "garuda_cache_hits_total", "counter",
-                   "Requests answered from the response cache.", sum(PG_M_CACHE_HITS))
+                   "Requests answered from the response cache.", sum(AV_M_CACHE_HITS))
             simple(&out, "garuda_cache_misses_total", "counter",
                    "Requests looked up in the response cache and not found.",
-                   sum(PG_M_CACHE_MISSES))
+                   sum(AV_M_CACHE_MISSES))
             simple(&out, "garuda_cache_stores_total", "counter",
-                   "Responses stored in the response cache.", sum(PG_M_CACHE_STORES))
+                   "Responses stored in the response cache.", sum(AV_M_CACHE_STORES))
         }
         // Half the slots: they come in pairs, one for a worker and one for the
         // replacement that overlaps it during a reload.
         simple(&out, "garuda_workers", "gauge",
-               "Workers sharing these counters.", UInt64(max(1, pg_metrics_slots() / 2)))
+               "Workers sharing these counters.", UInt64(max(1, av_metrics_slots() / 2)))
 
         histogram(&out)
     }
@@ -178,21 +178,21 @@ public enum Metrics {
 
         var cumulative: UInt64 = 0
         var i = 0
-        while i < PG_METRIC_BUCKETS {
-            cumulative &+= sum(PG_M_BUCKET0 + i)
+        while i < AV_METRIC_BUCKETS {
+            cumulative &+= sum(AV_M_BUCKET0 + i)
             out.write("garuda_request_duration_seconds_bucket{le=\"")
-            writeSeconds(&out, pg_metric_bucket_edge(Int32(i)))
+            writeSeconds(&out, av_metric_bucket_edge(Int32(i)))
             out.write("\"} ")
             out.writeDecimal(Int(cumulative))
             out.write("\n")
             i += 1
         }
-        let count = sum(PG_M_DURATION_COUNT)
+        let count = sum(AV_M_DURATION_COUNT)
         out.write("garuda_request_duration_seconds_bucket{le=\"+Inf\"} ")
         out.writeDecimal(Int(count))
         out.write("\n")
         out.write("garuda_request_duration_seconds_sum ")
-        writeSeconds(&out, sum(PG_M_DURATION_SUM_US))
+        writeSeconds(&out, sum(AV_M_DURATION_SUM_US))
         out.write("\n")
         out.write("garuda_request_duration_seconds_count ")
         out.writeDecimal(Int(count))

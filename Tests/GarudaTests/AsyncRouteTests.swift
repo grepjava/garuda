@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 private struct Person: Codable, Equatable {
@@ -152,18 +152,18 @@ private final class Socket {
     func close() {
         guard !closed else { return }
         closed = true
-        _ = pg_close(fd)
+        _ = av_close(fd)
     }
 
     func send(_ request: StaticString) {
-        _ = pg_write(fd, request.utf8Start, request.utf8CodeUnitCount)
+        _ = av_write(fd, request.utf8Start, request.utf8CodeUnitCount)
     }
 
     /// How many bytes have arrived so far, without waiting for any.
     @discardableResult
     func pending() -> Int {
         while got < capacity {
-            let n = pg_read(fd, buffer + got, capacity - got)
+            let n = av_read(fd, buffer + got, capacity - got)
             if n <= 0 { break }
             got += n
         }
@@ -191,7 +191,7 @@ extension TestClient {
         var request = [UInt8]("GET ".utf8)
         request += Array(path.utf8)
         request += Array(" HTTP/1.1\r\nHost: test\r\n\r\n".utf8)
-        _ = request.withUnsafeBufferPointer { pg_write(socket.fd, $0.baseAddress!, $0.count) }
+        _ = request.withUnsafeBufferPointer { av_write(socket.fd, $0.baseAddress!, $0.count) }
         while parked.isEmpty { turn() }
         // Closing the client's end is not enough: a worker does not drop a
         // connection whose handler still holds it, so the close is forced the

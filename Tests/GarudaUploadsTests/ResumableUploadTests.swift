@@ -4,9 +4,9 @@ import Glibc
 #elseif canImport(Darwin)
 import Darwin
 #endif
-import CGaruda
+import CAvian
 @testable import Garuda
-import GarudaHTTP
+import AvianHTTP
 @testable import GarudaUploads
 
 nonisolated(unsafe) private var completed: [(info: UploadInfo, bytes: [UInt8])] = []
@@ -315,15 +315,15 @@ struct ResumableUploadTests {
         let request = Array(head.utf8) + pattern(5, from: 10)
         _ = request.withUnsafeBufferPointer { write(socket, $0.baseAddress!, $0.count) }
         // Held for 100 ms, as a request on another worker finishing would.
-        let released = pg_monotonic_ms() + 100
+        let released = av_monotonic_ms() + 100
         var received: [UInt8] = []
         var chunk = [UInt8](repeating: 0, count: 4096)
         var answer: TestResponse? = nil
-        let deadline = pg_monotonic_ms() + 5000
-        while answer == nil && pg_monotonic_ms() < deadline {
-            if pg_monotonic_ms() >= released { busy.release() }
+        let deadline = av_monotonic_ms() + 5000
+        while answer == nil && av_monotonic_ms() < deadline {
+            if av_monotonic_ms() >= released { busy.release() }
             client.turn()
-            let n = chunk.withUnsafeMutableBufferPointer { pg_read(socket, $0.baseAddress!, $0.count) }
+            let n = chunk.withUnsafeMutableBufferPointer { av_read(socket, $0.baseAddress!, $0.count) }
             if n > 0 { received += chunk[0..<n] }
             answer = try TestResponse.parse(received, bodyless: false, closed: false)
         }

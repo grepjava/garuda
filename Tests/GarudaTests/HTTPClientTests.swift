@@ -1,7 +1,7 @@
 import Testing
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 @testable import Garuda
 
 // Tests for one HTTP/1.1 exchange over a connection the worker made.
@@ -46,17 +46,17 @@ private final class FakeOrigin {
     private var served = 0
 
     init?() {
-        let opened = "127.0.0.1".withCString { pg_listen_tcp($0, 0, 16, 0, 0) }
+        let opened = "127.0.0.1".withCString { av_listen_tcp($0, 0, 16, 0, 0) }
         guard opened >= 0 else { return nil }
-        let got = pg_local_port(opened)
-        guard got != 0 else { _ = pg_close(opened); return nil }
+        let got = av_local_port(opened)
+        guard got != 0 else { _ = av_close(opened); return nil }
         fd = opened
         port = got
     }
 
     deinit {
-        for peer in open { _ = pg_close(peer) }
-        _ = pg_close(fd)
+        for peer in open { _ = av_close(peer) }
+        _ = av_close(fd)
     }
 
     var url: String { "http://127.0.0.1:\(port)" }
@@ -70,17 +70,17 @@ private final class FakeOrigin {
         pending.removeAll()
         for (peer, rest) in owed {
             _ = rest.withUnsafeBytes { raw in
-                pg_write(peer, raw.baseAddress, raw.count)
+                av_write(peer, raw.baseAddress, raw.count)
             }
             if closeAfterResponse {
-                _ = pg_close(peer)
+                _ = av_close(peer)
                 open.removeAll { $0 == peer }
             }
         }
 
         var address = [CChar](repeating: 0, count: 64)
         var peerPort: UInt16 = 0
-        let peer = pg_accept(fd, &address, 64, &peerPort)
+        let peer = av_accept(fd, &address, 64, &peerPort)
         if peer >= 0 {
             open.append(peer)
             accepted += 1
@@ -89,7 +89,7 @@ private final class FakeOrigin {
         for peer in open {
             var buffer = [UInt8](repeating: 0, count: 65536)
             let got = buffer.withUnsafeMutableBytes { raw in
-                pg_read(peer, raw.baseAddress, raw.count)
+                av_read(peer, raw.baseAddress, raw.count)
             }
             guard got > 0 else { continue }
             received.append(String(decoding: buffer.prefix(got), as: UTF8.self))
@@ -99,15 +99,15 @@ private final class FakeOrigin {
             if splitAfter > 0, splitAfter < payload.count {
                 let first = Array(payload.prefix(splitAfter))
                 _ = first.withUnsafeBytes { raw in
-                    pg_write(peer, raw.baseAddress, raw.count)
+                    av_write(peer, raw.baseAddress, raw.count)
                 }
                 pending.append((peer, Array(payload.dropFirst(splitAfter))))
             } else {
                 _ = payload.withUnsafeBytes { raw in
-                    pg_write(peer, raw.baseAddress, raw.count)
+                    av_write(peer, raw.baseAddress, raw.count)
                 }
                 if closeAfterResponse {
-                    _ = pg_close(peer)
+                    _ = av_close(peer)
                     open.removeAll { $0 == peer }
                 }
             }
@@ -462,7 +462,7 @@ struct HTTPClientTests {
         wire.send("GET /fetch HTTP/1.1\r\nHost: test\r\n\r\n")
         _ = wire.turn(until: { origin.pump(); return !outcome.isEmpty }, turns: 20_000)
         _ = wire.receive()
-        #expect(outcome == "url(GarudaHTTP.HTTPURLError.scheme)")
+        #expect(outcome == "url(AvianHTTP.HTTPURLError.scheme)")
         #expect(origin.accepted == 0)
     }
 

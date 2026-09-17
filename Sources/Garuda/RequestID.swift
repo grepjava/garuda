@@ -24,9 +24,9 @@
 // workers the keys differ. That costs no system call per request.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 enum RequestID {
     /// The longest ID accepted from a proxy. Enough for any UUID, ULID or
@@ -84,12 +84,12 @@ extension Worker {
 
         if requestIDKey == (0, 0) {
             withUnsafeMutableBytes(of: &requestIDKey) { raw in
-                _ = pg_random_bytes(raw.baseAddress!, raw.count)
+                _ = av_random_bytes(raw.baseAddress!, raw.count)
             }
             // A failed read of the random source leaves a key of zero, which
             // is still unique within this worker; only across workers would it
-            // repeat, and pg_random_bytes does not fail where getrandom exists.
-            if requestIDKey == (0, 0) { requestIDKey = (UInt64(pg_getpid()), pg_realtime_us()) }
+            // repeat, and av_random_bytes does not fail where getrandom exists.
+            if requestIDKey == (0, 0) { requestIDKey = (UInt64(av_getpid()), av_realtime_us()) }
         }
         requestIDCount &+= 1
         var high = RequestID.mix(requestIDKey.0 &+ requestIDCount)

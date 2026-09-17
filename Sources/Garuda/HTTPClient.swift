@@ -26,9 +26,9 @@
 //     shared by every request to the same origin (HTTP2Client.swift).
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// Why an exchange did not finish.
 public enum ClientError: Error, Equatable {

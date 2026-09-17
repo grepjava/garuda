@@ -16,9 +16,9 @@ import Glibc
 import Darwin
 #endif
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 public final class Application {
     var routes = Routes()

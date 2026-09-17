@@ -7,8 +7,8 @@
 // progress, writing what it says to write.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 import GarudaPostgres
 
 /// Where a PostgreSQL server is and how to reach it.

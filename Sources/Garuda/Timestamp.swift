@@ -14,8 +14,8 @@
 // clock taken as UTC, which is the same instant only when TimeZone is UTC.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 import GarudaPostgres
 
 public struct Timestamp: Hashable, Comparable, Sendable {
@@ -31,7 +31,7 @@ public struct Timestamp: Hashable, Comparable, Sendable {
 
     /// The system's wall clock, now.
     public static var now: Timestamp {
-        Timestamp(microsecondsSinceEpoch: Int64(pg_realtime_us()))
+        Timestamp(microsecondsSinceEpoch: Int64(av_realtime_us()))
     }
 
     /// From ISO 8601 or RFC 3339 text -- `2026-09-16T20:53:43.196Z`, any UTC

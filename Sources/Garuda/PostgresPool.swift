@@ -16,8 +16,8 @@
 // rather than being handed one, so a handler never holds an engine pointer.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 import GarudaPostgres
 
 // MARK: - Values

@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 #if canImport(Glibc)
@@ -239,9 +239,9 @@ private final class Peer {
     /// both selections, since a peer with no protocol in common is not an
     /// error, only an agreement to speak HTTP/1.1.
     init?(alpn: String? = nil) {
-        let opened = socketPath.withCString { pg_listen_unix($0, 16, 1) }
+        let opened = socketPath.withCString { av_listen_unix($0, 16, 1) }
         guard opened >= 0 else { return nil }
-        _ = pg_set_nonblock(opened)
+        _ = av_set_nonblock(opened)
         var made = [CChar](repeating: 0, count: 256)
         let context: OpaquePointer? = certPath.withCString { cert in
             keyPath.withCString { key in
@@ -250,16 +250,16 @@ private final class Peer {
                     // installs a selection callback when the list is
                     // non-empty, and those are two different servers to be.
                     guard let alpn else {
-                        return pg_tls_ctx_new(cert, key, nil, nil, error.baseAddress, 256)
+                        return av_tls_ctx_new(cert, key, nil, nil, error.baseAddress, 256)
                     }
                     return alpn.withCString { protocols in
-                        pg_tls_ctx_new(cert, key, protocols, nil, error.baseAddress, 256)
+                        av_tls_ctx_new(cert, key, protocols, nil, error.baseAddress, 256)
                     }
                 }
             }
         }
         guard let context else {
-            _ = pg_close(opened)
+            _ = av_close(opened)
             return nil
         }
         listener = opened
@@ -267,21 +267,21 @@ private final class Peer {
     }
 
     deinit {
-        for session in sessions { pg_tls_free(session) }
-        for fd in fds { _ = pg_close(fd) }
-        pg_tls_ctx_free(ctx)
-        _ = pg_close(listener)
-        _ = socketPath.withCString { pg_unlink($0) }
+        for session in sessions { av_tls_free(session) }
+        for fd in fds { _ = av_close(fd) }
+        av_tls_ctx_free(ctx)
+        _ = av_close(listener)
+        _ = socketPath.withCString { av_unlink($0) }
     }
 
     /// Takes anything waiting to be accepted and gives it a session.
     func accept() {
         var address = [CChar](repeating: 0, count: 64)
         var port: UInt16 = 0
-        let fd = pg_accept(listener, &address, 64, &port)
+        let fd = av_accept(listener, &address, 64, &port)
         guard fd >= 0 else { return }
         fds.append(fd)
-        guard let session = pg_tls_new(ctx, fd) else { return }
+        guard let session = av_tls_new(ctx, fd) else { return }
         sessions.append(session)
         settled.append(false)
         shook.append(false)
@@ -292,7 +292,7 @@ private final class Peer {
     func pump() {
         for i in sessions.indices where !settled[i] {
             let step = error.withUnsafeMutableBufferPointer {
-                pg_tls_handshake(sessions[i], $0.baseAddress, 256)
+                av_tls_handshake(sessions[i], $0.baseAddress, 256)
             }
             if step == 1 {
                 settled[i] = true
@@ -499,12 +499,12 @@ struct OutboundTLSTests {
         let client = outboundTLSApp().test
         let text = try exchange(client, peer, "/tls-echo") { session in
             var buffer = [UInt8](repeating: 0, count: 64)
-            let n = buffer.withUnsafeMutableBytes { pg_tls_read(session, $0.baseAddress, $0.count) }
+            let n = buffer.withUnsafeMutableBytes { av_tls_read(session, $0.baseAddress, $0.count) }
             guard n > 0 else { return false }
             var sent = 0
             while sent < n {
                 let wrote = buffer.withUnsafeBytes {
-                    pg_tls_write(session, $0.baseAddress! + sent, n - sent)
+                    av_tls_write(session, $0.baseAddress! + sent, n - sent)
                 }
                 if wrote <= 0 { break }
                 sent += wrote

@@ -17,9 +17,9 @@
 // else is parsed pays nothing.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 /// Which request the worker's header table was last filled for.
 struct HeaderTableOwner {

@@ -1,5 +1,5 @@
 import Testing
-import CGaruda
+import CAvian
 @testable import Garuda
 
 #if canImport(Glibc)
@@ -160,7 +160,7 @@ struct ResolverConfigTests {
         search one.internal two.internal
         options ndots:2
         """, to: path))
-        defer { _ = path.withCString { pg_unlink($0) } }
+        defer { _ = path.withCString { av_unlink($0) } }
 
         let config = ResolverConfig.read(path: path)
         #expect(config.nameservers == ["10.1.2.3"])
@@ -181,7 +181,7 @@ struct ResolverConfigTests {
     @Test func aFileNamingNoNameserverStillGetsOne() {
         let path = "/tmp/garuda-resolv-empty.conf"
         #expect(writeText("search only.internal\n", to: path))
-        defer { _ = path.withCString { pg_unlink($0) } }
+        defer { _ = path.withCString { av_unlink($0) } }
 
         let config = ResolverConfig.read(path: path)
         #expect(config.nameservers == ["127.0.0.1"])
@@ -190,7 +190,7 @@ struct ResolverConfigTests {
 
     /// A system file swapped for a fifo must be refused outright.
     ///
-    /// Asserted against `pg_open_read` rather than through `read(path:)`,
+    /// Asserted against `av_open_read` rather than through `read(path:)`,
     /// because every way of failing comes back from there as the same
     /// fallback: mutation testing showed this test passing with the
     /// regular-file check deleted, since a fifo opened non-blocking simply
@@ -199,24 +199,24 @@ struct ResolverConfigTests {
     /// in it.
     @Test func aFifoIsRefusedRatherThanRead() {
         let path = "/tmp/garuda-resolv-fifo"
-        _ = path.withCString { pg_unlink($0) }
+        _ = path.withCString { av_unlink($0) }
         #expect(path.withCString { mkfifo($0, 0o644) } == 0)
-        defer { _ = path.withCString { pg_unlink($0) } }
+        defer { _ = path.withCString { av_unlink($0) } }
 
-        #expect(path.withCString { pg_open_read($0) } == -1)
+        #expect(path.withCString { av_open_read($0) } == -1)
         // And a regular file at the same path does open, so the refusal above
         // is about what the file is and not about the path or the test.
-        _ = path.withCString { pg_unlink($0) }
+        _ = path.withCString { av_unlink($0) }
         #expect(writeText("nameserver 10.9.9.9\n", to: path))
-        let fd = path.withCString { pg_open_read($0) }
+        let fd = path.withCString { av_open_read($0) }
         #expect(fd >= 0)
-        if fd >= 0 { _ = pg_close(fd) }
+        if fd >= 0 { _ = av_close(fd) }
         #expect(ResolverConfig.read(path: path).nameservers == ["10.9.9.9"])
     }
 
     /// A directory is the other thing a path can turn into, and read(2) on one
     /// fails with EISDIR rather than returning bytes.
     @Test func aDirectoryIsRefused() {
-        #expect("/tmp".withCString { pg_open_read($0) } == -1)
+        #expect("/tmp".withCString { av_open_read($0) } == -1)
     }
 }

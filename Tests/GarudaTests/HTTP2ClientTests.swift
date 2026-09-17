@@ -1,7 +1,7 @@
 import Testing
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 @testable import Garuda
 
 // Tests for HTTP/2 over connections the worker made.
@@ -75,7 +75,7 @@ private final class OriginPeer {
 
     deinit {
         decoder.destroy()
-        if !closed { _ = pg_close(fd) }
+        if !closed { _ = av_close(fd) }
     }
 }
 
@@ -135,17 +135,17 @@ private final class FakeH2Origin {
     var peerMaxFrameSize: UInt32 = 16384
 
     init?() {
-        let opened = "127.0.0.1".withCString { pg_listen_tcp($0, 0, 16, 0, 0) }
+        let opened = "127.0.0.1".withCString { av_listen_tcp($0, 0, 16, 0, 0) }
         guard opened >= 0 else { return nil }
-        let got = pg_local_port(opened)
-        guard got != 0 else { _ = pg_close(opened); return nil }
+        let got = av_local_port(opened)
+        guard got != 0 else { _ = av_close(opened); return nil }
         fd = opened
         port = got
     }
 
     deinit {
         peers.removeAll()
-        _ = pg_close(fd)
+        _ = av_close(fd)
     }
 
     var url: String { "http://127.0.0.1:\(port)" }
@@ -158,12 +158,12 @@ private final class FakeH2Origin {
         // connection per pump.
         for peer in peers where !peer.closed && !peer.pending.isEmpty {
             let next = peer.pending.removeFirst()
-            _ = next.withUnsafeBytes { pg_write(peer.fd, $0.baseAddress, $0.count) }
+            _ = next.withUnsafeBytes { av_write(peer.fd, $0.baseAddress, $0.count) }
         }
 
         var address = [CChar](repeating: 0, count: 64)
         var peerPort: UInt16 = 0
-        let accepted = pg_accept(fd, &address, 64, &peerPort)
+        let accepted = av_accept(fd, &address, 64, &peerPort)
         if accepted >= 0 {
             let peer = OriginPeer(accepted)
             peers.append(peer)
@@ -178,7 +178,7 @@ private final class FakeH2Origin {
                     payload.append(contentsOf: u32(value))
                 }
                 let frame = rawFrame(type: .settings, stream: 0, payload: payload)
-                _ = frame.withUnsafeBytes { pg_write(peer.fd, $0.baseAddress, $0.count) }
+                _ = frame.withUnsafeBytes { av_write(peer.fd, $0.baseAddress, $0.count) }
             }
         }
 
@@ -186,7 +186,7 @@ private final class FakeH2Origin {
             let peer = peers[index]
             var buffer = [UInt8](repeating: 0, count: 65536)
             let got = buffer.withUnsafeMutableBytes { raw in
-                pg_read(peer.fd, raw.baseAddress, raw.count)
+                av_read(peer.fd, raw.baseAddress, raw.count)
             }
             if got > 0 { peer.inbox.append(contentsOf: buffer.prefix(got)) }
             consume(index)
@@ -324,11 +324,11 @@ private final class FakeH2Origin {
     func closePeer(_ index: Int) {
         guard index < peers.count, !peers[index].closed else { return }
         peers[index].closed = true
-        _ = pg_close(peers[index].fd)
+        _ = av_close(peers[index].fd)
     }
 
     private func write(_ peer: OriginPeer, _ bytes: [UInt8]) {
-        _ = bytes.withUnsafeBytes { pg_write(peer.fd, $0.baseAddress, $0.count) }
+        _ = bytes.withUnsafeBytes { av_write(peer.fd, $0.baseAddress, $0.count) }
     }
 
     /// The field the most recent request carried.
@@ -1141,12 +1141,12 @@ struct HTTP2ClientTests {
         let wires = try start(client, routes)
         #expect(turn(client, origin) { origin.held.count == 2 })
 
-        let began = pg_monotonic_ms()
-        while outcomes["a"] == nil && pg_monotonic_ms() &- began < 4_000 {
+        let began = av_monotonic_ms()
+        while outcomes["a"] == nil && av_monotonic_ms() &- began < 4_000 {
             origin.pump()
             client.turn()
         }
-        let waited = pg_monotonic_ms() &- began
+        let waited = av_monotonic_ms() &- began
         #expect(outcomes["a"] == "timedOut")
         #expect(waited < 4_000, "the impatient request waited \(waited) ms for a 300 ms limit")
         #expect(outcomes["b"] == nil, "the patient request should still be waiting")

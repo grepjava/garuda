@@ -9,8 +9,8 @@
 // No Task, no work-stealing. One worker thread owns every op for its life.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 public enum ContState: UInt8 {
     case none
@@ -50,7 +50,7 @@ public struct AsyncOp {
     public var slot: Int32 = -1
     public var requestId: UInt32 = 0
     public var kind: OpKind = .timer
-    /// `pg_monotonic_us`. Not the coarse millisecond clock: a deadline taken
+    /// `av_monotonic_us`. Not the coarse millisecond clock: a deadline taken
     /// from a reading up to a tick stale can expire up to a tick early.
     public var deadlineUs: UInt64 = 0
     public var cancelled = false
@@ -396,7 +396,7 @@ extension Worker {
         let c = table[slot]
         // The clock reads truncated microseconds; one more keeps the deadline
         // from landing before the full duration.
-        let deadline = pg_monotonic_us() &+ 1 &+ max(1, ms) &* 1000
+        let deadline = av_monotonic_us() &+ 1 &+ max(1, ms) &* 1000
         guard let (index, generation) = asyncOps.allocate(
             slot: slot, requestId: c.pointee.requestId, kind: .timer,
             deadlineUs: deadline) else {
@@ -424,7 +424,7 @@ extension Worker {
     mutating func armDeadline(_ slot: Int, ms: UInt64) {
         disarmDeadline(slot)
         let c = table[slot]
-        let deadline = pg_monotonic_us() &+ 1 &+ max(1, ms) &* 1000
+        let deadline = av_monotonic_us() &+ 1 &+ max(1, ms) &* 1000
         guard let (index, generation) = asyncOps.allocate(
             slot: slot, requestId: c.pointee.requestId, kind: .deadline,
             deadlineUs: deadline) else {
@@ -455,7 +455,7 @@ extension Worker {
     }
 
     mutating func fireDueTimers() {
-        let now = pg_monotonic_us()
+        let now = av_monotonic_us()
         while let entry = timerHeap.popDue(nowUs: now, from: &asyncOps) {
             completeTimerOp(index: Int(entry.opIndex), generation: entry.opGeneration)
         }

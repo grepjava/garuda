@@ -13,7 +13,7 @@
 // the work here, along with a cap on how many parts one body may have.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// One part of a multipart body.
 public struct MultipartPart: Equatable, Sendable {

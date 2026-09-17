@@ -6,9 +6,9 @@
 // strings.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 public struct ServerConfig {
     // --- listening ---
@@ -26,7 +26,7 @@ public struct ServerConfig {
     public var workers = 1
     /// `workers` with 0 resolved to the CPU count, which is what every part of
     /// start-up actually wants.
-    public var resolvedWorkers: Int { workers > 0 ? workers : Int(pg_cpu_count()) }
+    public var resolvedWorkers: Int { workers > 0 ? workers : Int(av_cpu_count()) }
     public var maxConnections = 4096
 
     // --- limits ---
@@ -193,7 +193,7 @@ public struct ServerConfig {
     // --- rate limiting ---
     /// Requests each client may make per `rateLimitPeriodMs`, or 0 for no
     /// limit. Counted across every worker, not per worker; see
-    /// garuda_ratelimit.h.
+    /// avian_ratelimit.h.
     public var rateLimitCount = 0
     public var rateLimitPeriodMs: UInt64 = 1000
     /// Requests a client may make at once before the rate applies. 0 means

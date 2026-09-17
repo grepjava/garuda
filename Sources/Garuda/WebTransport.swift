@@ -34,10 +34,10 @@
 // against aioquic.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
-import GarudaQUIC
+import CAvian
+import AvianCore
+import AvianHTTP
+import AvianQUIC
 
 /// One stream belonging to a session.
 final class WTStream {

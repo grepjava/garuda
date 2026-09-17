@@ -13,7 +13,7 @@
 // of extractors returning a response, so the two never compete.
 //===----------------------------------------------------------------------===//
 
-import GarudaHTTP
+import AvianHTTP
 
 extension Application {
     /// Registers a typed handler for `method` and `pattern`.

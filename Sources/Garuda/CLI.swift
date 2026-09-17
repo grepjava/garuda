@@ -12,8 +12,8 @@ import Glibc
 import Darwin
 #endif
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 public enum GarudaCLI {
 
@@ -167,7 +167,7 @@ public enum GarudaCLI {
                         --forwarded-allow-ips 10.0.0.0/8
 
             """
-            _ = pg_write(1, usage.utf8Start, usage.utf8CodeUnitCount)
+            _ = av_write(1, usage.utf8Start, usage.utf8CodeUnitCount)
         }
 
         let version: StaticString = "garuda 0.1.0-dev"
@@ -182,7 +182,7 @@ public enum GarudaCLI {
             n = take
             buf[n] = 10
             n += 1
-            buf.withUnsafeBufferPointer { _ = pg_write(1, $0.baseAddress!, n) }
+            buf.withUnsafeBufferPointer { _ = av_write(1, $0.baseAddress!, n) }
         }
 
         var config = ServerConfig()

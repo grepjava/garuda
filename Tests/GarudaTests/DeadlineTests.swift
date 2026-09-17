@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 /// Where `/park` waits, so a test can wake it after its deadline has passed.
@@ -82,19 +82,19 @@ private final class Wire {
     func close() {
         guard !closed else { return }
         closed = true
-        _ = pg_close(fd)
+        _ = av_close(fd)
     }
 
     func send(_ request: String) {
         var request = request
-        request.withUTF8 { _ = pg_write(fd, $0.baseAddress!, $0.count) }
+        request.withUTF8 { _ = av_write(fd, $0.baseAddress!, $0.count) }
     }
 
     /// Bytes waiting now, without turning the worker.
     @discardableResult
     func pending() -> Int {
         while got < capacity {
-            let n = pg_read(fd, buffer + got, capacity - got)
+            let n = av_read(fd, buffer + got, capacity - got)
             if n <= 0 { break }
             got += n
         }

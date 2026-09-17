@@ -1,5 +1,5 @@
 import Testing
-import GarudaCore
+import AvianCore
 import GarudaPostgres
 @testable import Garuda
 

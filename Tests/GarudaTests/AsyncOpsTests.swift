@@ -1,5 +1,5 @@
 import Testing
-import GarudaCore
+import AvianCore
 @testable import Garuda
 
 /// A worker with no listener, driven by hand. Continuations are parked with

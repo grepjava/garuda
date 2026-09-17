@@ -14,7 +14,7 @@
 // An object captured before the fork is copied into each worker, not shared.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// A service the worker built at start-up, asked for by its type.
 public struct State<Value>: RequestExtractor {

@@ -30,8 +30,8 @@ import Glibc
 import Darwin
 #endif
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 final class ReloadWatcher {
     enum Change {
@@ -72,7 +72,7 @@ final class ReloadWatcher {
     init(config: ServerConfig) {
         var buffer = [CChar](repeating: 0, count: 4096)
         let found = buffer.withUnsafeMutableBufferPointer {
-            pg_executable_path($0.baseAddress!, $0.count) == 0
+            av_executable_path($0.baseAddress!, $0.count) == 0
         }
         executablePath = found
             ? buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
@@ -92,22 +92,22 @@ final class ReloadWatcher {
         self.certificates = certificates
         intervalMs = max(100, config.reloadIntervalMs)
 
-        notifyFD = pg_watch_open()
+        notifyFD = av_watch_open()
         if notifyFD >= 0 {
             var directories: [String] = []
             for path in (executablePath.map { [$0] } ?? []) + certificates {
                 let directory = ReloadWatcher.directory(of: path)
                 if !directories.contains(directory) { directories.append(directory) }
             }
-            for directory in directories { _ = pg_watch_add(notifyFD, directory) }
+            for directory in directories { _ = av_watch_add(notifyFD, directory) }
         }
 
         (executableSignature, certificateSignature) = scan()
-        lastScan = pg_monotonic_ms()
+        lastScan = av_monotonic_ms()
     }
 
     deinit {
-        if notifyFD >= 0 { pg_watch_close(notifyFD) }
+        if notifyFD >= 0 { av_watch_close(notifyFD) }
     }
 
     /// Whether the supervisor should come back in milliseconds rather than a
@@ -118,8 +118,8 @@ final class ReloadWatcher {
     /// What changed since the last call. Cheap when nothing is due, so the
     /// supervisor calls it on every loop turn.
     func poll() -> Change {
-        let now = pg_monotonic_ms()
-        if notifyFD >= 0 && pg_watch_drain(notifyFD) > 0 {
+        let now = av_monotonic_ms()
+        if notifyFD >= 0 && av_watch_drain(notifyFD) > 0 {
             // Every event restarts the wait: a build still writing is not yet
             // the change to act on.
             notifiedAt = now
@@ -157,10 +157,10 @@ final class ReloadWatcher {
     }
 
     private func scan() -> (executable: UInt64, certificates: UInt64) {
-        let executable = executablePath.map { pg_file_signature($0, 1) } ?? 0
+        let executable = executablePath.map { av_file_signature($0, 1) } ?? 0
         var digest: UInt64 = 0
         for path in certificates {
-            digest = digest &* 31 &+ pg_file_signature(path, 0)
+            digest = digest &* 31 &+ av_file_signature(path, 0)
         }
         return (executable, digest)
     }

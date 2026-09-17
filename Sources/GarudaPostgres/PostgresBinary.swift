@@ -9,7 +9,7 @@
 // as text -- which the tests hold it to, against a real server.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 public enum PostgresBinary {
 

@@ -8,7 +8,7 @@
 // so the socket layer only ever moves bytes.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// Why a session could not start, or a query did not complete.
 public enum PostgresError: Error, Equatable, Sendable {

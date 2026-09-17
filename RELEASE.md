@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 796 unit tests
+swift test                             # 512 unit tests
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -34,7 +34,6 @@ bash scripts/request-id-test.sh        # 12
 bash scripts/trace-context-test.sh     # 17
 bash scripts/drain-test.sh             # 14
 bash scripts/reload-test.sh            # 7
-bash scripts/cache-unit-test.sh
 python3 scripts/feature-test.py        # 62
 python3 scripts/http2-test.py          # 50
 python3 scripts/http3-test.py          # 53
@@ -239,6 +238,14 @@ The Python suites need `h2` and `aioquic`.
 - `--request-start-header` is read by handlers as `request.requestStart`, and
   `--scheme` is the scheme `request.scheme` falls back to.
 - No target sets unsafe build flags, so Garuda can be depended on by version.
+- The protocol and systems layers moved to
+  [aviancore](https://github.com/grepjava/aviancore), a package of their own:
+  `CAvian`, `AvianCore`, `AvianHTTP` and `AvianQUIC`, in place of `CGaruda`,
+  `GarudaCore`, `GarudaHTTP` and `GarudaQUIC`. Code that imported those modules
+  imports the Avian ones, and the C functions are named `av_` instead of `pg_`.
+  Their unit tests run in aviancore.
+- `GARUDA_UDP_GSO` and `GARUDA_NO_OPENAT2` are now `AVIAN_UDP_GSO` and
+  `AVIAN_NO_OPENAT2`.
 
 ### Fixed
 

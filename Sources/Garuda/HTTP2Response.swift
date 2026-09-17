@@ -12,9 +12,9 @@
 // control and the write high water mark apply to them.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 extension Worker {
 

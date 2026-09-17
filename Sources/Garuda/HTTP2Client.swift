@@ -51,9 +51,9 @@
 // lock could reach the wire after a larger one and be illegal on arrival.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 // MARK: - State
 
@@ -151,7 +151,7 @@ final class H2Shared {
     init(key: OutboundKey, socket: OutboundSocket) {
         self.key = key
         self.socket = socket
-        idleSince = pg_monotonic_ms()
+        idleSince = av_monotonic_ms()
     }
 
     deinit {
@@ -409,7 +409,7 @@ extension HTTPClient {
     func exchangeShared(_ shared: H2Shared, block: [UInt8], method: HTTPMethod,
                         body: [UInt8]) async throws(ClientError) -> ClientResponse {
         let stream = H2Stream(method: method, recvWindow: shared.conn.initialWindowSize,
-                              deadline: pg_monotonic_ms() &+ timeoutMilliseconds)
+                              deadline: av_monotonic_ms() &+ timeoutMilliseconds)
         do {
             try await openStream(shared, stream, block: block, endStream: body.isEmpty)
             if !body.isEmpty { try await sendBody(shared, stream, body) }
@@ -511,7 +511,7 @@ extension HTTPClient {
             }
             await unlock(shared, stream)
             sent += n
-            stream.deadline = pg_monotonic_ms() &+ timeoutMilliseconds
+            stream.deadline = av_monotonic_ms() &+ timeoutMilliseconds
         }
     }
 
@@ -545,7 +545,7 @@ extension HTTPClient {
     /// still where requests go, and closed otherwise.
     private func settleIfEmpty(_ shared: H2Shared) {
         guard shared.streams.isEmpty else { return }
-        shared.idleSince = pg_monotonic_ms()
+        shared.idleSince = av_monotonic_ms()
         let registered = worker.pointee.outboundH2[shared.key] === shared
         if !registered || shared.dead != nil || shared.goaway {
             retire(shared, shared.dead ?? .closed)
@@ -641,7 +641,7 @@ extension HTTPClient {
         while !ready() {
             if let dead = shared.dead { throw dead }
             if let error = stream.error { throw error }
-            if pg_monotonic_ms() >= stream.deadline { throw .timedOut }
+            if av_monotonic_ms() >= stream.deadline { throw .timedOut }
             if shared.readerActive {
                 await withUnsafeContinuation { stream.waiter = $0 }
                 continue
@@ -660,7 +660,7 @@ extension HTTPClient {
                 try await lock(shared)
                 await unlock(shared, stream)
             }
-            let now = pg_monotonic_ms()
+            let now = av_monotonic_ms()
             for other in shared.streams.values where other !== stream && now >= other.deadline {
                 shared.wake(other)
             }
@@ -681,7 +681,7 @@ extension HTTPClient {
             if shared.blockedWriter != nil { mask.insert(.write) }
             // Woken at the earliest deadline of any stream, so a parked request
             // that has run out of time is told even while nothing arrives.
-            let now = pg_monotonic_ms()
+            let now = av_monotonic_ms()
             var earliest = UInt64.max
             for s in shared.streams.values { earliest = min(earliest, s.deadline) }
             let wait = earliest == .max ? timeoutMilliseconds
@@ -764,7 +764,7 @@ extension HTTPClient {
     private func dispatch(_ shared: H2Shared, _ header: H2FrameHeader,
                           _ payload: UnsafePointer<UInt8>) -> ClientError? {
         let conn = shared.conn
-        let now = pg_monotonic_ms()
+        let now = av_monotonic_ms()
 
         // A header block may not be interleaved with anything, and a peer
         // that does it has left a block of unknown provenance half assembled.

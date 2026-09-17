@@ -17,8 +17,8 @@
 // pool. Every resume keeps its (slot, generation, request id) check.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 /// An async handler over the raw request. It reads what it needs from the
 /// request before its first `await`: the request is a view of a connection
@@ -60,7 +60,7 @@ final class WorkerExecutor: TaskExecutor, @unchecked Sendable {
     }
 
     func enqueue(_ job: consuming ExecutorJob) {
-        precondition(pg_worker_current() == worker,
+        precondition(av_worker_current() == worker,
                      "a handler task was resumed off its worker's thread")
         if count == capacity { grow() }
         (jobs + ((head &+ count) & (capacity &- 1))).initialize(to: UnownedJob(job))

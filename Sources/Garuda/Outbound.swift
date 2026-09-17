@@ -17,8 +17,8 @@
 // and naming is a layer above.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 /// Why an outbound connection did not come up, or did not stay up.
 public enum OutboundError: Error, Equatable {
@@ -193,7 +193,7 @@ extension Worker {
     mutating func beginConnect(host: String, port: UInt16,
                                tls: String = "") -> Result<Int, OutboundError> {
         var inProgress: Int32 = 0
-        let fd = host.withCString { pg_connect_tcp($0, port, &inProgress) }
+        let fd = host.withCString { av_connect_tcp($0, port, &inProgress) }
         return finishBegin(fd: fd, inProgress: inProgress != 0,
                            key: OutboundKey(host: host, port: port, tls: tls))
     }
@@ -205,7 +205,7 @@ extension Worker {
     /// the pool: `tls` carries a marker no TCP caller can spell, so even a
     /// caller asking for the same address and port cannot be handed this.
     mutating func beginConnect(udp host: String, port: UInt16) -> Result<Int, OutboundError> {
-        let fd = host.withCString { pg_connect_udp($0, port) }
+        let fd = host.withCString { av_connect_udp($0, port) }
         // connect(2) on a datagram socket only records the peer, so there is
         // no in-progress state and the record is open on return.
         return finishBegin(fd: fd, inProgress: false,
@@ -215,7 +215,7 @@ extension Worker {
     /// The same for a unix socket.
     mutating func beginConnect(path: String, tls: String = "") -> Result<Int, OutboundError> {
         var inProgress: Int32 = 0
-        let fd = path.withCString { pg_connect_unix($0, &inProgress) }
+        let fd = path.withCString { av_connect_unix($0, &inProgress) }
         return finishBegin(fd: fd, inProgress: inProgress != 0,
                            key: OutboundKey(host: path, port: 0, tls: tls))
     }
@@ -226,12 +226,12 @@ extension Worker {
             // EINVAL is the numeric-host parse refusing a name; anything else
             // is a socket that could not be made or a connection refused
             // outright, which loopback does synchronously.
-            let err = pg_errno()
+            let err = av_errno()
             return .failure(err == EINVAL ? .address : .failed(err))
         }
         let index = outboundTableOrMake()
         guard index >= 0 else {
-            _ = pg_close(fd)
+            _ = av_close(fd)
             return .failure(.exhausted)
         }
         outboundOpened &+= 1
@@ -245,11 +245,11 @@ extension Worker {
         o.pointee.state = inProgress ? .connecting : .open
         if inProgress {
             // Writability is how a non-blocking connect reports either
-            // outcome; `pg_connect_error` then says which it was.
+            // outcome; `av_connect_error` then says which it was.
             let token = PollToken.outbound(index: index, generation: o.pointee.generation)
             guard poller.add(fd, .write, token: token) else {
                 closeOutbound(index)
-                return .failure(.failed(pg_errno()))
+                return .failure(.failed(av_errno()))
             }
             o.pointee.registered = true
             o.pointee.interest = PollMask.write.rawValue
@@ -295,10 +295,10 @@ extension Worker {
             // which is the common case here and which testing `> 0` let
             // straight through -- the guard read as working while the event
             // path quietly did all of the catching.
-            if pg_poll_single(o.pointee.fd, 0, 0) != 0 {
+            if av_poll_single(o.pointee.fd, 0, 0) != 0 {
                 // On an encrypted connection what arrived may be nothing but a
                 // session ticket, which is not the peer going away.
-                guard let tls = o.pointee.tls, pg_tls_idle_ok(tls) != 0 else {
+                guard let tls = o.pointee.tls, av_tls_idle_ok(tls) != 0 else {
                     closeOutbound(index)
                     continue
                 }
@@ -307,7 +307,7 @@ extension Worker {
             // OpenSSL can be holding decrypted bytes the socket has already
             // given up, which no poll will ever mention again. That is a
             // half-read response by another name.
-            if let tls = o.pointee.tls, pg_tls_pending(tls) > 0 {
+            if let tls = o.pointee.tls, av_tls_pending(tls) > 0 {
                 closeOutbound(index)
                 continue
             }
@@ -339,7 +339,7 @@ extension Worker {
             return
         }
         o.pointee.state = .idle
-        o.pointee.idleSince = pg_monotonic_ms()
+        o.pointee.idleSince = av_monotonic_ms()
         disarmOutboundTimer(index)
         setOutboundInterest(index, .read)
         o.pointee.nextIdle = outboundIdle[key] ?? -1
@@ -434,9 +434,9 @@ extension Worker {
         case .connecting:
             // A non-blocking connect reports both outcomes the same way, by
             // becoming writable; SO_ERROR is what says which happened.
-            let err = pg_connect_error(o.pointee.fd)
+            let err = av_connect_error(o.pointee.fd)
             if err != 0 { settleOutbound(index, .failed(err)); return }
-            if mask.isFailed { settleOutbound(index, .failed(pg_errno())); return }
+            if mask.isFailed { settleOutbound(index, .failed(av_errno())); return }
             settleOutbound(index, nil)
         case .open:
             // Readable or writable as asked. A hangup still settles the wait:
@@ -450,7 +450,7 @@ extension Worker {
             // Except on an encrypted one: a TLS 1.3 server sends a session
             // ticket the moment the handshake finishes, and reading that as a
             // hangup means no encrypted connection is ever reused.
-            if let tls = o.pointee.tls, pg_tls_idle_ok(tls) != 0 { return }
+            if let tls = o.pointee.tls, av_tls_idle_ok(tls) != 0 { return }
             unlinkIdle(index)
             closeOutbound(index)
         }
@@ -472,13 +472,13 @@ extension Worker {
         // OpenSSL writing into a descriptor that may already be somebody
         // else's.
         if let tls = o.pointee.tls {
-            pg_tls_shutdown(tls)
-            pg_tls_free(tls)
+            av_tls_shutdown(tls)
+            av_tls_free(tls)
             o.pointee.tls = nil
         }
         if o.pointee.fd >= 0 {
             if o.pointee.interest != 0 { _ = poller.remove(o.pointee.fd) }
-            _ = pg_close(o.pointee.fd)
+            _ = av_close(o.pointee.fd)
         }
         // Mutated through the stored table rather than a copy written back: a
         // copy would lose anything the calls above changed.
@@ -493,7 +493,7 @@ extension Worker {
     mutating func armConnectTimeout(_ index: Int, milliseconds: UInt64) {
         guard let table = outbound else { return }
         let o = table[index]
-        let deadline = pg_monotonic_us() &+ 1 &+ max(1, milliseconds) &* 1000
+        let deadline = av_monotonic_us() &+ 1 &+ max(1, milliseconds) &* 1000
         guard let (op, generation) = asyncOps.allocate(
             slot: index, requestId: 0, kind: .outbound, deadlineUs: deadline) else { return }
         timerHeap.push(
@@ -574,11 +574,11 @@ struct OutboundSocket {
     /// be 0 when the socket is full -- then wait for `writable` and go again.
     func write(_ bytes: UnsafeRawBufferPointer) throws(OutboundError) -> Int {
         guard let o = record else { throw .cancelled }
-        let n = o.pointee.tls.map { pg_tls_write($0, bytes.baseAddress, bytes.count) }
-            ?? pg_write(o.pointee.fd, bytes.baseAddress, bytes.count)
+        let n = o.pointee.tls.map { av_tls_write($0, bytes.baseAddress, bytes.count) }
+            ?? av_write(o.pointee.fd, bytes.baseAddress, bytes.count)
         if n >= 0 { return n }
-        let err = pg_errno()
-        if pg_err_is_again(err) != 0 || pg_err_is_intr(err) != 0 { return 0 }
+        let err = av_errno()
+        if av_err_is_again(err) != 0 || av_err_is_intr(err) != 0 { return 0 }
         throw .failed(err)
     }
 
@@ -586,12 +586,12 @@ struct OutboundSocket {
     /// peer closing is reported as `failed(0)` so it cannot be mistaken for it.
     func read(into buffer: UnsafeMutableRawBufferPointer) throws(OutboundError) -> Int {
         guard let o = record else { throw .cancelled }
-        let n = o.pointee.tls.map { pg_tls_read($0, buffer.baseAddress, buffer.count) }
-            ?? pg_read(o.pointee.fd, buffer.baseAddress, buffer.count)
+        let n = o.pointee.tls.map { av_tls_read($0, buffer.baseAddress, buffer.count) }
+            ?? av_read(o.pointee.fd, buffer.baseAddress, buffer.count)
         if n > 0 { return n }
         if n == 0 { throw .failed(0) }
-        let err = pg_errno()
-        if pg_err_is_again(err) != 0 || pg_err_is_intr(err) != 0 { return 0 }
+        let err = av_errno()
+        if av_err_is_again(err) != 0 || av_err_is_intr(err) != 0 { return 0 }
         throw .failed(err)
     }
 
@@ -603,7 +603,7 @@ struct OutboundSocket {
     /// asking this waits for an event that is not coming.
     var hasBufferedInput: Bool {
         guard let o = record, let tls = o.pointee.tls else { return false }
-        return pg_tls_pending(tls) > 0
+        return av_tls_pending(tls) > 0
     }
 
     /// Whether ALPN settled on HTTP/2.
@@ -615,7 +615,7 @@ struct OutboundSocket {
     /// is not an error, only an agreement to speak HTTP/1.1.
     var isHTTP2: Bool {
         guard let o = record, let tls = o.pointee.tls else { return false }
-        return pg_tls_is_h2(tls) != 0
+        return av_tls_is_h2(tls) != 0
     }
 
     func readable(milliseconds: UInt64 = 10_000) async throws(OutboundError) {
@@ -673,8 +673,8 @@ struct OutboundSocket {
     /// rather than after, when it may or may not have run.
     var hasPendingInput: Bool {
         guard let o = record else { return true }
-        if let tls = o.pointee.tls, pg_tls_pending(tls) > 0 { return true }
-        return pg_poll_single(o.pointee.fd, 0, 0) != 0
+        if let tls = o.pointee.tls, av_tls_pending(tls) > 0 { return true }
+        return av_poll_single(o.pointee.fd, 0, 0) != 0
     }
 
     /// Changes what a wait already in progress is woken for.
@@ -705,10 +705,10 @@ extension Worker {
         let made: OpaquePointer? = error.withUnsafeMutableBufferPointer { buffer in
             alpn.withCString { protocols in
                 if caFile.isEmpty {
-                    return pg_tls_client_ctx_new(nil, protocols, buffer.baseAddress, 256)
+                    return av_tls_client_ctx_new(nil, protocols, buffer.baseAddress, 256)
                 }
                 return caFile.withCString {
-                    pg_tls_client_ctx_new($0, protocols, buffer.baseAddress, 256)
+                    av_tls_client_ctx_new($0, protocols, buffer.baseAddress, 256)
                 }
             }
         }
@@ -773,7 +773,7 @@ extension OutboundSocket {
         guard let ctx = worker.pointee.outboundTLSContext(caFile: caFile, alpn: alpn) else {
             throw .failed(0)
         }
-        guard let session = hostname.withCString({ pg_tls_client_new(ctx, o.pointee.fd, $0) }) else {
+        guard let session = hostname.withCString({ av_tls_client_new(ctx, o.pointee.fd, $0) }) else {
             throw .failed(0)
         }
         o.pointee.tls = session
@@ -781,7 +781,7 @@ extension OutboundSocket {
         var error = [CChar](repeating: 0, count: 256)
         while true {
             let outcome = error.withUnsafeMutableBufferPointer { buffer in
-                pg_tls_handshake(session, buffer.baseAddress, 256)
+                av_tls_handshake(session, buffer.baseAddress, 256)
             }
             switch outcome {
             case 1:

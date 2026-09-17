@@ -59,7 +59,7 @@ import Darwin
 #endif
 
 import Garuda
-import GarudaHTTP
+import AvianHTTP
 
 /// The limits a server advertises and enforces, as `Upload-Limit`.
 public struct UploadLimits: Sendable {

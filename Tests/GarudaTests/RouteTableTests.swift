@@ -1,5 +1,5 @@
 import Testing
-import GarudaHTTP
+import AvianHTTP
 @testable import Garuda
 
 private struct Match: Equatable {

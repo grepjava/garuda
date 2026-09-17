@@ -17,7 +17,7 @@
 // The protocol is JSON over HTTPS and it is small, so it is here in Swift with
 // a JSON reader just large enough for it. Everything that needs OpenSSL -- the
 // account key, ES256, the CSR, the challenge certificate, TLS to the CA -- is
-// in garuda_acme.c.
+// in avian_acme.c.
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
@@ -26,8 +26,8 @@ import Glibc
 import Darwin
 #endif
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 // MARK: - JSON, enough of it
 
@@ -295,7 +295,7 @@ struct ACMEClient {
         var error = [CChar](repeating: 0, count: 256)
         guard let key = accountKeyPath.withCString({ path in
             error.withUnsafeMutableBufferPointer {
-                pg_acme_key_load_or_create(path, $0.baseAddress, 256)
+                av_acme_key_load_or_create(path, $0.baseAddress, 256)
             }
         }) else {
             acmeLog(.error, "", acmeText(error))
@@ -303,9 +303,9 @@ struct ACMEClient {
         }
         var jwkBuffer = [CChar](repeating: 0, count: 256)
         var thumbBuffer = [CChar](repeating: 0, count: 64)
-        guard pg_acme_jwk(key, &jwkBuffer, 256) > 0,
-              pg_acme_thumbprint(key, &thumbBuffer, 64) > 0 else {
-            pg_acme_key_free(key)
+        guard av_acme_jwk(key, &jwkBuffer, 256) > 0,
+              av_acme_thumbprint(key, &thumbBuffer, 64) > 0 else {
+            av_acme_key_free(key)
             acmeLog(.error, "", "cannot describe the account key")
             return nil
         }
@@ -316,7 +316,7 @@ struct ACMEClient {
         self.thumbprint = acmeText(thumbBuffer)
     }
 
-    func destroy() { pg_acme_key_free(key) }
+    func destroy() { av_acme_key_free(key) }
 
     // MARK: HTTP
 
@@ -330,12 +330,12 @@ struct ACMEClient {
                         error.withUnsafeMutableBufferPointer { e in
                             if let body {
                                 return body.withUnsafeBufferPointer { b in
-                                    pg_acme_https(m, u, "application/jose+json",
+                                    av_acme_https(m, u, "application/jose+json",
                                                   b.baseAddress, b.count, a, ca,
                                                   e.baseAddress, 512)
                                 }
                             }
-                            return pg_acme_https(m, u, nil, nil, 0, a, ca, e.baseAddress, 512)
+                            return av_acme_https(m, u, nil, nil, 0, a, ca, e.baseAddress, 512)
                         }
                     }
                 }
@@ -345,11 +345,11 @@ struct ACMEClient {
             acmeLog(.error, "", acmeText(error))
             return nil
         }
-        defer { pg_acme_resp_free(resp) }
+        defer { av_acme_resp_free(resp) }
         var length = 0
-        let base = pg_acme_resp_body(resp, &length)
+        let base = av_acme_resp_body(resp, &length)
         let bytes = base.map { Array(UnsafeBufferPointer(start: $0, count: length)) } ?? []
-        return Response(status: Int(pg_acme_resp_status(resp)), body: bytes,
+        return Response(status: Int(av_acme_resp_status(resp)), body: bytes,
                         location: header(resp, "location"))
     }
 
@@ -357,7 +357,7 @@ struct ACMEClient {
         var out = [CChar](repeating: 0, count: 2048)
         let n = UnsafeRawPointer(name.utf8Start).withMemoryRebound(
             to: CChar.self, capacity: name.utf8CodeUnitCount + 1) {
-            pg_acme_resp_header(resp, $0, &out, 2048)
+            av_acme_resp_header(resp, $0, &out, 2048)
         }
         return n >= 0 ? acmeText(out) : nil
     }
@@ -367,7 +367,7 @@ struct ACMEClient {
         let resp: OpaquePointer? = url.withCString { u in
             withOptionalCString(caFile) { ca in
                 error.withUnsafeMutableBufferPointer { e in
-                    pg_acme_https("HEAD", u, nil, nil, 0, "application/json", ca, e.baseAddress, 512)
+                    av_acme_https("HEAD", u, nil, nil, 0, "application/json", ca, e.baseAddress, 512)
                 }
             }
         }
@@ -375,7 +375,7 @@ struct ACMEClient {
             acmeLog(.error, "", acmeText(error))
             return nil
         }
-        defer { pg_acme_resp_free(resp) }
+        defer { av_acme_resp_free(resp) }
         return header(resp, "replay-nonce")
     }
 
@@ -385,7 +385,7 @@ struct ACMEClient {
         let bytes = Array(s.utf8)
         var out = [CChar](repeating: 0, count: bytes.count * 4 / 3 + 8)
         let n = bytes.withUnsafeBufferPointer {
-            pg_acme_b64url($0.baseAddress, $0.count, &out, out.count)
+            av_acme_b64url($0.baseAddress, $0.count, &out, out.count)
         }
         return n >= 0 ? acmeText(out) : ""
     }
@@ -411,7 +411,7 @@ struct ACMEClient {
             let signingInput = Array((protected64 + "." + payload64).utf8)
             var signature = [CChar](repeating: 0, count: 128)
             let signed = signingInput.withUnsafeBufferPointer {
-                pg_acme_sign(key, $0.baseAddress, $0.count, &signature, 128)
+                av_acme_sign(key, $0.baseAddress, $0.count, &signature, 128)
             }
             guard signed > 0 else {
                 acmeLog(.error, "", "cannot sign a request")
@@ -439,7 +439,7 @@ struct ACMEClient {
                 withOptionalCString(caFile) { ca in
                     error.withUnsafeMutableBufferPointer { e in
                         body.withUnsafeBufferPointer { b in
-                            pg_acme_https("POST", u, "application/jose+json", b.baseAddress,
+                            av_acme_https("POST", u, "application/jose+json", b.baseAddress,
                                           b.count, a, ca, e.baseAddress, 512)
                         }
                     }
@@ -450,12 +450,12 @@ struct ACMEClient {
             acmeLog(.error, "", acmeText(error))
             return nil
         }
-        defer { pg_acme_resp_free(resp) }
+        defer { av_acme_resp_free(resp) }
         nonce = header(resp, "replay-nonce")
         var length = 0
-        let base = pg_acme_resp_body(resp, &length)
+        let base = av_acme_resp_body(resp, &length)
         let bytes = base.map { Array(UnsafeBufferPointer(start: $0, count: length)) } ?? []
-        return Response(status: Int(pg_acme_resp_status(resp)), body: bytes,
+        return Response(status: Int(av_acme_resp_status(resp)), body: bytes,
                         location: header(resp, "location"))
     }
 
@@ -579,7 +579,7 @@ enum ACME {
     /// Obtains a certificate for every domain and installs it. True when the
     /// files on disk are new and the workers should be reloaded.
     static func obtain(_ settings: Settings) -> Bool {
-        _ = pg_acme_mkdirs(settings.challengeDir)
+        _ = av_acme_mkdirs(settings.challengeDir)
         guard var client = ACMEClient(directoryURL: settings.directory,
                                       caFile: settings.caFile,
                                       accountKeyPath: settings.cacheDir + "/account.key") else {
@@ -602,7 +602,7 @@ enum ACME {
         }
 
         var written: [String] = []
-        defer { for path in written { _ = pg_unlink(path) } }
+        defer { for path in written { _ = av_unlink(path) } }
 
         for entry in orderJSON["authorizations"]?.array ?? [] {
             guard let authURL = entry.string,
@@ -632,7 +632,7 @@ enum ACME {
                 (token + "." + client.thumbprint).withCString { ka in
                     certPath.withCString { c in
                         keyPath.withCString { k in
-                            pg_acme_alpn_cert(d, ka, c, k, &error, 256)
+                            av_acme_alpn_cert(d, ka, c, k, &error, 256)
                         }
                     }
                 }
@@ -666,7 +666,7 @@ enum ACME {
         var csr = [CChar](repeating: 0, count: 8192)
         var error = [CChar](repeating: 0, count: 256)
         let csrLength = settings.names.withCString { n in
-            newKey.withCString { k in pg_acme_csr(n, k, &csr, 8192, &error, 256) }
+            newKey.withCString { k in av_acme_csr(n, k, &csr, 8192, &error, 256) }
         }
         guard csrLength > 0 else {
             acmeLog(.error, "", acmeText(error))
@@ -692,12 +692,12 @@ enum ACME {
 
         let wroteCert = newCert.withCString { path in
             certificate.body.withUnsafeBufferPointer {
-                pg_acme_write_file(path, $0.baseAddress, $0.count, 0o644)
+                av_acme_write_file(path, $0.baseAddress, $0.count, 0o644)
             }
         }
         guard wroteCert == 0,
-              newKey.withCString({ n in settings.keyPath.withCString { pg_acme_rename(n, $0) } }) == 0,
-              newCert.withCString({ n in settings.certPath.withCString { pg_acme_rename(n, $0) } }) == 0
+              newKey.withCString({ n in settings.keyPath.withCString { av_acme_rename(n, $0) } }) == 0,
+              newCert.withCString({ n in settings.certPath.withCString { av_acme_rename(n, $0) } }) == 0
         else {
             acmeLog(.error, "cannot install the certificate in ", settings.cacheDir)
             return false

@@ -14,7 +14,7 @@
 // value can run the stack out.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 /// What a document, or a value, could not be.
 public enum JSONError: Error, Equatable {

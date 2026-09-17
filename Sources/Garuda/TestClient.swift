@@ -16,8 +16,8 @@ import Glibc
 import Darwin
 #endif
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 public struct TestResponse {
     public let status: HTTPStatus
@@ -74,7 +74,7 @@ public final class TestClient {
         // is done. Without it the first close_notify written into a socket
         // whose far end has already gone takes the whole test process with it,
         // and the run reads as a crash rather than as EPIPE.
-        pg_ignore_sigpipe()
+        av_ignore_sigpipe()
         guard let poller = Poller(maxEvents: 64) else {
             fatalError("cannot create a readiness poller for the test client")
         }
@@ -161,17 +161,17 @@ public final class TestClient {
         #else
         let made = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
         #endif
-        guard made == 0 else { throw TestClientError.socket(pg_errno()) }
+        guard made == 0 else { throw TestClientError.socket(av_errno()) }
         for fd in fds {
-            _ = pg_set_nonblock(fd)
-            _ = pg_set_cloexec(fd)
+            _ = av_set_nonblock(fd)
+            _ = av_set_cloexec(fd)
         }
         let address: StaticString = "127.0.0.1"
         let slot = worker.pointee.adoptConnection(fds[0], address: address.utf8Start,
                                                   addressLength: address.utf8CodeUnitCount,
                                                   port: 1)
         guard slot >= 0 else {
-            _ = pg_close(fds[1])
+            _ = av_close(fds[1])
             throw TestClientError.socket(0)
         }
         return (fds[1], slot, worker.pointee.table[slot].pointee.generation)
@@ -182,9 +182,9 @@ public final class TestClient {
     /// once, cancelling whatever the request was waiting on.
     func abandon(_ bytes: [UInt8], turns: Int) throws {
         let (client, slot, generation) = try connect()
-        _ = bytes.withUnsafeBufferPointer { pg_write(client, $0.baseAddress!, $0.count) }
+        _ = bytes.withUnsafeBufferPointer { av_write(client, $0.baseAddress!, $0.count) }
         for _ in 0..<turns { turn() }
-        _ = pg_close(client)
+        _ = av_close(client)
         let c = worker.pointee.table[slot]
         if c.pointee.state != .free && c.pointee.generation == generation {
             onWorker { worker.pointee.closeConnection(slot) }
@@ -195,14 +195,14 @@ public final class TestClient {
         let (client, slot, generation) = try connect()
         defer { hangUp(client, slot: slot, generation: generation) }
 
-        let deadline = pg_monotonic_ms() + timeoutMillis
+        let deadline = av_monotonic_ms() + timeoutMillis
         var written = 0
         var received: [UInt8] = []
         var chunk = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             if written < bytes.count {
                 let n = bytes.withUnsafeBufferPointer {
-                    pg_write(client, $0.baseAddress! + written, bytes.count - written)
+                    av_write(client, $0.baseAddress! + written, bytes.count - written)
                 }
                 if n > 0 { written += n }
             }
@@ -210,7 +210,7 @@ public final class TestClient {
             var closed = false
             while true {
                 let n = chunk.withUnsafeMutableBufferPointer {
-                    pg_read(client, $0.baseAddress!, $0.count)
+                    av_read(client, $0.baseAddress!, $0.count)
                 }
                 if n > 0 {
                     received.append(contentsOf: chunk[0..<n])
@@ -223,7 +223,7 @@ public final class TestClient {
                 return response
             }
             if closed { throw TestClientError.closed(received: received.count) }
-            if pg_monotonic_ms() > deadline { throw TestClientError.timedOut }
+            if av_monotonic_ms() > deadline { throw TestClientError.timedOut }
         }
     }
 
@@ -253,7 +253,7 @@ public final class TestClient {
     /// Closes the client's end and turns the loop until the worker has let go
     /// of the connection, so the next request starts from an idle worker.
     func hangUp(_ client: Int32, slot: Int, generation: UInt32) {
-        _ = pg_close(client)
+        _ = av_close(client)
         for _ in 0..<1_000 {
             let c = worker.pointee.table[slot]
             if c.pointee.state == .free || c.pointee.generation != generation { return }

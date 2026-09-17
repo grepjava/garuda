@@ -1,7 +1,7 @@
 import Testing
 import CAllocationCounter
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 @testable import Garuda
 
 private struct HandlerFailure: Error {}
@@ -65,12 +65,12 @@ private final class Wire {
     }
 
     deinit {
-        _ = pg_close(fd)
+        _ = av_close(fd)
         buffer.deallocate()
     }
 
     func send(_ request: StaticString) {
-        _ = pg_write(fd, request.utf8Start, request.utf8CodeUnitCount)
+        _ = av_write(fd, request.utf8Start, request.utf8CodeUnitCount)
     }
 
     /// Turns the worker until one whole response has arrived, adding what the
@@ -82,7 +82,7 @@ private final class Wire {
             client.turn()
             allocations &+= garuda_test_allocations() &- before
             while got < capacity {
-                let n = pg_read(fd, buffer + got, capacity - got)
+                let n = av_read(fd, buffer + got, capacity - got)
                 if n <= 0 { break }
                 got += n
             }
@@ -207,7 +207,7 @@ struct HandlerTaskTests {
     func anAsyncHandlerAllocatesNothingOnceWarm() throws {
         // The counter sees the Swift runtime's allocations.
         let before = garuda_test_allocations()
-        let array = [Int](repeating: 7, count: 64 + Int(pg_monotonic_ms() % 16))
+        let array = [Int](repeating: 7, count: 64 + Int(av_monotonic_ms() % 16))
         #expect(garuda_test_allocations() > before)
         #expect(array.count >= 64)
 

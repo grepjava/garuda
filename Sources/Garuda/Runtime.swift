@@ -37,10 +37,10 @@ import Glibc
 import Darwin
 #endif
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
-import GarudaQUIC
+import CAvian
+import AvianCore
+import AvianHTTP
+import AvianQUIC
 
 enum GarudaRuntime {
 
@@ -58,12 +58,12 @@ enum GarudaRuntime {
 
     static func start(_ config: ServerConfig, inherited: inout Reexec?) -> Int32 {
         Log.level = config.logLevel
-        Log.pid = Int(pg_getpid())
+        Log.pid = Int(av_getpid())
         // The short name top and pkill match on, set once here so that every
-        // worker forked from here inherits it. See pg_set_process_name.
-        pg_set_process_name("garuda")
-        pg_ignore_sigpipe()
-        let limit = pg_raise_nofile_limit()
+        // worker forked from here inherits it. See av_set_process_name.
+        av_set_process_name("garuda")
+        av_ignore_sigpipe()
+        let limit = av_raise_nofile_limit()
         if limit > 0 && limit < Int(config.maxConnections) + 32 {
             Log.warn { line in
                 line.str("file descriptor limit ")
@@ -78,14 +78,14 @@ enum GarudaRuntime {
         // reloads off it once the CA has issued.
         if config.acmeEnabled, let dir = config.acmeCacheDir,
            let cert = config.tlsCertPath, let key = config.tlsKeyPath {
-            if pg_acme_mkdirs(dir) != 0 {
+            if av_acme_mkdirs(dir) != 0 {
                 Log.error("cannot create the --acme-cache directory")
                 return 1
             }
             if access(cert, R_OK) != 0 {
                 let names = ACME.settings(config).names
                 var error = [CChar](repeating: 0, count: 256)
-                let made = names.withCString { pg_acme_placeholder($0, cert, key, &error, 256) }
+                let made = names.withCString { av_acme_placeholder($0, cert, key, &error, 256) }
                 if made != 0 {
                     Log.error { line in
                         line.str("acme: ")
@@ -100,16 +100,16 @@ enum GarudaRuntime {
         // Certificates are checked once, here, rather than discovered to be
         // unreadable inside each worker after the sockets are already open.
         if config.tlsEnabled {
-            if pg_tls_available() == 0 {
+            if av_tls_available() == 0 {
                 Log.error("this build has no TLS support; rebuild against OpenSSL")
                 return 1
             }
             // --ktls, before any context is built: the option is read when each
             // one is, here and in every worker after the fork.
             if config.ktls {
-                if pg_tls_enable_ktls(1) == 0 {
+                if av_tls_enable_ktls(1) == 0 {
                     Log.warn("--ktls: this OpenSSL has no kernel TLS; encrypting in the process")
-                } else if pg_tls_kernel_ready() == 0 {
+                } else if av_tls_kernel_ready() == 0 {
                     Log.warn("--ktls: the kernel tls module is not loaded (modprobe tls); encrypting in the process")
                 } else {
                     Log.info("kernel TLS requested (--ktls)")
@@ -132,7 +132,7 @@ enum GarudaRuntime {
         // The pair for slot `i` is `i` and `i + workerCount`, and a handover
         // moves to whichever of the two is free.
         if config.metricsPort != 0 {
-            if pg_metrics_init(Int32(max(1, workerCount) * 2)) != 0 {
+            if av_metrics_init(Int32(max(1, workerCount) * 2)) != 0 {
                 Log.error("cannot map the shared metrics page")
                 return 1
             }
@@ -141,7 +141,7 @@ enum GarudaRuntime {
         // --cache-size. Mapped here for the same reason again: a response one
         // worker stored is only worth keeping if every other worker can read it.
         if config.cacheSizeMiB > 0 {
-            let slots = pg_cache_init(UInt64(config.cacheSizeMiB) * 1024 * 1024,
+            let slots = av_cache_init(UInt64(config.cacheSizeMiB) * 1024 * 1024,
                                       UInt32(responseCacheMaxHead),
                                       UInt32(config.cacheMaxObject))
             if slots < 0 {
@@ -169,7 +169,7 @@ enum GarudaRuntime {
             let burst = config.rateLimitBurst > 0 ? config.rateLimitBurst : config.rateLimitCount
             // 2^16 entries, a megabyte: room for tens of thousands of clients
             // active at once before entries have to be reused.
-            if pg_ratelimit_init(emission, emission * UInt64(burst - 1), 16) != 0 {
+            if av_ratelimit_init(emission, emission * UInt64(burst - 1), 16) != 0 {
                 Log.error("cannot map the shared rate-limit table")
                 return 1
             }
@@ -220,7 +220,7 @@ enum GarudaRuntime {
                               ciphers: config.tlsCiphers) else { return nil }
         }
         if config.acmeEnabled, let dir = config.acmeCacheDir {
-            if pg_tls_ctx_set_acme_dir(context.raw, dir) != 0 {
+            if av_tls_ctx_set_acme_dir(context.raw, dir) != 0 {
                 Log.error("cannot turn on tls-alpn-01 answering for --acme-domain")
                 return nil
             }
@@ -239,7 +239,7 @@ enum GarudaRuntime {
         }
         var error = [CChar](repeating: 0, count: 256)
         let loaded: OpaquePointer? = error.withUnsafeMutableBufferPointer {
-            pg_certkey_load(cert, key, $0.baseAddress, 256)
+            av_certkey_load(cert, key, $0.baseAddress, 256)
         }
         guard let certKey = loaded else {
             error.withUnsafeBufferPointer { buffer in
@@ -255,12 +255,12 @@ enum GarudaRuntime {
         }
 
         let port = config.quicPort != 0 ? config.quicPort : config.port
-        let fd = pg_bind_udp(config.host, port, 1, config.ipv6Only ? 1 : 0)
+        let fd = av_bind_udp(config.host, port, 1, config.ipv6Only ? 1 : 0)
         if fd < 0 {
-            let e = pg_errno()
+            let e = av_errno()
             Log.error { line in
                 line.str("cannot bind the QUIC socket: ")
-                line.cstr(pg_strerror(e))
+                line.cstr(av_strerror(e))
             }
             return nil
         }
@@ -282,20 +282,20 @@ enum GarudaRuntime {
                              unlinkStale: Bool) -> Int32? {
         let fd: Int32
         if let path = config.unixPath {
-            fd = pg_listen_unix(path, config.backlog, unlinkStale ? 1 : 0)
+            fd = av_listen_unix(path, config.backlog, unlinkStale ? 1 : 0)
         } else {
-            fd = pg_listen_tcp(config.host, config.port, config.backlog,
+            fd = av_listen_tcp(config.host, config.port, config.backlog,
                                reusePort ? 1 : 0, config.ipv6Only ? 1 : 0)
             // --request-start-header. On the listener so that accepted sockets
             // inherit it, and so that timestamping is already on when a
             // request that will queue behind a busy worker arrives.
-            if fd >= 0 && config.requestStartHeader { _ = pg_set_rx_timestamps(fd) }
+            if fd >= 0 && config.requestStartHeader { _ = av_set_rx_timestamps(fd) }
         }
         if fd < 0 {
-            let e = pg_errno()
+            let e = av_errno()
             Log.error { line in
                 line.str("cannot listen: ")
-                line.cstr(pg_strerror(e))
+                line.cstr(av_strerror(e))
             }
             return nil
         }
@@ -303,7 +303,7 @@ enum GarudaRuntime {
     }
 
     static func removeUnixPath(_ config: ServerConfig) {
-        if let path = config.unixPath { _ = pg_unlink(path) }
+        if let path = config.unixPath { _ = av_unlink(path) }
     }
 
     // MARK: - Supervisor
@@ -344,7 +344,7 @@ enum GarudaRuntime {
                 for i in 0..<count {
                     listeners[i] = record.listeners[i]
                     // Open across the exec on purpose; closed across any other.
-                    _ = pg_set_cloexec(listeners[i])
+                    _ = av_set_cloexec(listeners[i])
                 }
                 adopted = record.workers
             } else {
@@ -364,7 +364,7 @@ enum GarudaRuntime {
                 guard let fd = openListener(config, reusePort: true, unlinkStale: false) else {
                     // A bad bind is one clear error, not N identical ones
                     // arriving from N children.
-                    for k in 0..<i { _ = pg_close(listeners[k]) }
+                    for k in 0..<i { _ = av_close(listeners[k]) }
                     return 1
                 }
                 listeners[i] = fd
@@ -372,10 +372,10 @@ enum GarudaRuntime {
         }
         defer { removeUnixPath(config) }
 
-        let signalFD = pg_signal_pipe_init()
+        let signalFD = av_signal_pipe_init()
         // A supervisor that exec'd this image blocked these first, so that
         // one arriving in between would wait for the handlers just installed.
-        pg_unblock_piped_signals()
+        av_unblock_piped_signals()
         let pids = UnsafeMutablePointer<pid_t>.allocate(capacity: workers)
         defer { pids.deallocate() }
         pids.initialize(repeating: 0, count: workers)
@@ -395,7 +395,7 @@ enum GarudaRuntime {
         }
 
         // Metrics slots come in pairs, so that a worker and the replacement
-        // overlapping it never write to the same one -- see `pg_metrics_init`.
+        // overlapping it never write to the same one -- see `av_metrics_init`.
         // `metricsSlotOf[i]` is the slot the worker currently in `i` was given,
         // and a handover takes the other half of the pair.
         let metricsSlotOf = UnsafeMutablePointer<Int>.allocate(capacity: workers)
@@ -424,7 +424,7 @@ enum GarudaRuntime {
             let started = spawn(i)
             // Nothing is waiting on readiness at start-up: there is no worker
             // being replaced, so there is nothing to hold on to it for.
-            if started.ready >= 0 { _ = pg_close(started.ready) }
+            if started.ready >= 0 { _ = av_close(started.ready) }
             pids[i] = started.pid
             if pids[i] < 0 { return 1 }
         }
@@ -466,30 +466,30 @@ enum GarudaRuntime {
         /// placeholder, lacks a name, or is inside its renewal window.
         func checkCertificate() {
             guard let settings = acmeSettings, acmePid == 0, !shuttingDown else { return }
-            let now = pg_monotonic_ms()
+            let now = av_monotonic_ms()
             if now < acmeNextCheck { return }
             // A month to spare. Let's Encrypt certificates last ninety days
             // and it asks for renewal once two thirds have gone, which leaves
             // the retries below a month to succeed in.
             let needed = settings.certPath.withCString { cert in
                 settings.names.withCString { names in
-                    pg_acme_needs_certificate(cert, names, 30 * 86_400)
+                    av_acme_needs_certificate(cert, names, 30 * 86_400)
                 }
             }
             if needed == 0 {
                 acmeNextCheck = now &+ 12 * 3_600_000
                 return
             }
-            let pid = pg_fork()
+            let pid = av_fork()
             if pid == 0 {
                 // SIGTERM at shutdown has to end the helper, not be written
                 // into the supervisor's pipe by the handler it inherited.
-                pg_signals_default()
+                av_signals_default()
                 // The helper serves nothing, so it lets go of the sockets: a
                 // helper still waiting on a slow CA after the server has gone
                 // must not be what keeps the port bound.
-                for i in 0..<count where listeners[i] >= 0 { _ = pg_close(listeners[i]) }
-                _ = pg_close(signalFD)
+                for i in 0..<count where listeners[i] >= 0 { _ = av_close(listeners[i]) }
+                _ = av_close(signalFD)
                 _exit(ACME.obtain(settings) ? 0 : 1)
             }
             if pid < 0 {
@@ -558,16 +558,16 @@ enum GarudaRuntime {
         /// which shutdown still has to reach -- and, past the grace period,
         /// kills it.
         func signalAll(_ sig: Int32) {
-            for k in 0..<workers where retiring[k] > 0 { _ = pg_kill(retiring[k], sig) }
+            for k in 0..<workers where retiring[k] > 0 { _ = av_kill(retiring[k], sig) }
             // Mid-handover the outgoing worker is in neither array, and a
             // shutdown still has to reach it.
-            if handoverOld > 0 { _ = pg_kill(handoverOld, sig) }
-            for k in 0..<workers where pids[k] > 0 { _ = pg_kill(pids[k], sig) }
+            if handoverOld > 0 { _ = av_kill(handoverOld, sig) }
+            for k in 0..<workers where pids[k] > 0 { _ = av_kill(pids[k], sig) }
         }
 
         /// Clears the handover state, releasing the readiness pipe.
         func clearHandover() {
-            if handoverReadyFD >= 0 { _ = pg_close(handoverReadyFD) }
+            if handoverReadyFD >= 0 { _ = av_close(handoverReadyFD) }
             handoverSlot = -1
             handoverOld = 0
             handoverReadyFD = -1
@@ -583,7 +583,7 @@ enum GarudaRuntime {
             retiring[slot] = old
             // SIGQUIT, not SIGTERM: its replacement is already serving, so
             // there is nothing for --drain-delay to wait for.
-            _ = pg_kill(old, SIGQUIT)
+            _ = av_kill(old, SIGQUIT)
         }
 
         /// Replaces the slot at `restartCursor`, then advances. One slot is in
@@ -625,7 +625,7 @@ enum GarudaRuntime {
                 handoverSlot = i
                 handoverOld = old
                 handoverReadyFD = fresh.ready
-                handoverDeadline = pg_monotonic_ms() &+ readyTimeoutMs
+                handoverDeadline = av_monotonic_ms() &+ readyTimeoutMs
                 return
             }
             restartCursor = -1
@@ -643,7 +643,7 @@ enum GarudaRuntime {
             Log.info(why)
             // New workers may run new code, which may answer the same request
             // differently; nothing the old ones cached is served again.
-            pg_cache_flush()
+            av_cache_flush()
             if restartCursor >= 0 {
                 restartPending = true
                 return
@@ -659,7 +659,7 @@ enum GarudaRuntime {
             guard let path = watcher?.executablePath else { return }
             // Catches a file that is not a whole executable before this
             // process becomes it: a failed exec returns, a bad image does not.
-            if pg_probe_executable(path, 5_000) == 0 {
+            if av_probe_executable(path, 5_000) == 0 {
                 Log.error("--reload: the rebuilt executable does not run; keeping the current one")
                 return
             }
@@ -669,16 +669,16 @@ enum GarudaRuntime {
             var distinct: [Int32] = []
             for fd in record.listeners where !distinct.contains(fd) { distinct.append(fd) }
             setenv(Reexec.variable, record.encoded(), 1)
-            for fd in distinct { _ = pg_clear_cloexec(fd) }
-            pg_block_piped_signals()
-            _ = path.withCString { pg_execv($0, CommandLine.unsafeArgv) }
-            let e = pg_errno()
-            pg_unblock_piped_signals()
-            for fd in distinct { _ = pg_set_cloexec(fd) }
+            for fd in distinct { _ = av_clear_cloexec(fd) }
+            av_block_piped_signals()
+            _ = path.withCString { av_execv($0, CommandLine.unsafeArgv) }
+            let e = av_errno()
+            av_unblock_piped_signals()
+            for fd in distinct { _ = av_set_cloexec(fd) }
             unsetenv(Reexec.variable)
             Log.error { line in
                 line.str("--reload: cannot exec the rebuilt executable: ")
-                line.cstr(pg_strerror(e))
+                line.cstr(av_strerror(e))
             }
         }
 
@@ -700,9 +700,9 @@ enum GarudaRuntime {
             let watchFD: Int32 = shuttingDown ? -1 : (watcher?.notifyFD ?? -1)
             var buf = (UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt8(0))
             let n = withUnsafeMutableBytes(of: &buf) { raw -> Int in
-                let r = pg_poll_either(signalFD, watchFD, waitMs)
+                let r = av_poll_either(signalFD, watchFD, waitMs)
                 if r <= 0 || r & 1 == 0 { return 0 }
-                return pg_read(signalFD, raw.baseAddress!, 8)
+                return av_read(signalFD, raw.baseAddress!, 8)
             }
 
             if handoverReadyFD >= 0 {
@@ -715,10 +715,10 @@ enum GarudaRuntime {
                 // POLLHUP together and a poll cannot tell "ready" from "died
                 // during start-up" -- it reports the hangup either way. The
                 // read can: one byte is the signal, end of file is the death.
-                if pg_poll_single(handoverReadyFD, 0, 0) != 0 {
+                if av_poll_single(handoverReadyFD, 0, 0) != 0 {
                     var byte: UInt8 = 0
                     let got = withUnsafeMutableBytes(of: &byte) { raw in
-                        pg_read(handoverReadyFD, raw.baseAddress!, 1)
+                        av_read(handoverReadyFD, raw.baseAddress!, 1)
                     }
                     if got == 1 {
                         retireHandover()
@@ -726,10 +726,10 @@ enum GarudaRuntime {
                         // The reap below has the pid and puts the slot back;
                         // all that is needed here is to stop watching a pipe
                         // with nothing left to say.
-                        _ = pg_close(handoverReadyFD)
+                        _ = av_close(handoverReadyFD)
                         handoverReadyFD = -1
                     }
-                } else if handoverDeadline > 0 && pg_monotonic_ms() > handoverDeadline {
+                } else if handoverDeadline > 0 && av_monotonic_ms() > handoverDeadline {
                     Log.error("a replacement worker has not started serving after 60s;")
                     Log.error("retiring the worker it replaces anyway, as the reload asked")
                     retireHandover()
@@ -752,20 +752,20 @@ enum GarudaRuntime {
                                 // system that signals the whole group reaches
                                 // them without going through this process.
                                 signalAll(SIGTERM)
-                                if acmePid > 0 { _ = pg_kill(acmePid, SIGTERM) }
+                                if acmePid > 0 { _ = av_kill(acmePid, SIGTERM) }
                                 // Workers get the same grace period they give
                                 // their own requests, plus a moment to exit.
-                                killDeadline = pg_monotonic_ms() &+ config.drainDelayMs
+                                killDeadline = av_monotonic_ms() &+ config.drainDelayMs
                                     &+ config.gracefulShutdownMs &+ 2_000
                             }
                         case SIGINT, SIGQUIT:
                             // No delay, and a way to cut one short.
-                            let deadline = pg_monotonic_ms() &+ config.gracefulShutdownMs &+ 2_000
+                            let deadline = av_monotonic_ms() &+ config.gracefulShutdownMs &+ 2_000
                             if !shuttingDown {
                                 shuttingDown = true
                                 Log.info("shutting down; signalling workers")
                                 signalAll(SIGQUIT)
-                                if acmePid > 0 { _ = pg_kill(acmePid, SIGTERM) }
+                                if acmePid > 0 { _ = av_kill(acmePid, SIGTERM) }
                                 killDeadline = deadline
                             } else if killDeadline > deadline {
                                 Log.info("shutting down now, without waiting out --drain-delay")
@@ -783,7 +783,7 @@ enum GarudaRuntime {
 
             // Past the grace period a worker is no longer draining, it is
             // stuck; the deadline is what makes shutdown bounded.
-            if shuttingDown && killDeadline > 0 && pg_monotonic_ms() > killDeadline {
+            if shuttingDown && killDeadline > 0 && av_monotonic_ms() > killDeadline {
                 Log.warn("workers did not exit within the shutdown grace period; killing")
                 signalAll(SIGKILL)
                 killDeadline = 0
@@ -810,14 +810,14 @@ enum GarudaRuntime {
             // Reap whatever has exited.
             while true {
                 var status: Int32 = 0
-                let pid = pg_waitpid(-1, &status, 1)
+                let pid = av_waitpid(-1, &status, 1)
                 if pid <= 0 { break }
 
                 // The ACME helper is not a worker and never counted as one.
                 if acmePid > 0 && pid == acmePid {
                     acmePid = 0
-                    let now = pg_monotonic_ms()
-                    if pg_acme_exit_ok(status) != 0 {
+                    let now = av_monotonic_ms()
+                    if av_acme_exit_ok(status) != 0 {
                         acmeFailures = 0
                         acmeNextCheck = now &+ 12 * 3_600_000
                         beginRestart("certificate installed; reloading workers")
@@ -900,7 +900,7 @@ enum GarudaRuntime {
                         // A crash replacement has nobody to hand over from, so
                         // its readiness is nothing to wait for either.
                         let restarted = spawn(index)
-                        if restarted.ready >= 0 { _ = pg_close(restarted.ready) }
+                        if restarted.ready >= 0 { _ = av_close(restarted.ready) }
                         pids[index] = restarted.pid
                         if pids[index] > 0 { alive += 1 }
                     }
@@ -913,7 +913,7 @@ enum GarudaRuntime {
         for i in 0..<count where listeners[i] >= 0 {
             var alreadyClosed = false
             for k in 0..<i where listeners[k] == listeners[i] { alreadyClosed = true }
-            if !alreadyClosed { _ = pg_close(listeners[i]) }
+            if !alreadyClosed { _ = av_close(listeners[i]) }
         }
         Log.info("garuda stopped")
         return 0
@@ -929,7 +929,7 @@ enum GarudaRuntime {
                             metricsSlot: Int) -> (pid: pid_t, ready: Int32) {
         var fds: (Int32, Int32) = (-1, -1)
         let piped = withUnsafeMutableBytes(of: &fds) { raw in
-            pg_pipe(raw.baseAddress!.assumingMemoryBound(to: Int32.self))
+            av_pipe(raw.baseAddress!.assumingMemoryBound(to: Int32.self))
         }
         if piped != 0 {
             Log.error("cannot create the worker readiness pipe")
@@ -937,26 +937,26 @@ enum GarudaRuntime {
         }
 
         // Not plain fork: a signal that arrived before the child had a pipe of
-        // its own was lost. See pg_fork_worker.
-        let pid = pg_fork_worker()
+        // its own was lost. See av_fork_worker.
+        let pid = av_fork_worker()
         if pid < 0 {
             Log.error("fork failed")
-            _ = pg_close(fds.0)
-            _ = pg_close(fds.1)
+            _ = av_close(fds.0)
+            _ = av_close(fds.1)
             return (-1, -1)
         }
         if pid > 0 {
             // The supervisor keeps the read end only. Holding the write end
             // too would stop the pipe ever hanging up, and the hangup is how a
             // worker that dies during start-up is noticed.
-            _ = pg_close(fds.1)
+            _ = av_close(fds.1)
             return (pid, fds.0)
         }
 
         // --- child ---
-        _ = pg_close(fds.0)
+        _ = av_close(fds.0)
         readyPipeFD = fds.1
-        Log.pid = Int(pg_getpid())
+        Log.pid = Int(av_getpid())
 
         // fork hands over the whole descriptor table, so this worker starts out
         // holding a listener for every slot. It will only ever poll its own;
@@ -966,7 +966,7 @@ enum GarudaRuntime {
         // what the comparison against `mine` is for.
         let mine = listeners[index]
         for k in 0..<listenerCount where listeners[k] >= 0 && listeners[k] != mine {
-            _ = pg_close(listeners[k])
+            _ = av_close(listeners[k])
         }
 
         var fd = mine
@@ -1008,28 +1008,28 @@ enum GarudaRuntime {
 
         if config.metricsPort != 0 {
             Metrics.bind(slot: metricsSlot)
-            Metrics.set(PG_M_SLOTS_CAPACITY, UInt64(config.maxConnections))
+            Metrics.set(AV_M_SLOTS_CAPACITY, UInt64(config.maxConnections))
             let host = config.metricsHost ?? config.host
-            let fd = pg_listen_tcp(host, config.metricsPort, 64, 1,
+            let fd = av_listen_tcp(host, config.metricsPort, 64, 1,
                                    config.ipv6Only ? 1 : 0)
             if fd < 0 {
-                let e = pg_errno()
+                let e = av_errno()
                 Log.error { line in
                     line.str("cannot listen on the metrics port: ")
-                    line.cstr(pg_strerror(e))
+                    line.cstr(av_strerror(e))
                 }
                 return nil
             }
             workerPtr.pointee.metricsFD = fd
         }
         if config.redirectHTTPPort != 0 {
-            let fd = pg_listen_tcp(config.host, config.redirectHTTPPort, config.backlog, 1,
+            let fd = av_listen_tcp(config.host, config.redirectHTTPPort, config.backlog, 1,
                                    config.ipv6Only ? 1 : 0)
             if fd < 0 {
-                let e = pg_errno()
+                let e = av_errno()
                 Log.error { line in
                     line.str("cannot listen on the --redirect-http port: ")
-                    line.cstr(pg_strerror(e))
+                    line.cstr(av_strerror(e))
                 }
                 return nil
             }
@@ -1054,9 +1054,9 @@ enum GarudaRuntime {
         guard readyPipeFD >= 0 else { return }
         var byte: UInt8 = 1
         _ = withUnsafeBytes(of: &byte) { raw in
-            pg_write(readyPipeFD, raw.baseAddress!, 1)
+            av_write(readyPipeFD, raw.baseAddress!, 1)
         }
-        _ = pg_close(readyPipeFD)
+        _ = av_close(readyPipeFD)
         readyPipeFD = -1
     }
 
@@ -1075,7 +1075,7 @@ enum GarudaRuntime {
     static func runWorker(_ config: ServerConfig, listenFD: Int32,
                           index: Int = 0, metricsSlot: Int = 0) -> Bool {
         guard let workerPtr = makeWorker(config, listenFD: listenFD,
-                                         controlFD: pg_signal_pipe_init(),
+                                         controlFD: av_signal_pipe_init(),
                                          metricsSlot: metricsSlot) else {
             return false
         }

@@ -1,6 +1,6 @@
 import Testing
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 import GarudaPostgres
 @testable import Garuda
 
@@ -11,7 +11,7 @@ import GarudaPostgres
 // Opt-in through GARUDA_POSTGRES, like the driver's own integration tests.
 
 private let target: PostgresConfiguration? = {
-    guard let raw = pg_getenv("GARUDA_POSTGRES") else { return nil }
+    guard let raw = av_getenv("GARUDA_POSTGRES") else { return nil }
     let parts = String(cString: raw).split(separator: ":", omittingEmptySubsequences: false)
     guard parts.count == 5, let port = UInt16(parts[1]) else { return nil }
     var configuration = PostgresConfiguration(host: String(parts[0]), port: port,
@@ -333,11 +333,11 @@ struct PostgresPoolTests {
         holder.send("GET /hold HTTP/1.1\r\nHost: test\r\n\r\n")
         #expect(holder.turn(until: { poolForTests.map { $0.counts == (open: 1, idle: 0) } ?? false }, turns: 200_000))
 
-        let began = pg_monotonic_us()
+        let began = av_monotonic_us()
         let waiter = try TestWire(client)
         waiter.send("GET /count-why HTTP/1.1\r\nHost: test\r\n\r\n")
         let refused = waiter.receive(turns: 2_000_000) ?? "no response"
-        let waited = (pg_monotonic_us() &- began) / 1000
+        let waited = (av_monotonic_us() &- began) / 1000
         #expect(body(refused) == "poolTimedOut")
         #expect(waited >= 50 && waited < 350, "waited \(waited) ms")
         // Out of the queue as soon as it gave up, not when a release reaches
@@ -373,8 +373,8 @@ struct PostgresPoolTests {
         #expect(body(try get(client, "/terminate-outside/\(pid)")) == "t")
         // pg_terminate_backend signals and returns; the backend's goodbye
         // reaches the socket a moment later. Real time, not turns.
-        let began = pg_monotonic_ms()
-        while pg_monotonic_ms() &- began < 300 { client.turn() }
+        let began = av_monotonic_ms()
+        while av_monotonic_ms() &- began < 300 { client.turn() }
 
         let answer = try get(client, "/count")
         #expect(status(answer) == 200, "\(answer)")
@@ -439,8 +439,8 @@ struct PostgresPoolTests {
         #expect(body(try get(client, "/raw-begin")) == "left open")
         #expect(try #require(poolForTests).counts == (open: 0, idle: 0))
         // Long enough for a frozen now() to differ from a fresh timestamp.
-        let began = pg_monotonic_ms()
-        while pg_monotonic_ms() &- began < 30 { client.turn() }
+        let began = av_monotonic_ms()
+        while av_monotonic_ms() &- began < 30 { client.turn() }
         #expect(body(try get(client, "/in-transaction")) == "no")
     }
 

@@ -20,12 +20,18 @@ and project status in [README.md](README.md).
 
 ## Source tree
 
+The protocol and systems layers come from
+[aviancore](https://github.com/grepjava/aviancore), a separate package that
+other Swift servers share. Garuda depends on it by version; its modules are the
+first four rows below. Everything from `GarudaPostgres` down lives in this
+repository.
+
 | Target | What it holds |
 | --- | --- |
-| `CGaruda` | C shim: epoll/kqueue, sockets, signals, fork, `sendfile`, TLS over TCP (`garuda_tls.c`), crypto primitives for QUIC (`garuda_crypto.c`), UDP with `recvmmsg` and GSO (`garuda_udp.c`), ACME, compression, and the shared-memory tables for metrics, rate limiting and the response cache |
-| `GarudaCore` | `ByteBuffer`, `BufferPool`, `Poller`, logging, civil time |
-| `GarudaHTTP` | HTTP/1.1 parser, chunked decoder, response writer and parser, HPACK, QPACK, HTTP/2 and HTTP/3 framing, WebSocket framing, forwarded-header trust, cache policy |
-| `GarudaQUIC` | QUIC transport: packets, crypto, loss recovery, streams, the TLS 1.3 handshake |
+| `CAvian` (aviancore) | C shim: epoll/kqueue, sockets, signals, fork, `sendfile`, TLS over TCP (`avian_tls.c`), crypto primitives for QUIC (`avian_crypto.c`), UDP with `recvmmsg` and GSO (`avian_udp.c`), ACME, compression, and the shared-memory tables for metrics, rate limiting and the response cache |
+| `AvianCore` (aviancore) | `ByteBuffer`, `BufferPool`, `Poller`, logging, civil time |
+| `AvianHTTP` (aviancore) | HTTP/1.1 parser, chunked decoder, response writer and parser, HPACK, QPACK, HTTP/2 and HTTP/3 framing, WebSocket framing, forwarded-header trust, cache policy |
+| `AvianQUIC` (aviancore) | QUIC transport: packets, crypto, loss recovery, streams, the TLS 1.3 handshake |
 | `GarudaPostgres` | PostgreSQL wire protocol, session state machines, SCRAM-SHA-256, binary values. No sockets. |
 | `Garuda` | Supervisor, worker loop, connection table, HTTP/2 and HTTP/3 servers, dispatch, routes, middleware, response sink, handler tasks, timers, outbound connections, HTTP client, DNS resolver, PostgreSQL pool, streaming responses, WebTransport, static files, reload, ACME, metrics, CLI |
 | `garuda-server` | The `garuda` executable: the benchmark routes, served through the handler API |
@@ -34,13 +40,15 @@ and project status in [README.md](README.md).
 
 ```mermaid
 flowchart BT
-    CGaruda
-    Core[GarudaCore] --> CGaruda
-    HTTP[GarudaHTTP] --> Core
-    QUIC[GarudaQUIC] --> Core
-    QUIC --> HTTP
+    subgraph aviancore
+        CAvian
+        Core[AvianCore] --> CAvian
+        HTTP[AvianHTTP] --> Core
+        QUIC[AvianQUIC] --> Core
+        QUIC --> HTTP
+    end
     PG[GarudaPostgres] --> Core
-    PG --> CGaruda
+    PG --> CAvian
     Garuda --> Core
     Garuda --> HTTP
     Garuda --> QUIC
@@ -54,7 +62,7 @@ flowchart BT
     FT --> HTTP
     FT --> QUIC
     pgfuzz --> FT
-    pgfuzz --> CGaruda
+    pgfuzz --> CAvian
 ```
 
 Swift never imports an OpenSSL header. TLS sessions, contexts and keys are
@@ -97,7 +105,7 @@ Everything runs under a supervisor, including a single worker
 - compiles the application's routes (`Application.compile`), so every worker
   inherits the same read-only table.
 
-Workers are forked with `pg_fork_worker`, which blocks the piped signals across
+Workers are forked with `av_fork_worker`, which blocks the piped signals across
 the fork so none is lost. A child closes every other slot's listener. The
 supervisor keeps all listeners open for its whole life. The kernel assigns a
 connection to a socket in the `SO_REUSEPORT` group when the SYN arrives, so a
@@ -116,12 +124,12 @@ file means the worker died during start-up.
 
 Three tables are anonymous shared mappings created before the fork:
 
-- **Metrics** (`garuda_metrics.c`): two counter slots per worker, cache-line
+- **Metrics** (`avian_metrics.c`): two counter slots per worker, cache-line
   aligned. A replacement worker takes the other slot of its pair, so it never
   writes over the worker it replaces.
-- **Rate limit** (`garuda_ratelimit.c`, `--rate-limit`): GCRA per client
+- **Rate limit** (`avian_ratelimit.c`, `--rate-limit`): GCRA per client
   address, atomic entries, open addressing with a per-server random seed.
-- **Response cache** (`garuda_cache.c`, `--cache-size`): size-classed slots with
+- **Response cache** (`avian_cache.c`, `--cache-size`): size-classed slots with
   version words so readers never see a half-written entry. It is flushed on
   every reload. Handler responses are not stored in it yet.
 
@@ -450,7 +458,7 @@ task pool, the supervisor's state.
 ## Not wired to handlers yet
 
 - **WebSocket**: framing, UTF-8 validation and permessage-deflate exist in
-  `GarudaHTTP` with unit tests. There is no handshake path; `WebSocket.swift`
+  `AvianHTTP` with unit tests. There is no handshake path; `WebSocket.swift`
   holds stubs.
 - **Response compression and the response cache** do not apply to handler
   responses. Pre-compressed static files (`--compress-static`) are served.

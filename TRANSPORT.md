@@ -88,7 +88,7 @@ every 16 responses.
 
 ## TLS
 
-OpenSSL handles TLS over TCP (`garuda_tls.c`, `TLS.swift`), given the
+OpenSSL handles TLS over TCP (`avian_tls.c`, `TLS.swift`), given the
 descriptor directly. A TLS connection uses the same slot and state machine as
 a cleartext one.
 
@@ -96,7 +96,7 @@ a cleartext one.
   step.
 - OpenSSL can hold decrypted bytes the socket no longer has, which a
   level-triggered poller will not report, so reads continue while
-  `pg_tls_pending` is non-zero.
+  `av_tls_pending` is non-zero.
 - TLS 1.2 minimum, compression and renegotiation off, server cipher preference.
   `--tls-ciphers` sets the TLS 1.2 list.
 - **ALPN**: server preference from `h2,http/1.1`, or `http/1.1` with
@@ -203,8 +203,8 @@ transfer. A connection with no streams times out after `--keep-alive`.
 
 ## HTTP/3 and QUIC
 
-QUIC is implemented in Swift (`Sources/GarudaQUIC`). OpenSSL supplies only
-primitives through `garuda_crypto.c`: hashes, HKDF, AEAD, key exchange,
+QUIC is implemented in Swift (`Sources/AvianQUIC`). OpenSSL supplies only
+primitives through `avian_crypto.c`: hashes, HKDF, AEAD, key exchange,
 signatures.
 
 | RFC | Implemented |
@@ -259,7 +259,7 @@ acknowledgements and PTO probes go out.
 
 On Linux, runs of equal-sized datagrams to one peer go out in one `sendmsg`
 with UDP GSO, up to 32 per call. If the kernel refuses, the worker falls back
-to one datagram per call; `GARUDA_UDP_GSO=0` forces that. A full socket keeps
+to one datagram per call; `AVIAN_UDP_GSO=0` forces that. A full socket keeps
 the pending run and waits for writability.
 
 ### Transport parameters
@@ -361,7 +361,7 @@ of data, with line breaks in event names and IDs replaced.
 ## WebSocket
 
 Framing and UTF-8 validation (`WebSocketFrame.swift`) and permessage-deflate
-(`WebSocketDeflate.swift`, `garuda_wsdeflate.c`) exist with unit tests. There
+(`WebSocketDeflate.swift`, `avian_wsdeflate.c`) exist with unit tests. There
 is no handshake path. `--no-websockets` refuses an upgrade with 501; otherwise
 it goes to the routes like any request.
 

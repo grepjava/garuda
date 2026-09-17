@@ -7,7 +7,7 @@
 // request costs no allocation for the buffer after the first.
 //===----------------------------------------------------------------------===//
 
-import GarudaCore
+import AvianCore
 
 extension Response {
     /// Answers with `value` as JSON, and `content-type: application/json`.

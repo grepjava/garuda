@@ -15,9 +15,9 @@
 // because the proxy saw the request first.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
-import GarudaHTTP
+import CAvian
+import AvianCore
+import AvianHTTP
 
 extension Worker {
 
@@ -28,6 +28,6 @@ extension Worker {
         // Wall-clock already: an agent compares it with its own clock, and on
         // plaintext it came from the kernel's receive timestamp.
         let started = table[slot].pointee.headStartUs
-        return started > 0 ? started : pg_realtime_us()
+        return started > 0 ? started : av_realtime_us()
     }
 }

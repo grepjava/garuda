@@ -17,8 +17,8 @@
 // the moment something is already wrong.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 /// A name and what was asked about it. A and AAAA are separate questions with
 /// separate answers, so they are separate entries.

@@ -10,8 +10,12 @@ import PackageDescription
 
 let sharedSwiftSettings: [SwiftSetting] = [
     .swiftLanguageMode(.v6),
-    .define("GARUDA_RELEASE", .when(configuration: .release)),
 ]
+
+/// A module of aviancore, the protocol and systems layers Garuda is built on.
+func avian(_ name: String) -> Target.Dependency {
+    .product(name: name, package: "aviancore")
+}
 
 let package = Package(
     name: "garuda",
@@ -23,42 +27,26 @@ let package = Package(
         .library(name: "Garuda", targets: ["Garuda"]),
         .library(name: "GarudaUploads", targets: ["GarudaUploads"]),
     ],
+    dependencies: [
+        // The protocol and systems layers: syscalls, TLS, buffers, the poller,
+        // HTTP/1.1, HTTP/2, HTTP/3 and QUIC.
+        .package(url: "https://github.com/grepjava/aviancore", from: "0.1.0"),
+    ],
     targets: [
-        .target(
-            name: "CGaruda",
-            path: "Sources/CGaruda",
-            cSettings: [
-                .headerSearchPath("include"),
-            ],
-            linkerSettings: [
-                .linkedLibrary("ssl"),
-                .linkedLibrary("crypto"),
-                .linkedLibrary("z"),
-            ]
-        ),
-
-        .target(name: "GarudaCore", dependencies: ["CGaruda"],
-                swiftSettings: sharedSwiftSettings),
-
-        .target(name: "GarudaHTTP", dependencies: ["GarudaCore"],
-                swiftSettings: sharedSwiftSettings),
-
-        .target(name: "GarudaQUIC", dependencies: ["GarudaCore", "GarudaHTTP"],
-                swiftSettings: sharedSwiftSettings),
-
         // Database protocols as byte-level state machines: no sockets, no
         // poller, so each is tested against recorded exchanges.
-        .target(name: "GarudaPostgres", dependencies: ["GarudaCore", "CGaruda"],
+        .target(name: "GarudaPostgres", dependencies: [avian("CAvian"), avian("AvianCore")],
                 swiftSettings: sharedSwiftSettings),
 
         // The engine and the handler API: `import Garuda`.
         .target(name: "Garuda",
-                dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC", "GarudaPostgres"],
+                dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
+                               "GarudaPostgres"],
                 swiftSettings: sharedSwiftSettings),
 
         // Resumable uploads (draft-ietf-httpbis-resumable-upload), built on the
         // public handler API alone: `import GarudaUploads`.
-        .target(name: "GarudaUploads", dependencies: ["GarudaHTTP", "Garuda"],
+        .target(name: "GarudaUploads", dependencies: [avian("AvianHTTP"), "Garuda"],
                 swiftSettings: sharedSwiftSettings),
 
         // The `garuda` executable. Its module is not named `garuda`, which a
@@ -69,27 +57,27 @@ let package = Package(
 
         // The routes the end-to-end suites need a handler for.
         .executableTarget(name: "garuda-conformance",
-                          dependencies: ["GarudaCore", "GarudaHTTP", "Garuda", "GarudaUploads"],
+                          dependencies: [avian("AvianCore"), avian("AvianHTTP"), "Garuda", "GarudaUploads"],
                           path: "Sources/GarudaConformance",
                           swiftSettings: sharedSwiftSettings),
 
         .target(name: "GarudaFuzzTargets",
-                dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC", "Garuda"],
+                dependencies: [avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"), "Garuda"],
                 swiftSettings: sharedSwiftSettings),
 
         .executableTarget(name: "pgfuzz",
-                          dependencies: ["CGaruda", "GarudaFuzzTargets"],
+                          dependencies: [avian("CAvian"), "GarudaFuzzTargets"],
                           swiftSettings: sharedSwiftSettings),
 
         // Counts heap allocations in the test process, on glibc.
         .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),
 
         .testTarget(name: "GarudaTests",
-                    dependencies: ["GarudaCore", "GarudaHTTP", "GarudaQUIC", "GarudaPostgres",
-                                   "Garuda", "GarudaFuzzTargets", "CAllocationCounter"],
+                    dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
+                                   "GarudaPostgres", "Garuda", "GarudaFuzzTargets", "CAllocationCounter"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "GarudaUploadsTests",
-                    dependencies: ["GarudaHTTP", "Garuda", "GarudaUploads"],
+                    dependencies: [avian("CAvian"), avian("AvianHTTP"), "Garuda", "GarudaUploads"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
     ],
     cLanguageStandard: .gnu11

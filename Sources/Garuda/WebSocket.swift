@@ -2,7 +2,7 @@
 // application-level WebSocket handling yet: an upgrade request is routed like
 // any other request, or refused with 501 under --no-websockets.
 
-import GarudaHTTP
+import AvianHTTP
 
 public struct WebSocketState {
     public var accepted = false

@@ -21,8 +21,8 @@
 // the client preface rather than a request line.
 //===----------------------------------------------------------------------===//
 
-import CGaruda
-import GarudaCore
+import CAvian
+import AvianCore
 
 /// A server-wide TLS configuration. One per worker: an SSL_CTX is shareable,
 /// but a worker is a process and sharing it across a fork buys nothing.
@@ -36,7 +36,7 @@ public final class TLSContext {
                             ciphers: UnsafePointer<CChar>?) -> TLSContext? {
         var error = [CChar](repeating: 0, count: 256)
         let ctx: OpaquePointer? = error.withUnsafeMutableBufferPointer { buffer in
-            pg_tls_ctx_new(certPath, keyPath, alpn, ciphers, buffer.baseAddress, 256)
+            av_tls_ctx_new(certPath, keyPath, alpn, ciphers, buffer.baseAddress, 256)
         }
         guard let ctx else {
             error.withUnsafeBufferPointer { buffer in
@@ -61,7 +61,7 @@ public final class TLSContext {
                     ciphers: UnsafePointer<CChar>?) -> Bool {
         var error = [CChar](repeating: 0, count: 256)
         let ok = error.withUnsafeMutableBufferPointer { buffer in
-            pg_tls_ctx_add(raw, certPath, keyPath, ciphers, buffer.baseAddress, 256)
+            av_tls_ctx_add(raw, certPath, keyPath, ciphers, buffer.baseAddress, 256)
         }
         if ok == 0 {
             error.withUnsafeBufferPointer { buffer in
@@ -84,7 +84,7 @@ public final class TLSContext {
     /// name served by the wrong certificate is visible at start-up rather
     /// than in a browser warning.
     public func logCertificateNames() {
-        let hosts = Int(pg_tls_ctx_host_count(raw))
+        let hosts = Int(av_tls_ctx_host_count(raw))
         guard hosts > 1 else { return }
         var name = [CChar](repeating: 0, count: 256)
         for host in 0..<hosts {
@@ -92,7 +92,7 @@ public final class TLSContext {
             while true {
                 let found = name.withUnsafeMutableBufferPointer { buffer -> Bool in
                     guard let base = buffer.baseAddress else { return false }
-                    guard pg_tls_ctx_names(raw, Int32(host), Int32(index), base, 256) != 0
+                    guard av_tls_ctx_names(raw, Int32(host), Int32(index), base, 256) != 0
                     else { return false }
                     Log.info { line in
                         line.str("tls: certificate ")
@@ -111,7 +111,7 @@ public final class TLSContext {
 
     init(raw: OpaquePointer) { self.raw = raw }
 
-    deinit { pg_tls_ctx_free(raw) }
+    deinit { av_tls_ctx_free(raw) }
 }
 
 extension Worker {
@@ -122,15 +122,15 @@ extension Worker {
     @inline(__always)
     func connRead(_ slot: Int, _ p: UnsafeMutableRawPointer, _ n: Int) -> Int {
         let c = table[slot]
-        if let tls = c.pointee.tls { return pg_tls_read(tls, p, n) }
-        return pg_read(c.pointee.fd, p, n)
+        if let tls = c.pointee.tls { return av_tls_read(tls, p, n) }
+        return av_read(c.pointee.fd, p, n)
     }
 
     @inline(__always)
     func connWrite(_ slot: Int, _ p: UnsafeRawPointer, _ n: Int) -> Int {
         let c = table[slot]
-        if let tls = c.pointee.tls { return pg_tls_write(tls, p, n) }
-        return pg_write(c.pointee.fd, p, n)
+        if let tls = c.pointee.tls { return av_tls_write(tls, p, n) }
+        return av_write(c.pointee.fd, p, n)
     }
 
     /// Whether the transport is still holding data the poller will not
@@ -138,7 +138,7 @@ extension Worker {
     @inline(__always)
     func connHasBufferedInput(_ slot: Int) -> Bool {
         guard let tls = table[slot].pointee.tls else { return false }
-        return pg_tls_pending(tls) > 0
+        return av_tls_pending(tls) > 0
     }
 
     /// Whether a read could not finish until the socket is writable, which is
@@ -146,7 +146,7 @@ extension Worker {
     @inline(__always)
     func connWantsWrite(_ slot: Int) -> Bool {
         guard let tls = table[slot].pointee.tls else { return false }
-        return pg_tls_wants_write(tls) != 0
+        return av_tls_wants_write(tls) != 0
     }
 
     // MARK: - Handshake
@@ -156,7 +156,7 @@ extension Worker {
     mutating func beginTLS(_ slot: Int) -> Bool {
         guard let context = tlsContext else { return true }
         let c = table[slot]
-        guard let session = pg_tls_new(context.raw, c.pointee.fd) else {
+        guard let session = av_tls_new(context.raw, c.pointee.fd) else {
             Log.error("tls: cannot start a session")
             closeConnection(slot)
             return false
@@ -173,16 +173,16 @@ extension Worker {
         guard let session = c.pointee.tls else { return true }
         var error = [CChar](repeating: 0, count: 256)
         let outcome = error.withUnsafeMutableBufferPointer { buffer in
-            pg_tls_handshake(session, buffer.baseAddress, 256)
+            av_tls_handshake(session, buffer.baseAddress, 256)
         }
         switch outcome {
         case 1:
             c.pointee.flags.remove(.tlsHandshake)
             // ALPN has already decided which protocol this connection speaks.
-            if pg_tls_is_h2(session) != 0 { c.pointee.flags.insert(.alpnH2) }
+            if av_tls_is_h2(session) != 0 { c.pointee.flags.insert(.alpnH2) }
             // tls-alpn-01: the CA has seen the challenge certificate, which is
             // all it came for. RFC 8737 has the server close here.
-            if pg_tls_is_acme(session) != 0 {
+            if av_tls_is_acme(session) != 0 {
                 closeConnection(slot)
                 return false
             }
@@ -219,7 +219,7 @@ extension Worker {
         let c = table[slot]
         guard let session = c.pointee.tls else { return }
         c.pointee.tls = nil
-        if c.pointee.fd >= 0 { pg_tls_shutdown(session) }
-        pg_tls_free(session)
+        if c.pointee.fd >= 0 { av_tls_shutdown(session) }
+        av_tls_free(session)
     }
 }
