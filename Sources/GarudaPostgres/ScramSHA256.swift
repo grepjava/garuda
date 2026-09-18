@@ -17,9 +17,10 @@
 //     ceiling, PBKDF2 runs on the worker thread long enough to stall every
 //     request that worker is holding.
 //
-// Not done: SASLprep normalisation of the password. An ASCII password is
-// unaffected; a password whose normalised form differs from its UTF-8 bytes
-// will not authenticate. Said here so it is found here.
+// The password goes through SASLprep's mapping step first (`SaslPrep`), as
+// PostgreSQL does before it stores a verifier. NFKC normalisation is the one
+// step not carried out: a password already in normal form, which is what a
+// keyboard produces, is unaffected by it.
 //===----------------------------------------------------------------------===//
 
 import CAvian
@@ -59,7 +60,7 @@ public struct ScramSHA256Client {
     /// startup message and ignores this one.
     public init(username: String = "", password: String, nonce: String? = nil) {
         self.username = username
-        self.password = Array(password.utf8)
+        self.password = Array(SaslPrep.mapped(password).utf8)
         self.clientNonce = nonce ?? ScramSHA256Client.randomNonce()
         clientFirstBare = "n=\(ScramSHA256Client.escape(username)),r=\(clientNonce)"
     }

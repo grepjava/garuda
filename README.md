@@ -249,7 +249,10 @@ binary after the first run. `UUID`, `Timestamp`, `PostgresDate`,
 digits) and `PostgresJSON<T>` come without Foundation. An array column is a
 Swift list -- `[String]` for `text[]` -- and a list binds as one. `app.listen`
 hears `NOTIFY` in each worker, on a connection of its own, reconnecting with
-its channels when the server restarts.
+its channels when the server restarts. `copyIn` and `copyOut` are `COPY` in
+both directions, a chunk at a time; a composite type is a `PostgresRecord` and
+an enum is a Swift enum; and a server on this machine is reached over its unix
+socket.
 
 ### Redis
 
@@ -518,7 +521,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 831 unit tests, and the fuzz corpus
+swift test                                   # 849 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

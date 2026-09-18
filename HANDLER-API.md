@@ -288,9 +288,6 @@ wait once.
 
 ### Still to build
 
-**Step 3**
-- PostgreSQL: `COPY`, enums and composite types, SASLprep, unix sockets.
-
 **Step 6**
 - Benchmarks past hello-world against axum: path parameters, JSON in and out, a
   database round trip, streaming.

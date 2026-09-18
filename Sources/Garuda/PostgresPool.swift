@@ -277,6 +277,21 @@ public final class PostgresPool: @unchecked Sendable {
         }
     }
 
+    /// Lends one connection for as long as a `COPY` takes: the stream is the
+    /// connection's, so nothing else may have it until the copy is over.
+    func withConnectionForCopy<R>(_ body: (PostgresConnection) async throws -> R) async throws -> R {
+        guard let worker = currentWorker else { throw PostgresClientError.cancelled }
+        let connection = try await acquire(worker)
+        do {
+            let result = try await body(connection)
+            release(connection)
+            return result
+        } catch {
+            release(connection)
+            throw error
+        }
+    }
+
     /// For tests: how many connections exist, and how many are idle.
     var counts: (open: Int, idle: Int) { (open, idle.count) }
     /// For tests: how many statements are queued for a connection.

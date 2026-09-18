@@ -686,6 +686,32 @@ public enum PostgresFrontend {
         return true
     }
 
+    /// Data for a `COPY ... FROM STDIN`. The bytes are whatever format the
+    /// statement asked for, and are sent as they are.
+    public static func copyData(_ bytes: [UInt8], into out: inout ByteBuffer) {
+        let start = begin(UInt8(ascii: "d"), &out)
+        bytes.withUnsafeBufferPointer { p in
+            if let base = p.baseAddress, p.count > 0 { out.write(base, p.count) }
+        }
+        endMessage(&out, start)
+    }
+
+    /// The end of the data: the server then runs what it has been given.
+    public static func copyDone(into out: inout ByteBuffer) {
+        let start = begin(UInt8(ascii: "c"), &out)
+        endMessage(&out, start)
+    }
+
+    /// Abandons a `COPY ... FROM STDIN`, which the server reports as an error
+    /// carrying `message`, rather than running half a load.
+    public static func copyFail(_ message: String, into out: inout ByteBuffer) -> Bool {
+        guard !message.utf8.contains(0) else { return false }
+        let start = begin(UInt8(ascii: "f"), &out)
+        writeCString(message, into: &out)
+        endMessage(&out, start)
+        return true
+    }
+
     public static func sync(into out: inout ByteBuffer) {
         out.writeByte(UInt8(ascii: "S"))
         writeInt32(4, into: &out)

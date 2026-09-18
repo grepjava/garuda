@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 831 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 849 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -410,6 +410,30 @@ The Python suites need `h2` and `aioquic`.
   is that column rather than a row of columns, as bytes already were.
   `PostgresType.elementType(of:)` and `PostgresArrayText` are public for a
   driver of your own.
+- `COPY` in both directions: `pool.copyIn(sql, rows:)` loads rows without a
+  round trip each, `pool.copyIn(sql) { ... }` streams whatever bytes the
+  statement's format asks for, and `pool.copyOut(sql) { chunk in ... }` reads a
+  table out a chunk at a time, with `copyOutRows` for the text format's rows.
+  `PostgresCopyText` writes and reads that format -- tabs, `\N` for a null,
+  and a backslash before anything that would be punctuation. A `copyIn` whose
+  closure throws sends `CopyFail`, so the server keeps none of the load and the
+  connection stays usable; a `copyOut` whose closure throws closes the
+  connection, since a copy out cannot be stopped politely. Both are on
+  `PostgresTransaction` as well, where a load belongs to the transaction.
+- Composite types are `PostgresRecord`: the fields in order, since the wire
+  carries no names, read from `(a,b,"c,d")` and bound back as one. An enum
+  needs nothing of its own -- it arrives as its label, so a Swift enum backed
+  by `String` reads it -- which is now tested rather than assumed.
+- PostgreSQL over a unix socket: `PostgresConfiguration(unixSocketPath:user:)`,
+  or `?host=/var/run/postgresql` in a URL, or the path percent-encoded where
+  the host goes. The path may name the socket or the directory holding it, as
+  libpq's does. TLS is off for a socket, and asking for it anyway is
+  `tlsUnavailable` rather than a quiet fallback.
+- SASLprep's mapping step is applied to a password before SCRAM, as the server
+  applies it before storing a verifier: a non-ASCII space becomes a space and
+  a soft hyphen goes. A password that was pasted with a non-breaking space in
+  it now authenticates. NFKC normalisation is still not done, and
+  [CONNECTORS.md](CONNECTORS.md) says so.
 - Redis Cluster: `RedisCluster(seeds:)` is a pool per node and a map of which
   node owns which of the 16,384 slots, read with `CLUSTER SLOTS`. It is a
   `RedisCommandSender`, so every typed command a pool has it has too, aimed at

@@ -12,9 +12,16 @@
 // and parameters after `?`. User, password and database are percent-decoded,
 // so a password with an `@` or a `/` in it survives.
 //
-// Understood parameters: `sslmode`, `sslrootcert` (a trust store) and
-// `connect_timeout` (seconds). Others -- `application_name`, a pooler's own --
-// are ignored rather than refused, because a platform's URL often carries them.
+// Understood parameters: `sslmode`, `sslrootcert` (a trust store),
+// `connect_timeout` (seconds) and `host` when it names a unix socket. Others
+// -- `application_name`, a pooler's own -- are ignored rather than refused,
+// because a platform's URL often carries them.
+//
+// A socket is written either way libpq takes it, and means TLS is off unless
+// `sslmode` says otherwise:
+//
+//     postgres://app@/shop?host=/var/run/postgresql
+//     postgres://app@%2Fvar%2Frun%2Fpostgresql/shop
 //
 // `sslmode=prefer` and `sslmode=allow` are refused rather than taken as
 // either: they try TLS and fall back to plaintext when the server declines,
@@ -87,7 +94,13 @@ extension PostgresConfiguration {
             host = String(host[host.startIndex..<colon])
         }
         host = percentDecoded(host)
-        guard !host.isEmpty else { throw .noHost }
+        // The two ways libpq names a socket: `host=/path` among the
+        // parameters, with nothing where the host goes, or the path itself
+        // percent-encoded there. Either is a socket rather than a name to
+        // resolve.
+        let socket = parameters["host"].flatMap { $0.hasPrefix("/") ? $0 : nil }
+            ?? (host.hasPrefix("/") ? host : nil)
+        guard !host.isEmpty || socket != nil else { throw .noHost }
 
         var user = "postgres"
         var password = ""
@@ -98,10 +111,20 @@ extension PostgresConfiguration {
             if halves.count > 1 { password = percentDecoded(String(halves[1])) }
         }
 
-        self.init(host: host, port: port, user: user, password: password, database: database)
+        if let socket {
+            self.init(unixSocketPath: socket, user: user, password: password, database: database,
+                      port: port)
+        } else {
+            self.init(host: host, port: port, user: user, password: password, database: database)
+        }
 
         switch parameters["sslmode"] {
-        case nil, "require", "verify-ca", "verify-full":
+        case nil:
+            // A socket has no network to encrypt and PostgreSQL will not
+            // negotiate TLS on one; anything else requires it, as
+            // `PostgresConfiguration` does.
+            tls = socket == nil ? .require : .disable
+        case "require", "verify-ca", "verify-full":
             tls = .require
         case "disable":
             tls = .disable

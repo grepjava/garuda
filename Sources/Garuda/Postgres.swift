@@ -22,6 +22,10 @@ public struct PostgresConfiguration: Sendable {
 
     public var host: String
     public var port: UInt16
+    /// A unix socket to connect to instead of `host` and `port`: either the
+    /// socket itself, or the directory PostgreSQL keeps it in, which is what
+    /// `unix_socket_directories` names and what libpq's `host=/...` means.
+    public var unixSocketPath: String?
     public var user: String
     public var password: String
     public var database: String?
@@ -51,6 +55,32 @@ public struct PostgresConfiguration: Sendable {
         self.user = user
         self.password = password
         self.database = database
+    }
+
+    /// A server on this machine, over a unix socket.
+    ///
+    /// TLS is `.disable`, as it is for libpq: a socket has no network for
+    /// anyone to be on. `peer` and `trust` authentication need no password,
+    /// so it is empty unless given.
+    public init(unixSocketPath: String, user: String, password: String = "",
+                database: String? = nil, port: UInt16 = 5432) {
+        self.host = unixSocketPath
+        self.port = port
+        self.unixSocketPath = unixSocketPath
+        self.user = user
+        self.password = password
+        self.database = database
+        self.tls = .disable
+    }
+
+    /// The socket to connect to: the path as given when it names the socket
+    /// itself, and the directory's `.s.PGSQL.<port>` when it names a
+    /// directory -- which is how PostgreSQL names its own.
+    var socketPath: String? {
+        guard let path = unixSocketPath else { return nil }
+        if path.contains(".s.PGSQL.") { return path }
+        let base = path.hasSuffix("/") ? String(path.dropLast()) : path
+        return "\(base)/.s.PGSQL.\(port)"
     }
 }
 
@@ -134,16 +164,28 @@ final class PostgresConnection {
         let socket: OutboundSocket
         do {
             // Keyed apart from every HTTP connection to the same place.
-            socket = try await Worker.connect(worker, name: configuration.host,
-                                              port: configuration.port,
-                                              tls: "\u{0}postgres", milliseconds: ms)
-        } catch {
+            if let path = configuration.socketPath {
+                // A socket carries no TLS: there is no network on it to
+                // encrypt, and PostgreSQL will not negotiate it there.
+                guard configuration.tls == .disable else { throw PostgresClientError.tlsUnavailable }
+                socket = try await Worker.connect(worker, path: path, tls: "\u{0}postgres",
+                                                  milliseconds: ms)
+            } else {
+                socket = try await Worker.connect(worker, name: configuration.host,
+                                                  port: configuration.port,
+                                                  tls: "\u{0}postgres", milliseconds: ms)
+            }
+        } catch let error as PostgresClientError {
+            throw error
+        } catch let error as OutboundError {
             throw .connect(error)
+        } catch {
+            throw .closed
         }
 
         do {
             var encrypted = false
-            if configuration.tls == .require {
+            if configuration.tls == .require, configuration.socketPath == nil {
                 var out = ByteBuffer(capacity: 16)
                 PostgresFrontend.sslRequest(into: &out)
                 let request = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
@@ -554,3 +596,160 @@ final class PostgresConnection {
         }
     }
 }
+
+extension PostgresConnection {
+    /// Runs a `COPY ... TO STDOUT` and hands each chunk of it to `chunk` as it
+    /// arrives.
+    ///
+    /// A chunk is not a row: the server sends a byte stream and splits it
+    /// where it likes. `PostgresCopyText.rows` makes rows of it, or
+    /// `copyOut(_:rows:)` does that for you.
+    ///
+    /// A `chunk` that throws ends the copy by closing the connection: a COPY
+    /// out cannot be stopped politely, and reading a table to its end to be
+    /// tidy about it would be worse.
+    @discardableResult
+    func copyOut(_ sql: String, _ chunk: (ArraySlice<UInt8>) throws -> Void) async throws -> Int {
+        var copy = PostgresCopy(sql)
+        let ms = configuration.timeoutMilliseconds
+        let bytes: [UInt8]
+        do { bytes = try copy.messages() } catch { throw PostgresClientError.postgres(error) }
+        var thrown: (any Error)? = nil
+        do {
+            try await PostgresConnection.writeAll(socket, bytes, ms)
+            var buffer = ByteBuffer(capacity: 16_384)
+            defer { buffer.destroy() }
+            while true {
+                let (type, reader) = try await PostgresConnection.nextMessage(socket, &buffer, configuration)
+                let step: PostgresCopyStep
+                do {
+                    step = try copy.receive(type, reader)
+                } catch {
+                    throw PostgresClientError.postgres(error)
+                }
+                if case .data(let range) = step, thrown == nil {
+                    // The reader's bytes belong to the buffer, which the next
+                    // read may move: the closure sees them before then.
+                    let raw = UnsafeBufferPointer(start: reader.base + range.lowerBound,
+                                                  count: range.count)
+                    do {
+                        try chunk(ArraySlice(raw))
+                    } catch {
+                        thrown = error
+                    }
+                }
+                buffer.consume(5 + reader.count)
+                if thrown != nil {
+                    // Nothing can be said to stop it, so the connection goes.
+                    socket.close()
+                    break
+                }
+                if step == .finished {
+                    transactionStatus = copy.transactionStatus
+                    if collectsNotifications { notifications.append(contentsOf: copy.notifications) }
+                    guard buffer.readableBytes == 0 else {
+                        throw PostgresClientError.postgres(.unexpectedMessage(buffer.readPointer[0]))
+                    }
+                    switch copy.result() {
+                    case .success: return copy.copied
+                    case .failure(let error): throw PostgresClientError.postgres(error)
+                    }
+                }
+            }
+        } catch let error as PostgresClientError {
+            if case .postgres(.server) = error {} else { socket.close() }
+            throw error
+        } catch {
+            socket.close()
+            throw error
+        }
+        throw thrown ?? PostgresClientError.closed
+    }
+
+    /// Runs a `COPY ... FROM STDIN`, asking `next` for data until it returns
+    /// nil, and returns how many rows the server took.
+    ///
+    /// A `next` that throws tells the server so with CopyFail, which makes it
+    /// refuse the whole load rather than keep half of it, and then the error
+    /// is thrown on.
+    @discardableResult
+    func copyIn(_ sql: String, _ next: () throws -> [UInt8]?) async throws -> Int {
+        var copy = PostgresCopy(sql)
+        let ms = configuration.timeoutMilliseconds
+        let bytes: [UInt8]
+        do { bytes = try copy.messages() } catch { throw PostgresClientError.postgres(error) }
+        var thrown: (any Error)? = nil
+        do {
+            try await PostgresConnection.writeAll(socket, bytes, ms)
+            var buffer = ByteBuffer(capacity: 8_192)
+            defer { buffer.destroy() }
+            while true {
+                let (type, reader) = try await PostgresConnection.nextMessage(socket, &buffer, configuration)
+                let step: PostgresCopyStep
+                do {
+                    step = try copy.receive(type, reader)
+                } catch {
+                    throw PostgresClientError.postgres(error)
+                }
+                buffer.consume(5 + reader.count)
+                switch step {
+                case .ready:
+                    // The server is taking data. Whatever `next` gives goes in
+                    // one message at a time, and its size is the caller's
+                    // choice: a row, a batch, a file's worth.
+                    var out = ByteBuffer(capacity: 16_384)
+                    defer { out.destroy() }
+                    while true {
+                        let piece: [UInt8]?
+                        do {
+                            piece = try next()
+                        } catch {
+                            thrown = error
+                            break
+                        }
+                        guard let piece, !piece.isEmpty else { break }
+                        out.clear()
+                        PostgresFrontend.copyData(piece, into: &out)
+                        try await PostgresConnection.writeAll(
+                            socket,
+                            Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes)),
+                            ms)
+                    }
+                    out.clear()
+                    if let thrown {
+                        // Said out loud, so the server discards the load
+                        // rather than committing what arrived before the
+                        // trouble.
+                        _ = PostgresFrontend.copyFail("the client stopped: \(thrown)", into: &out)
+                    } else {
+                        PostgresFrontend.copyDone(into: &out)
+                    }
+                    try await PostgresConnection.writeAll(
+                        socket,
+                        Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes)), ms)
+                case .finished:
+                    transactionStatus = copy.transactionStatus
+                    if collectsNotifications { notifications.append(contentsOf: copy.notifications) }
+                    guard buffer.readableBytes == 0 else {
+                        throw PostgresClientError.postgres(.unexpectedMessage(buffer.readPointer[0]))
+                    }
+                    if let thrown { throw thrown }
+                    switch copy.result() {
+                    case .success: return copy.copied
+                    case .failure(let error): throw PostgresClientError.postgres(error)
+                    }
+                case .wait, .data, .done:
+                    continue
+                }
+            }
+        } catch let error as PostgresClientError {
+            if case .postgres(.server) = error {} else { socket.close() }
+            throw error
+        } catch {
+            // A CopyFail was sent and the server's answer read, so the
+            // connection is fine; it is the caller's error that is thrown.
+            throw error
+        }
+    }
+}
+

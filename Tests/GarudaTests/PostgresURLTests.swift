@@ -95,4 +95,41 @@ struct PostgresURLTests {
             }
         }
     }
+
+    /// A unix socket, written either way libpq takes it.
+    @Test func aSocketIsNamedByPathOrByParameter() throws {
+        let asParameter = try PostgresConfiguration(url: "postgres://app@/shop?host=/var/run/postgresql")
+        #expect(asParameter.unixSocketPath == "/var/run/postgresql")
+        #expect(asParameter.socketPath == "/var/run/postgresql/.s.PGSQL.5432")
+        #expect(asParameter.user == "app" && asParameter.database == "shop")
+        #expect(asParameter.tls == .disable, "a socket has no network to encrypt")
+
+        let asHost = try PostgresConfiguration(url: "postgres://app:secret@%2Fvar%2Frun%2Fpostgresql/shop")
+        #expect(asHost.unixSocketPath == "/var/run/postgresql")
+        #expect(asHost.password == "secret")
+
+        // A port still says which server in the directory, as PostgreSQL
+        // names its socket after it.
+        let other = try PostgresConfiguration(url: "postgres://app@:55432/shop?host=/tmp/sock")
+        #expect(other.socketPath == "/tmp/sock/.s.PGSQL.55432")
+        // A path that names the socket itself is used as it stands.
+        let exact = try PostgresConfiguration(url: "postgres://app@/shop?host=/tmp/.s.PGSQL.55432")
+        #expect(exact.socketPath == "/tmp/.s.PGSQL.55432")
+        // A trailing slash on the directory is not two.
+        let trailing = try PostgresConfiguration(unixSocketPath: "/tmp/sock/", user: "app", port: 5433)
+        #expect(trailing.socketPath == "/tmp/sock/.s.PGSQL.5433")
+
+        // Asked for TLS on a socket: kept, so that connecting says so rather
+        // than quietly going without it.
+        let insisting = try PostgresConfiguration(url: "postgres://app@/shop?host=/tmp&sslmode=require")
+        #expect(insisting.tls == .require)
+
+        // A host that is neither a name nor a path is still no host.
+        #expect(throws: PostgresURLError.noHost) {
+            try PostgresConfiguration(url: "postgres:///shop")
+        }
+        #expect(throws: PostgresURLError.noHost) {
+            try PostgresConfiguration(url: "postgres://app@/shop?host=db.internal")
+        }
+    }
 }

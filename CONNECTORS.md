@@ -14,7 +14,7 @@ change is in [RELEASE.md](RELEASE.md).
 | Connector | Status | Not supported |
 |---|---|---|
 | [HTTP client](#http-client) | Done | HTTP/3, proxies |
-| [PostgreSQL](#postgresql) | Done | Some types, `COPY`, unix sockets, several hosts |
+| [PostgreSQL](#postgresql) | Done | Ranges and `hstore`, replica routing |
 | [Redis](#redis) | Done | Replica reads, client-side caching |
 | [SQLite](#sqlite) | Done | Interrupting a statement, backups, custom functions |
 
@@ -79,6 +79,41 @@ try await pool.query(Note.self, "select id, tags from notes where $1 = any(tags)
 dimension, which Swift's nested lists are not, so `{{1,2},{3,4}}` is refused
 rather than flattened.
 
+`pool.copyIn` and `pool.copyOut` are `COPY`, the protocol's own bulk path: a
+million rows in without a million round trips, and a table out without holding
+it in memory.
+
+```swift
+try await pool.copyIn("copy users (name, email) from stdin",
+                      rows: people.map { [$0.name, $0.email] })
+
+try await pool.copyOutRows("copy users to stdout") { row in
+    try file.write(row)
+}
+```
+
+`rows:` and `copyOutRows` speak COPY's text format, which `PostgresCopyText`
+writes and reads; the closure forms take and give bytes, so `csv` or `binary`
+in the statement is yours to format. A `copyIn` whose closure throws tells the
+server with `CopyFail`, which makes it keep none of what arrived. Both are on
+a transaction too, where a load is part of it: there if it commits, gone if it
+does not.
+
+A composite type is a `PostgresRecord` -- its fields in order, since the wire
+carries no names -- and binds back as one. An enum needs nothing of its own: it
+arrives as its label, so a Swift enum backed by `String` reads it.
+
+A server on the same machine is reached over its socket, which is how `peer`
+authentication works:
+
+```swift
+PostgresConfiguration(unixSocketPath: "/var/run/postgresql", user: "app")
+try PostgresConfiguration(url: "postgres://app@/shop?host=/var/run/postgresql")
+```
+
+TLS is off for a socket -- there is no network on it -- and asking for it
+anyway is refused rather than quietly gone without.
+
 `LISTEN` and `NOTIFY` carry news from one process to the others, across
 machines as well as workers. A listener holds a connection of its own, which
 the pool does not count: a session that has listened is spoken to at any
@@ -105,21 +140,22 @@ by the server, so a notification is a key, not a document.
 
 ### Not supported
 
-- `COPY`.
 - Arrays of more than one dimension, and arrays of a type with no reader of
   its own, which are read as text.
-- Ranges, `hstore`, enums and composite types, which are read as text.
+- Ranges and `hstore`, which are read as text.
 - `money`, `bit`, `tsvector`, PostGIS: text as well.
-- Unix-domain sockets. The driver connects over TCP only.
-- SASLprep, so a password with non-ASCII characters may not authenticate.
+- SASLprep's NFKC step. The mapping step is done, so a non-ASCII space or a
+  soft hyphen in a password is what the server made of it; a password holding
+  a compatibility character -- a ligature, a full-width digit -- has to be in
+  normal form already.
 - Several hosts in one configuration, and sending reads to a replica. A pool
   talks to one server.
 
 ### Future work
 
-- `COPY` in both directions, streamed.
-- Enums and composite types as Swift types.
-- Unix-domain sockets, SASLprep, and a list of hosts to try in order.
+- Ranges and `hstore` as Swift types.
+- A list of hosts to try in order.
+- Binary `COPY`, which today is bytes the caller formats.
 
 ## Redis
 

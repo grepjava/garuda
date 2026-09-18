@@ -30,6 +30,17 @@ private let target: PostgresConfiguration? = {
     return configuration
 }()
 
+/// The same server over a unix socket, when GARUDA_POSTGRES_SOCKET names the
+/// directory it keeps one in.
+private let socketTarget: PostgresConfiguration? = {
+    guard let raw = av_getenv("GARUDA_POSTGRES_SOCKET"), let over = target else { return nil }
+    var configuration = PostgresConfiguration(unixSocketPath: String(cString: raw),
+                                              user: over.user, password: over.password,
+                                              database: over.database, port: over.port)
+    configuration.timeoutMilliseconds = 5_000
+    return configuration
+}()
+
 private func app() -> Application {
     let app = Application()
     app.onAsync(.get, "/run") { request, response in
@@ -493,6 +504,44 @@ struct PostgresIntegrationTests {
             return outcomes.joined(separator: "|")
         }
         #expect(text == "text refused|binary refused|infinity=infinity|text refused|binary refused|-infinity=-infinity")
+    }
+
+    /// Over a unix socket, which is how a server on the same machine is
+    /// usually reached. No TLS: there is no network on it to encrypt.
+    @Test(.enabled(if: socketTarget != nil, "set GARUDA_POSTGRES_SOCKET to run"))
+    func aUnixSocketConnects() throws {
+        let configuration = socketTarget!
+        let text = try onWorker { worker in
+            do {
+                let connection = try await PostgresConnection.connect(worker, configuration)
+                defer { connection.close() }
+                let rows = try await connection.query(
+                    "select $1::int + 1 as answer, current_setting('unix_socket_directories') <> '' as socketed",
+                    ["41"])
+                return (rows.text(row: 0, column: 0) ?? "null") + "|" + (rows.text(row: 0, column: 1) ?? "null")
+            } catch {
+                return describe(error)
+            }
+        }
+        #expect(text == "42|t", "\(text)")
+    }
+
+    /// TLS over a socket is refused rather than quietly gone without.
+    @Test(.enabled(if: socketTarget != nil, "set GARUDA_POSTGRES_SOCKET to run"))
+    func tlsOverASocketIsRefused() throws {
+        var insisting = socketTarget!
+        insisting.tls = .require
+        let configuration = insisting
+        let text = try onWorker { worker in
+            do {
+                let connection = try await PostgresConnection.connect(worker, configuration)
+                connection.close()
+                return "connected"
+            } catch {
+                return describe(error)
+            }
+        }
+        #expect(text == "tlsUnavailable", "\(text)")
     }
 
     @Test func theSessionIsAskedForUTF8AndISODates() throws {
