@@ -248,6 +248,48 @@ struct SQLiteConnectionTests {
         #expect(throws: SQLiteClientError.self) { try SQLiteDatabase(configuration) }
     }
 
+    /// A reader opens the file read-write, so that it can attach the
+    /// shared-memory index a write-ahead log is read through; what stops it
+    /// writing is `PRAGMA query_only`, not the open flags. This is that
+    /// guarantee, and it is here because it used to be the open flag's to
+    /// keep: a statement misrouted to a reader has to be refused, not run.
+    ///
+    /// The refusal is caught with a plain `catch` and a cast rather than
+    /// `catch let error as SQLiteClientError`: Swift 6.3.3 crashes in its
+    /// ownership verifier on the typed catch in this function, reliably, and
+    /// the two spellings mean the same thing.
+    @Test func aReaderIsHeldToReadsBySQLiteItself() throws {
+        let file = TemporaryDatabase("query-only")
+        let writer = try open(file)
+        _ = try writer.run("create table t (n integer)", [])
+
+        var configuration = SQLiteConfiguration(path: file.path)
+        configuration.busyTimeoutMilliseconds = 500
+        let reader = try SQLiteConnection.open(configuration, readOnly: true)
+        #expect(try reader.run("select count(*) from t", []).value(row: 0, column: 0)
+                    == .integer(0))
+        var refused = 0
+        do {
+            _ = try reader.run("insert into t values (1)", [])
+        } catch {
+            refused = Int(((error as? SQLiteClientError)?.sqliteCode ?? 0) & 0xFF)
+        }
+        // SQLITE_READONLY, which is what the read-only open flag gave before.
+        #expect(refused == 8)
+        #expect(try writer.run("select count(*) from t", []).value(row: 0, column: 0)
+                    == .integer(0))
+    }
+
+    /// The file is still not brought into being by a reader: it opens
+    /// read-write, and without CREATE.
+    @Test func aReaderDoesNotCreateAMissingFile() throws {
+        let file = TemporaryDatabase("reader-missing")
+        let configuration = SQLiteConfiguration(path: file.path)
+        #expect(throws: SQLiteClientError.self) {
+            try SQLiteConnection.open(configuration, readOnly: true)
+        }
+    }
+
     @Test func timestampsBindAsTextThatSortsAndSQLiteReads() throws {
         let file = TemporaryDatabase("time")
         let c = try open(file)
@@ -770,18 +812,19 @@ struct SQLiteDatabaseTests {
         let path = file.path
         let result = try run(file) { db in
             do {
+                // The first of these runs on the writer, which is where the
+                // pool learns that the statement only reads; the second is
+                // the first to want a reader, and so the first to open a
+                // second connection. That is where macOS failed, and a
+                // read-only connection cannot create the -shm file a WAL
+                // database is read through -- which is why a reader no longer
+                // opens read-only. If this ever fails again, which of those
+                // files exist is the thing to know.
+                _ = try await db.first(Int.self, "select 1")
                 _ = try await db.first(Int.self, "select 1")
             } catch {
-                // macOS fails here, and nowhere else, and serially as well as
-                // in parallel: the very first read-only connection will not
-                // open. A read-only connection cannot create a WAL
-                // database's -shm file, so it cannot be the first to open
-                // one, and this is the only test whose database is never
-                // written to. Whether the writer left those files behind is
-                // what says whether that is the reason.
-                return "the first read failed: \(error); files: \(databaseFiles(path))"
+                return "a read failed: \(error); files: \(databaseFiles(path))"
             }
-            _ = try await db.first(Int.self, "select 1")
             db.close()
             do {
                 _ = try await db.first(Int.self, "select 1")

@@ -278,8 +278,29 @@ final class SQLiteConnection: @unchecked Sendable {
     /// on another process's lock to switch the file to WAL.
     static func open(_ configuration: SQLiteConfiguration, readOnly: Bool) throws(SQLiteClientError) -> SQLiteConnection {
         guard gsq_available() != 0 else { throw .unavailable }
+        // A pool's reader opens the file read-write and is held to reads by
+        // SQLite rather than by the open flags. A read-only connection cannot
+        // create the -shm file a write-ahead log is read through, so it cannot
+        // be the first to open a WAL database that nothing has written to yet:
+        // on Darwin's SQLite that is "unable to open database file", and the
+        // first read of such a database failed. The file was opened for
+        // writing by this same pool a moment earlier, so nothing is given up
+        // by opening it that way again -- and CREATE is not passed, so a
+        // reader still never brings a database into being.
+        //
+        // A database configured read-only is a different thing: there the
+        // whole pool is read-only, the file may be one this process cannot
+        // write, and every connection opens read-only.
+        let fileReadOnly = configuration.mode == .readOnly
+        let holdToReads = readOnly && !fileReadOnly
         var flags = GSQ_OPEN_NOMUTEX | GSQ_OPEN_PRIVATECACHE
-        flags |= readOnly ? GSQ_OPEN_READONLY : (GSQ_OPEN_READWRITE | GSQ_OPEN_CREATE)
+        if readOnly && fileReadOnly {
+            flags |= GSQ_OPEN_READONLY
+        } else if readOnly {
+            flags |= GSQ_OPEN_READWRITE
+        } else {
+            flags |= GSQ_OPEN_READWRITE | GSQ_OPEN_CREATE
+        }
         var handle: OpaquePointer? = nil
         let rc = configuration.path.withCString { gsq_open($0, Int32(flags), &handle) }
         guard let handle else { throw .open(SQLiteFailure(extendedCode: rc, message: String(cString: gsq_errstr(rc)))) }
@@ -306,6 +327,13 @@ final class SQLiteConnection: @unchecked Sendable {
             }
             _ = try connection.run("PRAGMA synchronous=\(configuration.synchronous.rawValue)", [], cached: false)
             _ = try connection.run("PRAGMA foreign_keys=\(configuration.foreignKeys ? "ON" : "OFF")", [], cached: false)
+            // Last, so the settings above are still allowed to be made. From
+            // here SQLite refuses anything that would change the database on
+            // this connection, with SQLITE_READONLY, exactly as the read-only
+            // open flag would have.
+            if holdToReads {
+                _ = try connection.run("PRAGMA query_only=1", [], cached: false)
+            }
         } catch {
             connection.close()
             if case .sqlite(let failure) = error { throw .open(failure) }

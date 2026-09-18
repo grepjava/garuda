@@ -34,7 +34,7 @@ what CI keeps off a pull request:
 
 ```bash
 swift build -c release
-swift test                             # 946 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 948 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -925,6 +925,17 @@ The Python suites need `h2` and `aioquic`.
 - The reply parser is a `pgfuzz` target, `resp`.
 
 ### SQLite
+
+- A database that has never been written to can be read on macOS. A pool's
+  reader opened the file read-only, and a read-only connection cannot create
+  the shared-memory index a write-ahead log is read through, so it cannot be
+  the first to open a WAL database: on Darwin's SQLite the first read of a
+  fresh database failed with "unable to open database file". A reader now
+  opens the file read-write -- which the pool has just opened for writing
+  anyway, and still without CREATE, so a reader never brings a database into
+  being -- and is held to reads by `PRAGMA query_only`, which SQLite enforces
+  with the same SQLITE_READONLY it gave before. A test states that, since it
+  used to be the open flag's to keep.
 
 - `SQLiteDatabase`, built by `app.state`: the system's libsqlite3, loaded at
   run time, so building needs no SQLite headers. Where it cannot be loaded,
