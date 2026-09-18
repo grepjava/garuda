@@ -73,14 +73,17 @@ final class JSONWriter {
         var closing: UInt8 { self == .object ? 0x7D : 0x5D }
     }
 
-    private var buffer = ByteBuffer()
+    // Unchecked: a writer belongs to one `encode` on one thread, and the
+    // runtime's check on every access to these was a few percent of encoding
+    // an answer.
+    @exclusivity(unchecked) private var buffer = ByteBuffer()
     /// The containers still open, outermost first.
-    private var open: [Kind] = []
+    @exclusivity(unchecked) private var open: [Kind] = []
     /// Whether each open container has had an element written into it.
-    private var wrote: [Bool] = []
+    @exclusivity(unchecked) private var wrote: [Bool] = []
     /// The first failure from a call that could not throw, such as
     /// `Encoder.container(keyedBy:)`. Thrown by `finish`.
-    private var failure: JSONError? = nil
+    @exclusivity(unchecked) private var failure: JSONError? = nil
 
     /// The level a container just begun writes its elements at.
     var currentLevel: Int { open.count - 1 }

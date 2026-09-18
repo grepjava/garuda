@@ -459,8 +459,21 @@ private struct JSONValueReader {
         return value
     }
 
+    /// The standard library's scalars are read directly. `Array` and
+    /// `Optional` decode their elements through the generic `decode<T>`,
+    /// never the overload for the element's own type, so without this every
+    /// string in an array paid for a path, a decoder and a boxed
+    /// single-value container of its own.
     func decoded<T: Decodable>(_ type: T.Type) throws -> T {
-        try T(from: JSONDecoding(base: base, count: count, valueIndex: index, path: path))
+        if T.self == String.self { return unsafeBitCast(try string(), to: T.self) }
+        if T.self == Int.self { return unsafeBitCast(try signed(Int.self), to: T.self) }
+        if T.self == Bool.self { return unsafeBitCast(try bool(), to: T.self) }
+        if T.self == Double.self { return unsafeBitCast(try double(), to: T.self) }
+        if T.self == Int64.self { return unsafeBitCast(try signed(Int64.self), to: T.self) }
+        if T.self == Int32.self { return unsafeBitCast(try signed(Int32.self), to: T.self) }
+        if T.self == UInt64.self { return unsafeBitCast(try unsigned(UInt64.self), to: T.self) }
+        if T.self == UInt.self { return unsafeBitCast(try unsigned(UInt.self), to: T.self) }
+        return try T(from: JSONDecoding(base: base, count: count, valueIndex: index, path: path))
     }
 
     var isNull: Bool { JSONValue.isNull(base, count, at: index) }

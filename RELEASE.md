@@ -95,6 +95,15 @@ The Python suites need `h2` and `aioquic`.
 
 ### Requests and responses
 
+- The JSON coder writes and reads the standard library's scalars directly
+  when they arrive through a generic call, which is how `Array` and
+  `Optional` hand over every element: a `[String]` no longer costs a path,
+  an encoder and a boxed container per string. The writer's own state is
+  exempt from the runtime's exclusivity checks, and a JSON answer no longer
+  copies the whole worker to ask whether a content type was set. Decoding a
+  small body went from 2.6 to 1.8 µs and encoding one from 1.8 to 1.1 µs;
+  the JSON workload in `benchmarks/workloads.sh` went from 88,995 to 126,569
+  requests a second on the bench box, alongside axum's 124,704.
 - The JSON coder builds a value's coding path only when something reads it:
   an error, or a `Codable` conformance that looks. It was an array for every
   value in every document, and for an array element a number formatted as a

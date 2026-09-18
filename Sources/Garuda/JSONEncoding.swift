@@ -39,11 +39,50 @@ struct JSONEncoding: Encoder {
 
 /// Encodes `value` into the container at `level` under `key`. A value that
 /// writes nothing at all still owes its parent one, and gets an empty object.
-private func encodeValue(_ value: some Encodable, writer: JSONWriter, level: Int,
-                         key: String?, path: JSONPath) throws {
+///
+/// The standard library's scalars are written directly. `Array` and
+/// `Optional` encode their elements through the generic `encode<T>`, never
+/// the overload for the element's own type, so without this every string in
+/// an array paid for a path, an encoder and a boxed single-value container
+/// of its own -- most of what encoding `[String]` cost.
+private func encodeValue<T: Encodable>(_ value: T, writer: JSONWriter, level: Int,
+                                       key: String?, path: @autoclosure () -> JSONPath) throws {
+    if T.self == String.self {
+        writer.write(unsafeBitCast(value, to: String.self), level: level, key: key)
+        return
+    }
+    if T.self == Int.self {
+        writer.write(Int64(unsafeBitCast(value, to: Int.self)), level: level, key: key)
+        return
+    }
+    if T.self == Bool.self {
+        writer.write(unsafeBitCast(value, to: Bool.self), level: level, key: key)
+        return
+    }
+    if T.self == Double.self {
+        writer.write(unsafeBitCast(value, to: Double.self), level: level, key: key,
+                     path: describe(path().keys))
+        return
+    }
+    if T.self == Int64.self {
+        writer.write(unsafeBitCast(value, to: Int64.self), level: level, key: key)
+        return
+    }
+    if T.self == Int32.self {
+        writer.write(Int64(unsafeBitCast(value, to: Int32.self)), level: level, key: key)
+        return
+    }
+    if T.self == UInt64.self {
+        writer.write(unsafeBitCast(value, to: UInt64.self), level: level, key: key)
+        return
+    }
+    if T.self == UInt.self {
+        writer.write(UInt64(unsafeBitCast(value, to: UInt.self)), level: level, key: key)
+        return
+    }
     let before = writer.isEmpty
     let mark = writer.currentLevel
-    try value.encode(to: JSONEncoding(writer: writer, level: level, key: key, path: path))
+    try value.encode(to: JSONEncoding(writer: writer, level: level, key: key, path: path()))
     if before && writer.isEmpty && mark == writer.currentLevel {
         writer.begin(.object, level: level, key: key)
     }
@@ -195,7 +234,10 @@ private struct JSONUnkeyedEncoding: UnkeyedEncodingContainer {
     }
 
     mutating func encode<T: Encodable>(_ value: T) throws {
-        try encodeValue(value, writer: writer, level: level, key: nil, path: counted())
+        let index = count
+        count += 1
+        try encodeValue(value, writer: writer, level: level, key: nil,
+                        path: path.appending(.index(index)))
     }
 
     mutating func nestedContainer<NestedKey: CodingKey>(

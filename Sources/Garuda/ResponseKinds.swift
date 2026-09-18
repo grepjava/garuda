@@ -60,7 +60,12 @@ extension Response {
 
 extension Worker {
     /// Whether the handler has set a content type of its own.
-    func hasContentType(_ slot: Int) -> Bool {
+    ///
+    /// `mutating` though it changes nothing: called from a mutating method,
+    /// a non-mutating one is handed `self` by value, and a `Worker` is large
+    /// enough that the copy -- every field, and a retain of each reference
+    /// in it -- showed in the profile of every JSON answer.
+    mutating func hasContentType(_ slot: Int) -> Bool {
         var found = false
         forEachHeaderRecord(table[slot].pointee.responseHeaders) { name, _ in
             if name.count == 12 && equalsLowercased(name.base, 12, "content-type") { found = true }
