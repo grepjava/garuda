@@ -10,9 +10,10 @@
 #   stream  GET  /stream       64 KiB streamed as 16 chunks of 4 KiB
 #
 # benchmarks/workloads/garuda-app is the Garuda side and
-# benchmarks/workloads/axum the axum side. Garuda runs WORKERS workers with
-# POOL_SIZE connections each; axum runs Tokio's default of a worker thread per
-# CPU with one pool of WORKERS x POOL_SIZE connections.
+# benchmarks/workloads/axum the axum side. Garuda runs WORKERS workers, one
+# per CPU unless told otherwise, the number of threads Tokio runs by default.
+# The database gets POOL_TOTAL connections either way: one pool of them for
+# axum, and an equal share of them in each Garuda worker's own pool.
 #
 #   (cd benchmarks/workloads/garuda-app && swift build -c release)
 #   createdb bench      # once; the script makes and fills the table
@@ -29,8 +30,9 @@ CARGO=${CARGO:-$(command -v cargo || echo "$HOME/.cargo/bin/cargo")}
 OHA=${OHA:-oha}
 PSQL=${PSQL:-psql}
 DATABASE_URL=${DATABASE_URL:-postgres://garuda:garuda-secret@127.0.0.1:5432/bench?sslmode=disable}
-WORKERS=${WORKERS:-4}
-POOL_SIZE=${POOL_SIZE:-8}
+WORKERS=${WORKERS:-$(nproc)}
+POOL_TOTAL=${POOL_TOTAL:-32}
+POOL_SIZE=$(( (POOL_TOTAL + WORKERS - 1) / WORKERS ))
 CONNS=${CONNS:-64}
 DURATION=${DURATION:-10s}
 WARMUP=${WARMUP:-2s}

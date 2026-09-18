@@ -234,8 +234,9 @@ DATABASE_URL='postgres://user:pass@127.0.0.1/db?sslmode=disable' bash benchmarks
 
 Each workload is checked before it is measured: a server that answers fast and
 wrong prints FAILED instead of a figure. Then closed-loop oha at 64
-connections, a 2 s warm-up and a 10 s run, Garuda's 4 workers against Tokio's
-default of a thread per CPU. The script makes and fills the table it reads.
+connections, a 2 s warm-up and a 10 s run, Garuda with a worker per CPU
+against Tokio's default of a thread per CPU (`WORKERS` changes Garuda's), and
+32 connections to the database for either (`POOL_TOTAL`). The script makes and fills the table it reads.
 It takes under two minutes, and like vs-axum.sh it is a check between
 changes, not a figure to publish.
 
@@ -280,17 +281,45 @@ The same box, the same script, one run each:
 Single runs here vary by about 10%: axum's json read 118,814 and 132,745 on
 two runs of the same binary.
 
-The database is still behind, and not for CPU. Per request Garuda spends
-71.5 µs and axum 64.9 µs, with PostgreSQL about 60 µs behind either, and
-Garuda's four workers sat near 55% busy. Three things are different:
+The database was still behind. It was not the per-worker pools: one Garuda
+worker against one Tokio thread, both pinned to the same CPU with the same
+pool of 8 and nothing to balance, read 24,015 against 30,272. Kernel time per
+request was the same, 19.0 against 19.4 µs; Garuda spent 9 µs more in user
+space. Two causes, both fixed:
 
-- **Threads.** Tokio runs a thread per CPU, eight here; the script gives
-  Garuda four workers. With `WORKERS=8 POOL_SIZE=4`, the same 32 connections
-  to the database in all, Garuda reads 40,582.
-- **Pools.** Each worker has a pool of its own, as it has everything of its
-  own, while axum's 32 connections are one pool. The kernel spreads client
-  connections unevenly -- 22, 14, 13 and 15 on one run -- and the busiest
-  worker queues for its eight while another's sit idle.
-- **PostgreSQL itself is the limit on this box.** axum reads 51,188 with 16
-  connections, 45,619 with 32 and 36,512 with 64: every backend is another
-  process competing for the same eight cores.
+- **The client did too much per statement.** The RowDescription that comes
+  with every run was read into new strings every time, the statement cache
+  hashed the SQL up to three times, buffers were allocated per statement,
+  and each result built a dictionary of its column names. Now the same
+  description reuses the columns read from it last time, the cache is
+  looked up once, the buffers are kept, and a few columns are searched in
+  order.
+- **The pool was unfair.** A released connection went back to the idle list
+  with the oldest waiter woken, and whoever asked before that waiter ran --
+  a new request, or the one that had just released it -- took it. The
+  waiter queued again at the back. p99 was 4.6 ms against axum's 2.5; with
+  the connection handed straight to the oldest waiter it is 2.9.
+
+The script also gave Garuda four workers against Tokio's thread per CPU; it
+now defaults to a worker per CPU for both, with the same 32 connections to
+the database in all (`POOL_TOTAL`).
+
+### At equal threads, 2026-09-19
+
+Eight Garuda workers with four connections each against axum on eight
+threads with one pool of 32:
+
+| workload | Garuda | p50 | p99 | axum | p50 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| user | 166,923 | 0.337 | 1.309 | 134,836 | 0.428 | 1.254 |
+| json | 119,899 | 0.350 | 3.143 | 119,717 | 0.474 | 1.547 |
+| db | 42,166 | 1.447 | 2.999 | 45,391 | 1.366 | 2.450 |
+| stream | 37,206 | 1.660 | 3.081 | 34,657 | 1.824 | 3.359 |
+
+The database reads within 7% here and 46,482 against 47,194 on another run;
+single runs move by about 10%. PostgreSQL itself is the limit on this box:
+axum reads 51,188 with 16 connections, 45,619 with 32 and 36,512 with 64,
+every backend another process competing for the same eight cores. What is
+left on Garuda's side is mostly the concurrency runtime: every
+`swift_task_switch` reads the task's preferred executor under a lock, a few
+percent of a database request.
