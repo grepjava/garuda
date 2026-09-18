@@ -397,6 +397,9 @@ public enum PollToken {
     public static let blocking: UInt64 = .max - 6
     /// The broadcast ring's wake descriptor, once something has subscribed.
     public static let broadcast: UInt64 = .max - 7
+    /// The pipe a handler task resumed off this worker's thread writes to,
+    /// once the worker has handler tasks at all.
+    public static let handlerTasks: UInt64 = .max - 8
     /// Scrapes and redirects whose request has not finished arriving. One token
     /// per pending slot, so an event names its slot without a search. Kept
     /// clear of the singletons above and far below any slot token.

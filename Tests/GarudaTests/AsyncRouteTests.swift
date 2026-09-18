@@ -123,6 +123,30 @@ private func parkingApp() -> Application {
     return app
 }
 
+/// Holds what a C thread is to run, since a thread takes a function pointer
+/// and a pointer's worth of context.
+private final class ThreadBody {
+    let run: () -> Void
+    init(_ run: @escaping () -> Void) { self.run = run }
+}
+
+/// Runs `body` on a thread of its own and waits for it, so that whatever it
+/// resumes is resumed from a thread no worker has ever run on. This is what
+/// the runtime does to a task waiting on something the engine does not own:
+/// it resumes on its own timer thread, or a pool thread, and the handler's
+/// job reaches its worker from there.
+private func onAnotherThread(_ body: @escaping () -> Void) {
+    let context = Unmanaged.passRetained(ThreadBody(body)).toOpaque()
+    guard let thread = av_thread_start({ raw in
+        Unmanaged<ThreadBody>.fromOpaque(raw!).takeRetainedValue().run()
+    }, context) else {
+        Unmanaged<ThreadBody>.fromOpaque(context).release()
+        Issue.record("cannot start a thread")
+        return
+    }
+    av_thread_join(thread)
+}
+
 /// One connection driven directly, so a test can leave a request parked and
 /// unanswered across turns instead of waiting for a whole response.
 private final class Socket {
@@ -286,6 +310,34 @@ struct AsyncRouteTests {
         let pool = try #require(client.worker.pointee.handlerTasks)
         #expect(pool.count == 1)
         #expect(pool.idleCount == 1)
+    }
+
+    /// A handler's code runs on its worker's thread, and a handler may wait
+    /// on anything at all. Nothing then says the thread that resumes it is
+    /// the worker's: the runtime resumes a task wherever it resumed what the
+    /// task was waiting on. So the job has to reach the worker from a thread
+    /// that is nobody's worker, and the answer has to come out as it always
+    /// did. Resuming from a thread of the test's own is the deterministic
+    /// version of what a library's timer or thread pool does by itself --
+    /// which is why this went unseen until a macOS runner tripped over it
+    /// where nobody could reproduce it.
+    @Test func aHandlerResumedFromAnotherThreadStillAnswers() throws {
+        parked = []
+        answered = []
+        lateCancelled = nil
+        lateFinished = nil
+        let client = parkingApp().test
+        let socket = try Socket(client)
+        socket.send("GET /observe/away HTTP/1.1\r\nHost: test\r\n\r\n")
+        while parked.isEmpty { client.turn() }
+        let waiting = parked.removeFirst()
+        onAnotherThread { waiting.resume() }
+        let response = socket.receive()
+        #expect(response?.contains("away") == true)
+        #expect(answered == ["away"])
+        // Its request was still there, and the answer was its own to send.
+        #expect(lateCancelled == false)
+        #expect(lateFinished == true)
     }
 
     /// A handler waiting on the engine is unwound when its request is

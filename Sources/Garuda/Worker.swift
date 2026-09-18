@@ -222,6 +222,9 @@ public struct Worker {
             broadcast = nil
         }
         if let pool = handlerTasks {
+            if pool.executor.wakeFD >= 0 {
+                _ = poller.remove(pool.executor.wakeFD, last: .read)
+            }
             // Cancelled first, so that a task waiting on the engine unwinds
             // and can be ended.
             var slot = 0
@@ -304,6 +307,8 @@ public struct Worker {
                 handleBlockingFinished()
             case PollToken.broadcast:
                 handleBroadcastWake()
+            case PollToken.handlerTasks:
+                handleHandlerTaskWake()
             default:
                 if let pending = PollToken.metricsPendingIndex(token) {
                     handleScrapeReadable(pending)

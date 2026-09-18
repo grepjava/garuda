@@ -42,7 +42,11 @@ feature by feature, and [BENCHMARKS.md](BENCHMARKS.md) has the measurements.
 5. **An async handler runs on a reused task.** Each worker keeps a pool of
    long-lived tasks (up to 1,024, then a queue) on a `TaskExecutor` that runs
    jobs only on the worker's thread. The loop drains the executor in the same
-   turn that hands a request to a task or wakes one.
+   turn that hands a request to a task or wakes one. A handler resumed from
+   another thread -- which is where the runtime resumes a wait the engine does
+   not own -- has its job handed to the executor under a lock, and the worker
+   woken through a pipe; the handler's code still runs on the worker's
+   thread.
 6. **The answer goes through the response sink**, which runs `onSend` hooks,
    merges server headers, frames the body and enforces `Content-Length`.
 7. **Cancellation.** A reset stream or closed connection resumes a handler

@@ -517,17 +517,28 @@ The Python suites need `h2` and `aioquic`.
   a soft hyphen goes. A password that was pasted with a non-breaking space in
   it now authenticates. NFKC normalisation is still not done, and
   [CONNECTORS.md](CONNECTORS.md) says so.
+- The test that an idle outbound connection is swept away no longer sets the
+  idle time down to a millisecond before it has checked the connection is
+  there. A sweep landing in that gap failed the test by finding the very
+  thing it was about to ask for, which reads as the opposite of what went
+  wrong. A parallel run has done it.
 - Two unit tests that want a second loopback address skip where the machine
   has not got one, and say what to do about it, instead of failing. Linux
   routes the whole of 127.0.0.0/8 to `lo`; macOS configures 127.0.0.1 and
   nothing else. Both tests are worth keeping -- they are what proves the
   address a resolver returned is the address connected to, and that a
   certificate is checked against the address actually reached.
-- The precondition that catches a handler task resumed off its worker's thread
-  now says which worker was expected and which was current. A job enqueued
-  from a thread that was never a worker and a job enqueued while another
-  worker's thread was current are different faults with the same symptom; this
-  one has fired on a machine where it could not be reproduced.
+- A handler resumed from a thread that is not its worker's no longer crashes
+  the worker. An executor is entitled to be given a job from any thread -- the
+  runtime resumes a task wherever it resumed whatever the task was waiting on,
+  and for a wait the engine does not own that is a thread of its own choosing
+  -- and the worker's executor took that as a fault to be refused loudly. Such
+  a job now goes on a list under a lock, and a byte down a pipe the poller
+  watches wakes the worker to run it on its own thread. A handler's code still
+  runs only there, and the worker's own thread still enqueues without a lock
+  or a syscall. The fault was found by CI on a macOS runner and could not be
+  reproduced on any other machine; the test that now covers it resumes a
+  handler from a thread of its own, which does not depend on luck.
 - `response.cancellable { … }` gives up on a wait the engine does not own.
   A handler suspended on a library's own continuation was not woken when its
   request ended -- nothing knew to wake it -- and held a handler task until

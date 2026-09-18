@@ -276,10 +276,14 @@ struct OutboundTests {
         #expect(fd >= 0)
         defer { _ = av_close(fd); unlink() }
         let client = outboundApp().test
-        client.worker.pointee.outboundIdleMillis = 1
         #expect(try client.get("/pool").text == "released")
         #expect(client.worker.pointee.outbound?.liveCount == 1)
 
+        // Only now, so that the connection cannot be swept before it has
+        // been seen: a sweep between the release and the check would find it
+        // idle already, and the test would fail saying the opposite of what
+        // went wrong. A parallel run has done exactly that.
+        client.worker.pointee.outboundIdleMillis = 1
         // The sweep runs at most once a second, so let it come round.
         let started = av_monotonic_ms()
         while av_monotonic_ms() - started < 1_200 { client.turn() }
