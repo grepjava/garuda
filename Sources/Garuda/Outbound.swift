@@ -409,9 +409,16 @@ extension Worker {
         guard let waiter = o.pointee.waiter.take() else { return }
         if error == nil {
             o.pointee.state = .open
-            // Nothing is wanted from the socket until the owner asks again,
-            // so stop being told it is ready.
-            setOutboundInterest(index, [])
+            // Read interest stays. The owner is about to read, and then to
+            // wait for the next reply: taking the interest away and giving it
+            // back was two system calls an exchange -- a database statement
+            // paid both every time. Input that comes while nobody waits is
+            // handled when it is reported (`handleOutboundEvent`). Anything
+            // else goes: a socket is nearly always writable, and a
+            // level-triggered poller would say so every turn.
+            if o.pointee.interest != PollMask.read.rawValue {
+                setOutboundInterest(index, [])
+            }
         }
         disarmOutboundTimer(index)
         waiter.resume(returning: error)
@@ -439,6 +446,20 @@ extension Worker {
             if mask.isFailed { settleOutbound(index, .failed(av_errno())); return }
             settleOutbound(index, nil)
         case .open:
+            guard o.pointee.waiter != nil else {
+                // Nobody is waiting: read interest left on between waits,
+                // reporting input or a hangup before its owner has asked. The
+                // owner finds it when it next reads. Until then the
+                // descriptor leaves the poller altogether, which a hangup
+                // needs -- it is reported whatever the interest, and would be
+                // reported every turn -- and the next wait adds it back.
+                if o.pointee.registered, o.pointee.fd >= 0 {
+                    _ = poller.remove(o.pointee.fd)
+                    o.pointee.registered = false
+                    o.pointee.interest = 0
+                }
+                return
+            }
             // Readable or writable as asked. A hangup still settles the wait:
             // the reader wants to see the end of the stream, not hang on it.
             settleOutbound(index, nil)

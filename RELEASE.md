@@ -893,6 +893,12 @@ The Python suites need `h2` and `aioquic`.
 
 ### PostgreSQL
 
+- A statement costs two fewer system calls. A connection the worker made
+  used to be given read interest for every wait on a reply and have it taken
+  away after, which was an `epoll_ctl` either side of each statement. Read
+  interest now stays between waits; input or a hangup that arrives while
+  nobody is waiting takes the connection out of the poller until its owner
+  next waits. The HTTP client and Redis connections get the same.
 - A native driver on the worker's poller, with no libpq. A `PostgresPool` per
   worker runs `query`, `first` and `execute`. Rows decode into `Decodable`
   types by column name, values are bound as parameters, and a refused
