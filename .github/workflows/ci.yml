@@ -28,7 +28,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SWIFT_VERSION: "6.1.2"
+  SWIFT_VERSION: "6.3.3"
 
 jobs:
   linux:

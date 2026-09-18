@@ -291,8 +291,8 @@ extension Worker {
             var mtime: Int64 = 0
             let fd = av_static_open(fallback.directory, fallback.file, &size, &mtime)
             if fd < 0 { continue }
-            var name = Array(UnsafeBufferPointer(start: UnsafeRawPointer(fallback.file).assumingMemoryBound(to: UInt8.self),
-                                                 count: Int(strlen(fallback.file)))) + [0]
+            var name: [UInt8] = Array(UnsafeBufferPointer(start: UnsafeRawPointer(fallback.file).assumingMemoryBound(to: UInt8.self),
+                                                             count: Int(strlen(fallback.file)))) + [0]
             sendFile(slot, fd: fd, size: Int(size), mtime: Int(mtime), coding: .identity,
                      nameLength: name.count - 1, name: &name)
             return true

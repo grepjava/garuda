@@ -59,8 +59,8 @@ app.get("/person/:id") { (id: Path<Int>) in
 exit(app.run())
 ```
 
-`app.run()` reads the same command-line flags as the `garuda` binary. Swift 6.1
-or newer, on Linux or macOS 15. [INSTALLATION.md](INSTALLATION.md) lists the
+`app.run()` reads the same command-line flags as the `garuda` binary. Swift 6.2
+or newer, on Linux or macOS 15 -- 6.2 because a borrowed body is a `Span`. [INSTALLATION.md](INSTALLATION.md) lists the
 system packages, certificates and running as a service.
 
 [Examples/](Examples/README.md) has complete applications to run and copy

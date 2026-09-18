@@ -132,7 +132,7 @@ public final class TestWebSocket {
         if n < 126 {
             frame.append(0x80 | UInt8(n))
         } else if n <= 0xFFFF {
-            frame += [0x80 | 126, UInt8(n >> 8), UInt8(n & 0xFF)]
+            frame += [UInt8(0x80 | 126), UInt8(n >> 8), UInt8(n & 0xFF)]
         } else {
             frame.append(0x80 | 127)
             for shift in stride(from: 56, through: 0, by: -8) { frame.append(UInt8((n >> shift) & 0xFF)) }
