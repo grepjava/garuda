@@ -299,6 +299,7 @@ public enum PostgresBackend {
         let n = Int(try r.readInt16())
         // Each column is at least its four-byte length.
         guard n >= 0, n &* 4 <= r.remaining else { throw .badCount }
+        values.reserveCapacity(n)
         for _ in 0..<n {
             let length = try r.readInt32()
             if length == -1 {

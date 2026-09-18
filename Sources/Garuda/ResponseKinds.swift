@@ -75,16 +75,29 @@ extension Worker {
 
     /// Encodes `value` into the worker's own buffer and answers with it.
     mutating func respond(_ slot: Int, status: Int, json value: some Encodable) throws {
-        jsonScratch.clear()
-        try JSONCoder.encode(value, into: &jsonScratch)
-        if !hasContentType(slot) {
-            let name: StaticString = "content-type"
-            let type: StaticString = "application/json"
-            _ = addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
-                                  ByteSpan(type.utf8Start, type.utf8CodeUnitCount))
+        // The worker's own writer, kept between answers. An Encodable that
+        // somehow answers another request while this one is mid-document
+        // gets a writer of its own rather than a share of this one.
+        let reuse = !jsonWriterBusy
+        let writer = reuse ? (jsonWriter ?? JSONWriter()) : JSONWriter()
+        if reuse {
+            jsonWriter = writer
+            jsonWriterBusy = true
         }
-        let count = jsonScratch.readableBytes
-        respond(slot, status: status, count > 0 ? UnsafePointer(jsonScratch.readPointer) : nil, count)
+        defer {
+            if reuse { jsonWriterBusy = false } else { writer.destroy() }
+        }
+        // Encoded before anything is added to the answer, so a value that
+        // cannot be written leaves no JSON content type on the error.
+        try JSONCoder.encode(value, with: writer) { bytes, count in
+            if !hasContentType(slot) {
+                let name: StaticString = "content-type"
+                let type: StaticString = "application/json"
+                _ = addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
+                                      ByteSpan(type.utf8Start, type.utf8CodeUnitCount))
+            }
+            respond(slot, status: status, bytes, count)
+        }
     }
 
     /// Answers a `ResponseError` with its status, and `{"error":"..."}` when

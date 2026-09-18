@@ -44,6 +44,8 @@ public protocol AsyncRequestExtractor: RequestExtractor {
 }
 
 extension AsyncRequestExtractor {
+    public static var awaitsExtraction: Bool { true }
+
     /// Never used for a route: registering a synchronous handler that takes
     /// an async extractor stops the program.
     public static func extract(from request: borrowing Request, parameter: inout Int) throws -> Self {
@@ -52,6 +54,10 @@ extension AsyncRequestExtractor {
 }
 
 extension Optional: RequestExtractor where Wrapped: RequestExtractor {
+    /// Whatever the wrapped extractor does: the conditional async
+    /// conformance below does not choose this conformance's answer.
+    public static var awaitsExtraction: Bool { Wrapped.awaitsExtraction }
+
     public static func extract(from request: borrowing Request, parameter: inout Int) throws -> Wrapped? {
         let start = parameter
         do {
@@ -76,6 +82,9 @@ extension Optional: AsyncRequestExtractor where Wrapped: AsyncRequestExtractor {
 }
 
 extension Result: RequestExtractor where Success: RequestExtractor, Failure == any Error {
+    /// Whatever the wrapped extractor does, as for `Optional`.
+    public static var awaitsExtraction: Bool { Success.awaitsExtraction }
+
     public static func extract(from request: borrowing Request, parameter: inout Int) throws -> Result {
         let start = parameter
         do {
@@ -118,7 +127,7 @@ extension Result: OpenAPIExtractorDescribing where Success: RequestExtractor, Fa
 func extractForAsyncRoute<E: RequestExtractor>(_ type: E.Type, _ request: borrowing Request,
                                               _ parameter: inout Int,
                                               _ response: borrowing Response) async throws -> E {
-    guard let awaiting = E.self as? any AsyncRequestExtractor.Type else {
+    guard E.awaitsExtraction, let awaiting = E.self as? any AsyncRequestExtractor.Type else {
         return try E.extract(from: request, parameter: &parameter)
     }
     let value = try await extractAwaiting(awaiting, request, &parameter)

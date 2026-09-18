@@ -902,6 +902,13 @@ The Python suites need `h2` and `aioquic`.
 
 ### PostgreSQL
 
+- A database request allocates about half as much. A result's arrays grow
+  once rather than cell by cell, a row's scratch space is sized once, the
+  column count is checked before the runtime is asked whether a type is an
+  array column, a route no longer asks the runtime on every request whether
+  each extractor awaits (`RequestExtractor.awaitsExtraction`, answered by
+  the conformance), and a worker keeps one JSON writer for its answers
+  instead of making a writer, a buffer and their bookkeeping for each.
 - A released connection goes straight to the oldest request waiting for one.
   It used to go back to the idle list with that request woken, and whoever
   asked next before the woken task ran -- a new request, or the one that had

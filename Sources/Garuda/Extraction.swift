@@ -18,6 +18,16 @@ public protocol RequestExtractor {
     /// Takes this value from the request. `parameter` is the index of the next
     /// path parameter not yet claimed; an extractor that reads one advances it.
     static func extract(from request: borrowing Request, parameter: inout Int) throws -> Self
+
+    /// Whether the extractor awaits: true for an `AsyncRequestExtractor`.
+    /// Not to be implemented; the defaults answer it, from the conformance,
+    /// where asking with `as?` on every request was a lookup in the runtime's
+    /// conformance tables every time.
+    static var awaitsExtraction: Bool { get }
+}
+
+extension RequestExtractor {
+    public static var awaitsExtraction: Bool { false }
 }
 
 /// An extractor that claims a path parameter, so that a handler asking for

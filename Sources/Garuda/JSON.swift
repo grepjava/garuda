@@ -58,6 +58,18 @@ public enum JSONCoder {
         try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, path: .root))
         try writer.finish(into: &buffer)
     }
+
+    /// Encodes `value` with `writer`, which is reset first and kept by the
+    /// caller for the next document; `body` is lent the bytes. For a worker's
+    /// JSON answers, which otherwise made a writer, a buffer and its
+    /// bookkeeping for every one.
+    static func encode<R>(_ value: some Encodable, with writer: JSONWriter,
+                          _ body: (UnsafePointer<UInt8>?, Int) throws -> R) throws -> R {
+        writer.reset()
+        defer { writer.trim() }
+        try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, path: .root))
+        return try writer.finish(body)
+    }
 }
 
 // MARK: - The writer
@@ -90,6 +102,27 @@ final class JSONWriter {
 
     func destroy() {
         buffer.destroy()
+    }
+
+    /// Ready for a new document, keeping what has been allocated.
+    func reset() {
+        buffer.clear()
+        open.removeAll(keepingCapacity: true)
+        wrote.removeAll(keepingCapacity: true)
+        failure = nil
+    }
+
+    /// Lets go of a buffer one large document grew, so a kept writer does not
+    /// hold it for ever.
+    func trim() {
+        if buffer.allocatedCapacity > 64 * 1024 { buffer.destroy() }
+    }
+
+    /// Everything still open, closed, and the bytes lent to `body`.
+    func finish<R>(_ body: (UnsafePointer<UInt8>?, Int) throws -> R) throws -> R {
+        try close()
+        let count = buffer.readableBytes
+        return try body(count > 0 ? UnsafePointer(buffer.readPointer) : nil, count)
     }
 
     /// Opens a container inside the container at `level`, and returns the

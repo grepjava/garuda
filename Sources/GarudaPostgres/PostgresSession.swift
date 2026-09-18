@@ -237,6 +237,15 @@ public struct PostgresRows: Sendable {
     mutating func setColumns(_ columns: [PostgresColumn]) { self.columns = columns }
     mutating func setTag(_ tag: String) { self.tag = tag }
     mutating func append(_ body: PostgresReader, _ ranges: [Range<Int>?]) {
+        // Room made for the whole row first, doubling rather than to fit: an
+        // append at a time grew each array cell by cell, and a reserve to fit
+        // would copy the result again for every row.
+        if storage.capacity - storage.count < body.count {
+            storage.reserveCapacity(max(storage.count + body.count, storage.capacity * 2))
+        }
+        if cells.capacity - cells.count < ranges.count {
+            cells.reserveCapacity(max(cells.count + ranges.count, cells.capacity * 2))
+        }
         for range in ranges {
             guard let range else {
                 cells.append(nil)

@@ -381,7 +381,9 @@ private func decodeRow<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows, _
     }
     // `query([String].self, "select tags from notes")`: one array column
     // asked for as a list is that column, not a row of columns.
-    if Row.self is any PostgresArrayColumn.Type, rows.columns.count == 1,
+    // The column count first: it is free, and the conformance check is a
+    // lookup in the runtime's tables.
+    if rows.columns.count == 1, Row.self is any PostgresArrayColumn.Type,
        PostgresType.elementType(of: rows.columns[0].typeOID) != nil {
         return try decoding.onlyCell().decode(Row.self)
     }
