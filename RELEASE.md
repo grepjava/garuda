@@ -23,18 +23,18 @@ every pull request:
   them;
 - the end-to-end suites, which drive the release binary over a socket.
 
-Nightly, and on demand, it also runs the protocol suites -- HTTP/2, HTTP/3,
-WebSocket, WebTransport, uploads, broadcast -- and fuzzes the parsers with
-`pgfuzz` under AddressSanitizer, for ten minutes on the nightly run and one on
-the others. Those are slow and need a QUIC stack, so a failure in them is a
-bug to fix rather than a push to block.
+The protocol suites -- HTTP/2, HTTP/3, WebSocket, WebTransport, uploads,
+broadcast -- and a `pgfuzz` run under AddressSanitizer go on every push to
+`main`, nightly and on demand, but not on a pull request: they are slow and
+want a QUIC stack. The fuzzer runs for ten minutes on the nightly run and one
+minute on the others.
 
 **Before cutting a version.** Run the lot against the release build, including
-what CI holds back for the night:
+what CI keeps off a pull request:
 
 ```bash
 swift build -c release
-swift test                             # 938 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 946 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -57,7 +57,7 @@ python3 scripts/websocket-test.py      # 104, runs garuda-conformance
 python3 scripts/websocket-streams-test.py # 94, runs garuda-conformance
 python3 scripts/webtransport-test.py   # 46, runs garuda-conformance
 python3 scripts/upload-test.py         # 35, runs garuda-conformance
-python3 scripts/broadcast-test.py      # 35, runs garuda-conformance
+python3 scripts/broadcast-test.py      # 36, runs garuda-conformance
 ```
 
 The Python suites need `h2` and `aioquic`.

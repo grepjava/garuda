@@ -559,7 +559,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 927 unit tests, and the fuzz corpus
+swift test                                   # 946 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
@@ -604,7 +604,8 @@ reads network bytes is fuzzed with `swift run -c release pgfuzz`
 every push and pull request: the build and unit tests on Ubuntu 24.04 and
 macOS 15, the handler code that must not compile, the connectors against a
 real PostgreSQL and Redis, and the end-to-end suites. The protocol suites and
-a sanitizer fuzz run nightly.
+a sanitizer fuzz run on every push to `main`, nightly and on demand, but not
+on a pull request: they are slow and want a QUIC stack.
 
 ## Status
 
