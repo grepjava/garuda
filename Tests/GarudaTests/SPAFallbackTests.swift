@@ -10,16 +10,21 @@ import AvianHTTP
 // --spa-fallback: a single-page application's page for browser navigations no
 // file or route answers.
 
-nonisolated(unsafe) private var spaCounter = 0
-
 /// A directory holding `index.html` and `assets/app.js`, removed afterwards.
+///
+/// Named by `mkdtemp` rather than by a counter. The tests in this suite run
+/// side by side, so two of them shared a counter value often enough to be
+/// seen: both built the same path, and the first to finish deleted the
+/// other's `index.html` out from under it, which reads as a 404 for the page.
 private final class SiteDirectory {
     let path: String
 
     init() {
-        spaCounter += 1
-        path = "/tmp/garuda-spa-\(getpid())-\(spaCounter)"
-        mkdir(path, 0o755)
+        var template = Array("/tmp/garuda-spa-XXXXXX".utf8CString)
+        let made = template.withUnsafeMutableBufferPointer { mkdtemp($0.baseAddress!) }
+        precondition(made != nil, "no temporary directory")
+        path = String(cString: template)
+        chmod(path, 0o755)
         mkdir(path + "/assets", 0o755)
         write("/index.html", "<!doctype html><div id=app></div>")
         write("/assets/app.js", "console.log('app')")

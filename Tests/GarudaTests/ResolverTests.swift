@@ -136,6 +136,25 @@ private final class FakeNameserver {
 ///
 /// Listens on the same port its UDP sibling was given, so one `nameserverPort`
 /// reaches both -- which is how a real nameserver is reached too.
+/// A UDP nameserver and a TCP one answering on the same port number, which is
+/// what a real nameserver is.
+///
+/// The kernel picks the UDP port, and nothing says the TCP port of that number
+/// is free: the suites run side by side and open listeners of their own, and
+/// two of these tests used to fail once in a few runs for no other reason. So
+/// it asks again, holding the ports it could not use until it has a pair, so
+/// that they are not offered back one at a time.
+private func nameserverPair(host: String = "127.0.0.1") -> (FakeNameserver, FakeNameserverTCP)? {
+    var rejected: [FakeNameserver] = []
+    defer { rejected.removeAll() }
+    for _ in 0..<64 {
+        guard let server = FakeNameserver() else { return nil }
+        if let stream = FakeNameserverTCP(port: server.port, host: host) { return (server, stream) }
+        rejected.append(server)
+    }
+    return nil
+}
+
 private final class FakeNameserverTCP {
     let fd: Int32
     private(set) var questions: [String] = []
@@ -388,9 +407,8 @@ struct ResolverTests {
     /// Truncation means "ask me again over TCP", so that is what happens: the
     /// lookup succeeds with the answer the datagram could not carry.
     @Test func aTruncatedAnswerIsAskedAgainOverTCP() throws {
-        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
-        guard let stream = FakeNameserverTCP(port: server.port) else {
-            Issue.record("no tcp listener"); return
+        guard let (server, stream) = nameserverPair() else {
+            Issue.record("no nameserver pair"); return
         }
         // The datagram says there is more, and carries a record anyway -- a
         // resolver that read it would return one address and believe it had
@@ -417,9 +435,8 @@ struct ResolverTests {
     /// The retry carries a fresh id. Reusing the one the truncated datagram
     /// used would let an answer aimed at that query be taken for this one.
     @Test func theTCPRetryUsesADifferentId() throws {
-        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
-        guard let stream = FakeNameserverTCP(port: server.port) else {
-            Issue.record("no tcp listener"); return
+        guard let (server, stream) = nameserverPair() else {
+            Issue.record("no nameserver pair"); return
         }
         nonisolated(unsafe) var datagramID: UInt16 = 0
         nonisolated(unsafe) var streamID: UInt16 = 1
@@ -441,9 +458,8 @@ struct ResolverTests {
     /// there is no third transport. It must say so rather than read as a
     /// server that never answered.
     @Test func truncatedOverTCPAsWellIsReported() throws {
-        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
-        guard let stream = FakeNameserverTCP(port: server.port) else {
-            Issue.record("no tcp listener"); return
+        guard let (server, stream) = nameserverPair() else {
+            Issue.record("no nameserver pair"); return
         }
         server.answer = { id, name in reply(id: id, name: name, flags: 0x8380) }
         stream.answer = { id, name in reply(id: id, name: name, flags: 0x8380) }
@@ -461,9 +477,8 @@ struct ResolverTests {
     /// inside the body, both failed to change that. The limitation is recorded
     /// on `readExactly` itself; this test holds the framing, not the loop.
     @Test func aReplyWrittenInTwoPiecesIsUnderstood() throws {
-        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
-        guard let stream = FakeNameserverTCP(port: server.port) else {
-            Issue.record("no tcp listener"); return
+        guard let (server, stream) = nameserverPair() else {
+            Issue.record("no nameserver pair"); return
         }
         server.answer = { id, name in reply(id: id, name: name, flags: 0x8380) }
         stream.splitWrites = true
@@ -483,9 +498,8 @@ struct ResolverTests {
     /// reaches the pool, and a marker guarding that was provably dead. What is
     /// worth holding is the behaviour -- nothing left open, nothing inherited.
     @Test func theTCPConnectionIsNotLeftBehind() throws {
-        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
-        guard let stream = FakeNameserverTCP(port: server.port) else {
-            Issue.record("no tcp listener"); return
+        guard let (server, stream) = nameserverPair() else {
+            Issue.record("no nameserver pair"); return
         }
         server.answer = { id, name in reply(id: id, name: name, flags: 0x8380) }
         stream.answer = { id, name in
@@ -618,9 +632,8 @@ struct ResolverTests {
     /// connected to. The nameserver's own TCP listener stands in as something
     /// to connect to, since it is already listening on a known port.
     @Test func aNameIsResolvedAndThenConnectedTo() throws {
-        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
-        guard let stream = FakeNameserverTCP(port: server.port) else {
-            Issue.record("no tcp listener"); return
+        guard let (server, stream) = nameserverPair() else {
+            Issue.record("no nameserver pair"); return
         }
         server.answer = { id, name in
             reply(id: id, name: name, records: [(type: 1, data: [127, 0, 0, 1])])
@@ -639,11 +652,10 @@ struct ResolverTests {
     /// mutation testing said so. Loopback is a /8, so the answer here names
     /// 127.0.0.2 and only a connection that used it reaches this listener.
     @Test func theResolvedAddressIsTheOneConnectedTo() throws {
-        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
         // The listener is on 127.0.0.2 and nothing is on 127.0.0.1 at this
         // port, so a connection to the wrong address has nowhere to land.
-        guard let elsewhere = FakeNameserverTCP(port: server.port, host: "127.0.0.2") else {
-            Issue.record("no tcp listener on 127.0.0.2"); return
+        guard let (server, elsewhere) = nameserverPair(host: "127.0.0.2") else {
+            Issue.record("no nameserver pair on 127.0.0.2"); return
         }
         server.answer = { id, name in
             reply(id: id, name: name, records: [(type: 1, data: [127, 0, 0, 2])])
@@ -658,9 +670,8 @@ struct ResolverTests {
     /// A host whose first address is dead is still a host that works. The
     /// server put them in that order for a reason, so they are tried in it.
     @Test func everyAddressIsTriedInOrder() throws {
-        guard let server = FakeNameserver() else { Issue.record("no socket"); return }
-        guard let stream = FakeNameserverTCP(port: server.port) else {
-            Issue.record("no tcp listener"); return
+        guard let (server, stream) = nameserverPair() else {
+            Issue.record("no nameserver pair"); return
         }
         // 192.0.2.1 is TEST-NET-1 and goes nowhere; the second address is the
         // listener that is actually there.
