@@ -102,6 +102,13 @@ struct Routes {
     /// group.
     var cors: CORSPolicy? = nil
     var groupCORS: [Int: CORSPolicy] = [:]
+    /// What a scope adds to the OpenAPI entry of every route in it -- the 401
+    /// an `authenticate` can answer, the 403 an `authorize` can -- set outside
+    /// any group, and in groups, by group. Applied when the document is
+    /// written, so a scope's rules reach the routes registered before them as
+    /// well, the way its middleware does.
+    var notes: [OperationNote] = []
+    var groupNotes: [Int: [OperationNote]] = [:]
 
     /// The prefix routes registered now are mounted under.
     var currentPrefix: String {
@@ -217,6 +224,23 @@ extension Routes {
             if let policy = groupCORS[group] { return policy }
         }
         return cors
+    }
+
+    /// What every route of the innermost open scope says about itself in the
+    /// OpenAPI document, beyond what it says itself.
+    mutating func addNote(_ note: @escaping OperationNote) {
+        if let group = openGroups.last {
+            groupNotes[group, default: []].append(note)
+        } else {
+            notes.append(note)
+        }
+    }
+
+    /// Every note that applies to route `index`, outermost scope first.
+    func operationNotes(_ index: Int) -> [OperationNote] {
+        var all = notes
+        for group in routeGroups[index] { all += groupNotes[group] ?? [] }
+        return all
     }
 
     /// Sets the current scope's CORS policy.

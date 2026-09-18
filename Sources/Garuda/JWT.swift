@@ -592,6 +592,7 @@ extension RouteBuilder {
     /// `JWT<Claims>`. A request without one is answered 401 with the
     /// challenge RFC 6750 describes.
     public func authenticate<Claims: Decodable>(jwt claims: Claims.Type, verifier: any JWTVerifying) {
+        describeBearerScope(format: "JWT")
         use { request, response async throws -> (any ResponseConvertible)? in
             guard let header = request.header("authorization"), let token = parseBearer(header) else {
                 return Challenge("Bearer")

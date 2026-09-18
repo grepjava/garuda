@@ -128,6 +128,7 @@ a position:
 |---|---|---|
 | [`app.cors`](#cors) | Cross-origin resource sharing, preflights included | 204 to a preflight |
 | [`app.authenticate`](#authentication) | Bearer tokens and Basic credentials | 401 with a challenge |
+| [`app.authorize`](#authorization) | A named rule about who may reach a scope | 403 saying what it needs |
 | [`JWT<Claims>`, `authenticate(jwt:)`](#json-web-tokens) | Signed tokens checked without a lookup | 401 with `error="invalid_token"` |
 | [`app.sessions`](#sessions) | Server-side sessions in memory, Redis or SQLite | 500 if the store fails |
 | [`app.csrfProtection`](#csrf-protection) | Refuses cross-site request forgery | 403 |
@@ -183,6 +184,47 @@ app.group("/account") {
 - `Passwords.hash` and `Passwords.verify` store passwords as PBKDF2-SHA256 on
   the blocking pool; `Tokens.random` and `Tokens.digest` make session tokens
   worth storing only as digests.
+
+### Authorization
+
+Authentication says who is asking. A `Policy` says whether they may, named
+once and used wherever it applies:
+
+```swift
+extension Policy where Value == User {
+    static let admin = Policy(needs: "an administrator") { $0.role == .admin }
+    static let billing = Policy(needs: "the billing role") { $0.roles.contains("billing") }
+}
+
+app.group("/invoices") {
+    app.authenticate(bearer: CurrentUser.self, state: SQLiteDatabase.self) { token, db in … }
+    app.authorize(CurrentUser.self, .admin.or(.billing))
+    app.get("") { … }                       // and every other route in the group
+}
+```
+
+- `authorize` runs in the order of `use`, so it goes after the `authenticate`
+  that puts whoever is asking under the key.
+- A rule that does not hold is 403 with what would have been enough:
+  `{"error":"this route needs an administrator or the billing role"}`. A
+  request with nobody under the key is 401, since signing in may be the
+  answer.
+- `and` and `or` combine rules and their names. `about` points a rule written
+  about one type at part of another. A policy is a plain `(Value) -> Bool`,
+  so a test can call it: `#expect(Policy.admin(user))`.
+- `app.authorize(CurrentUser.self, needs: "a member") { … }` writes the rule
+  where it is used, and an `async` closure may ask a database -- once per
+  request in the scope, so keep it cheap.
+- `app.authorize(jwt: AccessClaims.self, .scope("orders:write"))` reads the
+  claims `authenticate(jwt:)` checked. Claims conforming to `ScopedClaims`
+  get `hasScope` and `scopes` from the OAuth 2.0 `scope` claim, matched whole.
+- A rule about one row -- whether this order is this customer's -- belongs in
+  the handler, which has the row: `throw AuthorizationError(needs: "the
+  customer")` answers the same way.
+- Both `authenticate` and `authorize` say what they can answer in the OpenAPI
+  document, for every route in their scope: the 401, the 403 and the security
+  scheme. `app.describeRoutes { operation in … }` does the same for a
+  middleware of your own, and leaves alone whatever a route said for itself.
 
 ### JSON Web Tokens
 

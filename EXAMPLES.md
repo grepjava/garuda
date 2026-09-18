@@ -259,6 +259,60 @@ Make the sessions table once with `SQLiteSessionStore.schema()` in a migration.
 A session change is written before the call returns, so change the session
 before answering.
 
+## Who may do what
+
+Signing in says who is asking. What they may do is a rule with a name, written
+once:
+
+```swift
+extension Policy where Value == User {
+    static let admin = Policy(needs: "an administrator") { $0.role == .admin }
+    static let billing = Policy(needs: "the billing role") { $0.roles.contains("billing") }
+}
+
+app.group("/invoices") {
+    app.authenticate(bearer: CurrentUser.self, state: PostgresPool.self) { token, db in
+        try await db.first(User.self, "select … where token_digest = $1", Tokens.digest(token))
+    }
+    app.authorize(CurrentUser.self, .admin.or(.billing))
+    app.get("") { (db: State<PostgresPool>) async throws in JSON(try await invoices(db.value)) }
+}
+```
+
+Every route in the group is guarded. A request the rule refuses is 403 saying
+what would have been enough -- `{"error":"this route needs an administrator or
+the billing role"}` -- and one with nobody signed in is 401. The rule is a
+plain function, so a test reads it without a server:
+
+```swift
+#expect(Policy.admin(ada))
+#expect(!Policy.admin.and(.billing)(grace))
+```
+
+A rule about one row needs the row, so it belongs in the handler:
+
+```swift
+app.get("/orders/:id") { (id: Path<Int64>, user: Context<CurrentUser>, db: State<PostgresPool>) async throws in
+    guard let order = try await find(id.value, db.value) else { return nil as JSON<Order>? }
+    guard order.customer == user.value.id else { throw AuthorizationError(needs: "the customer") }
+    return JSON(order)
+}
+```
+
+With tokens from an identity provider, the rule is usually a scope. Claims
+conforming to `ScopedClaims` read the OAuth 2.0 `scope` claim:
+
+```swift
+app.group("/orders") {
+    app.authenticate(jwt: AccessClaims.self, verifier: keys)
+    app.authorize(jwt: AccessClaims.self, .scope("orders:write"))
+}
+```
+
+Both `authenticate` and `authorize` add what they can answer to every route of
+the scope in the OpenAPI document, so the 401, the 403 and the security scheme
+are there without repeating them route by route.
+
 ## An extractor of your own
 
 ```swift

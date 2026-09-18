@@ -80,6 +80,16 @@ public protocol RouteBuilder: AnyObject {
     /// Gives the route registered last its entry in the OpenAPI document.
     /// The route methods call it.
     func document(_ operation: OpenAPIOperation)
+
+    /// Adds what `note` says to the OpenAPI entry of every route in the
+    /// current scope -- the routes of the application, group or router it is
+    /// called in, wherever in it the call is, as `use` applies to them all.
+    /// `authenticate` and `authorize` use it to say what they can answer.
+    ///
+    /// A note is applied each time a document is written, so it says nothing
+    /// that would differ the second time, and leaves alone what a route has
+    /// said about itself.
+    func describeRoutes(_ note: @escaping OperationNote)
 }
 
 extension RouteBuilder {
@@ -156,6 +166,7 @@ public final class Router: RouteBuilder {
         case asyncFallback(AsyncHandler)
         case cors(CORSPolicy)
         case document(OpenAPIOperation)
+        case describe(OperationNote)
     }
 
     /// What has been registered, innermost open group last.
@@ -224,6 +235,10 @@ public final class Router: RouteBuilder {
         add(.document(operation))
     }
 
+    public func describeRoutes(_ note: @escaping OperationNote) {
+        add(.describe(note))
+    }
+
     /// Registers every entry on `builder`, in the order they were made.
     func replay(into builder: some RouteBuilder) {
         precondition(open.count == 1, "a router was merged from inside one of its own groups")
@@ -263,6 +278,8 @@ public final class Router: RouteBuilder {
                 builder.cors(policy)
             case .document(let operation):
                 builder.document(operation)
+            case .describe(let note):
+                builder.describeRoutes(note)
             }
         }
     }
@@ -297,6 +314,11 @@ extension Application {
     public func cors(_ policy: CORSPolicy) {
         precondition(compiled == nil, "CORS policy set after the application was compiled")
         routes.setCORS(policy)
+    }
+
+    public func describeRoutes(_ note: @escaping OperationNote) {
+        precondition(compiled == nil, "routes described after the application was compiled")
+        routes.addNote(note)
     }
 
     public func fallback(_ handler: @escaping Handler) {

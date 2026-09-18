@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 870 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 882 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -188,6 +188,25 @@ The Python suites need `h2` and `aioquic`.
   the request's context, and answer 401 with the WWW-Authenticate challenge for
   a missing, malformed or refused one. The closure may be async, and a throw
   answers as a handler's does.
+- `Policy` is a named rule about who may reach a route, and
+  `app.authorize(CurrentUser.self, .admin)` requires it of every route in the
+  scope, after the `authenticate` that says whose request it is. `and`, `or`
+  and `about` combine rules and their names; a policy is a plain
+  `(Value) -> Bool`, so a test calls it without a request. A rule that does
+  not hold is 403 saying what would have been enough -- `{"error":"this route
+  needs an administrator or the billing role"}` -- and a request with nobody
+  under the key is 401 instead, since signing in may be the answer.
+  `authorize(_:needs:_:)` writes a rule where it is used, and its `async`
+  form may ask a database; `authorize(jwt:_:)` reads the claims
+  `authenticate(jwt:)` checked, with `Policy.scope("orders:write")` for claims
+  conforming to `ScopedClaims`. A handler with a rule about one row throws
+  `AuthorizationError(needs:)` for the same answer.
+- A scope says what it can answer in the OpenAPI document: `authenticate` adds
+  its 401 and its security scheme to every route in its scope, and `authorize`
+  its 403. `app.describeRoutes { operation in … }` does the same for a
+  middleware of your own. A note applies to every route of the scope wherever
+  in it the call is, as `use` does, and leaves alone what a route said about
+  the same status itself.
 - `BearerToken` and `BasicCredentials` extract the same credentials in a
   handler, and `constantTimeEquals` compares a secret in time that does not
   depend on where it differs.

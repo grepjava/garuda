@@ -116,6 +116,25 @@ keep two different failures apart: a body that is not the type means the client
 is building its request wrongly, and a body that is the type with a value this
 application will not take means the client is fine and the value is wrong.
 
+### Authorization is a rule with a name
+
+A `Policy` is `(Value) -> Bool` and a name for what it requires, and `authorize`
+is middleware that applies one to a scope. Two things follow from the name: the
+403 says what would have been enough, and the OpenAPI document can say it too.
+Two follow from it being a plain function: a rule is tested without a server,
+and rules combine (`and`, `or`, `about`) with their names combining as well.
+
+A policy cannot await, because a rule that has to ask something is a different
+thing: `authorize` has a closure form for that, and a rule about the row a
+handler is about belongs in the handler, which has already loaded the row. The
+split keeps the common rule -- a role, a scope, a flag on the account -- free of
+I/O on every request in the scope.
+
+`authenticate` and `authorize` describe their scope's routes through
+`describeRoutes`, which adds to the OpenAPI entry of every route in a scope. It
+is applied as the document is written rather than at registration, so a rule
+covers the routes registered before it as well, the way `use` does.
+
 ### State and fork semantics
 
 `app.state` runs a factory in each worker after the fork. What it builds belongs

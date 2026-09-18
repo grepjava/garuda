@@ -72,6 +72,10 @@ public enum OpenAPISecurityScheme: Sendable {
 
 /// One route's entry in the OpenAPI document, which its registration returns.
 /// Each method adds to it and returns it, so they chain.
+/// What a scope adds to the OpenAPI entry of every route in it, through
+/// `describeRoutes`.
+public typealias OperationNote = (OpenAPIOperation) -> Void
+
 public final class OpenAPIOperation: @unchecked Sendable {
     typealias Make = (OpenAPISchemas) -> OpenAPIValue
 
@@ -160,6 +164,18 @@ public final class OpenAPIOperation: @unchecked Sendable {
         setResponse(String(status.code)) { _ in
             ["description": .string(description), "content": .object([(contentType, OpenAPIValue.object([]))])]
         }
+    }
+
+    /// A status the route's scope can answer with -- the 401 of an
+    /// `authenticate`, the 403 of an `authorize` -- which leaves alone what
+    /// the route has said about that status itself, and says the same thing
+    /// again the second time it is called.
+    @discardableResult
+    public func scopeResponse(_ status: HTTPStatus, _ description: String) -> Self {
+        let code = String(status.code)
+        guard !responses.contains(where: { $0.code == code }) else { return self }
+        responses.append((code, { _ in ["description": .string(description)] }))
+        return self
     }
 
     /// The 422 an input with rules of its own can answer with, and the body
@@ -459,6 +475,12 @@ extension Routes {
         for index in handlers.indices {
             guard let full = patterns[index], let method = methods[index] else { continue }
             let operation = operations[index] ?? OpenAPIOperation(method, full)
+            // What the route's scopes add: a rule of a group applies to every
+            // route in it, so it is added here rather than at registration,
+            // where a route registered before the rule would have missed it.
+            // Each note leaves alone what the route said for itself, and says
+            // the same thing again when a document is written twice.
+            for note in operationNotes(index) { note(operation) }
             if operation.isHidden { continue }
             let (path, names) = openAPIPath(full)
             guard let methodName = openAPIMethodName(method) else { continue }

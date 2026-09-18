@@ -93,6 +93,7 @@ extension RouteBuilder {
     public func authenticate<Key: RequestContextKey>(
         bearer key: Key.Type, _ verify: @escaping (_ token: String) throws -> Key.Value?
     ) {
+        describeBearerScope()
         use { request, _ in
             guard let header = request.header("authorization"), let token = parseBearer(header),
                   let who = try verify(token) else {
@@ -109,6 +110,7 @@ extension RouteBuilder {
         bearer key: Key.Type, _ verify: sending @escaping (_ token: String) async throws -> Key.Value?
     ) {
         nonisolated(unsafe) let verify = verify
+        describeBearerScope()
         use { request, _ async throws -> (any ResponseConvertible)? in
             guard let header = request.header("authorization"), let token = parseBearer(header),
                   let who = try await verify(token) else {
@@ -128,6 +130,7 @@ extension RouteBuilder {
         _ verify: @escaping (_ username: String, _ password: String) throws -> Key.Value?
     ) {
         let challenge = basicChallenge(realm)
+        describeBasicScope()
         use { request, _ in
             guard let header = request.header("authorization"), let credentials = parseBasic(header),
                   let who = try verify(credentials.username, credentials.password) else {
@@ -145,6 +148,7 @@ extension RouteBuilder {
     ) {
         let challenge = basicChallenge(realm)
         nonisolated(unsafe) let verify = verify
+        describeBasicScope()
         use { request, _ async throws -> (any ResponseConvertible)? in
             guard let header = request.header("authorization"), let credentials = parseBasic(header),
                   let who = try await verify(credentials.username, credentials.password) else {
@@ -170,6 +174,7 @@ extension RouteBuilder {
         _ verify: sending @escaping (_ token: String, _ state: Service) async throws -> Key.Value?
     ) {
         nonisolated(unsafe) let verify = verify
+        describeBearerScope()
         use { request, _ async throws -> (any ResponseConvertible)? in
             let state = try request.state(Service.self)
             guard let header = request.header("authorization"), let token = parseBearer(header) else {
@@ -190,6 +195,7 @@ extension RouteBuilder {
     ) {
         let challenge = basicChallenge(realm)
         nonisolated(unsafe) let verify = verify
+        describeBasicScope()
         use { request, _ async throws -> (any ResponseConvertible)? in
             let state = try request.state(Service.self)
             guard let header = request.header("authorization"), let credentials = parseBasic(header) else {
@@ -201,6 +207,26 @@ extension RouteBuilder {
             }
             request[context: key] = who
             return nil
+        }
+    }
+}
+
+extension RouteBuilder {
+    /// What every route of this scope takes and can answer, once an
+    /// `authenticate` guards it. The same words the `BearerToken` and
+    /// `BasicCredentials` extractors use, so a route guarded either way reads
+    /// the same in the document.
+    func describeBearerScope(format: String? = nil) {
+        describeRoutes { operation in
+            operation.security(.bearer(format: format))
+            operation.scopeResponse(.unauthorized, "No valid bearer token")
+        }
+    }
+
+    func describeBasicScope() {
+        describeRoutes { operation in
+            operation.security(.basic)
+            operation.scopeResponse(.unauthorized, "No valid credentials")
         }
     }
 }

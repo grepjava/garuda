@@ -196,6 +196,15 @@ app.group("/api") {
   built, such as the database sessions live in. `BearerToken` and
   `BasicCredentials` are the same as extractors, and `constantTimeEquals`
   compares secrets.
+- `app.authorize(CurrentUser.self, .admin)` requires a named rule of every
+  route in the scope, once `authenticate` has said whose request it is. A
+  `Policy` is `(Value) -> Bool` with a name, combined with `and`, `or` and
+  `about`, and callable in a test without a request. A rule that does not hold
+  is 403 saying what would have been enough; nobody under the key is 401.
+  `authorize(jwt:)` reads the claims a scope verified, and
+  `Policy.scope("orders:write")` an OAuth 2.0 scope in them. Both
+  `authenticate` and `authorize` add what they can answer, and the security
+  scheme, to every route of the scope in the OpenAPI document.
 - `JWT<Claims>` takes a verified JSON Web Token (HS, RS, PS, ES or EdDSA),
   keys from PEM, JWK or a secret, with `exp`, `nbf`, `iss` and `aud` checked;
   `keys.sign(claims)` issues one and `keys.publicJWKS` publishes the key set.
@@ -542,7 +551,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 870 unit tests, and the fuzz corpus
+swift test                                   # 882 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
