@@ -517,6 +517,17 @@ The Python suites need `h2` and `aioquic`.
   a soft hyphen goes. A password that was pasted with a non-breaking space in
   it now authenticates. NFKC normalisation is still not done, and
   [CONNECTORS.md](CONNECTORS.md) says so.
+- Two unit tests that want a second loopback address skip where the machine
+  has not got one, and say what to do about it, instead of failing. Linux
+  routes the whole of 127.0.0.0/8 to `lo`; macOS configures 127.0.0.1 and
+  nothing else. Both tests are worth keeping -- they are what proves the
+  address a resolver returned is the address connected to, and that a
+  certificate is checked against the address actually reached.
+- The precondition that catches a handler task resumed off its worker's thread
+  now says which worker was expected and which was current. A job enqueued
+  from a thread that was never a worker and a job enqueued while another
+  worker's thread was current are different faults with the same symptom; this
+  one has fired on a machine where it could not be reproduced.
 - `response.cancellable { … }` gives up on a wait the engine does not own.
   A handler suspended on a library's own continuation was not woken when its
   request ended -- nothing knew to wake it -- and held a handler task until

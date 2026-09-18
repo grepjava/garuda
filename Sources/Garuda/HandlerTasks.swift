@@ -60,8 +60,19 @@ final class WorkerExecutor: TaskExecutor, @unchecked Sendable {
     }
 
     func enqueue(_ job: consuming ExecutorJob) {
-        precondition(av_worker_current() == worker,
-                     "a handler task was resumed off its worker's thread")
+        let current = av_worker_current()
+        // Two different faults wear the same words otherwise: a job enqueued
+        // from a thread that was never a worker -- the runtime having put it
+        // somewhere of its own choosing -- and a job enqueued while a
+        // *different* worker's thread was current. Nothing about the first is
+        // this worker's doing and everything about the second is. The message
+        // costs nothing until it fires, and this one has fired where it could
+        // not be reproduced.
+        precondition(current == worker, """
+            a handler task was resumed off its worker's thread: \
+            this worker is \(UInt(bitPattern: worker)), \
+            the current one is \(UInt(bitPattern: current)) (0 for none)
+            """)
         if count == capacity { grow() }
         (jobs + ((head &+ count) & (capacity &- 1))).initialize(to: UnownedJob(job))
         count += 1

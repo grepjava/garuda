@@ -595,7 +595,10 @@ python3 scripts/broadcast-test.py            # 35  topics across workers, Last-E
 ```
 
 The shell suites need `curl` and `openssl`. The Python suites are clients only,
-using `h2` and `aioquic`, which share no code with the server. Every parser that
+using `h2` and `aioquic`, which share no code with the server. Two unit tests
+want a second loopback address, which Linux has and macOS has to be asked for
+(`sudo ifconfig lo0 alias 127.0.0.2 up`); without it they say so and skip,
+rather than failing as though something were wrong. Every parser that
 reads network bytes is fuzzed with `swift run -c release pgfuzz`
 ([fuzz/README.md](fuzz/README.md)). CI (`.github/workflows/ci.yml`) runs on
 every push and pull request: the build and unit tests on Ubuntu 24.04 and

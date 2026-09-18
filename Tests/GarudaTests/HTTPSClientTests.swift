@@ -311,15 +311,13 @@ struct HTTPSClientTests {
         #expect(origin.serverNames == [""])
     }
 
-    @Test func anAddressTheCertificateDoesNotNameIsRefused() throws {
+    @Test(.enabled(if: loopbackAliasAvailable, "an address check \(loopbackAliasReason)"))
+    func anAddressTheCertificateDoesNotNameIsRefused() throws {
         // The same certificate, reached at 127.0.0.2. The chain is trusted and
         // the address is not the one it was issued to, so this must fail --
         // otherwise the check above passed because nothing was checked.
         #expect(installCertificate())
-        guard let origin = TLSOrigin(alpn: "h2,http/1.1", address: "127.0.0.2") else {
-            Issue.record("no origin on 127.0.0.2")
-            return
-        }
+        let origin = try #require(TLSOrigin(alpn: "h2,http/1.1", address: "127.0.0.2"))
         let client = httpsApp().test
         let text = try get(client, origin, "https://127.0.0.2:\(origin.port)/x")
         #expect(text.hasPrefix("connect("), "got \(text)")

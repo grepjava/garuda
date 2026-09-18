@@ -132,10 +132,6 @@ private final class FakeNameserver {
     }
 }
 
-/// The TCP half of a nameserver, for the retry a truncated answer asks for.
-///
-/// Listens on the same port its UDP sibling was given, so one `nameserverPort`
-/// reaches both -- which is how a real nameserver is reached too.
 /// A UDP nameserver and a TCP one answering on the same port number, which is
 /// what a real nameserver is.
 ///
@@ -155,6 +151,10 @@ private func nameserverPair(host: String = "127.0.0.1") -> (FakeNameserver, Fake
     return nil
 }
 
+/// The TCP half of a nameserver, for the retry a truncated answer asks for.
+///
+/// Listens on the same port its UDP sibling was given, so one port number
+/// reaches both -- which is how a real nameserver is reached too.
 private final class FakeNameserverTCP {
     let fd: Int32
     private(set) var questions: [String] = []
@@ -651,7 +651,8 @@ struct ResolverTests {
     /// discarding the answer and hardcoding that literal passed them all, and
     /// mutation testing said so. Loopback is a /8, so the answer here names
     /// 127.0.0.2 and only a connection that used it reaches this listener.
-    @Test func theResolvedAddressIsTheOneConnectedTo() throws {
+    @Test(.enabled(if: loopbackAliasAvailable, "resolving to a second address \(loopbackAliasReason)"))
+    func theResolvedAddressIsTheOneConnectedTo() throws {
         // The listener is on 127.0.0.2 and nothing is on 127.0.0.1 at this
         // port, so a connection to the wrong address has nowhere to land.
         guard let (server, elsewhere) = nameserverPair(host: "127.0.0.2") else {
