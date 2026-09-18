@@ -251,7 +251,46 @@ One run each; requests a second, p50 and p99 in milliseconds.
 | db | 31,456 | 1.958 | 3.431 | 45,545 | 1.359 | 2.476 |
 | stream | 17,364 | 3.663 | 8.385 | 34,802 | 1.811 | 3.359 |
 
-Routing is ahead, as hello-world is. The other three are behind, and they are
-where the work is: a handler that decodes and encodes JSON, waits on a
-database, or writes a body in pieces spends its time outside the engine that
-hello-world measures.
+Routing was ahead, as hello-world is. The other three were behind, and the
+profiles said why:
+
+- **stream**: every `body.write` was its own system call and its own wakeup
+  of the reader. Writes now go out together when the handler next waits.
+- **json**: the coder built a coding path, an array, for every value, and
+  `Array`'s elements came through the generic `encode<T>`/`decode<T>` and
+  paid for an encoder and a boxed container each. Paths are now built only
+  when read and the standard scalars are written and read directly.
+- **db**: read interest on the connection to PostgreSQL was added and taken
+  away around every statement, two `epoll_ctl` calls each time. It now
+  stays. And calling a non-mutating method through a `Worker` pointer copied
+  the whole worker, retaining every reference in it; `Worker` is now
+  `~Copyable`, so the compiler cannot.
+
+### After those changes, 2026-09-19
+
+The same box, the same script, one run each:
+
+| workload | Garuda | p50 | p99 | axum | p50 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| user | 184,837 | 0.358 | 0.446 | 134,653 | 0.430 | 1.233 |
+| json | 119,585 | 0.462 | 1.132 | 119,160 | 0.475 | 1.568 |
+| db | 37,150 | 1.620 | 3.325 | 45,619 | 1.357 | 2.460 |
+| stream | 39,967 | 1.584 | 2.027 | 34,810 | 1.815 | 3.395 |
+
+Single runs here vary by about 10%: axum's json read 118,814 and 132,745 on
+two runs of the same binary.
+
+The database is still behind, and not for CPU. Per request Garuda spends
+71.5 µs and axum 64.9 µs, with PostgreSQL about 60 µs behind either, and
+Garuda's four workers sat near 55% busy. Three things are different:
+
+- **Threads.** Tokio runs a thread per CPU, eight here; the script gives
+  Garuda four workers. With `WORKERS=8 POOL_SIZE=4`, the same 32 connections
+  to the database in all, Garuda reads 40,582.
+- **Pools.** Each worker has a pool of its own, as it has everything of its
+  own, while axum's 32 connections are one pool. The kernel spreads client
+  connections unevenly -- 22, 14, 13 and 15 on one run -- and the busiest
+  worker queues for its eight while another's sit idle.
+- **PostgreSQL itself is the limit on this box.** axum reads 51,188 with 16
+  connections, 45,619 with 32 and 36,512 with 64: every backend is another
+  process competing for the same eight cores.
