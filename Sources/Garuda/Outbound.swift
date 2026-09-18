@@ -639,10 +639,17 @@ struct OutboundSocket {
         return av_tls_is_h2(tls) != 0
     }
 
+    // The waits run where their caller runs, on the worker's task: a
+    // nonisolated async function would first ask the runtime to move it to
+    // the generic executor, a lock for a task with an executor preference.
+    @inline(__always)
+    nonisolated(nonsending)
     func readable(milliseconds: UInt64 = 10_000) async throws(OutboundError) {
         try await wait(.read, milliseconds: milliseconds)
     }
 
+    @inline(__always)
+    nonisolated(nonsending)
     func writable(milliseconds: UInt64 = 10_000) async throws(OutboundError) {
         try await wait(.write, milliseconds: milliseconds)
     }
@@ -653,6 +660,7 @@ struct OutboundSocket {
     /// many streams and the record has room for exactly one waiter: whoever
     /// holds the connection's read baton waits for readability *and*, when a
     /// writer is stuck, writability, in the single wait there is.
+    nonisolated(nonsending)
     func wait(_ mask: PollMask, milliseconds: UInt64) async throws(OutboundError) {
         guard isOpen else { throw .cancelled }
         // Already here, inside OpenSSL. Waiting would be waiting for nothing.

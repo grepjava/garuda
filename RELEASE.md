@@ -212,6 +212,9 @@ The Python suites need `h2` and `aioquic`.
   next request on the slot.
 - Handlers registered from `main.swift` take `sending` closures, so they run on
   the worker rather than being isolated to the main actor.
+- A typed async route takes the extractors that do not await synchronously,
+  before calling the handler, where each one used to be an async call of its
+  own: a frame and a task switch per extractor, per request.
 - `try await blocking { … }` runs a call that would block the worker -- a C
   library, disk I/O, a long computation -- on a thread of the worker's blocking
   pool, and resumes the handler on the worker with what it returns or throws.
@@ -902,6 +905,16 @@ The Python suites need `h2` and `aioquic`.
 
 ### PostgreSQL
 
+- A database request makes 3.3 task switches in the concurrency runtime
+  rather than 8.7, each of which took a lock to look up the task's executor
+  preference. The pool's and the connection's async functions are
+  `nonisolated(nonsending)`, so they run where the handler runs instead of
+  first asking to be moved; an idle connection is taken without an await;
+  the statement is written without one when the socket takes it all; and the
+  replies are handled as they are buffered, all at once, so the one await
+  left is for the server to answer. On one pinned core that measured 27.2k
+  requests a second against 26.7k before, within run-to-run noise: the
+  switches were a smaller share of the time than they looked.
 - A database request allocates 40% less: 4.1 objects rather than 7.0 on
   the bench box, and no longer asks the runtime about protocol conformances
   at all. A result's arrays grow
@@ -1136,6 +1149,9 @@ The Python suites need `h2` and `aioquic`.
   Their unit tests run in aviancore.
 - `GARUDA_UDP_GSO` and `GARUDA_NO_OPENAT2` are now `AVIAN_UDP_GSO` and
   `AVIAN_NO_OPENAT2`.
+- The executor async handlers run on is aviancore's `LoopExecutor`, which
+  needs aviancore 0.5.0. It was Garuda's own; it moved so that every server
+  on aviancore's loop runs its async code the same way.
 
 ### Fixed
 

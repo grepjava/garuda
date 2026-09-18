@@ -285,6 +285,8 @@ final class PostgresConnection {
     /// only when it failed outside a transaction. There a failed statement has
     /// been rolled back whole, so running it again cannot do anything twice;
     /// inside one, the failure has already failed the transaction.
+    @inline(__always)
+    nonisolated(nonsending)
     func query(_ sql: String, values: [PostgresValue] = []) async throws(PostgresClientError) -> PostgresRows {
         do {
             return try await run(sql, values)
@@ -301,7 +303,8 @@ final class PostgresConnection {
     /// message, which the server translates.
     private var reusedStaleStatement = false
 
-    private func run(_ sql: String, _ values: [PostgresValue]) async throws(PostgresClientError) -> PostgresRows {
+    private nonisolated(nonsending) func run(_ sql: String, _ values: [PostgresValue])
+        async throws(PostgresClientError) -> PostgresRows {
         let ms = configuration.timeoutMilliseconds
         let types = values.contains { $0.declaredType != 0 } ? values.map(\.declaredType) : []
         let key = StatementKey(sql: sql, types: types)
@@ -354,56 +357,73 @@ final class PostgresConnection {
             receiving = buffer
         }
         do { try query.write(into: &out) } catch { throw .postgres(error) }
-        do {
-            try await PostgresConnection.writeAll(socket, &out, ms)
+        do throws(PostgresClientError) {
+            // Written without an await when the socket takes it all, as it
+            // nearly always does; only a full one waits. And the replies are
+            // handled as they are buffered, all of them in one go, so the one
+            // await left is for the server to answer. Each message through
+            // an async function was a frame and a task switch of its own.
+            try PostgresConnection.writeSome(socket, &out)
+            if out.readableBytes > 0 { try await PostgresConnection.writeAll(socket, &out, ms) }
             buffer.reserve(8192)
-            while true {
-                let (type, reader) = try await nextMessage(socket, &buffer, configuration)
-                let finished: Bool
-                do {
-                    finished = try query.receive(type, reader)
-                } catch {
-                    throw PostgresClientError.postgres(error)
-                }
-                buffer.consume(5 + reader.count)
-                if finished {
-                    if collectsNotifications {
-                        // Kept whether the statement succeeded or not: a
-                        // notification that arrived while it ran was still
-                        // sent.
-                        notifications.append(contentsOf: query.notifications)
-                        // And what came after ReadyForQuery in the same read,
-                        // which on a listening connection is a notification
-                        // the server sent as the statement ended -- not a
-                        // reply nobody asked for. Refusing it here would end
-                        // a listener for being told something a moment too
-                        // late.
-                        keepForListener(&buffer)
-                    }
-                    guard buffer.readableBytes == 0 else {
-                        throw PostgresClientError.postgres(.unexpectedMessage(buffer.readPointer[0]))
-                    }
-                    // Recorded whether the statement succeeded or not: a
-                    // refused statement inside a transaction leaves it failed,
-                    // and that is exactly what must not be handed on.
-                    transactionStatus = query.transactionStatus
-                    if !name.isEmpty { remember(key, name, prepare: prepare, query) }
-                    switch query.result() {
-                    case .success(let rows): return rows
-                    // The server refused this statement and is ready for the
-                    // next: the connection is fine, the query is not.
-                    case .failure(let error): throw PostgresClientError.postgres(error)
-                    }
-                }
+            while try !receiveBuffered(&query, &buffer) {
+                try await PostgresConnection.readMore(socket, &buffer, ms)
             }
-        } catch let error as PostgresClientError {
+            if collectsNotifications {
+                // Kept whether the statement succeeded or not: a notification
+                // that arrived while it ran was still sent.
+                notifications.append(contentsOf: query.notifications)
+                // And what came after ReadyForQuery in the same read, which
+                // on a listening connection is a notification the server sent
+                // as the statement ended -- not a reply nobody asked for.
+                // Refusing it here would end a listener for being told
+                // something a moment too late.
+                keepForListener(&buffer)
+            }
+            guard buffer.readableBytes == 0 else {
+                throw .postgres(.unexpectedMessage(buffer.readPointer[0]))
+            }
+            // Recorded whether the statement succeeded or not: a refused
+            // statement inside a transaction leaves it failed, and that is
+            // exactly what must not be handed on.
+            transactionStatus = query.transactionStatus
+            if !name.isEmpty { remember(key, name, prepare: prepare, query) }
+            switch query.result() {
+            case .success(let rows): return rows
+            // The server refused this statement and is ready for the next:
+            // the connection is fine, the query is not.
+            case .failure(let error): throw .postgres(error)
+            }
+        } catch {
             // Anything but the server refusing the statement leaves the
             // connection in a state nobody should use.
             if case .postgres(.server) = error {} else { socket.close() }
             throw error
-        } catch {
-            socket.close()
-            throw .closed
+        }
+    }
+
+    /// Hands `query` every whole message buffered, consuming each. True once
+    /// it has had ReadyForQuery; false when the rest is still to be read.
+    private func receiveBuffered(_ query: inout PostgresQuery,
+                                 _ buffer: inout ByteBuffer) throws(PostgresClientError) -> Bool {
+        while true {
+            switch PostgresBackend.frame(buffer.readPointer, buffer.readableBytes,
+                                         maxLength: configuration.maxMessageBytes) {
+            case .frame(let frame):
+                let reader = PostgresReader(buffer.readPointer + frame.bodyOffset, frame.bodyLength)
+                let finished: Bool
+                do {
+                    finished = try query.receive(frame.type, reader)
+                } catch {
+                    throw .postgres(error)
+                }
+                buffer.consume(5 + reader.count)
+                if finished { return true }
+            case .failure(let error):
+                throw .postgres(.protocolViolation(error))
+            case .incomplete:
+                return false
+            }
         }
     }
 
@@ -563,12 +583,13 @@ final class PostgresConnection {
         try await PostgresConnection.nextMessage(socket, &buffer, configuration)
     }
 
+    nonisolated(nonsending)
     static func readMore(_ socket: OutboundSocket, _ buffer: inout ByteBuffer,
                          _ ms: UInt64) async throws(PostgresClientError) {
         while true {
             if !socket.hasBufferedInput {
                 do {
-                    try await socket.readable(milliseconds: ms)
+                    try await socket.wait(.read, milliseconds: ms)
                 } catch {
                     throw map(error)
                 }
@@ -603,9 +624,9 @@ final class PostgresConnection {
         }
     }
 
-    /// Sends everything in `out`, consuming it as it goes.
-    private static func writeAll(_ socket: OutboundSocket, _ out: inout ByteBuffer,
-                                 _ ms: UInt64) async throws(PostgresClientError) {
+    /// Sends what the socket will take of `out` now, consuming it.
+    private static func writeSome(_ socket: OutboundSocket,
+                                  _ out: inout ByteBuffer) throws(PostgresClientError) {
         while out.readableBytes > 0 {
             let n: Int
             do {
@@ -614,13 +635,21 @@ final class PostgresConnection {
             } catch {
                 throw map(error)
             }
+            if n == 0 { return }
             out.consume(n)
-            if out.readableBytes > 0 {
-                do {
-                    try await socket.writable(milliseconds: ms)
-                } catch {
-                    throw map(error)
-                }
+        }
+    }
+
+    /// Sends everything in `out`, consuming it as it goes.
+    private nonisolated(nonsending) static func writeAll(_ socket: OutboundSocket, _ out: inout ByteBuffer,
+                                                         _ ms: UInt64) async throws(PostgresClientError) {
+        while true {
+            try writeSome(socket, &out)
+            if out.readableBytes == 0 { return }
+            do {
+                try await socket.wait(.write, milliseconds: ms)
+            } catch {
+                throw map(error)
             }
         }
     }

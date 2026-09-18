@@ -99,8 +99,13 @@ extension RouteBuilder {
     ) -> OpenAPIOperation {
         onAsync(method, pattern) { request, response in
             var parameter = 0
+            // An extractor that does not await is taken here, synchronously:
+            // through the async function it would be an async frame and a
+            // task switch per extractor, per request.
             let answer = try await handler(
-                repeat try await extractForAsyncRoute((each E).self, request, &parameter, response))
+                repeat (each E).awaitsExtraction
+                    ? try await extractForAsyncRoute((each E).self, request, &parameter, response)
+                    : try (each E).extract(from: request, parameter: &parameter))
             try answer.write(to: response)
         }
         return documented(method, pattern, (repeat each E).self, R.self)

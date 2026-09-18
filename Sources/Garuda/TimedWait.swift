@@ -42,6 +42,7 @@ extension Worker {
     /// With no room in the op pool the wait is armed without a timer, as a
     /// route's deadline is: refusing to wait at all would fail the request
     /// over the safety net rather than the thing it guards against.
+    nonisolated(nonsending)
     static func waitTimed(_ worker: UnsafeMutablePointer<Worker>, milliseconds: UInt64,
                           register: (Int32) -> Void) async -> TimedWaitOutcome {
         await withUnsafeContinuation { continuation in

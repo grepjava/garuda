@@ -109,7 +109,14 @@ public final class PostgresPool: @unchecked Sendable {
         self.acquireTimeoutMilliseconds = acquireTimeoutMilliseconds ?? configuration.timeoutMilliseconds
     }
 
+    // The statements run where their caller runs -- a handler, on its
+    // worker's task -- rather than first asking the runtime to move them to
+    // the generic executor, which for a task with an executor preference is
+    // a lock taken per call: `nonisolated(nonsending)`, here and down the
+    // connection.
+
     /// Every row, decoded.
+    nonisolated(nonsending)
     public func query<Row: Decodable>(_ type: Row.Type, _ sql: String,
                                       _ values: any PostgresBindable...) async throws -> [Row] {
         let rows = try await run(sql, values)
@@ -117,6 +124,7 @@ public final class PostgresPool: @unchecked Sendable {
     }
 
     /// The first row decoded, or nil if there were none.
+    nonisolated(nonsending)
     public func first<Row: Decodable>(_ type: Row.Type, _ sql: String,
                                       _ values: any PostgresBindable...) async throws -> Row? {
         let rows = try await run(sql, values)
@@ -126,6 +134,7 @@ public final class PostgresPool: @unchecked Sendable {
 
     /// Runs a statement and returns how many rows it affected.
     @discardableResult
+    nonisolated(nonsending)
     public func execute(_ sql: String, _ values: any PostgresBindable...) async throws -> Int {
         try await run(sql, values).affected
     }
@@ -145,9 +154,9 @@ public final class PostgresPool: @unchecked Sendable {
     /// returned normally. PostgreSQL answers COMMIT on a failed transaction by
     /// rolling it back and saying ROLLBACK, not by failing, so a caller that
     /// swallowed one error would otherwise believe work was saved that was not.
+    nonisolated(nonsending)
     public func transaction<Result>(_ body: (PostgresTransaction) async throws -> Result) async throws -> Result {
-        guard let worker = currentWorker else { throw PostgresClientError.cancelled }
-        let connection = try await acquire(worker)
+        let connection = try await acquire()
         // Tracked rather than inferred from the error. An earlier draft let
         // errors carrying 25P02 through untouched, meaning its own -- but
         // PostgreSQL raises 25P02 itself for any statement in an aborted
@@ -192,13 +201,21 @@ public final class PostgresPool: @unchecked Sendable {
 
     // MARK: Connections
 
-    private func run(_ sql: String, _ values: [any PostgresBindable]) async throws(PostgresClientError) -> PostgresRows {
-        guard let worker = currentWorker else {
+    private nonisolated(nonsending) func run(_ sql: String, _ values: [any PostgresBindable])
+        async throws(PostgresClientError) -> PostgresRows {
+        guard currentWorker != nil else {
             // Only reachable by calling from a thread that is not a worker's,
             // which nothing in a handler can do.
             throw .cancelled
         }
-        let connection = try await acquire(worker)
+        // An idle connection is taken without an await: through `acquire` it
+        // was an async frame for what is almost always a pop off a list.
+        let connection: PostgresConnection
+        if let ready = takeIdle() {
+            connection = ready
+        } else {
+            connection = try await acquire()
+        }
         do {
             let rows = try await connection.query(sql, values: values.map(\.postgresValue))
             release(connection)
@@ -209,18 +226,27 @@ public final class PostgresPool: @unchecked Sendable {
         }
     }
 
-    private func acquire(_ worker: UnsafeMutablePointer<Worker>) async throws(PostgresClientError) -> PostgresConnection {
+    /// An idle connection still fit to use, if there is one.
+    private func takeIdle() -> PostgresConnection? {
+        while let connection = idle.popLast() {
+            // Anything arriving on a connection nobody was using is almost
+            // always the server going away: an idle timeout, a restart.
+            // Found out now, it costs a reconnect. Found out after the
+            // statement is written, it costs not knowing whether the
+            // statement ran.
+            if connection.isOpen && !connection.socket.hasPendingInput { return connection }
+            connection.close()
+            open -= 1
+        }
+        return nil
+    }
+
+    /// Waits for a connection, or opens one. Not `nonsending`: opening one
+    /// goes through the engine's own async functions.
+    private func acquire() async throws(PostgresClientError) -> PostgresConnection {
+        guard let worker = currentWorker else { throw .cancelled }
         while true {
-            while let connection = idle.popLast() {
-                // Anything arriving on a connection nobody was using is almost
-                // always the server going away: an idle timeout, a restart.
-                // Found out now, it costs a reconnect. Found out after the
-                // statement is written, it costs not knowing whether the
-                // statement ran.
-                if connection.isOpen && !connection.socket.hasPendingInput { return connection }
-                connection.close()
-                open -= 1
-            }
+            if let connection = takeIdle() { return connection }
             if open < maxConnections {
                 open += 1
                 do {
@@ -280,9 +306,9 @@ public final class PostgresPool: @unchecked Sendable {
 
     /// Lends one connection for as long as a `COPY` takes: the stream is the
     /// connection's, so nothing else may have it until the copy is over.
+    nonisolated(nonsending)
     func withConnectionForCopy<R>(_ body: (PostgresConnection) async throws -> R) async throws -> R {
-        guard let worker = currentWorker else { throw PostgresClientError.cancelled }
-        let connection = try await acquire(worker)
+        let connection = try await acquire()
         do {
             let result = try await body(connection)
             release(connection)
@@ -303,11 +329,13 @@ public final class PostgresPool: @unchecked Sendable {
 public struct PostgresTransaction {
     let connection: PostgresConnection
 
+    nonisolated(nonsending)
     public func query<Row: Decodable>(_ type: Row.Type, _ sql: String,
                                       _ values: any PostgresBindable...) async throws -> [Row] {
         try decodeAll(type, try await connection.query(sql, values: values.map(\.postgresValue)))
     }
 
+    nonisolated(nonsending)
     public func first<Row: Decodable>(_ type: Row.Type, _ sql: String,
                                       _ values: any PostgresBindable...) async throws -> Row? {
         let rows = try await connection.query(sql, values: values.map(\.postgresValue))
@@ -316,6 +344,7 @@ public struct PostgresTransaction {
     }
 
     @discardableResult
+    nonisolated(nonsending)
     public func execute(_ sql: String, _ values: any PostgresBindable...) async throws -> Int {
         try await connection.query(sql, values: values.map(\.postgresValue)).affected
     }

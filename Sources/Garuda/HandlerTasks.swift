@@ -4,7 +4,8 @@
 // A new `Task` per request costs 1.2-2.3 µs and five allocations; resuming a
 // long-lived one costs about 360 ns and none (benchmarks/async-probes/). So
 // each worker owns an executor that runs jobs only on the worker's thread,
-// when the worker drains it, and a pool of tasks that prefer that executor. A
+// when the worker drains it -- aviancore's `LoopExecutor`, shared with
+// anything else built on that loop -- and a pool of tasks that prefer it. A
 // request for an async handler resumes an idle task, which runs the handler
 // inline, in the same loop turn, until it answers or waits. When every task is
 // busy a new one joins the pool, up to `Worker.handlerTaskLimit`; past that
@@ -26,7 +27,6 @@
 
 import CAvian
 import AvianCore
-import Synchronization
 
 /// An async handler over the raw request. It reads what it needs from the
 /// request before its first `await`: the request is a view of a connection
@@ -41,164 +41,6 @@ public enum HandlerWaitError: Error, Equatable {
     case cancelled
     /// The worker had no room left to wait in.
     case exhausted
-}
-
-/// Runs the jobs of a worker's handler tasks, on the worker's thread, when the
-/// worker drains it.
-///
-/// A job may arrive from any thread. An executor does not get to say where its
-/// callers run: the runtime resumes a task wherever it resumed what the task
-/// was waiting on, and for a wait the engine does not own that is a thread of
-/// the runtime's choosing. The ring is the worker's alone, so a job from
-/// elsewhere goes on `intake` under `lock` and a byte down the pipe says so;
-/// the worker collects it on its next turn, or at once if that byte woke it
-/// from the poller. Its own thread takes the short way: no lock, no syscall.
-final class WorkerExecutor: TaskExecutor, @unchecked Sendable {
-    private let worker: UnsafeMutableRawPointer
-    private var jobs: UnsafeMutablePointer<UnownedJob>
-    /// A power of two, so the ring's indices wrap with a mask.
-    private var capacity: Int
-    private var head = 0
-    private(set) var count = 0
-    private var draining = false
-
-    /// Jobs other threads have left. `taken` is the empty list swapped in for
-    /// them, so collecting costs no allocation once both have grown.
-    private let lock: OpaquePointer
-    private var intake: [UnownedJob] = []
-    private var taken: [UnownedJob] = []
-    /// Whether `intake` holds anything, so the worker can ask on every turn of
-    /// its loop without taking the lock.
-    private let handedOver = Atomic<Bool>(false)
-    /// The pipe that wakes a worker asleep in the poller. The read end goes on
-    /// the poller under `PollToken.handlerTasks`, and is -1 when the pipe
-    /// could not be made: a job then waits for the next turn of the loop
-    /// rather than cutting it short.
-    let wakeFD: Int32
-    private let wakeWriteFD: Int32
-
-    init(worker: UnsafeMutablePointer<Worker>, capacity: Int = 64) {
-        self.worker = UnsafeMutableRawPointer(worker)
-        var size = 1
-        while size < capacity { size <<= 1 }
-        self.capacity = size
-        jobs = UnsafeMutablePointer<UnownedJob>.allocate(capacity: size)
-        // A job from another thread would have nowhere safe to go without it,
-        // and a mutex that cannot be allocated means there is no memory left
-        // for anything else either.
-        guard let lock = av_mutex_new() else {
-            preconditionFailure("no lock for the handler tasks")
-        }
-        self.lock = lock
-        var fds: (Int32, Int32) = (-1, -1)
-        let piped = withUnsafeMutableBytes(of: &fds) { raw in
-            av_pipe(raw.baseAddress!.assumingMemoryBound(to: Int32.self))
-        }
-        if piped != 0 { fds = (-1, -1) }
-        wakeFD = fds.0
-        wakeWriteFD = fds.1
-        if wakeFD < 0 {
-            Log.error("no pipe for the handler tasks: a task resumed off its worker's thread waits for the next turn of the loop")
-        }
-    }
-
-    deinit {
-        jobs.deallocate()
-        if wakeFD >= 0 { _ = av_close(wakeFD) }
-        if wakeWriteFD >= 0 { _ = av_close(wakeWriteFD) }
-        av_mutex_free(lock)
-    }
-
-    func enqueue(_ job: consuming ExecutorJob) {
-        let ready = UnownedJob(job)
-        if av_worker_current() == worker {
-            push(ready)
-        } else {
-            handOver(ready)
-        }
-    }
-
-    /// Whether a drain would run anything. Asked on every turn of the worker's
-    /// loop, so it reads the flag and not the list.
-    var hasWork: Bool { count > 0 || handedOver.load(ordering: .acquiring) }
-
-    /// Runs queued jobs, and the jobs they queue, until none is left. Called
-    /// from inside a job it returns at once: the drain already running picks
-    /// up whatever that job adds.
-    func drain() {
-        if draining { return }
-        draining = true
-        while true {
-            if count == 0 {
-                // Including what arrived while this drain was running: a job
-                // handed over by the thread that resumed a handler here is
-                // worth running in the same turn.
-                if handedOver.load(ordering: .acquiring) { collect() }
-                if count == 0 { break }
-            }
-            let job = (jobs + head).move()
-            head = (head &+ 1) & (capacity &- 1)
-            count -= 1
-            job.runSynchronously(on: asUnownedTaskExecutor())
-        }
-        draining = false
-    }
-
-    /// Empties the pipe. Called before the jobs its bytes stood for are run,
-    /// so that a byte arriving while they run is not read away with them.
-    func clearWake() {
-        guard wakeFD >= 0 else { return }
-        var scratch = (UInt64(0), UInt64(0), UInt64(0), UInt64(0),
-                       UInt64(0), UInt64(0), UInt64(0), UInt64(0))
-        while withUnsafeMutableBytes(of: &scratch, {
-            av_read(wakeFD, $0.baseAddress!, $0.count)
-        }) > 0 {}
-    }
-
-    /// Puts a job on the ring. The worker's thread only.
-    private func push(_ job: UnownedJob) {
-        if count == capacity { grow() }
-        (jobs + ((head &+ count) & (capacity &- 1))).initialize(to: job)
-        count += 1
-    }
-
-    /// Leaves a job for the worker to run, and wakes it if it is asleep.
-    private func handOver(_ job: UnownedJob) {
-        av_mutex_lock(lock)
-        intake.append(job)
-        // The worker takes the whole list when it hears, so only the job that
-        // found the list empty has anything to say.
-        let first = intake.count == 1
-        handedOver.store(true, ordering: .releasing)
-        av_mutex_unlock(lock)
-        guard first, wakeWriteFD >= 0 else { return }
-        var byte: UInt8 = 1
-        _ = av_write(wakeWriteFD, &byte, 1)
-    }
-
-    /// Moves what other threads left onto the ring. The worker's thread only,
-    /// which is what makes `taken` safe to hold outside the lock.
-    private func collect() {
-        av_mutex_lock(lock)
-        swap(&intake, &taken)
-        handedOver.store(false, ordering: .releasing)
-        av_mutex_unlock(lock)
-        for job in taken { push(job) }
-        taken.removeAll(keepingCapacity: true)
-    }
-
-    /// Only while tasks are being added faster than they run, so the ring
-    /// stops growing once the pool is warm.
-    private func grow() {
-        let larger = UnsafeMutablePointer<UnownedJob>.allocate(capacity: capacity * 2)
-        for i in 0..<count {
-            (larger + i).initialize(to: (jobs + ((head &+ i) & (capacity &- 1))).move())
-        }
-        jobs.deallocate()
-        jobs = larger
-        capacity *= 2
-        head = 0
-    }
 }
 
 /// A worker's handler tasks, and the requests waiting for one.
@@ -221,7 +63,7 @@ final class HandlerTaskPool: @unchecked Sendable {
     }
 
     let worker: UnsafeMutablePointer<Worker>
-    let executor: WorkerExecutor
+    let executor: LoopExecutor
     let limit: Int
     /// Tasks started, each numbered by its index into `records`.
     private(set) var count = 0
@@ -237,7 +79,7 @@ final class HandlerTaskPool: @unchecked Sendable {
         precondition(limit > 0)
         self.worker = worker
         self.limit = limit
-        executor = WorkerExecutor(worker: worker)
+        executor = LoopExecutor(owner: UnsafeMutableRawPointer(worker))
         records = UnsafeMutablePointer<Record>.allocate(capacity: limit)
         records.initialize(repeating: Record(), count: limit)
         idle = UnsafeMutablePointer<Int32>.allocate(capacity: limit)
@@ -378,7 +220,7 @@ final class HandlerTaskPool: @unchecked Sendable {
             && c.pointee.contTask < 0
     }
 
-    private func run(_ index: Int, _ work: Work) async {
+    private nonisolated(nonsending) func run(_ index: Int, _ work: Work) async {
         let worker = self.worker
         let c = worker.pointee.table[work.slot]
         // Cancelled between being handed over and starting.
