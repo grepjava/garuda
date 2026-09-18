@@ -296,10 +296,10 @@ public final class MemorySessionStore: SessionStore, @unchecked Sendable {
 /// with the server's own PX. Loading pushes the expiry out with GETEX, which
 /// needs Redis 6.2 or Valkey.
 public struct RedisSessionStore: SessionStore {
-    public let redis: RedisPool
+    public let redis: any RedisCommandSender
     public let prefix: String
 
-    public init(_ redis: RedisPool, prefix: String = "session:") {
+    public init(_ redis: any RedisCommandSender, prefix: String = "session:") {
         self.redis = redis
         self.prefix = prefix
     }

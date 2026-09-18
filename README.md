@@ -269,6 +269,13 @@ with typed replies (`get`, `set` with expiry and NX/XX, hashes, lists, sets,
 round trip, `session` holds one connection for WATCH, and `subscribe` listens
 to channels and patterns on a connection of its own.
 
+`RedisCluster` is the same API across a cluster: a pool per node, a slot map
+learned from the cluster, and every command aimed at the node that owns its
+key -- following `MOVED` and `ASK` when the map is behind. `RedisSentinelPool`
+asks a set of sentinels where the master is, checks what they name with `ROLE`,
+and asks again when a failover takes it away. Garuda's session and
+refresh-token stores work on either.
+
 ### SQLite
 
 ```swift
@@ -511,7 +518,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 806 unit tests, and the fuzz corpus
+swift test                                   # 831 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
@@ -566,9 +573,9 @@ before 1.0 are in [COMPATIBILITY.md](COMPATIBILITY.md). Pin with
 
 ### Not supported
 
-- Redis Cluster and Sentinel: the driver talks to one server, and a `MOVED`
-  reply is a server error. [CONNECTORS.md](CONNECTORS.md) has what works and
-  the plan.
+- Reads from Redis replicas: every command goes to the master, or to the node
+  that owns the slot. [CONNECTORS.md](CONNECTORS.md) has the rest of the
+  driver's limits.
 - Resumable uploads have no `min-size` or `min-append-size` limits and no
   digests, and a completed upload is not replayed to a client that asks again.
 - Byte ranges and directory listings for static files.

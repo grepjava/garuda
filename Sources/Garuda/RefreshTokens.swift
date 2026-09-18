@@ -305,10 +305,10 @@ public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
 /// `t:` a token's record, `u:` when it was spent (set with NX, so only one
 /// request spends it), `f:` a family's state, and `s:` a subject's families.
 public struct RedisRefreshTokenStore: RefreshTokenStore {
-    public let redis: RedisPool
+    public let redis: any RedisCommandSender
     public let prefix: String
 
-    public init(_ redis: RedisPool, prefix: String = "refresh:") {
+    public init(_ redis: any RedisCommandSender, prefix: String = "refresh:") {
         self.redis = redis
         self.prefix = prefix
     }

@@ -15,7 +15,7 @@ change is in [RELEASE.md](RELEASE.md).
 |---|---|---|
 | [HTTP client](#http-client) | Done | HTTP/3, proxies |
 | [PostgreSQL](#postgresql) | Done | Some types, `COPY`, unix sockets, several hosts |
-| [Redis](#redis) | Done | **Cluster, Sentinel**, sharded pub/sub, client-side caching |
+| [Redis](#redis) | Done | Replica reads, client-side caching |
 | [SQLite](#sqlite) | Done | Interrupting a statement, backups, custom functions |
 
 ## HTTP client
@@ -126,71 +126,80 @@ by the server, so a notification is a key, not a document.
 The driver speaks RESP3 through `HELLO` and falls back to RESP2 for servers
 older than Redis 6. Valkey works the same. TLS is required by default. The
 driver supports ACL users, databases other than 0, unix sockets, pipelines,
-transactions, `WATCH` sessions and pub/sub.
+transactions, `WATCH` sessions and pub/sub, sharded pub/sub included. A
+cluster and a set of sentinels are each a type of their own, below.
 
-### Cluster and Sentinel are not supported
+### Cluster
 
-A `RedisPool` talks to the one server its `RedisConfiguration` names. The
-driver never asks which nodes a cluster has or which server a Sentinel has
-promoted.
+`RedisCluster` is a pool per node and a map of which node owns which of the
+16,384 slots, learned from the cluster with `CLUSTER SLOTS`. It is a
+`RedisCommandSender`, so every typed command a pool has it has too, aimed at
+the node that owns the key:
 
-**Redis Cluster.** Pointed at one node of a cluster, the driver works only
-for keys whose hash slots that node holds:
+```swift
+app.state { _ in RedisCluster(RedisConfiguration(host: "redis-1", password: secret)) }
 
-- A key on another node is answered with `MOVED`, and a key being migrated with
-  `ASK`. The driver does not follow either redirect. Both throw
-  `RedisClientError.server`, with `code` set to `MOVED` or `ASK`.
-- A command, pipeline or transaction whose keys span several slots gets
-  `CROSSSLOT` from the server.
-- `subscribe` hears messages published on any node, as cluster pub/sub
-  spreads them. Sharded pub/sub (`SSUBSCRIBE`) has no method.
+app.get("/visits/:page") { (page: Path<String>, redis: State<RedisCluster>) async throws in
+    String(try await redis.value.incr("visits:\(page.value)"))
+}
+```
 
-**Redis Sentinel.** The driver does not speak to Sentinels:
+The map is how a command is aimed, never how correctness is decided:
 
-- Pointed at a Sentinel, data commands fail, because a Sentinel does not store
-  keys.
-- Pointed at the primary directly, the pool keeps its connections through a
-  failover. Once the old primary becomes a replica, writes throw
-  `RedisClientError.server` with `code` set to `READONLY` until those
-  connections close. If the old primary is down, requests fail to connect
-  until the configured address reaches a server again.
+- `MOVED` -- the slot has moved for good -- corrects the map and the command
+  goes again to the node named.
+- `ASK` -- this key has moved, the rest of the slot has not -- sends `ASKING`
+  and the command to the node taking the slot on, and leaves the map alone.
+- `TRYAGAIN` and `CLUSTERDOWN` are waited out and tried again, up to
+  `maxAttempts`.
+- A node that has gone is dropped, the map loaded from another, and the
+  command sent to whoever owns the slot now.
 
-**What works today:**
+So a map that is out of date costs a round trip, not a wrong answer. Keys
+touched together must share a slot, which a `{hash tag}` is for; `pipeline`
+sends one write per slot and returns the replies in the order they were asked
+for, while `transaction` and `session(for:)` are one node's and one slot's.
+`subscribe` goes to any node, since an ordinary channel reaches the whole
+cluster; `subscribeSharded` and `spublish` go to the shard that owns the
+channel. Garuda's session and refresh-token stores work on a cluster
+unchanged.
 
-- A single server, a primary with replicas where the application writes to the
-  primary, or a managed service's single endpoint.
-- A stable address that follows the primary through a failover, such as a DNS
-  name or a proxy that speaks the single-server protocol. A connection the
-  failover broke is closed, and the next one reaches the new primary. With a
-  DNS name, a connection still open to a demoted primary keeps getting
-  `READONLY` until it closes, so a proxy is the safer choice.
+### Sentinel
+
+`RedisSentinelPool` asks the sentinels where the master is, rather than being
+told:
+
+```swift
+let sentinels = [RedisConfiguration(host: "s1", port: 26379),
+                 RedisConfiguration(host: "s2", port: 26379)]
+app.state { _ in
+    RedisSentinelPool(RedisSentinelConfiguration(sentinels: sentinels, master: "cache",
+                                                 server: server))
+}
+```
+
+It asks the sentinel that answered last first, and checks what it names with
+`ROLE` before sending anything to it -- a sentinel can be behind and name a
+node that has been demoted. A connection that goes, or a `READONLY` reply,
+which is what a demoted master says to a write, means the master has moved:
+the sentinels are asked again and the command tried on the new one, up to
+`maxAttempts`. `masterAddress` is where it is now, and `refresh()` asks again
+on demand.
+
+### Not supported
+
+- Reads from replicas. Every command goes to the master, or in a cluster to
+  the node that owns the slot; `READONLY` and replica routing are not offered.
+- `CLUSTER SHARDS`, which would replace `CLUSTER SLOTS` on Redis 7 and later.
+- A sentinel's `+switch-master` event, which would say a failover has happened
+  before a command finds out.
+- Cluster commands across every node at once: `KEYS`, `SCAN`, `FLUSHALL` and
+  `DBSIZE` go to one node and answer for it alone.
 
 ### Future work
 
-**Cluster support:**
-
-- Read the slot map with `CLUSTER SHARDS` (`CLUSTER SLOTS` on older servers)
-  from a list of seed nodes.
-- Keep a pool per node in each worker, and route each command by the CRC16 of
-  its key, including `{hash tags}`.
-- Follow `MOVED` by refreshing the map and retrying once. Follow `ASK` by
-  sending `ASKING` to the named node for that one command.
-- Split a pipeline by node and put the replies back in order. Keep a
-  transaction and a `WATCH` session to one slot, and refuse keys from different
-  slots before sending.
-- Add `ssubscribe` for sharded pub/sub, on a connection to the node that owns
-  the channel.
-- Optionally send reads to replicas with `READONLY`.
-
-**Sentinel support:**
-
-- Configure a list of Sentinels and a primary's name. Ask the Sentinels with
-  `SENTINEL GET-MASTER-ADDR-BY-NAME`, and check the answer with `ROLE` before
-  using it.
-- Listen for `+switch-master` on a Sentinel, and close the pool's connections
-  when the primary changes.
-- Treat `READONLY` as a sign of a missed failover: ask the Sentinels again and
-  retry once.
+- Replica reads, per command or per pool.
+- Learning the other sentinels from one, with `SENTINEL sentinels`.
 
 **Other work:**
 

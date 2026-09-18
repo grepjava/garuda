@@ -90,6 +90,13 @@ public enum RedisValue: Sendable, Equatable {
 
     /// The elements of an array, set or push, or of a map flattened into key,
     /// value, key, value -- the shape RESP2 gives the same reply.
+    /// The number a reply carries, or nil when it is not one: a count, a
+    /// length, the value a counter reached.
+    public var integer: Int? {
+        if case .integer(let value) = self { return Int(exactly: value) }
+        return nil
+    }
+
     public var array: [RedisValue]? {
         switch self {
         case .array(let a), .set(let a), .push(let a): return a

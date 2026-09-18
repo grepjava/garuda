@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 806 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 831 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -410,6 +410,28 @@ The Python suites need `h2` and `aioquic`.
   is that column rather than a row of columns, as bytes already were.
   `PostgresType.elementType(of:)` and `PostgresArrayText` are public for a
   driver of your own.
+- Redis Cluster: `RedisCluster(seeds:)` is a pool per node and a map of which
+  node owns which of the 16,384 slots, read with `CLUSTER SLOTS`. It is a
+  `RedisCommandSender`, so every typed command a pool has it has too, aimed at
+  the node that owns the key. `MOVED` corrects the map and sends the command
+  again; `ASK` sends `ASKING` and the command to the node taking a slot on,
+  without touching the map; `TRYAGAIN` and `CLUSTERDOWN` are waited out; a node
+  that has gone is dropped and the map loaded from another. So a map that is
+  behind costs a round trip, not a wrong answer. `pipeline` sends one write per
+  slot and returns the replies in order; `transaction` and `session(for:)` are
+  one slot's, as they must be; `subscribeSharded` and `spublish` reach the
+  shard that owns a channel. `RedisSlots` and `RedisKeys` are public for a
+  driver of your own.
+- Redis Sentinel: `RedisSentinelPool(RedisSentinelConfiguration(sentinels:master:server:))`
+  asks the sentinels where the master is instead of being told, and checks what
+  they name with `ROLE` -- a sentinel can be behind and name a node that has
+  been demoted. A lost connection, or the `READONLY` a demoted master answers a
+  write with, means asking again and trying the new master. `masterAddress`
+  says where it is; `refresh()` asks on demand.
+- `RedisSessionStore` and `RedisRefreshTokenStore` take any
+  `RedisCommandSender`, so they work on a cluster and behind sentinels as well
+  as on one server. `pipeline` is part of that protocol now, and `RedisValue`
+  has an `integer` beside `string`, `bytes` and `array`.
 - `LISTEN` and `NOTIFY`: `app.listen("jobs") { notification, start in ... }`
   hears notifications in each worker, on the worker's thread with the worker's
   state, on a connection of its own that the pool does not count. A connection

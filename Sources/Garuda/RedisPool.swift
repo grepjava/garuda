@@ -22,10 +22,19 @@ import GarudaRedis
 // MARK: - Commands
 
 /// Something commands can be sent to: a pool, or one session taken from it.
-public protocol RedisCommandSender {
+public protocol RedisCommandSender: Sendable {
     /// Sends one command and returns its reply. A refusal from the server
     /// throws `RedisClientError.server`.
     func send(_ command: RedisCommand) async throws(RedisClientError) -> RedisValue
+
+    /// Sends several commands and returns a reply for each, in order. A
+    /// command the server refused is an `.error` among them rather than a
+    /// throw, so the others' replies are not lost with it.
+    ///
+    /// One write where one will do: a pool writes them all together, and a
+    /// cluster writes one batch per slot, since a node answers only for the
+    /// slots it owns.
+    func pipeline(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue]
 }
 
 /// How `set` treats a key that already exists.
@@ -209,6 +218,16 @@ extension RedisCommandSender {
         try integer(try await send("PUBLISH", channel, message))
     }
 
+    /// Publishes `message` on a sharded `channel`, and returns how many
+    /// subscribers received it.
+    ///
+    /// A sharded channel belongs to a slot, as a key does, so in a cluster it
+    /// travels no further than the shard that owns it.
+    @discardableResult
+    public func spublish(_ channel: String, _ message: any RedisArgument) async throws(RedisClientError) -> Int {
+        try integer(try await send("SPUBLISH", channel, message))
+    }
+
     // Replies
 
     private func integer(_ reply: RedisValue) throws(RedisClientError) -> Int {
@@ -236,7 +255,7 @@ extension RedisCommandSender {
 
 /// The replies to MULTI, the commands and EXEC: the commands' own, or nil
 /// when a watched key changed and none of them ran.
-private func transactionReplies(_ replies: [RedisValue], commands: Int) throws(RedisClientError) -> [RedisValue]? {
+func transactionReplies(_ replies: [RedisValue], commands: Int) throws(RedisClientError) -> [RedisValue]? {
     guard replies.count == commands + 2 else { throw .unexpectedReply(.array(replies)) }
     if case .error(let error) = replies[0] { throw .server(error) }
     let exec = replies[replies.count - 1]
@@ -293,9 +312,22 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
     /// command the server refused is an `.error` among them rather than a
     /// throw, so the others' replies are not lost with it.
     public func pipeline(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
+        try await pipeline(commands, timeoutMilliseconds: nil)
+    }
+
+    /// Sends every command in one write, waiting up to `timeoutMilliseconds`
+    /// for the replies.
+    public func pipeline(_ commands: [RedisCommand],
+                         timeoutMilliseconds: UInt64?) async throws(RedisClientError) -> [RedisValue] {
         try await withConnection { connection throws(RedisClientError) in
-            try await connection.send(commands)
+            try await connection.send(commands, milliseconds: timeoutMilliseconds)
         }
+    }
+
+    /// Where this pool's server is, as `host:port` -- or the socket path --
+    /// which is what a cluster keys its nodes by.
+    public var address: String {
+        configuration.unixSocketPath ?? "\(configuration.host):\(configuration.port)"
     }
 
     /// Runs the commands as one transaction -- MULTI, the commands, EXEC -- in
@@ -342,13 +374,26 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
     /// long as it lasts. The initial subscriptions are confirmed before this
     /// returns.
     public func subscribe(channels: [String] = [], patterns: [String] = []) async throws(RedisClientError) -> RedisSubscription {
-        guard let worker = currentWorker else { throw .cancelled }
         precondition(!channels.isEmpty || !patterns.isEmpty, "subscribe to at least one channel or pattern")
+        return try await subscribing(channels: channels, patterns: patterns, sharded: [])
+    }
+
+    /// Subscribes to sharded channels, which belong to slots as keys do: in a
+    /// cluster a sharded message reaches only the shard that owns it, and
+    /// `RedisCluster` subscribes on that shard's node.
+    public func subscribeSharded(channels: [String]) async throws(RedisClientError) -> RedisSubscription {
+        precondition(!channels.isEmpty, "subscribe to at least one channel")
+        return try await subscribing(channels: [], patterns: [], sharded: channels)
+    }
+
+    private func subscribing(channels: [String], patterns: [String],
+                             sharded: [String]) async throws(RedisClientError) -> RedisSubscription {
+        guard let worker = currentWorker else { throw .cancelled }
         let connection = try await RedisConnection.connect(worker, configuration)
         connection.reusable = false
         let subscription = RedisSubscription(connection: connection)
         do {
-            try await subscription.start(channels: channels, patterns: patterns)
+            try await subscription.start(channels: channels, patterns: patterns, sharded: sharded)
         } catch {
             connection.close()
             throw error
@@ -440,7 +485,10 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
 }
 
 /// One connection, for commands that belong together.
-public struct RedisSession: RedisCommandSender {
+/// `@unchecked Sendable` on the same ground as the pool it came from: it
+/// belongs to the worker that took it, whose one thread is the only one that
+/// ever touches the connection.
+public struct RedisSession: RedisCommandSender, @unchecked Sendable {
     let connection: RedisConnection
 
     /// The protocol the server speaks on this connection: 3, or 2.
@@ -504,13 +552,14 @@ public final class RedisSubscription: @unchecked Sendable {
 
     public var isOpen: Bool { connection.isOpen }
 
-    func start(channels: [String], patterns: [String]) async throws(RedisClientError) {
+    func start(channels: [String], patterns: [String], sharded: [String] = []) async throws(RedisClientError) {
         var commands: [RedisCommand] = []
         if !channels.isEmpty { commands.append(RedisCommand("SUBSCRIBE", arguments: channels)) }
         if !patterns.isEmpty { commands.append(RedisCommand("PSUBSCRIBE", arguments: patterns)) }
+        if !sharded.isEmpty { commands.append(RedisCommand("SSUBSCRIBE", arguments: sharded)) }
         try await connection.write(commands)
         var confirmed = 0
-        let expected = channels.count + patterns.count
+        let expected = channels.count + patterns.count + sharded.count
         let deadline = av_monotonic_ms() + connection.configuration.timeoutMilliseconds
         while confirmed < expected {
             let now = av_monotonic_ms()
@@ -525,7 +574,8 @@ public final class RedisSubscription: @unchecked Sendable {
             }
             switch classify(value) {
             case .message(let message): pending.append(message)
-            case .confirmation(let kind): if kind == "subscribe" || kind == "psubscribe" { confirmed += 1 }
+            case .confirmation(let kind):
+                if kind == "subscribe" || kind == "psubscribe" || kind == "ssubscribe" { confirmed += 1 }
             case .other: continue
             }
         }
@@ -569,6 +619,16 @@ public final class RedisSubscription: @unchecked Sendable {
 
     public func psubscribe(_ patterns: String...) async throws(RedisClientError) {
         try await connection.write([RedisCommand("PSUBSCRIBE", arguments: patterns)])
+    }
+
+    /// Listens to more sharded channels. In a cluster they have to be in the
+    /// slot this subscription's node owns.
+    public func ssubscribe(_ channels: String...) async throws(RedisClientError) {
+        try await connection.write([RedisCommand("SSUBSCRIBE", arguments: channels)])
+    }
+
+    public func sunsubscribe(_ channels: String...) async throws(RedisClientError) {
+        try await connection.write([RedisCommand("SUNSUBSCRIBE", arguments: channels)])
     }
 
     public func punsubscribe(_ patterns: String...) async throws(RedisClientError) {
