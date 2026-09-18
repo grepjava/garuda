@@ -54,6 +54,10 @@ jobs:
   macos:
     name: macos · build and unit tests
     runs-on: macos-15
+    env:
+      # A crash here has been hard to reproduce on a developer's Mac, so the
+      # runner is asked for frames rather than just a signal number.
+      SWIFT_BACKTRACE: enable=yes,interactive=no,threads=all
     steps:
       - uses: actions/checkout@v4
 
