@@ -40,6 +40,11 @@ public final class RedisCluster: RedisCommandSender, @unchecked Sendable {
     /// How many times a command is aimed again before it gives up: a
     /// redirect, a node that has gone, a slot being moved.
     public let maxAttempts: Int
+    /// What may be sent again when a node fails with the command already
+    /// written and no reply back. Reads, by default: aiming an `INCR` at
+    /// another node when the first may already have counted is how a retry
+    /// turns into a second write.
+    public let replay: RedisReplay
 
     /// A pool per node, by `host:port`.
     private var pools: [String: RedisPool] = [:]
@@ -56,7 +61,8 @@ public final class RedisCluster: RedisCommandSender, @unchecked Sendable {
     }
 
     public init(seeds: [RedisConfiguration], maxConnectionsPerNode: Int = 8,
-                acquireTimeoutMilliseconds: UInt64? = nil, maxAttempts: Int = 5) {
+                acquireTimeoutMilliseconds: UInt64? = nil, maxAttempts: Int = 5,
+                replay: RedisReplay = .reads) {
         precondition(!seeds.isEmpty, "a cluster needs at least one node to ask")
         precondition(maxAttempts > 0, "a command is sent at least once")
         self.seeds = seeds
@@ -64,13 +70,16 @@ public final class RedisCluster: RedisCommandSender, @unchecked Sendable {
         self.acquireTimeoutMilliseconds = acquireTimeoutMilliseconds
             ?? seeds[0].acquireTimeoutDefault
         self.maxAttempts = maxAttempts
+        self.replay = replay
     }
 
     /// One node to start from.
     public convenience init(_ seed: RedisConfiguration, maxConnectionsPerNode: Int = 8,
-                            acquireTimeoutMilliseconds: UInt64? = nil, maxAttempts: Int = 5) {
+                            acquireTimeoutMilliseconds: UInt64? = nil, maxAttempts: Int = 5,
+                            replay: RedisReplay = .reads) {
         self.init(seeds: [seed], maxConnectionsPerNode: maxConnectionsPerNode,
-                  acquireTimeoutMilliseconds: acquireTimeoutMilliseconds, maxAttempts: maxAttempts)
+                  acquireTimeoutMilliseconds: acquireTimeoutMilliseconds, maxAttempts: maxAttempts,
+                  replay: replay)
     }
 
     // MARK: Commands
@@ -119,7 +128,7 @@ public final class RedisCluster: RedisCommandSender, @unchecked Sendable {
     public func transaction(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
         let slot = slot(of: commands)
         let replies = try await route([RedisCommand("MULTI")] + commands + [RedisCommand("EXEC")],
-                                      slot: slot, timeoutMilliseconds: nil)
+                                      slot: slot, timeoutMilliseconds: nil, atomic: true)
         guard let results = try transactionReplies(replies, commands: commands.count) else {
             throw .unexpectedReply(.null)
         }
@@ -191,70 +200,132 @@ public final class RedisCluster: RedisCommandSender, @unchecked Sendable {
 
     // MARK: Routing
 
+    /// Where a command is going next.
+    private struct Aim: Equatable {
+        /// The node a redirect named, or nil for wherever the map says the
+        /// slot is.
+        var address: String? = nil
+        /// Whether `ASKING` goes in front, which is for this send only and
+        /// says nothing about the map.
+        var asking = false
+    }
+
+    /// Commands that stand or fall together, and where they are going.
+    private struct Unit {
+        /// Their places in the batch, which is also where their replies go.
+        var indices: [Int]
+        var aim = Aim()
+        var attempts = 0
+        /// How long to wait before going again, for a slot that is moving.
+        var pauseMilliseconds: UInt64 = 0
+    }
+
     /// Sends `commands` to the node that owns `slot`, following what the
     /// cluster says about where they should have gone.
+    ///
+    /// A pipeline is not one thing. One node can answer some of a batch and
+    /// redirect the rest -- which is exactly what a slot half migrated does,
+    /// where a key that has moved gets `ASK` and a key that has not is
+    /// answered -- so each command is followed on its own. What was answered
+    /// is kept, and only what was refused goes again. Sending the whole batch
+    /// again would repeat every write that had already happened in it.
+    ///
+    /// A transaction *is* one thing, and says so with `atomic`. A command
+    /// refused while it was being queued makes Redis abort the whole
+    /// transaction, so none of it ran and all of it goes again together.
     private func route(_ commands: [RedisCommand], slot: Int?,
-                       timeoutMilliseconds: UInt64?) async throws(RedisClientError) -> [RedisValue] {
-        var attempt = 0
-        // Where a redirect said to go instead, and whether it was an ASK --
-        // which is for this command only and does not change the map.
-        var redirect: String? = nil
-        var asking = false
-        while true {
-            attempt += 1
+                       timeoutMilliseconds: UInt64?,
+                       atomic: Bool = false) async throws(RedisClientError) -> [RedisValue] {
+        var replies = [RedisValue](repeating: .null, count: commands.count)
+        var pending: [Unit] = atomic
+            ? [Unit(indices: Array(commands.indices))]
+            : commands.indices.map { Unit(indices: [$0]) }
+        while let first = pending.first {
+            // One write holds everything that is going to the same place.
+            let aim = first.aim
+            let going = pending.indices.filter { pending[$0].aim == aim }
+            if let wait = going.map({ pending[$0].pauseMilliseconds }).max(), wait > 0 {
+                await pause(milliseconds: wait)
+            }
             let pool: RedisPool
-            if let redirect {
-                pool = poolFor(address: redirect)
+            if let address = aim.address {
+                pool = poolFor(address: address)
             } else if let slot {
                 pool = try await poolForSlot(slot)
             } else {
                 pool = try await anyPool()
             }
-            do {
-                let sent = asking ? [RedisCommand("ASKING")] + commands : commands
-                var replies = try await pool.pipeline(sent, timeoutMilliseconds: timeoutMilliseconds)
-                if asking { replies.removeFirst() }
-                // A redirect comes back as the first error among the replies:
-                // one node cannot answer some of a batch and redirect the rest.
-                if let move = replies.compactMap({ Redirect($0) }).first, attempt < maxAttempts {
-                    switch move.kind {
-                    case .moved:
-                        // The map was wrong. Correct this slot now so this
-                        // command goes straight there, and load the whole map
-                        // before the next one is aimed.
-                        remember(slot: move.slot, at: move.address)
-                        mapIsStale = true
-                        redirect = move.address
-                        asking = false
-                    case .ask:
-                        // This key has already moved, the rest of the slot has
-                        // not. ASKING says "I know" to the node taking it on.
-                        redirect = move.address
-                        asking = true
+            // ASKING is for the next command, so a unit that needs it carries
+            // its own. A unit is one command unless it is a transaction, and
+            // a transaction is asked for once, in front of its MULTI.
+            var sending: [RedisCommand] = []
+            for i in going {
+                if aim.asking { sending.append(RedisCommand("ASKING")) }
+                for index in pending[i].indices { sending.append(commands[index]) }
+            }
+            let kept = pending.indices.filter { !going.contains($0) }.map { pending[$0] }
+            var again: [Unit] = []
+            do throws(RedisClientError) {
+                let answers = try await pool.pipeline(sending, timeoutMilliseconds: timeoutMilliseconds)
+                guard answers.count == sending.count else { throw RedisClientError.unexpectedReply(.array(answers)) }
+                var at = 0
+                for i in going {
+                    var unit = pending[i]
+                    if aim.asking { at += 1 }
+                    let mine = Array(answers[at..<(at + unit.indices.count)])
+                    at += unit.indices.count
+                    unit.attempts += 1
+                    unit.pauseMilliseconds = 0
+                    if unit.attempts < maxAttempts, let move = mine.compactMap({ Redirect($0) }).first {
+                        switch move.kind {
+                        case .moved:
+                            // The map was wrong. Correct this slot now so the
+                            // command goes straight there, and load the whole
+                            // map before the next one is aimed.
+                            remember(slot: move.slot, at: move.address)
+                            mapIsStale = true
+                            unit.aim = Aim(address: move.address, asking: false)
+                        case .ask:
+                            // This key has already moved, the rest of the slot
+                            // has not. ASKING says "I know" to the node taking
+                            // it on.
+                            unit.aim = Aim(address: move.address, asking: true)
+                        }
+                        again.append(unit)
+                        continue
                     }
-                    continue
+                    // A slot being moved with more than one key in the command,
+                    // or a cluster that has not settled: both say to come back.
+                    if unit.attempts < maxAttempts, let retry = mine.compactMap({ retryable($0) }).first {
+                        if retry == .clusterDown { mapIsStale = true }
+                        unit.aim = Aim()
+                        unit.pauseMilliseconds = 20 * UInt64(unit.attempts)
+                        again.append(unit)
+                        continue
+                    }
+                    // Answered, or out of attempts and keeping what it was
+                    // told, which the caller sees as the error it is.
+                    for (n, index) in unit.indices.enumerated() { replies[index] = mine[n] }
                 }
-                // A slot being moved with more than one key in the command, or
-                // a cluster that has not settled: both say to come back.
-                if let again = replies.compactMap({ retryable($0) }).first, attempt < maxAttempts {
-                    if again == .clusterDown { mapIsStale = true }
-                    await pause(milliseconds: 20 * UInt64(attempt))
-                    redirect = nil
-                    asking = false
-                    continue
-                }
-                return replies
             } catch {
                 // The node is gone, or will not answer. Whoever owns the slot
-                // now is in a fresh map.
-                guard attempt < maxAttempts, isWorthAnotherNode(error) else { throw error }
+                // now is in a fresh map -- but only what can go again goes.
+                let written = going.flatMap { pending[$0].indices }.map { commands[$0] }
+                guard isWorthAnotherNode(error), replay.allows(error, written) else { throw error }
                 forget(address: pool.address)
                 mapIsStale = true
-                redirect = nil
-                asking = false
-                await pause(milliseconds: 20 * UInt64(attempt))
+                for i in going {
+                    var unit = pending[i]
+                    unit.attempts += 1
+                    guard unit.attempts < maxAttempts else { throw error }
+                    unit.aim = Aim()
+                    unit.pauseMilliseconds = 20 * UInt64(unit.attempts)
+                    again.append(unit)
+                }
             }
+            pending = kept + again
         }
+        return replies
     }
 
     /// The one slot a batch belongs to. A batch spanning slots is aimed at the
@@ -433,9 +504,10 @@ public final class RedisCluster: RedisCommandSender, @unchecked Sendable {
     }
 
     /// Whether a failure is worth another node rather than the caller's
-    /// attention: the connection, not the command.
+    /// attention: the connection, not the command. Whether the command may
+    /// be sent to that node is `replay`'s question, not this one's.
     private func isWorthAnotherNode(_ error: RedisClientError) -> Bool {
-        switch error {
+        switch error.cause {
         case .connect, .closed, .timedOut, .poolTimedOut: return true
         default: return false
         }

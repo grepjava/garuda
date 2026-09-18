@@ -189,7 +189,15 @@ The map is how a command is aimed, never how correctness is decided:
 - `TRYAGAIN` and `CLUSTERDOWN` are waited out and tried again, up to
   `maxAttempts`.
 - A node that has gone is dropped, the map loaded from another, and the
-  command sent to whoever owns the slot now.
+  command sent to whoever owns the slot now -- if sending it again cannot
+  repeat what it did; see [what may be sent again](#what-may-be-sent-again).
+
+Each of these follows one command, not the batch it arrived in. A slot in the
+middle of migrating answers the keys it still has and redirects the keys it
+does not, so a pipeline comes back part answered and part redirected: what was
+answered is kept and only what was refused goes again. A transaction is the
+exception, and is treated as one thing, because a command refused while it was
+being queued makes Redis abort all of it.
 
 So a map that is out of date costs a round trip, not a wrong answer. Keys
 touched together must share a slot, which a `{hash tag}` is for; `pipeline`
@@ -222,6 +230,48 @@ the sentinels are asked again and the command tried on the new one, up to
 `maxAttempts`. `masterAddress` is where it is now, and `refresh()` asks again
 on demand.
 
+A failover can land in the middle of a pipeline, answering the commands before
+it and refusing the writes after it with `READONLY`. Only the refused ones go
+to the new master: a refusal is proof that the command did not run, and an
+answer is proof that it did.
+
+### What may be sent again
+
+A retry is only safe when the client knows the command did not run. There are
+two quite different failures behind one word:
+
+- The command never reached the server -- the connection was refused, the pool
+  timed out, the write failed on its first byte. Sending it again repeats
+  nothing, so it is always sent again.
+- The bytes went out and no reply came back. From here, the command having run
+  and its reply having been lost look exactly the same. `SET` sent again is
+  the same `SET`; `INCR` sent again counts twice, and a lost reply to `EXEC`
+  does not mean the transaction was rolled back.
+
+The second case throws `RedisClientError.unknownOutcome`, which wraps the
+failure underneath -- `error.cause` is the `closed` or `timedOut` it happened
+to be, and `error.mayHaveRun` is true. Whether the cluster or sentinel pool
+sends such a command again is `replay`:
+
+```swift
+RedisCluster(seed, replay: .reads)      // the default
+RedisSentinelPool(configuration, replay: .anything)
+```
+
+- `.reads` -- the default -- sends commands that only read. A write whose
+  outcome is unknown is reported, for the application to decide about: retry
+  it, check the key, or fail the request.
+- `.anything` sends everything, for a cache where doing a write twice costs
+  nothing.
+- `.nothing` reports every failure that happened after the bytes went out.
+
+`RedisReads.only(_:)` is the table behind `.reads`. It names the commands the
+driver's own API sends and the ones an application reaches for; anything it
+does not recognise counts as a write, which is the safe way to be wrong.
+
+`RedisPool` retries nothing at all, so it has no `replay` -- but it does throw
+`unknownOutcome` for a failure after the bytes went out, and so does a session.
+
 ### Not supported
 
 - Reads from replicas. Every command goes to the master, or in a cluster to
@@ -229,6 +279,8 @@ on demand.
 - `CLUSTER SHARDS`, which would replace `CLUSTER SLOTS` on Redis 7 and later.
 - A sentinel's `+switch-master` event, which would say a failover has happened
   before a command finds out.
+- Deciding replay per command. `replay` is per pool; a caller who wants one
+  `INCR` retried and another reported catches `unknownOutcome` and decides.
 - Cluster commands across every node at once: `KEYS`, `SCAN`, `FLUSHALL` and
   `DBSIZE` go to one node and answer for it alone.
 

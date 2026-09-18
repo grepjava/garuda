@@ -204,7 +204,10 @@ struct RedisScriptedTests {
             out.append("\(try await redis.send("PING"))")
             return out.joined(separator: "|")
         }
-        #expect(result == "closed|(open: 0, idle: 0)|simpleString(\"PONG\")")
+        // The GET was written and half answered, so what the server did with
+        // it is not knowable from here. `unknownOutcome` says so, rather than
+        // letting a bare "closed" be read as "it did not run".
+        #expect(result == "unknownOutcome(Garuda.RedisClientError.closed)|(open: 0, idle: 0)|simpleString(\"PONG\")")
         #expect(fake.accepted == 2)
     }
 
@@ -223,7 +226,7 @@ struct RedisScriptedTests {
                 return "\(error)|\(av_monotonic_ms() - start >= 90)|\(redis.counts)"
             }
         }
-        #expect(result == "timedOut|true|(open: 0, idle: 0)")
+        #expect(result == "unknownOutcome(Garuda.RedisClientError.timedOut)|true|(open: 0, idle: 0)")
     }
 
     @Test func aRefusedHandshakeClosesTheConnection() throws {

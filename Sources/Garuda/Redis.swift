@@ -85,6 +85,62 @@ public enum RedisClientError: Error, Equatable {
     case server(RedisServerError)
     /// A reply that is not the shape the method asked for.
     case unexpectedReply(RedisValue)
+    /// The connection failed with the command's bytes already written, so
+    /// whether the server ran it is not known. A `SET` sent again would be
+    /// the same `SET`; an `INCR` sent again would count twice, and a lost
+    /// reply to `EXEC` does not mean the transaction was rolled back. So
+    /// this is where a retry stops and the caller decides.
+    indirect case unknownOutcome(RedisClientError)
+}
+
+extension RedisClientError {
+    /// What went wrong, with `unknownOutcome` taken off: the connection
+    /// closed, or timed out, or whatever it was.
+    public var cause: RedisClientError {
+        if case .unknownOutcome(let inner) = self { return inner.cause }
+        return self
+    }
+
+    /// Whether the command may already have run. Nothing else is known about
+    /// it: it is not that it did, and not that it did not.
+    public var mayHaveRun: Bool {
+        if case .unknownOutcome = self { return true }
+        return false
+    }
+
+    /// The same failure, marked as having happened after the bytes went out.
+    func afterSending() -> RedisClientError {
+        mayHaveRun ? self : .unknownOutcome(self)
+    }
+}
+
+/// What may be sent again after a failure that leaves it unknown whether the
+/// server ran the command.
+///
+/// This is only about the uncertain case. A command that never reached the
+/// server -- the connection refused, the pool timed out, the write failed on
+/// its first byte -- is always sent again, whatever this says, because
+/// sending it again cannot repeat anything.
+public enum RedisReplay: Sendable, Equatable {
+    /// Commands that only read. A write whose outcome is unknown is reported
+    /// as `unknownOutcome` rather than repeated. The default.
+    case reads
+    /// Everything, for a cache where doing a write twice costs nothing.
+    case anything
+    /// Nothing: any failure after the bytes went out is the caller's.
+    case nothing
+}
+
+extension RedisReplay {
+    /// Whether `commands` may be sent again after `error`.
+    func allows(_ error: RedisClientError, _ commands: [RedisCommand]) -> Bool {
+        guard error.mayHaveRun else { return true }
+        switch self {
+        case .anything: return true
+        case .nothing: return false
+        case .reads: return RedisReads.only(commands)
+        }
+    }
 }
 
 /// One connection to a Redis server.
@@ -191,6 +247,11 @@ final class RedisConnection {
     /// Writes every command at once, then reads a reply for each, in order.
     /// A command the server refused is an `.error` among the replies; only a
     /// failure of the connection throws.
+    ///
+    /// A failure with bytes already written throws `unknownOutcome`, because
+    /// from here the command having run and its reply having been lost look
+    /// the same. A failure before the first byte throws plainly: that one the
+    /// server never saw.
     func send(_ commands: [RedisCommand], milliseconds: UInt64? = nil) async throws(RedisClientError) -> [RedisValue] {
         guard !commands.isEmpty else { return [] }
         let ms = milliseconds ?? configuration.timeoutMilliseconds
@@ -198,8 +259,9 @@ final class RedisConnection {
         for command in commands { command.write(into: &out) }
         let bytes = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
         out.destroy()
+        var sent = 0
         do {
-            try await RedisConnection.writeAll(socket, bytes, ms)
+            try await RedisConnection.writeAll(socket, bytes, ms, sent: &sent)
             var replies: [RedisValue] = []
             replies.reserveCapacity(commands.count)
             while replies.count < commands.count {
@@ -214,7 +276,7 @@ final class RedisConnection {
         } catch {
             // A command half answered leaves a stream nobody can pick up.
             close()
-            throw error
+            throw sent > 0 ? error.afterSending() : error
         }
     }
 
@@ -229,11 +291,12 @@ final class RedisConnection {
         for command in commands { command.write(into: &out) }
         let bytes = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
         out.destroy()
+        var sent = 0
         do {
-            try await RedisConnection.writeAll(socket, bytes, configuration.timeoutMilliseconds)
+            try await RedisConnection.writeAll(socket, bytes, configuration.timeoutMilliseconds, sent: &sent)
         } catch {
             close()
-            throw error
+            throw sent > 0 ? error.afterSending() : error
         }
     }
 
@@ -324,6 +387,14 @@ final class RedisConnection {
     private static func writeAll(_ socket: OutboundSocket, _ bytes: [UInt8],
                                  _ ms: UInt64) async throws(RedisClientError) {
         var sent = 0
+        try await writeAll(socket, bytes, ms, sent: &sent)
+    }
+
+    /// The same, reporting how many bytes reached the kernel before it
+    /// failed. Nothing reaching it is the one case where the server certainly
+    /// did not see the command; past that the answer is not knowable here.
+    private static func writeAll(_ socket: OutboundSocket, _ bytes: [UInt8],
+                                 _ ms: UInt64, sent: inout Int) async throws(RedisClientError) {
         while sent < bytes.count {
             let n: Int
             do {

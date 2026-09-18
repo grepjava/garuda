@@ -504,6 +504,28 @@ The Python suites need `h2` and `aioquic`.
   a soft hyphen goes. A password that was pasted with a non-breaking space in
   it now authenticates. NFKC normalisation is still not done, and
   [CONNECTORS.md](CONNECTORS.md) says so.
+- A Redis retry cannot repeat a write it may already have done. A failure
+  with the command's bytes already written is `RedisClientError.unknownOutcome`,
+  wrapping the `closed` or `timedOut` underneath -- `error.cause` reads it
+  back and `error.mayHaveRun` is true. A failure before the first byte throws
+  plainly, as before, because the server never saw it. `RedisCluster` and
+  `RedisSentinelPool` take `replay:`: `.reads` by default, which sends only
+  commands that read to another node, `.anything` for a cache where a second
+  write costs nothing, and `.nothing`. `RedisReads.only(_:)` is the table
+  behind `.reads`, and treats anything it does not recognise as a write.
+  Before this, a lost reply to `INCR` or `EXEC` was a retry.
+- A cluster follows a redirect per command rather than per batch. A slot in
+  the middle of migrating answers the keys it still has and redirects the keys
+  it does not, so a pipeline comes back part answered and part redirected:
+  what was answered is kept and only what was refused goes again, each behind
+  its own `ASKING`. Before this, the whole batch went again and every write in
+  it already answered happened twice. A transaction is still treated as one
+  thing, which is right: a command refused while it was being queued makes
+  Redis abort all of it.
+- A sentinel pool retries only the part of a pipeline the old master refused.
+  A failover in the middle of a batch answers the commands before it and
+  refuses the writes after it with `READONLY`; the refusal is proof they did
+  not run, and the answers are proof the others did.
 - Redis Cluster: `RedisCluster(seeds:)` is a pool per node and a map of which
   node owns which of the 16,384 slots, read with `CLUSTER SLOTS`. It is a
   `RedisCommandSender`, so every typed command a pool has it has too, aimed at

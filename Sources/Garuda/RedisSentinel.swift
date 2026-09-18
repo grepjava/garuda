@@ -61,14 +61,21 @@ public final class RedisSentinelPool: RedisCommandSender, @unchecked Sendable {
     /// The sentinel that answered last, asked first next time.
     private var preferred = 0
 
+    /// What may be sent to the new master when the old one failed with the
+    /// command already written. Reads, by default: a failover is exactly when
+    /// a write's fate is least knowable.
+    public let replay: RedisReplay
+
     public init(_ configuration: RedisSentinelConfiguration, maxConnections: Int = 8,
-                acquireTimeoutMilliseconds: UInt64? = nil, maxAttempts: Int = 4) {
+                acquireTimeoutMilliseconds: UInt64? = nil, maxAttempts: Int = 4,
+                replay: RedisReplay = .reads) {
         precondition(maxAttempts > 0, "a command is tried at least once")
         self.configuration = configuration
         self.maxConnections = maxConnections
         self.acquireTimeoutMilliseconds = acquireTimeoutMilliseconds
             ?? configuration.server.timeoutMilliseconds
         self.maxAttempts = maxAttempts
+        self.replay = replay
     }
 
     /// Where the master was last found, as `host:port`, or nil before anyone
@@ -84,26 +91,51 @@ public final class RedisSentinelPool: RedisCommandSender, @unchecked Sendable {
     /// Sends one command, waiting up to `timeoutMilliseconds` for its reply.
     public func send(_ command: RedisCommand,
                      timeoutMilliseconds: UInt64?) async throws(RedisClientError) -> RedisValue {
-        try await attempting { pool throws(RedisClientError) in
+        try await attempting([command]) { pool throws(RedisClientError) in
             try await pool.send(command, timeoutMilliseconds: timeoutMilliseconds)
         }
     }
 
     /// Sends every command in one write to the master, and reads every reply.
+    ///
+    /// A failover can land in the middle of a batch: the commands before it
+    /// are answered and the writes after it are refused with READONLY. Only
+    /// the refused ones go to the new master. A refusal is proof that the
+    /// command did not run, and an answer is proof that it did -- sending the
+    /// whole batch again would repeat everything that already happened.
     public func pipeline(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
-        try await attempting { pool throws(RedisClientError) in
-            let replies = try await pool.pipeline(commands)
-            // A demoted master refuses a write with READONLY rather than
-            // closing, so a batch that came back refused for that reason is a
-            // batch that never ran: worth finding the new master for.
-            if replies.contains(where: { isFailover($0) }) { throw RedisClientError.closed }
-            return replies
+        guard !commands.isEmpty else { return [] }
+        var replies = [RedisValue](repeating: .null, count: commands.count)
+        var outstanding = Array(commands.indices)
+        var attempt = 0
+        while true {
+            attempt += 1
+            let batch = outstanding.map { commands[$0] }
+            do throws(RedisClientError) {
+                let pool = try await master()
+                let answers = try await pool.pipeline(batch)
+                guard answers.count == batch.count else { throw RedisClientError.unexpectedReply(.array(answers)) }
+                var again: [Int] = []
+                for (n, index) in outstanding.enumerated() {
+                    replies[index] = answers[n]
+                    if isFailover(answers[n]) { again.append(index) }
+                }
+                guard !again.isEmpty, attempt < maxAttempts else { return replies }
+                outstanding = again
+            } catch {
+                guard attempt < maxAttempts, isFailover(error),
+                      replay.allows(error, batch) else { throw error }
+            }
+            // Either the master has gone or it is not the master any more.
+            // Both are answered by asking the sentinels.
+            forget()
+            await pause(milliseconds: 100 * UInt64(attempt))
         }
     }
 
     /// Runs the commands as one transaction on the master.
     public func transaction(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
-        try await attempting { pool throws(RedisClientError) in
+        try await attempting([RedisCommand("MULTI")] + commands + [RedisCommand("EXEC")]) { pool throws(RedisClientError) in
             try await pool.transaction(commands)
         }
     }
@@ -139,7 +171,8 @@ public final class RedisSentinelPool: RedisCommandSender, @unchecked Sendable {
 
     // MARK: Finding the master
 
-    private func attempting<R>(_ body: (RedisPool) async throws(RedisClientError) -> R) async throws(RedisClientError) -> R {
+    private func attempting<R>(_ commands: [RedisCommand],
+                               _ body: (RedisPool) async throws(RedisClientError) -> R) async throws(RedisClientError) -> R {
         var attempt = 0
         while true {
             attempt += 1
@@ -147,7 +180,8 @@ public final class RedisSentinelPool: RedisCommandSender, @unchecked Sendable {
             do {
                 return try await body(pool)
             } catch {
-                guard attempt < maxAttempts, isFailover(error) else { throw error }
+                guard attempt < maxAttempts, isFailover(error),
+                      replay.allows(error, commands) else { throw error }
                 // Either the master has gone or it is not the master any
                 // more. Both are answered by asking the sentinels.
                 forget()
@@ -237,7 +271,7 @@ public final class RedisSentinelPool: RedisCommandSender, @unchecked Sendable {
     /// Whether a failure means the master has moved rather than the command
     /// being wrong.
     private func isFailover(_ error: RedisClientError) -> Bool {
-        switch error {
+        switch error.cause {
         case .connect, .closed, .timedOut, .poolTimedOut:
             return true
         case .server(let error):
