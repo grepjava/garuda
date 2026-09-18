@@ -73,6 +73,11 @@ public struct Worker {
     /// to by finishing a response and dispatching the request pipelined
     /// behind it. The walk picks those up itself rather than starting another.
     var runningDeferredFlushes = false
+    /// Set while handler tasks run. A streamed body's writes are held until
+    /// the run ends (`HandlerTaskPool.runReady`), which flushes them; a write
+    /// made anywhere else -- a timer's keep-alive comment -- has nothing
+    /// after it to do that, and goes out at once.
+    var runningHandlerTasks = false
 
     public var running = true
     /// Set on SIGTERM: stop accepting, finish what is in flight, then exit.
@@ -957,7 +962,11 @@ public struct Worker {
     /// other end. Written one at a time as each request is answered, the
     /// readers have gone back to sleep before every write, and every write
     /// pays for a full cross-CPU wakeup.
-    mutating func flushSoon(_ slot: Int) {
+    ///
+    /// `holdingUpTo` is how much may wait in the write buffer before it goes
+    /// out at once: a request's buffer size unless the caller says otherwise.
+    mutating func flushSoon(_ slot: Int, holdingUpTo limit: Int? = nil) {
+        let hold = limit ?? config.readBufferSize
         let c = table[slot]
         // A stream writes into its connection, which has its own pacing.
         if c.pointee.isStream || c.pointee.fd < 0 {
@@ -967,10 +976,10 @@ public struct Worker {
         if c.pointee.flags.contains(.flushQueued) {
             // Already going out with the batch, unless it has grown too big to
             // be worth holding back.
-            if c.pointee.write.readableBytes >= config.readBufferSize { _ = flush(slot) }
+            if c.pointee.write.readableBytes >= hold { _ = flush(slot) }
             return
         }
-        if c.pointee.write.readableBytes >= config.readBufferSize
+        if c.pointee.write.readableBytes >= hold
             || deferredFlushCount >= table.capacity {
             _ = flush(slot)
             return

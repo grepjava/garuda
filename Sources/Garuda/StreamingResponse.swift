@@ -301,7 +301,19 @@ extension Worker {
             finishStreamingResponse(slot)
             return false
         }
-        _ = flush(slot)
+        // From a handler, sent when the handler next waits rather than now: a
+        // handler writing a body in pieces makes its writes in one run of its
+        // task, and every one of them flushed on its own was a system call
+        // and a wakeup of the reader for each piece -- sixteen for a 64 KiB
+        // body in 4 KiB chunks, where one does. The run's end flushes, so
+        // what was written is on the wire before anything else can happen to
+        // it. A backlog past the low-water mark goes out at once, so holding
+        // it never grows the buffer much.
+        if runningHandlerTasks {
+            flushSoon(slot, holdingUpTo: config.writeLowWaterMark)
+        } else {
+            _ = flush(slot)
+        }
         return true
     }
 
@@ -392,7 +404,10 @@ extension Worker {
         } else if c.pointee.isStream {
             h2FailRequest(slot, status: 500)
         } else {
-            closeConnection(slot)
+            // What was written before the failure goes first: writes are held
+            // until the handler waits, and one that threw straight after a
+            // write never did.
+            if flush(slot) { closeConnection(slot) }
         }
     }
 

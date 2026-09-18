@@ -713,6 +713,15 @@ The Python suites need `h2` and `aioquic`.
 
 ### Streaming responses and server-sent events
 
+- A streamed body's writes go out together when the handler next waits,
+  rather than one system call each. A handler writing 64 KiB in 4 KiB pieces
+  made sixteen writes to the socket and woke the reader sixteen times; it now
+  makes one, and `benchmarks/workloads.sh` streams twice as many such bodies
+  a second (17,364 to 36,005 on the bench box). A backlog past the low-water
+  mark still goes out at once, a write from outside a handler -- a
+  server-sent events keep-alive -- goes at once, and a handler that throws
+  straight after a write still has that write sent before the connection
+  closes.
 - `response.stream(contentType:)` or a returned `StreamingBody` writes a body as
   it is produced: chunked on HTTP/1.1, close-delimited on HTTP/1.0, DATA frames
   on HTTP/2 and HTTP/3. A `Content-Length` the handler sets is kept and

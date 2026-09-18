@@ -268,8 +268,22 @@ final class HandlerTaskPool: @unchecked Sendable {
         } else {
             return false
         }
-        executor.drain()
+        runReady()
         return true
+    }
+
+    /// Runs every job that is ready, then sends what they wrote. A streamed
+    /// body's writes are held while tasks run (`Worker.streamBody`), so
+    /// every place that runs tasks comes through here: a write left held
+    /// would sit until some unrelated event ended a batch. Only the
+    /// outermost run flushes, when every task in it has waited.
+    func runReady() {
+        let outer = !worker.pointee.runningHandlerTasks
+        worker.pointee.runningHandlerTasks = true
+        executor.drain()
+        guard outer else { return }
+        worker.pointee.runningHandlerTasks = false
+        if worker.pointee.deferredFlushCount > 0 { worker.pointee.runDeferredFlushes() }
     }
 
     /// Queues a request that found every task busy.
@@ -288,7 +302,7 @@ final class HandlerTaskPool: @unchecked Sendable {
     /// Resumes the task waiting on the engine for a request, to carry on.
     func wake(_ index: Int) {
         records[index].wake.take()?.resume(returning: true)
-        executor.drain()
+        runReady()
     }
 
     /// Resumes the task waiting on the engine for a request, to carry on,
@@ -314,12 +328,12 @@ final class HandlerTaskPool: @unchecked Sendable {
     /// than the engine is left to finish on its own.
     func shutdown() {
         while waiting.pop() != nil {}
-        executor.drain()
+        runReady()
         while idleCount > 0 {
             idleCount -= 1
             records[Int(idle[idleCount])].inbox.take()?.resume(returning: nil)
         }
-        executor.drain()
+        runReady()
     }
 
     private func spawn(_ index: Int, first: Work) {
@@ -436,7 +450,7 @@ extension Worker {
     @inline(__always)
     mutating func runHandlerTasks() {
         guard let pool = handlerTasks, pool.executor.hasWork else { return }
-        pool.executor.drain()
+        pool.runReady()
     }
 
     /// A task was resumed off this worker's thread, and its job is waiting to
@@ -444,7 +458,7 @@ extension Worker {
     mutating func handleHandlerTaskWake() {
         guard let pool = handlerTasks else { return }
         pool.executor.clearWake()
-        pool.executor.drain()
+        pool.runReady()
     }
 
     /// Settles the request a task's handler has finished with, if it is still
