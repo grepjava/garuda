@@ -36,7 +36,7 @@ extension JSONCoder {
         var start = JSONScanner(base: base, count: count)
         start.skipWhitespace()
         return try T(from: JSONDecoding(base: base, count: count, valueIndex: start.index,
-                                        codingPath: []))
+                                        path: .root))
     }
 }
 
@@ -214,31 +214,30 @@ enum JSONValue {
     }
 
     static func bool(_ base: UnsafePointer<UInt8>, _ count: Int, at index: Int,
-                     _ path: [any CodingKey]) throws -> Bool {
+                     _ path: @autoclosure () -> [any CodingKey]) throws -> Bool {
         switch base[index] {
         case 0x74: return true
         case 0x66: return false
-        case 0x6E: throw JSONError.valueNotFound(path: describe(path), expected: "Bool")
-        default: throw JSONError.typeMismatch(path: describe(path), expected: "Bool")
+        case 0x6E: throw JSONError.valueNotFound(path: describe(path()), expected: "Bool")
+        default: throw JSONError.typeMismatch(path: describe(path()), expected: "Bool")
         }
     }
 
     static func string(_ base: UnsafePointer<UInt8>, _ count: Int, at index: Int,
-                       _ path: [any CodingKey]) throws -> String {
+                       _ path: @autoclosure () -> [any CodingKey]) throws -> String {
         guard base[index] == 0x22 else {
             if base[index] == 0x6E {
-                throw JSONError.valueNotFound(path: describe(path), expected: "String")
+                throw JSONError.valueNotFound(path: describe(path()), expected: "String")
             }
-            throw JSONError.typeMismatch(path: describe(path), expected: "String")
+            throw JSONError.typeMismatch(path: describe(path()), expected: "String")
         }
         var scanner = JSONScanner(base: base, count: count, at: index)
         try scanner.skipString()
-        return try text(base, from: index, to: scanner.index, path)
+        return try text(base, from: index, to: scanner.index)
     }
 
     /// The decoded contents of the string literal between `start` and `end`.
-    static func text(_ base: UnsafePointer<UInt8>, from start: Int, to end: Int,
-                     _ path: [any CodingKey]) throws -> String {
+    static func text(_ base: UnsafePointer<UInt8>, from start: Int, to end: Int) throws -> String {
         let contentStart = start + 1
         let contentEnd = end - 1
         if !hasEscape(base, contentStart, contentEnd) {
@@ -312,12 +311,13 @@ enum JSONValue {
     /// The number at `index`, as an integer. A fraction or an exponent is not
     /// one: `1.0` decodes as a Double, not as an Int.
     static func integer(_ base: UnsafePointer<UInt8>, _ count: Int, at index: Int,
-                        _ path: [any CodingKey], expected: String) throws -> (UInt64, Bool) {
+                        _ path: @autoclosure () -> [any CodingKey],
+                        expected: @autoclosure () -> String) throws -> (UInt64, Bool) {
         guard base[index] == 0x2D || (base[index] >= 0x30 && base[index] <= 0x39) else {
             if base[index] == 0x6E {
-                throw JSONError.valueNotFound(path: describe(path), expected: expected)
+                throw JSONError.valueNotFound(path: describe(path()), expected: expected())
             }
-            throw JSONError.typeMismatch(path: describe(path), expected: expected)
+            throw JSONError.typeMismatch(path: describe(path()), expected: expected())
         }
         var i = index
         let negative = base[i] == 0x2D
@@ -327,26 +327,28 @@ enum JSONValue {
         while i < count, base[i] >= 0x30, base[i] <= 0x39 {
             let digit = UInt64(base[i] - 0x30)
             let (product, overflowedProduct) = magnitude.multipliedReportingOverflow(by: 10)
-            guard !overflowedProduct else { throw JSONError.numberOutOfRange(path: describe(path)) }
+            guard !overflowedProduct else { throw JSONError.numberOutOfRange(path: describe(path())) }
             let (sum, overflowedSum) = product.addingReportingOverflow(digit)
-            guard !overflowedSum else { throw JSONError.numberOutOfRange(path: describe(path)) }
+            guard !overflowedSum else { throw JSONError.numberOutOfRange(path: describe(path())) }
             magnitude = sum
             i += 1
         }
-        guard i > digitsStart else { throw JSONError.typeMismatch(path: describe(path), expected: expected) }
+        guard i > digitsStart else {
+            throw JSONError.typeMismatch(path: describe(path()), expected: expected())
+        }
         if i < count, base[i] == 0x2E || base[i] == 0x65 || base[i] == 0x45 {
-            throw JSONError.typeMismatch(path: describe(path), expected: expected)
+            throw JSONError.typeMismatch(path: describe(path()), expected: expected())
         }
         return (magnitude, negative)
     }
 
     static func double(_ base: UnsafePointer<UInt8>, _ count: Int, at index: Int,
-                       _ path: [any CodingKey]) throws -> Double {
+                       _ path: @autoclosure () -> [any CodingKey]) throws -> Double {
         guard base[index] == 0x2D || (base[index] >= 0x30 && base[index] <= 0x39) else {
             if base[index] == 0x6E {
-                throw JSONError.valueNotFound(path: describe(path), expected: "Double")
+                throw JSONError.valueNotFound(path: describe(path()), expected: "Double")
             }
-            throw JSONError.typeMismatch(path: describe(path), expected: "Double")
+            throw JSONError.typeMismatch(path: describe(path()), expected: "Double")
         }
         var scanner = JSONScanner(base: base, count: count, at: index)
         try scanner.skipNumber()
@@ -360,8 +362,25 @@ enum JSONValue {
         }
         // `1e400` is a JSON number and not a Double. Infinity here would be a
         // value the encoder then refuses to write back.
-        guard value.isFinite else { throw JSONError.numberOutOfRange(path: describe(path)) }
+        guard value.isFinite else { throw JSONError.numberOutOfRange(path: describe(path())) }
         return value
+    }
+
+    /// Whether the string literal between `start` and `end` reads as `name`.
+    /// Compared as bytes where the literal has no escape in it, which is
+    /// every key in practice, so finding a member makes no string.
+    static func literal(_ base: UnsafePointer<UInt8>, from start: Int, to end: Int,
+                        equals name: String) throws -> Bool {
+        let contentStart = start + 1
+        let length = end - 1 - contentStart
+        if !hasEscape(base, contentStart, end - 1) {
+            let same = name.utf8.withContiguousStorageIfAvailable { wanted -> Bool in
+                wanted.count == length
+                    && (length == 0 || memcmp(wanted.baseAddress!, base + contentStart, length) == 0)
+            }
+            if let same { return same }
+        }
+        return try text(base, from: start, to: end) == name
     }
 }
 
@@ -371,7 +390,8 @@ struct JSONDecoding: Decoder {
     let base: UnsafePointer<UInt8>
     let count: Int
     let valueIndex: Int
-    var codingPath: [any CodingKey]
+    let path: JSONPath
+    var codingPath: [any CodingKey] { path.keys }
     var userInfo: [CodingUserInfoKey: Any] { [:] }
 
     func container<Key: CodingKey>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> {
@@ -379,64 +399,68 @@ struct JSONDecoding: Decoder {
             throw JSONError.typeMismatch(path: describe(codingPath), expected: "an object")
         }
         return KeyedDecodingContainer(
-            JSONKeyedDecoding<Key>(base: base, count: count, objectIndex: valueIndex,
-                                   codingPath: codingPath))
+            JSONKeyedDecoding<Key>(base: base, count: count, objectIndex: valueIndex, path: path))
     }
 
     func unkeyedContainer() throws -> any UnkeyedDecodingContainer {
         guard base[valueIndex] == 0x5B else {
             throw JSONError.typeMismatch(path: describe(codingPath), expected: "an array")
         }
-        return JSONUnkeyedDecoding(base: base, count: count, arrayIndex: valueIndex,
-                                   codingPath: codingPath)
+        return JSONUnkeyedDecoding(base: base, count: count, arrayIndex: valueIndex, path: path)
     }
 
     func singleValueContainer() throws -> any SingleValueDecodingContainer {
-        JSONSingleValueDecoding(base: base, count: count, valueIndex: valueIndex,
-                                codingPath: codingPath)
+        JSONSingleValueDecoding(base: base, count: count, valueIndex: valueIndex, path: path)
     }
 }
 
 /// Reads one value at an offset, for every scalar type a container decodes.
+///
+/// It holds the path of the container the value is in and the step to the
+/// value, rather than the value's own path: that is only put together for an
+/// error, or for a value that is itself a container.
 private struct JSONValueReader {
     let base: UnsafePointer<UInt8>
     let count: Int
     let index: Int
-    let path: [any CodingKey]
+    let container: JSONPath
+    let step: JSONPath.Step?
 
-    func bool() throws -> Bool { try JSONValue.bool(base, count, at: index, path) }
-    func string() throws -> String { try JSONValue.string(base, count, at: index, path) }
-    func double() throws -> Double { try JSONValue.double(base, count, at: index, path) }
+    var path: JSONPath { step.map { container.appending($0) } ?? container }
+
+    func bool() throws -> Bool { try JSONValue.bool(base, count, at: index, path.keys) }
+    func string() throws -> String { try JSONValue.string(base, count, at: index, path.keys) }
+    func double() throws -> Double { try JSONValue.double(base, count, at: index, path.keys) }
 
     func signed<T: FixedWidthInteger & SignedInteger>(_ type: T.Type) throws -> T {
-        let (magnitude, negative) = try JSONValue.integer(base, count, at: index, path,
+        let (magnitude, negative) = try JSONValue.integer(base, count, at: index, path.keys,
                                                           expected: "\(type)")
         if negative {
             guard magnitude <= UInt64(T.max.magnitude) + (T.min == 0 ? 0 : 1) else {
-                throw JSONError.numberOutOfRange(path: describe(path))
+                throw JSONError.numberOutOfRange(path: describe(path.keys))
             }
             guard let value = T(exactly: Int64(bitPattern: ~magnitude &+ 1)) else {
-                throw JSONError.numberOutOfRange(path: describe(path))
+                throw JSONError.numberOutOfRange(path: describe(path.keys))
             }
             return value
         }
         guard let value = T(exactly: magnitude) else {
-            throw JSONError.numberOutOfRange(path: describe(path))
+            throw JSONError.numberOutOfRange(path: describe(path.keys))
         }
         return value
     }
 
     func unsigned<T: FixedWidthInteger & UnsignedInteger>(_ type: T.Type) throws -> T {
-        let (magnitude, negative) = try JSONValue.integer(base, count, at: index, path,
+        let (magnitude, negative) = try JSONValue.integer(base, count, at: index, path.keys,
                                                           expected: "\(type)")
         guard !negative, let value = T(exactly: magnitude) else {
-            throw JSONError.numberOutOfRange(path: describe(path))
+            throw JSONError.numberOutOfRange(path: describe(path.keys))
         }
         return value
     }
 
     func decoded<T: Decodable>(_ type: T.Type) throws -> T {
-        try T(from: JSONDecoding(base: base, count: count, valueIndex: index, codingPath: path))
+        try T(from: JSONDecoding(base: base, count: count, valueIndex: index, path: path))
     }
 
     var isNull: Bool { JSONValue.isNull(base, count, at: index) }
@@ -446,11 +470,13 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
     let base: UnsafePointer<UInt8>
     let count: Int
     let objectIndex: Int
-    var codingPath: [any CodingKey]
+    let path: JSONPath
+    var codingPath: [any CodingKey] { path.keys }
 
     var allKeys: [Key] {
         var keys: [Key] = []
-        try? forEachMember { name, valueIndex in
+        try? forEachMember { keyStart, keyEnd, valueIndex in
+            let name = try JSONValue.text(base, from: keyStart, to: keyEnd)
             if let key = Key(stringValue: name) { keys.append(key) }
             _ = valueIndex
             return true
@@ -462,8 +488,10 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
         (try? offset(of: key)) ?? nil != nil
     }
 
-    /// Walks the object's members. `body` returns false to stop.
-    private func forEachMember(_ body: (String, Int) throws -> Bool) throws {
+    /// Walks the object's members, handing `body` where each key's literal
+    /// starts and ends and where its value starts. `body` returns false to
+    /// stop.
+    private func forEachMember(_ body: (Int, Int, Int) throws -> Bool) throws {
         var scanner = JSONScanner(base: base, count: count, at: objectIndex + 1)
         scanner.skipWhitespace()
         if scanner.peek() == 0x7D { return }
@@ -471,12 +499,12 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
             scanner.skipWhitespace()
             let keyStart = scanner.index
             try scanner.skipString()
-            let name = try JSONValue.text(base, from: keyStart, to: scanner.index, codingPath)
+            let keyEnd = scanner.index
             scanner.skipWhitespace()
             scanner.index += 1  // :
             scanner.skipWhitespace()
             let valueIndex = scanner.index
-            if try !body(name, valueIndex) { return }
+            if try !body(keyStart, keyEnd, valueIndex) { return }
             try scanner.skipValue()
             scanner.skipWhitespace()
             guard let byte = scanner.peek(), byte == 0x2C else { return }
@@ -488,8 +516,8 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
     private func offset(of key: Key) throws -> Int? {
         var found: Int? = nil
         let wanted = key.stringValue
-        try forEachMember { name, valueIndex in
-            if name == wanted {
+        try forEachMember { keyStart, keyEnd, valueIndex in
+            if try JSONValue.literal(base, from: keyStart, to: keyEnd, equals: wanted) {
                 found = valueIndex
                 return false
             }
@@ -502,8 +530,8 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
         guard let index = try offset(of: key) else {
             throw JSONError.missingKey(path: describe(codingPath + [key]))
         }
-        return JSONValueReader(base: base, count: count, index: index,
-                               path: codingPath + [key])
+        return JSONValueReader(base: base, count: count, index: index, container: path,
+                               step: .key(key))
     }
 
     func decodeNil(forKey key: Key) throws -> Bool {
@@ -539,7 +567,7 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
         }
         return KeyedDecodingContainer(
             JSONKeyedDecoding<NestedKey>(base: base, count: count, objectIndex: index,
-                                         codingPath: codingPath + [key]))
+                                         path: path.appending(.key(key))))
     }
 
     func nestedUnkeyedContainer(forKey key: Key) throws -> any UnkeyedDecodingContainer {
@@ -548,17 +576,17 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
             throw JSONError.typeMismatch(path: describe(codingPath + [key]), expected: "an array")
         }
         return JSONUnkeyedDecoding(base: base, count: count, arrayIndex: index,
-                                   codingPath: codingPath + [key])
+                                   path: path.appending(.key(key)))
     }
 
     func superDecoder() throws -> any Decoder {
-        JSONDecoding(base: base, count: count, valueIndex: objectIndex, codingPath: codingPath)
+        JSONDecoding(base: base, count: count, valueIndex: objectIndex, path: path)
     }
 
     func superDecoder(forKey key: Key) throws -> any Decoder {
         let index = try reader(key).index
         return JSONDecoding(base: base, count: count, valueIndex: index,
-                            codingPath: codingPath + [key])
+                            path: path.appending(.key(key)))
     }
 }
 
@@ -568,19 +596,19 @@ private struct JSONUnkeyedDecoding: UnkeyedDecodingContainer {
     /// how many elements this array holds.
     let length: Int
     let arrayIndex: Int
-    var codingPath: [any CodingKey]
+    let path: JSONPath
+    var codingPath: [any CodingKey] { path.keys }
     var currentIndex = 0
     let count: Int?
     /// Where the next element starts, once the elements before it have been
     /// stepped over.
     private var cursor: Int
 
-    init(base: UnsafePointer<UInt8>, count length: Int, arrayIndex: Int,
-         codingPath: [any CodingKey]) {
+    init(base: UnsafePointer<UInt8>, count length: Int, arrayIndex: Int, path: JSONPath) {
         self.base = base
         self.length = length
         self.arrayIndex = arrayIndex
-        self.codingPath = codingPath
+        self.path = path
         var scanner = JSONScanner(base: base, count: length, at: arrayIndex + 1)
         scanner.skipWhitespace()
         cursor = scanner.index
@@ -600,7 +628,8 @@ private struct JSONUnkeyedDecoding: UnkeyedDecodingContainer {
         count = elements
     }
 
-    var this: [any CodingKey] { codingPath + [JSONKey(index: currentIndex)] }
+    /// The path of the element about to be read.
+    var this: JSONPath { path.appending(.index(currentIndex)) }
 
     var isAtEnd: Bool {
         var scanner = JSONScanner(base: base, count: length, at: cursor)
@@ -611,12 +640,13 @@ private struct JSONUnkeyedDecoding: UnkeyedDecodingContainer {
     /// The offset of the element about to be read, having stepped past it.
     private mutating func take() throws -> JSONValueReader {
         guard !isAtEnd else {
-            throw JSONError.valueNotFound(path: describe(this), expected: "another element")
+            throw JSONError.valueNotFound(path: describe(this.keys), expected: "another element")
         }
         var scanner = JSONScanner(base: base, count: length, at: cursor)
         scanner.skipWhitespace()
         let index = scanner.index
-        let reader = JSONValueReader(base: base, count: length, index: index, path: this)
+        let reader = JSONValueReader(base: base, count: length, index: index, container: path,
+                                     step: .index(currentIndex))
         try scanner.skipValue()
         scanner.skipWhitespace()
         if scanner.peek() == 0x2C { scanner.index += 1 }
@@ -654,30 +684,30 @@ private struct JSONUnkeyedDecoding: UnkeyedDecodingContainer {
     mutating func nestedContainer<NestedKey: CodingKey>(
         keyedBy type: NestedKey.Type
     ) throws -> KeyedDecodingContainer<NestedKey> {
-        let path = this
+        let element = this
         let reader = try take()
         guard base[reader.index] == 0x7B else {
-            throw JSONError.typeMismatch(path: describe(path), expected: "an object")
+            throw JSONError.typeMismatch(path: describe(element.keys), expected: "an object")
         }
         return KeyedDecodingContainer(
             JSONKeyedDecoding<NestedKey>(base: base, count: length, objectIndex: reader.index,
-                                         codingPath: path))
+                                         path: element))
     }
 
     mutating func nestedUnkeyedContainer() throws -> any UnkeyedDecodingContainer {
-        let path = this
+        let element = this
         let reader = try take()
         guard base[reader.index] == 0x5B else {
-            throw JSONError.typeMismatch(path: describe(path), expected: "an array")
+            throw JSONError.typeMismatch(path: describe(element.keys), expected: "an array")
         }
         return JSONUnkeyedDecoding(base: base, count: length, arrayIndex: reader.index,
-                                   codingPath: path)
+                                   path: element)
     }
 
     mutating func superDecoder() throws -> any Decoder {
-        let path = this
+        let element = this
         let reader = try take()
-        return JSONDecoding(base: base, count: length, valueIndex: reader.index, codingPath: path)
+        return JSONDecoding(base: base, count: length, valueIndex: reader.index, path: element)
     }
 }
 
@@ -685,10 +715,11 @@ private struct JSONSingleValueDecoding: SingleValueDecodingContainer {
     let base: UnsafePointer<UInt8>
     let count: Int
     let valueIndex: Int
-    var codingPath: [any CodingKey]
+    let path: JSONPath
+    var codingPath: [any CodingKey] { path.keys }
 
     private var reader: JSONValueReader {
-        JSONValueReader(base: base, count: count, index: valueIndex, path: codingPath)
+        JSONValueReader(base: base, count: count, index: valueIndex, container: path, step: nil)
     }
 
     func decodeNil() -> Bool { reader.isNull }

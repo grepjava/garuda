@@ -46,7 +46,7 @@ public enum JSONCoder {
     public static func encode(_ value: some Encodable) throws -> [UInt8] {
         let writer = JSONWriter()
         defer { writer.destroy() }
-        try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, codingPath: []))
+        try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, path: .root))
         return try writer.finish()
     }
 
@@ -55,7 +55,7 @@ public enum JSONCoder {
     static func encode(_ value: some Encodable, into buffer: inout ByteBuffer) throws {
         let writer = JSONWriter()
         defer { writer.destroy() }
-        try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, codingPath: []))
+        try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, path: .root))
         try writer.finish(into: &buffer)
     }
 }
@@ -205,20 +205,21 @@ final class JSONWriter {
     }
 
     private func writeUnsigned(_ value: UInt64, negative: Bool) {
-        var digits = [UInt8](repeating: 0, count: 20)
-        var count = 0
-        var v = value
-        repeat {
-            digits[count] = UInt8(48 &+ (v % 10))
-            v /= 10
-            count += 1
-        } while v > 0
-        buffer.reserve(count + 1)
-        if negative { buffer.writeByte(cDash) }
-        var i = count - 1
-        while i >= 0 {
-            buffer.writeByte(digits[i])
-            i -= 1
+        // Formatted backwards into room on the stack, then written in one go:
+        // an integer is the commonest thing an answer holds.
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 21) { digits in
+            var start = 21
+            var v = value
+            repeat {
+                start -= 1
+                digits[start] = UInt8(48 &+ (v % 10))
+                v /= 10
+            } while v > 0
+            if negative {
+                start -= 1
+                digits[start] = cDash
+            }
+            buffer.write(digits.baseAddress! + start, 21 - start)
         }
     }
 
@@ -230,6 +231,13 @@ final class JSONWriter {
         value.withUTF8 { bytes in
             buffer.reserve(bytes.count + 2)
             buffer.writeByte(0x22)
+            // Most strings need nothing escaped, and go in with one copy.
+            if !bytes.contains(where: { $0 < 0x20 || $0 == 0x22 || $0 == 0x5C }) {
+                if let base = bytes.baseAddress { buffer.write(base, bytes.count) }
+                buffer.reserve(1)
+                buffer.writeByte(0x22)
+                return
+            }
             for byte in bytes {
                 switch byte {
                 case 0x22: buffer.write("\\\"")

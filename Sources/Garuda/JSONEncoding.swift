@@ -17,33 +17,33 @@ struct JSONEncoding: Encoder {
     let writer: JSONWriter
     let level: Int
     let key: String?
-    var codingPath: [any CodingKey]
+    let path: JSONPath
+    var codingPath: [any CodingKey] { path.keys }
     var userInfo: [CodingUserInfoKey: Any] { [:] }
 
     func container<Key: CodingKey>(keyedBy type: Key.Type) -> KeyedEncodingContainer<Key> {
         let inner = writer.begin(.object, level: level, key: key)
         return KeyedEncodingContainer(
-            JSONKeyedEncoding<Key>(writer: writer, level: inner, codingPath: codingPath))
+            JSONKeyedEncoding<Key>(writer: writer, level: inner, path: path))
     }
 
     func unkeyedContainer() -> any UnkeyedEncodingContainer {
         let inner = writer.begin(.array, level: level, key: key)
-        return JSONUnkeyedEncoding(writer: writer, level: inner, codingPath: codingPath)
+        return JSONUnkeyedEncoding(writer: writer, level: inner, path: path)
     }
 
     func singleValueContainer() -> any SingleValueEncodingContainer {
-        JSONSingleValueEncoding(writer: writer, level: level, key: key, codingPath: codingPath)
+        JSONSingleValueEncoding(writer: writer, level: level, key: key, path: path)
     }
 }
 
 /// Encodes `value` into the container at `level` under `key`. A value that
 /// writes nothing at all still owes its parent one, and gets an empty object.
 private func encodeValue(_ value: some Encodable, writer: JSONWriter, level: Int,
-                         key: String?, codingPath: [any CodingKey]) throws {
+                         key: String?, path: JSONPath) throws {
     let before = writer.isEmpty
     let mark = writer.currentLevel
-    try value.encode(to: JSONEncoding(writer: writer, level: level, key: key,
-                                      codingPath: codingPath))
+    try value.encode(to: JSONEncoding(writer: writer, level: level, key: key, path: path))
     if before && writer.isEmpty && mark == writer.currentLevel {
         writer.begin(.object, level: level, key: key)
     }
@@ -52,9 +52,10 @@ private func encodeValue(_ value: some Encodable, writer: JSONWriter, level: Int
 private struct JSONKeyedEncoding<Key: CodingKey>: KeyedEncodingContainerProtocol {
     let writer: JSONWriter
     let level: Int
-    var codingPath: [any CodingKey]
+    let path: JSONPath
+    var codingPath: [any CodingKey] { path.keys }
 
-    private func path(_ key: Key) -> [any CodingKey] { codingPath + [key] }
+    private func path(_ key: Key) -> JSONPath { path.appending(.key(key)) }
 
     mutating func encodeNil(forKey key: Key) throws {
         writer.writeNull(level: level, key: key.stringValue)
@@ -70,7 +71,7 @@ private struct JSONKeyedEncoding<Key: CodingKey>: KeyedEncodingContainerProtocol
 
     mutating func encode(_ value: Double, forKey key: Key) throws {
         writer.write(value, level: level, key: key.stringValue,
-                     path: describe(path(key)))
+                     path: describe(path(key).keys))
     }
 
     mutating func encode(_ value: Float, forKey key: Key) throws {
@@ -103,7 +104,7 @@ private struct JSONKeyedEncoding<Key: CodingKey>: KeyedEncodingContainerProtocol
 
     mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {
         try encodeValue(value, writer: writer, level: level, key: key.stringValue,
-                        codingPath: path(key))
+                        path: path(key))
     }
 
     mutating func nestedContainer<NestedKey: CodingKey>(
@@ -111,59 +112,62 @@ private struct JSONKeyedEncoding<Key: CodingKey>: KeyedEncodingContainerProtocol
     ) -> KeyedEncodingContainer<NestedKey> {
         let inner = writer.begin(.object, level: level, key: key.stringValue)
         return KeyedEncodingContainer(
-            JSONKeyedEncoding<NestedKey>(writer: writer, level: inner, codingPath: path(key)))
+            JSONKeyedEncoding<NestedKey>(writer: writer, level: inner, path: path(key)))
     }
 
     mutating func nestedUnkeyedContainer(forKey key: Key) -> any UnkeyedEncodingContainer {
         let inner = writer.begin(.array, level: level, key: key.stringValue)
-        return JSONUnkeyedEncoding(writer: writer, level: inner, codingPath: path(key))
+        return JSONUnkeyedEncoding(writer: writer, level: inner, path: path(key))
     }
 
     mutating func superEncoder() -> any Encoder {
-        JSONEncoding(writer: writer, level: level, key: "super", codingPath: codingPath)
+        JSONEncoding(writer: writer, level: level, key: "super", path: path)
     }
 
     mutating func superEncoder(forKey key: Key) -> any Encoder {
-        JSONEncoding(writer: writer, level: level, key: key.stringValue, codingPath: path(key))
+        JSONEncoding(writer: writer, level: level, key: key.stringValue, path: path(key))
     }
 }
 
 private struct JSONUnkeyedEncoding: UnkeyedEncodingContainer {
     let writer: JSONWriter
     let level: Int
-    var codingPath: [any CodingKey]
+    let path: JSONPath
+    var codingPath: [any CodingKey] { path.keys }
     private(set) var count = 0
 
-    private mutating func counted() -> [any CodingKey] {
-        let path = codingPath + [JSONKey(index: count)]
+    /// The path of the element about to be written, which is then counted.
+    /// Only asked for when the element needs one: a scalar never does.
+    private mutating func counted() -> JSONPath {
+        let element = path.appending(.index(count))
         count += 1
-        return path
+        return element
     }
 
     mutating func encodeNil() throws {
-        _ = counted()
+        count += 1
         writer.writeNull(level: level, key: nil)
     }
 
     mutating func encode(_ value: Bool) throws {
-        _ = counted()
+        count += 1
         writer.write(value, level: level, key: nil)
     }
 
     mutating func encode(_ value: String) throws {
-        _ = counted()
+        count += 1
         writer.write(value, level: level, key: nil)
     }
 
     mutating func encode(_ value: Double) throws {
-        let path = counted()
-        writer.write(value, level: level, key: nil, path: describe(path))
+        let element = counted()
+        writer.write(value, level: level, key: nil, path: describe(element.keys))
     }
 
     mutating func encode(_ value: Float) throws { try encode(Double(value)) }
 
     mutating func encode(_ value: Int) throws {
-        _ = counted()
+        count += 1
         writer.write(Int64(value), level: level, key: nil)
     }
 
@@ -172,12 +176,12 @@ private struct JSONUnkeyedEncoding: UnkeyedEncodingContainer {
     mutating func encode(_ value: Int32) throws { try encode(Int(value)) }
 
     mutating func encode(_ value: Int64) throws {
-        _ = counted()
+        count += 1
         writer.write(value, level: level, key: nil)
     }
 
     mutating func encode(_ value: UInt) throws {
-        _ = counted()
+        count += 1
         writer.write(UInt64(value), level: level, key: nil)
     }
 
@@ -186,33 +190,31 @@ private struct JSONUnkeyedEncoding: UnkeyedEncodingContainer {
     mutating func encode(_ value: UInt32) throws { try encode(UInt(value)) }
 
     mutating func encode(_ value: UInt64) throws {
-        _ = counted()
+        count += 1
         writer.write(value, level: level, key: nil)
     }
 
     mutating func encode<T: Encodable>(_ value: T) throws {
-        let path = counted()
-        try encodeValue(value, writer: writer, level: level, key: nil, codingPath: path)
+        try encodeValue(value, writer: writer, level: level, key: nil, path: counted())
     }
 
     mutating func nestedContainer<NestedKey: CodingKey>(
         keyedBy keyType: NestedKey.Type
     ) -> KeyedEncodingContainer<NestedKey> {
-        let path = counted()
+        let element = counted()
         let inner = writer.begin(.object, level: level, key: nil)
         return KeyedEncodingContainer(
-            JSONKeyedEncoding<NestedKey>(writer: writer, level: inner, codingPath: path))
+            JSONKeyedEncoding<NestedKey>(writer: writer, level: inner, path: element))
     }
 
     mutating func nestedUnkeyedContainer() -> any UnkeyedEncodingContainer {
-        let path = counted()
+        let element = counted()
         let inner = writer.begin(.array, level: level, key: nil)
-        return JSONUnkeyedEncoding(writer: writer, level: inner, codingPath: path)
+        return JSONUnkeyedEncoding(writer: writer, level: inner, path: element)
     }
 
     mutating func superEncoder() -> any Encoder {
-        let path = counted()
-        return JSONEncoding(writer: writer, level: level, key: nil, codingPath: path)
+        JSONEncoding(writer: writer, level: level, key: nil, path: counted())
     }
 }
 
@@ -220,14 +222,15 @@ private struct JSONSingleValueEncoding: SingleValueEncodingContainer {
     let writer: JSONWriter
     let level: Int
     let key: String?
-    var codingPath: [any CodingKey]
+    let path: JSONPath
+    var codingPath: [any CodingKey] { path.keys }
 
     mutating func encodeNil() throws { writer.writeNull(level: level, key: key) }
     mutating func encode(_ value: Bool) throws { writer.write(value, level: level, key: key) }
     mutating func encode(_ value: String) throws { writer.write(value, level: level, key: key) }
 
     mutating func encode(_ value: Double) throws {
-        writer.write(value, level: level, key: key, path: describe(codingPath))
+        writer.write(value, level: level, key: key, path: describe(path.keys))
     }
 
     mutating func encode(_ value: Float) throws { try encode(Double(value)) }
@@ -243,7 +246,7 @@ private struct JSONSingleValueEncoding: SingleValueEncodingContainer {
     mutating func encode(_ value: UInt64) throws { writer.write(value, level: level, key: key) }
 
     mutating func encode<T: Encodable>(_ value: T) throws {
-        try encodeValue(value, writer: writer, level: level, key: key, codingPath: codingPath)
+        try encodeValue(value, writer: writer, level: level, key: key, path: path)
     }
 }
 
@@ -271,6 +274,51 @@ struct JSONKey: CodingKey {
     init(index: Int) {
         stringValue = String(index)
         intValue = index
+    }
+}
+
+/// A coding path, kept as the path of the container a value is in and the one
+/// step from there to the value, and only put together when something reads
+/// it.
+///
+/// Nearly nothing does: the path is for errors, and for the rare `Codable`
+/// conformance that looks. Built eagerly it was an array for every value in
+/// every document, and for an array element a number formatted as a string
+/// too -- much of what a small request body cost to decode and a small answer
+/// to encode.
+struct JSONPath {
+    enum Step {
+        case key(any CodingKey)
+        case index(Int)
+
+        var codingKey: any CodingKey {
+            switch self {
+            case .key(let key): key
+            case .index(let index): JSONKey(index: index)
+            }
+        }
+    }
+
+    private let parent: [any CodingKey]
+    private let step: Step?
+
+    static let root = JSONPath(parent: [], step: nil)
+
+    private init(parent: [any CodingKey], step: Step?) {
+        self.parent = parent
+        self.step = step
+    }
+
+    var keys: [any CodingKey] {
+        guard let step else { return parent }
+        return parent + [step.codingKey]
+    }
+
+    /// The path one step further down. This one is put together first if it
+    /// has a step of its own: once for each container inside another, rather
+    /// than once for each value.
+    func appending(_ step: Step) -> JSONPath {
+        JSONPath(parent: keys, step: step)
     }
 }
 

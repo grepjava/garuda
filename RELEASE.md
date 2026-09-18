@@ -95,6 +95,14 @@ The Python suites need `h2` and `aioquic`.
 
 ### Requests and responses
 
+- The JSON coder builds a value's coding path only when something reads it:
+  an error, or a `Codable` conformance that looks. It was an array for every
+  value in every document, and for an array element a number formatted as a
+  string too. A key is found by comparing bytes rather than by making a
+  string of every member name passed on the way, an integer's type name is
+  only formatted for an error, integers are written without a heap
+  allocation, and a string with nothing to escape is copied whole. Errors
+  name the same paths as before, and there are tests for the nested ones.
 - `Request` and `Response` are `~Copyable`. The request lends its bytes to
   closures as `Span`s (`withPath`, `withHeader`, `withBody` and others), and the
   compiler refuses a handler that lets one escape. `path`, `header(_:)`, `body`
