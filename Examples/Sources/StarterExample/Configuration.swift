@@ -2,31 +2,20 @@
 // Everything the application reads from its environment, in one type, checked
 // once at start-up.
 //
-// The rule this follows: a value the application needs is read and validated
-// before anything is served, and every problem is reported at once rather than
-// one per restart. A missing secret should not be discovered by a request.
+// `AppEnvironment` does the reading and collects the problems; this file says
+// what the variables are, what they default to, and what combinations make no
+// sense. Nothing is served until it all checks out, and every problem is
+// reported at once rather than one per restart.
 //
 // Garuda's own flags -- port, workers, TLS, rate limits -- stay on the command
 // line (CONFIG.md). This is for what the *application* needs: where the
 // database is, what signs its tokens, whether sign-ups are open.
 //===----------------------------------------------------------------------===//
 
-#if canImport(Glibc)
-import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 import Garuda
 
 public struct StarterConfiguration: Sendable {
-    public enum Mode: String, Sendable {
-        /// Loose defaults, and a signing key made up at start-up.
-        case development
-        /// Nothing is guessed: every secret must be given.
-        case production
-    }
-
-    public var mode: Mode
+    public var mode: AppEnvironment.Mode
     /// `postgres://user:password@host:port/database?sslmode=require`
     public var databaseURL: String
     /// An ES256 private key in PEM, what access tokens are signed with. Nil in
@@ -40,10 +29,12 @@ public struct StarterConfiguration: Sendable {
     /// Where the OpenAPI document and Swagger UI are served, or nil for
     /// neither.
     public var documentationPath: String?
+    /// What was read, for `starter env`, with secrets held back.
+    public var summary: String = ""
 
     public var isProduction: Bool { mode == .production }
 
-    public init(mode: Mode = .development,
+    public init(mode: AppEnvironment.Mode = .development,
                 databaseURL: String = "postgres://garuda:garuda-secret@127.0.0.1:5432/starter?sslmode=disable",
                 signingKeyPEM: String? = nil,
                 accessTokenSeconds: Int = 15 * 60,
@@ -64,15 +55,6 @@ public struct StarterConfiguration: Sendable {
     }
 }
 
-/// What was wrong with the environment, all of it at once.
-public struct ConfigurationError: Error, CustomStringConvertible {
-    public let problems: [String]
-
-    public var description: String {
-        "the environment is not usable:\n" + problems.map { "  - " + $0 }.joined(separator: "\n")
-    }
-}
-
 extension StarterConfiguration {
     /// Reads the environment, or reports everything that is wrong with it.
     ///
@@ -88,114 +70,68 @@ extension StarterConfiguration {
     /// | `SIGNUPS_OPEN` | no | true |
     /// | `DATABASE_POOL_SIZE` | no | 8 |
     /// | `DOCS_PATH` | no | `/docs`, and `off` serves neither |
-    public static func fromEnvironment(_ read: (String) -> String? = environment) throws -> StarterConfiguration {
-        var problems: [String] = []
+    public static func fromEnvironment(
+        _ read: @escaping (String) -> String? = AppEnvironment.processEnvironment
+    ) throws -> StarterConfiguration {
+        var env = AppEnvironment(read)
         var configuration = StarterConfiguration()
+        configuration.mode = env.mode
+        // Development may have defaults; production is told or it fails.
+        let production = env.mode == .production
 
-        let modeName = read("APP_ENV") ?? "development"
-        if let mode = Mode(rawValue: modeName) {
-            configuration.mode = mode
-        } else {
-            problems.append("APP_ENV is \"\(modeName)\"; it is development or production")
-        }
-        let production = configuration.mode == .production
-
-        if let url = read("DATABASE_URL"), !url.isEmpty {
-            configuration.databaseURL = url
+        configuration.databaseURL = env.url("DATABASE_URL",
+                                            default: production ? nil : configuration.databaseURL)
+        if !configuration.databaseURL.isEmpty {
             do {
-                let parsed = try PostgresConfiguration(url: url)
+                let parsed = try PostgresConfiguration(url: configuration.databaseURL)
                 if production, parsed.tls == .disable {
-                    problems.append("DATABASE_URL has sslmode=disable, which production should not")
+                    env.problem("DATABASE_URL has sslmode=disable, which production should not")
                 }
             } catch {
-                problems.append("DATABASE_URL cannot be read: \(error)")
+                env.problem("DATABASE_URL cannot be read: \(error)")
             }
-        } else if production {
-            problems.append("DATABASE_URL is not set; production has no default database")
         }
 
-        if let path = read("JWT_PRIVATE_KEY_FILE"), !path.isEmpty {
-            if let pem = contentsOfFile(path) {
-                configuration.signingKeyPEM = pem
-            } else {
-                problems.append("JWT_PRIVATE_KEY_FILE names \"\(path)\", which cannot be read")
-            }
-        } else if let pem = read("JWT_PRIVATE_KEY"), !pem.isEmpty {
-            configuration.signingKeyPEM = pem
-        } else if production {
-            problems.append("JWT_PRIVATE_KEY is not set; a key made up per run would sign out every "
-                                + "user on each deployment, and no two workers would agree")
-        }
+        // In development, no key means one made up for the run, which
+        // `starterApp` does. In production that would sign out every user on
+        // each deployment, and no two workers would agree.
+        let key = env.secretOrFile("JWT_PRIVATE_KEY", default: production ? nil : "")
+        configuration.signingKeyPEM = key.isEmpty ? nil : key
         if let pem = configuration.signingKeyPEM {
             do {
                 _ = try JWTKey.pem(pem, algorithm: .ES256)
             } catch {
-                problems.append("the signing key is not an ES256 private key in PEM: \(error)")
+                env.problem("the signing key is not an ES256 private key in PEM: \(error)")
             }
         }
 
-        func positive(_ name: String, _ into: inout Int) {
-            guard let raw = read(name), !raw.isEmpty else { return }
-            guard let value = Int(raw), value > 0 else {
-                problems.append("\(name) is \"\(raw)\"; it is a whole number above zero")
-                return
-            }
-            into = value
-        }
-        positive("ACCESS_TOKEN_SECONDS", &configuration.accessTokenSeconds)
-        positive("REFRESH_TOKEN_DAYS", &configuration.refreshTokenDays)
-        positive("SESSION_DAYS", &configuration.sessionDays)
-        positive("DATABASE_POOL_SIZE", &configuration.databasePoolSize)
+        configuration.accessTokenSeconds = env.int("ACCESS_TOKEN_SECONDS", default: 15 * 60, in: 1...86_400)
+        configuration.refreshTokenDays = env.int("REFRESH_TOKEN_DAYS", default: 14, in: 1...3_650)
+        configuration.sessionDays = env.int("SESSION_DAYS", default: 90, in: 1...3_650)
+        configuration.databasePoolSize = env.int("DATABASE_POOL_SIZE", default: 8, in: 1...500)
+        configuration.signUpsOpen = env.bool("SIGNUPS_OPEN", default: true)
 
+        // Settings that are each fine and wrong together.
         if configuration.accessTokenSeconds >= configuration.refreshTokenDays * 24 * 3600 {
-            problems.append("ACCESS_TOKEN_SECONDS is not shorter than REFRESH_TOKEN_DAYS; a short access "
-                                + "token is the point of having a refresh token")
+            env.problem("ACCESS_TOKEN_SECONDS is not shorter than REFRESH_TOKEN_DAYS; a short access "
+                            + "token is the point of having a refresh token")
         }
         if configuration.refreshTokenDays > configuration.sessionDays {
-            problems.append("REFRESH_TOKEN_DAYS is longer than SESSION_DAYS, so a session would end "
-                                + "before its refresh token expires")
+            env.problem("REFRESH_TOKEN_DAYS is longer than SESSION_DAYS, so a session would end "
+                            + "before its refresh token expires")
         }
 
-        if let raw = read("SIGNUPS_OPEN"), !raw.isEmpty {
-            switch raw.lowercased() {
-            case "1", "true", "yes", "on": configuration.signUpsOpen = true
-            case "0", "false", "no", "off": configuration.signUpsOpen = false
-            default: problems.append("SIGNUPS_OPEN is \"\(raw)\"; it is true or false")
-            }
+        let docs = env.string("DOCS_PATH", default: "/docs")
+        if docs == "off" {
+            configuration.documentationPath = nil
+        } else if docs.hasPrefix("/") {
+            configuration.documentationPath = docs
+        } else {
+            env.problem("DOCS_PATH is \"\(docs)\"; it is a path beginning with / , or off")
         }
 
-        if let raw = read("DOCS_PATH"), !raw.isEmpty {
-            if raw == "off" {
-                configuration.documentationPath = nil
-            } else if raw.hasPrefix("/") {
-                configuration.documentationPath = raw
-            } else {
-                problems.append("DOCS_PATH is \"\(raw)\"; it is a path beginning with / , or off")
-            }
-        }
-
-        guard problems.isEmpty else { throw ConfigurationError(problems: problems) }
+        try env.check()
+        configuration.summary = env.summary()
         return configuration
     }
-
-    /// One environment variable, or nil when it is unset.
-    public static func environment(_ name: String) -> String? {
-        guard let raw = getenv(name) else { return nil }
-        return String(cString: raw)
-    }
-}
-
-/// A file's contents as text, for a secret mounted as a file.
-private func contentsOfFile(_ path: String) -> String? {
-    guard let file = fopen(path, "rb") else { return nil }
-    defer { fclose(file) }
-    var bytes: [UInt8] = []
-    var buffer = [UInt8](repeating: 0, count: 4096)
-    while true {
-        let read = fread(&buffer, 1, buffer.count, file)
-        if read <= 0 { break }
-        bytes.append(contentsOf: buffer[0..<read])
-    }
-    guard !bytes.isEmpty else { return nil }
-    return String(decoding: bytes, as: UTF8.self)
 }

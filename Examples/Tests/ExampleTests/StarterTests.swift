@@ -234,7 +234,7 @@ struct StarterConfigurationTests {
         do {
             _ = try StarterConfiguration.fromEnvironment(read(["APP_ENV": "production"]))
             Issue.record("production with nothing set should not be usable")
-        } catch let error as ConfigurationError {
+        } catch let error as AppEnvironmentError {
             // Every problem at once, not one per restart.
             #expect(error.problems.count == 2, "\(error)")
             #expect(error.problems.contains { $0.contains("DATABASE_URL") })
@@ -251,7 +251,7 @@ struct StarterConfigurationTests {
                 "JWT_PRIVATE_KEY": key,
             ]))
             Issue.record("sslmode=disable should not pass in production")
-        } catch let error as ConfigurationError {
+        } catch let error as AppEnvironmentError {
             #expect(error.problems.count == 1)
             #expect(error.problems[0].contains("sslmode=disable"))
         }
@@ -260,6 +260,7 @@ struct StarterConfigurationTests {
     @Test func whatIsRefusedInAnyMode() throws {
         do {
             _ = try StarterConfiguration.fromEnvironment(read([
+                // staging is a mode like any other; the five below are not.
                 "APP_ENV": "staging",
                 "ACCESS_TOKEN_SECONDS": "0",
                 "REFRESH_TOKEN_DAYS": "not a number",
@@ -268,9 +269,24 @@ struct StarterConfigurationTests {
                 "JWT_PRIVATE_KEY": "not a key",
             ]))
             Issue.record("none of that should pass")
-        } catch let error as ConfigurationError {
-            #expect(error.problems.count == 6, "\(error)")
+        } catch let error as AppEnvironmentError {
+            #expect(error.problems.count == 5, "\(error)")
+            #expect(!error.problems.contains { $0.contains("APP_ENV") })
         }
+    }
+
+    @Test func aSummaryIsWhatStarterEnvPrints() throws {
+        let key = try #require(try JWTKey.generate(.ES256).privatePEM)
+        let configuration = try StarterConfiguration.fromEnvironment(read([
+            "DATABASE_URL": "postgres://app:secret@db/starter?sslmode=disable",
+            "JWT_PRIVATE_KEY": key,
+        ]))
+        // The password and the key are held back; everything else is shown.
+        #expect(configuration.summary.contains("postgres://app:***@db/starter?sslmode=disable"))
+        #expect(!configuration.summary.contains("secret@"))
+        #expect(configuration.summary.contains("JWT_PRIVATE_KEY       set"))
+        #expect(!configuration.summary.contains("PRIVATE KEY-----"), "no key material in a summary")
+        #expect(configuration.summary.contains("SESSION_DAYS"))
     }
 
     @Test func lifetimesMustMakeSenseTogether() throws {
@@ -280,7 +296,7 @@ struct StarterConfigurationTests {
                 "REFRESH_TOKEN_DAYS": "1",
             ]))
             Issue.record("an access token outliving its refresh token is not usable")
-        } catch let error as ConfigurationError {
+        } catch let error as AppEnvironmentError {
             #expect(error.problems.count == 1, "\(error)")
             #expect(error.problems[0].contains("ACCESS_TOKEN_SECONDS"))
         }
@@ -290,7 +306,7 @@ struct StarterConfigurationTests {
                 "SESSION_DAYS": "7",
             ]))
             Issue.record("a refresh token outliving its session is not usable")
-        } catch let error as ConfigurationError {
+        } catch let error as AppEnvironmentError {
             #expect(error.problems[0].contains("SESSION_DAYS"))
         }
     }
@@ -310,7 +326,7 @@ struct StarterConfigurationTests {
         do {
             _ = try StarterConfiguration.fromEnvironment(read(["JWT_PRIVATE_KEY_FILE": "/tmp/nothing-here.pem"]))
             Issue.record("a key file that cannot be read should not pass")
-        } catch let error as ConfigurationError {
+        } catch let error as AppEnvironmentError {
             #expect(error.problems[0].contains("cannot be read"))
         }
     }

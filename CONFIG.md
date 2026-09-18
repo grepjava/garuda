@@ -775,3 +775,59 @@ Next: [INSTALLATION.md](INSTALLATION.md) covers building, certificates and
 running as a service. [README.md](README.md) describes the handler API and
 current status. [TRANSPORT.md](TRANSPORT.md) covers each protocol, and
 [ARCHITECTURE.md](ARCHITECTURE.md) explains how the server is built.
+
+---
+
+## Your application's own settings
+
+The flags above are the server's. What your application needs -- a database
+URL, a signing key, which features are on -- belongs in the environment, where
+a deployment sets it as a secret, and `AppEnvironment` reads it:
+
+```swift
+struct Settings {
+    let databaseURL: String
+    let signingKey: String
+    let poolSize: Int
+    let signUpsOpen: Bool
+}
+
+func settings() throws -> Settings {
+    var env = AppEnvironment()
+    let production = env.mode == .production      // APP_ENV
+    let settings = Settings(
+        // A default in development; required in production.
+        databaseURL: env.url("DATABASE_URL", default: production ? nil : "postgres://localhost/dev"),
+        // JWT_PRIVATE_KEY, or the contents of the file JWT_PRIVATE_KEY_FILE names.
+        signingKey: env.secretOrFile("JWT_PRIVATE_KEY", default: production ? nil : ""),
+        poolSize: env.int("DATABASE_POOL_SIZE", default: 8, in: 1...500),
+        signUpsOpen: env.bool("SIGNUPS_OPEN", default: true))
+    if settings.signUpsOpen && production && settings.databaseURL.isEmpty {
+        env.problem("SIGNUPS_OPEN cannot be on with no database")
+    }
+    try env.check()        // throws once, listing every problem
+    return settings
+}
+```
+
+| Reader | Reads |
+|---|---|
+| `string(_:default:)` | text; `default: nil` makes it required |
+| `int(_:default:in:)` | a whole number, refused outside the range |
+| `bool(_:default:)` | `true`/`yes`/`on`/`1` and their opposites, any case |
+| `choice(_:default:)` | one case of a `RawRepresentable & CaseIterable` |
+| `secret(_:default:)` | text that `summary()` only says is set |
+| `secretOrFile(_:default:)` | the same, or the contents of the file `<NAME>_FILE` names |
+| `url(_:default:)` | a URL whose password `summary()` takes out |
+
+- **Every problem at once.** A reader always returns a usable value and records
+  what was wrong, so reading goes on and `check()` reports the lot. A missing
+  secret and a mistyped number are one restart, not two.
+- **`mode`** is `APP_ENV`: `development`, `test`, `staging` or `production`,
+  and `development` when it is unset.
+- **`summary()`** is what a `myapp env` command prints: every variable that was
+  read, secrets held back, passwords taken out of URLs.
+- **Where to call it:** before the application is built, so nothing is served
+  until the environment checks out.
+  [Examples/STARTER.md](Examples/STARTER.md) does exactly this, and
+  `Examples/Sources/StarterExample/Configuration.swift` is the whole file.

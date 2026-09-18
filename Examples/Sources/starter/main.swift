@@ -51,17 +51,9 @@ case "migrate":
     }
 
 case "env":
-    print("""
-          APP_ENV               \(configuration.mode.rawValue)
-          DATABASE_URL          \(redacted(configuration.databaseURL))
-          JWT_PRIVATE_KEY       \(configuration.signingKeyPEM == nil ? "made up for this run" : "set")
-          ACCESS_TOKEN_SECONDS  \(configuration.accessTokenSeconds)
-          REFRESH_TOKEN_DAYS    \(configuration.refreshTokenDays)
-          SESSION_DAYS          \(configuration.sessionDays)
-          SIGNUPS_OPEN          \(configuration.signUpsOpen)
-          DATABASE_POOL_SIZE    \(configuration.databasePoolSize)
-          DOCS_PATH             \(configuration.documentationPath ?? "off")
-          """)
+    // What the environment said, as the application read it: secrets held
+    // back and the database password taken out.
+    print(configuration.summary)
     exit(0)
 
 case "serve":
@@ -75,16 +67,6 @@ case "serve":
 case let unknown:
     StandardError.put("starter: unknown command \"\(unknown)\"; try serve, migrate or env\n")
     exit(64)  // EX_USAGE
-}
-
-/// A connection URL with its password taken out, so it can be printed.
-func redacted(_ url: String) -> String {
-    // No Foundation here, so the indices are found by hand.
-    guard let colon = url.firstIndex(of: ":"), url[colon...].hasPrefix("://") else { return url }
-    let afterScheme = url.index(colon, offsetBy: 3)
-    guard let at = url[afterScheme...].firstIndex(of: "@") else { return url }
-    guard let passwordStart = url[afterScheme..<at].firstIndex(of: ":") else { return url }
-    return String(url[url.startIndex...passwordStart]) + "***" + String(url[at...])
 }
 
 /// Standard error, without Foundation.

@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 763 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 771 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -389,6 +389,17 @@ The Python suites need `h2` and `aioquic`.
   starts with it, and Swift without Foundation has no such method.
 - `PostgresClientError.isConstraintViolation` says whether the server refused a
   statement for breaking a constraint, as `SQLiteClientError` already did.
+- `AppEnvironment` reads an application's own settings -- where its database
+  is, what signs its tokens, which features are on -- and collects every
+  problem instead of failing at the first: `string`, `int` with a range,
+  `bool`, `choice` over a `CaseIterable`, `secret` and `secretOrFile` (which
+  reads `<NAME>_FILE`, as a mounted secret arrives), and `url`, whose password
+  is held back. `problem(_:)` records a check of the application's own, and
+  `check()` throws `AppEnvironmentError` listing all of them. `mode` reads
+  `APP_ENV`, and `default: production ? nil : value` is how a setting has a
+  default in development and is required in production. `summary()` prints
+  what was read for a `myapp env` command, with secrets held back and
+  passwords taken out of URLs. Garuda's own settings stay on the command line.
 - `app.run(arguments:)` parses a list of arguments as the `garuda` executable
   parses its command line, so an application with commands of its own can hand
   Garuda the flags that are Garuda's: `starter serve -- --port 8080`.

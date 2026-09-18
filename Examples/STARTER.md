@@ -92,6 +92,11 @@ environment variables, because a deployment sets them as secrets:
 | `DATABASE_POOL_SIZE` | no | 8, per worker |
 | `DOCS_PATH` | no | `/docs`; `off` serves neither |
 
+`AppEnvironment` (Garuda) does the reading and collects the problems;
+[Configuration.swift](Sources/StarterExample/Configuration.swift) says what the
+variables are, what they default to, and which combinations make no sense.
+CONFIG.md has the readers.
+
 Three things this pattern is built around:
 
 - **Everything is read before anything is served.** `fromEnvironment` returns a
