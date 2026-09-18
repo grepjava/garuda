@@ -9,6 +9,14 @@ private enum Who: RequestContextKey { typealias Value = String }
 
 nonisolated(unsafe) private var senderEvents: [String] = []
 
+/// Somewhere for a handler to record what it saw. A box rather than a
+/// captured local: the handler is a `sending` closure, and a local is still
+/// reachable from the test, which Swift 6.2 reads as a race even though both
+/// run on the one worker thread.
+private final class Seen: @unchecked Sendable {
+    var text = ""
+}
+
 @Suite("WebSocket handlers", .serialized)
 struct WebSocketHandlerTests {
 
@@ -79,18 +87,18 @@ struct WebSocketHandlerTests {
     }
 
     @Test func theHandlerSeesThePeersClose() throws {
-        nonisolated(unsafe) var seen = ""
+        let seen = Seen()
         let app = Application()
         app.webSocket("/ws") { (ws: WebSocket) async throws in
             while try await ws.receive() != nil {}
-            seen = "\(ws.closeCode ?? 0) \(ws.closeReason)"
+            seen.text = "\(ws.closeCode ?? 0) \(ws.closeReason)"
         }
         let client = app.test
         let ws = try client.webSocket("/ws")
         try ws.close(code: 4001, reason: "done")
         #expect(ws.closeCode == 4001)
-        for _ in 0..<100 where seen.isEmpty { client.turn() }
-        #expect(seen == "4001 done")
+        for _ in 0..<100 where seen.text.isEmpty { client.turn() }
+        #expect(seen.text == "4001 done")
     }
 
     @Test func aHandlerClosesWithItsCodeOrForItself() throws {

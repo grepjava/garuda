@@ -149,8 +149,13 @@ struct PostgresSessionTests {
 
     @Test func aServerErrorDuringStartupIsReported() {
         var startup = PostgresStartup(user: "garuda", password: "wrong", database: nil)
-        let body = [UInt8(ascii: "S")] + cstr("FATAL") + [UInt8(ascii: "C")] + cstr("28P01")
-            + [UInt8(ascii: "M")] + cstr("password authentication failed") + [0]
+        var body: [UInt8] = [UInt8(ascii: "S")]
+        body += cstr("FATAL")
+        body += [UInt8(ascii: "C")]
+        body += cstr("28P01")
+        body += [UInt8(ascii: "M")]
+        body += cstr("password authentication failed")
+        body += [0]
         let error = thrown { _ = try feed(&startup, "E", body) }
         guard case .server(let fields) = error else {
             Issue.record("expected a server error, got \(String(describing: error))")

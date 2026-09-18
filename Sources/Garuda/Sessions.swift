@@ -204,11 +204,11 @@ extension RouteBuilder {
                          store: @escaping (borrowing Request) throws -> any SessionStore) {
         let template = configuration.cookie
         let ttl = configuration.idleTimeoutSeconds * 1000
-        nonisolated(unsafe) let store = store
+        let carried = Unsafely(store)
         use { request, response async throws -> (any ResponseConvertible)? in
             // Everything the request and response are asked for is asked
             // before the store is awaited.
-            let session = Session(store: try store(request), ttlMilliseconds: ttl)
+            let session = Session(store: try carried.value(request), ttlMilliseconds: ttl)
             request[context: SessionKey.self] = session
             let https = String(describing: request.scheme) == "https"
             response.onSend { outgoing in

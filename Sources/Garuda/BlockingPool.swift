@@ -61,11 +61,13 @@ public func blocking<T: Sendable>(_ work: @Sendable @escaping () throws -> T) as
     let pool = try worker.pointee.blockingPool()
     let result = await withUnsafeContinuation { (continuation: UnsafeContinuation<BlockingOutcome<T>, Never>) in
         let job = BlockingJob()
-        nonisolated(unsafe) var outcome: BlockingOutcome<T> = .refused(.unavailable)
+        // The pool's thread writes it and the worker's reads it, one after the
+        // other: `finish` is called on the worker once `run` has returned.
+        let outcome = UnsafelyShared<BlockingOutcome<T>>(.refused(.unavailable))
         job.run = {
-            do { outcome = .returned(try work()) } catch { outcome = .threw(error) }
+            do { outcome.value = .returned(try work()) } catch { outcome.value = .threw(error) }
         }
-        job.finish = { continuation.resume(returning: outcome) }
+        job.finish = { continuation.resume(returning: outcome.value) }
         if let refusal = pool.submit(job) { continuation.resume(returning: .refused(refusal)) }
     }
     switch result {

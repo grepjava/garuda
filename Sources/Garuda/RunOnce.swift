@@ -78,12 +78,11 @@ final class OneOffWorker {
             throw RunOnceError.workerCouldNotBeBuilt(String(describing: error))
         }
         let outcome = OneOffOutcome()
-        nonisolated(unsafe) let body = work
-        nonisolated(unsafe) let me = worker
+        let carried = Unsafely((worker: worker, work: work))
         let pool = worker.pointee.handlerTasks ?? worker.pointee.makeHandlerTasks()
         let task = Task(executorPreference: pool.executor) {
             do {
-                try await body(WorkerStartup(index: 0, worker: me))
+                try await carried.value.work(WorkerStartup(index: 0, worker: carried.value.worker))
             } catch {
                 outcome.failure = String(describing: error)
             }

@@ -49,6 +49,11 @@ private func uploadApp(_ store: FileUploadStore, limits: UploadLimits = UploadLi
 
 private func header(_ response: TestResponse, _ name: String) -> String? { response.header(name) }
 
+/// Somewhere for an upload handler to record what it saw.
+private final class DigestsSeen: @unchecked Sendable {
+    var digests: [[UInt8]?] = []
+}
+
 /// Where the upload lives: in the final response while it is still open, and
 /// in the 104 for a client that completed it in one request.
 private func uploadURL(_ response: TestResponse) -> String? {
@@ -699,11 +704,14 @@ struct ResumableUploadTests {
     }
 
     @Test func theHandlerCanHaveTheDigestWithoutAskingTwice() throws {
-        nonisolated(unsafe) var seen: [[UInt8]?] = []
+        // A box rather than a captured local: the handler is a `sending`
+        // closure, and a local is still reachable from here, which Swift 6.2
+        // reads as a race even though both run on the one worker thread.
+        let seen = DigestsSeen()
         let store = try FileUploadStore(directory: temporaryDirectory())
         let app = Application()
         app.resumableUploads("/files", store: store, progressInterval: 0) { upload in
-            seen.append(upload.digest())
+            seen.digests.append(upload.digest())
             return Text("ok", status: .created)
         }
         // Computed for the check, and handed on rather than computed again.
@@ -711,12 +719,12 @@ struct ResumableUploadTests {
             ("Upload-Complete", "?1"),
             ("Repr-Digest", Digest.field(Digest.sha256(pattern(10)))),
         ]).status == 201)
-        #expect(seen == [Digest.sha256(pattern(10))])
+        #expect(seen.digests == [Digest.sha256(pattern(10))])
 
         // Nobody asked, so it is read from the file when the handler wants it.
-        seen = []
+        seen.digests = []
         #expect(try app.test.post("/files", body: pattern(6), headers: [("Upload-Complete", "?1")]).status == 201)
-        #expect(seen == [Digest.sha256(pattern(6))])
+        #expect(seen.digests == [Digest.sha256(pattern(6))])
     }
 
     @Test func aFinishedUploadIsAnsweredAgainToAClientThatAsks() throws {

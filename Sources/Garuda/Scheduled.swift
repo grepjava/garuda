@@ -91,13 +91,15 @@ extension GarudaRuntime {
     static func startScheduledJobs(_ worker: UnsafeMutablePointer<Worker>, index: Int, jobs: [ScheduledJob]) {
         guard !jobs.isEmpty else { return }
         let pool = worker.pointee.handlerTasks ?? worker.pointee.makeHandlerTasks()
-        nonisolated(unsafe) let me = worker
         let running = worker.pointee.scheduled ?? ScheduledJobs()
         worker.pointee.scheduled = running
         for job in jobs where job.worker == nil || job.worker == index {
             running.live += 1
+            let carried = Unsafely((worker: worker, job: job))
             let task = Task(executorPreference: pool.executor) {
                 defer { running.live -= 1 }
+                let me = carried.value.worker
+                let job = carried.value.job
                 var first = true
                 while !Task.isCancelled, me.pointee.running, !me.pointee.draining {
                     let slept = await sleepInSlices(me, milliseconds: job.delay(first: first))

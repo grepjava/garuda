@@ -456,9 +456,11 @@ struct PostgresIntegrationTests {
             _ = try await connection.query("set time zone 'UTC'")
             _ = try await connection.query("create temporary table stamps (n int, id uuid, at timestamptz, wall timestamp, maybe uuid)")
             for (n, instant) in instants.enumerated() {
+                let values: [PostgresValue] = [PostgresValue(String(n)), id.postgresValue,
+                                               instant.postgresValue, instant.postgresValue,
+                                               UUID?.none.postgresValue]
                 _ = try await connection.query("insert into stamps values ($1, $2, $3, $4, $5)",
-                                               values: [PostgresValue(String(n)), id.postgresValue,
-                                                        instant.postgresValue, instant.postgresValue, UUID?.none.postgresValue])
+                                               values: values)
             }
             let sql = "select id, at, wall, maybe from stamps order by n"
             let first = try await connection.query(sql)
@@ -476,9 +478,17 @@ struct PostgresIntegrationTests {
             // And the server agrees on what the bound values meant.
             let check = try await connection.query("select $1::uuid::text, extract(epoch from $2::timestamptz)::text",
                                                    values: [id.postgresValue, instants[0].postgresValue])
-            return formats + "|\(a == expected)|\(b == expected)|" + mismatches.joined(separator: "; ")
-                + "|" + (check.text(row: 0, column: 0) == id.description ? "id" : "id?")
-                + "," + (check.text(row: 0, column: 1) ?? "null")
+            // Built up rather than added together: a + chain this long over
+            // strings, interpolations and ternaries is more than Swift 6.2's
+            // type checker will work through.
+            let sameID = check.text(row: 0, column: 0) == id.description ? "id" : "id?"
+            let epoch = check.text(row: 0, column: 1) ?? "null"
+            var parts: [String] = [formats]
+            parts.append("\(a == expected)")
+            parts.append("\(b == expected)")
+            parts.append(mismatches.joined(separator: "; "))
+            parts.append(sameID + "," + epoch)
+            return parts.joined(separator: "|")
         }
         #expect(text == "bbbb|true|true||id,1789591223.196123")
     }

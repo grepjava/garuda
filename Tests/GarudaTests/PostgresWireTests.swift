@@ -35,6 +35,11 @@ private func i32(_ v: Int32) -> [UInt8] {
 
 private func cstr(_ s: String) -> [UInt8] { Array(s.utf8) + [0] }
 
+/// One field of an ErrorResponse: its one-byte code, then the text.
+private func field(_ code: Character, _ text: String) -> [UInt8] {
+    [UInt8(ascii: Unicode.Scalar(String(code).unicodeScalars.first!))] + cstr(text)
+}
+
 /// Runs `body` on a reader over `bytes`.
 ///
 /// Takes an untyped closure: a closure literal does not pick up a typed throw
@@ -174,13 +179,14 @@ struct PostgresWireTests {
     // MARK: Errors
 
     @Test func anErrorResponseIsRead() throws {
-        let body = [UInt8(ascii: "S")] + cstr("ERROR")
-            + [UInt8(ascii: "C")] + cstr("23505")
-            + [UInt8(ascii: "M")] + cstr("duplicate key value")
-            + [UInt8(ascii: "D")] + cstr("Key (id)=(1) already exists.")
-            + [UInt8(ascii: "n")] + cstr("users_pkey")
-            + [UInt8(ascii: "R")] + cstr("_bt_check_unique")
-            + [0]
+        var body: [UInt8] = []
+        body += field("S", "ERROR")
+        body += field("C", "23505")
+        body += field("M", "duplicate key value")
+        body += field("D", "Key (id)=(1) already exists.")
+        body += field("n", "users_pkey")
+        body += field("R", "_bt_check_unique")
+        body += [0]
         let fields = try? reading(body) { try PostgresBackend.errorFields($0) }.get()
         #expect(fields?.code == "23505")
         #expect(fields?.message == "duplicate key value")
@@ -267,7 +273,12 @@ struct PostgresWireTests {
         let bytes = written {
             PostgresFrontend.startup(user: "garuda", database: "app", into: &$0)
         }
-        let body = i32(196_608) + cstr("user") + cstr("garuda") + cstr("database") + cstr("app") + [0]
+        var body: [UInt8] = i32(196_608)
+        body += cstr("user")
+        body += cstr("garuda")
+        body += cstr("database")
+        body += cstr("app")
+        body += [0]
         #expect(bytes == i32(Int32(body.count + 4)) + body)
     }
 
@@ -293,11 +304,23 @@ struct PostgresWireTests {
                            + i32(1) + Array("7".utf8) + i32(-1) + i16(0)))
         // A binary parameter makes the formats explicit, one per parameter,
         // and results can be asked for per column.
+        var bound: [UInt8] = cstr("p")
+        bound += cstr("s")
+        bound += i16(2)
+        bound += i16(0)
+        bound += i16(1)
+        bound += i16(2)
+        bound += i32(1)
+        bound += Array("7".utf8)
+        bound += i32(2)
+        bound += [1, 2]
+        bound += i16(2)
+        bound += i16(1)
+        bound += i16(0)
         #expect(written { PostgresFrontend.bind(portal: "p", statement: "s",
                                                 values: [PostgresValue("7"), .binary([1, 2], type: 17)],
                                                 resultFormats: [1, 0], into: &$0) }
-                == message("B", cstr("p") + cstr("s") + i16(2) + i16(0) + i16(1) + i16(2)
-                           + i32(1) + Array("7".utf8) + i32(2) + [1, 2] + i16(2) + i16(1) + i16(0)))
+                == message("B", bound))
         #expect(written { PostgresFrontend.describe(portal: "", into: &$0) }
                 == message("D", [UInt8(ascii: "P")] + cstr("")))
         #expect(written { PostgresFrontend.execute(portal: "", into: &$0) }

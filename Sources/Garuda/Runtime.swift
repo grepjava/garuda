@@ -1089,12 +1089,11 @@ enum GarudaRuntime {
                                prepare: @escaping @Sendable (WorkerStartup) async throws -> Void,
                                timeoutMilliseconds: UInt64, turn: () -> Void) -> Bool {
         let outcome = Preparation()
-        nonisolated(unsafe) let work = prepare
-        nonisolated(unsafe) let me = worker
+        let carried = Unsafely((worker: worker, work: prepare))
         let pool = worker.pointee.handlerTasks ?? worker.pointee.makeHandlerTasks()
         let task = Task(executorPreference: pool.executor) {
             do {
-                try await work(WorkerStartup(index: index, worker: me))
+                try await carried.value.work(WorkerStartup(index: index, worker: carried.value.worker))
             } catch {
                 outcome.failure = String(describing: error)
             }
