@@ -242,6 +242,36 @@ struct ScopeAuthorizationTests {
         #expect(none.scopes.isEmpty)
     }
 
+    @Test func aRouterGuardsItsOwnRoutesWithoutBeingHandedTheKeys() throws {
+        // What a feature module needs: the verifier comes from the worker, so
+        // the router can be built and mounted on its own.
+        let set = try JWTKeys([try JWTKey.generate(.ES256, keyID: "k")])
+        let orders = Router()
+        orders.authenticate(jwt: ScopedToken.self)
+        orders.authorize(jwt: ScopedToken.self, .scope("orders:write"))
+        orders.post("") { (jwt: JWT<ScopedToken>) async in "made for \(jwt.claims.sub)" }
+
+        let app = Application()
+        app.jwtVerifier { _ in set }
+        app.nest("/orders", orders)
+        let client = app.test
+
+        let future = Int(Timestamp.now.secondsSinceEpoch) + 3600
+        func bearer(_ scope: String) throws -> [(String, String)] {
+            [("authorization",
+              "Bearer " + (try set.sign(ScopedToken(sub: "ada", exp: future, scope: scope))))]
+        }
+        #expect(try client.post("/orders", body: "", headers: try bearer("orders:write")).text == "made for ada")
+        #expect(try client.post("/orders", body: "", headers: try bearer("orders:read")).status == .forbidden)
+        let anonymous = try client.post("/orders", body: "")
+        #expect(anonymous.status == .unauthorized)
+        #expect(anonymous.header("www-authenticate") == "Bearer")
+        // A token that will not verify is 401 and says so, not 403.
+        let bad = try client.post("/orders", body: "", headers: [("authorization", "Bearer nonsense")])
+        #expect(bad.status == .unauthorized)
+        #expect(bad.header("www-authenticate") == #"Bearer error="invalid_token""#)
+    }
+
     @Test func aScopeGuardsARouteThroughTheTokenTheScopeChecked() throws {
         let set = try JWTKeys([try JWTKey.generate(.ES256, keyID: "k")])
         let app = Application()

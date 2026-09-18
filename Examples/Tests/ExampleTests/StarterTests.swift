@@ -177,6 +177,101 @@ struct StarterExampleTests {
     }
 
     @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))
+    func onlyAnAdministratorReachesTheAdminRoutes() throws {
+        try emptySchema()
+
+        // The order a deployment does this in: the accounts exist, and then
+        // the deployment names one an administrator and restarts.
+        let plain = starterApp(testConfiguration()).test
+        plain.timeoutMillis = 30_000
+        let ada = try signUp(plain, "ada@example.com").json(Account.self)
+        let grace = try signUp(plain, "grace@example.com").json(Account.self)
+        #expect(ada.role == "member", "an account starts as a member")
+
+        var configuration = testConfiguration()
+        configuration.adminEmails = ["ada@example.com"]
+        let client = starterApp(configuration).test
+        client.timeoutMillis = 30_000
+
+        // The role is in the token, so it is in /auth/me without a lookup.
+        let adaTokens = try logIn(client, "ada@example.com")
+        #expect(try client.get("/auth/me", headers: bearer(adaTokens)).json(Account.self).role == "admin")
+        let graceTokens = try logIn(client, "grace@example.com")
+        #expect(try client.get("/auth/me", headers: bearer(graceTokens)).json(Account.self).role == "member")
+
+        // A member is refused, and told what would have been enough.
+        let refused = try client.get("/admin/accounts", headers: bearer(graceTokens))
+        #expect(refused.status == .forbidden)
+        #expect(refused.text == #"{"error":"this route needs an administrator"}"#, "\(refused.text)")
+        // No token at all is 401 with the challenge, from the authenticate in
+        // front of the rule.
+        let anonymous = try client.get("/admin/accounts")
+        #expect(anonymous.status == .unauthorized)
+        #expect(anonymous.header("www-authenticate") == "Bearer")
+
+        // The administrator sees the accounts.
+        let page = try client.get("/admin/accounts", headers: bearer(adaTokens)).json(AccountPage.self)
+        #expect(page.accounts.map(\.email) == ["grace@example.com", "ada@example.com"])
+        #expect(page.accounts.map(\.role) == ["member", "admin"])
+
+        // A role that is not one: refused by the type's rules, with the field
+        // named and the choices given.
+        let nonsense = try client.request("PUT", "/admin/accounts/\(grace.id)/role", headers: bearer(adaTokens),
+                                          body: Array(#"{"role":"root"}"#.utf8))
+        #expect(nonsense.status == .unprocessableContent)
+        #expect(nonsense.text == #"{"error":"role must be one of member, admin","#
+                    + #""fields":[{"field":"role","message":"must be one of member, admin"}]}"#, "\(nonsense.text)")
+
+        // Promoting somebody ends their sessions, so their next refresh is
+        // refused and signing in again mints a token that says the new role.
+        let promoted = try client.request("PUT", "/admin/accounts/\(grace.id)/role", headers: bearer(adaTokens),
+                                          body: Array(#"{"role":"admin"}"#.utf8))
+        #expect(promoted.status == .ok, "\(promoted.status) \(promoted.text)")
+        #expect(try promoted.json(Account.self).role == "admin")
+        #expect(try client.post("/auth/refresh",
+                                body: #"{"refresh_token":"\#(graceTokens.refreshToken)"}"#).status == .badRequest)
+        let graceAgain = try logIn(client, "grace@example.com")
+        #expect(try client.get("/admin/accounts", headers: bearer(graceAgain)).status == .ok)
+
+        // Setting the role it already has changes nothing, and does not end
+        // their sessions.
+        let again = try client.request("PUT", "/admin/accounts/\(grace.id)/role", headers: bearer(adaTokens),
+                                       body: Array(#"{"role":"admin"}"#.utf8))
+        #expect(again.status == .ok)
+        #expect(try client.get("/admin/accounts", headers: bearer(graceAgain)).status == .ok,
+                "still signed in")
+
+        // An account the deployment names cannot be demoted through the API:
+        // the next restart would promote it again.
+        let named = try client.request("PUT", "/admin/accounts/\(ada.id)/role", headers: bearer(graceAgain),
+                                       body: Array(#"{"role":"member"}"#.utf8))
+        #expect(named.status == .conflict)
+        #expect(named.text.contains("ADMIN_EMAILS"), "\(named.text)")
+
+        // Grace may demote herself, because Ada is still an administrator.
+        let stepDown = try client.request("PUT", "/admin/accounts/\(grace.id)/role", headers: bearer(graceAgain),
+                                          body: Array(#"{"role":"member"}"#.utf8))
+        #expect(stepDown.status == .ok, "\(stepDown.status) \(stepDown.text)")
+        #expect(try stepDown.json(Account.self).role == "member")
+
+        // And now Ada is the last one, which the count refuses before the
+        // list does.
+        let last = try client.request("PUT", "/admin/accounts/\(ada.id)/role", headers: bearer(adaTokens),
+                                      body: Array(#"{"role":"member"}"#.utf8))
+        #expect(last.status == .conflict)
+        #expect(last.text == #"{"error":"the last administrator cannot be demoted"}"#, "\(last.text)")
+
+        // An account that is not there.
+        #expect(try client.request("PUT", "/admin/accounts/999999/role", headers: bearer(adaTokens),
+                                   body: Array(#"{"role":"admin"}"#.utf8)).status == .notFound)
+
+        // The 401, the 403 and the scheme are in the document for every admin
+        // route, from the two lines that guard them.
+        let document = try client.get("/docs/openapi.json").text
+        #expect(document.contains("Needs an administrator"))
+    }
+
+    @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))
     func healthReadinessAndDocumentation() throws {
         try emptySchema()
         var configuration = testConfiguration()

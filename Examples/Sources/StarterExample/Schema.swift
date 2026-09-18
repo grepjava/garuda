@@ -42,4 +42,13 @@ public let starterMigrations: [[String]] = [
     ],
     // 3: refresh tokens, Garuda's own tables.
     PostgresRefreshTokenStore.schema(),
+    // 4: what an account may do. A default, so every account that already
+    // exists has one the moment the column does -- a migration that left it
+    // null would need every route to decide what null means.
+    [
+        "alter table users add column role text not null default 'member'",
+        // Partial, because the question is only ever "how many
+        // administrators are there", and that must not read every account.
+        "create index users_admins on users (id) where role = 'admin'",
+    ],
 ]

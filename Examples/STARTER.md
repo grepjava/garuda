@@ -45,12 +45,14 @@ Open <http://localhost:8080/docs> for Swagger UI over the generated document.
 | `POST` | `/auth/refresh` | | 200 a new pair, 400 `invalid_grant` |
 | `POST` | `/auth/logout` | | 204, and safe to repeat |
 | `POST` | `/auth/logout-all` | access token | 204 |
-| `GET` | `/auth/me` | access token | 200 the account |
+| `GET` | `/auth/me` | access token | 200 the account, its role included |
 | `GET` | `/notes?limit=&before=` | access token | 200 a page, newest first |
 | `POST` | `/notes` | access token | 201 the note, 422 |
 | `GET` | `/notes/:id` | access token | 200, 404 |
 | `PATCH` | `/notes/:id` | access token | 200, 404, 422 |
 | `DELETE` | `/notes/:id` | access token | 204, 404 |
+| `GET` | `/admin/accounts?limit=&before=` | an administrator | 200 a page, 401, 403 |
+| `PUT` | `/admin/accounts/:id/role` | an administrator | 200 the account, 401, 403, 404, 409, 422 |
 | `GET` | `/health` | | 200 always, while the process runs |
 | `GET` | `/ready` | | 200, or 503 when the database does not answer |
 | `GET` | `/docs`, `/docs/openapi.json` | | the API, documented |
@@ -64,6 +66,7 @@ Open <http://localhost:8080/docs> for Swagger UI over the generated document.
 | [Schema.swift](Sources/StarterExample/Schema.swift) | migrations, append-only |
 | [Accounts.swift](Sources/StarterExample/Accounts.swift) | sign-up, login, refresh, logout |
 | [Notes.swift](Sources/StarterExample/Notes.swift) | what an account owns |
+| [Admin.swift](Sources/StarterExample/Admin.swift) | the routes only an administrator reaches |
 | [StarterApp.swift](Sources/StarterExample/StarterApp.swift) | the application: state, start-up, middleware, routes |
 | [starter/main.swift](Sources/starter/main.swift) | `serve`, `migrate` and `env` |
 | [StarterTests.swift](Tests/ExampleTests/StarterTests.swift) | the whole thing through `app.test` |
@@ -144,6 +147,7 @@ environment variables, because a deployment sets them as secrets:
 | `REFRESH_TOKEN_DAYS` | no | 14 |
 | `SESSION_DAYS` | no | 90 |
 | `SIGNUPS_OPEN` | no | true |
+| `ADMIN_EMAILS` | no | none; `ada@example.com,grace@example.com` are made administrators at start-up |
 | `DATABASE_POOL_SIZE` | no | 8, per worker |
 | `DOCS_PATH` | no | `/docs`; `off` serves neither |
 
@@ -198,6 +202,55 @@ public let starterMigrations: [[String]] = [
 - **Write migrations that suit a rolling deployment**: add a column before the
   code that writes it, stop writing a column before dropping it. Two workers,
   old and new, serve at the same time through a reload.
+
+## Roles: who may do what
+
+An account is a `member` or an `admin`, and
+[Admin.swift](Sources/StarterExample/Admin.swift) is guarded in two lines:
+
+```swift
+app.authenticate(jwt: AccessClaims.self)       // whose request it is
+app.authorize(jwt: AccessClaims.self, .admin)  // whether they may
+```
+
+No handler there checks anything about who is asking. A member's token is
+refused `403 {"error":"this route needs an administrator"}`, a request with no
+token is `401` with the challenge, and both appear in the OpenAPI document for
+every route in the group without either route saying so. The rule itself is a
+value, named once and testable without a server:
+
+```swift
+extension Policy where Value == AccessClaims {
+    static let admin = Policy(needs: "an administrator") { $0.role == "admin" }
+}
+```
+
+**The role is in the access token**, so guarding a route costs no lookup. The
+price is staleness, and it is bounded twice: a token lives
+`ACCESS_TOKEN_SECONDS` (15 minutes by default), and a change of role also ends
+that account's sessions, so its next refresh is refused and signing in again
+mints a token that tells the truth. Put the role in the token when a route may
+act on a 15-minute-old answer; look it up per request when it may not.
+
+**The first administrator comes from the deployment.** A new database has none,
+and a route that promotes whoever asks is not a route, so `ADMIN_EMAILS` names
+them and every worker applies it at start-up:
+
+```bash
+ADMIN_EMAILS=ada@example.com,grace@example.com
+```
+
+That list only ever *promotes*. A list that also demoted would undo an
+administrator's work at the next restart, so it is a floor rather than the
+whole truth — and an account in it cannot be demoted through the API, which
+answers 409 saying to take it out of the list first.
+
+**The last administrator cannot be demoted.** That is the one rule a policy
+cannot hold: whether this demotion leaves any is a question for the database.
+It is asked inside the transaction, with the row locked (`select … for
+update`), so two administrators demoting each other at the same moment cannot
+both pass, and it answers 409 rather than 403 — nothing about who is asking is
+wrong.
 
 ## The per-worker model
 

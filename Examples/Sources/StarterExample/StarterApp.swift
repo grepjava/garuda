@@ -92,6 +92,7 @@ public func starterApp(_ given: StarterConfiguration) -> Application {
     // mounted here, and mountable on an application of its own in a test.
     addAccountRoutes(app, settled)
     app.nest("/notes", noteRoutes())
+    app.nest("/admin", adminRoutes())
 
     if let path = settled.documentationPath {
         app.openAPI(OpenAPIInfo(title: "Starter", version: "1.0.0",

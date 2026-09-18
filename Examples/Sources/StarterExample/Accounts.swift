@@ -1,12 +1,12 @@
 //===----------------------------------------------------------------------===//
 // Accounts: signing up, signing in, keeping a session alive, and ending it.
 //
-//   POST /auth/signup   {"email","password"}      201 {"id","email"}, 409, 422
+//   POST /auth/signup   {"email","password"}      201 the account, 409, 422
 //   POST /auth/login    {"email","password"}      200 a token pair, or 401
 //   POST /auth/refresh  {"refresh_token"}         200 a token pair, or 400
 //   POST /auth/logout   {"refresh_token"}         204, and repeatable
 //   POST /auth/logout-all  Bearer access token    204, every device
-//   GET  /auth/me          Bearer access token    200 {"id","email"}
+//   GET  /auth/me          Bearer access token    200 {"id","email","role"}
 //
 // A login answers with a short-lived access token (a JWT, checked on every
 // request without a lookup) and a long-lived refresh token (32 random bytes,
@@ -59,12 +59,16 @@ struct RefreshRequest: Decodable {
 public struct Account: Codable, Equatable, Sendable {
     public let id: Int64
     public let email: String
+    /// What this account may do: `member` or `admin`. See Admin.swift.
+    public let role: String
 }
 
 
 /// An address as it is stored and looked up: trimmed, and lowercased, so that
-/// one person has one account however they type it.
-private func normalised(email: String) -> String {
+/// one person has one account however they type it. Shared with the
+/// configuration, which normalises `ADMIN_EMAILS` the same way so that they
+/// match a row.
+func normalised(email: String) -> String {
     email.trimmingWhitespace().lowercased()
 }
 
@@ -82,7 +86,8 @@ func addAccountRoutes(_ app: Application, _ configuration: StarterConfiguration)
             do {
                 guard let account = try await services.value.pool.first(
                     Account.self,
-                    "insert into users (email, password, created_at) values ($1, $2, $3) returning id, email",
+                    "insert into users (email, password, created_at) values ($1, $2, $3) "
+                        + "returning id, email, role",
                     email, hash, Timestamp.now.secondsSinceEpoch) else {
                     throw HTTPError(.internalServerError)
                 }
@@ -137,7 +142,9 @@ func addAccountRoutes(_ app: Application, _ configuration: StarterConfiguration)
             .tags("auth")
 
         app.get("/me") { (jwt: JWT<AccessClaims>) async -> JSON<Account> in
-            JSON(Account(id: jwt.claims.userID ?? -1, email: jwt.claims.email))
+            // From the token, with no lookup: it carries who they are and what
+            // they may do, as of when it was issued.
+            JSON(Account(id: jwt.claims.userID ?? -1, email: jwt.claims.email, role: jwt.claims.role))
         }
             .summary("Who the access token belongs to")
             .tags("auth")

@@ -32,10 +32,10 @@ public final class Services {
             // Built at every login and every refresh, against the database as
             // it is now: an email that changed, or a role taken away, is in
             // the next access token and so gone within one token's life.
-            let row = try await pool.first(AccountRow.self, "select id, email from users where id = $1",
+            let row = try await pool.first(AccountRow.self, "select id, email, role from users where id = $1",
                                            Int64(subject) ?? -1)
             guard let row else { throw HTTPError(.unauthorized, "that account no longer exists") }
-            return AccessClaims(sub: subject, email: row.email, iat: lifetime.issuedAt,
+            return AccessClaims(sub: subject, email: row.email, role: row.role, iat: lifetime.issuedAt,
                                 exp: lifetime.expiresAt, jti: lifetime.tokenID)
         }
     }
@@ -50,7 +50,28 @@ public final class Services {
     /// hash above.
     public func warmUp() async throws {
         try await pool.migrate(starterMigrations)
+        try await promoteAdministrators()
         absentPasswordHash = try await Passwords.hash(Tokens.random())
+    }
+
+    /// Makes every account in `ADMIN_EMAILS` an administrator.
+    ///
+    /// A new database has no administrator, and a route that promotes whoever
+    /// asks is not a route, so the first one is named by the deployment. The
+    /// list is a floor and not the whole truth: it only ever promotes, because
+    /// a list that also demoted would undo an administrator's work at the next
+    /// restart. To demote one of these accounts, take it out of the list first.
+    ///
+    /// Idempotent, and every worker runs it: the `where` clause means only the
+    /// first to arrive writes anything.
+    private func promoteAdministrators() async throws {
+        let emails = configuration.adminEmails
+        guard !emails.isEmpty else { return }
+        let promoted = try await pool.execute(
+            "update users set role = 'admin' where email = any($1) and role <> 'admin'", emails)
+        if promoted > 0 {
+            AppLog.info("promoted administrators", ["accounts": "\(promoted)"])
+        }
     }
 
     /// Closes what the worker opened. `app.state`'s shutdown calls it.
@@ -64,6 +85,11 @@ public final class Services {
 public struct AccessClaims: Codable, Sendable {
     public let sub: String
     public let email: String
+    /// What the account may do, as of when the token was issued. Carried in
+    /// the token so a route can check it without a lookup, which is what
+    /// bounds how stale it can be: `accessTokenSeconds`, and less than that
+    /// when the change also ends their sessions (Admin.swift).
+    public let role: String
     public let iat: Int
     public let exp: Int
     /// The token's own id, so one can be named in a log without the token
@@ -76,4 +102,5 @@ public struct AccessClaims: Codable, Sendable {
 struct AccountRow: Decodable {
     let id: Int64
     let email: String
+    let role: String
 }

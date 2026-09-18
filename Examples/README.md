@@ -11,7 +11,7 @@ Garuda checkout this directory sits in.
 | [Auth](Sources/AuthExample/AuthApp.swift) | `swift run auth` | Sign-up, login and logout: PBKDF2 password hashes, random session tokens stored as digests, `authenticate(bearer:state:)` |
 | [Streaming](Sources/StreamingExample/StreamingApp.swift) | `swift run streaming` | Server-sent events, a CSV export written as it is produced, uploads written to disk as they arrive |
 | [Chat](Sources/ChatExample/ChatApp.swift) | `swift run chat` | Rooms over WebSockets and server-sent events, heard across every worker through `Topic` |
-| [**Starter**](STARTER.md) | `swift run starter` | A whole application: PostgreSQL, accounts with JWT access and refresh tokens, migrations, configuration from the environment, OpenAPI, health and readiness, and a deployment recipe |
+| [**Starter**](STARTER.md) | `swift run starter` | A whole application: PostgreSQL, accounts with JWT access and refresh tokens, roles and admin-only routes, input rules answered as 422, migrations, configuration from the environment, OpenAPI, health and readiness, and a deployment recipe |
 
 ```bash
 cd Examples

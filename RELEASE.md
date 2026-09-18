@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 882 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 883 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -201,6 +201,9 @@ The Python suites need `h2` and `aioquic`.
   `authenticate(jwt:)` checked, with `Policy.scope("orders:write")` for claims
   conforming to `ScopedClaims`. A handler with a rule about one row throws
   `AuthorizationError(needs:)` for the same answer.
+- `app.authenticate(jwt: Claims.self)` guards a scope with the verifier
+  `app.jwtVerifier` registered, found in the worker rather than passed in, so a
+  `Router` built on its own can require a token without being handed the keys.
 - A scope says what it can answer in the OpenAPI document: `authenticate` adds
   its 401 and its security scheme to every route in its scope, and `authorize`
   its 403. `app.describeRoutes { operation in … }` does the same for a
@@ -798,6 +801,17 @@ The Python suites need `h2` and `aioquic`.
   sessions with hashed passwords; server-sent events, a streamed CSV export and
   uploads written to disk as they arrive; and chat rooms over WebSockets and
   event streams, heard across every worker.
+- The starter application has roles: an account is a `member` or an `admin`,
+  the role rides in the access token, and `/admin/accounts` and
+  `PUT /admin/accounts/:id/role` are guarded by two lines --
+  `authenticate(jwt:)` and `authorize(jwt:, .admin)` -- with no handler
+  checking anything about who is asking. `ADMIN_EMAILS` names the first
+  administrators, since a new database has none and a route that promotes
+  whoever asks is not a route; the list only promotes, because one that
+  demoted would undo an administrator's work at each restart. A change of role
+  ends that account's sessions, so the next refresh mints the new role rather
+  than waiting out the token. The last administrator cannot be demoted, which
+  is a question for the database and answers 409.
 - The starter application states its input rules on the types, so a refused
   request names the field, and mounts its notes feature as a `Router`.
   [STARTER.md](Examples/STARTER.md) says how a feature is assembled as an

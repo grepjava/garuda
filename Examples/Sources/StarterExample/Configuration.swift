@@ -25,6 +25,10 @@ public struct StarterConfiguration: Sendable {
     public var refreshTokenDays: Int
     public var sessionDays: Int
     public var signUpsOpen: Bool
+    /// Accounts that must be administrators, made so at every start-up. A new
+    /// database has none, and a route that promotes whoever asks is not a
+    /// route; see Admin.swift.
+    public var adminEmails: [String]
     public var databasePoolSize: Int
     /// Where the OpenAPI document and Swagger UI are served, or nil for
     /// neither.
@@ -41,6 +45,7 @@ public struct StarterConfiguration: Sendable {
                 refreshTokenDays: Int = 14,
                 sessionDays: Int = 90,
                 signUpsOpen: Bool = true,
+                adminEmails: [String] = [],
                 databasePoolSize: Int = 8,
                 documentationPath: String? = "/docs") {
         self.mode = mode
@@ -50,6 +55,7 @@ public struct StarterConfiguration: Sendable {
         self.refreshTokenDays = refreshTokenDays
         self.sessionDays = sessionDays
         self.signUpsOpen = signUpsOpen
+        self.adminEmails = adminEmails
         self.databasePoolSize = databasePoolSize
         self.documentationPath = documentationPath
     }
@@ -68,6 +74,7 @@ extension StarterConfiguration {
     /// | `REFRESH_TOKEN_DAYS` | no | 14 |
     /// | `SESSION_DAYS` | no | 90 |
     /// | `SIGNUPS_OPEN` | no | true |
+    /// | `ADMIN_EMAILS` | no | none; `a@x.com,b@y.com` are made administrators |
     /// | `DATABASE_POOL_SIZE` | no | 8 |
     /// | `DOCS_PATH` | no | `/docs`, and `off` serves neither |
     public static func fromEnvironment(
@@ -110,6 +117,18 @@ extension StarterConfiguration {
         configuration.sessionDays = env.int("SESSION_DAYS", default: 90, in: 1...3_650)
         configuration.databasePoolSize = env.int("DATABASE_POOL_SIZE", default: 8, in: 1...500)
         configuration.signUpsOpen = env.bool("SIGNUPS_OPEN", default: true)
+
+        // Addresses, comma separated, normalised the way a sign-up normalises
+        // one so that they match a row. An address that cannot be one is the
+        // deployment's mistake and is reported here, not ignored at start-up
+        // where nobody would see it.
+        let admins = env.string("ADMIN_EMAILS", default: "")
+        configuration.adminEmails = admins.split(separator: ",")
+            .map { normalised(email: String($0)) }
+            .filter { !$0.isEmpty }
+        for email in configuration.adminEmails where !Validation.looksLikeEmail(email) {
+            env.problem("ADMIN_EMAILS has \"\(email)\", which is not an email address")
+        }
 
         // Settings that are each fine and wrong together.
         if configuration.accessTokenSeconds >= configuration.refreshTokenDays * 24 * 3600 {

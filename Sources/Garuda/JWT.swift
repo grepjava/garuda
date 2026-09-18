@@ -591,6 +591,27 @@ extension RouteBuilder {
     /// checked by `verifier`, and keeps it for handlers that take
     /// `JWT<Claims>`. A request without one is answered 401 with the
     /// challenge RFC 6750 describes.
+    /// `authenticate(jwt:verifier:)` with the verifier `app.jwtVerifier`
+    /// registered, found in the worker rather than passed in -- so a `Router`
+    /// built on its own can guard its routes without being handed the keys.
+    public func authenticate<Claims: Decodable>(jwt claims: Claims.Type) {
+        describeBearerScope(format: "JWT")
+        use { request, response async throws -> (any ResponseConvertible)? in
+            guard let header = request.header("authorization"), let token = parseBearer(header) else {
+                return Challenge("Bearer")
+            }
+            let verifier = try request.state((any JWTVerifying).self)
+            do {
+                let verified = try await verifier.verify(token, as: Claims.self)
+                guard response.isActive else { throw HandlerWaitError.cancelled }
+                request[context: JWTContextKey<Claims>.self] = JWT(claims: verified, token: token)
+                return nil
+            } catch let error as JWTError where error.status == .unauthorized {
+                return Challenge(#"Bearer error="invalid_token""#)
+            }
+        }
+    }
+
     public func authenticate<Claims: Decodable>(jwt claims: Claims.Type, verifier: any JWTVerifying) {
         describeBearerScope(format: "JWT")
         use { request, response async throws -> (any ResponseConvertible)? in
