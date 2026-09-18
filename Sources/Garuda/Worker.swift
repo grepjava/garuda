@@ -29,7 +29,7 @@ public var currentWorker: UnsafeMutablePointer<Worker>? {
     }
 }
 
-public struct Worker {
+public struct Worker: ~Copyable {
     public var config: ServerConfig
     public var poller: Poller
     public var table: ConnectionTable

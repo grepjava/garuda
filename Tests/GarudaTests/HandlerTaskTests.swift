@@ -140,7 +140,8 @@ struct HandlerTaskTests {
         let first = try client.get("/now")
         #expect(first.status == 200)
         #expect(first.text == "now")
-        let pool = try #require(client.worker.pointee.handlerTasks)
+        let tasks = client.worker.pointee.handlerTasks
+        let pool = try #require(tasks)
         #expect(pool.count == 1)
         #expect(pool.idleCount == 1)
 
@@ -176,7 +177,8 @@ struct HandlerTaskTests {
         let client = asyncApp().test
         try client.abandon(Array("GET /sleep/5000 HTTP/1.1\r\nHost: test\r\n\r\n".utf8), turns: 3)
         client.turn()
-        let pool = try #require(client.worker.pointee.handlerTasks)
+        let tasks = client.worker.pointee.handlerTasks
+        let pool = try #require(tasks)
         #expect(pool.count == 1)
         #expect(pool.idleCount == 1)
         #expect(client.worker.pointee.asyncOps.liveCount == 0)
@@ -198,7 +200,8 @@ struct HandlerTaskTests {
             answered += 1
         }
         #expect(answered == 5)
-        let pool = try #require(client.worker.pointee.handlerTasks)
+        let tasks = client.worker.pointee.handlerTasks
+        let pool = try #require(tasks)
         #expect(pool.count == 2)
         #expect(pool.idleCount == 2)
     }

@@ -1033,6 +1033,16 @@ The Python suites need `h2` and `aioquic`.
 
 ### Server
 
+- `Worker` is `~Copyable`. Nothing in Garuda meant to copy one, and nothing
+  did in the source, but calling a method that does not mutate it -- through
+  the pointer every handler holds, or from inside one that does -- had the
+  compiler take a copy of the whole struct first, retaining every reference
+  in it and releasing them after. Profiles of JSON answers and database
+  statements both showed it. Now the compiler cannot. On the bench box the
+  PostgreSQL workload went from 34,126 to 37,150 requests a second and the
+  streamed one from 36,005 to 39,967. Tests that handed `worker.pointee`'s
+  properties straight to `#require` take them out first: the macro wants a
+  copyable base.
 - `benchmarks/workloads.sh` measures requests that do work against axum:
   a path parameter, JSON in and out, a PostgreSQL row, and a streamed 64 KiB
   body, from two applications that answer each with the same bytes. Each

@@ -297,7 +297,8 @@ struct AsyncRouteTests {
         #expect(client.worker.pointee.handlerTasks == nil)
 
         #expect(try client.get("/hello").text == "hello")
-        let pool = try #require(client.worker.pointee.handlerTasks)
+        let tasks = client.worker.pointee.handlerTasks
+        let pool = try #require(tasks)
         #expect(pool.count == 1)
     }
 
@@ -307,7 +308,8 @@ struct AsyncRouteTests {
             #expect(try client.get("/person/1").status == 200)
             #expect(try client.get("/hello").status == 200)
         }
-        let pool = try #require(client.worker.pointee.handlerTasks)
+        let tasks = client.worker.pointee.handlerTasks
+        let pool = try #require(tasks)
         #expect(pool.count == 1)
         #expect(pool.idleCount == 1)
     }

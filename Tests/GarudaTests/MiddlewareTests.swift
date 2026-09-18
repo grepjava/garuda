@@ -219,7 +219,8 @@ struct MiddlewareTests {
         let response = try client.get("/me", headers: [("Authorization", "Bearer letmein")])
         #expect(response.status == 200)
         #expect(response.text == "hello ada")
-        let pool = try #require(client.worker.pointee.handlerTasks)
+        let tasks = client.worker.pointee.handlerTasks
+        let pool = try #require(tasks)
         #expect(pool.count == 1)
     }
 
