@@ -141,6 +141,56 @@ fi
 is "and the old ETag no longer matches" \
    "$(code -H "If-None-Match: $ETAG_BEFORE" $H/static/rewritten.txt)" "200"
 
+# --- byte ranges ---------------------------------------------------------
+# A range has to be right on every path the bytes can take out of the server:
+# read into the head for a small file, sendfile for a big one, and the write
+# buffer for TLS and HTTP/2 further down.
+range_of() { curl -sS --max-time 10 -H "Range: $1" "$2"; }
+range_head() { curl -sS -I --max-time 10 -H "Range: $1" "$2" | tr -d '\r'; }
+
+is "a range is 206"            "$(code -H 'Range: bytes=0-3' $H/static/site.css)" "206"
+is "and carries those bytes"   "$(range_of 'bytes=0-3' $H/static/site.css)" "body"
+is "a range in the middle"     "$(range_of 'bytes=7-11' $H/static/site.css)" "color"
+is "an open range is the rest" "$(range_of 'bytes=7-' $H/static/site.css)" "color: red }"
+is "a suffix is the end"       "$(range_of 'bytes=-8' $H/static/site.css)" ": red }"
+is "Content-Range says where it came from" \
+   "$(range_head 'bytes=0-3' $H/static/site.css | awk '/^[Cc]ontent-[Rr]ange:/ {print $2, $3}')" \
+   "bytes 0-3/20"
+is "Content-Length is the range" \
+   "$(range_head 'bytes=0-3' $H/static/site.css | awk '/^[Cc]ontent-[Ll]ength:/ {print $2}')" "4"
+is "Accept-Ranges is advertised" \
+   "$(curl -sS -I --max-time 10 $H/static/site.css | tr -d '\r' | awk '/^[Aa]ccept-[Rr]anges:/ {print $2}')" "bytes"
+is "a range past the end is 416" "$(code -H 'Range: bytes=9999-' $H/static/site.css)" "416"
+is "and says how big the file is" \
+   "$(range_head 'bytes=9999-' $H/static/site.css | awk '/^[Cc]ontent-[Rr]ange:/ {print $2, $3}')" "bytes */20"
+is "a range that is not one is the whole file" \
+   "$(range_of 'bytes=nonsense' $H/static/site.css)" "body { color: red }"
+is "several ranges are answered whole" \
+   "$(range_of 'bytes=0-3,7-11' $H/static/site.css)" "body { color: red }"
+is "a HEAD with a range is 206 with no body" \
+   "$(curl -sS -I --max-time 10 -o /dev/null -w '%{http_code}:%{size_download}' -H 'Range: bytes=0-3' $H/static/site.css)" \
+   "206:0"
+
+# The two paths a body takes in the clear, byte for byte against the file.
+is "a range of a file sent with its head" \
+   "$(range_of 'bytes=100-199' $H/static/inline.bin | cmp -s - <(dd if="$WORK/assets/inline.bin" bs=1 skip=100 count=100 2>/dev/null) && echo same)" "same"
+is "a range of a file sent with sendfile" \
+   "$(range_of 'bytes=1000-1999' $H/static/sendfile.bin | cmp -s - <(dd if="$WORK/assets/sendfile.bin" bs=1 skip=1000 count=1000 2>/dev/null) && echo same)" "same"
+is "a range at the very end of a big file" \
+   "$(range_of 'bytes=-16' $H/static/big.bin | cmp -s - <(tail -c 16 "$WORK/assets/big.bin") && echo same)" "same"
+
+# If-Range: the range, but only while the client's copy is still current.
+is "If-Range with the current tag is 206" \
+   "$(code -H "If-Range: $ETAG" -H 'Range: bytes=0-3' $H/static/site.css)" "206"
+is "If-Range with a stale tag is the whole file" \
+   "$(code -H 'If-Range: "nope"' -H 'Range: bytes=0-3' $H/static/site.css)" "200"
+is "and a stale If-Range sends every byte" \
+   "$(curl -sS --max-time 10 -H 'If-Range: "nope"' -H 'Range: bytes=0-3' $H/static/site.css)" "body { color: red }"
+is "a weak If-Range never matches" \
+   "$(code -H "If-Range: W/$ETAG" -H 'Range: bytes=0-3' $H/static/site.css)" "200"
+is "a 304 wins over a range" \
+   "$(code -H "If-None-Match: $ETAG" -H 'Range: bytes=0-3' $H/static/site.css)" "304"
+
 # --- refusals ------------------------------------------------------------
 # Each of these must fall through to the router, which has no route for them
 # and answers 404, rather than being served from disk.
@@ -187,6 +237,18 @@ is "a 3MB file over HTTP/2 is byte-identical" \
    "$(curl -sS -k --http2 --max-time 60 $HS/static/big.bin | cmp -s - "$WORK/assets/big.bin" && echo same)" "same"
 is "a stale If-Match over HTTP/2 is 412" \
    "$(curl -sS -k --http2 -o /dev/null -w '%{http_code}' --max-time 10 -H 'If-Match: "nope"' $HS/static/site.css)" "412"
+is "a range over TLS is 206 with the right bytes" \
+   "$(curl -sS -k --max-time 10 -H 'Range: bytes=7-11' $HS/static/site.css)" "color"
+is "a range of a big file over TLS is byte-identical" \
+   "$(curl -sS -k --max-time 60 -H 'Range: bytes=1048576-2097151' $HS/static/big.bin | cmp -s - <(dd if="$WORK/assets/big.bin" bs=1048576 skip=1 count=1 2>/dev/null) && echo same)" "same"
+is "a range over HTTP/2 is 206" \
+   "$(curl -sS -k --http2 -o /dev/null -w '%{http_code}' --max-time 10 -H 'Range: bytes=7-11' $HS/static/site.css)" "206"
+is "and carries the right bytes" \
+   "$(curl -sS -k --http2 --max-time 10 -H 'Range: bytes=7-11' $HS/static/site.css)" "color"
+is "a range of a big file over HTTP/2 is byte-identical" \
+   "$(curl -sS -k --http2 --max-time 60 -H 'Range: bytes=1048576-2097151' $HS/static/big.bin | cmp -s - <(dd if="$WORK/assets/big.bin" bs=1048576 skip=1 count=1 2>/dev/null) && echo same)" "same"
+is "a range past the end over HTTP/2 is 416" \
+   "$(curl -sS -k --http2 -o /dev/null -w '%{http_code}' --max-time 10 -H 'Range: bytes=99999999-' $HS/static/site.css)" "416"
 
 echo
 echo "  $PASS passed, $FAIL failed"

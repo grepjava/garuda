@@ -523,8 +523,8 @@ These work without any handler code, set by flags:
   TLS (`--ktls`) so static files use `sendfile` over HTTPS.
 - **ACME** certificates (`--acme-domain`), obtained and renewed with tls-alpn-01
   on the port already served.
-- **Static files** (`--static-dir`) with `sendfile` and `ETag`, and
-  pre-compressed copies (`--compress-static`).
+- **Static files** (`--static-dir`) with `sendfile`, `ETag` and byte ranges,
+  and pre-compressed copies (`--compress-static`).
 - **Rate limiting** (`--rate-limit`) counted across workers.
 - **HTTPS redirects** (`--redirect-http`), **HSTS**, **request IDs**, **W3C
   trace context**, an **access log**, **Prometheus metrics** and a **health
@@ -551,7 +551,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 904 unit tests, and the fuzz corpus
+swift test                                   # 912 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
@@ -563,7 +563,7 @@ its first argument. Most use `.build/release/garuda`; `handler-test.py`,
 
 ```bash
 bash scripts/integration-test.sh             # 36  HTTP/1.1 framing and smuggling defences
-bash scripts/static-test.sh                  # 42  --static-dir
+bash scripts/static-test.sh                  # 69  --static-dir
 bash scripts/compress-test.sh                # 76  --compress, --compress-static
 bash scripts/cache-test.sh                   # 85  --cache-size
 bash scripts/ratelimit-test.sh               # 18  --rate-limit
@@ -609,7 +609,8 @@ before 1.0 are in [COMPATIBILITY.md](COMPATIBILITY.md). Pin with
 - Reads from Redis replicas: every command goes to the master, or to the node
   that owns the slot. [CONNECTORS.md](CONNECTORS.md) has the rest of the
   driver's limits.
-- Byte ranges and directory listings for static files.
+- Directory listings for static files, and `multipart/byteranges`: a request
+  for several ranges at once is answered with the whole file.
 - QUIC session resumption and 0-RTT.
 - TLS over TCP in Swift: it is OpenSSL.
 - Windows, except through WSL 2.

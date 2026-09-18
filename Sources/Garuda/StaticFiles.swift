@@ -31,13 +31,25 @@
 // file truncated mid-response from a short body into a SIGBUS that takes the
 // worker down, so the files are read.
 //
-// Not served: byte ranges, directory indexes, and Last-Modified. Ranges and
-// indexes are absent because they are a real amount of behaviour and this is
-// an asset route, not a file server. Last-Modified is absent because ETag is
-// the stronger validator and emitting only one means a client can only ask the
-// question that can be answered exactly: a date has one-second resolution and
-// says nothing about a file that changed twice in a second.
+// A `Range` is served as 206 with `Content-Range`, on every one of those
+// paths -- the kernel copy takes an offset, and the two that read take a seek
+// first. One range: `multipart/byteranges` would mean interleaving boundary
+// text with a file being handed to the kernel, which is most of what this code
+// exists to avoid, for something almost nothing asks for. A request for
+// several is answered whole, which RFC 9110 section 14.2 allows in as many
+// words. `If-Range` holds the range to the client's copy still being current.
+//
+// Not served: Last-Modified. ETag is the stronger validator, and emitting only
+// one means a client can only ask the question that can be answered exactly: a
+// date has one-second resolution and says nothing about a file that changed
+// twice in a second.
 //===----------------------------------------------------------------------===//
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 import CAvian
 import AvianCore
@@ -338,19 +350,50 @@ extension Worker {
             return
         }
 
+        // What of it to send. A range asked for and outside the file is 416
+        // carrying the size, which is how a client learns what it should have
+        // asked for.
+        var start = 0
+        var length = size
+        var partial = false
+        switch requestedRange(slot, etag: &etag, etagLength: etagLength, size: size) {
+        case .whole:
+            break
+        case .bytes(let from, let count):
+            start = from
+            length = count
+            partial = true
+        case .unsatisfiable:
+            _ = av_close(fd)
+            logAccess(slot, status: 416)
+            dates.refresh()
+            sendBodiless(slot, status: 416, etag: &etag, etagLength: etagLength, vary: vary,
+                         unsatisfiedSize: size)
+            return
+        }
+
         let head = c.pointee.head.method == .head
-        logAccess(slot, status: 200)
+        logAccess(slot, status: partial ? 206 : 200)
         dates.refresh()
+
+        // Every path but sendfile's reads from the descriptor's own position,
+        // so a range moves it once here rather than in each of them.
+        if start > 0, !head, lseek(fd, off_t(start), SEEK_SET) < 0 {
+            _ = av_close(fd)
+            closeConnection(slot)
+            return
+        }
 
         if c.pointee.isStream || c.pointee.isH3Stream {
             startMultiplexedFile(slot, fd: fd, size: size, head: head,
                                  etag: &etag, etagLength: etagLength,
                                  coding: coding, vary: vary,
+                                 start: start, length: length, partial: partial,
                                  nameLength: nameLength, name: &name)
             return
         }
 
-        HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: 200)
+        HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: partial ? 206 : 200)
         HTTPResponseWriter.writeDate(&c.pointee.write, dates)
         c.pointee.write.write("Server: garuda\r\n")
         writeServerHeaders(slot, &c.pointee.write)
@@ -361,40 +404,49 @@ extension Worker {
             c.pointee.write.write(coding.token)
         }
         if vary { c.pointee.write.write("\r\nVary: Accept-Encoding") }
+        c.pointee.write.write("\r\nAccept-Ranges: bytes")
         c.pointee.write.write("\r\nETag: ")
         etag.withUnsafeBufferPointer { c.pointee.write.write($0.baseAddress!, etagLength) }
         c.pointee.write.write("\r\n")
-        HTTPResponseWriter.writeContentLength(&c.pointee.write, size)
+        if partial {
+            var line = [UInt8](repeating: 0, count: 80)
+            var count = 0
+            count += writeContentRange(start: start, length: length, size: size, into: &line, at: count)
+            c.pointee.write.write("Content-Range: ")
+            line.withUnsafeBufferPointer { c.pointee.write.write($0.baseAddress!, count) }
+            c.pointee.write.write("\r\n")
+        }
+        HTTPResponseWriter.writeContentLength(&c.pointee.write, length)
         HTTPResponseWriter.writeConnection(&c.pointee.write,
                                            keepAlive: c.pointee.flags.contains(.keepAlive))
         HTTPResponseWriter.endHead(&c.pointee.write)
 
-        if head || size == 0 {
+        if head || length == 0 {
             _ = av_close(fd)
-        } else if size <= Worker.inlineFileBytes {
+        } else if length <= Worker.inlineFileBytes {
             // Small enough to go out with its head in one write. Handing a
             // kilobyte of CSS to sendfile costs a second system call for the
             // body -- measured at a seventh of the worker's time on small
             // assets -- to save a copy the size of a page.
-            c.pointee.write.reserve(size)
+            c.pointee.write.reserve(length)
             var got = 0
-            while got < size {
-                let r = av_read(fd, c.pointee.write.writePointer + got, size - got)
+            while got < length {
+                let r = av_read(fd, c.pointee.write.writePointer + got, length - got)
                 if r <= 0 { break }
                 got += r
             }
             _ = av_close(fd)
-            if got < size {
+            if got < length {
                 // Truncated since it was opened, after a Content-Length was
                 // promised: there is no honest way to finish the message.
                 closeConnection(slot)
                 return
             }
-            c.pointee.write.advanceWriter(size)
+            c.pointee.write.advanceWriter(length)
         } else {
             c.pointee.fileFD = fd
-            c.pointee.fileOffset = 0
-            c.pointee.fileRemaining = size
+            c.pointee.fileOffset = start
+            c.pointee.fileRemaining = length
         }
         c.pointee.state = .writing
         _ = flush(slot)
@@ -408,11 +460,12 @@ extension Worker {
     /// is the whole message, or `412 Precondition Failed`, which has nothing
     /// to send.
     private mutating func sendBodiless(_ slot: Int, status: Int, etag: inout [UInt8],
-                                       etagLength: Int, vary: Bool) {
+                                       etagLength: Int, vary: Bool,
+                                       unsatisfiedSize: Int? = nil) {
         let c = table[slot]
         if c.pointee.isStream || c.pointee.isH3Stream {
             sendBodilessOnStream(slot, status: status, etag: &etag, etagLength: etagLength,
-                                 vary: vary)
+                                 vary: vary, unsatisfiedSize: unsatisfiedSize)
             return
         }
         HTTPResponseWriter.writeStatusLine(&c.pointee.write, status: status)
@@ -425,6 +478,15 @@ extension Worker {
             c.pointee.write.write("\r\n")
             if vary { c.pointee.write.write("Vary: Accept-Encoding\r\n") }
         } else {
+            // 416 says how big the thing is, which is the one fact that lets
+            // a client ask again for something that exists.
+            if let unsatisfiedSize {
+                var line = [UInt8](repeating: 0, count: 48)
+                let count = writeUnsatisfiedRange(size: unsatisfiedSize, into: &line)
+                c.pointee.write.write("Content-Range: ")
+                line.withUnsafeBufferPointer { c.pointee.write.write($0.baseAddress!, count) }
+                c.pointee.write.write("\r\nAccept-Ranges: bytes\r\n")
+            }
             // Anything but a 304 has a body to frame, empty as it is.
             HTTPResponseWriter.writeContentLength(&c.pointee.write, 0)
         }
@@ -438,7 +500,8 @@ extension Worker {
     /// The same on a multiplexed stream, where the end of the stream frames
     /// the empty body.
     private mutating func sendBodilessOnStream(_ slot: Int, status: Int, etag: inout [UInt8],
-                                               etagLength: Int, vary: Bool) {
+                                               etagLength: Int, vary: Bool,
+                                               unsatisfiedSize: Int? = nil) {
         let c = table[slot]
         let parent = Int(c.pointee.parentSlot)
         var block = ByteBuffer()
@@ -456,6 +519,14 @@ extension Worker {
                     encodeStaticH3(h3, "etag", $0.baseAddress!, etagLength, into: &block)
                 }
                 if vary { encodeStaticH3(h3, "vary", "accept-encoding", into: &block) }
+            }
+            if let unsatisfiedSize {
+                var line = [UInt8](repeating: 0, count: 48)
+                let count = writeUnsatisfiedRange(size: unsatisfiedSize, into: &line)
+                line.withUnsafeBufferPointer {
+                    encodeStaticH3(h3, "content-range", $0.baseAddress!, count, into: &block)
+                }
+                encodeStaticH3(h3, "accept-ranges", "bytes", into: &block)
             }
             encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
             encodeStaticH3(h3, "server", "garuda", into: &block)
@@ -475,6 +546,14 @@ extension Worker {
                 encodeStatic(h2, "etag", $0.baseAddress!, etagLength, into: &block)
             }
             if vary { encodeStatic(h2, "vary", "accept-encoding", into: &block) }
+        }
+        if let unsatisfiedSize {
+            var line = [UInt8](repeating: 0, count: 48)
+            let count = writeUnsatisfiedRange(size: unsatisfiedSize, into: &line)
+            line.withUnsafeBufferPointer {
+                encodeStatic(h2, "content-range", $0.baseAddress!, count, into: &block)
+            }
+            encodeStatic(h2, "accept-ranges", "bytes", into: &block)
         }
         encodeStatic(h2, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
         encodeStatic(h2, "server", "garuda", into: &block)
@@ -519,14 +598,21 @@ extension Worker {
                                                head: Bool,
                                                etag: inout [UInt8], etagLength: Int,
                                                coding: ContentCoding, vary: Bool,
+                                               start: Int, length count: Int, partial: Bool,
                                                nameLength: Int, name: inout [UInt8]) {
         let c = table[slot]
         let type = contentType(nameLength: nameLength, name: &name)
         var length = [UInt8](repeating: 0, count: 24)
         var lengthCount = 0
-        lengthCount = writeDecimal(size, into: &length)
+        lengthCount = writeDecimal(count, into: &length)
+        var contentRange = [UInt8](repeating: 0, count: 80)
+        var contentRangeCount = 0
+        if partial {
+            contentRangeCount = writeContentRange(start: start, length: count, size: size,
+                                                  into: &contentRange, at: 0)
+        }
 
-        let empty = head || size == 0
+        let empty = head || count == 0
         var block = ByteBuffer()
         defer { block.destroy() }
 
@@ -538,9 +624,16 @@ extension Worker {
                 return
             }
             h3.encoder.begin(into: &block)
-            h3.encoder.encodeStatus(200, into: &block)
+            h3.encoder.encodeStatus(partial ? 206 : 200, into: &block)
             encodeStaticH3(h3, "content-type", type.utf8Start, type.utf8CodeUnitCount,
                            into: &block)
+            encodeStaticH3(h3, "accept-ranges", "bytes", into: &block)
+            if partial {
+                contentRange.withUnsafeBufferPointer {
+                    encodeStaticH3(h3, "content-range", $0.baseAddress!, contentRangeCount,
+                                   into: &block)
+                }
+            }
             if coding != .identity {
                 encodeStaticH3(h3, "content-encoding", coding.token, into: &block)
             }
@@ -562,9 +655,16 @@ extension Worker {
                 closeConnection(slot)
                 return
             }
-            h2.encoder.encodeStatus(200, into: &block)
+            h2.encoder.encodeStatus(partial ? 206 : 200, into: &block)
             encodeStatic(h2, "content-type", type.utf8Start, type.utf8CodeUnitCount,
                          into: &block)
+            encodeStatic(h2, "accept-ranges", "bytes", into: &block)
+            if partial {
+                contentRange.withUnsafeBufferPointer {
+                    encodeStatic(h2, "content-range", $0.baseAddress!, contentRangeCount,
+                                 into: &block)
+                }
+            }
             if coding != .identity {
                 encodeStatic(h2, "content-encoding", coding.token, into: &block)
             }
@@ -603,10 +703,10 @@ extension Worker {
         // The declared length, which is what tells the stream flusher whether
         // the body it sent matched the promise.
         c.pointee.state = .writing
-        c.pointee.responseRemaining = size
+        c.pointee.responseRemaining = count
         c.pointee.fileFD = fd
-        c.pointee.fileOffset = 0
-        c.pointee.fileRemaining = size
+        c.pointee.fileOffset = start
+        c.pointee.fileRemaining = count
         _ = flush(slot)
     }
 
@@ -682,6 +782,48 @@ extension Worker {
         return present
     }
 
+    /// What the request's `Range` asks for, once `If-Range` has had its say.
+    ///
+    /// `If-Range` is the client saying "the range, but only if the file is
+    /// still the one I have part of". A validator that does not match is not
+    /// a failure: the answer is the whole file, which is what the client
+    /// needs if its copy is stale. A date there never matches, because this
+    /// serves no `Last-Modified` to have been given one -- the comparison has
+    /// to be exact, and a date is not.
+    private func requestedRange(_ slot: Int, etag: inout [UInt8], etagLength: Int,
+                                size: Int) -> StaticRange {
+        let c = table[slot]
+        let base = c.pointee.headBase()
+        var range: StaticRange = .whole
+        var ifRange: (offset: Int, length: Int)? = nil
+        var i = 0
+        while i < c.pointee.head.headerCount {
+            let h = headers[i]
+            i += 1
+            if h.name.length == 5, equalsLowercased(base + Int(h.name.offset), 5, "range") {
+                range = parseByteRange(base + Int(h.value.offset), Int(h.value.length), size: size)
+            } else if h.name.length == 8, equalsLowercased(base + Int(h.name.offset), 8, "if-range") {
+                ifRange = (Int(h.value.offset), Int(h.value.length))
+            }
+        }
+        guard case .bytes = range else { return range }
+        guard let ifRange else { return range }
+        // A strong comparison, and nothing else will do: a weak tag says two
+        // representations are equivalent, not that their bytes line up.
+        let value = base + ifRange.offset
+        var start = 0
+        var end = ifRange.length
+        while start < end, value[start] == UInt8(ascii: " ") { start += 1 }
+        while end > start, value[end - 1] == UInt8(ascii: " ") { end -= 1 }
+        guard end - start == etagLength else { return .whole }
+        var k = 0
+        while k < etagLength {
+            if value[start + k] != etag[k] { return .whole }
+            k += 1
+        }
+        return range
+    }
+
     /// Whether `If-None-Match` names the entity we were about to send.
     ///
     /// `*` matches anything that exists, per RFC 9110. A list of tags is
@@ -730,6 +872,108 @@ extension Worker {
         }
         return false
     }
+}
+
+/// What a `Range` header asks of a representation of a known size.
+enum StaticRange: Equatable {
+    /// No range to serve: the header is absent, asks for something this does
+    /// not do, or is not a range at all. RFC 9110 section 14.2 says an
+    /// unsatisfiable *syntax* is ignored, and the whole thing is sent.
+    case whole
+    /// The bytes from `start`, `length` of them.
+    case bytes(start: Int, length: Int)
+    /// Inside the syntax and outside the file: 416.
+    case unsatisfiable
+}
+
+/// Reads `bytes=…` against a representation of `size` bytes.
+///
+/// One range only. A request for several is answered whole, which section
+/// 14.2 allows in as many words ("A server MAY ignore the Range header
+/// field"), and is the honest trade here: `multipart/byteranges` means
+/// interleaving boundaries with the file as it is pumped, in the path that
+/// exists to hand a descriptor to the kernel and stay out of the way, for a
+/// thing almost nothing asks for.
+func parseByteRange(_ value: UnsafePointer<UInt8>, _ count: Int, size: Int) -> StaticRange {
+    var i = 0
+    while i < count, value[i] == UInt8(ascii: " ") || value[i] == UInt8(ascii: "\t") { i += 1 }
+    // Only `bytes`. Another unit is one this does not serve, and the
+    // representation goes out whole.
+    guard count - i >= 6, equalsLowercased(value + i, 5, "bytes"),
+          value[i + 5] == UInt8(ascii: "=") else { return .whole }
+    i += 6
+    while i < count, value[i] == UInt8(ascii: " ") { i += 1 }
+
+    func digits() -> (value: Int, count: Int) {
+        var out = 0
+        var seen = 0
+        while i < count, value[i] >= UInt8(ascii: "0"), value[i] <= UInt8(ascii: "9") {
+            // Enough for any file, and short of anything that could overflow.
+            if seen < 18 { out = out * 10 + Int(value[i] - UInt8(ascii: "0")) }
+            seen += 1
+            i += 1
+        }
+        return (seen > 18 ? Int.max : out, seen)
+    }
+
+    let first = digits()
+    guard i < count, value[i] == UInt8(ascii: "-") else { return .whole }
+    i += 1
+    let last = digits()
+    while i < count, value[i] == UInt8(ascii: " ") || value[i] == UInt8(ascii: "\t") { i += 1 }
+    // Anything left is a second range, or rubbish. Either way, whole.
+    guard i == count else { return .whole }
+
+    if first.count == 0 {
+        // `-N`: the last N bytes. `bytes=-` names neither end, so it is not a
+        // range at all rather than one that cannot be served.
+        guard last.count > 0 else { return .whole }
+        guard last.value > 0, size > 0 else { return .unsatisfiable }
+        let length = min(last.value, size)
+        return .bytes(start: size - length, length: length)
+    }
+    guard first.value < size else { return .unsatisfiable }
+    let end = last.count == 0 ? size - 1 : min(last.value, size - 1)
+    // `500-499` is not a range. Not satisfiable and not sensible: ignored.
+    guard end >= first.value else { return .whole }
+    return .bytes(start: first.value, length: end - first.value + 1)
+}
+
+/// The same, for a test that has the header as text.
+func parseByteRange(_ text: String, size: Int) -> StaticRange {
+    var bytes = Array(text.utf8)
+    return bytes.withUnsafeMutableBufferPointer { parseByteRange($0.baseAddress!, $0.count, size: size) }
+}
+
+/// `bytes <start>-<end>/<size>`, the `Content-Range` of a 206.
+func writeContentRange(start: Int, length: Int, size: Int,
+                       into out: inout [UInt8], at offset: Int) -> Int {
+    var at = offset
+    for byte in "bytes ".utf8 { out[at] = byte; at += 1 }
+    at += writeDecimal(start, into: &out, at: at)
+    out[at] = UInt8(ascii: "-"); at += 1
+    at += writeDecimal(start + length - 1, into: &out, at: at)
+    out[at] = UInt8(ascii: "/"); at += 1
+    at += writeDecimal(size, into: &out, at: at)
+    return at - offset
+}
+
+/// `bytes */<size>`, the `Content-Range` of a 416: what the client asked
+/// about, and how big it actually is.
+func writeUnsatisfiedRange(size: Int, into out: inout [UInt8]) -> Int {
+    var at = 0
+    for byte in "bytes */".utf8 { out[at] = byte; at += 1 }
+    at += writeDecimal(size, into: &out, at: at)
+    return at
+}
+
+/// Base-ten at `at`. Returns how many bytes were written.
+private func writeDecimal(_ value: Int, into out: inout [UInt8], at: Int) -> Int {
+    var digits = [UInt8](repeating: 0, count: 24)
+    let count = writeDecimal(value, into: &digits)
+    var k = 0
+    while k < count { out[at + k] = digits[k]; k += 1 }
+    return count
 }
 
 /// Base-ten, into the front of `out`. Returns how many bytes were written.

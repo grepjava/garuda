@@ -324,6 +324,34 @@ async def static_files():
             is_("a 3MB file arrives whole", len(body), len(large))
             is_("a 3MB file is byte-identical", body, large)
 
+            # Ranges, which HTTP/3 encodes its own headers for.
+            status, headers, body = await client.request(
+                "GET", "/static/site.css", headers=((b"range", b"bytes=7-11"),))
+            is_("a range is 206 over HTTP/3", status, 206)
+            is_("and carries those bytes", body, small[7:12])
+            is_("with the Content-Range that says so", headers.get(b"content-range"),
+                b"bytes 7-11/%d" % len(small))
+            is_("and a Content-Length of the range", headers.get(b"content-length"), b"5")
+            check("ranges are advertised", headers.get(b"accept-ranges") == b"bytes", headers)
+
+            status, headers, _ = await client.request(
+                "GET", "/static/site.css", headers=((b"range", b"bytes=99999-"),))
+            is_("a range past the end is 416", status, 416)
+            is_("and says how big the file is", headers.get(b"content-range"),
+                b"bytes */%d" % len(small))
+
+            status, _, body = await client.collect(
+                client.start("GET", "/static/big.bin",
+                             headers=((b"range", b"bytes=1000000-1999999"),)),
+                timeout=60.0)
+            is_("a range of a 3MB file is byte-identical", body, large[1000000:2000000])
+
+            status, _, body = await client.request(
+                "GET", "/static/site.css",
+                headers=((b"if-range", b'"nope"'), (b"range", b"bytes=0-3")))
+            is_("a stale If-Range sends the whole file", status, 200)
+            is_("every byte of it", body, small)
+
             status, _, _ = await client.request("GET", "/static/../etc/passwd")
             is_("dot-dot does not escape", status, 404)
             status, _, _ = await client.request("GET", "/static/missing.css")

@@ -344,7 +344,13 @@ garuda --static-dir /static=/srv/app/static --static-dir /media=/srv/app/media
   `..`, `%2e%2e` and symlinks that leave the tree are refused.
 - The `ETag` comes from the file's size and modification time.
   `If-None-Match` gets `304` and `If-Match` gets `412`. There is no
-  `Last-Modified`, no byte ranges and no directory index.
+  `Last-Modified`: an `ETag` answers exactly, and a date to the second cannot.
+- `Range` is served: `206` with `Content-Range`, `416` with the file's size
+  when it asks for what is not there, and `Accept-Ranges: bytes` on every
+  answer. One range per request -- a request for several gets the whole file,
+  as RFC 9110 section 14.2 allows. `If-Range` sends the range only while the
+  client's copy is current, and the whole file otherwise.
+- There is no directory index.
 - On plaintext HTTP/1.1 the file goes out with `sendfile(2)`. Over TLS (without
   `--ktls`), HTTP/2 and HTTP/3 it is read and then encrypted or framed.
 

@@ -21,10 +21,10 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 904 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 912 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
-bash scripts/static-test.sh            # 42
+bash scripts/static-test.sh            # 69
 bash scripts/compress-test.sh          # 76, and garuda-conformance
 bash scripts/cache-test.sh             # 85, runs garuda-conformance
 bash scripts/ratelimit-test.sh         # 18
@@ -37,7 +37,7 @@ bash scripts/drain-test.sh             # 14
 bash scripts/reload-test.sh            # 7
 python3 scripts/feature-test.py        # 62
 python3 scripts/http2-test.py          # 54
-python3 scripts/http3-test.py          # 53
+python3 scripts/http3-test.py          # 63
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 143, runs garuda-conformance
 python3 scripts/websocket-test.py      # 104, runs garuda-conformance
@@ -850,6 +850,16 @@ The Python suites need `h2` and `aioquic`.
 
 ### Server
 
+- `--static-dir` serves byte ranges. `Range` is answered 206 with
+  `Content-Range` on HTTP/1.1, TLS, HTTP/2 and HTTP/3 alike,
+  `Accept-Ranges: bytes` goes on every answer, and a range outside the file is
+  416 carrying the file's size. The kernel copy takes an offset and the paths
+  that read take a seek first, so a range costs what the whole file costs. One
+  range per request: a request for several is answered whole, which RFC 9110
+  section 14.2 allows, rather than interleaving `multipart/byteranges`
+  boundaries with a file being handed to `sendfile`. `If-Range` sends the range
+  only while the client's copy is still current, and the whole file when it is
+  not.
 - `--compress` compresses handler responses, whoever answered them, with the
   coding the client rates highest. A whole body states its compressed length,
   and a streamed one is compressed as it is written, flushed with each write.
