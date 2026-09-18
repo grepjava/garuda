@@ -271,6 +271,18 @@ struct StarterExampleTests {
         #expect(document.contains("Needs an administrator"))
     }
 
+    /// What the application says about itself before it serves anything: a
+    /// route asking for a path parameter its pattern has not got, or for a
+    /// `State` nothing registers, is a mistake in the program. It needs no
+    /// database, so it runs whether or not there is one.
+    @Test func theRoutesCanAllBeServed() throws {
+        var configuration = StarterConfiguration(mode: .development,
+                                                 databaseURL: "postgres://x@127.0.0.1:5432/x?sslmode=disable")
+        configuration.signingKeyPEM = try JWTKey.generate(.ES256, keyID: "access").privatePEM
+        #expect(starterApp(configuration).problems().isEmpty,
+                "\(starterApp(configuration).problems())")
+    }
+
     @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))
     func healthReadinessAndDocumentation() throws {
         try emptySchema()

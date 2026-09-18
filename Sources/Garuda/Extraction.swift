@@ -20,6 +20,14 @@ public protocol RequestExtractor {
     static func extract(from request: borrowing Request, parameter: inout Int) throws -> Self
 }
 
+/// An extractor that claims a path parameter, so that a handler asking for
+/// more of them than its pattern declares is found before the server starts
+/// rather than by the request that asks (Application.swift, `problems()`).
+///
+/// `Path<T>?` does not conform, for the reason `State<T>?` does not: an
+/// optional extractor is nil where the one it wraps would have refused.
+protocol PathClaiming {}
+
 /// A path parameter, in the order the pattern declares it: the first `Path` in
 /// a handler's parameters takes `:id` in `/user/:id`, the second the next one.
 /// Percent-escapes are undone before the value is made.
@@ -138,6 +146,8 @@ func percentDecoded(_ text: String) -> String {
     }
     return String(decoding: out, as: UTF8.self)
 }
+
+extension Path: PathClaiming {}
 
 extension Path: Sendable where Value: Sendable {}
 extension Query: Sendable where Value: Sendable {}

@@ -16,6 +16,18 @@
 
 import AvianCore
 
+/// An extractor that needs something `app.state` built, so that a route
+/// asking for what nothing registers is found before the server starts
+/// rather than by the request that asks (Application.swift, `problems()`).
+///
+/// `State<T>?` and `Result<State<T>, _>` deliberately do not conform: an
+/// optional extractor is nil where the one it wraps would have refused, which
+/// is a route saying it can do without.
+protocol StateRequiring {
+    /// The type the route asks `app.state` for.
+    static var requiredStateType: Any.Type { get }
+}
+
 /// A service the worker built at start-up, asked for by its type.
 public struct State<Value>: RequestExtractor {
     public var value: Value
@@ -28,6 +40,10 @@ public struct State<Value>: RequestExtractor {
                                parameter: inout Int) throws -> Self {
         State(try request.state(Value.self))
     }
+}
+
+extension State: StateRequiring {
+    static var requiredStateType: Any.Type { Value.self }
 }
 
 extension Request {
@@ -51,12 +67,17 @@ extension Application {
     /// accepts anything, and hands it to handlers that ask for
     /// `State<Value>`. `shutdown` runs when the worker's loop has ended.
     ///
-    /// One value per type: registering the same type twice replaces what the
-    /// first factory would have built.
+    /// One value per type, and registering the same type twice is refused.
+    /// It used to replace the first, which meant both factories ran in every
+    /// worker: two pools opened, one of them reachable by nobody and shut
+    /// down never, while the other was shut down twice. A second registration
+    /// is a mistake in every reading, so it is one here.
     public func state<Value>(_ make: @escaping (_ worker: Int) throws -> Value,
                              shutdown: ((Value) -> Void)? = nil) {
         precondition(compiled == nil, "state added after the application was compiled")
         let key = ObjectIdentifier(Value.self)
+        precondition(!stateFactories.contains { $0.0 == key },
+                     "app.state registered \(Value.self) twice; one type is one value")
         stateFactories.append((key, { index in try make(index) }))
         if let shutdown {
             stateShutdowns.append((key, { stored in

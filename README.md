@@ -181,7 +181,12 @@ app.group("/api") {
 }
 ```
 
-- `app.state` builds a value once in each worker process, after the fork.
+- `app.state` builds a value once in each worker process, after the fork. One
+  value per type; registering a type twice is refused.
+- `app.problems()` is what the routes cannot do, found before serving: a
+  handler taking more `Path` extractors than its pattern has parameters, or
+  asking for a `State<T>` nothing registered. `run()` prints them and exits 2
+  instead of starting, and a test can assert `app.problems().isEmpty`.
 - `app.use` runs before every route in its scope, whether it is called before
   or after the routes. It returns `nil` to carry on or an answer to send
   instead, and can be async. `response.onSend` sees and changes the final
@@ -554,7 +559,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 912 unit tests, and the fuzz corpus
+swift test                                   # 920 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

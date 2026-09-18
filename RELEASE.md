@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 912 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 920 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -138,7 +138,20 @@ The Python suites need `h2` and `aioquic`.
   it carries, in the OpenAPI document.
 - `app.state { worker in … }` builds a value once in each worker, after the
   fork and before it reports ready. A factory that throws stops that worker's
-  start-up. An optional `shutdown:` tears the value down.
+  start-up. An optional `shutdown:` tears the value down. Registering the same
+  type twice is refused: it used to run both factories in every worker, so one
+  value was reachable by nobody and shut down never, while the other was shut
+  down twice.
+- `app.problems()` says what about the routes cannot work, before anything is
+  served: a handler taking more `Path` extractors than its pattern has
+  parameters, and a handler asking for a `State<T>` no `app.state` registered.
+  Both used to be a 500 for whoever sent the first request that reached them.
+  `run()` prints every problem and exits 2 rather than serving, and a test can
+  ask for them without starting anything -- `#expect(app.problems().isEmpty)`,
+  which the starter does. An optional extractor asks for nothing, since `E?`
+  is nil where `E` would have refused, and a middleware's
+  `request.state(T.self)` is a call rather than a declaration and cannot be
+  checked this way.
 - `Multipart` gives each part's name, filename, content type and bytes, up to
   1,000 parts.
 

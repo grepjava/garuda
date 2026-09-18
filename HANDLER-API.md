@@ -116,6 +116,23 @@ keep two different failures apart: a body that is not the type means the client
 is building its request wrongly, and a body that is the type with a value this
 application will not take means the client is fine and the value is wrong.
 
+### A route that cannot work is found before serving
+
+`Path` takes path parameters by position, and `State<T>` takes what `app.state`
+built. Both can be asked for and not be there, and both used to answer 500 to
+whoever sent the request that found out. Neither is a runtime condition: the
+handler's parameter types and the route's pattern are known when the route is
+registered, and the state factories are known before the first fork.
+
+`app.problems()` compares them and `run()` refuses to serve, printing every
+problem at once rather than one per restart. It is a list rather than a throw
+so that a test can assert on it, and it is on `Application` rather than inside
+`compile()` so that asking costs nothing and answers the same thing twice.
+
+What it will not find is what is not declared: a middleware calling
+`request.state(T.self)` is a call in a closure, and an optional extractor is a
+route saying it can do without. Both keep the answer they had.
+
 ### Authorization is a rule with a name
 
 A `Policy` is `(Value) -> Bool` and a name for what it requires, and `authorize`

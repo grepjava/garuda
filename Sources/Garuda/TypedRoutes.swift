@@ -164,6 +164,7 @@ extension RouteBuilder {
     ) -> OpenAPIOperation {
         let operation = OpenAPIOperation(method, pattern)
         repeat operation.describeExtractor((each E).self)
+        repeat operation.noteRequirements((each E).self)
         operation.describeResponse(R.self)
         document(operation)
         return operation

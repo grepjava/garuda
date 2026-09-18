@@ -96,6 +96,16 @@ public final class OpenAPIOperation: @unchecked Sendable {
     var responses: [(code: String, make: Make)] = []
     var security: [OpenAPISecurityScheme] = []
 
+    /// What the handler's extractors need of the application, for the check
+    /// `Application.problems()` runs before serving. Not in the document:
+    /// this is about the route being able to work at all, and the operation
+    /// is simply where a route's facts already gather.
+    ///
+    /// How many path parameters the handler claims by position, and the
+    /// `app.state` types it asks for.
+    var claimedPathParameters = 0
+    var requiredState: [Any.Type] = []
+
     public init(_ method: HTTPMethod, _ pattern: String) {
         self.method = method
         self.pattern = pattern
@@ -273,6 +283,14 @@ public final class OpenAPIOperation: @unchecked Sendable {
     /// Adds what `type` says about itself, when it says anything.
     func describeExtractor<E: RequestExtractor>(_ type: E.Type) {
         (E.self as? any OpenAPIExtractorDescribing.Type)?.describe(self)
+    }
+
+    /// Records what `type` needs from the application, for the start-up check.
+    func noteRequirements<E: RequestExtractor>(_ type: E.Type) {
+        if E.self is any PathClaiming.Type { claimedPathParameters += 1 }
+        if let state = E.self as? any StateRequiring.Type {
+            requiredState.append(state.requiredStateType)
+        }
     }
 
     func describeResponse<R: ResponseConvertible>(_ type: R.Type) {
@@ -551,7 +569,7 @@ func openAPIPath(_ pattern: String) -> (String, [String]) {
     return (path.isEmpty ? "/" : path, names)
 }
 
-private func openAPIMethodName(_ method: HTTPMethod) -> String? {
+func openAPIMethodName(_ method: HTTPMethod) -> String? {
     switch method {
     case .get: return "get"
     case .head: return "head"

@@ -255,9 +255,62 @@ public final class Application: RouteBuilder {
     }
 
     func serve(_ config: ServerConfig) -> Int32 {
+        // Before a socket is opened: a route that cannot work is a mistake in
+        // the program, and the request that would have found it is a 500 for
+        // somebody who did nothing wrong.
+        let found = problems()
+        if !found.isEmpty {
+            for problem in found {
+                Log.error { line in
+                    line.str("the routes cannot work: ")
+                    problem.withCString { line.cstr($0) }
+                }
+            }
+            return 2
+        }
         GarudaRuntime.application = compile()
         defer { GarudaRuntime.application = nil }
         return GarudaRuntime.run(config: config)
+    }
+
+    /// What is wrong with the routes, in the order they were registered, and
+    /// empty when there is nothing. `run` prints these and exits 2 rather
+    /// than serving; a test can ask for them without starting anything:
+    ///
+    /// ```
+    /// #expect(app.problems().isEmpty)
+    /// ```
+    ///
+    /// What it finds:
+    ///
+    /// - A handler taking more `Path` extractors than its pattern has
+    ///   parameters. Those are taken by position, so the extra one has
+    ///   nothing to take and every request to that route is a 500.
+    /// - A handler asking for a `State<T>` no `app.state` registered, which
+    ///   is a 500 for the same reason.
+    ///
+    /// What it cannot find: a middleware's `request.state(T.self)`, which is
+    /// a call rather than a declaration, and an optional extractor, which is
+    /// a route saying it can do without.
+    public func problems() -> [String] {
+        var found: [String] = []
+        let registered = Set(stateFactories.map { $0.0 })
+        for index in routes.handlers.indices {
+            guard let operation = routes.operations[index],
+                  let pattern = routes.patterns[index],
+                  let method = routes.methods[index] else { continue }
+            let (_, names) = openAPIPath(pattern)
+            let route = (openAPIMethodName(method) ?? "?").uppercased() + " " + pattern
+            if operation.claimedPathParameters > names.count {
+                let takes = operation.claimedPathParameters
+                found.append("\(route) takes \(takes) Path extractor\(takes == 1 ? "" : "s") and its "
+                                 + "pattern has \(names.count) parameter\(names.count == 1 ? "" : "s")")
+            }
+            for type in operation.requiredState where !registered.contains(ObjectIdentifier(type)) {
+                found.append("\(route) asks for State<\(type)> and no app.state registered one")
+            }
+        }
+        return found
     }
 
     // MARK: Testing
