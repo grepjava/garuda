@@ -350,7 +350,14 @@ high-water mark (512 KiB). Then it waits on the worker until the backlog falls
 to the low-water mark (128 KiB). The backlog is the connection or stream write
 buffer, plus on HTTP/3 the bytes QUIC has not had acknowledged.
 
-- A client that disconnects ends the wait with `HandlerWaitError.cancelled`.
+Every producer waits, not only the first to arrive at a full backlog. Bytes
+are queued and then waited on, so each producer can carry the backlog past the
+mark by its own last write and no further: with one producer the ceiling is
+the mark plus that write, and with several it is the mark plus one write each.
+The mark is where writers start waiting rather than a ceiling on the buffer.
+
+- A client that disconnects ends the wait with `HandlerWaitError.cancelled`,
+  and ends it for every producer waiting, not one of them.
 - A client that stops reading is closed after `--request-timeout`.
 - A body that passes its `Content-Length` is ended there. One that ends short,
   or a handler that throws after the head was sent, closes the HTTP/1.1
@@ -413,7 +420,8 @@ and `WebSocketStreams.swift` for what differs on a stream).
   socket and TCP slows the sender. On a stream, bytes stop being credited back,
   so flow control stops that one stream and leaves the rest of the connection
   alone. A send waits while more than `writeHighWaterMark` is queued for a slow
-  reader.
+  reader, and every concurrent sender waits, so a peer that reads nothing
+  cannot be flooded into the server's memory by a second task.
 - **Deflate** contexts are made on the first compressed message in each
   direction, and messages under 64 bytes go out uncompressed.
 

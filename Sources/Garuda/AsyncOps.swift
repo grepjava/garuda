@@ -375,8 +375,8 @@ extension Worker {
         } else if c.pointee.contKind == .task {
             cancelTask(slot)
         }
-        // A writer waiting for room in a response that is over.
-        c.pointee.writerWake.take()?.resume(returning: false)
+        // The writers waiting for room in a response that is over.
+        wakeWriters(slot, drained: false)
         c.pointee.contOp = -1
         c.pointee.contState = .none
         c.pointee.contKind = .none

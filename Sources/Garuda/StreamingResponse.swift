@@ -28,11 +28,19 @@
 // A write queues its bytes and returns, unless what is still waiting to go
 // out has passed `ServerConfig.writeHighWaterMark`. Then it waits, on the
 // worker, until that has fallen to `writeLowWaterMark`: a client that reads slowly slows
-// the handler writing to it and nothing else, and a producer never buffers
-// more than the mark ahead of the network. A client that goes away ends the
-// wait with `HandlerWaitError.cancelled`, as it ends every other wait on the
-// engine; a client that stops reading altogether is closed once it has been
-// silent for `--request-timeout`.
+// the handler writing to it and nothing else. Every producer waits, not only
+// the first to arrive. A client that goes away ends the wait with
+// `HandlerWaitError.cancelled`, as it ends every other wait on the engine; a
+// client that stops reading altogether is closed once it has been silent for
+// `--request-timeout`.
+//
+// What that bounds, exactly: a write is queued and then waited on, so each
+// producer can carry the backlog past the mark by its own last write, and no
+// further -- it is parked before it can queue another. With one producer the
+// ceiling is the mark plus that write; with several it is the mark plus one
+// write each. The mark is where writers start waiting, not a ceiling on the
+// buffer, and a handler that means to bound its memory exactly should write
+// in pieces it has chosen rather than in whatever size a row happens to be.
 //===----------------------------------------------------------------------===//
 
 import CAvian
@@ -43,9 +51,9 @@ import AvianHTTP
 ///
 /// Belongs to the task that runs the handler, and to the child tasks it
 /// starts, which run on the same worker. Writers do not have to take turns:
-/// bytes go out in the order the writes were made. Only one writer at a time
-/// waits for the backlog to drain, though; another that finds it waiting
-/// returns without waiting, its bytes already queued behind the first's.
+/// bytes go out in the order the writes were made. Every one of them waits
+/// while the client is behind, though -- a producer let through because
+/// another was already waiting would be free to queue for ever.
 public final class ResponseBodyWriter: @unchecked Sendable {
     let worker: UnsafeMutablePointer<Worker>
     let slot: Int
@@ -148,11 +156,11 @@ public final class ResponseBodyWriter: @unchecked Sendable {
         let slot = self.slot
         while worker.pointee.isStreaming(slot, generation: generation, requestId: requestId),
               worker.pointee.streamBacklog(slot) > worker.pointee.config.writeHighWaterMark {
-            // Someone else is already waiting for this drain, and their wake
-            // is the only one there is. Ours are queued behind theirs.
-            if worker.pointee.table[slot].pointee.writerWake != nil { return }
+            // Every producer waits for itself. Checking the backlog and
+            // parking happen in one turn of the worker's one thread, so there
+            // is no room between them for the drain that would be missed.
             let drained = await withUnsafeContinuation { (wake: UnsafeContinuation<Bool, Never>) in
-                worker.pointee.table[slot].pointee.writerWake = wake
+                worker.pointee.table[slot].pointee.writerWakes.append(wake)
             }
             // Ended while waiting by a `finish` elsewhere is not a failure:
             // these bytes were queued ahead of the end.
@@ -308,9 +316,24 @@ extension Worker {
 
     mutating func resumeStreamWriter(_ slot: Int) {
         guard streamBacklog(slot) <= config.writeLowWaterMark else { return }
-        // Resumed, not run: the task goes on the executor and runs when the
+        // Resumed, not run: the tasks go on the executor and run when the
         // loop drains it, never inside the flush that made the room.
-        table[slot].pointee.writerWake.take()?.resume(returning: true)
+        wakeWriters(slot, drained: true)
+    }
+
+    /// Whether any handler is waiting for this response's backlog to drain.
+    func hasWriterWaiting(_ slot: Int) -> Bool {
+        !table[slot].pointee.writerWakes.isEmpty
+    }
+
+    /// Resumes every waiting writer. Each reads the backlog again for itself
+    /// and parks again if it is still above the mark, so this is a nudge
+    /// rather than a promise of room.
+    mutating func wakeWriters(_ slot: Int, drained: Bool) {
+        let waiting = table[slot].pointee.writerWakes
+        guard !waiting.isEmpty else { return }
+        table[slot].pointee.writerWakes = []
+        for wake in waiting { wake.resume(returning: drained) }
     }
 
     /// Ends a streamed body: the last chunk, END_STREAM or FIN, once what is

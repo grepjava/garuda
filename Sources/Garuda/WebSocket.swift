@@ -85,14 +85,37 @@ final class WSChannel {
     var closeCode: UInt16 = WSCloseCode.abnormal
     var closeReason: [UInt8] = []
     var receiveWaiter: UnsafeContinuation<Void, Never>? = nil
-    var writeWaiter: UnsafeContinuation<Void, Never>? = nil
+    /// The senders waiting for the backlog to drain -- all of them, not the
+    /// first only: one let through because another was already waiting would
+    /// be free to queue frames for ever against a peer reading nothing.
+    var writeWaiters: [WebSocketWriteWaiter] = []
     /// Timed waits (`WebSocket.sleep`) to end early when the connection goes.
     var sleeps: [Int32] = []
 
+    var isWriteWaiting: Bool { !writeWaiters.isEmpty }
+
+    /// Resumes every sender waiting for room. Each reads the backlog again
+    /// for itself and waits again if it is still above the mark.
+    func wakeWriters() {
+        let waiting = writeWaiters
+        guard !waiting.isEmpty else { return }
+        writeWaiters = []
+        for waiter in waiting { waiter.wake.take()?.resume() }
+    }
+
     func wakeAll() {
         receiveWaiter.take()?.resume()
-        writeWaiter.take()?.resume()
+        wakeWriters()
     }
+}
+
+/// One sender's place in the queue for room, so that a cancelled send takes
+/// its own continuation back and leaves everyone else's alone.
+///
+/// Unchecked on the same ground as `WSChannel`: it belongs to one worker,
+/// whose one thread is the only one that ever touches it.
+final class WebSocketWriteWaiter: @unchecked Sendable {
+    var wake: UnsafeContinuation<Void, Never>? = nil
 }
 
 /// RFC 6455 section 1.3.
@@ -623,8 +646,8 @@ extension Worker {
         c.pointee.ws.closeSent = true
         c.pointee.ws.closeSentAt = av_monotonic_ms()
         WebSocketCodec.writeClose(&c.pointee.write, code: code, reason: reason, reasonLength: reasonLength)
-        // A writer waiting for room will never get to use it.
-        c.pointee.ws.channel?.writeWaiter.take()?.resume()
+        // Writers waiting for room will never get to use it.
+        c.pointee.ws.channel?.wakeWriters()
         if !flush(slot) { return }
         closeWebSocketIfDone(slot)
     }
@@ -737,9 +760,9 @@ extension Worker {
     /// write low-water mark.
     mutating func resumeWebSocketWriter(_ slot: Int) {
         let c = table[slot]
-        guard let channel = c.pointee.ws.channel, channel.writeWaiter != nil,
+        guard let channel = c.pointee.ws.channel, channel.isWriteWaiting,
               streamBacklog(slot) <= config.writeLowWaterMark else { return }
-        channel.writeWaiter.take()?.resume()
+        channel.wakeWriters()
     }
 
     /// Releases everything a WebSocket holds. Called from `closeConnection`.

@@ -504,6 +504,15 @@ The Python suites need `h2` and `aioquic`.
   a soft hyphen goes. A password that was pasted with a non-breaking space in
   it now authenticates. NFKC normalisation is still not done, and
   [CONNECTORS.md](CONNECTORS.md) says so.
+- Every producer writing a streamed response waits while the client is
+  behind, not only the first to find the backlog full. A second producer used
+  to be let through on the ground that someone else was already waiting, which
+  left it free to queue as fast as it could produce while the client read
+  nothing -- the mark bounded one writer and nothing else. WebSocket sends had
+  the same shape and are fixed with it. The ceiling is now the mark plus one
+  write from each producer, which [TRANSPORT.md](TRANSPORT.md) states, since a
+  write is queued before it is waited on and so can cross the mark by its own
+  size.
 - A Redis retry cannot repeat a write it may already have done. A failure
   with the command's bytes already written is `RedisClientError.unknownOutcome`,
   wrapping the `closed` or `timedOut` underneath -- `error.cause` reads it

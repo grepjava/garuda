@@ -182,7 +182,7 @@ extension Worker {
             return
         }
         c.pointee.eventKeepAliveDue = av_monotonic_ms() &+ UInt64(c.pointee.eventKeepAliveMs)
-        guard c.pointee.writerWake == nil else { return }
+        guard !hasWriterWaiting(slot) else { return }
         _ = eventKeepAliveComment.withUnsafeBufferPointer { streamBody(slot, $0.baseAddress!, $0.count) }
     }
 

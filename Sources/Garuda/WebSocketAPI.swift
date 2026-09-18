@@ -188,11 +188,16 @@ public final class WebSocket: @unchecked Sendable {
         onWorker()
         guard sent, !channel.gone else { throw WebSocketError.closed }
         while !channel.gone, worker.pointee.websocketBacklog(slot) > worker.pointee.config.writeHighWaterMark {
-            // Someone else is already waiting for this drain. Ours are queued
-            // behind theirs, in order.
-            if channel.writeWaiter != nil { return }
-            try await parkOnWorker(worker, { self.channel.writeWaiter = $0 },
-                                   { self.channel.writeWaiter.take() })
+            // Every sender waits for itself. Bytes still go out in the order
+            // they were queued; what waits here is the sender's return.
+            let waiter = WebSocketWriteWaiter()
+            try await parkOnWorker(worker, {
+                waiter.wake = $0
+                self.channel.writeWaiters.append(waiter)
+            }, {
+                self.channel.writeWaiters.removeAll { $0 === waiter }
+                return waiter.wake.take()
+            })
         }
         if channel.gone { throw WebSocketError.closed }
     }

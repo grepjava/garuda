@@ -1597,7 +1597,7 @@ public struct Worker {
                 if idle > limit { closeConnection(slot) }
             case .readingBody, .writing:
                 if idle > config.requestHeadTimeoutMs { closeConnection(slot) }
-            case .dispatching where c.pointee.writerWake != nil
+            case .dispatching where hasWriterWaiting(slot)
                                  || c.pointee.bodyStream?.waiter != nil:
                 // A streamed response the client stopped reading, or a body
                 // it stopped sending. One that is merely quiet -- events a
@@ -1750,7 +1750,7 @@ public struct Worker {
     @inline(__always)
     mutating func resumeWriterIfDrained(_ slot: Int) {
         let c = table[slot]
-        if c.pointee.writerWake != nil {
+        if hasWriterWaiting(slot) {
             resumeStreamWriter(slot)
         } else if c.pointee.state == .websocket {
             resumeWebSocketWriter(slot)

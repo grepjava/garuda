@@ -273,9 +273,10 @@ leaves the response open, and returns a `ResponseBodyWriter`. A typed handler
 returns `StreamingBody`, whose producer the handler's task runs after the
 handler returns. A write waits on a continuation in the slot above
 `writeHighWaterMark` (512 KiB), and every flush and QUIC acknowledgement checks whether to
-wake it. The wake is queued on the executor, never run inside the flush. Only
-one writer waits at a time; another finds it waiting and returns, its bytes
-queued behind. A stalled reader is closed after `--request-timeout`.
+wake it. The wake is queued on the executor, never run inside the flush.
+Concurrent producers each wait, and the drain wakes all of them to read the
+backlog again for themselves. A stalled reader is closed after
+`--request-timeout`.
 `EventStream` is built on the writer.
 
 A `Topic` has to reach clients held by every worker process, so a message goes

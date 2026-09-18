@@ -7,6 +7,8 @@ import Testing
 
 private enum Who: RequestContextKey { typealias Value = String }
 
+nonisolated(unsafe) private var senderEvents: [String] = []
+
 @Suite("WebSocket handlers", .serialized)
 struct WebSocketHandlerTests {
 
@@ -142,6 +144,38 @@ struct WebSocketHandlerTests {
         let ws = try app.test.webSocket("/late")
         for i in 0..<20 { try ws.send("m\(i)") }
         #expect(try ws.receive() == .text("20"))
+    }
+
+    /// Two senders against a peer that reads nothing. Both must be waiting
+    /// for room when the dust settles: a sender let through because another
+    /// was already waiting would queue its whole flood into memory.
+    @Test func everyConcurrentSenderWaitsForThePeer() throws {
+        senderEvents = []
+        var config = ServerConfig()
+        config.writeHighWaterMark = 64 * 1024
+        config.writeLowWaterMark = 16 * 1024
+        let app = Application()
+        let piece = [UInt8](repeating: 9, count: 16 * 1024)
+        app.webSocket("/flood") { (ws: WebSocket) async throws in
+            @Sendable func produce(_ name: String) async {
+                do {
+                    for _ in 0..<200 { try await ws.send(piece) }
+                    senderEvents.append("\(name) never waited")
+                } catch {
+                    senderEvents.append("\(name) stopped")
+                }
+            }
+            async let first: Void = produce("a")
+            async let second: Void = produce("b")
+            await first
+            await second
+        }
+        let client = app.testClient(configuration: config)
+        let ws = try client.webSocket("/flood")
+        #expect(ws.response.status == 101)
+        // Turned without reading a single frame.
+        for _ in 0..<50 { client.turn() }
+        #expect(senderEvents == [], "\(senderEvents)")
     }
 
     @Test func aRoutersWebSocketTakesThePrefix() throws {

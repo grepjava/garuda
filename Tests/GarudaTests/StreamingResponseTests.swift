@@ -235,8 +235,8 @@ struct StreamingResponseTests {
         let piece = 2 * 1024 * 1024
         app.onAsync(.get, "/two") { _, response in
             let body = response.stream()
-            // Both cross the mark: one waits for the drain, the other finds it
-            // waiting and returns. Neither may be left waiting forever.
+            // Both cross the mark, so both wait for the drain. Neither may be
+            // left waiting forever.
             async let first: Void = body.write(pattern(piece, from: 0))
             async let second: Void = body.write(pattern(piece, from: piece))
             try await first
@@ -248,6 +248,76 @@ struct StreamingResponseTests {
         let response = try client.get("/two")
         #expect(response.body.count == 2 * piece)
         #expect(streamEvents == ["both written"])
+    }
+
+    /// Two producers against a client that reads slowly. Each may carry the
+    /// backlog past the mark by its own last write and no further, because it
+    /// is parked before it can queue another. A producer let through on the
+    /// ground that another was already waiting would queue its whole body in
+    /// one go, which is what this measures.
+    @Test func everyConcurrentWriterIsHeldToTheMark() throws {
+        largestBacklog = 0
+        var config = ServerConfig()
+        config.writeHighWaterMark = 64 * 1024
+        config.writeLowWaterMark = 16 * 1024
+        let app = Application()
+        let piece = 16 * 1024
+        let each = 512 * 1024
+        app.onAsync(.get, "/both") { _, response in
+            let body = response.stream()
+            @Sendable func produce(_ from: Int) async throws {
+                var sent = 0
+                while sent < each {
+                    try await body.write(pattern(piece, from: from))
+                    sent += piece
+                    largestBacklog = max(largestBacklog,
+                                         body.worker.pointee.streamBacklog(body.slot))
+                }
+            }
+            async let first: Void = produce(0)
+            async let second: Void = produce(1)
+            try await first
+            try await second
+        }
+        let client = app.testClient(configuration: config)
+        client.timeoutMillis = 30_000
+        let response = try client.get("/both")
+        #expect(response.body.count == 2 * each)
+        #expect(largestBacklog <= 64 * 1024 + 2 * piece + 64, "\(largestBacklog)")
+    }
+
+    /// A client that leaves wakes every waiter, not the first one only: a
+    /// producer left parked would hold its task for as long as the process
+    /// lived.
+    @Test func everyWriterWaitingForAClientThatLeavesIsCancelled() throws {
+        streamEvents = []
+        var config = ServerConfig()
+        config.writeHighWaterMark = 64 * 1024
+        config.writeLowWaterMark = 16 * 1024
+        let app = Application()
+        app.onAsync(.get, "/forever") { _, response in
+            let body = response.stream()
+            @Sendable func produce(_ name: String) async {
+                do {
+                    // Bounded so that a producer nobody holds back ends the
+                    // test rather than running until something kills it.
+                    for _ in 0..<200 { try await body.write(pattern(32 * 1024, from: 0)) }
+                    streamEvents.append("\(name) never waited")
+                } catch let error as HandlerWaitError {
+                    streamEvents.append("\(name) \(error)")
+                } catch {
+                    streamEvents.append("\(name) unexpected")
+                }
+            }
+            async let first: Void = produce("a")
+            async let second: Void = produce("b")
+            await first
+            await second
+        }
+        let client = app.testClient(configuration: config)
+        try client.abandon(Array("GET /forever HTTP/1.1\r\nHost: x\r\n\r\n".utf8), turns: 20)
+        for _ in 0..<40 { client.turn() }
+        #expect(streamEvents.sorted() == ["a cancelled", "b cancelled"])
     }
 
     @Test func aWriterWaitingForAClientThatLeavesIsCancelled() throws {

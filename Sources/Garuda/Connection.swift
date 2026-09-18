@@ -298,9 +298,13 @@ public struct Connection {
     public var connectProtocol = ByteBuffer()
     /// The WebTransport session this extended CONNECT became, if it became one.
     var wt: WTSession? = nil
-    /// A handler waiting for a streamed response's backlog to drain: resumed
-    /// with true when it has, false when the request ends first.
-    var writerWake: UnsafeContinuation<Bool, Never>? = nil
+    /// The handlers waiting for a streamed response's backlog to drain, each
+    /// resumed with true when it has and false when the request ends first.
+    ///
+    /// A list rather than one, because concurrent producers are part of the
+    /// API: if the second one to find the backlog full were let through, the
+    /// mark would bound the first writer and nothing else.
+    var writerWakes: [UnsafeContinuation<Bool, Never>] = []
     /// The body a streaming route is reading as it arrives, shared with its
     /// reader so what arrived survives the slot closing.
     var bodyStream: RequestBodyState? = nil
