@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 771 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 778 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -389,6 +389,14 @@ The Python suites need `h2` and `aioquic`.
   starts with it, and Swift without Foundation has no such method.
 - `PostgresClientError.isConstraintViolation` says whether the server refused a
   statement for breaking a constraint, as `SQLiteClientError` already did.
+- `app.every(interval, jitter:firstAfter:onWorker:) { start in ... }` runs work
+  on a timer in each worker: clearing what has expired, refreshing a cache. It
+  runs on the worker's own thread with the worker's state, from the moment that
+  worker serves until it drains, and a throw is logged and retried at the next
+  turn. `jitter` (a tenth of the interval by default) keeps workers from
+  firing on the same tick, and `onWorker: 0` restricts a job to one worker --
+  which is one process group's worker 0, not the cluster's, so work that must
+  happen once takes a lock in the database. `app.test` runs the jobs too.
 - `AppEnvironment` reads an application's own settings -- where its database
   is, what signs its tokens, which features are on -- and collects every
   problem instead of failing at the first: `string`, `int` with a range,

@@ -106,12 +106,18 @@ public final class TestClient {
             }
             if !ready { fatalError("app.prepare did not finish in the test client") }
         }
+        // Scheduled jobs run here too, so a test can drive one.
+        if let jobs = worker.pointee.application?.pointee.scheduledJobs, !jobs.isEmpty {
+            onWorker { GarudaRuntime.startScheduledJobs(worker, index: 0, jobs: jobs) }
+        }
     }
 
     static let broadcastRing: Bool = av_bus_enabled() != 0 || av_bus_init(4 * 1024 * 1024, 1) == 0
 
     deinit {
         onWorker {
+            worker.pointee.draining = true
+            GarudaRuntime.stopScheduledJobs(worker) { self.turn() }
             worker.pointee.tearDownState(worker.pointee.application)
             worker.pointee.destroy()
         }

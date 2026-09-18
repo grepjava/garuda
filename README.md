@@ -506,7 +506,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 771 unit tests, and the fuzz corpus
+swift test                                   # 778 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
@@ -579,7 +579,7 @@ before 1.0 are in [COMPATIBILITY.md](COMPATIBILITY.md). Pin with
 | [INSTALLATION.md](INSTALLATION.md) | Building, dependencies, certificates, deployment |
 | [CONFIG.md](CONFIG.md) | Every command-line flag |
 | [MIDDLEWARE.md](MIDDLEWARE.md) | How middleware runs, every piece Garuda ships, and writing your own |
-| [EXAMPLES.md](EXAMPLES.md) | The runnable applications, and recipes for common tasks |
+| [EXAMPLES.md](EXAMPLES.md) | The runnable applications, and recipes: the per-worker model, settings, common tasks |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine is built |
 | [TRANSPORT.md](TRANSPORT.md) | What each protocol implementation does |
 | [Examples/README.md](Examples/README.md) | Five runnable applications and how they are laid out |

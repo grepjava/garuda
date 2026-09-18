@@ -1189,8 +1189,19 @@ enum GarudaRuntime {
             }
         }
         application?.pointee.onStart?(index)
+        if let jobs = application?.pointee.scheduledJobs {
+            startScheduledJobs(workerPtr, index: index, jobs: jobs)
+        }
         logReady(config)
         runSynchronousLoop(workerPtr)
+        // Before the state they use is torn down.
+        stopScheduledJobs(workerPtr) {
+            let n = workerPtr.pointee.poller.wait(timeoutMillis: 10)
+            if n > 0 { workerPtr.pointee.processEvents(n) }
+            workerPtr.pointee.fireDueTimers()
+            workerPtr.pointee.drainReadyQueue()
+            workerPtr.pointee.runHandlerTasks()
+        }
         // The loop ends once in-flight requests have finished or the grace
         // period has; the exit watchdog armed at the drain bounds this too.
         application?.pointee.onShutdown?(index)

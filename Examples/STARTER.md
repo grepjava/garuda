@@ -162,6 +162,10 @@ that, and what this application does about it:
   worker drains.
 - **What every worker must see lives outside the process:** the database, and
   `Topic` for anything to be heard across workers (the chat example).
+- **Work on a timer** is `app.every`. This application clears ended refresh
+  tokens hourly with `onWorker: 0`, so four workers do not each run the
+  delete. Across machines, take a lock in the database instead; EXAMPLES.md
+  shows how.
 - **Work repeated in every worker is work done N times.** A cache warmed in
   `prepare` is warmed per worker; a scheduled job started in every worker runs
   N times. Use `start.index == 0` to do something once, and remember that

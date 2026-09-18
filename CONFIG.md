@@ -827,6 +827,9 @@ func settings() throws -> Settings {
   and `development` when it is unset.
 - **`summary()`** is what a `myapp env` command prints: every variable that was
   read, secrets held back, passwords taken out of URLs.
+- **Work on a timer** belongs to the application too: `app.every(3600) { … }`
+  runs in each worker between serving and draining. EXAMPLES.md has the
+  recipes, including how to make a job run once across every process.
 - **Where to call it:** before the application is built, so nothing is served
   until the environment checks out.
   [Examples/STARTER.md](Examples/STARTER.md) does exactly this, and

@@ -119,6 +119,8 @@ public struct Worker {
     /// The tasks async handlers run on (HandlerTasks.swift), made on the first
     /// async request, and how many there may be.
     var handlerTasks: HandlerTaskPool? = nil
+    /// The jobs `app.every` asked for, running in this worker.
+    var scheduled: ScheduledJobs? = nil
     var handlerTaskLimit = 1024
     /// The threads `blocking` runs work on (BlockingPool.swift), started the
     /// first time it is called.

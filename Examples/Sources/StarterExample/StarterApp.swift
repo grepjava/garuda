@@ -57,6 +57,15 @@ public func starterApp(_ given: StarterConfiguration) -> Application {
     // verifies in any of its routes.
     app.jwtVerifier { _ in try Services.keys(for: settled) }
 
+    // Housekeeping: a refresh token whose family has ended is of no use to
+    // anyone. Hourly, in one worker, a minute after it starts so a deployment
+    // is not spent on cleaning up.
+    app.every(3600, firstAfter: 60, onWorker: 0) { start in
+        let store = PostgresRefreshTokenStore(try start.state(Services.self).pool)
+        let removed = try await store.deleteExpired()
+        if removed > 0 { AppLog.info("cleared expired refresh tokens", ["count": "\(removed)"]) }
+    }
+
     app.securityHeaders()
 
     // Liveness: no database, so it answers while the database is down and a

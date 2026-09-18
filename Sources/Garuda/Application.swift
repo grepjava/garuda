@@ -24,6 +24,7 @@ public final class Application: RouteBuilder {
     var routes = Routes()
     var startHooks: [(Int) -> Void] = []
     var prepareHooks: [(timeout: UInt64, hook: @Sendable (WorkerStartup) async throws -> Void)] = []
+    var scheduledJobs: [ScheduledJob] = []
     var shutdownHooks: [(Int) -> Void] = []
     var responseObservers: [(CompletedRequest) -> Void] = []
     var trailingSlashPolicy = TrailingSlash.strict
@@ -301,6 +302,7 @@ public final class Application: RouteBuilder {
         }
         let start = startHooks
         let prepare = prepareHooks
+        let scheduled = scheduledJobs
         let shutdown = shutdownHooks
         let observers = responseObservers
         let application = UnsafeMutablePointer<CompiledApplication>.allocate(capacity: 1)
@@ -322,6 +324,7 @@ public final class Application: RouteBuilder {
                 for entry in prepare { try await entry.hook(start) }
             },
             prepareTimeoutMilliseconds: prepare.reduce(0) { $0 + $1.timeout },
+            scheduledJobs: scheduled,
             onStart: start.isEmpty ? nil : { index in for hook in start { hook(index) } },
             onShutdown: shutdown.isEmpty ? nil : { index in for hook in shutdown { hook(index) } },
             routePatterns: routes.patterns,
@@ -360,6 +363,8 @@ struct CompiledApplication {
     let onPrepare: (@Sendable (WorkerStartup) async throws -> Void)?
     /// How long every prepare hook together may take.
     let prepareTimeoutMilliseconds: UInt64
+    /// What `app.every` asked to have run on a timer.
+    let scheduledJobs: [ScheduledJob]
     let onStart: ((Int) -> Void)?
     let onShutdown: ((Int) -> Void)?
     /// Each route's pattern, by route number, nil for a fallback.
