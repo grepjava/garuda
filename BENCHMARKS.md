@@ -16,7 +16,8 @@ builds it, under the suite's load command.
 
 ## What is measured, and why
 
-The route is hello-world: `GET /`, status 200, empty body. A handler that does
+The route is hello-world: `GET /`, status 200, empty body. Requests that do
+work -- JSON, a database, streaming -- are [measured separately](#requests-that-do-work). A handler that does
 nothing leaves only the server's own cost: parsing, dispatch, writing the
 response, and the socket calls. That is what these figures measure. They do not
 say what an application built on Garuda will serve.
@@ -210,12 +211,47 @@ Latency at 256 connections, p50 / p99 in milliseconds:
   alike: the CPU cannot hold its clocks that long. Never read a sweep's figure
   against a short run's.
 
-## Planned
+## Requests that do work
 
-Hello-world measures the server. Next, benchmarks that measure a request doing
-work:
+Hello-world measures the server. [benchmarks/workloads.sh](benchmarks/workloads.sh)
+measures four requests that do something, each answered with the same bytes by
+two applications written the way each framework documents:
+[workloads/garuda-app](benchmarks/workloads/garuda-app/Sources/workloads/main.swift)
+on Garuda's typed routes, and [workloads/axum](benchmarks/workloads/axum/src/main.rs)
+on axum 0.8 with tokio-postgres and deadpool.
 
-- path parameters (`GET /user/:id`)
-- JSON in and out
-- a database round trip
-- streaming response bodies
+| workload | request | what it exercises |
+|---|---|---|
+| user | `GET /user/12345` | a path parameter, answered as text |
+| json | `POST /json`, 60 bytes | a JSON body decoded into a struct, another encoded |
+| db | `GET /db/517` | one row from PostgreSQL by primary key, as JSON; a pool of 32 connections either way |
+| stream | `GET /stream` | 64 KiB streamed as 16 chunks of 4 KiB, chunked |
+
+```bash
+(cd benchmarks/workloads/garuda-app && swift build -c release)
+DATABASE_URL='postgres://user:pass@127.0.0.1/db?sslmode=disable' bash benchmarks/workloads.sh
+```
+
+Each workload is checked before it is measured: a server that answers fast and
+wrong prints FAILED instead of a figure. Then closed-loop oha at 64
+connections, a 2 s warm-up and a 10 s run, Garuda's 4 workers against Tokio's
+default of a thread per CPU. The script makes and fills the table it reads.
+It takes under two minutes, and like vs-axum.sh it is a check between
+changes, not a figure to publish.
+
+### First run, 2026-09-19
+
+The bench box: 8 cores, Ubuntu 26.04, PostgreSQL 18.6 on the same machine.
+One run each; requests a second, p50 and p99 in milliseconds.
+
+| workload | Garuda | p50 | p99 | axum | p50 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| user | 183,993 | 0.367 | 0.423 | 135,474 | 0.427 | 1.222 |
+| json | 88,995 | 0.593 | 2.109 | 119,483 | 0.475 | 1.538 |
+| db | 31,456 | 1.958 | 3.431 | 45,545 | 1.359 | 2.476 |
+| stream | 17,364 | 3.663 | 8.385 | 34,802 | 1.811 | 3.359 |
+
+Routing is ahead, as hello-world is. The other three are behind, and they are
+where the work is: a handler that decodes and encodes JSON, waits on a
+database, or writes a body in pieces spends its time outside the engine that
+hello-world measures.

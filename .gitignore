@@ -43,3 +43,7 @@ benchmarks/actix/target/
 benchmarks/actix/Cargo.lock
 benchmarks/vertx/target/
 REVIEW-*.md
+
+# What cargo builds for benchmarks/workloads/axum. Its Cargo.lock is kept: the
+# workload comparison is ours, not upstream's, and should build the same twice.
+benchmarks/workloads/axum/target/

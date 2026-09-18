@@ -1001,6 +1001,10 @@ The Python suites need `h2` and `aioquic`.
 
 ### Server
 
+- `benchmarks/workloads.sh` measures requests that do work against axum:
+  a path parameter, JSON in and out, a PostgreSQL row, and a streamed 64 KiB
+  body, from two applications that answer each with the same bytes. Each
+  answer is checked before it is measured. BENCHMARKS.md has the first run.
 - HTTP/3 serves the certificate the client asked for. `--tls-cert` and
   `--tls-key` repeat for SNI, and until now only TCP followed them: the QUIC
   handshake is written from the primitives rather than driven by OpenSSL, so
