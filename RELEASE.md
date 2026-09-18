@@ -517,6 +517,13 @@ The Python suites need `h2` and `aioquic`.
   a soft hyphen goes. A password that was pasted with a non-breaking space in
   it now authenticates. NFKC normalisation is still not done, and
   [CONNECTORS.md](CONNECTORS.md) says so.
+- The broadcast suite waits until an event stream is demonstrably subscribed
+  before it publishes to it, rather than the instant its head arrives: the
+  head of a stream goes out before its handler has subscribed, so the two
+  orders are not the same. Where that check has passed and the stream is
+  still sent nothing, the suite now says which worker the stream landed on
+  and which workers the WebSockets landed on. A CI runner has failed here
+  once, and the cause is not yet known; this is what will name it.
 - The test that an idle outbound connection is swept away no longer sets the
   idle time down to a millisecond before it has checked the connection is
   there. A sweep landing in that gap failed the test by finding the very

@@ -377,6 +377,18 @@ def websockets():
         pids = {c.receive() for c in clients}
         check("WebSockets landed on more than one worker", len(pids) > 1, pids)
         stream = Stream(server, "chat")
+        # An event stream's head goes out before its handler has subscribed,
+        # so a message published the instant the head arrives could be missed
+        # through no fault of the bus. One message published and waited for
+        # puts the subscription beyond doubt, and every socket hears it too,
+        # so their queues are drained along with it.
+        server.publish("chat", "priming", event="said")
+        primed = [e.get("data") for e in stream.events(1)]
+        check("the event stream is subscribed before anything is published",
+              primed == ["priming"],
+              "stream on pid %s, sockets on %r, got %r" % (stream.pid, sorted(pids), primed))
+        for c in clients:
+            c.receive()
 
         clients[0].send("hello from a socket")
         lines = [c.receive() for c in clients]
@@ -385,6 +397,16 @@ def websockets():
         check("every WebSocket heard it, with one number", len(ids) == 1, lines)
         is_("as the ws event", rest, {"ws hello from a socket"})
         events = stream.events(1)
+        if not events:
+            # This has failed once, on a CI runner, and could not be made to
+            # fail anywhere else. Which worker the stream landed on, and
+            # whether any WebSocket was on that worker, is what says where to
+            # look next: a worker that hears nothing from the ring at all, or
+            # one that heard it and did not pass it to the stream it holds.
+            print("       stream on pid %s, sockets on %r, %d comments, %d bytes unparsed"
+                  % (stream.pid, sorted(pids), stream.comments,
+                     len(stream.text) + len(stream.wire)))
+            sys.stdout.flush()
         is_("and so did the event stream",
             [(e.get("event"), e.get("data")) for e in events], [("ws", "hello from a socket")])
 
