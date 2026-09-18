@@ -289,8 +289,7 @@ wait once.
 ### Still to build
 
 **Step 3**
-- PostgreSQL: `date`, `time`, `interval`, `numeric` and `json` types, `LISTEN`,
-  SASLprep.
+- PostgreSQL: `COPY`, enums and composite types, SASLprep, unix sockets.
 
 **Step 6**
 - Benchmarks past hello-world against axum: path parameters, JSON in and out, a
