@@ -1,6 +1,6 @@
 # Examples
 
-Five applications built on Garuda's public API. Four are small enough to read
+Six applications built on Garuda's public API. Five are small enough to read
 in one sitting, each showing one thing; the starter shows the shape of a whole
 application and is the one to copy when beginning. They build against the
 Garuda checkout this directory sits in.
@@ -11,6 +11,7 @@ Garuda checkout this directory sits in.
 | [Auth](Sources/AuthExample/AuthApp.swift) | `swift run auth` | Sign-up, login and logout: PBKDF2 password hashes, random session tokens stored as digests, `authenticate(bearer:state:)` |
 | [Streaming](Sources/StreamingExample/StreamingApp.swift) | `swift run streaming` | Server-sent events, a CSV export written as it is produced, uploads written to disk as they arrive |
 | [Chat](Sources/ChatExample/ChatApp.swift) | `swift run chat` | Rooms over WebSockets and server-sent events, heard across every worker through `Topic` |
+| [Files](Sources/FilesExample/FilesApp.swift) | `swift run files` | Uploads that survive a dropped connection and downloads that resume: the resumable upload protocol, size limits at both ends, digests, and `--static-dir` serving the store with byte ranges and a listing |
 | [**Starter**](STARTER.md) | `swift run starter` | A whole application: PostgreSQL, accounts with JWT access and refresh tokens, roles and admin-only routes, input rules answered as 422, migrations, configuration from the environment, OpenAPI, health and readiness, and a deployment recipe |
 
 ```bash

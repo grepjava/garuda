@@ -825,11 +825,19 @@ The Python suites need `h2` and `aioquic`.
 
 ### Examples
 
-- `Examples/` is a package of four applications on the public API, each with
-  tests through `app.test`: a todo CRUD API on SQLite; sign-up, login and
-  sessions with hashed passwords; server-sent events, a streamed CSV export and
-  uploads written to disk as they arrive; and chat rooms over WebSockets and
-  event streams, heard across every worker.
+- `Examples/` is a package of applications on the public API, each with tests
+  through `app.test`: a todo CRUD API on SQLite; sign-up, login and sessions
+  with hashed passwords; server-sent events, a streamed CSV export and uploads
+  written to disk as they arrive; chat rooms over WebSockets and event streams,
+  heard across every worker; and a file service.
+- `swift run files` is that file service, and the shortest path through what
+  uploads and downloads need: `app.resumableUploads` for an upload that
+  survives a dropped connection, `UploadLimits` at both ends, `Repr-Digest`
+  checked before the handler sees the bytes, a name from `Content-Disposition`
+  held to what a file name may be, and `--static-dir` serving the store with
+  `sendfile`, `ETag`, byte ranges and a listing -- the download side without a
+  line of code. Its tests cut an upload off at 120 KB of 200 KB and resume
+  it.
 - The starter application has roles: an account is a `member` or an `admin`,
   the role rides in the access token, and `/admin/accounts` and
   `PUT /admin/accounts/:id/role` are guarded by two lines --

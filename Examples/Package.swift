@@ -10,6 +10,7 @@ import PackageDescription
 //                        across every worker
 //   swift run starter    accounts and notes on PostgreSQL: configuration,
 //                        migrations, JWT access and refresh tokens, OpenAPI
+//   swift run files      resumable uploads, and downloads with byte ranges
 //
 // Each application is a library target with a function that builds it, so
 // `swift test` drives it through `app.test`, and a small executable that runs
@@ -34,12 +35,19 @@ let package = Package(
         .target(name: "ChatExample", dependencies: [.product(name: "Garuda", package: "garuda")]),
         .executableTarget(name: "chat", dependencies: ["ChatExample"]),
 
+        .target(name: "FilesExample", dependencies: [.product(name: "Garuda", package: "garuda"),
+                                                     .product(name: "GarudaUploads", package: "garuda")]),
+        .executableTarget(name: "files", dependencies: ["FilesExample",
+                                                        .product(name: "Garuda", package: "garuda")]),
+
         .target(name: "StarterExample", dependencies: [.product(name: "Garuda", package: "garuda")]),
         .executableTarget(name: "starter", dependencies: ["StarterExample",
                                                           .product(name: "Garuda", package: "garuda")]),
 
         .testTarget(name: "ExampleTests",
                     dependencies: ["TodoExample", "AuthExample", "StreamingExample", "ChatExample",
-                                   "StarterExample", .product(name: "Garuda", package: "garuda")]),
+                                   "StarterExample", "FilesExample",
+                                   .product(name: "Garuda", package: "garuda"),
+                                   .product(name: "GarudaUploads", package: "garuda")]),
     ]
 )

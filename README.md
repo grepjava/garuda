@@ -63,9 +63,11 @@ exit(app.run())
 or newer, on Linux or macOS 15. [INSTALLATION.md](INSTALLATION.md) lists the
 system packages, certificates and running as a service.
 
-[Examples/](Examples/README.md) has four complete applications to run and copy
+[Examples/](Examples/README.md) has complete applications to run and copy
 from: a CRUD API on SQLite, accounts with hashed passwords and sessions,
-streaming both ways, and chat rooms over WebSockets across workers.
+streaming both ways, chat rooms over WebSockets across workers, a file service
+with resumable uploads and ranged downloads, and a whole starter application
+on PostgreSQL.
 
 ## Writing handlers
 
