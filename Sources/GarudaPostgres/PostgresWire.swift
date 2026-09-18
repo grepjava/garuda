@@ -418,11 +418,17 @@ public enum PostgresType {
     public static let int2: UInt32 = 21
     public static let int4: UInt32 = 23
     public static let text: UInt32 = 25
+    public static let json: UInt32 = 114
     public static let float4: UInt32 = 700
     public static let float8: UInt32 = 701
+    public static let date: UInt32 = 1082
+    public static let time: UInt32 = 1083
     public static let timestamp: UInt32 = 1114
     public static let timestamptz: UInt32 = 1184
+    public static let interval: UInt32 = 1186
+    public static let numeric: UInt32 = 1700
     public static let uuid: UInt32 = 2950
+    public static let jsonb: UInt32 = 3802
 }
 
 public enum PostgresFrontend {

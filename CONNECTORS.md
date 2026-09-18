@@ -56,11 +56,20 @@ app.prepare { start in try await start.state(PostgresPool.self).migrate(migratio
 ``` A database further ahead than the build is `unknownSchemaVersion`, not a
 migration backwards.
 
+Types: `Int`, `Double`, `Bool`, `String`, `[UInt8]` (bytea), `UUID` and
+`Timestamp` (timestamptz), and `PostgresDate`, `PostgresTime`,
+`PostgresInterval`, `PostgresNumeric` and `PostgresJSON<T>` for `date`,
+`time`, `interval`, `numeric` and `json`/`jsonb`. Each reads the binary form
+the driver asks for and text as a fallback, and binds as text the server
+accepts whatever its `DateStyle` or `IntervalStyle` is. `numeric` is kept as
+its digits, so 1234.56 is 1234.56 rather than 1234.5599999999999.
+
 ### Not supported
 
-- `date`, `time`, `interval`, `numeric` and `json` have no Swift types of their
-  own and are read as text.
 - `LISTEN` and `NOTIFY`, and `COPY`.
+- Arrays, ranges, `hstore`, enums and composite types, which are read as
+  text.
+- `money`, `bit`, `tsvector`, PostGIS: text as well.
 - Unix-domain sockets. The driver connects over TCP only.
 - SASLprep, so a password with non-ASCII characters may not authenticate.
 - Several hosts in one configuration, and sending reads to a replica. A pool
@@ -68,8 +77,8 @@ migration backwards.
 
 ### Future work
 
-- Types for dates, times, intervals, `numeric` and `json`.
 - `LISTEN` on a connection of its own, like Redis `subscribe`.
+- Arrays, as `[T]` where `T` is already read.
 - `COPY` in both directions, streamed.
 - Unix-domain sockets, SASLprep, and a list of hosts to try in order.
 

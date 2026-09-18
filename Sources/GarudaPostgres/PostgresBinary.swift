@@ -18,8 +18,12 @@ public enum PostgresBinary {
         switch type {
         case PostgresType.bool, PostgresType.bytea, PostgresType.int2, PostgresType.int4,
              PostgresType.int8, PostgresType.float4, PostgresType.float8, PostgresType.uuid,
-             PostgresType.timestamp, PostgresType.timestamptz:
+             PostgresType.timestamp, PostgresType.timestamptz, PostgresType.date,
+             PostgresType.time, PostgresType.interval, PostgresType.numeric:
             return true
+        // json and jsonb come as text: jsonb's binary form is a version byte
+        // and then the same text, so there is nothing to gain and a byte to
+        // get wrong.
         default:
             return false
         }
@@ -92,6 +96,69 @@ public enum PostgresBinary {
 
     /// A timestamp's microseconds since 1970, or nil for infinity and for a
     /// value past what Int64 holds from 1970.
+    /// A `date`: days since 2000-01-01. Infinity is refused, as it is for a
+    /// timestamp: it names no day.
+    public static func dateDays(_ bytes: ArraySlice<UInt8>) -> Int32? {
+        guard bytes.count == 4, let wide = integer(bytes) else { return nil }
+        let days = Int32(truncatingIfNeeded: wide)
+        guard days != Int32.max, days != Int32.min else { return nil }
+        return days
+    }
+
+    /// A `time`: microseconds since midnight.
+    public static func timeMicroseconds(_ bytes: ArraySlice<UInt8>) -> Int64? {
+        guard bytes.count == 8, let micros = integer(bytes), micros >= 0, micros <= 86_400_000_000 else {
+            return nil
+        }
+        return micros
+    }
+
+    /// An `interval`: microseconds, days and months, in that order on the
+    /// wire, kept apart because a month is not 30 days.
+    public static func interval(_ bytes: ArraySlice<UInt8>) -> (months: Int32, days: Int32,
+                                                                microseconds: Int64)? {
+        guard bytes.count == 16 else { return nil }
+        let start = bytes.startIndex
+        guard let micros = integer(bytes[start..<(start + 8)]),
+              let days = integer(bytes[(start + 8)..<(start + 12)]),
+              let months = integer(bytes[(start + 12)..<(start + 16)]) else { return nil }
+        return (Int32(truncatingIfNeeded: months), Int32(truncatingIfNeeded: days), micros)
+    }
+
+    /// A `numeric`: a count of base-10000 digits, the exponent of the first of
+    /// them, a sign, the decimal scale, and then the digits.
+    public static func numeric(_ bytes: ArraySlice<UInt8>) -> (negative: Bool, isNaN: Bool, weight: Int,
+                                                               digits: [UInt16], scale: Int)? {
+        guard bytes.count >= 8 else { return nil }
+        let start = bytes.startIndex
+        func word(_ offset: Int) -> UInt16 {
+            UInt16(bytes[start + offset]) << 8 | UInt16(bytes[start + offset + 1])
+        }
+        let count = Int(Int16(bitPattern: word(0)))
+        let weight = Int(Int16(bitPattern: word(2)))
+        let sign = word(4)
+        let scale = Int(Int16(bitPattern: word(6)))
+        guard count >= 0, scale >= 0, bytes.count == 8 + count * 2 else { return nil }
+        switch sign {
+        case 0x0000, 0x4000:
+            break
+        case 0xC000:
+            // NaN carries no digits.
+            return (false, true, 0, [], 0)
+        default:
+            // -Infinity and Infinity, which no decimal can hold.
+            return nil
+        }
+        var digits: [UInt16] = []
+        digits.reserveCapacity(count)
+        for i in 0..<count {
+            let digit = word(8 + i * 2)
+            guard digit < 10_000 else { return nil }
+            digits.append(digit)
+        }
+        return (sign == 0x4000, false, weight, digits, scale)
+    }
+
     public static func timestampMicroseconds(_ bytes: ArraySlice<UInt8>) -> Int64? {
         guard bytes.count == 8, let since2000 = integer(bytes),
               since2000 != .max, since2000 != .min else { return nil }

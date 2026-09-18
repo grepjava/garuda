@@ -542,7 +542,55 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
         if T.self == [UInt8].self { return try bytes() as! T }
         if T.self == UUID.self { return try uuid() as! T }
         if T.self == Timestamp.self { return try timestamp() as! T }
+        if T.self == PostgresDate.self { return try date() as! T }
+        if T.self == PostgresTime.self { return try time() as! T }
+        if T.self == PostgresInterval.self { return try interval() as! T }
+        if T.self == PostgresNumeric.self { return try numeric() as! T }
+        // A json or jsonb column, decoded into what PostgresJSON wraps.
+        if let column = T.self as? any PostgresJSONColumn.Type {
+            return try column.fromJSONBytes(Array(try required().utf8)) as! T
+        }
         return try T(from: self)
+    }
+
+    private func date() throws -> PostgresDate {
+        if let raw = try binary(PostgresType.date) {
+            guard let days = PostgresBinary.dateDays(raw) else { throw notConvertible(PostgresDate.self) }
+            return PostgresDate(daysSince2000: days)
+        }
+        guard let value = PostgresDate(try required()) else { throw notConvertible(PostgresDate.self) }
+        return value
+    }
+
+    private func time() throws -> PostgresTime {
+        if let raw = try binary(PostgresType.time) {
+            guard let micros = PostgresBinary.timeMicroseconds(raw),
+                  let value = PostgresTime(microsecondsSinceMidnight: micros) else {
+                throw notConvertible(PostgresTime.self)
+            }
+            return value
+        }
+        guard let value = PostgresTime(try required()) else { throw notConvertible(PostgresTime.self) }
+        return value
+    }
+
+    private func interval() throws -> PostgresInterval {
+        if let raw = try binary(PostgresType.interval) {
+            guard let parts = PostgresBinary.interval(raw) else { throw notConvertible(PostgresInterval.self) }
+            return PostgresInterval(months: parts.months, days: parts.days, microseconds: parts.microseconds)
+        }
+        guard let value = PostgresInterval(try required()) else { throw notConvertible(PostgresInterval.self) }
+        return value
+    }
+
+    private func numeric() throws -> PostgresNumeric {
+        if let raw = try binary(PostgresType.numeric) {
+            guard let parts = PostgresBinary.numeric(raw),
+                  let value = PostgresNumeric(parts) else { throw notConvertible(PostgresNumeric.self) }
+            return value
+        }
+        guard let value = PostgresNumeric(try required()) else { throw notConvertible(PostgresNumeric.self) }
+        return value
     }
 
     private func uuid() throws -> UUID {

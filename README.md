@@ -244,7 +244,9 @@ A native driver runs on the worker's poller. It supports SCRAM-SHA-256, TLS
 (required by default) and a pool per worker with an acquire timeout. Rows decode
 into `Decodable` types by column name. `db.transaction { tx in … }` commits or
 rolls back. Statements stay prepared on each connection, and values are read in
-binary after the first run. `UUID` and `Timestamp` come without Foundation.
+binary after the first run. `UUID`, `Timestamp`, `PostgresDate`,
+`PostgresTime`, `PostgresInterval`, `PostgresNumeric` (exact, kept as its
+digits) and `PostgresJSON<T>` come without Foundation.
 
 ### Redis
 
@@ -506,7 +508,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 778 unit tests, and the fuzz corpus
+swift test                                   # 788 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

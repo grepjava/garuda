@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 778 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 788 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -389,6 +389,15 @@ The Python suites need `h2` and `aioquic`.
   starts with it, and Swift without Foundation has no such method.
 - `PostgresClientError.isConstraintViolation` says whether the server refused a
   statement for breaking a constraint, as `SQLiteClientError` already did.
+- PostgreSQL types for what had none: `PostgresDate` (`date`),
+  `PostgresTime` (`time`), `PostgresInterval` (`interval`, months, days and
+  microseconds kept apart), `PostgresNumeric` (`numeric`, exact, kept as its
+  digits) and `PostgresJSON<T>` (`json` and `jsonb`, decoded into your type).
+  Each reads the binary form and text as a fallback, and binds as text the
+  server accepts whatever its `DateStyle` or `IntervalStyle` is. The interval
+  parser reads every style PostgreSQL writes, ISO-8601, the default and
+  `sql_standard`. `PostgresClientError.isConstraintViolation` joins
+  `sqlState`.
 - `app.every(interval, jitter:firstAfter:onWorker:) { start in ... }` runs work
   on a timer in each worker: clearing what has expired, refreshing a cache. It
   runs on the worker's own thread with the worker's state, from the moment that
