@@ -48,11 +48,6 @@ extension Double: PostgresBindable { public var postgresValue: PostgresValue { P
 extension Float: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(String(self)) } }
 extension Bool: PostgresBindable { public var postgresValue: PostgresValue { PostgresValue(self ? "true" : "false") } }
 
-/// Bytes, bound as `bytea` in binary.
-extension Array: PostgresBindable where Element == UInt8 {
-    public var postgresValue: PostgresValue { .binary(self, type: PostgresType.bytea) }
-}
-
 extension Optional: PostgresBindable where Wrapped: PostgresBindable {
     public var postgresValue: PostgresValue { self?.postgresValue ?? .null }
 }
@@ -335,6 +330,12 @@ private func decodeRow<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows, _
     if Row.self == [UInt8].self {
         return try decoding.onlyCell().decode([UInt8].self) as! Row
     }
+    // `query([String].self, "select tags from notes")`: one array column
+    // asked for as a list is that column, not a row of columns.
+    if Row.self is any PostgresArrayColumn.Type, rows.columns.count == 1,
+       PostgresType.elementType(of: rows.columns[0].typeOID) != nil {
+        return try decoding.onlyCell().decode(Row.self)
+    }
     return try Row(from: decoding)
 }
 
@@ -441,6 +442,11 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
 
     var name: String { rows.columns[column].name }
     var text: String? { rows.text(row: row, column: column) }
+    /// The same cell as text, which is what reads every type the server did
+    /// not send in binary -- and every element of an array.
+    var asText: PostgresTextValue {
+        PostgresTextValue(text: text, name: name, typeOID: rows.columns[column].typeOID)
+    }
     var userInfo: [CodingUserInfoKey: Any] { [:] }
 
     func container<Key: CodingKey>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> {
@@ -486,11 +492,7 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
     }
 
     private func scalar<T: LosslessStringConvertible>(_ type: T.Type) throws -> T {
-        let text = try required()
-        guard let value = T(text) else {
-            throw PostgresDecodingError.notConvertible(column: name, value: text, expected: "\(type)")
-        }
-        return value
+        try asText.scalar(type)
     }
 
     func decodeNil() -> Bool { text == nil }
@@ -500,13 +502,7 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
             guard let value = PostgresBinary.bool(raw) else { throw notConvertible(type) }
             return value
         }
-        // PostgreSQL's text form of a boolean is t or f.
-        switch try required() {
-        case "t", "true": return true
-        case "f", "false": return false
-        case let other:
-            throw PostgresDecodingError.notConvertible(column: name, value: other, expected: "Bool")
-        }
+        return try asText.decode(Bool.self)
     }
 
     func decode(_ type: String.Type) throws -> String { try required() }
@@ -539,6 +535,13 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
     func decode(_ type: UInt32.Type) throws -> UInt32 { try integer(type) }
     func decode(_ type: UInt64.Type) throws -> UInt64 { try integer(type) }
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        // An array column into a list, whatever its elements are. Before the
+        // bytes below, so `[UInt8]` from a `smallint[]` is its numbers while
+        // `[UInt8]` from a `bytea` stays its bytes.
+        if let element = PostgresType.elementType(of: rows.columns[column].typeOID),
+           let list = T.self as? any PostgresArrayColumn.Type {
+            return try list.decodePostgresArray(try required(), element: element, column: name) as! T
+        }
         if T.self == [UInt8].self { return try bytes() as! T }
         if T.self == UUID.self { return try uuid() as! T }
         if T.self == Timestamp.self { return try timestamp() as! T }
@@ -558,8 +561,7 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
             guard let days = PostgresBinary.dateDays(raw) else { throw notConvertible(PostgresDate.self) }
             return PostgresDate(daysSince2000: days)
         }
-        guard let value = PostgresDate(try required()) else { throw notConvertible(PostgresDate.self) }
-        return value
+        return try asText.decode(PostgresDate.self)
     }
 
     private func time() throws -> PostgresTime {
@@ -570,8 +572,7 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
             }
             return value
         }
-        guard let value = PostgresTime(try required()) else { throw notConvertible(PostgresTime.self) }
-        return value
+        return try asText.decode(PostgresTime.self)
     }
 
     private func interval() throws -> PostgresInterval {
@@ -579,8 +580,7 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
             guard let parts = PostgresBinary.interval(raw) else { throw notConvertible(PostgresInterval.self) }
             return PostgresInterval(months: parts.months, days: parts.days, microseconds: parts.microseconds)
         }
-        guard let value = PostgresInterval(try required()) else { throw notConvertible(PostgresInterval.self) }
-        return value
+        return try asText.decode(PostgresInterval.self)
     }
 
     private func numeric() throws -> PostgresNumeric {
@@ -589,8 +589,7 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
                   let value = PostgresNumeric(parts) else { throw notConvertible(PostgresNumeric.self) }
             return value
         }
-        guard let value = PostgresNumeric(try required()) else { throw notConvertible(PostgresNumeric.self) }
-        return value
+        return try asText.decode(PostgresNumeric.self)
     }
 
     private func uuid() throws -> UUID {
@@ -598,9 +597,7 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
             guard let value = UUID(bytes: Array(raw)) else { throw notConvertible(UUID.self) }
             return value
         }
-        let text = try required()
-        guard let value = UUID(text) else { throw notConvertible(UUID.self) }
-        return value
+        return try asText.decode(UUID.self)
     }
 
     /// From a timestamptz or timestamp column, or text in either layout.
@@ -612,25 +609,21 @@ struct PostgresCell: Decoder, SingleValueDecodingContainer {
             }
             return Timestamp(microsecondsSinceEpoch: micros)
         }
-        let text = try required()
-        guard let value = Timestamp(text) else { throw notConvertible(Timestamp.self) }
-        return value
+        return try asText.decode(Timestamp.self)
     }
 
     /// The cell as bytes: a bytea's own bytes, in whichever format it came,
     /// and any other column's text as UTF-8.
     private func bytes() throws -> [UInt8] {
-        guard let raw = rows.bytes(row: row, column: column) else {
-            throw PostgresDecodingError.null(column: name)
-        }
         let description = rows.columns[column]
-        if description.typeOID == PostgresType.bytea && description.binary { return Array(raw) }
-        // Any other column is its text, whichever format it came in.
-        guard description.typeOID == PostgresType.bytea else { return Array((text ?? "").utf8) }
-        guard let decoded = PostgresBytea.decodeHex(raw) else {
-            throw PostgresDecodingError.notConvertible(column: name, value: String(decoding: raw.prefix(32), as: UTF8.self),
-                                                       expected: "bytea in hex")
+        if description.typeOID == PostgresType.bytea && description.binary {
+            guard let raw = rows.bytes(row: row, column: column) else {
+                throw PostgresDecodingError.null(column: name)
+            }
+            return Array(raw)
         }
-        return decoded
+        // A bytea as text is its hex; any other column is its text, whichever
+        // format it came in.
+        return try asText.decodeBytes()
     }
 }

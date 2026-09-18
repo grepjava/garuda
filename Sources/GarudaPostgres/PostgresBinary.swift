@@ -23,7 +23,9 @@ public enum PostgresBinary {
             return true
         // json and jsonb come as text: jsonb's binary form is a version byte
         // and then the same text, so there is nothing to gain and a byte to
-        // get wrong.
+        // get wrong. An array comes as text as well -- its binary form repeats
+        // the element format under a header per dimension, where its text is
+        // the elements' own text, which the same readers already read.
         default:
             return false
         }
@@ -167,14 +169,7 @@ public enum PostgresBinary {
     }
 
     static func byteaText(_ bytes: ArraySlice<UInt8>) -> String {
-        let digits: StaticString = "0123456789abcdef"
-        var out: [UInt8] = [UInt8(ascii: "\\"), UInt8(ascii: "x")]
-        out.reserveCapacity(2 + bytes.count * 2)
-        for byte in bytes {
-            out.append(digits.utf8Start[Int(byte >> 4)])
-            out.append(digits.utf8Start[Int(byte & 0x0F)])
-        }
-        return String(decoding: out, as: UTF8.self)
+        PostgresBytea.encodeHex(bytes)
     }
 
     /// A float as PostgreSQL 12 and later write one: the shortest digits that

@@ -177,4 +177,105 @@ struct PostgresTypesRoundTripTests {
         let text = try client.get("/run").text
         #expect(text == "all agree", "\(text)")
     }
+
+    /// Arrays: bound as parameters, read back into lists, and put in and taken
+    /// out of a real column -- including the values that make an array literal
+    /// hard, and a NULL among the elements.
+    @Test(.enabled(if: roundTripTarget != nil, "set GARUDA_POSTGRES to run"))
+    func arraysSurviveTheServer() throws {
+        let configuration = roundTripTarget!
+        let app = Application()
+        app.state { _ in PostgresPool(configuration, maxConnections: 2) }
+        app.get("/run") { (db: State<PostgresPool>) async -> String in
+            struct Row: Decodable {
+                let tags: [String]
+                let awkward: [String]
+                let scores: [Int]
+                let empty: [String]
+                let sparse: [String?]
+                let totals: [PostgresNumeric]
+                let days: [PostgresDate]
+                let blobs: [[UInt8]]
+                let ids: [UUID]
+                let stamps: [Timestamp]
+                let tagsText: String
+                let absent: [String]?
+            }
+            struct Tagged: Decodable { let id: Int; let tags: [String] }
+            do {
+                let pool = db.value
+                let tags = ["swift", "http"]
+                // Everything an array literal has to survive: the delimiter,
+                // a quote, a backslash, braces, nothing at all, and the word
+                // the literal spells a NULL with.
+                let awkward = ["a,b", #"say "hi""#, #"back\slash"#, "{braced}", "",
+                               "NULL", " padded "]
+                let totals = [PostgresNumeric("1234.56")!, PostgresNumeric("-0.00005")!]
+                let days = [PostgresDate(2026, 9, 18)!, PostgresDate(1, 1, 1)!]
+                let blobs: [[UInt8]] = [[0, 1, 255], []]
+                let ids = [UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")!]
+                let stamps = [Timestamp(microsecondsSinceEpoch: 1_758_153_600_000_000)]
+                var wrong: [String] = []
+                let sql = """
+                    select $1::text[] as tags, $2::text[] as awkward, $3::int[] as scores,
+                           $4::text[] as empty, $5::text[] as sparse, $6::numeric[] as totals,
+                           $7::date[] as days, $8::bytea[] as blobs, $9::uuid[] as ids,
+                           $10::timestamptz[] as stamps, $1::text[]::text as "tagsText",
+                           null::text[] as absent
+                    """
+                // Twice: the first run comes all as text, and the second asks
+                // for binary wherever a column has a binary reader -- which an
+                // array never does, so the mixed formats are exercised too.
+                for run in 1...2 {
+                    guard let row = try await pool.first(Row.self, sql, tags, awkward, [1, 2, 3],
+                                                         [String](), ["a", nil] as [String?], totals,
+                                                         days, blobs, ids, stamps) else {
+                        wrong.append("run \(run): no row")
+                        continue
+                    }
+                    if row.tags != tags { wrong.append("run \(run) tags: \(row.tags)") }
+                    if row.awkward != awkward { wrong.append("run \(run) awkward: \(row.awkward)") }
+                    if row.scores != [1, 2, 3] { wrong.append("run \(run) scores: \(row.scores)") }
+                    if !row.empty.isEmpty { wrong.append("run \(run) empty: \(row.empty)") }
+                    if row.sparse != ["a", nil] { wrong.append("run \(run) sparse: \(row.sparse)") }
+                    if row.totals != totals { wrong.append("run \(run) totals: \(row.totals)") }
+                    if row.days != days { wrong.append("run \(run) days: \(row.days)") }
+                    if row.blobs != blobs { wrong.append("run \(run) blobs: \(row.blobs)") }
+                    if row.ids != ids { wrong.append("run \(run) ids: \(row.ids)") }
+                    if row.stamps != stamps { wrong.append("run \(run) stamps: \(row.stamps)") }
+                    // The server's own text for the same array.
+                    if row.tagsText != "{swift,http}" { wrong.append("run \(run) text: \(row.tagsText)") }
+                    if row.absent != nil { wrong.append("run \(run) absent: \(String(describing: row.absent))") }
+                }
+                // One array column asked for as a list, with no type of its
+                // own around it.
+                let only = try await pool.first([String].self, "select $1::text[]", tags)
+                if only != tags { wrong.append("one column: \(String(describing: only))") }
+
+                // A real column, and a list on the way in as well as out.
+                let found = try await pool.transaction { tx -> [Tagged] in
+                    try await tx.execute("create temp table array_round_trip "
+                                             + "(id serial primary key, tags text[] not null)")
+                    try await tx.execute("insert into array_round_trip (tags) values ($1), ($2)",
+                                         awkward, tags)
+                    let rows = try await tx.query(Tagged.self,
+                                                  "select id, tags from array_round_trip "
+                                                      + "where $1 = any(tags) order by id",
+                                                  "a,b")
+                    try await tx.execute("drop table array_round_trip")
+                    return rows
+                }
+                if found.count != 1 || found.first?.tags != awkward {
+                    wrong.append("column: \(found.map(\.tags))")
+                }
+                return wrong.isEmpty ? "all agree" : wrong.joined(separator: "; ")
+            } catch {
+                return "threw \(error)"
+            }
+        }
+        let client = app.test
+        client.timeoutMillis = 20_000
+        let text = try client.get("/run").text
+        #expect(text == "all agree", "\(text)")
+    }
 }

@@ -64,11 +64,27 @@ the driver asks for and text as a fallback, and binds as text the server
 accepts whatever its `DateStyle` or `IntervalStyle` is. `numeric` is kept as
 its digits, so 1234.56 is 1234.56 rather than 1234.5599999999999.
 
+An array is a Swift list: `[String]` for `text[]`, `[Int]` for `int[]`,
+`[Timestamp?]` where NULLs are among the elements, and a list of any other
+type the driver reads. A list binds as an array literal, so a parameter is an
+array as readily as a column is:
+
+```swift
+try await pool.execute("insert into notes (tags) values ($1)", ["swift", "http"])
+try await pool.query(Note.self, "select id, tags from notes where $1 = any(tags)", tag)
+```
+
+`[UInt8]` stays a `bytea` rather than a list of numbers, and `[[UInt8]]` is a
+`bytea[]`. One dimension: PostgreSQL's arrays are rectangular and of any
+dimension, which Swift's nested lists are not, so `{{1,2},{3,4}}` is refused
+rather than flattened.
+
 ### Not supported
 
 - `LISTEN` and `NOTIFY`, and `COPY`.
-- Arrays, ranges, `hstore`, enums and composite types, which are read as
-  text.
+- Arrays of more than one dimension, and arrays of a type with no reader of
+  its own, which are read as text.
+- Ranges, `hstore`, enums and composite types, which are read as text.
 - `money`, `bit`, `tsvector`, PostGIS: text as well.
 - Unix-domain sockets. The driver connects over TCP only.
 - SASLprep, so a password with non-ASCII characters may not authenticate.
@@ -78,8 +94,8 @@ its digits, so 1234.56 is 1234.56 rather than 1234.5599999999999.
 ### Future work
 
 - `LISTEN` on a connection of its own, like Redis `subscribe`.
-- Arrays, as `[T]` where `T` is already read.
 - `COPY` in both directions, streamed.
+- Enums and composite types as Swift types.
 - Unix-domain sockets, SASLprep, and a list of hosts to try in order.
 
 ## Redis

@@ -122,7 +122,7 @@ public struct PostgresDate: Sendable, Hashable, Codable, Comparable, CustomStrin
         var julian = UInt(julian)
         julian += 32044
         var quad = julian / 146097
-        var extra = (julian - quad * 146097) * 4 + 3
+        let extra = (julian - quad * 146097) * 4 + 3
         julian += 60 + quad * 3 + extra / 146097
         quad = julian / 1461
         julian -= quad * 1461

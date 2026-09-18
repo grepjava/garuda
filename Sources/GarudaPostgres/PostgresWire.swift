@@ -382,6 +382,19 @@ public enum PostgresValue: Equatable, Sendable {
 
 /// bytea's text form.
 public enum PostgresBytea {
+    /// `\x` and two hex digits a byte, which is how a server takes bytea as
+    /// text and how one element of a `bytea[]` goes in.
+    public static func encodeHex<Bytes: Collection<UInt8>>(_ bytes: Bytes) -> String {
+        let digits: StaticString = "0123456789abcdef"
+        var out: [UInt8] = [UInt8(ascii: "\\"), UInt8(ascii: "x")]
+        out.reserveCapacity(2 + bytes.count * 2)
+        for byte in bytes {
+            out.append(digits.utf8Start[Int(byte >> 4)])
+            out.append(digits.utf8Start[Int(byte & 0x0F)])
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
     /// `\x` and two hex digits a byte, which is how a server has sent bytea
     /// as text since 9.0. The older escape format, which bytea_output can still
     /// ask for, is refused rather than misread.
@@ -414,6 +427,8 @@ public enum PostgresBytea {
 public enum PostgresType {
     public static let bool: UInt32 = 16
     public static let bytea: UInt32 = 17
+    public static let char: UInt32 = 18
+    public static let name: UInt32 = 19
     public static let int8: UInt32 = 20
     public static let int2: UInt32 = 21
     public static let int4: UInt32 = 23
@@ -423,12 +438,70 @@ public enum PostgresType {
     public static let float8: UInt32 = 701
     public static let date: UInt32 = 1082
     public static let time: UInt32 = 1083
+    public static let bpchar: UInt32 = 1042
+    public static let varchar: UInt32 = 1043
     public static let timestamp: UInt32 = 1114
     public static let timestamptz: UInt32 = 1184
     public static let interval: UInt32 = 1186
     public static let numeric: UInt32 = 1700
     public static let uuid: UInt32 = 2950
     public static let jsonb: UInt32 = 3802
+
+    // An array is a type of its own per element type, which pg_type names
+    // after the element's: `_text` for `text[]`.
+    public static let boolArray: UInt32 = 1000
+    public static let byteaArray: UInt32 = 1001
+    public static let charArray: UInt32 = 1002
+    public static let nameArray: UInt32 = 1003
+    public static let int2Array: UInt32 = 1005
+    public static let int4Array: UInt32 = 1007
+    public static let textArray: UInt32 = 1009
+    public static let bpcharArray: UInt32 = 1014
+    public static let varcharArray: UInt32 = 1015
+    public static let int8Array: UInt32 = 1016
+    public static let float4Array: UInt32 = 1021
+    public static let float8Array: UInt32 = 1022
+    public static let jsonArray: UInt32 = 199
+    public static let timestampArray: UInt32 = 1115
+    public static let dateArray: UInt32 = 1182
+    public static let timeArray: UInt32 = 1183
+    public static let timestamptzArray: UInt32 = 1185
+    public static let intervalArray: UInt32 = 1187
+    public static let numericArray: UInt32 = 1231
+    public static let uuidArray: UInt32 = 2951
+    public static let jsonbArray: UInt32 = 3807
+
+    /// What one element of an array of this type is, or nil when the type is
+    /// not an array of a type the driver reads.
+    ///
+    /// The types left out -- geometry, ranges, `tsvector` -- have no Swift
+    /// type here either, so their arrays stay text a handler can read itself.
+    public static func elementType(of array: UInt32) -> UInt32? {
+        switch array {
+        case boolArray: return bool
+        case byteaArray: return bytea
+        case charArray: return char
+        case nameArray: return name
+        case int2Array: return int2
+        case int4Array: return int4
+        case textArray: return text
+        case bpcharArray: return bpchar
+        case varcharArray: return varchar
+        case int8Array: return int8
+        case float4Array: return float4
+        case float8Array: return float8
+        case jsonArray: return json
+        case timestampArray: return timestamp
+        case dateArray: return date
+        case timeArray: return time
+        case timestamptzArray: return timestamptz
+        case intervalArray: return interval
+        case numericArray: return numeric
+        case uuidArray: return uuid
+        case jsonbArray: return jsonb
+        default: return nil
+        }
+    }
 }
 
 public enum PostgresFrontend {

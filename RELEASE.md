@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 788 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 795 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -398,6 +398,18 @@ The Python suites need `h2` and `aioquic`.
   parser reads every style PostgreSQL writes, ISO-8601, the default and
   `sql_standard`. `PostgresClientError.isConstraintViolation` joins
   `sqlState`.
+- PostgreSQL arrays are Swift lists: `[String]` for `text[]`, `[Int]` for
+  `int[]`, `[String?]` where NULLs are among the elements, and a list of any
+  other type the driver reads, `[[UInt8]]` for `bytea[]` included. A list
+  binds as an array literal, so `$1 = any(tags)` takes a list as readily as a
+  column gives one, and every element -- a comma, a quote, a brace, an empty
+  string, the word NULL -- survives the round trip. `[UInt8]` is still a
+  `bytea` rather than a list of numbers. Arrays of more than one dimension are
+  refused rather than flattened. One array column asked for as a list --
+  `pool.first([String].self, "select tags from notes where id = $1", id)` --
+  is that column rather than a row of columns, as bytes already were.
+  `PostgresType.elementType(of:)` and `PostgresArrayText` are public for a
+  driver of your own.
 - `app.every(interval, jitter:firstAfter:onWorker:) { start in ... }` runs work
   on a timer in each worker: clearing what has expired, refreshing a cache. It
   runs on the worker's own thread with the worker's state, from the moment that
