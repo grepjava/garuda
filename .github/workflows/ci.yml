@@ -47,7 +47,9 @@ jobs:
         run: swift test
 
       - name: Handler code that must not compile
-        run: bash scripts/compile-fail-test.sh
+        run: |
+          swift build
+          bash scripts/compile-fail-test.sh
 
   macos:
     name: macos · build and unit tests
@@ -100,23 +102,30 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-      redis:
-        image: redis:7
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
     env:
       GARUDA_POSTGRES: 127.0.0.1:5432:garuda:garuda-secret:garuda
-      GARUDA_REDIS: 127.0.0.1:6379
+      GARUDA_REDIS: 127.0.0.1:6379:garuda-secret
       STARTER_DATABASE_URL: postgres://garuda:garuda-secret@127.0.0.1:5432/garuda?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/swift-linux
         with:
           swift-version: ${{ env.SWIFT_VERSION }}
+
+      # Not a `services:` entry, because one cannot give the image a command,
+      # and the suite checks what a wrong password and no password do -- which
+      # needs a server that asks for one.
+      - name: Redis, asking for a password
+        run: |
+          docker run -d --name redis -p 6379:6379 redis:7 \
+            redis-server --requirepass garuda-secret
+          for _ in $(seq 1 30); do
+            if docker exec redis redis-cli -a garuda-secret ping 2>/dev/null | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "redis did not come up"; docker logs redis; exit 1
 
       - name: Unit tests, with the connector suites switched on
         run: swift test
