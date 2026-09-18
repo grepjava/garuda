@@ -393,6 +393,24 @@ timeouts. When it resumes, every `Response` operation checks
 `(slot, generation, requestId)` and drops an answer for a request that is gone.
 `response.isCancelled` lets a handler check for itself.
 
+`response.cancellable { … }` (Cancellation.swift) is how such a wait is given
+up on rather than merely noticed. The handler task cannot be cancelled --
+tasks are pooled and reused, and a task cancelled in Swift's sense stays
+cancelled -- so the body runs in an unstructured task of its own, on the same
+worker executor, and the handler races it against a waiter registered on the
+connection slot. Every path that ends a request wakes those waiters:
+`cancelOps` covers a closed connection, a reset stream and the next request on
+a keep-alive, and `deadlineFired` covers the deadline, which does not go
+through `cancelOps` while a task holds the slot.
+
+The body is cancelled when the handler gives up, and a body that pays no
+attention to cancellation keeps running on the worker's thread. What it gives
+back is the handler task and nothing else, so the worker counts those
+(`Worker.abandonedWaits`), logs once on the way past
+`ServerConfig.maxAbandonedWaits`, and answers the health check 503 until it
+has caught up -- out of rotation rather than failing requests that have
+nothing to do with what is stuck.
+
 ### Outbound I/O
 
 Connections a worker makes (`Outbound.swift`) are registered on the same

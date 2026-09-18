@@ -49,7 +49,10 @@ feature by feature, and [BENCHMARKS.md](BENCHMARKS.md) has the measurements.
    waiting on the engine, such as `response.sleep` or a streamed write, so that
    it throws and unwinds. A handler waiting on anything else finds
    `response.isCancelled` set when it resumes, and whatever it sends is
-   dropped.
+   dropped. `response.cancellable { … }` runs such a wait in a task of its own
+   and races it against the request ending, so the handler is given back at
+   once; the task is a fresh one, which is why it can be cancelled when the
+   pooled handler task cannot.
 
 What an async handler costs, from probes on Swift 6.3.3 under WSL2, one million
 requests each (single figures move by up to 2× there):

@@ -375,8 +375,10 @@ extension Worker {
         } else if c.pointee.contKind == .task {
             cancelTask(slot)
         }
-        // The writers waiting for room in a response that is over.
+        // The writers waiting for room in a response that is over, and the
+        // handlers waiting to hear that it is over.
         wakeWriters(slot, drained: false)
+        wakeCancelWaiters(slot)
         c.pointee.contOp = -1
         c.pointee.contState = .none
         c.pointee.contKind = .none

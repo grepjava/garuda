@@ -517,6 +517,23 @@ The Python suites need `h2` and `aioquic`.
   a soft hyphen goes. A password that was pasted with a non-breaking space in
   it now authenticates. NFKC normalisation is still not done, and
   [CONNECTORS.md](CONNECTORS.md) says so.
+- `response.cancellable { … }` gives up on a wait the engine does not own.
+  A handler suspended on a library's own continuation was not woken when its
+  request ended -- nothing knew to wake it -- and held a handler task until
+  that wait finished on its own. The body now runs in a task of its own, raced
+  against the request ending, so the handler throws `cancelled` at once. The
+  body is cancelled in the ordinary Swift way, which works because that task
+  is a fresh one: the pooled task running the handler cannot be cancelled,
+  since a task cancelled in Swift's sense stays cancelled. A typed handler
+  asks for the same thing as a `Cancellation` extractor.
+- What that does not do is stop work which ignores cancellation, so the worker
+  counts it, logs once past `ServerConfig.maxAbandonedWaits` (256) and
+  answers the health check 503 until it has caught up. Out of rotation rather
+  than failing requests that have nothing to do with whatever is stuck.
+- Swift 6.2 builds and tests Garuda again, and the package and README say 6.2
+  rather than 6.1, which is where `Span` arrived. Five places handed a
+  `nonisolated(unsafe)` local to a `sending` closure, which 6.3 allows and 6.2
+  does not; `Unsafely` says the claim once instead.
 - CI checks every change instead of waiting to be started by hand. Build,
   unit tests and compile-fail run on each push and pull request, and so do two
   things that were not in CI at all: the connectors against a real PostgreSQL

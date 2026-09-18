@@ -41,6 +41,12 @@ public struct ServerConfig {
     /// producer for every single socket write; a gap gives it a whole batch to
     /// refill.
     public var writeLowWaterMark = 128 * 1024
+    /// How much work outliving its request a worker carries before it stops
+    /// taking new ones (`response.cancellable`, Cancellation.swift). A body
+    /// the handler gave up on keeps running until it finishes; this is where
+    /// a worker full of them says 503 rather than looking healthy. 0 for no
+    /// limit.
+    public var maxAbandonedWaits = 256
     /// Request bytes buffered ahead of the application before the worker stops
     /// reading the socket. An upload that arrives faster than it is taken
     /// should cost TCP window, not memory.

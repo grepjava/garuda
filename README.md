@@ -597,15 +597,20 @@ python3 scripts/broadcast-test.py            # 35  topics across workers, Last-E
 The shell suites need `curl` and `openssl`. The Python suites are clients only,
 using `h2` and `aioquic`, which share no code with the server. Every parser that
 reads network bytes is fuzzed with `swift run -c release pgfuzz`
-([fuzz/README.md](fuzz/README.md)). CI (`.github/workflows/ci.yml`) is started
-by hand. It builds and runs the unit tests on Ubuntu 24.04 and macOS 15, and
-fuzzes for 60 seconds under AddressSanitizer.
+([fuzz/README.md](fuzz/README.md)). CI (`.github/workflows/ci.yml`) runs on
+every push and pull request: the build and unit tests on Ubuntu 24.04 and
+macOS 15, the handler code that must not compile, the connectors against a
+real PostgreSQL and Redis, and the end-to-end suites. The protocol suites and
+a sanitizer fuzz run nightly.
 
 ## Status
 
 A handler waiting on something other than the engine (its own continuation,
 say) is not unwound when its request is cancelled. It resumes to find
-`response.isCancelled` set, and anything it sends is dropped.
+`response.isCancelled` set, and anything it sends is dropped. Wrap such a wait
+in `response.cancellable { … }` and it is given up on when the request ends;
+what it cannot do is stop work that ignores cancellation, which the worker
+counts and reports on the health check instead.
 
 Garuda is before 1.0, so a minor release may still break the public API.
 What that covers, how much notice a change gets, and what has to be true

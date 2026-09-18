@@ -305,6 +305,9 @@ public struct Connection {
     /// API: if the second one to find the backlog full were let through, the
     /// mark would bound the first writer and nothing else.
     var writerWakes: [UnsafeContinuation<Bool, Never>] = []
+    /// Handlers waiting for this request to end so that they can give up on
+    /// a wait the engine does not own (Cancellation.swift).
+    var cancelWaiters: [CancelWaiter] = []
     /// The body a streaming route is reading as it arrives, shared with its
     /// reader so what arrived survives the slot closing.
     var bodyStream: RequestBodyState? = nil

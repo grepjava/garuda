@@ -238,6 +238,9 @@ extension Worker {
         if task < 0 { clearContinuation(slot) }
         respondError(slot, status: .gatewayTimeout, reason: "the handler passed its deadline")
         if task >= 0 { handlerTasks?.cancel(task) }
+        // A deadline does not go through `cancelOps` while a task holds the
+        // slot, so the waits that are not the engine's are ended here.
+        wakeCancelWaiters(slot)
     }
 
     /// Whether the request a handler was given is still the one on the slot,

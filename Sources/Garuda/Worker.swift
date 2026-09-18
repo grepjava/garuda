@@ -122,6 +122,8 @@ public struct Worker {
     /// The jobs `app.every` asked for, running in this worker.
     var scheduled: ScheduledJobs? = nil
     var handlerTaskLimit = 1024
+    /// Bodies still running whose request has ended (Cancellation.swift).
+    var abandonedWaitCount = 0
     /// The threads `blocking` runs work on (BlockingPool.swift), started the
     /// first time it is called.
     var blockingThreads: BlockingPool? = nil
@@ -1243,7 +1245,9 @@ public struct Worker {
     /// once SIGTERM has arrived, so that traffic is routed elsewhere.
     mutating func respondHealthy(_ slot: Int) {
         let c = table[slot]
-        let status = unready ? 503 : 200
+        // Draining, or carrying more work outliving its requests than it can
+        // (Cancellation.swift). Either way this worker should not be sent more.
+        let status = unready || isOverAbandoned ? 503 : 200
         // HTTP/2 and HTTP/3 already have a path that writes a status with an
         // empty body and ends the stream. It was written for error codes, but
         // there is nothing about it that is specific to them.
