@@ -1,3 +1,4 @@
+import Synchronization
 import Testing
 import CAvian
 import AvianCore
@@ -8,15 +9,19 @@ import CGarudaSQLite
 // a database in handlers on a test worker, with its statements on the blocking
 // pool. Every test has a file of its own, removed afterwards.
 
-nonisolated(unsafe) private var fileCounter = 0
+/// Atomic because the three suites in this file run beside one another, and
+/// each of them makes databases. The names they ask for differ, so a torn
+/// count never collided, but a plain `var` read and written from several
+/// threads is a data race whether or not it is got away with.
+private let fileCounter = Atomic<Int>(0)
 
 /// A database path no other test uses, and its removal with its WAL files.
 private final class TemporaryDatabase {
     let path: String
 
     init(_ name: String) {
-        fileCounter += 1
-        path = "/tmp/garuda-sqlite-\(av_getpid())-\(fileCounter)-\(name).db"
+        let number = fileCounter.wrappingAdd(1, ordering: .relaxed).newValue
+        path = "/tmp/garuda-sqlite-\(av_getpid())-\(number)-\(name).db"
         remove()
     }
 

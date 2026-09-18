@@ -54,10 +54,6 @@ jobs:
   macos:
     name: macos · build and unit tests
     runs-on: macos-15
-    env:
-      # A crash here has been hard to reproduce on a developer's Mac, so the
-      # runner is asked for frames rather than just a signal number.
-      SWIFT_BACKTRACE: enable=yes,interactive=no,threads=all
     steps:
       - uses: actions/checkout@v4
 
@@ -83,7 +79,33 @@ jobs:
 
       - name: Unit tests and the fuzz corpus
         run: |
+          # macOS gives a shell 256 descriptors where Linux gives 1024 or
+          # more, and the suites run side by side, each with a worker holding
+          # listeners, connections, pipes and databases. Running out of them
+          # fails a test as though what it tests were broken, so the limit is
+          # raised and printed: 946 tests at 256 descriptors pass on Linux,
+          # so this is not known to be the cause of anything -- it is one
+          # variable fewer, and the numbers are worth having in the log.
+          echo "descriptors: $(ulimit -n) -> $(ulimit -n 4096 2>/dev/null; ulimit -n)"
+          ulimit -n 4096 || true
           swift test \
+            -Xcc -I"$OPENSSL_PREFIX/include" \
+            -Xlinker -L"$OPENSSL_PREFIX/lib"
+
+      # Four tests fail here and nowhere else -- two async handlers that time
+      # out, two SQLite tests -- and no developer's Mac has reproduced any of
+      # them. Running the suites one at a time says which half to look in: if
+      # they pass, the tests interfere with each other through something they
+      # share, and the answer is in how they are scoped; if they still fail,
+      # it is macOS or this toolchain, and the answer is in the engine. This
+      # runs whether the parallel step passed or not, and does not fail the
+      # job on its own.
+      - name: Unit tests again, one suite at a time
+        if: always()
+        continue-on-error: true
+        run: |
+          ulimit -n 4096 || true
+          swift test --no-parallel \
             -Xcc -I"$OPENSSL_PREFIX/include" \
             -Xlinker -L"$OPENSSL_PREFIX/lib"
 
