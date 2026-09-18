@@ -96,14 +96,9 @@ public final class PostgresPool: @unchecked Sendable {
     private var idle: [PostgresConnection] = []
     /// Connections that exist, idle or in use -- including one being opened.
     private var open = 0
-    /// The timed waits of statements waiting for a connection, oldest first,
-    /// from `waitingHead` on: taken from the front by moving the head rather
-    /// than shifting the rest down.
-    private var waiting: [Int32] = []
-    private var waitingHead = 0
-    /// Connections released straight to a wait, by its id, for it to take
-    /// when it runs.
-    private var handedOver: [Int32: PostgresConnection] = [:]
+    /// The statements waiting for a connection, and the connections released
+    /// straight to them.
+    private var waiting = PoolWaiters<PostgresConnection>()
 
     /// `acquireTimeoutMilliseconds` defaults to the configuration's timeout.
     public init(_ configuration: PostgresConfiguration, maxConnections: Int = 8,
@@ -191,8 +186,7 @@ public final class PostgresPool: @unchecked Sendable {
     public func close() {
         for connection in idle { connection.close() }
         idle.removeAll()
-        for connection in handedOver.values { connection.close() }
-        handedOver.removeAll()
+        for connection in waiting.takeAllHandedOver() { connection.close() }
         open = 0
     }
 
@@ -243,20 +237,18 @@ public final class PostgresPool: @unchecked Sendable {
             var id: Int32 = -1
             let outcome = await Worker.waitTimed(worker, milliseconds: acquireTimeoutMilliseconds) {
                 id = $0
-                waiting.append($0)
+                waiting.add($0)
             }
             switch outcome {
             case .woken:
                 // Handed over by the release that woke this wait, so nobody
-                // who arrived since can have taken it first. Nothing handed
-                // over means a connection closed rather than came back, and
-                // there is room to open one.
-                if let connection = handedOver.removeValue(forKey: id) { return connection }
+                // who arrived since can have taken it first (PoolWaiters).
+                if let connection = waiting.take(id) { return connection }
                 continue
             case .timedOut:
                 // Gone from the queue now, rather than when a release reaches
                 // it: with every connection stuck, none may come.
-                if let at = waiting[waitingHead...].firstIndex(of: id) { waiting.remove(at: at) }
+                waiting.remove(id)
                 throw .poolTimedOut
             case .cancelled:
                 throw .cancelled
@@ -271,17 +263,9 @@ public final class PostgresPool: @unchecked Sendable {
         // it -- seeing, and committing or rolling back, work that was never
         // theirs. Closing it makes the server roll back.
         if connection.isOpen && connection.transactionStatus == .idle {
-            // Straight to the oldest wait, if there is one. Put back as idle
-            // and the wait merely woken, it went to whoever asked next before
-            // the woken task ran -- a new request, or the one that had just
-            // released it -- and the wait joined the back of the queue again
-            // with nothing: a request could lose its turn over and over, and
-            // the slowest answers were twice axum's under the same load.
-            if let id = wakeOne() {
-                handedOver[id] = connection
-            } else {
-                idle.append(connection)
-            }
+            // Straight to the oldest wait, if there is one (PoolWaiters).
+            if let worker = currentWorker, waiting.handOver(connection, on: worker) { return }
+            idle.append(connection)
         } else {
             if connection.isOpen { connection.close() }
             open -= 1
@@ -289,30 +273,9 @@ public final class PostgresPool: @unchecked Sendable {
         }
     }
 
-    /// Wakes the oldest wait still waiting. An id at the front may belong to a
-    /// wait whose timer has fired but whose task has not yet run to take it
-    /// out of the queue; waking it wakes nothing, and stopping there would
-    /// leave the live wait behind it asleep with a connection free.
-    ///
-    /// Returns the wait it woke, or nil when there was none.
-    @discardableResult
-    private func wakeOne() -> Int32? {
-        guard let worker = currentWorker else { return nil }
-        while waitingHead < waiting.count {
-            let id = waiting[waitingHead]
-            waitingHead += 1
-            if waitingHead == waiting.count {
-                waiting.removeAll(keepingCapacity: true)
-                waitingHead = 0
-            } else if waitingHead >= 64 && waitingHead * 2 >= waiting.count {
-                // A queue that never empties under steady load would
-                // otherwise keep everything it has ever served.
-                waiting.removeFirst(waitingHead)
-                waitingHead = 0
-            }
-            if worker.pointee.wakeTimed(id) { return id }
-        }
-        return nil
+    private func wakeOne() {
+        guard let worker = currentWorker else { return }
+        waiting.wakeOldest(on: worker)
     }
 
     /// Lends one connection for as long as a `COPY` takes: the stream is the
@@ -333,7 +296,7 @@ public final class PostgresPool: @unchecked Sendable {
     /// For tests: how many connections exist, and how many are idle.
     var counts: (open: Int, idle: Int) { (open, idle.count) }
     /// For tests: how many statements are queued for a connection.
-    var waitingCount: Int { waiting.count - waitingHead }
+    var waitingCount: Int { waiting.count }
 }
 
 /// Statements inside one transaction, all on the same connection.

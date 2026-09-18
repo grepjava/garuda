@@ -284,7 +284,9 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
 
     private var idle: [RedisConnection] = []
     private var open = 0
-    private var waiting: [Int32] = []
+    /// The commands waiting for a connection, and the connections released
+    /// straight to them.
+    private var waiting = PoolWaiters<RedisConnection>()
 
     public init(_ configuration: RedisConfiguration, maxConnections: Int = 8,
                 acquireTimeoutMilliseconds: UInt64? = nil) {
@@ -405,6 +407,7 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
     public func close() {
         for connection in idle { connection.close() }
         idle.removeAll()
+        for connection in waiting.takeAllHandedOver() { connection.close() }
         open = 0
     }
 
@@ -446,13 +449,16 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
             var id: Int32 = -1
             let outcome = await Worker.waitTimed(worker, milliseconds: acquireTimeoutMilliseconds) {
                 id = $0
-                waiting.append($0)
+                waiting.add($0)
             }
             switch outcome {
             case .woken:
+                // Handed over by the release that woke this wait, so nobody
+                // who arrived since can have taken it first (PoolWaiters).
+                if let connection = waiting.take(id) { return connection }
                 continue
             case .timedOut:
-                waiting.removeAll { $0 == id }
+                waiting.remove(id)
                 throw .poolTimedOut
             case .cancelled:
                 throw .cancelled
@@ -462,21 +468,21 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
 
     private func release(_ connection: RedisConnection) {
         if connection.isOpen && connection.isClean {
+            // Straight to the oldest wait, if there is one (PoolWaiters).
+            if let worker = currentWorker, waiting.handOver(connection, on: worker) { return }
             idle.append(connection)
         } else {
             // Closing is what discards a MULTI or a WATCH left behind: the
             // server drops both with the connection.
             if connection.isOpen { connection.close() }
             open -= 1
+            wakeOne()
         }
-        wakeOne()
     }
 
     private func wakeOne() {
         guard let worker = currentWorker else { return }
-        while !waiting.isEmpty {
-            if worker.pointee.wakeTimed(waiting.removeFirst()) { return }
-        }
+        waiting.wakeOldest(on: worker)
     }
 
     /// For tests: how many connections exist, and how many are idle.

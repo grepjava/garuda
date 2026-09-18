@@ -947,6 +947,10 @@ The Python suites need `h2` and `aioquic`.
 
 ### Redis
 
+- A released connection goes straight to the oldest command waiting for one,
+  as the PostgreSQL pool's now does: woken and left to take it from the idle
+  list, a waiting command could lose it to one that arrived after it, again
+  and again. The two pools share the queue that does this.
 - A native driver on the worker's poller. A `RedisPool` per worker, built by
   `app.state`, with an acquire timeout like PostgreSQL's.
 - HELLO 3 with the credentials and client name, so replies are RESP3; a server
