@@ -633,6 +633,9 @@ struct SQLiteDatabaseTests {
         var otherConfiguration = SQLiteConfiguration(path: path)
         otherConfiguration.busyTimeoutMilliseconds = 50
         let other = Other(try SQLiteDatabase(otherConfiguration))
+        /// Set once /main-holds has its write lock.
+        final class Held: @unchecked Sendable { var value = false }
+        let mainHeld = Held()
         app.get("/other-holds") { (_: State<SQLiteDatabase>) async throws -> String in
             try await other.db.transaction { tx in
                 try await tx.execute("insert into n values (1)")
@@ -661,6 +664,7 @@ struct SQLiteDatabaseTests {
         app.get("/main-holds") { (db: State<SQLiteDatabase>) async throws -> String in
             try await db.value.transaction { tx in
                 try await tx.execute("insert into n values (4)")
+                mainHeld.value = true
                 await pause(300)
             }
             return "released"
@@ -688,8 +692,10 @@ struct SQLiteDatabaseTests {
         // the wait gives up with SQLITE_BUSY (5).
         let mainHolder = try TestWire(client)
         mainHolder.send("GET /main-holds HTTP/1.1\r\nHost: test\r\n\r\n")
-        let settle2 = av_monotonic_ms()
-        while av_monotonic_ms() &- settle2 < 50 { client.turn() }
+        // Until the insert has run and holds the lock, not for a fixed time:
+        // on a slow runner 50 ms was not always enough, and the write that
+        // should have been refused went through.
+        #expect(mainHolder.turn(until: { mainHeld.value }, turns: 5_000_000))
         #expect(try client.get("/other-write").text == "busy 5")
         #expect((mainHolder.receive(turns: 5_000_000) ?? "").hasSuffix("released"))
         #expect(try client.get("/other-write").text == "written")
