@@ -69,10 +69,18 @@ server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
     --static-dir "/static=$WORK/assets" \
     > "$WORK/server.log" 2>&1
 
-for _ in $(seq 1 60); do
-    curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null && break
-    sleep 0.2
-done
+# A server that has been started is not yet a server that is listening, and
+# every section below restarts one. Waiting for the port is the difference
+# between a suite that passes and a suite that passes on an idle machine.
+wait_for_port() {
+    for _ in $(seq 1 60); do
+        curl -sS --max-time 1 -o /dev/null "http://127.0.0.1:$1/" 2>/dev/null && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+wait_for_port "$PORT"
 H="http://127.0.0.1:$PORT"
 
 code() { curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
@@ -231,6 +239,7 @@ server_require_port_free "$PORT" || exit 1
 server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
     --static-dir "/static=$WORK/assets" --static-listing \
     > "$WORK/dir.log" 2>&1
+wait_for_port "$PORT"
 H="http://127.0.0.1:$PORT"
 
 is "a directory with an index serves it"   "$(body $H/static/pages/)" "<h1>Index</h1>"
@@ -271,6 +280,7 @@ server_require_port_free "$PORT" || exit 1
 server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
     --static-dir "/static=$WORK/assets" --static-index \
     > "$WORK/index.log" 2>&1
+wait_for_port "$PORT"
 is "an index is served"                  "$(body $H/static/pages/)" "<h1>Index</h1>"
 is "a directory without one is not listed" "$(code $H/static/listed/)" "404"
 
@@ -281,6 +291,7 @@ server_require_port_free "$PORT" || exit 1
 server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
     --static-dir "/static=$WORK/assets" \
     > "$WORK/plain.log" 2>&1
+wait_for_port "$PORT"
 is "a directory is not served by default"    "$(code $H/static/pages/)" "404"
 is "not even one with an index"              "$(code $H/static/pages)" "404"
 is "and the route root is still not served"  "$(code $H/static/)" "404"
