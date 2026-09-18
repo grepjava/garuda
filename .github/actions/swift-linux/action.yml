@@ -1,0 +1,53 @@
+# The Swift toolchain and the system libraries Garuda links, on Ubuntu.
+#
+# One copy, because four jobs need it and four copies drift. The toolchain is
+# cached by version, so only the first run of a new version downloads it.
+
+name: Swift on Linux
+description: Installs the system packages and the Swift toolchain, and puts it on PATH.
+
+inputs:
+  swift-version:
+    description: The Swift release to install.
+    required: true
+  platform:
+    description: The download's platform directory, such as ubuntu24.04.
+    required: false
+    default: ubuntu24.04
+  slug:
+    description: The download's platform slug, such as ubuntu2404.
+    required: false
+    default: ubuntu2404
+
+runs:
+  using: composite
+  steps:
+    - name: System packages
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
+          libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev
+
+    - name: Cache the Swift toolchain
+      id: swift-cache
+      uses: actions/cache@v4
+      with:
+        path: /opt/swift
+        key: swift-${{ inputs.swift-version }}-${{ inputs.platform }}
+
+    - name: Swift toolchain
+      if: steps.swift-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        dir="swift-${{ inputs.swift-version }}-RELEASE-${{ inputs.platform }}"
+        url="https://download.swift.org/swift-${{ inputs.swift-version }}-release/${{ inputs.slug }}"
+        url="${url}/swift-${{ inputs.swift-version }}-RELEASE/${dir}.tar.gz"
+        curl -fsSL "$url" -o /tmp/swift.tar.gz
+        tar -xzf /tmp/swift.tar.gz -C /tmp
+        sudo cp -r "/tmp/${dir}/usr" /opt/swift
+
+    - name: Environment
+      shell: bash
+      run: echo "/opt/swift/bin" >> "$GITHUB_PATH"

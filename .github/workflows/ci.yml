@@ -1,8 +1,26 @@
-# Swift build, tests, and a short fuzz run. Started by hand.
+# What every change is checked by.
+#
+# On a push or a pull request: the build, the unit tests, the handler code that
+# must not compile, the connectors against real PostgreSQL and Redis, and the
+# end-to-end suites that drive the release binary over HTTP/1.1. Those are the
+# ones fast enough to run each time and specific enough to be worth waiting
+# for.
+#
+# Nightly, and on demand: the protocol suites -- HTTP/2, HTTP/3, WebSocket,
+# WebTransport, uploads -- which need a Python environment and a QUIC stack,
+# and the fuzzer under AddressSanitizer. A failure there is a bug to fix, not
+# a pull request to block, and the matrix is long enough that running it on
+# every push would teach people to ignore it.
 
 name: CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 03:17 UTC, off the hour so it does not queue behind everyone else's.
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -11,42 +29,16 @@ concurrency:
 
 env:
   SWIFT_VERSION: "6.1.2"
-  SWIFT_PLATFORM: ubuntu24.04
-  SWIFT_SLUG: ubuntu2404
 
 jobs:
   linux:
-    name: linux
+    name: linux · build and unit tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: System packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
-            libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev
-
-      - name: Cache the Swift toolchain
-        id: swift-cache
-        uses: actions/cache@v4
+      - uses: ./.github/actions/swift-linux
         with:
-          path: /opt/swift
-          key: swift-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_PLATFORM }}
-
-      - name: Swift toolchain
-        if: steps.swift-cache.outputs.cache-hit != 'true'
-        run: |
-          dir="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}"
-          url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_SLUG}"
-          url="${url}/swift-${SWIFT_VERSION}-RELEASE/${dir}.tar.gz"
-          curl -fsSL "$url" -o /tmp/swift.tar.gz
-          tar -xzf /tmp/swift.tar.gz -C /tmp
-          sudo cp -r "/tmp/${dir}/usr" /opt/swift
-
-      - name: Environment
-        run: echo "/opt/swift/bin" >> "$GITHUB_PATH"
+          swift-version: ${{ env.SWIFT_VERSION }}
 
       - name: Build
         run: swift build -c release --product garuda
@@ -58,7 +50,7 @@ jobs:
         run: bash scripts/compile-fail-test.sh
 
   macos:
-    name: macos
+    name: macos · build and unit tests
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -89,44 +81,148 @@ jobs:
             -Xcc -I"$OPENSSL_PREFIX/include" \
             -Xlinker -L"$OPENSSL_PREFIX/lib"
 
-  fuzz:
-    name: fuzz · address sanitizer
+  # The connector tests are opt-in: without these environment variables they
+  # skip themselves, which is how `swift test` stays runnable with nothing
+  # installed. This job is what stops that from meaning "never run".
+  connectors:
+    name: linux · PostgreSQL, Redis and the example app
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: garuda
+          POSTGRES_PASSWORD: garuda-secret
+          POSTGRES_DB: garuda
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U garuda"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GARUDA_POSTGRES: 127.0.0.1:5432:garuda:garuda-secret:garuda
+      GARUDA_REDIS: 127.0.0.1:6379
+      STARTER_DATABASE_URL: postgres://garuda:garuda-secret@127.0.0.1:5432/garuda?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/swift-linux
+        with:
+          swift-version: ${{ env.SWIFT_VERSION }}
+
+      - name: Unit tests, with the connector suites switched on
+        run: swift test
+
+      - name: The example applications
+        working-directory: Examples
+        run: swift test
+
+  # The release binary driven over a socket, which is the only way to check
+  # what the parser and the connection do rather than what a test client does.
+  end-to-end:
+    name: linux · end-to-end suites
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: System packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
-            libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev
-
-      - name: Cache the Swift toolchain
-        id: swift-cache
-        uses: actions/cache@v4
+      - uses: ./.github/actions/swift-linux
         with:
-          path: /opt/swift
-          key: swift-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_PLATFORM }}
+          swift-version: ${{ env.SWIFT_VERSION }}
 
-      - name: Swift toolchain
-        if: steps.swift-cache.outputs.cache-hit != 'true'
+      - name: Tools the suites drive the server with
+        run: sudo apt-get install -y --no-install-recommends curl netcat-openbsd openssl
+
+      - name: Build the servers
+        run: swift build -c release
+
+      - name: Router, static files, compression and caching
         run: |
-          dir="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}"
-          url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_SLUG}"
-          url="${url}/swift-${SWIFT_VERSION}-RELEASE/${dir}.tar.gz"
-          curl -fsSL "$url" -o /tmp/swift.tar.gz
-          tar -xzf /tmp/swift.tar.gz -C /tmp
-          sudo cp -r "/tmp/${dir}/usr" /opt/swift
+          bash scripts/integration-test.sh
+          bash scripts/static-test.sh
+          bash scripts/compress-test.sh
+          bash scripts/cache-test.sh
 
-      - name: Environment
-        run: echo "/opt/swift/bin" >> "$GITHUB_PATH"
+      - name: Limits, redirects and certificates
+        run: |
+          bash scripts/ratelimit-test.sh
+          bash scripts/redirect-test.sh
+          bash scripts/sni-test.sh
+
+      - name: Request identity and the supervisor
+        run: |
+          bash scripts/request-id-test.sh
+          bash scripts/trace-context-test.sh
+          bash scripts/drain-test.sh
+          bash scripts/reload-test.sh
+
+  # HTTP/2, HTTP/3, WebSocket, WebTransport and uploads, against clients built
+  # from h2 and aioquic. Nightly: they need a Python environment and a QUIC
+  # stack, and they are slow enough that blocking a push on them would be a
+  # good way to have them turned off.
+  protocols:
+    name: linux · protocol suites
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/swift-linux
+        with:
+          swift-version: ${{ env.SWIFT_VERSION }}
+
+      - name: Python clients
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --upgrade pip
+          /tmp/venv/bin/pip install h2 aioquic
+          echo "/tmp/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Tools the suites drive the server with
+        run: sudo apt-get install -y --no-install-recommends curl openssl
+
+      - name: Build the servers
+        run: swift build -c release
+
+      - name: Features and HTTP/1.1 handlers
+        run: |
+          python3 scripts/feature-test.py
+          python3 scripts/handler-test.py
+          python3 scripts/router-streams-test.py
+
+      - name: HTTP/2 and HTTP/3
+        run: |
+          python3 scripts/http2-test.py
+          python3 scripts/http3-test.py
+
+      - name: WebSocket, WebTransport, uploads and broadcast
+        run: |
+          python3 scripts/websocket-test.py
+          python3 scripts/websocket-streams-test.py
+          python3 scripts/webtransport-test.py
+          python3 scripts/upload-test.py
+          python3 scripts/broadcast-test.py
+
+  fuzz:
+    name: linux · fuzz under AddressSanitizer
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/swift-linux
+        with:
+          swift-version: ${{ env.SWIFT_VERSION }}
 
       - name: Build with AddressSanitizer
         run: swift build -c release --product pgfuzz -Xswiftc -sanitize=address
 
       - name: Fuzz the parsers
-        run: .build/release/pgfuzz --seconds 60
+        run: .build/release/pgfuzz --seconds ${{ github.event_name == 'schedule' && '600' || '60' }}
 
       - name: Keep what it found
         if: failure()
@@ -137,37 +233,13 @@ jobs:
           if-no-files-found: ignore
 
   dependency:
-    name: versioned dependency
+    name: linux · versioned dependency
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: System packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
-            libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev
-
-      - name: Cache the Swift toolchain
-        id: swift-cache
-        uses: actions/cache@v4
+      - uses: ./.github/actions/swift-linux
         with:
-          path: /opt/swift
-          key: swift-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_PLATFORM }}
-
-      - name: Swift toolchain
-        if: steps.swift-cache.outputs.cache-hit != 'true'
-        run: |
-          dir="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}"
-          url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_SLUG}"
-          url="${url}/swift-${SWIFT_VERSION}-RELEASE/${dir}.tar.gz"
-          curl -fsSL "$url" -o /tmp/swift.tar.gz
-          tar -xzf /tmp/swift.tar.gz -C /tmp
-          sudo cp -r "/tmp/${dir}/usr" /opt/swift
-
-      - name: Environment
-        run: echo "/opt/swift/bin" >> "$GITHUB_PATH"
+          swift-version: ${{ env.SWIFT_VERSION }}
 
       # SwiftPM treats a git URL with a version requirement as a remote
       # dependency and refuses unsafe build flags in one, so this fails if a

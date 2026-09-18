@@ -13,15 +13,28 @@ under [Unreleased](#unreleased) in the commit that makes it. When a version is
 cut, that section is renamed to the version and its date, and a new empty
 Unreleased section goes above it.
 
-**Before cutting a version.** CI (`.github/workflows/ci.yml`) is started by
-hand. It builds the release binary and runs `swift test` on Ubuntu 24.04 and
-macOS 15, and fuzzes the parsers with `pgfuzz` for 60 seconds under
-AddressSanitizer. The end-to-end suites are not in CI. Run them against the
-release build:
+**What CI runs.** `.github/workflows/ci.yml` runs on every push to `main` and
+every pull request:
+
+- the release build and `swift test` on Ubuntu 24.04 and macOS 15, and the
+  handler code that must not compile;
+- `swift test` again against a real PostgreSQL and a real Redis, which is what
+  turns the opt-in connector suites on, and the example applications with
+  them;
+- the end-to-end suites, which drive the release binary over a socket.
+
+Nightly, and on demand, it also runs the protocol suites -- HTTP/2, HTTP/3,
+WebSocket, WebTransport, uploads, broadcast -- and fuzzes the parsers with
+`pgfuzz` under AddressSanitizer, for ten minutes on the nightly run and one on
+the others. Those are slow and need a QUIC stack, so a failure in them is a
+bug to fix rather than a push to block.
+
+**Before cutting a version.** Run the lot against the release build, including
+what CI holds back for the night:
 
 ```bash
 swift build -c release
-swift test                             # 927 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 938 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -504,6 +517,17 @@ The Python suites need `h2` and `aioquic`.
   a soft hyphen goes. A password that was pasted with a non-breaking space in
   it now authenticates. NFKC normalisation is still not done, and
   [CONNECTORS.md](CONNECTORS.md) says so.
+- CI checks every change instead of waiting to be started by hand. Build,
+  unit tests and compile-fail run on each push and pull request, and so do two
+  things that were not in CI at all: the connectors against a real PostgreSQL
+  and a real Redis, which is what makes the opt-in suites run, and the
+  end-to-end suites that drive the release binary over a socket. The protocol
+  suites and the sanitizer fuzz run nightly. The Swift toolchain setup is one
+  composite action rather than four copies.
+- Two races in the tests themselves, which each failed about one full run in
+  five: the resolver's fakes took a TCP port because a UDP one of that number
+  was free, and the SPA fallback tests named their site directory from an
+  unsynchronised counter.
 - Every producer writing a streamed response waits while the client is
   behind, not only the first to find the backlog full. A second producer used
   to be let through on the ground that someone else was already waiting, which
