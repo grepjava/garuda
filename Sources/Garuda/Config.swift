@@ -194,6 +194,19 @@ public struct ServerConfig {
     /// to a client that accepts it. A static file reflects nothing, so this is
     /// safe wherever the files themselves are.
     public var compressStatic = false
+    /// Answer a request for a `--static-dir` directory with its `index.html`.
+    /// Off by default, because a directory that is not served falls through
+    /// to the application, and taking that path away is the operator's
+    /// decision rather than a default.
+    public var staticIndex = false
+    /// Answer a request for a `--static-dir` directory that has no index with
+    /// a listing of what is in it. Implies `staticIndex`: a directory with an
+    /// index file is served that, since it is the page somebody wrote.
+    ///
+    /// Off by default, and deliberately: a listing tells whoever asks every
+    /// name in the directory, which is a different decision from serving the
+    /// files themselves.
+    public var staticListing = false
     /// A response declaring fewer bytes than this is sent as it is. Below
     /// about a kilobyte the saving is smaller than the framing.
     public var compressMinimumLength = 1024

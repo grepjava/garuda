@@ -24,7 +24,7 @@ swift build -c release
 swift test                             # 912 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
-bash scripts/static-test.sh            # 69
+bash scripts/static-test.sh            # 93
 bash scripts/compress-test.sh          # 76, and garuda-conformance
 bash scripts/cache-test.sh             # 85, runs garuda-conformance
 bash scripts/ratelimit-test.sh         # 18
@@ -860,6 +860,16 @@ The Python suites need `h2` and `aioquic`.
   boundaries with a file being handed to `sendfile`. `If-Range` sends the range
   only while the client's copy is still current, and the whole file when it is
   not.
+- `--static-index` answers a request for a `--static-dir` directory with its
+  `index.html`, and `--static-listing` lists one that has no index. Both are
+  off by default: a directory that is not answered falls through to the
+  routes, as an unserved path always has, and a listing tells whoever asks
+  every name in the directory. A directory asked for without its trailing
+  slash is a 301 to the slash, keeping the query. A listing shows regular
+  files and directories, directories first, leaves out names beginning with
+  `.`, and carries `Cache-Control: no-store`. It walks one segment at a time
+  with `O_NOFOLLOW`, so it cannot leave the tree and a symlinked directory is
+  not listed.
 - `--compress` compresses handler responses, whoever answered them, with the
   coding the client rates highest. A whole body states its compressed length,
   and a streamed one is compressed as it is written, flushed with each write.

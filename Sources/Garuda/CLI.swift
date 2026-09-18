@@ -154,6 +154,10 @@ public enum GarudaCLI {
                                        are (default 1024)
               --compress-static        serve FILE.br, FILE.zst or FILE.gz beside a
                                        --static-dir file to clients that accept it
+              --static-index           answer a --static-dir directory with its
+                                       index.html
+              --static-listing         answer a --static-dir directory that has no
+                                       index.html with a listing of it
               --request-start-header   give handlers request.requestStart, when the
                                        request arrived, for APM agents that report
                                        queue time
@@ -495,6 +499,11 @@ public enum GarudaCLI {
                 config.compress = true
             } else if matches(arg, "--compress-static") {
                 config.compressStatic = true
+            } else if matches(arg, "--static-index") {
+                config.staticIndex = true
+            } else if matches(arg, "--static-listing") {
+                config.staticListing = true
+                config.staticIndex = true
             } else if matches(arg, "--compress-min-size") {
                 guard let v = next("--compress-min-size needs a byte count") else { break }
                 config.compressMinimumLength = max(0, parseInt(v))

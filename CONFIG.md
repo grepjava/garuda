@@ -306,6 +306,8 @@ with 501.
 | flag | default | what it does |
 |---|---|---|
 | `--static-dir P=DIR` | none | serve URL prefix P from DIR; repeatable |
+| `--static-index` | off | answer a `--static-dir` directory with its `index.html` |
+| `--static-listing` | off | list a `--static-dir` directory that has no `index.html` |
 | `--spa-fallback P=FILE` | none | answer a browser navigation under P that nothing else answers with FILE; repeatable |
 | `--compress-static` | off | serve `FILE.br`, `FILE.zst` or `FILE.gz` beside a static file when accepted |
 | `--compress` | off | compress handler responses with brotli, zstd or gzip, as the client accepts |
@@ -350,9 +352,37 @@ garuda --static-dir /static=/srv/app/static --static-dir /media=/srv/app/media
   answer. One range per request -- a request for several gets the whole file,
   as RFC 9110 section 14.2 allows. `If-Range` sends the range only while the
   client's copy is current, and the whole file otherwise.
-- There is no directory index.
+- A directory is not served unless asked for: `--static-index` answers one
+  with its `index.html`, and `--static-listing` lists one that has no index.
+  Without either, a directory falls through to the routes as any unserved
+  path does.
 - On plaintext HTTP/1.1 the file goes out with `sendfile(2)`. Over TLS (without
   `--ktls`), HTTP/2 and HTTP/3 it is read and then encrypted or framed.
+
+### `--static-index` and `--static-listing`
+
+```bash
+garuda --static-dir /files=/srv/files --static-listing
+```
+
+- `--static-index` answers a request for a directory with its `index.html`,
+  through the same path as any other file: the same containment, `ETag`,
+  ranges and conditional requests.
+- `--static-listing` also lists a directory that has no `index.html`. It
+  implies `--static-index`, since a page somebody wrote beats a list of names.
+- Both are off by default. A directory that is not answered falls through to
+  the routes, and a listing tells whoever asks every name in the directory --
+  a different decision from serving the files themselves.
+- A directory asked for without its trailing slash is a `301` to the slash,
+  keeping the query, so that relative links resolve inside it.
+- A listing shows regular files and directories, sorted with the directories
+  first. Names beginning with `.` are left out, and so is anything that is
+  neither a file nor a directory. It carries `Cache-Control: no-store`: it
+  describes what is there now and has no validator to check that against.
+- A symlinked directory is not listed, even one pointing inside the tree. A
+  listing walks one segment at a time with `O_NOFOLLOW`, so the walk cannot
+  leave the tree at all; deciding whether a link's target is still inside it
+  would need the resolution that opening a file does.
 
 ### `--compress-static`
 

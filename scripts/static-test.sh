@@ -215,6 +215,76 @@ is "keep-alive survives a static file" \
 
 server_stop
 
+# --- directories ---------------------------------------------------------
+# Off by default: a directory falls through to the router, as it always has.
+# With --static-index it is answered by its index.html, and with
+# --static-listing one without an index is listed.
+mkdir -p "$WORK/assets/pages/inner" "$WORK/assets/listed/sub"
+echo "<h1>Index</h1>"     > "$WORK/assets/pages/index.html"
+echo "inner"              > "$WORK/assets/pages/inner/deep.txt"
+echo "one"                > "$WORK/assets/listed/one.txt"
+printf 'x%.0s' $(seq 1 2048) > "$WORK/assets/listed/two.bin"
+echo "hidden"             > "$WORK/assets/listed/.hidden"
+ln -s "$WORK/secret"      "$WORK/assets/listed/out"
+
+server_require_port_free "$PORT" || exit 1
+server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
+    --static-dir "/static=$WORK/assets" --static-listing \
+    > "$WORK/dir.log" 2>&1
+H="http://127.0.0.1:$PORT"
+
+is "a directory with an index serves it"   "$(body $H/static/pages/)" "<h1>Index</h1>"
+is "and without the slash redirects to it" "$(code $H/static/pages)" "301"
+is "the redirect points at the slash" \
+   "$(curl -sS -I --max-time 10 $H/static/pages | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}')" \
+   "/static/pages/"
+is "a query survives the redirect" \
+   "$(curl -sS -I --max-time 10 "$H/static/pages?a=1" | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}')" \
+   "/static/pages/?a=1"
+
+is "a directory with no index is listed" "$(code $H/static/listed/)" "200"
+is "the listing is HTML" \
+   "$(curl -sS -I --max-time 10 $H/static/listed/ | tr -d '\r' | awk '/^[Cc]ontent-[Tt]ype:/ {print $2, $3}')" \
+   "text/html; charset=utf-8"
+is "it names the files"      "$(body $H/static/listed/ | grep -c 'one.txt')" "1"
+is "it names the directories" "$(body $H/static/listed/ | grep -c 'sub/')" "1"
+is "it says how big a file is" "$(body $H/static/listed/ | grep -c '2.0 kB')" "1"
+is "it has a link to the parent" "$(body $H/static/listed/ | grep -c 'href="../"')" "1"
+is "a dotfile is not listed"  "$(body $H/static/listed/ | grep -c 'hidden')" "0"
+is "a symlink out of the tree is not listed" "$(body $H/static/listed/ | grep -c '>out<')" "0"
+is "and is not served through the listing" "$(code $H/static/listed/out/passwd)" "404"
+is "a listing is not cached" \
+   "$(curl -sS -I --max-time 10 $H/static/listed/ | tr -d '\r' | awk '/^[Cc]ache-[Cc]ontrol:/ {print $2}')" \
+   "no-store"
+is "a HEAD of a listing has no body" \
+   "$(curl -sS -I --max-time 10 -o /dev/null -w '%{http_code}:%{size_download}' $H/static/listed/)" "200:0"
+is "dot-dot cannot walk out of a listing" "$(code --path-as-is $H/static/listed/../../secret/)" "404"
+is "a file is still served with listings on" "$(body $H/static/site.css)" "body { color: red }"
+is "a missing directory still reaches the router" "$(code $H/static/nothing/)" "404"
+is "a listing over HTTP/2 is the same" \
+   "$(curl -sS --http2-prior-knowledge --max-time 10 $H/static/listed/ | grep -c 'one.txt')" "1"
+
+server_stop
+
+# --- an index without listings -------------------------------------------
+server_require_port_free "$PORT" || exit 1
+server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
+    --static-dir "/static=$WORK/assets" --static-index \
+    > "$WORK/index.log" 2>&1
+is "an index is served"                  "$(body $H/static/pages/)" "<h1>Index</h1>"
+is "a directory without one is not listed" "$(code $H/static/listed/)" "404"
+
+server_stop
+
+# --- neither flag --------------------------------------------------------
+server_require_port_free "$PORT" || exit 1
+server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
+    --static-dir "/static=$WORK/assets" \
+    > "$WORK/plain.log" 2>&1
+is "a directory is not served by default"    "$(code $H/static/pages/)" "404"
+is "not even one with an index"              "$(code $H/static/pages)" "404"
+is "and the route root is still not served"  "$(code $H/static/)" "404"
+
 # --- over TLS ------------------------------------------------------------
 # sendfile cannot encrypt, so TLS takes the read-and-buffer path. It has to
 # produce the same bytes.

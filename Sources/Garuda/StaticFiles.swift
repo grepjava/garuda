@@ -214,7 +214,16 @@ extension Worker {
                     av_static_open(route.directory, $0, &size, &mtime)
                 }
             }
-            if fd < 0 { continue }
+            if fd < 0 {
+                // No file there. It may still be a directory somebody asked
+                // to have answered.
+                if config.staticIndex,
+                   serveDirectory(slot, route: route, decoded: &decoded, n: n,
+                                  prefixLength: prefixLength) {
+                    return true
+                }
+                continue
+            }
 
             // --compress-static: a copy compressed at build time, beside the
             // file, in the order the client prefers. The original has to
@@ -292,7 +301,7 @@ extension Worker {
     }
 
     /// Writes the response head for an open file, then arms the body.
-    private mutating func sendFile(_ slot: Int, fd: Int32, size: Int, mtime: Int,
+    mutating func sendFile(_ slot: Int, fd: Int32, size: Int, mtime: Int,
                                    coding: ContentCoding,
                                    nameLength: Int, name: inout [UInt8]) {
         let c = table[slot]
