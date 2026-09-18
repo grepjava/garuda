@@ -113,9 +113,21 @@ public struct UploadLimits: Sendable {
 public struct CompletedUpload: Sendable {
     public let info: UploadInfo
     public let store: FileUploadStore
+    /// The SHA-256 of the bytes, when it has been computed already -- because
+    /// the client declared one that was checked, or asked to be told it.
+    public let sha256: [UInt8]?
     /// Where the bytes are.
     public var path: String { store.dataPath(info.id) }
     public var length: Int { info.offset }
+
+    /// The SHA-256 of the upload's bytes, read from the file when it has not
+    /// been computed already. Nil only if the file cannot be read.
+    ///
+    /// Worth storing beside whatever the bytes become: it is what lets a
+    /// client be told later that what it sent is what is held.
+    public func digest() -> [UInt8]? {
+        sha256 ?? Digest.sha256(contentsOfFile: path)
+    }
 
     /// Removes the upload and its bytes, once they have been moved or used.
     public func remove() throws { try store.delete(info.id) }
@@ -168,6 +180,14 @@ extension RouteBuilder {
 enum UploadProblem {
     static let mismatchingOffset = "https://iana.org/assignments/http-problem-types#mismatching-upload-offset"
     static let inconsistentLength = "https://iana.org/assignments/http-problem-types#inconsistent-upload-length"
+    /// Not one of the draft's: bytes that are not what the client's digest
+    /// said, which the draft says nothing about.
+    static let mismatchingDigest = "https://garuda.dev/problems/mismatching-digest"
+}
+
+enum UploadDigestError: Error {
+    /// A digest field naming an algorithm this server does not check.
+    case unreadable
 }
 
 /// Shared by an application's upload routes. A worker is one thread, and
@@ -266,13 +286,28 @@ final class UploadService: @unchecked Sendable {
            declared > maxAppendSize {
             return tooLarge(response)
         }
+        let contentDigest: [UInt8]?
+        do {
+            contentDigest = try digestOf(request)
+        } catch {
+            return response.send(status: .badRequest,
+                                 "Content-Digest names no digest this server checks")
+        }
         let now = Int(time(nil))
         if now - lastExpiry >= 60 {
             lastExpiry = now
             store.removeExpired(olderThan: limits.maxAge)
         }
+        // What the client says the whole upload will be, kept for when the
+        // last byte is in, however many requests that takes.
+        let reprDigest = request.header("repr-digest")
+        if let reprDigest, Digest.sha256(field: reprDigest) == nil {
+            return response.send(status: .badRequest,
+                                 "Repr-Digest names no digest this server checks")
+        }
         let info = try store.create(length: length, contentType: request.header("content-type"),
-                                    contentDisposition: request.header("content-disposition"))
+                                    contentDisposition: request.header("content-disposition"),
+                                    reprDigest: reprDigest)
         guard let handle = try store.acquire(info.id) else {
             return response.send(status: .serviceUnavailable)
         }
@@ -285,7 +320,8 @@ final class UploadService: @unchecked Sendable {
             ])
         }
         try await transfer(handle, body, &response, complete: complete, length: length,
-                           resumable: resumable, interim: interim, creating: true)
+                           resumable: resumable, interim: interim, creating: true,
+                           contentDigest: contentDigest, wantsDigest: wantsSHA256(request))
     }
 
     // MARK: Appending
@@ -350,6 +386,13 @@ final class UploadService: @unchecked Sendable {
            let declared = body.expectedLength, declared < minAppendSize {
             return tooSmall(response, "this append is shorter than min-append-size")
         }
+        let contentDigest: [UInt8]?
+        do {
+            contentDigest = try digestOf(request)
+        } catch {
+            return response.send(status: .badRequest,
+                                 "Content-Digest names no digest this server checks")
+        }
         let interim = speaksDraft(request)
         let handle: UploadHandle
         do {
@@ -371,13 +414,14 @@ final class UploadService: @unchecked Sendable {
         }
         if length != info.length { try store.update(id, length: length, complete: false) }
         try await transfer(handle, body, &response, complete: complete, length: length,
-                           resumable: true, interim: interim, creating: false)
+                           resumable: true, interim: interim, creating: false,
+                           contentDigest: contentDigest, wantsDigest: wantsSHA256(request))
     }
 
     /// Stores the body as it arrives, and answers once it has all come.
     func transfer(_ handle: UploadHandle, _ body: RequestBodyStream, _ response: inout Response,
                   complete: Bool, length: Int?, resumable: Bool, interim: Bool,
-                  creating: Bool) async throws {
+                  creating: Bool, contentDigest: [UInt8]?, wantsDigest: Bool) async throws {
         let id = handle.id
         appending[id] = body
         defer {
@@ -386,6 +430,9 @@ final class UploadService: @unchecked Sendable {
         }
         var sinceProgress = 0
         let start = handle.offset
+        // Only when the client said what these bytes should be: hashing what
+        // nobody will check is a pass over every byte for nothing.
+        let running = contentDigest == nil ? nil : SHA256Digest()
         do {
             while let bytes = try await body.read(maxBytes: 256 * 1024) {
                 if let length, handle.offset + bytes.count > length {
@@ -400,6 +447,7 @@ final class UploadService: @unchecked Sendable {
                     return tooLarge(response)
                 }
                 try handle.append(bytes)
+                running?.update(bytes)
                 sinceProgress += bytes.count
                 if interim && progressInterval > 0 && sinceProgress >= progressInterval {
                     sinceProgress = 0
@@ -414,6 +462,17 @@ final class UploadService: @unchecked Sendable {
             // arrived is stored, and is where it resumes from; there is
             // nobody to answer, or the engine already has.
             return
+        }
+
+        // What this request carried, before anything else is decided about
+        // it. Bytes that are not what the client said they are were corrupted
+        // on the way, so they are dropped and the upload stays where it began
+        // this request -- the client sends them again from there.
+        if let contentDigest, let running, !Digest.equal(running.digest(), contentDigest) {
+            try? handle.truncate(to: start)
+            response.addHeader("Upload-Offset", "\(start)")
+            return problem(response, .badRequest, UploadProblem.mismatchingDigest,
+                           "the bytes are not what Content-Digest says", [])
         }
 
         let offset = handle.offset
@@ -446,10 +505,29 @@ final class UploadService: @unchecked Sendable {
             response.addHeader("Upload-Offset", "\(offset)")
             return tooSmall(response, "the upload is shorter than min-size")
         }
+        // The whole upload, now that there is a whole upload: one pass over
+        // the file, and only when somebody asked for it.
+        var sha256: [UInt8]? = nil
+        if let declared = (try? store.info(id))?.reprDigest.flatMap({ Digest.sha256(field: $0) }) {
+            guard let actual = Digest.sha256(contentsOfFile: store.dataPath(id)),
+                  Digest.equal(actual, declared) else {
+                // Whole and wrong: appending cannot mend it, so it goes, and
+                // the client starts again rather than holding a name for
+                // bytes nobody will accept.
+                handle.release()
+                try? store.delete(id)
+                return problem(response, .badRequest, UploadProblem.mismatchingDigest,
+                               "the upload is not what Repr-Digest says", [])
+            }
+            sha256 = actual
+        } else if wantsDigest {
+            sha256 = Digest.sha256(contentsOfFile: store.dataPath(id))
+        }
         try store.update(id, length: offset, complete: true)
         handle.release()
         guard let info = try store.info(id) else { return response.send(status: .notFound) }
-        let answer = try await onComplete(CompletedUpload(info: info, store: store))
+        if wantsDigest, let sha256 { response.addHeader("Repr-Digest", Digest.field(sha256)) }
+        let answer = try await onComplete(CompletedUpload(info: info, store: store, sha256: sha256))
         if resumable { response.addHeader("Upload-Complete", "?1") }
         try answer.write(to: response)
     }
@@ -488,6 +566,30 @@ final class UploadService: @unchecked Sendable {
         } catch {
             response.send(status: .notFound)
         }
+    }
+
+    /// The SHA-256 this request says its own bytes are, or nil when it says
+    /// nothing. Throws when it says something in a language this does not
+    /// speak, which is not the same as saying nothing: a client that asked for
+    /// a check should not be told silently that there was none.
+    func digestOf(_ request: borrowing Request) throws -> [UInt8]? {
+        guard let field = request.header("content-digest") else { return nil }
+        guard let digest = Digest.sha256(field: field) else { throw UploadDigestError.unreadable }
+        return digest
+    }
+
+    /// Whether the request asked to be told the upload's digest (RFC 9530's
+    /// `Want-Repr-Digest`). A preference of 0 is a client saying it does not
+    /// want one.
+    func wantsSHA256(_ request: borrowing Request) -> Bool {
+        guard let field = request.header("want-repr-digest") else { return false }
+        for member in field.split(separator: ",") {
+            let parts = member.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard String(parts[0]).trimmingWhitespace().lowercased() == "sha-256" else { continue }
+            if parts.count == 2, String(parts[1]).trimmingWhitespace() == "0" { return false }
+            return true
+        }
+        return false
     }
 
     /// The upload, unless it does not exist or has outlived `maxAge`.

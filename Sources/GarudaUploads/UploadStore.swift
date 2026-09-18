@@ -44,6 +44,9 @@ public struct UploadInfo: Codable, Sendable, Equatable {
     /// it, when it sent them.
     public var contentType: String?
     public var contentDisposition: String?
+    /// The `Repr-Digest` the client declared for the whole upload, as the
+    /// field's text. Checked once the last byte is in (ResumableUploads.swift).
+    public var reprDigest: String?
 }
 
 public enum UploadStoreError: Error, Equatable {
@@ -86,6 +89,19 @@ public final class UploadHandle {
         offset += bytes.count
     }
 
+    /// Drops everything past `offset`, for a request whose bytes turned out
+    /// not to be what its digest said. What was stored before this request
+    /// began is untouched, so the upload stays resumable from there.
+    public func truncate(to offset: Int) throws {
+        precondition(fd >= 0, "truncate of a released upload")
+        precondition(offset <= self.offset, "truncate can only drop bytes")
+        while ftruncate(fd, off_t(offset)) != 0 {
+            if errno == EINTR { continue }
+            throw UploadStoreError.system("ftruncate", errno)
+        }
+        self.offset = offset
+    }
+
     /// Lets another request append.
     public func release() {
         if fd >= 0 {
@@ -114,7 +130,8 @@ public final class FileUploadStore: @unchecked Sendable {
     func infoPath(_ id: String) -> String { "\(directory)/\(id).info" }
 
     /// Starts an upload with nothing in it.
-    public func create(length: Int?, contentType: String?, contentDisposition: String?) throws -> UploadInfo {
+    public func create(length: Int?, contentType: String?, contentDisposition: String?,
+                       reprDigest: String? = nil) throws -> UploadInfo {
         var id = ""
         for byte in (0..<16).map({ _ in UInt8.random(in: 0...255) }) {
             let hex: [Character] = Array("0123456789abcdef")
@@ -126,7 +143,7 @@ public final class FileUploadStore: @unchecked Sendable {
         _ = close(fd)
         let info = UploadInfo(id: id, offset: 0, length: length, complete: false,
                               createdAt: Int(time(nil)), contentType: contentType,
-                              contentDisposition: contentDisposition)
+                              contentDisposition: contentDisposition, reprDigest: reprDigest)
         try save(info)
         return info
     }

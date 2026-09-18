@@ -574,6 +574,135 @@ struct ResumableUploadTests {
         #expect(try store.info(String(location.dropFirst(9)))?.offset == 3)
     }
 
+    @Test func bytesThatAreNotWhatContentDigestSaysAreDropped() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let created = try app.test.post("/files", body: pattern(4), headers: [("Upload-Complete", "?0")])
+        let location = try #require(header(created, "location"))
+        let id = String(location.dropFirst(9))
+
+        // A digest of bytes other than the ones sent: the append is refused
+        // and the upload stays where it was, so the client can send again.
+        let wrong = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "4"),
+            ("Upload-Complete", "?0"),
+            ("Content-Digest", Digest.field(Digest.sha256(pattern(6, from: 99)))),
+        ], body: pattern(6, from: 4))
+        #expect(wrong.status == 400)
+        #expect(wrong.text.contains("mismatching-digest"))
+        #expect(header(wrong, "upload-offset") == "4")
+        #expect(try store.info(id)?.offset == 4, "nothing of that request was kept")
+
+        // The same bytes with the digest they really have.
+        let right = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "4"),
+            ("Upload-Complete", "?1"),
+            ("Content-Digest", Digest.field(Digest.sha256(pattern(6, from: 4)))),
+        ], body: pattern(6, from: 4))
+        #expect(right.status == 201, "\(right.status) \(right.text)")
+        #expect(completed.first?.bytes == pattern(10))
+    }
+
+    @Test func aDigestInALanguageTheServerDoesNotSpeakIsRefused() throws {
+        // Saying nothing is fine; asking for a check that cannot happen is
+        // not, because the client would take silence for a yes.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let response = try app.test.post("/files", body: pattern(4), headers: [
+            ("Upload-Complete", "?1"), ("Content-Digest", "sha-512=:AAAA:"),
+        ])
+        #expect(response.status == 400)
+        #expect(response.text.contains("Content-Digest"))
+        #expect(completed.isEmpty)
+        #expect(try listUploads(store).isEmpty)
+
+        let declared = try app.test.post("/files", body: pattern(4), headers: [
+            ("Upload-Complete", "?1"), ("Repr-Digest", "md5=:AAAA:"),
+        ])
+        #expect(declared.status == 400)
+        #expect(declared.text.contains("Repr-Digest"))
+    }
+
+    @Test func anUploadIsCheckedAgainstTheDigestItWasCreatedWith() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let whole = pattern(10)
+
+        // Declared at creation, checked when the last byte is in -- three
+        // requests later, and it holds across all of them.
+        let created = try app.test.post("/files", body: Array(whole[0..<4]), headers: [
+            ("Upload-Complete", "?0"), ("Upload-Length", "10"),
+            ("Repr-Digest", Digest.field(Digest.sha256(whole))),
+        ])
+        let location = try #require(header(created, "location"))
+        #expect(try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "4"),
+            ("Upload-Complete", "?0"),
+        ], body: Array(whole[4..<7])).status == 204)
+        let done = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "7"),
+            ("Upload-Complete", "?1"),
+        ], body: Array(whole[7...]))
+        #expect(done.status == 201, "\(done.status) \(done.text)")
+        #expect(completed.first?.bytes == whole)
+    }
+
+    @Test func anUploadThatIsNotItsReprDigestIsRefusedAndRemoved() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        // A digest of something else: each request's own bytes are fine, and
+        // what they add up to is not what was promised.
+        let response = try app.test.post("/files", body: pattern(10), headers: [
+            ("Upload-Complete", "?1"),
+            ("Repr-Digest", Digest.field(Digest.sha256(pattern(10, from: 5)))),
+        ])
+        #expect(response.status == 400)
+        #expect(response.text.contains("mismatching-digest"))
+        #expect(completed.isEmpty, "the handler never saw it")
+        // Whole and wrong: appending cannot mend it, so it is gone.
+        #expect(try listUploads(store).isEmpty)
+    }
+
+    @Test func aClientCanAskWhatTheUploadsDigestIs() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let asked = try app.test.post("/files", body: pattern(10), headers: [
+            ("Upload-Complete", "?1"), ("Want-Repr-Digest", "sha-256=1"),
+        ])
+        #expect(asked.status == 201)
+        #expect(header(asked, "repr-digest") == Digest.field(Digest.sha256(pattern(10))))
+
+        // Not asked for, not computed, not sent.
+        let quiet = try app.test.post("/files", body: pattern(10), headers: [("Upload-Complete", "?1")])
+        #expect(header(quiet, "repr-digest") == nil)
+        // And a client that says it does not want one.
+        let declined = try app.test.post("/files", body: pattern(10), headers: [
+            ("Upload-Complete", "?1"), ("Want-Repr-Digest", "sha-256=0"),
+        ])
+        #expect(header(declined, "repr-digest") == nil)
+    }
+
+    @Test func theHandlerCanHaveTheDigestWithoutAskingTwice() throws {
+        nonisolated(unsafe) var seen: [[UInt8]?] = []
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = Application()
+        app.resumableUploads("/files", store: store, progressInterval: 0) { upload in
+            seen.append(upload.digest())
+            return Text("ok", status: .created)
+        }
+        // Computed for the check, and handed on rather than computed again.
+        #expect(try app.test.post("/files", body: pattern(10), headers: [
+            ("Upload-Complete", "?1"),
+            ("Repr-Digest", Digest.field(Digest.sha256(pattern(10)))),
+        ]).status == 201)
+        #expect(seen == [Digest.sha256(pattern(10))])
+
+        // Nobody asked, so it is read from the file when the handler wants it.
+        seen = []
+        #expect(try app.test.post("/files", body: pattern(6), headers: [("Upload-Complete", "?1")]).status == 201)
+        #expect(seen == [Digest.sha256(pattern(6))])
+    }
+
     @Test func anUploadPastItsAgeIsGone() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
         let app = uploadApp(store, limits: UploadLimits(maxAge: 0))

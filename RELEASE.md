@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 887 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 899 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -93,6 +93,12 @@ The Python suites need `h2` and `aioquic`.
 - `HTTPStatus` names statuses and still takes an integer literal.
   `send(json:)`, `send(text:)`, `send(html:)`, `send(bytes:contentType:)` and
   `redirect(to:status:)` set the content type they imply.
+- `Digest.sha256(_:)` hashes bytes or a file, `SHA256Digest` hashes what
+  arrives a piece at a time, and `Digest.field(_:)` and
+  `Digest.sha256(field:)` write and read the `sha-256=:...:` of RFC 9530's
+  `Content-Digest` and `Repr-Digest`. A field naming an algorithm this does
+  not check reads as nil, so a caller sees "nothing to check" rather than a
+  check that passed.
 - `JSONCoder` encodes and decodes `Encodable` and `Decodable` types without
   Foundation. Decoding reads only the keys a type asks for. Nesting is bounded
   at 64, a number that does not fit its type is an error, and the coder is
@@ -633,6 +639,16 @@ The Python suites need `h2` and `aioquic`.
     `min-append-size`, since starting with an empty body is what the draft
     describes. Too small is a 400 carrying `Upload-Limit`, HTTP having no
     opposite of 413.
+  - Integrity, as RFC 9530 has it. `Content-Digest` on a request is checked
+    against the bytes that arrive; bytes that are not what it says were
+    corrupted on the way, so they are dropped and the upload stays at the
+    offset that request began at. `Repr-Digest` on the request that creates an
+    upload is checked when the last byte is in, however many requests later
+    that is; an upload that is whole and wrong cannot be mended by appending,
+    so it is removed. `Want-Repr-Digest` asks for the digest in the answer,
+    and `upload.digest()` gives the handler the same one to store beside the
+    bytes, computed once. A digest field naming an algorithm the server does
+    not check is refused rather than ignored.
   - A wrong offset or inconsistent length is answered with the draft's problem
     documents.
   - Only one request appends to an upload at a time, across worker processes,
