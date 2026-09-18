@@ -108,9 +108,18 @@ extension RedisClientError {
         return false
     }
 
-    /// The same failure, marked as having happened after the bytes went out.
+    /// The same failure, marked as having happened after the bytes went out
+    /// -- if it is one where that makes the outcome unknowable.
+    ///
+    /// A connection that closed or timed out with the command written is the
+    /// case this is for. A reply that could not be read, or one the server
+    /// refused, is not: the server answered, so the command ran, and what is
+    /// unknown is only what it said about it.
     func afterSending() -> RedisClientError {
-        mayHaveRun ? self : .unknownOutcome(self)
+        switch self {
+        case .closed, .timedOut, .cancelled: return .unknownOutcome(self)
+        default: return self
+        }
     }
 }
 

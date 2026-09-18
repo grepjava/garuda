@@ -119,13 +119,18 @@ jobs:
         run: |
           docker run -d --name redis -p 6379:6379 redis:7 \
             redis-server --requirepass garuda-secret
+          ready=""
           for _ in $(seq 1 30); do
             if docker exec redis redis-cli -a garuda-secret ping 2>/dev/null | grep -q PONG; then
-              exit 0
+              ready=yes
+              break
             fi
             sleep 1
           done
-          echo "redis did not come up"; docker logs redis; exit 1
+          if [ -z "$ready" ]; then echo "redis did not come up"; docker logs redis; exit 1; fi
+          # The ACL suite checks that a user is held to the keys it was given.
+          docker exec redis redis-cli -a garuda-secret ACL SETUSER app on '>app-secret' \
+            '~app:*' +@all -@dangerous
 
       - name: Unit tests, with the connector suites switched on
         run: swift test

@@ -18,11 +18,18 @@ SWIFTC=${SWIFTC:-swiftc}
 AVIAN=${AVIAN:-$ROOT/.build/checkouts/aviancore}
 [ -d "$AVIAN" ] || AVIAN=$ROOT/../aviancore
 
+# Every C target Garuda's module was built against, not aviancore's alone:
+# a swiftmodule names the clang modules it needs, and swiftc refuses to
+# load Garuda at all unless it can find every one of them.
 compile() {
     "$SWIFTC" -parse-as-library -swift-version 6 -emit-sil -o /dev/null \
         -I "$BUILD/Modules" \
         -Xcc -fmodule-map-file="$BUILD/CAvian.build/module.modulemap" \
+        -Xcc -fmodule-map-file="$BUILD/CGarudaJWT.build/module.modulemap" \
+        -Xcc -fmodule-map-file="$BUILD/CGarudaSQLite.build/module.modulemap" \
         -Xcc -I"$AVIAN/Sources/CAvian/include" \
+        -Xcc -I"$ROOT/Sources/CGarudaJWT/include" \
+        -Xcc -I"$ROOT/Sources/CGarudaSQLite/include" \
         "$1" 2>&1
 }
 
