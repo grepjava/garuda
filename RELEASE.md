@@ -377,6 +377,21 @@ The Python suites need `h2` and `aioquic`.
   store's index of a subject's families only ever has its expiry pushed out, so
   two logins arriving at once cannot leave `revokeAll(subject:)` blind to a
   family that is still good.
+- A fifth example, the starter (`swift run starter`, Examples/STARTER.md): a
+  whole application rather than one feature. PostgreSQL, accounts with JWT
+  access tokens and rotating refresh tokens, an append-only migration list run
+  both by `starter migrate` and by every worker at start-up, configuration read
+  from the environment and checked once with every problem reported at once,
+  cursor paging, ownership answered as 404, OpenAPI with Swagger UI, health and
+  readiness, tests through `app.test` against a real database, and a Dockerfile
+  and systemd unit in Examples/deploy/.
+- `String.trimmingWhitespace()` is public: validating a field someone typed
+  starts with it, and Swift without Foundation has no such method.
+- `PostgresClientError.isConstraintViolation` says whether the server refused a
+  statement for breaking a constraint, as `SQLiteClientError` already did.
+- `app.run(arguments:)` parses a list of arguments as the `garuda` executable
+  parses its command line, so an application with commands of its own can hand
+  Garuda the flags that are Garuda's: `starter serve -- --port 8080`.
 - `app.runOnce { start in ... }` runs one piece of async work against an
   application's state with nothing served: a migration, a backfill or a seed
   from the command line. A worker is built in the process with no listening

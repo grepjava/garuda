@@ -67,6 +67,13 @@ extension PostgresClientError {
         if case .postgres(.server(let fields)) = self { return fields.code }
         return nil
     }
+
+    /// Whether the server refused the statement for breaking a constraint:
+    /// unique, not null, foreign key, check, exclusion -- class 23 of the
+    /// SQLSTATE codes.
+    public var isConstraintViolation: Bool {
+        sqlState.map { $0.hasPrefix("23") } ?? false
+    }
 }
 
 /// Why a row could not become the type asked for.

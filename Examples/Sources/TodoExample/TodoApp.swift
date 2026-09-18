@@ -135,11 +135,3 @@ public func todoApp(databasePath path: String) -> Application {
     return app
 }
 
-extension String {
-    func trimmingWhitespace() -> String {
-        let scalars = unicodeScalars
-        guard let start = scalars.firstIndex(where: { !$0.properties.isWhitespace }),
-              let end = scalars.lastIndex(where: { !$0.properties.isWhitespace }) else { return "" }
-        return String(scalars[start...end])
-    }
-}

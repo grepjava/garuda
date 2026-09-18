@@ -137,3 +137,18 @@ func percentDecoded(_ text: String) -> String {
 extension Path: Sendable where Value: Sendable {}
 extension Query: Sendable where Value: Sendable {}
 extension Body: Sendable where Value: Sendable {}
+
+extension String {
+    /// The string without whitespace at either end -- what validating a field
+    /// a person typed usually starts with. Swift has no such method without
+    /// Foundation, and an application should not have to write one.
+    ///
+    /// Whitespace is the Unicode property, so a non-breaking space pasted in
+    /// from a document counts.
+    public func trimmingWhitespace() -> String {
+        let scalars = unicodeScalars
+        guard let start = scalars.firstIndex(where: { !$0.properties.isWhitespace }),
+              let end = scalars.lastIndex(where: { !$0.properties.isWhitespace }) else { return "" }
+        return String(scalars[start...end])
+    }
+}

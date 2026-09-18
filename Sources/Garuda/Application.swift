@@ -23,7 +23,7 @@ import AvianHTTP
 public final class Application: RouteBuilder {
     var routes = Routes()
     var startHooks: [(Int) -> Void] = []
-    var prepareHooks: [(timeout: UInt64, hook: (WorkerStartup) async throws -> Void)] = []
+    var prepareHooks: [(timeout: UInt64, hook: @Sendable (WorkerStartup) async throws -> Void)] = []
     var shutdownHooks: [(Int) -> Void] = []
     var responseObservers: [(CompletedRequest) -> Void] = []
     var trailingSlashPolicy = TrailingSlash.strict
@@ -179,7 +179,7 @@ public final class Application: RouteBuilder {
     /// `timeoutMilliseconds` stops the worker, which the supervisor reports as
     /// a worker that would not start.
     public func prepare(timeoutMilliseconds: UInt64 = 30_000,
-                        _ hook: @escaping (_ start: WorkerStartup) async throws -> Void) {
+                        _ hook: @escaping @Sendable (_ start: WorkerStartup) async throws -> Void) {
         precondition(compiled == nil, "a prepare hook added after the application was compiled")
         precondition(timeoutMilliseconds > 0, "a prepare hook needs time to run in")
         prepareHooks.append((timeoutMilliseconds, hook))
@@ -202,6 +202,33 @@ public final class Application: RouteBuilder {
             return status
         case .run(let config):
             return serve(config)
+        }
+    }
+
+    /// Parses `arguments` as the `garuda` executable parses its command line,
+    /// then serves. For an application with commands of its own:
+    ///
+    /// ```
+    /// // starter serve -- --port 8080 --workers 4
+    /// case "serve":
+    ///     var mine = Array(CommandLine.arguments.dropFirst(2))
+    ///     if mine.first == "--" { mine.removeFirst() }
+    ///     exit(app.run(arguments: mine))
+    /// ```
+    ///
+    /// `arguments` holds the flags only, without the program name. An
+    /// unknown flag prints the usage and returns 2, as it does for `garuda`.
+    public func run(arguments: [String]) -> Int32 {
+        var storage = (["garuda"] + arguments).map { strdup($0) }
+        defer { for pointer in storage { free(pointer) } }
+        storage.append(nil)
+        return storage.withUnsafeMutableBufferPointer { argv -> Int32 in
+            switch GarudaCLI.parse(argc: argv.count - 1, argv: argv.baseAddress!) {
+            case .exit(let status):
+                return status
+            case .run(let config):
+                return serve(config)
+            }
         }
     }
 
@@ -291,7 +318,7 @@ public final class Application: RouteBuilder {
             handlerCount: count,
             stateFactories: stateFactories,
             stateShutdowns: stateShutdowns,
-            onPrepare: prepare.isEmpty ? nil : { start in
+            onPrepare: prepare.isEmpty ? nil : { @Sendable start in
                 for entry in prepare { try await entry.hook(start) }
             },
             prepareTimeoutMilliseconds: prepare.reduce(0) { $0 + $1.timeout },
@@ -330,7 +357,7 @@ struct CompiledApplication {
     let stateFactories: [(ObjectIdentifier, (Int) throws -> Any)]
     let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]
     /// Async start-up work, run before the worker accepts anything.
-    let onPrepare: ((WorkerStartup) async throws -> Void)?
+    let onPrepare: (@Sendable (WorkerStartup) async throws -> Void)?
     /// How long every prepare hook together may take.
     let prepareTimeoutMilliseconds: UInt64
     let onStart: ((Int) -> Void)?

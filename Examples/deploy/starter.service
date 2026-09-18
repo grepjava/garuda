@@ -1,0 +1,63 @@
+# The starter example as a systemd service.
+#
+#   install -m 755 .build/release/starter /usr/local/bin/starter
+#   install -m 644 Examples/deploy/starter.service /etc/systemd/system/
+#   install -m 640 -o root -g starter Examples/deploy/env.example /etc/starter/env
+#   systemctl daemon-reload && systemctl enable --now starter
+#
+# A new binary goes out with `systemctl reload starter`: the workers are
+# replaced one at a time and no connection is dropped.
+
+[Unit]
+Description=starter
+Documentation=https://github.com/grepjava/garuda/blob/main/Examples/STARTER.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=starter
+Group=starter
+EnvironmentFile=/etc/starter/env
+
+# Migrate before any worker serves. Workers would migrate for themselves; doing
+# it here means a failed migration fails the unit instead of the first request.
+ExecStartPre=/usr/local/bin/starter migrate
+
+# Everything after -- is Garuda's own (CONFIG.md). Loopback because a proxy
+# terminates TLS; --forwarded-allow-ips is what makes the proxy's headers
+# trusted. For TLS here instead: --tls-cert, --tls-key or --acme-domain.
+ExecStart=/usr/local/bin/starter serve -- \
+    --host 127.0.0.1 --port 8080 --workers 0 \
+    --access-log --request-id \
+    --forwarded-allow-ips 127.0.0.1 \
+    --drain-delay 5000 --health-check-path /health \
+    --metrics-port 9090 --metrics-host 127.0.0.1
+
+# SIGHUP replaces the workers without dropping a connection.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=2
+# Above --drain-delay plus --graceful-timeout (10 s by default).
+TimeoutStopSec=30
+
+# Nothing here writes to disk, so almost everything can be taken away.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# With --acme-domain, the cache directory must be writable:
+# ReadWritePaths=/var/lib/starter
+
+[Install]
+WantedBy=multi-user.target

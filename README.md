@@ -582,7 +582,8 @@ before 1.0 are in [COMPATIBILITY.md](COMPATIBILITY.md). Pin with
 | [EXAMPLES.md](EXAMPLES.md) | The runnable applications, and recipes for common tasks |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine is built |
 | [TRANSPORT.md](TRANSPORT.md) | What each protocol implementation does |
-| [Examples/README.md](Examples/README.md) | Four runnable applications and how they are laid out |
+| [Examples/README.md](Examples/README.md) | Five runnable applications and how they are laid out |
+| [Examples/STARTER.md](Examples/STARTER.md) | The starter application: layout, configuration, migrations, deployment |
 | [CONNECTORS.md](CONNECTORS.md) | The HTTP client and database drivers: limits and future work |
 | [BENCHMARKS.md](BENCHMARKS.md) | Benchmark method and results |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What an application may depend on, and what a release may change |

@@ -8,6 +8,8 @@ import PackageDescription
 //   swift run streaming  server-sent events, a streamed export and uploads
 //   swift run chat       rooms over WebSockets and server-sent events,
 //                        across every worker
+//   swift run starter    accounts and notes on PostgreSQL: configuration,
+//                        migrations, JWT access and refresh tokens, OpenAPI
 //
 // Each application is a library target with a function that builds it, so
 // `swift test` drives it through `app.test`, and a small executable that runs
@@ -32,8 +34,12 @@ let package = Package(
         .target(name: "ChatExample", dependencies: [.product(name: "Garuda", package: "garuda")]),
         .executableTarget(name: "chat", dependencies: ["ChatExample"]),
 
+        .target(name: "StarterExample", dependencies: [.product(name: "Garuda", package: "garuda")]),
+        .executableTarget(name: "starter", dependencies: ["StarterExample",
+                                                          .product(name: "Garuda", package: "garuda")]),
+
         .testTarget(name: "ExampleTests",
                     dependencies: ["TodoExample", "AuthExample", "StreamingExample", "ChatExample",
-                                   .product(name: "Garuda", package: "garuda")]),
+                                   "StarterExample", .product(name: "Garuda", package: "garuda")]),
     ]
 )

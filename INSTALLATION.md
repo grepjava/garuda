@@ -132,6 +132,34 @@ including the OpenSSL flags on macOS.
 
 ---
 
+### An application with commands of its own
+
+`app.run()` reads the process's command line. An application that has commands
+of its own -- a `migrate` before it serves -- hands Garuda only the arguments
+that are Garuda's:
+
+```swift
+switch CommandLine.arguments.dropFirst().first ?? "serve" {
+case "migrate":
+    try app.runOnce { start in
+        try await start.state(PostgresPool.self).migrate(migrations)
+    }
+case "serve":
+    var flags = Array(CommandLine.arguments.dropFirst(2))
+    if flags.first == "--" { flags.removeFirst() }
+    exit(app.run(arguments: flags))
+default:
+    exit(64)
+}
+```
+
+`app.runOnce` builds a worker with no listening socket, runs the work on it and
+tears the state down, so a command can migrate or backfill without serving.
+[Examples/STARTER.md](Examples/STARTER.md) is a whole application built this
+way.
+
+---
+
 ## Certificates
 
 HTTP/2 over TLS and HTTP/3 need a certificate. `--http3` without one is refused

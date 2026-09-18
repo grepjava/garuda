@@ -1,8 +1,9 @@
 # Examples
 
-Four applications built on Garuda's public API, each small enough to read in
-one sitting and complete enough to copy from. They build against the Garuda
-checkout this directory sits in.
+Five applications built on Garuda's public API. Four are small enough to read
+in one sitting, each showing one thing; the starter shows the shape of a whole
+application and is the one to copy when beginning. They build against the
+Garuda checkout this directory sits in.
 
 | Example | Run | What it shows |
 |---|---|---|
@@ -10,12 +11,20 @@ checkout this directory sits in.
 | [Auth](Sources/AuthExample/AuthApp.swift) | `swift run auth` | Sign-up, login and logout: PBKDF2 password hashes, random session tokens stored as digests, `authenticate(bearer:state:)` |
 | [Streaming](Sources/StreamingExample/StreamingApp.swift) | `swift run streaming` | Server-sent events, a CSV export written as it is produced, uploads written to disk as they arrive |
 | [Chat](Sources/ChatExample/ChatApp.swift) | `swift run chat` | Rooms over WebSockets and server-sent events, heard across every worker through `Topic` |
+| [**Starter**](STARTER.md) | `swift run starter` | A whole application: PostgreSQL, accounts with JWT access and refresh tokens, migrations, configuration from the environment, OpenAPI, health and readiness, and a deployment recipe |
 
 ```bash
 cd Examples
 swift run chat -- --port 8080 --workers 4     # then open http://localhost:8080
 swift test                                    # every example, through app.test
+
+createdb starter
+DATABASE_URL='postgres://you@127.0.0.1:5432/starter?sslmode=disable' \
+    swift run starter serve -- --port 8080    # then open http://localhost:8080/docs
 ```
+
+The starter has its own guide, [STARTER.md](STARTER.md): its layout,
+configuration, migrations, the per-worker model, and how to deploy it.
 
 Everything after `--` is Garuda's own flags ([CONFIG.md](../CONFIG.md)): TLS,
 HTTP/3, workers, compression, rate limits. Each `main.swift` has `curl`

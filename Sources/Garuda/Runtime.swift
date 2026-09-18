@@ -1086,7 +1086,7 @@ enum GarudaRuntime {
     /// Runs `prepare` on the worker's executor, turning `turn` until it
     /// finishes or the time runs out. False means the worker must not serve.
     static func runPreparation(_ worker: UnsafeMutablePointer<Worker>, index: Int,
-                               prepare: @escaping (WorkerStartup) async throws -> Void,
+                               prepare: @escaping @Sendable (WorkerStartup) async throws -> Void,
                                timeoutMilliseconds: UInt64, turn: () -> Void) -> Bool {
         let outcome = Preparation()
         nonisolated(unsafe) let work = prepare

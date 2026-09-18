@@ -39,7 +39,7 @@ extension Application {
     /// Runs `work` against this application's state on a worker of its own,
     /// then tears the state down.
     public func runOnce(timeoutMilliseconds: UInt64 = 5 * 60 * 1000,
-                        _ work: @escaping (_ start: WorkerStartup) async throws -> Void) throws {
+                        _ work: @escaping @Sendable (_ start: WorkerStartup) async throws -> Void) throws {
         precondition(timeoutMilliseconds > 0, "a one-off command needs time to run in")
         var configuration = ServerConfig()
         configuration.maxConnections = 4
@@ -67,7 +67,7 @@ final class OneOffWorker {
         worker.pointee.pollsBroadcast = false
     }
 
-    func run(_ work: @escaping (WorkerStartup) async throws -> Void, timeoutMilliseconds: UInt64) throws {
+    func run(_ work: @escaping @Sendable (WorkerStartup) async throws -> Void, timeoutMilliseconds: UInt64) throws {
         let previous = currentWorker
         currentWorker = worker
         defer { currentWorker = previous }

@@ -108,7 +108,17 @@ struct CookiesTests {
         let value = cookieValue(try client.get("/set/\(kind)").header("set-cookie"))
         #expect(!value.isEmpty)
         #expect(isCookieValue(value))
-        if kind == "encrypted" { #expect(!value.contains("ada")) }
+        if kind == "encrypted" {
+            // The plaintext is not in the cookie. Checked against the decoded
+            // bytes, not the text: base64 of random bytes contains a given
+            // three-letter run often enough to fail a test now and then.
+            let decoded = base64Decode(value) ?? []
+            let plaintext = Array("ada; admin".utf8)
+            #expect(!decoded.indices.contains { start in
+                start + plaintext.count <= decoded.count
+                    && Array(decoded[start..<(start + plaintext.count)]) == plaintext
+            })
+        }
 
         #expect(try client.get("/read/\(kind)", headers: [("cookie", "user=\(value)")]).text == "ada; admin=\"yes\" é")
 
