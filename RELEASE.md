@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 883 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 887 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -624,9 +624,15 @@ The Python suites need `h2` and `aioquic`.
   the rest with PATCH. Creation can be POST, PUT or PATCH.
   - Only a client that sends `Upload-Draft-Interop-Version: 9` gets 104
     responses, as the draft requires.
-  - `UploadLimits` sets `max-size`, `max-append-size` and `max-age`, advertised
-    in `Upload-Limit` and enforced as the body arrives, including bodies with no
-    declared length.
+  - `UploadLimits` sets `max-size`, `min-size`, `max-append-size`,
+    `min-append-size` and `max-age`, advertised in `Upload-Limit` and enforced
+    as the body arrives, including bodies with no declared length. A client
+    that declares a size under a minimum is refused before anything is stored;
+    one whose body turns out to be short is refused the completion and keeps
+    what arrived, so it can send the rest. Creating an upload is not held to
+    `min-append-size`, since starting with an empty body is what the draft
+    describes. Too small is a 400 carrying `Upload-Limit`, HTTP having no
+    opposite of 413.
   - A wrong offset or inconsistent length is answered with the draft's problem
     documents.
   - Only one request appends to an upload at a time, across worker processes,

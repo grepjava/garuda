@@ -462,6 +462,118 @@ struct ResumableUploadTests {
         #expect(try store.info(String(location.dropFirst(9)))?.offset == 5)
     }
 
+    @Test func anUploadShorterThanMinSizeIsRefused() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store, limits: UploadLimits(minSize: 10))
+
+        // Declared too short: refused before an upload exists.
+        let declared = try app.test.post("/files", body: pattern(4),
+                                         headers: [("Upload-Complete", "?1")])
+        #expect(declared.status == 400)
+        #expect(declared.text.contains("min-size"))
+        #expect(header(declared, "upload-limit") == "min-size=10, max-age=86400")
+        #expect(try listUploads(store).isEmpty, "nothing was stored for it")
+        #expect(completed.isEmpty)
+
+        // An append that says it completes the upload at 6 bytes says so
+        // before it sends them, so it too is refused before anything is
+        // stored: the upload stays where it was.
+        let created = try app.test.post("/files", body: pattern(4), headers: [("Upload-Complete", "?0")])
+        let location = try #require(header(created, "location"))
+        let id = String(location.dropFirst(9))
+        let short = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "4"),
+            ("Upload-Complete", "?1"),
+        ], body: pattern(2, from: 4))
+        #expect(short.status == 400)
+        #expect(short.text.contains("min-size"))
+        #expect(completed.isEmpty, "the handler was not called")
+        #expect(try store.info(id)?.complete == false, "still open")
+        #expect(try store.info(id)?.offset == 4, "and nothing was taken from it")
+
+        // The rest of it, and now it is long enough.
+        let rest = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "4"),
+            ("Upload-Complete", "?1"),
+        ], body: pattern(6, from: 4))
+        #expect(rest.status == 201, "\(rest.status) \(rest.text)")
+        #expect(completed.count == 1)
+        #expect(completed.first?.bytes == pattern(10))
+    }
+
+    @Test func anUploadThatEndsShortOfMinSizeKeepsWhatItHas() throws {
+        // Chunked, so how short it is only becomes known once it has all
+        // arrived. The completion is refused, the upload stays open, and what
+        // came is kept -- the client can send the rest.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store, limits: UploadLimits(minSize: 10))
+        let created = try app.test.post("/files", body: pattern(4), headers: [("Upload-Complete", "?0")])
+        let location = try #require(header(created, "location"))
+        let id = String(location.dropFirst(9))
+        let raw = "PATCH \(location) HTTP/1.1\r\nHost: x\r\nContent-Type: application/partial-upload\r\n"
+            + "Upload-Offset: 4\r\nUpload-Complete: ?1\r\nTransfer-Encoding: chunked\r\n\r\n"
+            + "2\r\nab\r\n0\r\n\r\n"
+        let response = try app.test.send(raw: Array(raw.utf8))
+        #expect(response.status == 400)
+        #expect(response.text.contains("min-size"))
+        #expect(header(response, "upload-offset") == "6")
+        #expect(completed.isEmpty)
+        #expect(try store.info(id)?.complete == false)
+        #expect(try store.info(id)?.offset == 6, "what arrived is kept")
+    }
+
+    @Test func anAppendShorterThanMinAppendSizeIsRefused() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store, limits: UploadLimits(minAppendSize: 8))
+
+        // Creating with an empty body is how a client starts, so creation is
+        // not held to it.
+        let created = try app.test.post("/files", body: [], headers: [("Upload-Complete", "?0")])
+        #expect(created.status == 201)
+        let location = try #require(header(created, "location"))
+
+        let small = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "0"),
+            ("Upload-Complete", "?0"),
+        ], body: pattern(3))
+        #expect(small.status == 400)
+        #expect(small.text.contains("min-append-size"))
+        #expect(header(small, "upload-limit") == "min-append-size=8, max-age=86400")
+        #expect(try store.info(String(location.dropFirst(9)))?.offset == 0, "nothing was stored")
+
+        // A big enough one is taken.
+        #expect(try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "0"),
+            ("Upload-Complete", "?0"),
+        ], body: pattern(8)).status == 204)
+
+        // And the one that completes the upload may be as short as what is
+        // left of it.
+        let last = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "8"),
+            ("Upload-Complete", "?1"),
+        ], body: pattern(1, from: 8))
+        #expect(last.status == 201, "\(last.status) \(last.text)")
+        #expect(completed.first?.bytes == pattern(9))
+    }
+
+    @Test func anAppendOfNoDeclaredLengthIsHeldToTheMinimumToo() throws {
+        // Chunked: how much came is only known once it has, so what arrived is
+        // kept at the offset it reached and the request is still refused.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store, limits: UploadLimits(minAppendSize: 8))
+        let created = try app.test.post("/files", body: [], headers: [("Upload-Complete", "?0")])
+        let location = try #require(header(created, "location"))
+        let raw = "PATCH \(location) HTTP/1.1\r\nHost: x\r\nContent-Type: application/partial-upload\r\n"
+            + "Upload-Offset: 0\r\nUpload-Complete: ?0\r\nTransfer-Encoding: chunked\r\n\r\n"
+            + "3\r\nabc\r\n0\r\n\r\n"
+        let response = try app.test.send(raw: Array(raw.utf8))
+        #expect(response.status == 400)
+        #expect(response.text.contains("min-append-size"))
+        #expect(header(response, "upload-offset") == "3", "what arrived is where it resumes from")
+        #expect(try store.info(String(location.dropFirst(9)))?.offset == 3)
+    }
+
     @Test func anUploadPastItsAgeIsGone() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
         let app = uploadApp(store, limits: UploadLimits(maxAge: 0))
@@ -493,9 +605,9 @@ struct ResumableUploadTests {
 
     @Test func optionsAdvertisesTheLimits() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
-        let app = uploadApp(store, limits: UploadLimits(maxSize: 5, maxAppendSize: 3, maxAge: 9))
+        let app = uploadApp(store, limits: UploadLimits(maxSize: 5, minSize: 2, maxAppendSize: 3, minAppendSize: 1, maxAge: 9))
         let response = try app.test.request("OPTIONS", "/files")
-        #expect(header(response, "upload-limit") == "max-size=5, max-append-size=3, max-age=9")
+        #expect(header(response, "upload-limit") == "max-size=5, min-size=2, max-append-size=3, min-append-size=1, max-age=9")
     }
 }
 

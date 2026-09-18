@@ -65,21 +65,45 @@ import AvianHTTP
 public struct UploadLimits: Sendable {
     /// The largest upload, in bytes.
     public var maxSize: Int?
+    /// The smallest upload, in bytes. A client that declares a shorter one is
+    /// refused before anything is stored, and one that ends shorter is refused
+    /// the completion -- the upload stays as it was, so the client can send
+    /// the rest or cancel it.
+    public var minSize: Int?
     /// The most one request may carry, in bytes.
     public var maxAppendSize: Int?
+    /// The least an *append* may carry, in bytes, except the one that
+    /// completes the upload. It is what stops a client from resuming a
+    /// gigabyte a byte at a time, where the bookkeeping costs more than the
+    /// upload. Creating does not have to meet it: a client that creates an
+    /// upload with an empty body and then appends is doing what the draft
+    /// describes.
+    public var minAppendSize: Int?
     /// How long an upload is kept, in seconds, from when it was created.
     public var maxAge: Int
 
-    public init(maxSize: Int? = nil, maxAppendSize: Int? = nil, maxAge: Int = 24 * 3600) {
+    public init(maxSize: Int? = nil, minSize: Int? = nil,
+                maxAppendSize: Int? = nil, minAppendSize: Int? = nil,
+                maxAge: Int = 24 * 3600) {
+        precondition(!(maxSize != nil && minSize != nil) || maxSize! >= minSize!,
+                     "an upload cannot be both larger than maxSize and smaller than minSize")
+        precondition(!(maxAppendSize != nil && minAppendSize != nil) || maxAppendSize! >= minAppendSize!,
+                     "a request cannot carry both more than maxAppendSize and less than minAppendSize")
         self.maxSize = maxSize
+        self.minSize = minSize
         self.maxAppendSize = maxAppendSize
+        self.minAppendSize = minAppendSize
         self.maxAge = maxAge
     }
 
+    /// In the order the draft's Appendix A lists them, so a client reading it
+    /// beside the field sees the same order.
     func field(remaining: Int) -> String {
         var members: [(String, Int)] = []
         if let maxSize { members.append(("max-size", maxSize)) }
+        if let minSize { members.append(("min-size", minSize)) }
         if let maxAppendSize { members.append(("max-append-size", maxAppendSize)) }
+        if let minAppendSize { members.append(("min-append-size", minAppendSize)) }
         members.append(("max-age", max(0, remaining)))
         return StructuredField.dictionary(members)
     }
@@ -232,6 +256,12 @@ final class UploadService: @unchecked Sendable {
         if let maxSize = limits.maxSize, let length, length > maxSize {
             return tooLarge(response)
         }
+        // A length the client declares below min-size is refused here, before
+        // an upload exists: there is no point taking bytes for something that
+        // can never be accepted.
+        if let minSize = limits.minSize, let length, length < minSize {
+            return tooSmall(response, "the upload is shorter than min-size")
+        }
         if let maxAppendSize = limits.maxAppendSize, let declared = body.expectedLength,
            declared > maxAppendSize {
             return tooLarge(response)
@@ -307,9 +337,18 @@ final class UploadService: @unchecked Sendable {
         if let maxSize = limits.maxSize, let length, length > maxSize {
             return tooLarge(response)
         }
+        if let minSize = limits.minSize, let length, length < minSize {
+            return tooSmall(response, "the upload is shorter than min-size")
+        }
         if let maxAppendSize = limits.maxAppendSize, let declared = body.expectedLength,
            declared > maxAppendSize {
             return tooLarge(response)
+        }
+        // Not the request that completes the upload: that one may be as short
+        // as the upload's last bytes are.
+        if let minAppendSize = limits.minAppendSize, !complete,
+           let declared = body.expectedLength, declared < minAppendSize {
+            return tooSmall(response, "this append is shorter than min-append-size")
         }
         let interim = speaksDraft(request)
         let handle: UploadHandle
@@ -378,6 +417,15 @@ final class UploadService: @unchecked Sendable {
         }
 
         let offset = handle.offset
+        // A body of no declared length is only measured once it has all
+        // arrived, so this append is held to min-append-size here. What came
+        // is kept, at the offset it reached: the protocol is driven by the
+        // offset, and the client's next request reads it from a HEAD.
+        if !complete, !creating, let minAppendSize = limits.minAppendSize,
+           offset - start < minAppendSize {
+            response.addHeader("Upload-Offset", "\(offset)")
+            return tooSmall(response, "this append is shorter than min-append-size")
+        }
         guard complete else {
             response.addHeader("Upload-Complete", "?0")
             response.addHeader("Upload-Offset", "\(offset)")
@@ -391,6 +439,12 @@ final class UploadService: @unchecked Sendable {
         if let length, length != offset {
             return problem(response, .badRequest, UploadProblem.inconsistentLength,
                            "the upload ended short of its length", [])
+        }
+        // Refused the completion, not deleted: the upload stays where it is,
+        // so a client that ended it early can send the rest or cancel it.
+        if let minSize = limits.minSize, offset < minSize {
+            response.addHeader("Upload-Offset", "\(offset)")
+            return tooSmall(response, "the upload is shorter than min-size")
         }
         try store.update(id, length: offset, complete: true)
         handle.release()
@@ -451,6 +505,14 @@ final class UploadService: @unchecked Sendable {
     func tooLarge(_ response: borrowing Response) {
         response.addHeader("Upload-Limit", limits.field(remaining: limits.maxAge))
         response.send(status: .contentTooLarge)
+    }
+
+    /// Under a limit the server advertised. HTTP has no opposite of 413, so
+    /// this is a 400 carrying `Upload-Limit`: the client sent what the limits
+    /// had already said it should not, and the answer says so again.
+    func tooSmall(_ response: borrowing Response, _ why: String) {
+        response.addHeader("Upload-Limit", limits.field(remaining: limits.maxAge))
+        response.send(status: .badRequest, why)
     }
 
     func problem(_ response: borrowing Response, _ status: HTTPStatus, _ type: String,
