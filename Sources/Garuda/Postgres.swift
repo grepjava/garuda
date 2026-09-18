@@ -81,6 +81,9 @@ final class PostgresConnection {
     let socket: OutboundSocket
     let configuration: PostgresConfiguration
     let parameters: [String: String]
+    /// The server's process ID for this session, from BackendKeyData: what a
+    /// notification this session sent carries as its sender.
+    let processID: Int32
     /// As the last ReadyForQuery reported it.
     private(set) var transactionStatus: PostgresTransactionStatus = .idle
 
@@ -101,6 +104,15 @@ final class PostgresConnection {
     }
 
     private(set) var prepared: [StatementKey: PreparedStatement] = [:]
+    /// Set by a listener, which is the only owner with somewhere to put a
+    /// notification. A pooled connection drops them: whoever ran `LISTEN` on
+    /// one has already handed it back.
+    var collectsNotifications = false
+    private var notifications: [PostgresNotification] = []
+    /// Where a listener reads asynchronous messages, kept between calls so
+    /// that whatever arrived beyond the message just handled is not lost.
+    /// Allocated on first use, which is never for a pooled connection.
+    private var listening = ByteBuffer()
     private var uses: UInt64 = 0
     private var nextStatement = 0
     /// Statements the server holds that the cache has let go of, closed with
@@ -108,10 +120,11 @@ final class PostgresConnection {
     private var toClose: [String] = []
 
     init(socket: OutboundSocket, configuration: PostgresConfiguration,
-         parameters: [String: String]) {
+         parameters: [String: String], processID: Int32 = 0) {
         self.socket = socket
         self.configuration = configuration
         self.parameters = parameters
+        self.processID = processID
     }
 
     /// Connects, negotiates TLS if required, and authenticates.
@@ -185,7 +198,8 @@ final class PostgresConnection {
                         throw PostgresClientError.postgres(.unexpectedMessage(buffer.readPointer[0]))
                     }
                     return PostgresConnection(socket: socket, configuration: configuration,
-                                              parameters: startup.parameters)
+                                              parameters: startup.parameters,
+                                              processID: startup.processID)
                 }
             }
         } catch let error as PostgresClientError {
@@ -274,6 +288,19 @@ final class PostgresConnection {
                 }
                 buffer.consume(5 + reader.count)
                 if finished {
+                    if collectsNotifications {
+                        // Kept whether the statement succeeded or not: a
+                        // notification that arrived while it ran was still
+                        // sent.
+                        notifications.append(contentsOf: query.notifications)
+                        // And what came after ReadyForQuery in the same read,
+                        // which on a listening connection is a notification
+                        // the server sent as the statement ended -- not a
+                        // reply nobody asked for. Refusing it here would end
+                        // a listener for being told something a moment too
+                        // late.
+                        keepForListener(&buffer)
+                    }
                     guard buffer.readableBytes == 0 else {
                         throw PostgresClientError.postgres(.unexpectedMessage(buffer.readPointer[0]))
                     }
@@ -326,7 +353,94 @@ final class PostgresConnection {
         }
     }
 
+    /// What arrived while this connection's own statements ran, in order,
+    /// and clears it. For a listener, which has nowhere else to look.
+    func takeNotifications() -> [PostgresNotification] {
+        defer { notifications.removeAll(keepingCapacity: true) }
+        return notifications
+    }
+
+    /// Moves what is left of a query's buffer to where a listener reads, in
+    /// order, after the notifications the query itself collected.
+    private func keepForListener(_ buffer: inout ByteBuffer) {
+        let count = buffer.readableBytes
+        guard count > 0 else { return }
+        listening.reserve(count)
+        UnsafeMutableRawBufferPointer(start: listening.writePointer, count: count)
+            .copyMemory(from: UnsafeRawBufferPointer(start: buffer.readPointer, count: count))
+        listening.advanceWriter(count)
+        buffer.consume(count)
+    }
+
+    /// Waits for the server to say something unasked -- a notification -- and
+    /// returns it, or nil when nothing came within `milliseconds`.
+    ///
+    /// For a listener, whose connection has nothing else in flight. A notice
+    /// or a changed setting is passed over and the wait goes on; anything else
+    /// is a server sending a reply to a statement nobody ran, after which the
+    /// connection is not to be trusted.
+    func nextNotification(milliseconds: UInt64) async throws(PostgresClientError) -> PostgresNotification? {
+        let deadline = av_monotonic_ms() + milliseconds
+        // Moved out and back rather than passed as `inout` across an await:
+        // one owner of the allocation at a time.
+        var buffer = listening
+        listening = ByteBuffer()
+        defer { listening = buffer }
+        while true {
+            // What is already buffered first: several notifications can
+            // arrive in one read, and the buffer holds nothing at all until
+            // the first one does.
+            var framed: (type: UInt8, reader: PostgresReader)? = nil
+            if buffer.readableBytes > 0 {
+                switch PostgresBackend.frame(buffer.readPointer, buffer.readableBytes,
+                                             maxLength: configuration.maxMessageBytes) {
+                case .frame(let frame):
+                    framed = (frame.type, PostgresReader(buffer.readPointer + frame.bodyOffset,
+                                                         frame.bodyLength))
+                case .failure(let error):
+                    socket.close()
+                    throw .postgres(.protocolViolation(error))
+                case .incomplete:
+                    break
+                }
+            }
+            guard let (type, reader) = framed else {
+                let now = av_monotonic_ms()
+                guard now < deadline else { return nil }
+                do {
+                    try await PostgresConnection.readMore(socket, &buffer, deadline - now)
+                } catch .timedOut {
+                    return nil
+                } catch {
+                    socket.close()
+                    throw error
+                }
+                continue
+            }
+            var notification: PostgresNotification? = nil
+            var failure: PostgresError? = nil
+            switch type {
+            case UInt8(ascii: "A"):
+                do { notification = try PostgresBackend.notification(reader) }
+                catch { failure = .protocolViolation(error) }
+            // A notice -- a warning, a raised message -- or a setting that
+            // changed under the session. Neither ends it.
+            case UInt8(ascii: "N"), UInt8(ascii: "S"):
+                break
+            default:
+                failure = .unexpectedMessage(type)
+            }
+            buffer.consume(5 + reader.count)
+            if let failure {
+                socket.close()
+                throw .postgres(failure)
+            }
+            if let notification { return notification }
+        }
+    }
+
     func close() {
+        listening.destroy()
         var out = ByteBuffer(capacity: 8)
         PostgresFrontend.terminate(into: &out)
         let bytes = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
@@ -364,8 +478,8 @@ final class PostgresConnection {
         try await PostgresConnection.nextMessage(socket, &buffer, configuration)
     }
 
-    private static func readMore(_ socket: OutboundSocket, _ buffer: inout ByteBuffer,
-                                 _ ms: UInt64) async throws(PostgresClientError) {
+    static func readMore(_ socket: OutboundSocket, _ buffer: inout ByteBuffer,
+                         _ ms: UInt64) async throws(PostgresClientError) {
         while true {
             if !socket.hasBufferedInput {
                 do {

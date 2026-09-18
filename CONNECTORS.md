@@ -14,7 +14,7 @@ change is in [RELEASE.md](RELEASE.md).
 | Connector | Status | Not supported |
 |---|---|---|
 | [HTTP client](#http-client) | Done | HTTP/3, proxies |
-| [PostgreSQL](#postgresql) | Done | Some types, `LISTEN`, `COPY`, unix sockets, several hosts |
+| [PostgreSQL](#postgresql) | Done | Some types, `COPY`, unix sockets, several hosts |
 | [Redis](#redis) | Done | **Cluster, Sentinel**, sharded pub/sub, client-side caching |
 | [SQLite](#sqlite) | Done | Interrupting a statement, backups, custom functions |
 
@@ -79,9 +79,33 @@ try await pool.query(Note.self, "select id, tags from notes where $1 = any(tags)
 dimension, which Swift's nested lists are not, so `{{1,2},{3,4}}` is refused
 rather than flattened.
 
+`LISTEN` and `NOTIFY` carry news from one process to the others, across
+machines as well as workers. A listener holds a connection of its own, which
+the pool does not count: a session that has listened is spoken to at any
+moment, so it cannot be handed to the next statement.
+
+```swift
+app.listen("jobs") { notification, start in          // in every worker
+    try await runJob(notification.payload, start.state(PostgresPool.self))
+}
+
+try await pool.transaction { tx in
+    try await tx.execute("insert into jobs (payload) values ($1)", payload)
+    try await tx.notify("jobs", payload)             // sent only if this commits
+}
+```
+
+`app.listen` reconnects with the same channels when the server restarts, and
+`whenListening:` runs each time they start listening -- the place to sweep up
+what was sent while there was no listener, since the server keeps nothing for
+a session that is not connected. `pool.listen` is the same thing without the
+worker around it: a `PostgresListener` whose `next(timeoutMilliseconds:)`
+waits for the next notification. A payload of 8,000 bytes or more is refused
+by the server, so a notification is a key, not a document.
+
 ### Not supported
 
-- `LISTEN` and `NOTIFY`, and `COPY`.
+- `COPY`.
 - Arrays of more than one dimension, and arrays of a type with no reader of
   its own, which are read as text.
 - Ranges, `hstore`, enums and composite types, which are read as text.
@@ -93,7 +117,6 @@ rather than flattened.
 
 ### Future work
 
-- `LISTEN` on a connection of its own, like Redis `subscribe`.
 - `COPY` in both directions, streamed.
 - Enums and composite types as Swift types.
 - Unix-domain sockets, SASLprep, and a list of hosts to try in order.

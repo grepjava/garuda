@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 795 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 806 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -410,6 +410,22 @@ The Python suites need `h2` and `aioquic`.
   is that column rather than a row of columns, as bytes already were.
   `PostgresType.elementType(of:)` and `PostgresArrayText` are public for a
   driver of your own.
+- `LISTEN` and `NOTIFY`: `app.listen("jobs") { notification, start in ... }`
+  hears notifications in each worker, on the worker's thread with the worker's
+  state, on a connection of its own that the pool does not count. A connection
+  that goes is logged and made again with the same channels after
+  `reconnectAfter` seconds; `whenListening:` runs each time the channels start
+  listening, which is where an application picks up what was sent while it had
+  no listener -- the server keeps nothing for a session that is not connected.
+  A throw from the handler is logged and the next notification is handled as
+  usual. Underneath, `pool.listen(channels)` gives a `PostgresListener` with
+  `next(timeoutMilliseconds:)`, `listen`, `unlisten`, `channels`, `isOpen` and
+  `processID`, and `pool.notify(channel, payload)` sends one through
+  `pg_notify` so neither the channel nor the payload is part of the statement.
+  `tx.notify(channel, payload)` sends one when its transaction commits, and
+  not at all if it rolls back. A notification that arrives in the same read as
+  the reply to the statement that subscribed is kept for the listener rather
+  than refused as a reply nobody asked for.
 - `app.every(interval, jitter:firstAfter:onWorker:) { start in ... }` runs work
   on a timer in each worker: clearing what has expired, refreshing a cache. It
   runs on the worker's own thread with the worker's state, from the moment that

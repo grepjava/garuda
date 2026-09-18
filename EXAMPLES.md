@@ -376,6 +376,36 @@ app.every(3600, onWorker: 0) { start in
 }
 ```
 
+### News from the database
+
+```swift
+// Every worker hears it, on a connection of its own.
+app.listen("jobs", whenListening: { start in
+    // Listening has just started, on the first connection or after a
+    // reconnection: pick up whatever was sent while there was no listener.
+    try await claimWaitingJobs(start.state(PostgresPool.self))
+}) { notification, start in
+    try await runJob(notification.payload, start.state(PostgresPool.self))
+}
+```
+
+A throw from the handler is logged and the next notification is handled as
+usual; a connection that goes is logged and made again with the same channels.
+Sending is the other half, and belongs with the work it is news of:
+
+```swift
+// Sent when, and only when, the transaction that wrote the row commits.
+try await pool.transaction { tx in
+    try await tx.execute("insert into jobs (payload) values ($1)", payload)
+    try await tx.notify("jobs", payload)
+}
+```
+
+`NOTIFY` reaches other machines, which a `Topic` does not. The server keeps
+nothing for a session that is not connected, so a notification is news, not a
+queue: `whenListening` is where the queue is read, and the payload -- under
+8,000 bytes, or the server refuses it -- says only what to look at.
+
 ### What every worker must see
 
 State that has to be shared does not live in a process:
@@ -383,6 +413,7 @@ State that has to be shared does not live in a process:
 | To share | Use |
 |---|---|
 | events (a chat message, an invalidation) | `Topic`, which reaches every worker through shared memory |
+| news from another machine | PostgreSQL `LISTEN`/`NOTIFY`, through `app.listen` |
 | sessions, tokens, rate limits across workers | Redis, PostgreSQL or SQLite; Garuda's stores for each |
 | counters worth scraping | `--metrics-port`, which aggregates across workers |
 | anything durable | the database |

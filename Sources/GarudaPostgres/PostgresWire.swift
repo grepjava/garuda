@@ -205,6 +205,17 @@ public enum PostgresBackend {
         return (pid, key)
     }
 
+    /// An `A` message: a notification for a session that has listened.
+    public static func notification(_ body: PostgresReader)
+        throws(PostgresProtocolError) -> PostgresNotification {
+        var r = body
+        let pid = try r.readInt32()
+        let channel = try r.readCString()
+        let payload = try r.readCString()
+        try r.finish()
+        return PostgresNotification(channel: channel, payload: payload, senderProcessID: pid)
+    }
+
     /// A `Z` message.
     public static func readyForQuery(_ body: PostgresReader)
         throws(PostgresProtocolError) -> PostgresTransactionStatus {
@@ -344,6 +355,26 @@ public struct PostgresErrorFields: Equatable, Sendable {
     public var constraint: String? = nil
 
     public init() {}
+}
+
+/// A notification from `NOTIFY`, delivered to a session that has `LISTEN`ed
+/// for its channel.
+///
+/// It can arrive at any time: between statements, or in the middle of one.
+public struct PostgresNotification: Sendable, Equatable {
+    /// The channel it was sent on.
+    public let channel: String
+    /// What the sender sent with it, empty when it sent nothing.
+    public let payload: String
+    /// The process ID of the session that sent it, which is how a listener
+    /// tells a notification of its own from someone else's.
+    public let senderProcessID: Int32
+
+    public init(channel: String, payload: String, senderProcessID: Int32) {
+        self.channel = channel
+        self.payload = payload
+        self.senderProcessID = senderProcessID
+    }
 }
 
 /// One column of a result, as a RowDescription describes it.

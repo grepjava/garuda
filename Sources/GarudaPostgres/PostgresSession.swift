@@ -267,6 +267,10 @@ public struct PostgresQuery {
     /// Statements to close before this one runs.
     let closing: [String]
     public private(set) var rows = PostgresRows()
+    /// Notifications that arrived while this statement ran. A session that
+    /// has listened can be told at any moment, including between a statement
+    /// and its ReadyForQuery, so they are collected rather than refused.
+    public private(set) var notifications: [PostgresNotification] = []
     /// Whether the server parsed the statement. A prepared statement exists
     /// from then on, whatever happens to the rest of the query.
     public private(set) var parsed = false
@@ -332,6 +336,9 @@ public struct PostgresQuery {
                 return false
             case UInt8(ascii: "2"), UInt8(ascii: "3"), UInt8(ascii: "n"),
                  UInt8(ascii: "N"), UInt8(ascii: "S"), UInt8(ascii: "I"):
+                return false
+            case UInt8(ascii: "A"):
+                notifications.append(try PostgresBackend.notification(body))
                 return false
             case UInt8(ascii: "T"):
                 rows.setColumns(try PostgresBackend.rowDescription(body))
