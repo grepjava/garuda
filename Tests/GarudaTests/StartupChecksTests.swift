@@ -108,3 +108,122 @@ struct StartupChecksTests {
         #expect(app.problems().isEmpty, "a different type is a different value")
     }
 }
+
+// MARK: - The test client's JSON helpers
+
+private struct NewThing: Codable, Equatable, Sendable {
+    let name: String
+    let count: Int
+}
+
+@Suite("Test client JSON")
+struct TestClientJSONTests {
+    private func echoApp() -> Application {
+        let app = Application()
+        app.post("/things") { (body: Body<NewThing>) in JSON(body.value, status: .created) }
+        app.put("/things/:id") { (id: Path<Int>, body: Body<NewThing>) in JSON(body.value) }
+        app.patch("/things/:id") { (id: Path<Int>, body: Body<NewThing>) in JSON(body.value) }
+        app.post("/type") { request, response in
+            response.send(request.header("content-type") ?? "none")
+        }
+        return app
+    }
+
+    @Test func aValueGoesOutAsJSONAndComesBackAsTheType() throws {
+        let client = echoApp().test
+        let thing = NewThing(name: "a widget", count: 3)
+
+        let created = try client.post("/things", json: thing)
+        #expect(created.status == .created)
+        #expect(try created.json(NewThing.self) == thing)
+        #expect(try client.put("/things/1", json: thing).json(NewThing.self) == thing)
+        #expect(try client.patch("/things/1", json: thing).json(NewThing.self) == thing)
+        #expect(try client.request("POST", "/things", json: thing).json(NewThing.self) == thing)
+    }
+
+    @Test func theContentTypeIsSetUnlessTheTestSetsIt() throws {
+        let client = echoApp().test
+        #expect(try client.post("/type", json: NewThing(name: "x", count: 1)).text == "application/json")
+        // A test sending the wrong type on purpose still can.
+        #expect(try client.post("/type", json: NewThing(name: "x", count: 1),
+                                headers: [("content-type", "text/plain")]).text == "text/plain")
+    }
+
+    @Test func patchAndPutTakeAStringOrBytesAsWell() throws {
+        let client = echoApp().test
+        #expect(try client.patch("/things/1", body: #"{"name":"x","count":1}"#).status == .ok)
+        #expect(try client.put("/things/1", body: Array(#"{"name":"x","count":1}"#.utf8)).status == .ok)
+    }
+}
+
+// MARK: - What the document cannot promise
+
+/// A type whose decoder reads a string and parses it, so recording what it
+/// decodes shows a string and not the fields it really has. The kind of type
+/// `OpenAPISchemaDescribing` exists for -- and this one does not conform, so
+/// the audit should name it.
+private struct Coordinate: Codable, Sendable {
+    let latitude: Double
+    let longitude: Double
+
+    init(from decoder: any Decoder) throws {
+        let text = try decoder.singleValueContainer().decode(String.self)
+        let parts = text.split(separator: ",")
+        guard parts.count == 2, let latitude = Double(parts[0]), let longitude = Double(parts[1]) else {
+            throw JSONError.invalidValue(path: "", reason: "not a coordinate")
+        }
+        self.latitude = latitude
+        self.longitude = longitude
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode("\(latitude),\(longitude)")
+    }
+}
+
+private struct Plain: Codable, Sendable {
+    let name: String
+    let count: Int
+    let tags: [String]
+    let when: Timestamp
+    let inner: Inner?
+
+    struct Inner: Codable, Sendable { let id: Int }
+}
+
+@Suite("OpenAPI document checks")
+struct DocumentChecksTests {
+    private let info = OpenAPIInfo(title: "Things", version: "1")
+
+    @Test func adocumentThatSaysEverythingHasNothingToReport() throws {
+        let app = Application()
+        app.get("/things") { JSON([Plain]()) }.operationID("listThings")
+        app.post("/things") { (body: Body<Plain>) in JSON(body.value) }.operationID("addThing")
+        app.get("/things/:id") { (id: Path<Int>) in JSON(Plain?.none) }.operationID("getThing")
+        #expect(app.documentProblems(info).isEmpty, "\(app.documentProblems(info))")
+    }
+
+    @Test func aSchemaReadFromATypeThatStoppedEarly() throws {
+        let app = Application()
+        app.post("/places") { (body: Body<Coordinate>) in "ok" }
+        let problems = app.documentProblems(info)
+        #expect(problems.count == 1, "\(problems)")
+        #expect(problems.first?.contains("Coordinate") == true, "\(problems)")
+        #expect(problems.first?.contains("may be incomplete") == true, "\(problems)")
+    }
+
+    @Test func twoRoutesThatShareAnOperationID() throws {
+        let app = Application()
+        app.get("/a") { "a" }.operationID("thing")
+        app.get("/b") { "b" }.operationID("thing")
+        #expect(app.documentProblems(info)
+                    == [#"GET /b and GET /a share the operationID "thing""#])
+    }
+
+    @Test func aHiddenRouteIsNotAuditedEither() throws {
+        let app = Application()
+        app.post("/places") { (body: Body<Coordinate>) in "ok" }.hidden()
+        #expect(app.documentProblems(info).isEmpty, "\(app.documentProblems(info))")
+    }
+}

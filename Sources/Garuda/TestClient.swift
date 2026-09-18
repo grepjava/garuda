@@ -145,8 +145,54 @@ public final class TestClient {
         try request("PUT", path, headers: headers, body: body)
     }
 
+    public func patch(_ path: String, body: [UInt8] = [], headers: [(String, String)] = []) throws -> TestResponse {
+        try request("PATCH", path, headers: headers, body: body)
+    }
+
+    public func patch(_ path: String, body: String, headers: [(String, String)] = []) throws -> TestResponse {
+        try request("PATCH", path, headers: headers, body: Array(body.utf8))
+    }
+
+    public func put(_ path: String, body: String, headers: [(String, String)] = []) throws -> TestResponse {
+        try request("PUT", path, headers: headers, body: Array(body.utf8))
+    }
+
     public func delete(_ path: String, headers: [(String, String)] = []) throws -> TestResponse {
         try request("DELETE", path, headers: headers)
+    }
+
+    /// Sends `value` as a JSON body, with the content type:
+    ///
+    ///     let created = try client.post("/orders", json: NewOrder(quantity: 2))
+    ///     let order = try created.json(Order.self)
+    ///
+    /// The encoding is Garuda's own coder, the one the server decodes with, so
+    /// a test sends what a client of this API would send rather than a string
+    /// somebody has to keep in step with the type.
+    public func post(_ path: String, json value: some Encodable,
+                     headers: [(String, String)] = []) throws -> TestResponse {
+        try request("POST", path, headers: headers, json: value)
+    }
+
+    public func put(_ path: String, json value: some Encodable,
+                    headers: [(String, String)] = []) throws -> TestResponse {
+        try request("PUT", path, headers: headers, json: value)
+    }
+
+    public func patch(_ path: String, json value: some Encodable,
+                      headers: [(String, String)] = []) throws -> TestResponse {
+        try request("PATCH", path, headers: headers, json: value)
+    }
+
+    /// Any method with a JSON body. `content-type` is added unless the call
+    /// gives one, so a test can send the wrong type on purpose.
+    public func request(_ method: String, _ path: String, headers: [(String, String)] = [],
+                        json value: some Encodable) throws -> TestResponse {
+        var headers = headers
+        if !headers.contains(where: { $0.0.lowercased() == "content-type" }) {
+            headers.append(("content-type", "application/json"))
+        }
+        return try request(method, path, headers: headers, body: try JSONCoder.encode(value))
     }
 
     /// Sends an HTTP/1.1 request. Host is added unless given, and

@@ -292,6 +292,50 @@ public final class Application: RouteBuilder {
     /// What it cannot find: a middleware's `request.state(T.self)`, which is
     /// a call rather than a declaration, and an optional extractor, which is
     /// a route saying it can do without.
+    /// What the OpenAPI document cannot promise, for a team generating
+    /// clients from it. Empty when it says everything it should.
+    ///
+    /// ```
+    /// #expect(app.documentProblems(info).isEmpty)
+    /// ```
+    ///
+    /// What it finds:
+    ///
+    /// - A schema read from a type whose decoding stopped early, which is a
+    ///   schema that may be missing whatever came after. Such a type either
+    ///   conforms to `OpenAPISchemaDescribing` and says what it is, or gets
+    ///   named here.
+    /// - Two routes with the same `operationID`, which generated clients turn
+    ///   into two functions of one name. (Two routes with the same method and
+    ///   path cannot get this far: the route table refuses them.)
+    ///
+    /// It does not serve anything, so the document it builds is thrown away.
+    public func documentProblems(_ info: OpenAPIInfo) -> [String] {
+        var found: [String] = []
+        let schemas = OpenAPISchemas()
+        var identifiers: [String: String] = [:]
+        for index in routes.handlers.indices {
+            guard let operation = routes.operations[index], !operation.isHidden,
+                  let pattern = routes.patterns[index], let method = routes.methods[index],
+                  let name = openAPIMethodName(method) else { continue }
+            let (path, _) = openAPIPath(pattern)
+            let route = name.uppercased() + " " + path
+            if let id = operation.identifier {
+                if let other = identifiers[id] {
+                    found.append("\(route) and \(other) share the operationID \"\(id)\"")
+                }
+                identifiers[id] = route
+            }
+        }
+        // Building the document is what reads the types, so the schemas only
+        // know what is uncertain afterwards.
+        _ = routes.openAPIDocument(info, into: schemas)
+        for (type, reason) in schemas.uncertain {
+            found.append("the schema for \(type) may be incomplete: \(reason)")
+        }
+        return found
+    }
+
     public func problems() -> [String] {
         var found: [String] = []
         let registered = Set(stateFactories.map { $0.0 })

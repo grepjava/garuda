@@ -614,8 +614,13 @@ import Testing
 import Garuda
 
 @Test func itemsAreCreated() throws {
-    let client = shopApp(databasePath: ":memory:").test
-    let created = try client.post("/items", body: #"{"name":"pen","price":1.5}"#)
+    let app = shopApp(databasePath: ":memory:")
+    // What the routes cannot do, before a request asks: a handler taking more
+    // path parameters than its pattern has, or a State nothing registers.
+    #expect(app.problems().isEmpty, "\(app.problems())")
+
+    let client = app.test
+    let created = try client.post("/items", json: NewItem(name: "pen", price: 1.5))
     #expect(created.status == .created)
     #expect(try created.json(Item.self).name == "pen")
     #expect(try client.get("/items/99").status == .notFound)
@@ -624,6 +629,23 @@ import Garuda
 
 `app.test` runs the application on a real worker in the test process, through
 the same engine and parser as the server, with no port to open.
+
+`post`, `put` and `patch` take `json:` and encode it with the coder the server
+decodes with, so a test sends what a client of the API would rather than a
+string somebody keeps in step by hand; `body:` still takes a `String` or bytes
+for a request that is meant to be malformed. `response.json(T.self)` reads the
+answer back.
+
+An application whose clients are generated from its OpenAPI document has one
+more thing worth asserting:
+
+```swift
+#expect(app.documentProblems(OpenAPIInfo(title: "Shop", version: "1")).isEmpty)
+```
+
+which names a schema read from a type whose decoding stopped early -- so the
+schema may be missing what came after -- and two routes sharing an
+`operationID`.
 
 ## Running in production
 

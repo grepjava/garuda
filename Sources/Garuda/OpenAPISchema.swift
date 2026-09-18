@@ -73,6 +73,11 @@ public protocol OpenAPISchemaDescribing {
 public final class OpenAPISchemas {
     /// Named object schemas, in the order they were first described.
     public private(set) var components: [(String, OpenAPIValue)] = []
+    /// Types whose schema may be short of what they decode, because reading
+    /// them stopped early. `Application.documentProblems` reports these; a
+    /// type that means to be described differently says so by conforming to
+    /// `OpenAPISchemaDescribing`, and is never in here.
+    public private(set) var uncertain: [(type: String, reason: String)] = []
     private var componentIndex: [String: Int] = [:]
     private var names: [ObjectIdentifier: String] = [:]
     private var inProgress: Set<ObjectIdentifier> = []
@@ -95,12 +100,28 @@ public final class OpenAPISchemas {
         inProgress.insert(id)
         defer { inProgress.remove(id) }
         let node = SchemaNode()
-        _ = try? T(from: RecordingDecoder(schemas: self, node: node))
+        do {
+            _ = try T(from: RecordingDecoder(schemas: self, node: node))
+        } catch is SchemaRecordingStopped {
+            note(name, "it nests deeper than the recorder follows")
+        } catch {
+            // The type read something a placeholder could not satisfy, so what
+            // it decodes after that point is not in the schema. Worth saying
+            // rather than swallowing: a client generated from this document
+            // would be missing whatever came next.
+            note(name, "its init(from:) threw \(Swift.type(of: error))")
+        }
         let schema = node.schema
         guard node.isObject else { return schema }
         componentIndex[name] = components.count
         components.append((name, schema))
         return reference(name)
+    }
+
+    /// Records a type whose reading stopped early, once per type.
+    private func note(_ type: String, _ reason: String) {
+        guard !uncertain.contains(where: { $0.type == type }) else { return }
+        uncertain.append((type, reason))
     }
 
     /// The object schema itself for `type`, following a `$ref`.

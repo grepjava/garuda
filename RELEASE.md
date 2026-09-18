@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 920 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 927 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -142,6 +142,15 @@ The Python suites need `h2` and `aioquic`.
   type twice is refused: it used to run both factories in every worker, so one
   value was reachable by nobody and shut down never, while the other was shut
   down twice.
+- `app.documentProblems(info)` says what the OpenAPI document cannot promise,
+  for a team generating clients from it: a schema read from a type whose
+  decoding stopped early, which is a schema that may be missing whatever came
+  after, and two routes sharing an `operationID`. Reading a type used to
+  discard the failure, so an incomplete schema was silent.
+- The test client takes `json:` on `post`, `put`, `patch` and `request`,
+  encoding with the coder the server decodes with and setting the content type
+  unless the test sets its own, and has `patch` and the `String` forms of
+  `put` and `patch` it was missing.
 - `app.problems()` says what about the routes cannot work, before anything is
   served: a handler taking more `Path` extractors than its pattern has
   parameters, and a handler asking for a `State<T>` no `app.state` registered.

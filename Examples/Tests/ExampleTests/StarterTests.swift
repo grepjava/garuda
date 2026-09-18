@@ -281,6 +281,14 @@ struct StarterExampleTests {
         configuration.signingKeyPEM = try JWTKey.generate(.ES256, keyID: "access").privatePEM
         #expect(starterApp(configuration).problems().isEmpty,
                 "\(starterApp(configuration).problems())")
+
+        // And what the document it publishes cannot promise: a schema read
+        // from a type whose decoding stopped early, or two routes sharing an
+        // operationID. Worth asserting in any application whose clients are
+        // generated from the document.
+        let info = OpenAPIInfo(title: "Starter", version: "1.0.0")
+        let document = starterApp(configuration).documentProblems(info)
+        #expect(document.isEmpty, "\(document)")
     }
 
     @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))

@@ -485,8 +485,9 @@ extension Application {
 }
 
 extension Routes {
-    func openAPIDocument(_ info: OpenAPIInfo) -> OpenAPIValue {
-        let schemas = OpenAPISchemas()
+    /// `schemas` is taken rather than made when a caller wants to see what
+    /// reading the types found: `Application.documentProblems`.
+    func openAPIDocument(_ info: OpenAPIInfo, into schemas: OpenAPISchemas = OpenAPISchemas()) -> OpenAPIValue {
         var paths: [(String, [(String, OpenAPIValue)])] = []
         var schemes: [(String, OpenAPIValue)] = []
 
