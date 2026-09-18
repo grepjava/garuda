@@ -902,6 +902,23 @@ The Python suites need `h2` and `aioquic`.
 
 ### PostgreSQL
 
+- A released connection goes straight to the oldest request waiting for one.
+  It used to go back to the idle list with that request woken, and whoever
+  asked next before the woken task ran -- a new request, or the one that had
+  just released it -- took it; the woken request joined the back of the queue
+  with nothing, and could lose its turn again. With 64 clients on 8
+  connections the slowest 1% of answers took 4.6 ms, twice axum's; now 2.9 ms
+  against its 2.5.
+- A statement costs less on the client. The RowDescription that comes back
+  with every run is compared with the last one byte for byte, and the same
+  one reuses the columns read from it then instead of making a string per
+  column again; a renamed column still makes a different description, and is
+  read by its new name (there is a test). The statement cache is looked up
+  once rather than hashed up to three times, the formats to ask for are kept
+  with the statement, the buffers a statement is written into and read from
+  are kept by the connection, and a row's columns are found by name without
+  building a dictionary for each result. One worker answering the database
+  workload went from 24,015 to 26,025 requests a second.
 - A statement costs two fewer system calls. A connection the worker made
   used to be given read interest for every wait on a reply and have it taken
   away after, which was an `epoll_ctl` either side of each statement. Read

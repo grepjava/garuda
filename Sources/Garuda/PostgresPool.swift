@@ -96,8 +96,14 @@ public final class PostgresPool: @unchecked Sendable {
     private var idle: [PostgresConnection] = []
     /// Connections that exist, idle or in use -- including one being opened.
     private var open = 0
-    /// The timed waits of statements waiting for a connection, oldest first.
+    /// The timed waits of statements waiting for a connection, oldest first,
+    /// from `waitingHead` on: taken from the front by moving the head rather
+    /// than shifting the rest down.
     private var waiting: [Int32] = []
+    private var waitingHead = 0
+    /// Connections released straight to a wait, by its id, for it to take
+    /// when it runs.
+    private var handedOver: [Int32: PostgresConnection] = [:]
 
     /// `acquireTimeoutMilliseconds` defaults to the configuration's timeout.
     public init(_ configuration: PostgresConfiguration, maxConnections: Int = 8,
@@ -185,6 +191,8 @@ public final class PostgresPool: @unchecked Sendable {
     public func close() {
         for connection in idle { connection.close() }
         idle.removeAll()
+        for connection in handedOver.values { connection.close() }
+        handedOver.removeAll()
         open = 0
     }
 
@@ -239,11 +247,16 @@ public final class PostgresPool: @unchecked Sendable {
             }
             switch outcome {
             case .woken:
+                // Handed over by the release that woke this wait, so nobody
+                // who arrived since can have taken it first. Nothing handed
+                // over means a connection closed rather than came back, and
+                // there is room to open one.
+                if let connection = handedOver.removeValue(forKey: id) { return connection }
                 continue
             case .timedOut:
                 // Gone from the queue now, rather than when a release reaches
                 // it: with every connection stuck, none may come.
-                waiting.removeAll { $0 == id }
+                if let at = waiting[waitingHead...].firstIndex(of: id) { waiting.remove(at: at) }
                 throw .poolTimedOut
             case .cancelled:
                 throw .cancelled
@@ -258,23 +271,48 @@ public final class PostgresPool: @unchecked Sendable {
         // it -- seeing, and committing or rolling back, work that was never
         // theirs. Closing it makes the server roll back.
         if connection.isOpen && connection.transactionStatus == .idle {
-            idle.append(connection)
+            // Straight to the oldest wait, if there is one. Put back as idle
+            // and the wait merely woken, it went to whoever asked next before
+            // the woken task ran -- a new request, or the one that had just
+            // released it -- and the wait joined the back of the queue again
+            // with nothing: a request could lose its turn over and over, and
+            // the slowest answers were twice axum's under the same load.
+            if let id = wakeOne() {
+                handedOver[id] = connection
+            } else {
+                idle.append(connection)
+            }
         } else {
             if connection.isOpen { connection.close() }
             open -= 1
+            wakeOne()
         }
-        wakeOne()
     }
 
     /// Wakes the oldest wait still waiting. An id at the front may belong to a
     /// wait whose timer has fired but whose task has not yet run to take it
     /// out of the queue; waking it wakes nothing, and stopping there would
     /// leave the live wait behind it asleep with a connection free.
-    private func wakeOne() {
-        guard let worker = currentWorker else { return }
-        while !waiting.isEmpty {
-            if worker.pointee.wakeTimed(waiting.removeFirst()) { return }
+    ///
+    /// Returns the wait it woke, or nil when there was none.
+    @discardableResult
+    private func wakeOne() -> Int32? {
+        guard let worker = currentWorker else { return nil }
+        while waitingHead < waiting.count {
+            let id = waiting[waitingHead]
+            waitingHead += 1
+            if waitingHead == waiting.count {
+                waiting.removeAll(keepingCapacity: true)
+                waitingHead = 0
+            } else if waitingHead >= 64 && waitingHead * 2 >= waiting.count {
+                // A queue that never empties under steady load would
+                // otherwise keep everything it has ever served.
+                waiting.removeFirst(waitingHead)
+                waitingHead = 0
+            }
+            if worker.pointee.wakeTimed(id) { return id }
         }
+        return nil
     }
 
     /// Lends one connection for as long as a `COPY` takes: the stream is the
@@ -295,7 +333,7 @@ public final class PostgresPool: @unchecked Sendable {
     /// For tests: how many connections exist, and how many are idle.
     var counts: (open: Int, idle: Int) { (open, idle.count) }
     /// For tests: how many statements are queued for a connection.
-    var waitingCount: Int { waiting.count }
+    var waitingCount: Int { waiting.count - waitingHead }
 }
 
 /// Statements inside one transaction, all on the same connection.
@@ -322,12 +360,45 @@ public struct PostgresTransaction {
 
 // MARK: - Decoding
 
-private func columnIndex(_ rows: PostgresRows) -> [String: Int] {
-    var index: [String: Int] = [:]
-    for (i, column) in rows.columns.enumerated() where index[column.name] == nil {
-        index[column.name] = i
+private func columnIndex(_ rows: PostgresRows) -> PostgresColumnIndex {
+    PostgresColumnIndex(rows.columns)
+}
+
+/// Finds a result's column by name; the first of that name, if two share it.
+///
+/// A result of a few columns is searched in order: hashing every name into a
+/// dictionary, and every property's name again to look it up, cost more than
+/// the comparisons for the handful of columns a row usually has. A wide
+/// result gets the dictionary.
+struct PostgresColumnIndex {
+    /// The result's own array, shared rather than copied.
+    private let columns: [PostgresColumn]
+    private let table: [String: Int]?
+
+    static let searchedInOrder = 16
+
+    init(_ columns: [PostgresColumn]) {
+        self.columns = columns
+        if columns.count > PostgresColumnIndex.searchedInOrder {
+            var table: [String: Int] = [:]
+            for (i, column) in columns.enumerated() where table[column.name] == nil {
+                table[column.name] = i
+            }
+            self.table = table
+        } else {
+            table = nil
+        }
     }
-    return index
+
+    subscript(_ name: String) -> Int? {
+        if let table { return table[name] }
+        var i = 0
+        while i < columns.count {
+            if columns[i].name == name { return i }
+            i += 1
+        }
+        return nil
+    }
 }
 
 func decodeAll<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows) throws -> [Row] {
@@ -339,7 +410,7 @@ func decodeAll<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows) throws ->
 }
 
 private func decodeRow<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows, _ row: Int,
-                                       _ index: [String: Int]) throws -> Row {
+                                       _ index: PostgresColumnIndex) throws -> Row {
     let decoding = PostgresRowDecoding(rows: rows, row: row, index: index)
     // Bytes are a scalar here, not the list of numbers Decodable makes them.
     if Row.self == [UInt8].self {
@@ -359,7 +430,7 @@ private func decodeRow<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows, _
 struct PostgresRowDecoding: Decoder {
     let rows: PostgresRows
     let row: Int
-    let index: [String: Int]
+    let index: PostgresColumnIndex
     var codingPath: [any CodingKey] = []
     var userInfo: [CodingUserInfoKey: Any] { [:] }
 
@@ -388,7 +459,7 @@ struct PostgresRowDecoding: Decoder {
 private struct PostgresRowKeyed<Key: CodingKey>: KeyedDecodingContainerProtocol {
     let rows: PostgresRows
     let row: Int
-    let index: [String: Int]
+    let index: PostgresColumnIndex
     var codingPath: [any CodingKey] = []
     var allKeys: [Key] { rows.columns.compactMap { Key(stringValue: $0.name) } }
 

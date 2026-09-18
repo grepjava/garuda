@@ -285,6 +285,25 @@ struct PostgresIntegrationTests {
         #expect(text == "1|2|new")
     }
 
+    /// The result is described on every run, and a description the same as
+    /// the last one reuses the columns read from it then. A renamed column
+    /// makes a different description, which must be read again: a server that
+    /// no longer refuses the old plan over a new name leaves the description
+    /// as all that stands between the rename and a row decoded by the old one.
+    @Test func aColumnRenamedUnderAStatementIsReadByItsNewName() throws {
+        let text = try onConnection { connection in
+            _ = try await connection.query("create temporary table renames (a int)")
+            _ = try await connection.query("insert into renames values (7)")
+            for _ in 0..<3 { _ = try await connection.query("select * from renames") }
+            _ = try await connection.query("alter table renames rename column a to b")
+            let after = try await connection.query("select * from renames")
+            let again = try await connection.query("select * from renames")
+            return after.columns.map(\.name).joined() + again.columns.map(\.name).joined()
+                + "|" + (again.text(row: 0, column: 0) ?? "null")
+        }
+        #expect(text == "bb|7")
+    }
+
     @Test func aStaleStatementInsideATransactionIsReportedNotRetried() throws {
         // The refusal has already failed the transaction: running the
         // statement again inside it could only be refused again.

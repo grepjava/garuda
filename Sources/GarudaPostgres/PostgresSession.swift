@@ -282,10 +282,19 @@ public struct PostgresQuery {
     /// The row limit a result may reach before the query is failed. Rows are
     /// copied as they arrive, so an unbounded SELECT is an unbounded buffer.
     let maxRows: Int
+    /// A RowDescription this statement was answered with before, as it came
+    /// on the wire, and the columns read out of it. One that arrives the same
+    /// byte for byte is those columns again, and is not read a second time.
+    let knownDescription: [UInt8]
+    let knownColumns: [PostgresColumn]
+    /// The RowDescription this query read, as it came on the wire, when it
+    /// was not the known one: what a caller keeps to pass back next time.
+    public private(set) var freshDescription: [UInt8]? = nil
 
     public init(_ sql: String, _ values: [PostgresValue] = [], maxRows: Int = 1_000_000,
                 statement: String = "", prepare: Bool = true, resultFormats: [Int16] = [],
-                closing: [String] = []) {
+                closing: [String] = [], knownDescription: [UInt8] = [],
+                knownColumns: [PostgresColumn] = []) {
         self.sql = sql
         self.values = values
         self.statement = statement
@@ -293,6 +302,8 @@ public struct PostgresQuery {
         self.resultFormats = resultFormats
         self.closing = closing
         self.maxRows = maxRows
+        self.knownDescription = knownDescription
+        self.knownColumns = knownColumns
     }
 
     /// Close what is evicted, parse unless the statement is already prepared,
@@ -304,6 +315,13 @@ public struct PostgresQuery {
     public func messages() throws(PostgresError) -> [UInt8] {
         var out = ByteBuffer(capacity: 256)
         defer { out.destroy() }
+        try write(into: &out)
+        return Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
+    }
+
+    /// The same messages, appended to `out`: for a connection that keeps one
+    /// buffer for everything it sends.
+    public func write(into out: inout ByteBuffer) throws(PostgresError) {
         for name in closing {
             guard PostgresFrontend.close(statement: name, into: &out) else { throw .unsendable }
         }
@@ -318,7 +336,6 @@ public struct PostgresQuery {
             throw .unsendable
         }
         PostgresFrontend.sync(into: &out)
-        return Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
     }
 
     /// Handles one message. Returns true once the query has finished, after
@@ -341,7 +358,16 @@ public struct PostgresQuery {
                 notifications.append(try PostgresBackend.notification(body))
                 return false
             case UInt8(ascii: "T"):
-                rows.setColumns(try PostgresBackend.rowDescription(body))
+                // The portal is described every time -- the description is
+                // what says a column's name and format now -- but it is
+                // nearly always the one before, and reading it again was a
+                // string per column and an array for every statement.
+                if matchesKnownDescription(body) {
+                    rows.setColumns(knownColumns)
+                } else {
+                    rows.setColumns(try PostgresBackend.rowDescription(body))
+                    freshDescription = Array(UnsafeBufferPointer(start: body.base, count: body.count))
+                }
                 return false
             case UInt8(ascii: "D"):
                 try PostgresBackend.dataRow(body, into: &scratch)
@@ -379,6 +405,18 @@ public struct PostgresQuery {
             throw error
         } catch {
             throw .protocolViolation(.truncated)
+        }
+    }
+
+    private func matchesKnownDescription(_ body: PostgresReader) -> Bool {
+        guard !knownColumns.isEmpty, knownDescription.count == body.count else { return false }
+        return knownDescription.withUnsafeBufferPointer { known in
+            var i = 0
+            while i < body.count {
+                if known[i] != body.base[i] { return false }
+                i += 1
+            }
+            return true
         }
     }
 

@@ -128,9 +128,25 @@ final class PostgresConnection {
     struct PreparedStatement {
         let name: String
         /// The columns its last result described, for choosing formats.
-        var columns: [PostgresColumn]
+        var columns: [PostgresColumn] {
+            didSet { formats = PostgresBinary.resultFormats(columns) }
+        }
+        /// That RowDescription as it came on the wire. The next one that is
+        /// the same is these columns again (`PostgresQuery.knownDescription`).
+        var description: [UInt8]
+        /// The format to ask for each column in, worked out once from
+        /// `columns` rather than for every run.
+        private(set) var formats: [Int16]
         /// When it was last used, for evicting the least recent.
         var used: UInt64
+
+        init(name: String, columns: [PostgresColumn], description: [UInt8], used: UInt64) {
+            self.name = name
+            self.columns = columns
+            self.description = description
+            self.formats = PostgresBinary.resultFormats(columns)
+            self.used = used
+        }
     }
 
     private(set) var prepared: [StatementKey: PreparedStatement] = [:]
@@ -143,6 +159,10 @@ final class PostgresConnection {
     /// that whatever arrived beyond the message just handled is not lost.
     /// Allocated on first use, which is never for a pooled connection.
     private var listening = ByteBuffer()
+    /// What a statement is written into and its answer read from, kept from
+    /// one statement to the next instead of allocated for each.
+    private var sending = ByteBuffer()
+    private var receiving = ByteBuffer()
     private var uses: UInt64 = 0
     private var nextStatement = 0
     /// Statements the server holds that the cache has let go of, closed with
@@ -288,17 +308,23 @@ final class PostgresConnection {
         var name = ""
         var prepare = true
         var formats: [Int16] = []
+        var knownDescription: [UInt8] = []
+        var knownColumns: [PostgresColumn] = []
         uses &+= 1
         if configuration.statementCacheCapacity > 0 {
-            if var statement = prepared[key] {
+            // Looked up once, and updated through the index: the SQL is
+            // hashed for the lookup and not again.
+            if let found = prepared.index(forKey: key) {
+                let statement = prepared.values[found]
                 name = statement.name
                 prepare = false
                 // The types its last result had. Should they have changed,
                 // the server refuses the plan (0A000) before sending a row, so
                 // a format chosen for the old type never meets the new one.
-                formats = PostgresBinary.resultFormats(statement.columns)
-                statement.used = uses
-                prepared[key] = statement
+                formats = statement.formats
+                knownDescription = statement.description
+                knownColumns = statement.columns
+                prepared.values[found].used = uses
             } else {
                 if prepared.count >= configuration.statementCacheCapacity,
                    let oldest = prepared.min(by: { $0.value.used < $1.value.used }) {
@@ -313,13 +339,24 @@ final class PostgresConnection {
         toClose.removeAll()
         reusedStaleStatement = false
         var query = PostgresQuery(sql, values, maxRows: configuration.maxRows, statement: name,
-                                  prepare: prepare, resultFormats: formats, closing: closing)
-        let bytes: [UInt8]
-        do { bytes = try query.messages() } catch { throw .postgres(error) }
+                                  prepare: prepare, resultFormats: formats, closing: closing,
+                                  knownDescription: knownDescription, knownColumns: knownColumns)
+        // Moved out and back rather than used in place across the awaits
+        // below: one owner of each allocation at a time.
+        var out = sending
+        sending = ByteBuffer()
+        var buffer = receiving
+        receiving = ByteBuffer()
+        defer {
+            out.clear()
+            sending = out
+            buffer.clear()
+            receiving = buffer
+        }
+        do { try query.write(into: &out) } catch { throw .postgres(error) }
         do {
-            try await writeAll(socket, bytes, ms)
-            var buffer = ByteBuffer(capacity: 8192)
-            defer { buffer.destroy() }
+            try await PostgresConnection.writeAll(socket, &out, ms)
+            buffer.reserve(8192)
             while true {
                 let (type, reader) = try await nextMessage(socket, &buffer, configuration)
                 let finished: Bool
@@ -384,9 +421,13 @@ final class PostgresConnection {
             // Refused before it was parsed -- a syntax error, a failed
             // transaction -- and there is nothing to keep.
             guard query.parsed else { return }
-            prepared[key] = PreparedStatement(name: name, columns: query.rows.columns, used: uses)
-        } else if !query.rows.columns.isEmpty {
+            prepared[key] = PreparedStatement(name: name, columns: query.rows.columns,
+                                              description: query.freshDescription ?? [], used: uses)
+        } else if let description = query.freshDescription {
+            // Only when the description changed: the same one again is the
+            // columns already kept.
             prepared[key]?.columns = query.rows.columns
+            prepared[key]?.description = description
         }
         // Statements the session dropped wholesale. Their names would each be
         // refused once and retried; forgetting them now saves the round trips.
@@ -483,6 +524,8 @@ final class PostgresConnection {
 
     func close() {
         listening.destroy()
+        sending.destroy()
+        receiving.destroy()
         var out = ByteBuffer(capacity: 8)
         PostgresFrontend.terminate(into: &out)
         let bytes = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
@@ -556,6 +599,28 @@ final class PostgresConnection {
                 if n == 1 { return byte }
             } catch {
                 throw map((error as? OutboundError) ?? .failed(0))
+            }
+        }
+    }
+
+    /// Sends everything in `out`, consuming it as it goes.
+    private static func writeAll(_ socket: OutboundSocket, _ out: inout ByteBuffer,
+                                 _ ms: UInt64) async throws(PostgresClientError) {
+        while out.readableBytes > 0 {
+            let n: Int
+            do {
+                n = try socket.write(UnsafeRawBufferPointer(start: out.readPointer,
+                                                            count: out.readableBytes))
+            } catch {
+                throw map(error)
+            }
+            out.consume(n)
+            if out.readableBytes > 0 {
+                do {
+                    try await socket.writable(milliseconds: ms)
+                } catch {
+                    throw map(error)
+                }
             }
         }
     }
