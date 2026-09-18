@@ -72,6 +72,61 @@ Open <http://localhost:8080/docs> for Swagger UI over the generated document.
 chooses what to do with it. That is what makes the tests exercise the same
 routes the executable serves.
 
+### One file per feature, as it grows
+
+Two features fit in two files. Twenty need a rule, and this is the one to
+copy: a feature is a function, and what it contributes is registered in one
+place.
+
+```swift
+// Notes.swift: routes only, so the feature is a value.
+func noteRoutes() -> Router {
+    let app = Router()
+    app.get("") { … }
+    return app
+}
+
+// StarterApp.swift
+app.nest("/notes", noteRoutes())
+```
+
+A feature that needs more than routes takes the application and registers it
+all together -- there is nothing else to declare it to:
+
+```swift
+// Billing.swift
+func addBilling(_ app: Application, _ configuration: StarterConfiguration) {
+    app.state { _ in try StripeClient(configuration.stripeKey) }   // per worker
+    app.prepare { start in try await start.state(StripeClient.self).warmUp() }
+    app.every(3600, onWorker: 0) { _ in … }                        // one worker's job
+    app.nest("/billing", billingRoutes())
+}
+```
+
+- **Routes as a `Router`** when the feature only serves requests: it can be
+  mounted under any prefix, mounted twice, and tested on an application of its
+  own. `Notes.swift` is this shape.
+- **A function on `Application`** when the feature also needs per-worker state,
+  start-up work, a timer or middleware, because those belong to the
+  application. `Accounts.swift` is this shape, since it needs the
+  configuration.
+- **Migrations stay in one list** ([Schema.swift](Sources/StarterExample/Schema.swift)),
+  not one per feature: the order they ran in is what the version counts, and
+  two lists cannot agree on an order. A feature's tables go at the end of the
+  one list.
+- **Shared services in one value** ([Services.swift](Sources/StarterExample/Services.swift)),
+  built once per worker. Features reach it with `State<Services>` rather than
+  each holding a pool of its own -- a pool per feature is connections
+  multiplied by workers multiplied by features.
+- **Tests per feature**, through `app.test` on the whole application, so what
+  is tested is what is served. A `Router` feature can also be tested alone:
+  `let app = Application(); app.merge(noteRoutes())`.
+
+Nothing here is a framework mechanism to learn: a module is a function, and
+`Router` is the value it can hand back. There is no container to register with
+and no scan at start-up, so what an application is made of is what its one
+file says it is.
+
 ## Configuration
 
 Garuda's own concerns stay on the command line, because the server parses them

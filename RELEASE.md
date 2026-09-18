@@ -798,6 +798,12 @@ The Python suites need `h2` and `aioquic`.
   sessions with hashed passwords; server-sent events, a streamed CSV export and
   uploads written to disk as they arrive; and chat rooms over WebSockets and
   event streams, heard across every worker.
+- The starter application states its input rules on the types, so a refused
+  request names the field, and mounts its notes feature as a `Router`.
+  [STARTER.md](Examples/STARTER.md) says how a feature is assembled as an
+  application grows: routes as a `Router` when that is all it has, a function
+  on `Application` when it also needs per-worker state, start-up work or a
+  timer, one migration list, and one value for the shared services.
 
 ### Server
 

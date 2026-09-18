@@ -69,77 +69,83 @@ struct PageQuery: Decodable {
 private let noteColumns = #"id, title, body, created_at as "createdAt", updated_at as "updatedAt""#
 
 
-func addNoteRoutes(_ app: Application) {
-    app.group("/notes") {
-        app.get("") { (query: Query<PageQuery>, jwt: JWT<AccessClaims>, services: State<Services>)
-            async throws -> JSON<NotePage> in
-            let owner = try owner(jwt)
-            let limit = min(max(query.value.limit ?? 20, 1), 100)
-            let before = query.value.before ?? Int64.max
-            let notes = try await services.value.pool.query(
-                Note.self,
-                "select \(noteColumns) from notes where user_id = $1 and id < $2 order by id desc limit $3",
-                owner, before, limit)
-            // A full page means there may be another; a short one is the end.
-            return JSON(NotePage(notes: notes, nextBefore: notes.count == limit ? notes.last?.id : nil))
-        }
-            .summary("A page of your notes, newest first")
-            .tags("notes")
-
-        app.post("") { (body: Body<NewNote>, jwt: JWT<AccessClaims>, services: State<Services>)
-            async throws -> JSON<Note> in
-            let owner = try owner(jwt)
-            // Checked before this ran, so what is left is what to store.
-            let title = body.value.title.trimmingWhitespace()
-            let text = body.value.body ?? ""
-            let now = Timestamp.now.secondsSinceEpoch
-            guard let note = try await services.value.pool.first(
-                Note.self,
-                "insert into notes (user_id, title, body, created_at, updated_at) "
-                    + "values ($1, $2, $3, $4, $4) returning \(noteColumns)",
-                owner, title, text, now) else {
-                throw HTTPError(.internalServerError)
-            }
-            return JSON(note, status: .created)
-        }
-            .summary("Write a note")
-            .tags("notes")
-
-        app.get("/:id") { (id: Path<Int64>, jwt: JWT<AccessClaims>, services: State<Services>)
-            async throws -> JSON<Note>? in
-            try await services.value.pool.first(
-                Note.self, "select \(noteColumns) from notes where id = $1 and user_id = $2",
-                id.value, try owner(jwt)).map { JSON($0) }
-        }
-            .summary("One note")
-            .tags("notes")
-            .response(.notFound, "No note of yours has that id")
-
-        app.patch("/:id") { (id: Path<Int64>, body: Body<NoteChanges>, jwt: JWT<AccessClaims>,
-                             services: State<Services>) async throws -> JSON<Note>? in
-            let owner = try owner(jwt)
-            let title = body.value.title?.trimmingWhitespace()
-            let text = body.value.body
-            // coalesce keeps what the request left out.
-            return try await services.value.pool.first(
-                Note.self,
-                "update notes set title = coalesce($1, title), body = coalesce($2, body), updated_at = $3 "
-                    + "where id = $4 and user_id = $5 returning \(noteColumns)",
-                title, text, Timestamp.now.secondsSinceEpoch, id.value, owner).map { JSON($0) }
-        }
-            .summary("Change a note")
-            .tags("notes")
-            .response(.notFound, "No note of yours has that id")
-
-        app.delete("/:id") { (id: Path<Int64>, jwt: JWT<AccessClaims>, services: State<Services>)
-            async throws -> HTTPStatus in
-            let deleted = try await services.value.pool.execute(
-                "delete from notes where id = $1 and user_id = $2", id.value, try owner(jwt))
-            return deleted == 1 ? .noContent : .notFound
-        }
-            .summary("Delete a note")
-            .tags("notes")
+/// Every route this feature has, as a value: the application mounts it with
+/// `app.nest("/notes", noteRoutes())`, and a test can mount it on an
+/// application of its own. A module that needs state or start-up work takes
+/// the `Application` as well and registers it here; this one needs only what
+/// `Services` already holds.
+func noteRoutes() -> Router {
+    let app = Router()
+    app.get("") { (query: Query<PageQuery>, jwt: JWT<AccessClaims>, services: State<Services>)
+        async throws -> JSON<NotePage> in
+        let owner = try owner(jwt)
+        let limit = min(max(query.value.limit ?? 20, 1), 100)
+        let before = query.value.before ?? Int64.max
+        let notes = try await services.value.pool.query(
+            Note.self,
+            "select \(noteColumns) from notes where user_id = $1 and id < $2 order by id desc limit $3",
+            owner, before, limit)
+        // A full page means there may be another; a short one is the end.
+        return JSON(NotePage(notes: notes, nextBefore: notes.count == limit ? notes.last?.id : nil))
     }
+        .summary("A page of your notes, newest first")
+        .tags("notes")
+
+    app.post("") { (body: Body<NewNote>, jwt: JWT<AccessClaims>, services: State<Services>)
+        async throws -> JSON<Note> in
+        let owner = try owner(jwt)
+        // Checked before this ran, so what is left is what to store.
+        let title = body.value.title.trimmingWhitespace()
+        let text = body.value.body ?? ""
+        let now = Timestamp.now.secondsSinceEpoch
+        guard let note = try await services.value.pool.first(
+            Note.self,
+            "insert into notes (user_id, title, body, created_at, updated_at) "
+                + "values ($1, $2, $3, $4, $4) returning \(noteColumns)",
+            owner, title, text, now) else {
+            throw HTTPError(.internalServerError)
+        }
+        return JSON(note, status: .created)
+    }
+        .summary("Write a note")
+        .tags("notes")
+
+    app.get("/:id") { (id: Path<Int64>, jwt: JWT<AccessClaims>, services: State<Services>)
+        async throws -> JSON<Note>? in
+        try await services.value.pool.first(
+            Note.self, "select \(noteColumns) from notes where id = $1 and user_id = $2",
+            id.value, try owner(jwt)).map { JSON($0) }
+    }
+        .summary("One note")
+        .tags("notes")
+        .response(.notFound, "No note of yours has that id")
+
+    app.patch("/:id") { (id: Path<Int64>, body: Body<NoteChanges>, jwt: JWT<AccessClaims>,
+                         services: State<Services>) async throws -> JSON<Note>? in
+        let owner = try owner(jwt)
+        let title = body.value.title?.trimmingWhitespace()
+        let text = body.value.body
+        // coalesce keeps what the request left out.
+        return try await services.value.pool.first(
+            Note.self,
+            "update notes set title = coalesce($1, title), body = coalesce($2, body), updated_at = $3 "
+                + "where id = $4 and user_id = $5 returning \(noteColumns)",
+            title, text, Timestamp.now.secondsSinceEpoch, id.value, owner).map { JSON($0) }
+    }
+        .summary("Change a note")
+        .tags("notes")
+        .response(.notFound, "No note of yours has that id")
+
+    app.delete("/:id") { (id: Path<Int64>, jwt: JWT<AccessClaims>, services: State<Services>)
+        async throws -> HTTPStatus in
+        let deleted = try await services.value.pool.execute(
+            "delete from notes where id = $1 and user_id = $2", id.value, try owner(jwt))
+        return deleted == 1 ? .noContent : .notFound
+    }
+        .summary("Delete a note")
+        .tags("notes")
+
+    return app
 }
 
 /// The account an access token names. A token this server signed always has a

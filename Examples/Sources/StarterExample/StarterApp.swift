@@ -87,8 +87,11 @@ public func starterApp(_ given: StarterConfiguration) -> Application {
         .tags("ops")
         .response(.serviceUnavailable, "The database did not answer")
 
+    // One feature per file. Accounts takes the application, because it needs
+    // the configuration; notes is a `Router`, which is a feature as a value:
+    // mounted here, and mountable on an application of its own in a test.
     addAccountRoutes(app, settled)
-    addNoteRoutes(app)
+    app.nest("/notes", noteRoutes())
 
     if let path = settled.documentationPath {
         app.openAPI(OpenAPIInfo(title: "Starter", version: "1.0.0",
