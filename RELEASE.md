@@ -517,12 +517,15 @@ The Python suites need `h2` and `aioquic`.
   a soft hyphen goes. A password that was pasted with a non-breaking space in
   it now authenticates. NFKC normalisation is still not done, and
   [CONNECTORS.md](CONNECTORS.md) says so.
-- The macOS CI job raises its descriptor limit, prints it, and runs the unit
-  tests a second time one suite at a time. Four tests fail there and on no
-  developer machine -- two async handlers that time out and two SQLite
-  tests -- and a serial run says whether they interfere with one another or
-  whether it is the platform. The SQLite tests no longer share a plain
-  `Int` between suites that run beside one another.
+- The macOS CI job prints its descriptor limit and runs the unit tests a
+  second time one suite at a time. That split the four failures it alone
+  has: three pass serially, so those interfere with one another through
+  something the suites share, and `aClosedDatabaseRefusesStatements` fails
+  either way, so that one is the platform. It is the only test whose
+  database is never written to, and a read-only connection cannot create a
+  WAL database's -shm file, so it now says which of those files the writer
+  left behind. The SQLite tests also no longer share a plain `Int` between
+  suites that run beside one another.
 - The broadcast suite waits until an event stream is demonstrably subscribed
   before it publishes to it, rather than the instant its head arrives: the
   head of a stream goes out before its handler has subscribed, so the two

@@ -79,32 +79,25 @@ jobs:
 
       - name: Unit tests and the fuzz corpus
         run: |
-          # macOS gives a shell 256 descriptors where Linux gives 1024 or
-          # more, and the suites run side by side, each with a worker holding
-          # listeners, connections, pipes and databases. Running out of them
-          # fails a test as though what it tests were broken, so the limit is
-          # raised and printed: 946 tests at 256 descriptors pass on Linux,
-          # so this is not known to be the cause of anything -- it is one
-          # variable fewer, and the numbers are worth having in the log.
-          echo "descriptors: $(ulimit -n) -> $(ulimit -n 4096 2>/dev/null; ulimit -n)"
-          ulimit -n 4096 || true
+          # Printed, not changed: the runner starts at 10240, which is
+          # plenty, and a shell here gets 256 only when it is interactive.
+          # A run that ever does fail for want of descriptors should say so
+          # in its log rather than be quietly given more.
+          echo "descriptors: $(ulimit -n)"
           swift test \
             -Xcc -I"$OPENSSL_PREFIX/include" \
             -Xlinker -L"$OPENSSL_PREFIX/lib"
 
-      # Four tests fail here and nowhere else -- two async handlers that time
-      # out, two SQLite tests -- and no developer's Mac has reproduced any of
-      # them. Running the suites one at a time says which half to look in: if
-      # they pass, the tests interfere with each other through something they
-      # share, and the answer is in how they are scoped; if they still fail,
-      # it is macOS or this toolchain, and the answer is in the engine. This
-      # runs whether the parallel step passed or not, and does not fail the
-      # job on its own.
+      # Four tests fail here and nowhere else, and running them one at a
+      # time split them: three pass serially, so those three interfere with
+      # each other through something the suites share, and one --
+      # aClosedDatabaseRefusesStatements -- fails either way, so that one is
+      # macOS or this toolchain. Keeping both runs is what tells the two
+      # apart as either is worked on. This one does not fail the job.
       - name: Unit tests again, one suite at a time
         if: always()
         continue-on-error: true
         run: |
-          ulimit -n 4096 || true
           swift test --no-parallel \
             -Xcc -I"$OPENSSL_PREFIX/include" \
             -Xlinker -L"$OPENSSL_PREFIX/lib"

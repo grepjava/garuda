@@ -34,6 +34,17 @@ private final class TemporaryDatabase {
     }
 }
 
+/// Which of a database's files exist, for a failure that turns on it.
+private func databaseFiles(_ path: String) -> String {
+    var out: [String] = []
+    for suffix in ["", "-wal", "-shm"] {
+        let fd = (path + suffix).withCString { av_open_read($0) }
+        if fd >= 0 { _ = av_close(fd) }
+        out.append("\(suffix.isEmpty ? "db" : suffix) \(fd >= 0 ? "there" : "missing")")
+    }
+    return out.joined(separator: ", ")
+}
+
 private func pause(_ milliseconds: UInt64) async {
     _ = await Worker.waitTimed(currentWorker!, milliseconds: milliseconds) { _ in }
 }
@@ -756,8 +767,20 @@ struct SQLiteDatabaseTests {
 
     @Test func aClosedDatabaseRefusesStatements() throws {
         let file = TemporaryDatabase("closed")
+        let path = file.path
         let result = try run(file) { db in
-            _ = try await db.first(Int.self, "select 1")
+            do {
+                _ = try await db.first(Int.self, "select 1")
+            } catch {
+                // macOS fails here, and nowhere else, and serially as well as
+                // in parallel: the very first read-only connection will not
+                // open. A read-only connection cannot create a WAL
+                // database's -shm file, so it cannot be the first to open
+                // one, and this is the only test whose database is never
+                // written to. Whether the writer left those files behind is
+                // what says whether that is the reason.
+                return "the first read failed: \(error); files: \(databaseFiles(path))"
+            }
             _ = try await db.first(Int.self, "select 1")
             db.close()
             do {
