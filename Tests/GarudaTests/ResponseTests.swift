@@ -126,14 +126,14 @@ struct ResponseTests {
         let why = try client.get("/why")
         #expect(why.status == .badRequest)
         #expect(why.header("content-type") == "application/json")
-        #expect(try why.json([String: String].self) == ["error": "id must be a number"])
+        #expect(try why.json(ErrorBody.self) == ErrorBody(error: "id must be a number", fields: nil))
     }
 
     @Test func aReasonIsOneJSONStringWhateverItHolds() throws {
         let response = try typedApp().test.get("/quoted")
         #expect(response.status == .conflict)
-        #expect(try response.json([String: String].self)
-            == ["error": "the \"name\" is taken\nalready"])
+        #expect(try response.json(ErrorBody.self).error
+            == "the \"name\" is taken\nalready")
     }
 
     @Test func anErrorTheApplicationDidNotPlanForIs500() throws {
@@ -150,14 +150,14 @@ struct ResponseTests {
 
         let notJSON = try client.post("/decode", body: "{oops")
         #expect(notJSON.status == .badRequest)
-        #expect(try notJSON.json([String: String].self)["error"]?.contains("not JSON") == true)
+        #expect(try notJSON.json(ErrorBody.self).error.contains("not JSON") == true)
 
         let wrongType = try client.post("/decode", body: #"{"id":"seven","name":"Di"}"#)
         #expect(wrongType.status == .badRequest)
-        #expect(try wrongType.json([String: String].self)["error"] == "id is not Int")
+        #expect(try wrongType.json(ErrorBody.self).error == "id is not Int")
 
         let missingKey = try client.post("/decode", body: #"{"id":7}"#)
         #expect(missingKey.status == .badRequest)
-        #expect(try missingKey.json([String: String].self)["error"] == "name is missing")
+        #expect(try missingKey.json(ErrorBody.self).error == "name is missing")
     }
 }

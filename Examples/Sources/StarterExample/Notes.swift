@@ -27,14 +27,31 @@ public struct Note: Codable, Equatable, Sendable {
     public let updatedAt: Int64
 }
 
-struct NewNote: Decodable {
+struct NewNote: Decodable, Validated {
     let title: String
     let body: String?
+
+    func validate(_ check: inout Validation) {
+        check.notEmpty("title", title)
+        check.length("title", title, atMost: 200)
+        check.require((body?.utf8.count ?? 0) <= 64 * 1024, "body", "is at most 64 KiB")
+    }
 }
 
-struct NoteChanges: Decodable {
+struct NoteChanges: Decodable, Validated {
     let title: String?
     let body: String?
+
+    func validate(_ check: inout Validation) {
+        // A field that is absent is not being changed; one that is there is
+        // held to the same rule as a new note's.
+        check.notEmpty("title", title)
+        check.length("title", title, atMost: 200)
+        check.require((body?.utf8.count ?? 0) <= 64 * 1024, "body", "is at most 64 KiB")
+        // A rule about the value and not about any one field, which is what
+        // the empty name is for.
+        check.require(title != nil || body != nil, "", "send a title, a body, or both")
+    }
 }
 
 public struct NotePage: Codable, Sendable {
@@ -51,20 +68,6 @@ struct PageQuery: Decodable {
 /// Every column a `Note` needs, named as its properties are.
 private let noteColumns = #"id, title, body, created_at as "createdAt", updated_at as "updatedAt""#
 
-private func validTitle(_ raw: String) throws -> String {
-    let title = raw.trimmingWhitespace()
-    guard !title.isEmpty, title.count <= 200 else {
-        throw HTTPError(.unprocessableContent, "a title is 1 to 200 characters")
-    }
-    return title
-}
-
-private func validBody(_ raw: String) throws -> String {
-    guard raw.utf8.count <= 64 * 1024 else {
-        throw HTTPError(.unprocessableContent, "a body is at most 64 KiB")
-    }
-    return raw
-}
 
 func addNoteRoutes(_ app: Application) {
     app.group("/notes") {
@@ -86,8 +89,9 @@ func addNoteRoutes(_ app: Application) {
         app.post("") { (body: Body<NewNote>, jwt: JWT<AccessClaims>, services: State<Services>)
             async throws -> JSON<Note> in
             let owner = try owner(jwt)
-            let title = try validTitle(body.value.title)
-            let text = try validBody(body.value.body ?? "")
+            // Checked before this ran, so what is left is what to store.
+            let title = body.value.title.trimmingWhitespace()
+            let text = body.value.body ?? ""
             let now = Timestamp.now.secondsSinceEpoch
             guard let note = try await services.value.pool.first(
                 Note.self,
@@ -114,11 +118,8 @@ func addNoteRoutes(_ app: Application) {
         app.patch("/:id") { (id: Path<Int64>, body: Body<NoteChanges>, jwt: JWT<AccessClaims>,
                              services: State<Services>) async throws -> JSON<Note>? in
             let owner = try owner(jwt)
-            let title = try body.value.title.map(validTitle)
-            let text = try body.value.body.map(validBody)
-            guard title != nil || text != nil else {
-                throw HTTPError(.unprocessableContent, "send a title, a body, or both")
-            }
+            let title = body.value.title?.trimmingWhitespace()
+            let text = body.value.body
             // coalesce keeps what the request left out.
             return try await services.value.pool.first(
                 Note.self,

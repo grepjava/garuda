@@ -55,7 +55,9 @@ struct TodoExampleTests {
         let client = todoApp(databasePath: ":memory:").test
         let blank = try client.post("/todos", body: #"{"title":"   "}"#)
         #expect(blank.status == .unprocessableContent)
-        #expect(blank.text.contains("1 to 200"))
+        // The field is named, so a form knows where to put the message.
+        #expect(blank.text == #"{"error":"title must not be empty","#
+                    + #""fields":[{"field":"title","message":"must not be empty"}]}"#, "\(blank.text)")
         #expect(try client.post("/todos", body: #"{"name":"x"}"#).status == .badRequest)
 
         #expect(try client.post("/todos", body: #"{"title":"same"}"#).status == .created)

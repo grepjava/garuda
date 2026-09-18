@@ -97,6 +97,25 @@ allocation for an error without a payload and three for one carrying a
 `String`, and only when thrown. Anything that is not a `ResponseError` is a 500
 and a log line.
 
+An error that knows which field is at fault says so, and the body carries
+`fields` beside `error`. The alternative was a message per error and a client
+that parses English; naming the field costs one array that is usually empty and
+lets a form mark the input that was refused.
+
+### Validation is a conformance, not a call at the route
+
+Rules beyond a type's shape live on the type, as `Validated`, and extraction
+holds whatever it decodes to them. The conformance is the opt-in: there is no
+`validate` at each route to forget, and no annotation to scan for. What it costs
+a type that has no rules is one cast that fails, on a path that has just parsed
+JSON.
+
+Every broken rule is answered, not the first, because a form with three wrong
+fields should not be filled in three times. The status is 422 rather than 400 to
+keep two different failures apart: a body that is not the type means the client
+is building its request wrongly, and a body that is the type with a value this
+application will not take means the client is fine and the value is wrong.
+
 ### State and fork semantics
 
 `app.state` runs a factory in each worker after the fork. What it builds belongs

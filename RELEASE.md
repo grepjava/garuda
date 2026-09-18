@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 849 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 870 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -110,6 +110,26 @@ The Python suites need `h2` and `aioquic`.
   `HTTPStatus`, or an Optional whose nil is a 404.
 - A thrown `ResponseError` is the response: `HTTPError(.conflict, "the name is
   taken")` answers 409 with a JSON body. Other errors are a 500 and a log line.
+- Rules beyond a type's shape are a `Validated` conformance, and `Body<T>`,
+  `Query<T>` and `Form<T>` hold whatever they decode to them before the handler
+  runs. `validate(_ check: inout Validation)` states the rules field by field
+  -- `check.range("quantity", quantity, atLeast: 1)`, `notEmpty`, `length`,
+  `email`, `oneOf`, `count`, `nested` and `each` for values inside this one,
+  `require` for anything else -- and a field named "" is a rule about the value
+  as a whole. Every broken rule is answered at once, as 422: the type was
+  right and what it asks for is not allowed, where 400 stays a body that is
+  not the type at all. `try value.validated()` checks a value that came from a
+  queue or a file rather than a request.
+- An error that knows which fields are at fault says so: an answer carries
+  `"fields":[{"field":"email","message":"must look like an email address"}]`
+  beside `error`, so a form can put every message where it belongs. Validation
+  fills it, and so do JSON and query decoding, from the path they already
+  report -- `items[0].sku` for a body, the item's name for a query string. An
+  error with nothing to add there answers with the one key it always did.
+  `ResponseError` has a `fields` requirement with an empty default, so an
+  error of your own can fill it too.
+- A route whose input has rules documents the 422 it can answer, and the body
+  it carries, in the OpenAPI document.
 - `app.state { worker in … }` builds a value once in each worker, after the
   fork and before it reports ready. A factory that throws stops that worker's
   start-up. An optional `shutdown:` tears the value down.

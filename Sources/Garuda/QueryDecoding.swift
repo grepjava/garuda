@@ -37,6 +37,19 @@ extension QueryError: ResponseError {
             return "a query string cannot hold \(what)"
         }
     }
+
+    /// The item at fault, named as the query string names it.
+    public var fields: [ValidationProblem] {
+        switch self {
+        case .missing(let name):
+            return [ValidationProblem(field: name, message: "is missing")]
+        case .notConvertible(let name, _, let expected):
+            return [ValidationProblem(field: name, message: "is not \(expected)")]
+        case .unsupported:
+            // The program's mistake rather than a field's.
+            return []
+        }
+    }
 }
 
 enum QueryString {

@@ -124,6 +124,59 @@ Any `ResponseError` thrown from a handler, extractor or middleware becomes its
 status and reason. Any other error is a 500, and its description goes to the
 log, not the client.
 
+## Rules on what arrives
+
+Decoding says a request has the right shape. What a value is allowed to be
+belongs on the type, as `Validated`:
+
+```swift
+struct NewOrder: Decodable, Validated {
+    let email: String
+    let quantity: Int
+    let note: String?
+    let items: [Line]
+
+    func validate(_ check: inout Validation) {
+        check.email("email", email)
+        check.range("quantity", quantity, atLeast: 1, atMost: 100)
+        check.length("note", note, atMost: 280)         // nil is absent, not wrong
+        check.count("items", items, atLeast: 1)
+        check.each("items", items)                      // each line's own rules
+        check.require(quantity % 12 == 0, "quantity", "must be whole boxes")
+    }
+}
+
+app.post("/orders") { (order: Body<NewOrder>, db: State<PostgresPool>) async throws in
+    JSON(try await place(order.value, db.value), status: .created)   // already checked
+}
+```
+
+`Body`, `Query` and `Form` hold what they decode to the type's rules, so there
+is nothing to call at the route. Every broken rule is answered together, as 422
+with the fields named:
+
+```json
+{"error": "email must look like an email address; items[0].sku must be at least 3 characters",
+ "fields": [{"field": "email", "message": "must look like an email address"},
+            {"field": "items[0].sku", "message": "must be at least 3 characters"}]}
+```
+
+A body that is not the type at all stays 400, and fills `fields` from the path
+the decoder reports, so a form reads one answer either way. The rules are
+`notEmpty`, `length`, `email`, `range`, `oneOf`, `count`, `nested`, `each` and
+`require` for everything else; a field named `""` is a rule about the value as
+a whole, such as "send a title, a body, or both".
+
+What the type cannot know -- whether this address is already registered -- is
+the handler's, and answers the same way:
+
+```swift
+throw ValidationError(field: "email", message: "is already registered")
+```
+
+A value that came from a queue or a file rather than a request is checked with
+`try order.validated()`.
+
 ## Groups and routers
 
 ```swift

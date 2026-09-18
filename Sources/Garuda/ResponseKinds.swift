@@ -83,8 +83,10 @@ extension Worker {
     }
 
     /// Answers a `ResponseError` with its status, and `{"error":"..."}` when
-    /// it says why.
-    mutating func respondError(_ slot: Int, status: HTTPStatus, reason: String?) {
+    /// it says why -- with `"fields"` as well when it knows which fields are
+    /// at fault.
+    mutating func respondError(_ slot: Int, status: HTTPStatus, reason: String?,
+                               fields: [ValidationProblem] = []) {
         guard let reason else {
             respond(slot, status: status.code, nil, 0)
             return
@@ -92,14 +94,18 @@ extension Worker {
         // Through the coder, so that a reason holding a quote or a newline is
         // still one JSON string.
         do {
-            try respond(slot, status: status.code, json: ErrorBody(error: reason))
+            try respond(slot, status: status.code,
+                        json: ErrorBody(error: reason, fields: fields.isEmpty ? nil : fields))
         } catch {
             respond(slot, status: status.code, nil, 0)
         }
     }
 }
 
-/// The shape every error answer takes.
-struct ErrorBody: Encodable {
+/// The shape every error answer takes. `fields` is left out entirely when
+/// there is nothing to put in it, so an error about the request as a whole
+/// answers with the one key it always did.
+struct ErrorBody: Codable, Equatable {
     var error: String
+    var fields: [ValidationProblem]?
 }

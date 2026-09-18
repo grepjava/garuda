@@ -34,7 +34,9 @@ public struct Form<Value: Decodable>: RequestExtractor {
                 return QueryString.items(base, bytes.count)
             }
         }
-        return Form(try Value(from: QueryDecoding(items: items)))
+        let value = try Value(from: QueryDecoding(items: items))
+        try Validation.check(value)
+        return Form(value)
     }
 }
 

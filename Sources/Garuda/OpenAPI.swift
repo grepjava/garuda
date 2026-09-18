@@ -162,6 +162,16 @@ public final class OpenAPIOperation: @unchecked Sendable {
         }
     }
 
+    /// The 422 an input with rules of its own can answer with, and the body
+    /// it carries. Nothing is added for a type conforming to nothing, since
+    /// such a route has no rule to break.
+    @discardableResult
+    public func validationResponse<Value>(_ type: Value.Type) -> Self {
+        guard Value.self is any Validated.Type else { return self }
+        return response(.unprocessableContent, "A field breaks one of this route's rules",
+                        json: ErrorBody.self)
+    }
+
     /// Says the route needs `scheme`. Called more than once, it needs every
     /// one of them.
     @discardableResult
@@ -284,6 +294,7 @@ extension Path: OpenAPIExtractorDescribing {
 extension Query: OpenAPIExtractorDescribing {
     public static func describe(_ operation: OpenAPIOperation) {
         operation.queryParameters(Value.self)
+        operation.validationResponse(Value.self)
     }
 }
 
@@ -291,12 +302,14 @@ extension Body: OpenAPIExtractorDescribing {
     public static func describe(_ operation: OpenAPIOperation) {
         operation.requestBody(Value.self)
         operation.response(.badRequest, "The body is not the JSON this route takes")
+        operation.validationResponse(Value.self)
     }
 }
 
 extension Form: OpenAPIExtractorDescribing {
     public static func describe(_ operation: OpenAPIOperation) {
         operation.requestBody(Value.self, contentType: "application/x-www-form-urlencoded")
+        operation.validationResponse(Value.self)
     }
 }
 

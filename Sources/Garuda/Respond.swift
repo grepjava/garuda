@@ -284,7 +284,8 @@ extension Worker {
             // A wait armed before the throw is for an answer that is not coming.
             clearContinuation(slot)
             if let answer {
-                respondError(slot, status: answer.status, reason: answer.reason)
+                respondError(slot, status: answer.status, reason: answer.reason,
+                             fields: answer.fields)
             } else {
                 respond(slot, status: 500, nil, 0)
             }

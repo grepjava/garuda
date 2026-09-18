@@ -8,6 +8,12 @@
 //
 // The body is JSON -- `{"error":"..."}` -- because the typed API is JSON
 // first. A handler wanting another shape catches its own error and sends it.
+//
+// An error that knows which field is at fault says so in `fields`, and the
+// body gains `"fields":[{"field":"email","message":"is missing"}]`. Decoding
+// failures and validation both fill it, so a form can put every message where
+// it belongs from one answer, whichever of the two refused it. An error with
+// nothing to add there -- most of them -- answers as it always did.
 //===----------------------------------------------------------------------===//
 
 /// An error a handler can throw that becomes the response.
@@ -16,6 +22,13 @@ public protocol ResponseError: Error {
     var status: HTTPStatus { get }
     /// What to tell the client, or nil to answer with no body.
     var reason: String? { get }
+    /// Which fields are at fault, when the error knows. Empty for an error
+    /// about the request as a whole, which is most of them.
+    var fields: [ValidationProblem] { get }
+}
+
+extension ResponseError {
+    public var fields: [ValidationProblem] { [] }
 }
 
 /// The ordinary way to fail a request: a status, and optionally why.
@@ -94,5 +107,30 @@ extension JSONError: ResponseError {
         case .invalidValue(let path, let why):
             return path.isEmpty ? why : "\(path): \(why)"
         }
+    }
+
+    /// The field at fault, where the failure is about one. The path is the one
+    /// the decoder reports -- `items[0].sku` -- which is the name the form
+    /// that sent it has for the same place.
+    public var fields: [ValidationProblem] {
+        switch self {
+        case .syntax, .depthExceeded, .trailingBytes:
+            // About the bytes, not about a field: there is no path to give.
+            return []
+        case .typeMismatch(let path, let expected):
+            return JSONError.at(path, "is not \(expected)")
+        case .missingKey(let path):
+            return JSONError.at(path, "is missing")
+        case .valueNotFound(let path, let expected):
+            return JSONError.at(path, "is null, and \(expected) was expected")
+        case .numberOutOfRange(let path):
+            return JSONError.at(path, "does not fit")
+        case .invalidValue(let path, let why):
+            return JSONError.at(path, why)
+        }
+    }
+
+    private static func at(_ path: String, _ message: String) -> [ValidationProblem] {
+        path.isEmpty ? [] : [ValidationProblem(field: path, message: message)]
     }
 }

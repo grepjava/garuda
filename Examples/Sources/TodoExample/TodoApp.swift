@@ -25,13 +25,28 @@ public struct Todo: Codable, Equatable, Sendable {
     // coding keys to column names, so the SQL renames the column instead.
 }
 
-struct NewTodo: Decodable {
+/// A title is 1 to 200 characters once trimmed. Conforming to `Validated` is
+/// all it takes: `Body<NewTodo>` checks the rules and answers 422 with the
+/// field named before the handler runs.
+struct NewTodo: Decodable, Validated {
     let title: String
+
+    func validate(_ check: inout Validation) {
+        check.notEmpty("title", title)
+        check.length("title", title, atMost: 200)
+    }
 }
 
-struct TodoChanges: Decodable {
+struct TodoChanges: Decodable, Validated {
     let title: String?
     let done: Bool?
+
+    func validate(_ check: inout Validation) {
+        // A title that is absent is not being changed; one that is there is
+        // held to the same rule as a new todo's.
+        check.notEmpty("title", title)
+        check.length("title", title, atMost: 200)
+    }
 }
 
 struct ListQuery: Decodable {
@@ -53,15 +68,6 @@ let migrations = [
     """,
     "create index todos_done on todos (done, id)",
 ]
-
-/// A title is 1 to 200 characters once trimmed.
-private func validTitle(_ raw: String) throws -> String {
-    let title = raw.trimmingWhitespace()
-    guard !title.isEmpty, title.count <= 200 else {
-        throw HTTPError(.unprocessableContent, "a title is 1 to 200 characters")
-    }
-    return title
-}
 
 /// Runs `body`, answering a unique title as 409 rather than 500.
 private func uniqueTitle<T>(_ body: () async throws -> T) async throws -> T {
@@ -99,7 +105,7 @@ public func todoApp(databasePath path: String) -> Application {
     }
 
     app.post("/todos") { (body: Body<NewTodo>, db: State<SQLiteDatabase>) async throws -> JSON<Todo> in
-        let title = try validTitle(body.value.title)
+        let title = body.value.title.trimmingWhitespace()
         let todo = try await uniqueTitle {
             try await db.value.first(
                 Todo.self, "insert into todos (title, created_at) values (?, ?) returning \(columns)",
@@ -115,7 +121,7 @@ public func todoApp(databasePath path: String) -> Application {
 
     app.patch("/todos/:id") { (id: Path<Int>, body: Body<TodoChanges>, db: State<SQLiteDatabase>)
         async throws -> JSON<Todo>? in
-        let title = try body.value.title.map(validTitle)
+        let title = body.value.title?.trimmingWhitespace()
         // coalesce keeps what the request left out.
         let todo = try await uniqueTitle {
             try await db.value.first(

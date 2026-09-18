@@ -85,7 +85,7 @@ struct StateTests {
         }
         let response = try app.test.get("/missing")
         #expect(response.status == .internalServerError)
-        #expect(try response.json([String: String].self)["error"]
+        #expect(try response.json(ErrorBody.self).error
             == "no Settings was registered with app.state")
     }
 

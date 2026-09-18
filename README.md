@@ -96,6 +96,27 @@ app.post("/login") { (form: Form<Credentials>) in Redirect(to: "/") }
 - **Errors:** a thrown `ResponseError` is the response.
   `throw HTTPError(.conflict, "the name is taken")` answers 409 with
   `{"error":"the name is taken"}`. Anything else thrown is a 500 and a log line.
+- **Rules:** a type saying what its values have to be, beyond their shape,
+  conforms to `Validated`, and whatever is decoded from a request is held to
+  them before the handler runs:
+
+  ```swift
+  struct NewOrder: Decodable, Validated {
+      let quantity: Int
+      let email: String
+
+      func validate(_ check: inout Validation) {
+          check.range("quantity", quantity, atLeast: 1, atMost: 100)
+          check.email("email", email)
+      }
+  }
+  ```
+
+  Every broken rule is answered at once, as 422 with the fields named:
+  `{"error":"quantity must be at least 1","fields":[{"field":"quantity",
+  "message":"must be at least 1"}]}`. A decoding failure fills `fields` the
+  same way, from the path it already reports, so one answer tells a form where
+  each message goes whichever of the two refused the request.
 
 JSON goes through Garuda's own coder over `Encodable` and `Decodable`, which
 reads only the keys a type asks for, straight from the request bytes.
@@ -521,7 +542,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 849 unit tests, and the fuzz corpus
+swift test                                   # 870 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

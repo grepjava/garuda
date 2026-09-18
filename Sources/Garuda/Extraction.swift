@@ -67,7 +67,9 @@ public struct Query<Value: Decodable>: RequestExtractor {
                 return QueryString.items(base, bytes.count)
             }
         }
-        return Query(try Value(from: QueryDecoding(items: items)))
+        let value = try Value(from: QueryDecoding(items: items))
+        try Validation.check(value)
+        return Query(value)
     }
 }
 
@@ -83,7 +85,10 @@ public struct Body<Value: Decodable>: RequestExtractor {
                                parameter: inout Int) throws -> Self {
         try request.withBody { bytes in
             guard bytes.count > 0 else { throw ExtractionError.noBody }
-            return Body(try JSONCoder.decode(Value.self, from: bytes))
+            let value = try JSONCoder.decode(Value.self, from: bytes)
+            // The type's own rules, when it has any: see Validation.swift.
+            try Validation.check(value)
+            return Body(value)
         }
     }
 }

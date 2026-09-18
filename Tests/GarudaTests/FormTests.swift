@@ -78,7 +78,7 @@ struct FormTests {
     @Test func aFormMissingAFieldIs400() throws {
         let response = try formApp().test.post("/login", body: "user=ada", headers: [formType])
         #expect(response.status == .badRequest)
-        #expect(try response.json([String: String].self)["error"] == "password is missing")
+        #expect(try response.json(ErrorBody.self).error == "password is missing")
     }
 
     @Test func aBodySentAsSomethingElseIs415() throws {
@@ -86,7 +86,7 @@ struct FormTests {
         let asJSON = try client.post("/login", body: #"{"user":"ada"}"#,
                                      headers: [("content-type", "application/json")])
         #expect(asJSON.status == .unsupportedMediaType)
-        #expect(try asJSON.json([String: String].self)["error"]
+        #expect(try asJSON.json(ErrorBody.self).error
             == "this route takes application/x-www-form-urlencoded, and the body has \"application/json\"")
 
         let untyped = try client.post("/login", body: "user=ada")
@@ -139,7 +139,7 @@ struct FormTests {
             "/upload", body: Array("--x\r\n\r\n".utf8),
             headers: [("content-type", "multipart/form-data")])
         #expect(response.status == .badRequest)
-        #expect(try response.json([String: String].self)["error"]
+        #expect(try response.json(ErrorBody.self).error
             == "the content type is multipart/form-data with no boundary")
     }
 
@@ -149,7 +149,7 @@ struct FormTests {
 
         let noBoundary = try client.post("/upload", body: "nothing like a part", headers: headers)
         #expect(noBoundary.status == .badRequest)
-        #expect(try noBoundary.json([String: String].self)["error"]
+        #expect(try noBoundary.json(ErrorBody.self).error
             == "the multipart body is malformed: no boundary in the body")
 
         // A part that opens and never closes.

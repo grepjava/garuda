@@ -81,7 +81,7 @@ struct ExtractionTests {
     @Test func aPathParameterOfTheWrongTypeIs400() throws {
         let response = try extractingApp().test.get("/person/abc")
         #expect(response.status == .badRequest)
-        #expect(try response.json([String: String].self)["error"]
+        #expect(try response.json(ErrorBody.self).error
             == "the path parameter at 0 is \"abc\", which is not Int")
     }
 
@@ -104,11 +104,11 @@ struct ExtractionTests {
         let client = extractingApp().test
         let missing = try client.get("/search")
         #expect(missing.status == .badRequest)
-        #expect(try missing.json([String: String].self)["error"] == "q is missing")
+        #expect(try missing.json(ErrorBody.self).error == "q is missing")
 
         let wrong = try client.get("/search?q=x&page=later")
         #expect(wrong.status == .badRequest)
-        #expect(try wrong.json([String: String].self)["error"] == "page=later is not Int")
+        #expect(try wrong.json(ErrorBody.self).error == "page=later is not Int")
     }
 
     @Test func aJSONBodyArrivesDecoded() throws {
@@ -119,11 +119,11 @@ struct ExtractionTests {
 
         let empty = try client.post("/people", body: "")
         #expect(empty.status == .badRequest)
-        #expect(try empty.json([String: String].self)["error"] == "the request has no body")
+        #expect(try empty.json(ErrorBody.self).error == "the request has no body")
 
         let wrong = try client.post("/people", body: #"{"name":"Bo"}"#)
         #expect(wrong.status == .badRequest)
-        #expect(try wrong.json([String: String].self)["error"] == "age is missing")
+        #expect(try wrong.json(ErrorBody.self).error == "age is missing")
     }
 
     @Test func extractorsCombineInTheOrderDeclared() throws {

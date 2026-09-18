@@ -23,9 +23,33 @@
 
 import Garuda
 
+/// What a login sends. No rules of its own on purpose: the rules below say
+/// what a *new* password has to be, and an account made before they changed
+/// still has to be able to sign in. A login answers yes or no, and nothing
+/// about the shape of what was sent.
 struct Credentials: Decodable {
     let email: String
     let password: String
+}
+
+/// What a sign-up sends, and what it has to be. Refused as 422 with the field
+/// named, before the handler runs -- see Validation.swift in Garuda.
+struct NewAccount: Decodable, Validated {
+    let email: String
+    let password: String
+
+    func validate(_ check: inout Validation) {
+        // Deliberately not a grammar for RFC 5322: an address is checked by
+        // sending to it, and this only refuses what cannot be one.
+        check.email("email", normalised(email: email))
+        check.length("email", email, atMost: 320)
+        // Length is the only password rule worth having: composition rules
+        // push people towards "Password1!". 72 bytes is where bcrypt
+        // truncates, and this is PBKDF2, but staying under it keeps a later
+        // change of algorithm open.
+        check.require(password.utf8.count >= 10 && password.utf8.count <= 72,
+                      "password", "is 10 to 72 bytes")
+    }
 }
 
 struct RefreshRequest: Decodable {
@@ -38,40 +62,23 @@ public struct Account: Codable, Equatable, Sendable {
 }
 
 
-private func validEmail(_ raw: String) throws -> String {
-    let email = raw.trimmingWhitespace().lowercased()
-    // Deliberately not a grammar for RFC 5322: an address is checked by
-    // sending to it. This only refuses what cannot be one.
-    guard email.count >= 3, email.count <= 320,
-          let at = email.firstIndex(of: "@"), at != email.startIndex,
-          email.index(after: at) != email.endIndex,
-          email[email.index(after: at)...].contains("."),
-          !email.contains(" ") else {
-        throw HTTPError(.unprocessableContent, "that is not an email address")
-    }
-    return email
-}
-
-private func validPassword(_ password: String) throws -> String {
-    // Length is the only rule worth having: composition rules push people
-    // towards "Password1!". 72 bytes is where bcrypt truncates, and this is
-    // PBKDF2, but staying under it keeps a later change of algorithm open.
-    guard password.utf8.count >= 10, password.utf8.count <= 72 else {
-        throw HTTPError(.unprocessableContent, "a password is 10 to 72 bytes")
-    }
-    return password
+/// An address as it is stored and looked up: trimmed, and lowercased, so that
+/// one person has one account however they type it.
+private func normalised(email: String) -> String {
+    email.trimmingWhitespace().lowercased()
 }
 
 func addAccountRoutes(_ app: Application, _ configuration: StarterConfiguration) {
     app.group("/auth") {
-        app.post("/signup") { (body: Body<Credentials>, services: State<Services>)
+        app.post("/signup") { (body: Body<NewAccount>, services: State<Services>)
             async throws -> JSON<Account> in
             guard services.value.configuration.signUpsOpen else {
                 throw HTTPError(.forbidden, "sign-ups are closed")
             }
-            let email = try validEmail(body.value.email)
-            let password = try validPassword(body.value.password)
-            let hash = try await Passwords.hash(password)
+            // Already checked: extraction refused anything that breaks
+            // `NewAccount`'s rules before this ran.
+            let email = normalised(email: body.value.email)
+            let hash = try await Passwords.hash(body.value.password)
             do {
                 guard let account = try await services.value.pool.first(
                     Account.self,
@@ -89,7 +96,7 @@ func addAccountRoutes(_ app: Application, _ configuration: StarterConfiguration)
 
         app.post("/login") { (body: Body<Credentials>, services: State<Services>)
             async throws -> JSON<TokenPair> in
-            let email = (try? validEmail(body.value.email)) ?? body.value.email
+            let email = normalised(email: body.value.email)
             let found = try await services.value.pool.first(
                 LoginRow.self, "select id, password from users where email = $1", email)
             // The same work either way: an unknown email verifies against a
