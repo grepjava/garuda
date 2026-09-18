@@ -166,7 +166,9 @@ garuda --port 443 \
   `example.com`.
 - A name no certificate covers, or no SNI, gets the default certificate.
 - An unequal number of certificates and keys is a start-up error.
-- HTTP/3 always serves the default pair. Its handshake has no SNI selection.
+- HTTP/3 chooses the same way. Its handshake does the selection itself, since
+  it is not OpenSSL's to do, and reads the names out of the same
+  certificates.
 
 ### ACME
 

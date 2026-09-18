@@ -117,9 +117,9 @@ public struct ServerConfig {
     /// that list, and a second copy of it in a command line is a second copy
     /// to get wrong.
     ///
-    /// TCP only. HTTP/3 serves the default pair whatever the client asks for:
-    /// the QUIC handshake here is written from the primitives rather than
-    /// driven by OpenSSL, and it has no SNI selection of its own yet.
+    /// Both transports. TCP has OpenSSL's SNI callback choosing, and the QUIC
+    /// handshake -- written from the primitives rather than driven by OpenSSL
+    /// -- chooses with the same rule over the same names.
     public var tlsExtraCerts: [(cert: UnsafePointer<CChar>, key: UnsafePointer<CChar>)] = []
     /// OpenSSL cipher list for TLS 1.2. TLS 1.3 suites are not configurable
     /// here and do not need to be.

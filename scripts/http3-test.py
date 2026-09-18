@@ -39,6 +39,7 @@ try:
     from aioquic.h3.events import DataReceived, HeadersReceived
     from aioquic.quic.configuration import QuicConfiguration
     from aioquic.quic.events import ConnectionTerminated
+    from cryptography.x509.oid import NameOID
 except ImportError:
     sys.stderr.write("this script needs the aioquic package: pip install aioquic\n")
     raise SystemExit(2)
@@ -53,6 +54,7 @@ EXTRA = shlex.split(os.environ.get("GARUDA_EXTRA_ARGS", ""))
 PASS = 0
 FAIL = 0
 CERTS = None
+NAMED_CERTS = None
 
 
 def ok(name):
@@ -102,6 +104,39 @@ def make_certs():
         return CERTS
     CERTS = (cert, key)
     return CERTS
+
+
+def make_named_certs():
+    """One certificate per name, for the SNI checks.
+
+    The same three scripts/sni-test.sh makes for TCP -- two exact names and a
+    wildcard -- so the two transports are asked the same question. They go
+    after the default pair on the command line, which leaves CN=localhost as
+    the default and these three as the ones SNI chooses.
+    """
+    global NAMED_CERTS
+    if NAMED_CERTS is not None:
+        return NAMED_CERTS
+    directory = tempfile.mkdtemp(prefix="garuda-h3-sni-")
+    made = []
+    for name, san in [("alpha", "DNS:alpha.example"),
+                      ("beta", "DNS:beta.example"),
+                      ("star", "DNS:*.wild.example")]:
+        cert = os.path.join(directory, name + ".pem")
+        key = os.path.join(directory, name + ".key")
+        try:
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                            "-keyout", key, "-out", cert, "-days", "2", "-nodes",
+                            "-subj", "/CN=" + name,
+                            "-addext", "subjectAltName=" + san],
+                           check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.CalledProcessError):
+            NAMED_CERTS = []
+            return NAMED_CERTS
+        made.append((cert, key))
+    NAMED_CERTS = made
+    return NAMED_CERTS
 
 
 def free_port():
@@ -711,6 +746,59 @@ def http2_alt_svc(port, path):
         sock.close()
 
 
+async def served_for(port, asked):
+    """The common name of the certificate served to a client asking for
+    `asked`, which is how the client says which one it wanted."""
+    config = configuration()
+    config.server_name = asked
+    async with connect("127.0.0.1", port, configuration=config,
+                       create_protocol=Client) as client:
+        # After a request, so the handshake is certainly finished.
+        await client.request("GET", "/")
+        certificate = client._quic.tls._peer_certificate
+        names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        return names[0].value if names else ""
+
+
+async def sni():
+    print("\nSNI")
+    # HTTP/3 served the default certificate whatever the client asked for
+    # until the QUIC handshake learned to choose: there is no OpenSSL
+    # handshake here to do it. These are scripts/sni-test.sh's cases, over
+    # QUIC, with CN=localhost as the default rather than alpha.
+    named = make_named_certs()
+    if not named:
+        print("  skipped: no openssl to make certificates")
+        return
+    flags = []
+    for cert, key in named:
+        flags += ["--tls-cert", cert, "--tls-key", key]
+    with Server(*flags) as server:
+        is_("an exact name gets its own certificate",
+            await served_for(server.port, "alpha.example"), "alpha")
+        is_("a second exact name gets its own",
+            await served_for(server.port, "beta.example"), "beta")
+        is_("a wildcard covers one label",
+            await served_for(server.port, "a.wild.example"), "star")
+        is_("a wildcard does not cross a dot",
+            await served_for(server.port, "a.b.wild.example"), "localhost")
+        is_("a wildcard does not match the bare domain",
+            await served_for(server.port, "wild.example"), "localhost")
+        is_("a name no certificate claims gets the default",
+            await served_for(server.port, "nothing.example"), "localhost")
+        is_("matching is case-insensitive",
+            await served_for(server.port, "BETA.Example"), "beta")
+        # The certificate is chosen while the handshake is being built, so a
+        # connection that chose one has to go on working like any other.
+        config = configuration()
+        config.server_name = "beta.example"
+        async with connect("127.0.0.1", server.port, configuration=config,
+                           create_protocol=Client) as client:
+            status, _, body = await client.request("GET", "/user/sni")
+            is_("a request on a chosen certificate is answered", status, 200)
+            is_("and answers with its own body", body, b"sni")
+
+
 async def alt_svc():
     print("\nAlt-Svc")
     # A client cannot find HTTP/3 by trying: it has to be told, on the TCP
@@ -747,7 +835,7 @@ async def main():
 
     for test in (basics, hsts, health_check, static_files, congestion, compression,
                  request_bodies, multiplexing, rapid_reset, spoofed_address,
-                 large_headers, long_lived, key_update, alt_svc):
+                 large_headers, long_lived, key_update, alt_svc, sni):
         try:
             await test()
         except Exception:

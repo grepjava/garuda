@@ -50,7 +50,7 @@ bash scripts/drain-test.sh             # 14
 bash scripts/reload-test.sh            # 7
 python3 scripts/feature-test.py        # 62
 python3 scripts/http2-test.py          # 54
-python3 scripts/http3-test.py          # 63
+python3 scripts/http3-test.py          # 72
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 143, runs garuda-conformance
 python3 scripts/websocket-test.py      # 104, runs garuda-conformance
@@ -990,6 +990,17 @@ The Python suites need `h2` and `aioquic`.
 
 ### Server
 
+- HTTP/3 serves the certificate the client asked for. `--tls-cert` and
+  `--tls-key` repeat for SNI, and until now only TCP followed them: the QUIC
+  handshake is written from the primitives rather than driven by OpenSSL, so
+  nothing was choosing, and every HTTP/3 client was served the default pair
+  whatever name it asked for. A browser reaching a second domain over HTTP/3
+  got a certificate warning where HTTP/1.1 and HTTP/2 were fine. The
+  handshake now picks a certificate as soon as it has read the ClientHello,
+  by the same RFC 6125 rule the TCP path uses and over the same names, with
+  the first pair the default for a client that sends no name or asks for one
+  nothing covers. aviancore 0.4.0 carries the selection and the matching
+  rule, which both paths now share rather than each having a copy.
 - `--static-dir` serves byte ranges. `Range` is answered 206 with
   `Content-Range` on HTTP/1.1, TLS, HTTP/2 and HTTP/3 alike,
   `Accept-Ranges: bytes` goes on every answer, and a range outside the file is

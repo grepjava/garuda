@@ -253,21 +253,30 @@ enum GarudaRuntime {
             Log.error("--http3 needs --tls-cert and --tls-key: QUIC has no cleartext form")
             return nil
         }
-        var error = [CChar](repeating: 0, count: 256)
-        let loaded: OpaquePointer? = error.withUnsafeMutableBufferPointer {
-            av_certkey_load(cert, key, $0.baseAddress, 256)
-        }
-        guard let certKey = loaded else {
-            error.withUnsafeBufferPointer { buffer in
-                guard let base = buffer.baseAddress else { return }
-                var n = 0
-                while n < 256 && base[n] != 0 { n += 1 }
-                Log.error { line in
-                    line.str("http3: ")
-                    base.withMemoryRebound(to: UInt8.self, capacity: n) { line.bytes($0, n) }
-                }
+        // Every pair, the default first: the QUIC handshake chooses among them
+        // by the name in the client's SNI extension, as OpenSSL's callback
+        // does for TCP, so a server with several certificates serves the same
+        // ones over both.
+        var certKeys: [OpaquePointer] = []
+        for pair in [(cert, key)] + config.tlsExtraCerts.map { ($0.cert, $0.key) } {
+            var error = [CChar](repeating: 0, count: 256)
+            let loaded: OpaquePointer? = error.withUnsafeMutableBufferPointer {
+                av_certkey_load(pair.0, pair.1, $0.baseAddress, 256)
             }
-            return nil
+            guard let certKey = loaded else {
+                error.withUnsafeBufferPointer { buffer in
+                    guard let base = buffer.baseAddress else { return }
+                    var n = 0
+                    while n < 256 && base[n] != 0 { n += 1 }
+                    Log.error { line in
+                        line.str("http3: ")
+                        base.withMemoryRebound(to: UInt8.self, capacity: n) { line.bytes($0, n) }
+                    }
+                }
+                for loaded in certKeys { av_certkey_free(loaded) }
+                return nil
+            }
+            certKeys.append(certKey)
         }
 
         let port = config.quicPort != 0 ? config.quicPort : config.port
@@ -278,10 +287,11 @@ enum GarudaRuntime {
                 line.str("cannot bind the QUIC socket: ")
                 line.cstr(av_strerror(e))
             }
+            for loaded in certKeys { av_certkey_free(loaded) }
             return nil
         }
 
-        var quicConfig = QUICServerConfig(certKey: certKey, alpn: [Array("h3".utf8)])
+        var quicConfig = QUICServerConfig(certKeys: certKeys, alpn: [Array("h3".utf8)])
         quicConfig.maxIdleTimeoutMs = UInt64(config.keepAliveTimeoutMs)
         quicConfig.initialMaxStreamData = UInt64(config.bodyHighWaterMark)
         quicConfig.initialMaxData = UInt64(config.bodyHighWaterMark) * 8
