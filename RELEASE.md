@@ -21,7 +21,7 @@ release build:
 
 ```bash
 swift build -c release
-swift test                             # 899 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 904 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 42
@@ -649,6 +649,13 @@ The Python suites need `h2` and `aioquic`.
     and `upload.digest()` gives the handler the same one to store beside the
     bytes, computed once. A digest field naming an algorithm the server does
     not check is refused rather than ignored.
+  - The answer to the request that completed an upload is remembered as it is
+    sent, and given again to a `GET` of the upload's URL until `max-age`: a
+    client whose connection died before the answer arrived can ask for it
+    rather than be told only that the upload is complete. It outlives the
+    bytes, so a handler that files them away and calls `upload.remove()` still
+    answers. `HEAD` is left exactly as the draft describes, and `DELETE` takes
+    the answer away with the upload.
   - A wrong offset or inconsistent length is answered with the draft's problem
     documents.
   - Only one request appends to an upload at a time, across worker processes,

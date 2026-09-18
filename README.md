@@ -551,7 +551,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 899 unit tests, and the fuzz corpus
+swift test                                   # 904 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
@@ -609,7 +609,6 @@ before 1.0 are in [COMPATIBILITY.md](COMPATIBILITY.md). Pin with
 - Reads from Redis replicas: every command goes to the master, or to the node
   that owns the slot. [CONNECTORS.md](CONNECTORS.md) has the rest of the
   driver's limits.
-- A completed upload is not replayed to a client that asks for it again.
 - Byte ranges and directory listings for static files.
 - QUIC session resumption and 0-RTT.
 - TLS over TCP in Swift: it is OpenSSL.

@@ -49,6 +49,22 @@ private func uploadApp(_ store: FileUploadStore, limits: UploadLimits = UploadLi
 
 private func header(_ response: TestResponse, _ name: String) -> String? { response.header(name) }
 
+/// Where the upload lives: in the final response while it is still open, and
+/// in the 104 for a client that completed it in one request.
+private func uploadURL(_ response: TestResponse) -> String? {
+    if let there = response.header("location") { return there }
+    for interim in response.interim {
+        if let there = interim.headers.first(where: { $0.name.lowercased() == "location" })?.value {
+            return there
+        }
+    }
+    return nil
+}
+
+/// A complete upload made the way a client of the draft makes one, so the
+/// answer names where it lives.
+private let draft = [("Upload-Complete", "?1"), ("Upload-Draft-Interop-Version", "9")]
+
 @Suite("Structured fields")
 struct StructuredFieldTests {
     @Test func booleansIntegersAndDictionaries() {
@@ -701,6 +717,89 @@ struct ResumableUploadTests {
         seen = []
         #expect(try app.test.post("/files", body: pattern(6), headers: [("Upload-Complete", "?1")]).status == 201)
         #expect(seen == [Digest.sha256(pattern(6))])
+    }
+
+    @Test func aFinishedUploadIsAnsweredAgainToAClientThatAsks() throws {
+        // The answer to the request that finished an upload is the one thing
+        // the protocol cannot give a client a second time: HEAD says it is
+        // complete, and says nothing about what the application made of it.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let created = try app.test.post("/files", body: pattern(10), headers: draft)
+        #expect(created.status == 201)
+        #expect(created.text == "stored 10")
+        let location = try #require(uploadURL(created))
+
+        let again = try app.test.get(location)
+        #expect(again.status == 201, "the same status")
+        #expect(again.text == "stored 10", "and the same body")
+        #expect(header(again, "upload-complete") == "?1")
+        #expect(header(again, "content-type") == "text/plain; charset=utf-8")
+        #expect(completed.count == 1, "and the handler did not run again")
+
+        // HEAD is what the draft describes, and stays that way.
+        let head = try app.test.head(location)
+        #expect(head.status == 204)
+        #expect(header(head, "upload-offset") == "10")
+        #expect(header(head, "upload-complete") == "?1")
+    }
+
+    @Test func anAnswerOutlivesTheBytesItIsAbout() throws {
+        // What a real handler does: move the bytes somewhere and remove the
+        // upload. The answer is still owed to a client that lost it.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = Application()
+        app.resumableUploads("/files", store: store, progressInterval: 0) { upload in
+            try upload.remove()
+            return Text("filed \(upload.length)", status: .created)
+        }
+        let created = try app.test.post("/files", body: pattern(7), headers: draft)
+        let location = try #require(uploadURL(created))
+        let id = String(location.dropFirst(9))
+        #expect(try store.info(id) == nil, "the upload itself is gone")
+
+        let again = try app.test.get(location)
+        #expect(again.status == 201)
+        #expect(again.text == "filed 7")
+        // And a HEAD, which is about the upload rather than the answer, says
+        // it is not there any more.
+        #expect(try app.test.head(location).status == 404)
+    }
+
+    @Test func anUploadStillGoingIsNotReplayed() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let created = try app.test.post("/files", body: pattern(4), headers: [("Upload-Complete", "?0")])
+        let location = try #require(header(created, "location"))
+        // A GET before it finishes is the offset, as it always was.
+        let response = try app.test.get(location)
+        #expect(response.status == 204)
+        #expect(header(response, "upload-offset") == "4")
+        #expect(header(response, "upload-complete") == "?0")
+    }
+
+    @Test func cancellingTakesTheAnswerWithIt() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let created = try app.test.post("/files", body: pattern(5), headers: draft)
+        let location = try #require(uploadURL(created))
+        #expect(try app.test.get(location).status == 201)
+        // The client asked for it to be gone, so it is gone.
+        #expect(try app.test.delete(location).status == 204)
+        #expect(try app.test.get(location).status == 404)
+        #expect(try listUploads(store).isEmpty)
+    }
+
+    @Test func anAnswerExpiresWithTheUploadItIsAbout() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store, limits: UploadLimits(maxAge: 0))
+        let created = try app.test.post("/files", body: pattern(5), headers: draft)
+        let location = try #require(uploadURL(created))
+        usleep(1_100_000)
+        #expect(try app.test.get(location).status == 404, "past maxAge, there is nothing to replay")
+        // And the next sweep takes the file with it.
+        _ = store.removeExpired(olderThan: 0)
+        #expect(try store.answer(String(location.dropFirst(9))) == nil)
     }
 
     @Test func anUploadPastItsAgeIsGone() throws {

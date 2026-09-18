@@ -25,7 +25,9 @@
 //                                PUT or PATCH, when `methods` includes them)
 //   OPTIONS <pattern>            the limits, as Upload-Limit
 //   HEAD    <uploads>/:id        the offset, whether it is complete, the length
-//   GET     <uploads>/:id        the same
+//   GET     <uploads>/:id        the same, and once it is complete, the answer
+//                                the handler gave, for a client whose
+//                                connection died before it arrived
 //   PATCH   <uploads>/:id        append at the offset the client names
 //   DELETE  <uploads>/:id        cancel
 //
@@ -46,6 +48,13 @@
 //     itself once its connection has been silent for --request-timeout.
 //   * A request that completes the upload and whose handler throws. The
 //     upload stays complete, and the client is answered 500.
+//   * An answer that never arrived. The answer to the request that completed
+//     an upload is remembered as it is sent, and given again to a GET of the
+//     upload's URL until `maxAge` -- the one thing HEAD cannot say, since it
+//     speaks about the upload and not about what the application made of it.
+//     It outlives the bytes, so a handler that files them away and removes the
+//     upload still answers the client that lost its answer. HEAD is left
+//     exactly as the draft describes.
 //   * Progress. A 104 with the current offset every `progressInterval` bytes.
 //   * Expiry. Uploads older than `maxAge` are removed, complete or not, when
 //     the next one is created; the handler should move a finished upload's
@@ -166,7 +175,7 @@ extension RouteBuilder {
             try await service.offset(request, &response)
         }
         onAsync(.get, "\(prefix)/:id") { request, response in
-            try await service.offset(request, &response)
+            try await service.offset(request, &response, replaying: true)
         }
         onStreamingBody(.patch, "\(prefix)/:id") { request, response, body in
             try await service.append(request, &response, body)
@@ -529,16 +538,44 @@ final class UploadService: @unchecked Sendable {
         if wantsDigest, let sha256 { response.addHeader("Repr-Digest", Digest.field(sha256)) }
         let answer = try await onComplete(CompletedUpload(info: info, store: store, sha256: sha256))
         if resumable { response.addHeader("Upload-Complete", "?1") }
+        // What the handler answers is remembered on its way out, whatever kind
+        // of answer it is, so a client whose connection dies before it arrives
+        // can ask for it again with GET. It is kept even after the handler
+        // removes the upload: the bytes have gone somewhere, and the answer is
+        // what says where.
+        let store = self.store
+        let created = info.createdAt
+        response.onSend { outgoing in
+            let status = outgoing.status.code
+            let type = outgoing.header("content-type")
+            let body = outgoing.withBody { span in
+                var bytes = [UInt8]()
+                bytes.reserveCapacity(span.count)
+                for i in 0..<span.count { bytes.append(span[i]) }
+                return bytes
+            }
+            try? store.remember(id, status: status, contentType: type, body: body, createdAt: created)
+        }
         try answer.write(to: response)
     }
 
     // MARK: Offset, limits, cancellation
 
-    func offset(_ request: borrowing Request, _ response: inout Response) async throws {
+    func offset(_ request: borrowing Request, _ response: inout Response,
+                replaying: Bool = false) async throws {
         response.addHeader("Cache-Control", "no-store")
         let id = request.parameter(0)
         // An offset is only worth giving once nothing is still adding to it.
         try await supersede(id, response)
+        // A GET for an upload that finished is the client asking for the
+        // answer it did not get. HEAD is left as the draft describes it, so a
+        // client following the draft sees exactly what the draft says.
+        if replaying, let answer = try? store.answer(id),
+           Int(time(nil)) - answer.createdAt <= limits.maxAge {
+            if let type = answer.contentType { response.addHeader("Content-Type", type) }
+            response.addHeader("Upload-Complete", "?1")
+            return response.send(status: HTTPStatus(answer.status), answer.body)
+        }
         guard let info = try? live(id) else {
             return response.send(status: .notFound)
         }
@@ -561,7 +598,9 @@ final class UploadService: @unchecked Sendable {
         let id = request.parameter(0)
         try await supersede(id, response)
         do {
-            try store.delete(id)
+            // Everything, the answer included: the client asked for this
+            // upload to be gone.
+            try store.forget(id)
             response.send(status: .noContent)
         } catch {
             response.send(status: .notFound)
@@ -596,7 +635,7 @@ final class UploadService: @unchecked Sendable {
     func live(_ id: String) throws -> UploadInfo? {
         guard let info = try store.info(id) else { return nil }
         if Int(time(nil)) - info.createdAt > limits.maxAge {
-            try? store.delete(id)
+            try? store.forget(id)
             return nil
         }
         return info

@@ -9,6 +9,9 @@
 //   <id>.data   the bytes received so far; its size is the offset
 //   <id>.info   the declared length, whether it is complete, when it was
 //               created, and the metadata sent with it
+//   <id>.done   what the completed upload was answered with, kept after the
+//               handler has taken the bytes away, so a client whose
+//               connection died before the answer arrived can ask again
 //
 // The offset is the data file's size rather than a number written beside it,
 // so a worker that crashes part-way through an append leaves an upload whose
@@ -47,6 +50,16 @@ public struct UploadInfo: Codable, Sendable, Equatable {
     /// The `Repr-Digest` the client declared for the whole upload, as the
     /// field's text. Checked once the last byte is in (ResumableUploads.swift).
     public var reprDigest: String?
+}
+
+/// What a completed upload was answered with, kept so it can be given again.
+public struct UploadAnswer: Sendable, Equatable {
+    public var status: Int
+    public var contentType: String?
+    public var body: [UInt8]
+    /// When the upload it answers was created, so the answer can be expired
+    /// along with the upload it belongs to, even once that upload is gone.
+    public var createdAt: Int
 }
 
 public enum UploadStoreError: Error, Equatable {
@@ -191,12 +204,55 @@ public final class FileUploadStore: @unchecked Sendable {
         try save(info)
     }
 
-    /// Removes an upload and its bytes.
+    /// Removes an upload and its bytes, keeping the answer it was given: the
+    /// handler moving a finished upload's bytes somewhere else should not
+    /// take away what a client is still owed.
     public func delete(_ id: String) throws {
         guard FileUploadStore.isValidID(id) else { throw UploadStoreError.notFound }
         let gone = unlink(infoPath(id)) != 0 && errno == ENOENT
         _ = unlink(dataPath(id))
         if gone { throw UploadStoreError.notFound }
+    }
+
+    /// Removes an upload and everything remembered about it, including its
+    /// answer: what a client asking for it to be gone means, and what expiry
+    /// does.
+    public func forget(_ id: String) throws {
+        defer { if FileUploadStore.isValidID(id) { _ = unlink(donePath(id)) } }
+        try delete(id)
+    }
+
+    // MARK: - The answer a completed upload was given
+
+    func donePath(_ id: String) -> String { "\(directory)/\(id).done" }
+
+    /// Remembers what the completed upload was answered with, so a client
+    /// whose connection died before the answer reached it can ask again.
+    ///
+    /// The file is the status, when the upload was created, the content type,
+    /// a newline, and then the body as it was. A header value cannot hold a
+    /// newline and the first two are numbers, so there is nothing to escape
+    /// and nothing to parse wrongly.
+    public func remember(_ id: String, status: Int, contentType: String?, body: [UInt8],
+                         createdAt: Int) throws {
+        guard FileUploadStore.isValidID(id) else { throw UploadStoreError.notFound }
+        var bytes = Array("\(status) \(createdAt) \(contentType ?? "")\n".utf8)
+        bytes += body
+        try writeFile(bytes, to: donePath(id))
+    }
+
+    /// The answer a completed upload was given, or nil for an upload that has
+    /// none: one still going, or one whose answer has expired.
+    public func answer(_ id: String) throws -> UploadAnswer? {
+        guard FileUploadStore.isValidID(id) else { return nil }
+        guard let bytes = try readFile(donePath(id)) else { return nil }
+        guard let newline = bytes.firstIndex(of: UInt8(ascii: "\n")) else { return nil }
+        let head = String(decoding: bytes[..<newline], as: UTF8.self)
+            .split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+        guard head.count == 3, let status = Int(head[0]), let createdAt = Int(head[1]) else { return nil }
+        let type = String(head[2])
+        return UploadAnswer(status: status, contentType: type.isEmpty ? nil : type,
+                            body: Array(bytes[(newline + 1)...]), createdAt: createdAt)
     }
 
     /// Removes every upload created more than `seconds` ago. Returns how
@@ -205,18 +261,26 @@ public final class FileUploadStore: @unchecked Sendable {
     public func removeExpired(olderThan seconds: Int) -> Int {
         guard let dir = opendir(directory) else { return 0 }
         var ids: [String] = []
+        var answers: [String] = []
         while let entry = readdir(dir) {
             let name = withUnsafePointer(to: entry.pointee.d_name) {
                 $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) }
             }
             if name.hasSuffix(".info") { ids.append(String(name.dropLast(5))) }
+            // An upload whose handler removed its bytes leaves only the
+            // answer, which expires by its own age.
+            if name.hasSuffix(".done") { answers.append(String(name.dropLast(5))) }
         }
         closedir(dir)
         let cutoff = Int(time(nil)) - seconds
         var removed = 0
         for id in ids {
             guard let info = try? info(id), info.createdAt < cutoff else { continue }
-            if (try? delete(id)) != nil { removed += 1 }
+            if (try? forget(id)) != nil { removed += 1 }
+        }
+        for id in answers where !ids.contains(id) {
+            guard let answer = try? answer(id), answer.createdAt < cutoff else { continue }
+            _ = unlink(donePath(id))
         }
         return removed
     }
@@ -226,9 +290,12 @@ public final class FileUploadStore: @unchecked Sendable {
     }
 
     private func save(_ info: UploadInfo) throws {
-        let bytes = try JSONCoder.encode(info)
-        // Written aside and renamed over, so a reader never sees half of it.
-        let temporary = infoPath(info.id) + ".\(getpid()).tmp"
+        try writeFile(try JSONCoder.encode(info), to: infoPath(info.id))
+    }
+
+    /// Written aside and renamed over, so a reader never sees half of it.
+    private func writeFile(_ bytes: [UInt8], to path: String) throws {
+        let temporary = path + ".\(getpid()).tmp"
         let fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         if fd < 0 { throw UploadStoreError.system("open", errno) }
         var done = 0
@@ -243,7 +310,7 @@ public final class FileUploadStore: @unchecked Sendable {
             done += n
         }
         _ = close(fd)
-        if rename(temporary, infoPath(info.id)) != 0 { throw UploadStoreError.system("rename", errno) }
+        if rename(temporary, path) != 0 { throw UploadStoreError.system("rename", errno) }
     }
 
     private func readFile(_ path: String) throws -> [UInt8]? {
