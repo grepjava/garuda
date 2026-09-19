@@ -1,4 +1,5 @@
 import Testing
+import CAvian
 import AvianCore
 @testable import Garuda
 
@@ -191,20 +192,17 @@ struct AsyncOpsTests {
         var worker = makeWorker(connections: 4)
         defer { worker.destroy() }
         let slot = openRequest(&worker)
-        let clock = SuspendingClock()
         // 4 ms is one coarse clock tick on common kernels, the most a deadline
-        // taken from that clock could expire early by.
+        // taken from that clock could expire early by. Measured on the
+        // timers' own clock: another one, read a moment apart, has been seen
+        // a microsecond out on macOS.
         for _ in 0..<10 {
-            let start = clock.now
+            let start = av_monotonic_us()
             worker.armDelay(slot, ms: 4, kind: .none)
             while worker.table[slot].pointee.contState != .ready {
                 worker.fireDueTimers()
             }
-            let elapsed = clock.now - start
-            // Less a microsecond: the timers keep whole microseconds and this
-            // clock nanoseconds, so a start truncated by the timers' clock
-            // can read up to one short here -- 3.9997 ms once on macOS.
-            #expect(elapsed >= .milliseconds(4) - .microseconds(1))
+            #expect(av_monotonic_us() - start >= 4_000)
             worker.clearContinuation(slot)
         }
     }

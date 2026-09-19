@@ -19,6 +19,7 @@ import Darwin
 import CAvian
 import AvianCore
 import AvianHTTP
+import Tracing
 
 public final class Application: RouteBuilder {
     var routes = Routes()
@@ -27,6 +28,8 @@ public final class Application: RouteBuilder {
     var scheduledJobs: [ScheduledJob] = []
     var shutdownHooks: [(Int) -> Void] = []
     var responseObservers: [(CompletedRequest) -> Void] = []
+    /// What `tracing` asked for, made in each worker.
+    var makeTracer: ((Int) -> any Tracer)? = nil
     var trailingSlashPolicy = TrailingSlash.strict
     /// The OpenAPI documents `openAPI` serves, written when the application compiles.
     var openAPIDocuments: [OpenAPIDocumentBox] = []
@@ -427,7 +430,8 @@ public final class Application: RouteBuilder {
             routePatterns: routes.patterns,
             routeMethods: routes.methods,
             trailingSlash: trailingSlashPolicy,
-            onResponse: observers.isEmpty ? nil : { completed in for observe in observers { observe(completed) } }))
+            onResponse: observers.isEmpty ? nil : { completed in for observe in observers { observe(completed) } },
+            makeTracer: makeTracer))
         compiled = application
         return application
     }
@@ -472,6 +476,8 @@ struct CompiledApplication {
     let trailingSlash: TrailingSlash
     /// Every `onResponse` observer, in order, or nil for none.
     let onResponse: ((CompletedRequest) -> Void)?
+    /// Makes the worker's tracer, when requests are traced.
+    let makeTracer: ((Int) -> any Tracer)?
 
     func destroy() {
         routes.destroy()

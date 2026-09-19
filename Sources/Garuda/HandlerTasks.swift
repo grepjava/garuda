@@ -27,6 +27,7 @@
 
 import CAvian
 import AvianCore
+import Tracing
 
 /// An async handler over the raw request. It reads what it needs from the
 /// request before its first `await`: the request is a view of a connection
@@ -220,6 +221,28 @@ final class HandlerTaskPool: @unchecked Sendable {
             && c.pointee.contTask < 0
     }
 
+    /// Runs the handler, and then the body it returned to be streamed, if
+    /// any: what either threw.
+    private nonisolated(nonsending) func handle(_ work: Work) async -> (any Error)? {
+        let worker = self.worker
+        let request = Request(worker: worker, slot: work.slot)
+        var response = Response(worker: worker, slot: work.slot,
+                                generation: work.generation, requestId: work.requestId)
+        do {
+            try await work.handler(request, &response)
+            // A handler that returned a streamed body (`StreamingBody`,
+            // `EventStream`) has had its head sent; the body is written here,
+            // still on this task.
+            if let produce = worker.pointee.takeStreamProducer(work.slot, generation: work.generation,
+                                                               requestId: work.requestId) {
+                try await produce(ResponseBodyWriter(response))
+            }
+            return nil
+        } catch {
+            return error
+        }
+    }
+
     private nonisolated(nonsending) func run(_ index: Int, _ work: Work) async {
         let worker = self.worker
         let c = worker.pointee.table[work.slot]
@@ -230,21 +253,15 @@ final class HandlerTaskPool: @unchecked Sendable {
         c.pointee.contTask = Int32(index)
         c.pointee.contState = .none
         c.pointee.contAsyncHandler = nil
-        let request = Request(worker: worker, slot: work.slot)
-        var response = Response(worker: worker, slot: work.slot,
-                                generation: work.generation, requestId: work.requestId)
-        var failure: (any Error)? = nil
-        do {
-            try await work.handler(request, &response)
-            // A handler that returned a streamed body (`StreamingBody`,
-            // `EventStream`) has had its head sent; the body is written here,
-            // still on this task.
-            if let produce = worker.pointee.takeStreamProducer(work.slot, generation: work.generation,
-                                                               requestId: work.requestId) {
-                try await produce(ResponseBodyWriter(response))
+        let failure: (any Error)?
+        // A task outlives the request it was handed, so the request's span is
+        // bound for this one alone.
+        if let span = worker.pointee.requestSpan(work.slot) {
+            failure = await ServiceContext.$current.withValue(span.context) {
+                await self.handle(work)
             }
-        } catch {
-            failure = error
+        } else {
+            failure = await handle(work)
         }
         worker.pointee.taskFinished(index, work.slot, generation: work.generation,
                                     requestId: work.requestId, failure)

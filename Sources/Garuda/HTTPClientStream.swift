@@ -23,6 +23,7 @@
 import CAvian
 import AvianCore
 import AvianHTTP
+import Tracing
 
 /// A response whose body is read as it arrives. From `HTTPClient.stream`.
 ///
@@ -44,6 +45,8 @@ public final class ClientResponseStream: @unchecked Sendable {
     private var client: HTTPClient
     private var source: Source
     private var events = ServerSentEventParser()
+    /// The call's span, when the worker traces: ended with the body.
+    var span: (any Span)?
 
     enum Source {
         case h1(H1Body)
@@ -71,7 +74,10 @@ public final class ClientResponseStream: @unchecked Sendable {
     deinit {
         // Given up on without a word. Only the worker's own thread may touch
         // the connection; anywhere else, the worker closes it when it goes.
-        guard av_worker_current() == UnsafeMutableRawPointer(client.worker) else { return }
+        guard av_worker_current() == UnsafeMutableRawPointer(client.worker) else {
+            span?.end()
+            return
+        }
         cancel()
     }
 
@@ -91,11 +97,11 @@ public final class ClientResponseStream: @unchecked Sendable {
             switch source {
             case .h1(let body):
                 let piece = try await body.next(client)
-                if piece == nil { source = .ended }
+                if piece == nil { ended() }
                 return piece
             case .h2(let shared, let stream):
                 let piece = try await client.nextShared(shared, stream)
-                if piece == nil { source = .ended }
+                if piece == nil { ended() }
                 return piece
             case .ended:
                 return nil
@@ -103,6 +109,8 @@ public final class ClientResponseStream: @unchecked Sendable {
         } catch {
             // Closed or reset already by whatever failed.
             source = .ended
+            span?.fail(error, type: error.kind)
+            span = nil
             throw error
         }
     }
@@ -146,7 +154,13 @@ public final class ClientResponseStream: @unchecked Sendable {
         case .h2(let shared, let stream): client.cancelShared(shared, stream)
         case .ended: break
         }
+        ended()
+    }
+
+    private func ended() {
         source = .ended
+        span?.answered(status)
+        span = nil
     }
 
     /// The head is in: from here each read is bounded by the per-wait

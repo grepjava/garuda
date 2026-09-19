@@ -10,6 +10,7 @@
 import CAvian
 import AvianCore
 import GarudaPostgres
+import Tracing
 
 /// Where a PostgreSQL server is and how to reach it.
 public struct PostgresConfiguration: Sendable {
@@ -288,6 +289,23 @@ final class PostgresConnection {
     @inline(__always)
     nonisolated(nonsending)
     func query(_ sql: String, values: [PostgresValue] = []) async throws(PostgresClientError) -> PostgresRows {
+        guard let span = startPostgresSpan(sql, configuration) else {
+            return try await untracedQuery(sql, values: values)
+        }
+        do throws(PostgresClientError) {
+            let rows = try await untracedQuery(sql, values: values)
+            span.end()
+            return rows
+        } catch {
+            span.fail(error)
+            throw error
+        }
+    }
+
+    /// `query`, for a caller that keeps a span of its own around it.
+    @inline(__always)
+    nonisolated(nonsending)
+    func untracedQuery(_ sql: String, values: [PostgresValue]) async throws(PostgresClientError) -> PostgresRows {
         do {
             return try await run(sql, values)
         } catch {

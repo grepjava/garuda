@@ -106,6 +106,7 @@ public final class TestClient {
             }
             if !ready { fatalError("app.prepare did not finish in the test client") }
         }
+        onWorker { worker.pointee.startTracing(0) }
         // Scheduled jobs run here too, so a test can drive one.
         if let jobs = worker.pointee.application?.pointee.scheduledJobs, !jobs.isEmpty {
             onWorker { GarudaRuntime.startScheduledJobs(worker, index: 0, jobs: jobs) }

@@ -10,6 +10,7 @@
 
 import CAvian
 import AvianCore
+import Tracing
 // Its values and commands are part of this API, so `import Garuda` is enough.
 @_exported import GarudaRedis
 
@@ -300,6 +301,27 @@ final class RedisConnection {
     /// server never saw.
     func send(_ commands: [RedisCommand], milliseconds: UInt64? = nil) async throws(RedisClientError) -> [RedisValue] {
         guard !commands.isEmpty else { return [] }
+        guard let span = startRedisSpan(commands, configuration) else {
+            return try await untracedSend(commands, milliseconds: milliseconds)
+        }
+        do throws(RedisClientError) {
+            let replies = try await untracedSend(commands, milliseconds: milliseconds)
+            // A command the server refused is answered, not failed, at this
+            // level; its caller throws it. A pipeline's refusals are its
+            // commands', each answered in its place.
+            if replies.count == 1, case .error(let refused) = replies[0] {
+                span.fail(.server(refused))
+            } else {
+                span.end()
+            }
+            return replies
+        } catch {
+            span.fail(error)
+            throw error
+        }
+    }
+
+    private func untracedSend(_ commands: [RedisCommand], milliseconds: UInt64?) async throws(RedisClientError) -> [RedisValue] {
         let ms = milliseconds ?? configuration.timeoutMilliseconds
         var out = ByteBuffer(capacity: 256)
         for command in commands { command.write(into: &out) }

@@ -375,6 +375,7 @@ extension Worker {
         }
         c.pointee.flags.insert(.responseComplete)
         c.pointee.state = .writing
+        if tracer != nil { endRequestSpan(slot) }
         _ = flush(slot)
     }
 
@@ -389,6 +390,9 @@ extension Worker {
             line.str("handler threw part-way through a streamed response: ")
             description.withCString { line.cstr($0) }
         }
+        if tracer != nil {
+            requestSpanFailed(slot, failure, "handler threw part-way through a streamed response: " + description)
+        }
         failStreamedResponse(slot)
     }
 
@@ -399,6 +403,10 @@ extension Worker {
         let c = table[slot]
         c.pointee.capture.abandon()
         c.pointee.encoder.destroy()
+        if tracer != nil {
+            requestSpanFailed(slot, nil, "the streamed response could not be finished")
+            endRequestSpan(slot)
+        }
         if c.pointee.isH3Stream {
             h3FailRequest(slot, status: 500)
         } else if c.pointee.isStream {

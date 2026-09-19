@@ -280,6 +280,36 @@ app.group("/api") {
   for any other Host, and `app.addressFilter(allow: ["10.0.0.0/8"])` answers
   403 to a client address outside the list or on a `deny` list.
 
+### Tracing
+
+`app.tracing()` traces through
+[swift-distributed-tracing](https://github.com/apple/swift-distributed-tracing),
+so any tracer written for it records the spans, the OpenTelemetry exporters
+among them:
+
+```swift
+import Tracing
+
+app.onWorkerStart { _ in
+    InstrumentationSystem.bootstrap(makeTracer())   // any Tracer
+}
+app.tracing()
+```
+
+Each request is a server span named for its route, `GET /users/:id`,
+continuing the trace its headers carry. Under it are child spans for every
+call `request.client` makes, which passes the trace on in its headers, and for
+every PostgreSQL statement and Redis round trip. Spans a handler starts with
+`withSpan` go under it too. The attributes follow OpenTelemetry's HTTP and
+database conventions. SQL is recorded as written; bound values, Redis keys and
+values, and query-string values in URLs are not. A streamed response's span
+ends with its last byte, not its head.
+
+Workers are processes, and an exporter's threads do not survive the fork, so
+the tracer is made in each worker: bootstrap it in `onWorkerStart`, or pass
+`app.tracing { worker in … }` a closure that returns one. With tracing off,
+each request pays one check.
+
 ### OpenAPI
 
 `app.openAPI(OpenAPIInfo(title: "Shop", version: "1.0.0"))` serves an OpenAPI
@@ -580,7 +610,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 948 unit tests, and the fuzz corpus
+swift test                                   # 995 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

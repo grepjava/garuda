@@ -13,6 +13,7 @@
 import CAvian
 import AvianCore
 import AvianHTTP
+import Tracing
 
 /// The worker this process is running. Held behind a raw pointer rather than a
 /// class so that it can be reached without an ARC-managed context.
@@ -121,6 +122,11 @@ public struct Worker: ~Copyable {
     /// Why a route failed, by slot, until its answer is reported to
     /// `onResponse` observers. Only kept while there are observers.
     var handlerFailures: [Int: (generation: UInt32, requestId: UInt32, description: String)] = [:]
+    /// What traces this worker's requests, when `app.tracing` asked for it
+    /// (RequestTracing.swift).
+    var tracer: (any Tracer)? = nil
+    /// Each traced request's span, by slot, until it is answered.
+    var requestSpans: [Int: RequestSpan] = [:]
     static let readyDrainBudget = 64
     /// The tasks async handlers run on (HandlerTasks.swift), made on the first
     /// async request, and how many there may be.
@@ -888,6 +894,7 @@ public struct Worker: ~Copyable {
         // a probe, a 429, a static file -- is logged with its ID.
         if config.requestID { assignRequestID(slot) }
         if config.traceContext { assignTraceContext(slot) }
+        if tracer != nil { startRequestSpan(slot) }
         // --no-websockets, and --websocket-protocols without http1. Refused
         // before anything else can answer, so an upgrade is never mistaken for
         // an ordinary request to its path.
@@ -1318,7 +1325,10 @@ public struct Worker: ~Copyable {
     /// The head slices are still valid here: a Content-Length body is read into
     /// its own buffer, and a chunked request keeps its head in `headStore`, so
     /// nothing has overwritten the request line.
-    mutating func logAccess(_ slot: Int, status: Int) {
+    ///
+    /// `bodyToCome`: the head of a streamed body, which the handler is still
+    /// to write.
+    mutating func logAccess(_ slot: Int, status: Int, bodyToCome: Bool = false) {
         let c = table[slot]
         // Every response with a status passes through here, on every
         // protocol and interface, which is where a change to a target shows.
@@ -1329,6 +1339,7 @@ public struct Worker: ~Copyable {
             Metrics.requestFinished(status: status, micros: micros)
             RouteMetrics.record(application, slot: busSlot, route: Int(c.pointee.routeIndex), status: status, micros: micros)
         }
+        if tracer != nil { requestSpanAnswered(slot, status: status, bodyToCome: bodyToCome) }
         if let observe = application?.pointee.onResponse { reportResponse(slot, status: status, observe) }
         guard config.accessLog, Log.enabled(.info) else { return }
         let base = c.pointee.headBase()
@@ -1453,6 +1464,8 @@ public struct Worker: ~Copyable {
         let c = table[slot]
         if c.pointee.state == .free { return }
         cancelOps(slot: slot)
+        // A request cut off before its answer was done.
+        if !requestSpans.isEmpty { endRequestSpan(slot) }
         // A streaming route's reader keeps what arrived before the end.
         if c.pointee.bodyStream != nil { detachStreamedBody(slot) }
         // Before the slot goes back on the free list: an op left armed would

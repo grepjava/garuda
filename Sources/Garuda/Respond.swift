@@ -20,6 +20,7 @@
 import CAvian
 import AvianCore
 import AvianHTTP
+import Tracing
 
 /// Which request the worker's header table was last filled for.
 struct HeaderTableOwner {
@@ -188,7 +189,16 @@ extension Worker {
             var response = Response(worker: worker, slot: slot,
                                     generation: generation, requestId: requestId)
             do {
-                try handler(request, &response)
+                // Traced, the handler runs inside its request's span, which
+                // is what the spans it starts, and the calls it makes, are
+                // children of.
+                if let span = worker.pointee.requestSpan(slot) {
+                    try ServiceContext.$current.withValue(span.context) {
+                        try handler(request, &response)
+                    }
+                } else {
+                    try handler(request, &response)
+                }
             } catch {
                 worker.pointee.handlerThrew(slot, generation: generation,
                                             requestId: requestId, error)
@@ -277,6 +287,9 @@ extension Worker {
             Log.error { line in
                 line.str("handler threw: ")
                 description.withCString { line.cstr($0) }
+            }
+            if tracer != nil, stillHolds(slot, generation: generation, requestId: requestId) {
+                requestSpan(slot)?.recordError(error)
             }
             noteHandlerFailure(slot, "handler threw: " + description)
         }
@@ -462,7 +475,7 @@ extension Worker {
             return
         }
 
-        logAccess(slot, status: status)
+        logAccess(slot, status: status, bodyToCome: open)
         dates.refresh()
         c.pointee.flags.insert(.responseStarted)
         // A body that disagrees with its own Content-Length leaves the
@@ -541,7 +554,7 @@ extension Worker {
         let endStream = sending == 0 && short == 0 && !open
         writeHeaderBlock(slot, h2, block: &block, endStream: endStream)
         c.pointee.flags.insert(.responseStarted)
-        logAccess(slot, status: status)
+        logAccess(slot, status: status, bodyToCome: open)
         if open {
             c.pointee.flags.insert(.streamingResponse)
             c.pointee.eventKeepAliveMs = 0
@@ -597,7 +610,7 @@ extension Worker {
         }
         writeH3HeaderBlock(slot, h3, block: &block)
         c.pointee.flags.insert(.responseStarted)
-        logAccess(slot, status: status)
+        logAccess(slot, status: status, bodyToCome: open)
         if open {
             c.pointee.flags.insert(.streamingResponse)
             c.pointee.eventKeepAliveMs = 0

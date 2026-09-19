@@ -74,6 +74,7 @@ extension Worker {
 
     /// Notes why a route failed, for the observers to see with its answer.
     mutating func noteHandlerFailure(_ slot: Int, _ description: @autoclosure () -> String) {
+        if tracer != nil { requestSpanFailed(slot, nil, description()) }
         guard observesResponses else { return }
         let c = table[slot]
         handlerFailures[slot] = (c.pointee.generation, c.pointee.requestId, description())

@@ -18,6 +18,7 @@
 
 import AvianCore
 import AvianHTTP
+import Tracing
 
 /// Which redirects an `HTTPClient` follows.
 public struct RedirectPolicy: Sendable {
@@ -74,6 +75,23 @@ extension HTTPClient {
     public func send(_ method: HTTPMethod, _ url: String,
                      headers: [(String, String)] = [],
                      body: [UInt8] = []) async throws(ClientError) -> ClientResponse {
+        var headers = headers
+        guard let span = startHTTPClientSpan(method, url, &headers) else {
+            return try await following(method, url, headers: headers, body: body)
+        }
+        do throws(ClientError) {
+            let response = try await following(method, url, headers: headers, body: body)
+            span.answered(response.status)
+            return response
+        } catch {
+            span.fail(error, type: error.kind)
+            throw error
+        }
+    }
+
+    private func following(_ method: HTTPMethod, _ url: String,
+                           headers: [(String, String)],
+                           body: [UInt8]) async throws(ClientError) -> ClientResponse {
         // The whole of it, redirects included, inside one budget if there is
         // one: the deadline is set once, here, and every wait below reads it.
         let client = startingExchange()
@@ -122,23 +140,58 @@ extension HTTPClient {
         var headers = headers
         var body = body
         var followed = 0
+        // Open until the body has been read or given up on.
+        let span = startHTTPClientSpan(method, url, &headers)
         while true {
-            let started = try await client.start(method, url, headers: headers, body: body, streaming: true)
+            let started: Started
+            do throws(ClientError) {
+                started = try await client.start(method, url, headers: headers, body: body, streaming: true)
+            } catch {
+                span?.fail(error, type: error.kind)
+                throw error
+            }
             let response = ClientResponseStream(client, started, url: url)
             guard let next = client.redirect(response.status, response.header("location"), from: url) else {
                 // The budget was for getting here. The body is read for as
                 // long as the caller wants it, a wait at a time.
                 response.startReading()
+                response.span = span
+                if let span, span.isRecording { span.attributes["http.response.status_code"] = response.status }
                 return response
             }
             // A redirect's own body is short, and reading it keeps the
             // connection for the request it points at.
             if (try? await response.collect(limit: maxBodyBytes)) == nil { response.cancel() }
-            guard followed < redirects.limit else { throw .tooManyRedirects }
+            guard followed < redirects.limit else {
+                span?.fail(ClientError.tooManyRedirects, type: ClientError.tooManyRedirects.kind)
+                throw .tooManyRedirects
+            }
             followed += 1
             client.follow(response.status, to: next, from: url, &method, &headers, &body)
             url = next
         }
+    }
+
+    /// The span of one call, with the trace it belongs to added to `headers`
+    /// for the server to continue. Nil when the worker does not trace.
+    func startHTTPClientSpan(_ method: HTTPMethod, _ url: String,
+                             _ headers: inout [(String, String)]) -> (any Span)? {
+        guard let tracer = worker.pointee.tracer else { return nil }
+        let name = method.token.map { String(describing: $0) } ?? "HTTP"
+        let span = tracer.startSpan(name, ofKind: .client)
+        if span.isRecording {
+            let origin = ClientOrigin(url)
+            span.updateAttributes { attributes in
+                attributes["http.request.method"] = name == "HTTP" ? "_OTHER" : name
+                attributes["url.full"] = redactedURL(url)
+                if let origin {
+                    attributes["server.address"] = origin.host
+                    attributes["server.port"] = Int(origin.port)
+                }
+            }
+        }
+        tracer.inject(span.context, into: &headers, using: ClientHeaderInjector())
+        return span
     }
 
     /// What following a redirect does to the request: 303 turns any method

@@ -31,6 +31,10 @@ let package = Package(
         // The protocol and systems layers: syscalls, TLS, buffers, the poller,
         // HTTP/1.1, HTTP/2, HTTP/3 and QUIC.
         .package(url: "https://github.com/grepjava/aviancore", from: "0.5.0"),
+        // The tracing API the Swift server ecosystem shares: Garuda starts
+        // spans, and whichever tracer the application bootstraps records
+        // them. No Foundation, no threads of its own.
+        .package(url: "https://github.com/apple/swift-distributed-tracing", from: "1.3.0"),
     ],
     targets: [
         // Database protocols as byte-level state machines: no sockets, no
@@ -48,7 +52,8 @@ let package = Package(
         // The engine and the handler API: `import Garuda`.
         .target(name: "Garuda",
                 dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
-                               "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT"],
+                               "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT",
+                               .product(name: "Tracing", package: "swift-distributed-tracing")],
                 swiftSettings: sharedSwiftSettings),
 
         // Resumable uploads (draft-ietf-httpbis-resumable-upload), built on the
@@ -82,7 +87,9 @@ let package = Package(
         .testTarget(name: "GarudaTests",
                     dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
                                    "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT", "Garuda", "GarudaFuzzTargets",
-                                   "CAllocationCounter"],
+                                   "CAllocationCounter",
+                                   .product(name: "Tracing", package: "swift-distributed-tracing"),
+                                   .product(name: "InMemoryTracing", package: "swift-distributed-tracing")],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "GarudaUploadsTests",
                     dependencies: [avian("CAvian"), avian("AvianHTTP"), "Garuda", "GarudaUploads"],

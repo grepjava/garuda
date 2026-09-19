@@ -1198,6 +1198,8 @@ enum GarudaRuntime {
             }
         }
         application?.pointee.onStart?(index)
+        // After the start hooks, where a tracer is bootstrapped.
+        workerPtr.pointee.startTracing(index)
         if let jobs = application?.pointee.scheduledJobs {
             startScheduledJobs(workerPtr, index: index, jobs: jobs)
         }

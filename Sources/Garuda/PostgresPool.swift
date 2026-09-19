@@ -19,6 +19,7 @@
 import CAvian
 import AvianCore
 import GarudaPostgres
+import Tracing
 
 // MARK: - Values
 
@@ -208,20 +209,30 @@ public final class PostgresPool: @unchecked Sendable {
             // which nothing in a handler can do.
             throw .cancelled
         }
+        // Opened before the wait for a connection, which is part of what the
+        // statement cost its caller.
+        let span = startPostgresSpan(sql, configuration)
         // An idle connection is taken without an await: through `acquire` it
         // was an async frame for what is almost always a pop off a list.
         let connection: PostgresConnection
         if let ready = takeIdle() {
             connection = ready
         } else {
-            connection = try await acquire()
+            do throws(PostgresClientError) {
+                connection = try await acquire()
+            } catch {
+                span?.fail(error)
+                throw error
+            }
         }
-        do {
-            let rows = try await connection.query(sql, values: values.map(\.postgresValue))
+        do throws(PostgresClientError) {
+            let rows = try await connection.untracedQuery(sql, values: values.map(\.postgresValue))
             release(connection)
+            span?.end()
             return rows
         } catch {
             release(connection)
+            span?.fail(error)
             throw error
         }
     }

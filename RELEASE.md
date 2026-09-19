@@ -21,20 +21,19 @@ every pull request:
 - `swift test` again against a real PostgreSQL and a real Redis, which is what
   turns the opt-in connector suites on, and the example applications with
   them;
-- the end-to-end suites, which drive the release binary over a socket.
+- the end-to-end suites, which drive the release binary over a socket;
+- the protocol suites -- HTTP/2, HTTP/3, WebSocket, WebTransport, uploads --
+  against clients built from h2 and aioquic, and `pgfuzz` under
+  AddressSanitizer.
 
-The protocol suites -- HTTP/2, HTTP/3, WebSocket, WebTransport, uploads,
-broadcast -- and a `pgfuzz` run under AddressSanitizer go on every push to
-`main`, nightly and on demand, but not on a pull request: they are slow and
-want a QUIC stack. The fuzzer runs for ten minutes on the nightly run and one
-minute on the others.
+The same runs nightly and on demand, with the fuzzer given ten minutes rather
+than one.
 
-**Before cutting a version.** Run the lot against the release build, including
-what CI keeps off a pull request:
+**Before cutting a version.** Run the lot against the release build:
 
 ```bash
 swift build -c release
-swift test                             # 948 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 995 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -300,6 +299,20 @@ The Python suites need `h2` and `aioquic`.
   a metric label. `done.failure` says why a route answered 5xx on its own
   account: a throw, a handler that returned without answering, or its
   deadline.
+- `app.tracing()` traces through swift-distributed-tracing, with the tracer
+  `InstrumentationSystem` holds in each worker; `app.tracing { worker in … }`
+  makes one per worker instead. Each request is a server span named for its
+  method and route pattern, continued from the trace its headers carry, and
+  ended when its response is answered -- a streamed response's with its last
+  byte. A handler runs with that span as `ServiceContext.current`, sync or
+  async, so the spans it starts are its children. Beneath it: a client span
+  for each `request.client` call, which carries the trace on in its headers
+  and, for `client.stream`, ends with the body; a span per PostgreSQL
+  statement, the wait for a pooled connection included, with its SQLSTATE
+  when refused; and a span per Redis round trip, named for its command or
+  PIPELINE, with the error code a refused command gets. Attributes follow
+  OpenTelemetry's HTTP and database conventions; bound values, Redis
+  arguments and query-string values are never recorded.
 - `app.maxBodySize(bytes) { … }` holds the bodies of the routes registered
   inside it to `bytes` instead of `--max-body`, larger or smaller. A declared
   length past it is 413 before the body is read, and a chunked, HTTP/2 or
