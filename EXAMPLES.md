@@ -344,7 +344,8 @@ app.get("/offers") { (customer: Customer?) async in customer == nil ? "public of
 ```
 
 An `AsyncRequestExtractor` needs an async handler; registering a synchronous
-one stops the program at start-up. `Customer?` is nil where `Customer` would
+one stops the program at start-up, unless the extractor has a synchronous
+`extract` too and says `extractsSynchronously`, as `JWT` does. `Customer?` is nil where `Customer` would
 have refused, and `Result<Customer, any Error>` hands you the error.
 
 ## OpenAPI and Swagger UI

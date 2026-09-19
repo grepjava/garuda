@@ -124,6 +124,51 @@ struct JWKSTests {
         #expect(try await narrow.verify(try token(ec), as: Claims.self).sub == "ada")
     }
 
+    @Test func verifyNowAnswersOnlyWhatItCanWithoutFetching() async throws {
+        let key = try JWTKey.generate(.ES256, keyID: "k")
+        let (verifier, clock) = verifier { try set([key]) }
+        // Nothing fetched yet: that is verify's to do.
+        #expect(try verifier.verifyNow(try token(key), as: Claims.self)?.sub == nil)
+        #expect(verifier.fetches == 0)
+        _ = try await verifier.verify(try token(key), as: Claims.self)
+        #expect(try verifier.verifyNow(try token(key, "grace"), as: Claims.self)?.sub == "grace")
+        #expect(verifier.fetches == 1)
+        // Refused as verify would refuse it: signed by another key with the same kid.
+        let impostor = try JWTKey.generate(.ES256, keyID: "k")
+        #expect(throws: JWTError.badSignature) { try verifier.verifyNow(try token(impostor), as: Claims.self) }
+        // A key ID the set does not have: refused while asking again is not
+        // yet due, left to verify once it is.
+        let stranger = try JWTKey.generate(.ES256, keyID: "made-up")
+        #expect(throws: JWTError.unknownKey) { try verifier.verifyNow(try token(stranger), as: Claims.self) }
+        clock.seconds += 60
+        #expect(try verifier.verifyNow(try token(stranger), as: Claims.self)?.sub == nil)
+        // Aged: verify would fetch.
+        clock.seconds += 3600
+        #expect(try verifier.verifyNow(try token(key), as: Claims.self)?.sub == nil)
+        #expect(verifier.fetches == 1)
+    }
+
+    @Test func aSynchronousRouteAnswers503UntilTheKeysAreIn() throws {
+        let key = try JWTKey.generate(.ES256, keyID: "k")
+        let body = try set([key])
+        let verifier = JWKSVerifier(url: "https://idp.example/jwks")
+        verifier.fetcher = { _ in body }
+        let app = Application()
+        app.jwtVerifier { _ in verifier }
+        app.get("/me") { (jwt: JWT<Claims>) in jwt.claims.sub }
+        let client = app.test
+        let bearer = [("authorization", "Bearer \(try token(key))")]
+        #expect(try client.get("/me", headers: bearer).status == 503)
+        // The fetch that request started finishes on the worker's loop.
+        var answered = try client.get("/me", headers: bearer)
+        for _ in 0..<50 where answered.status != 200 {
+            client.turn()
+            answered = try client.get("/me", headers: bearer)
+        }
+        #expect(answered.text == "ada")
+        #expect(verifier.fetches == 1)
+    }
+
     @Test func requestsThatArriveTogetherShareOneFetch() throws {
         let key = try JWTKey.generate(.ES256, keyID: "k")
         let body = try set([key])

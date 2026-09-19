@@ -13,7 +13,7 @@
 //     app.jwtVerifier { _ in keys }
 //
 //     let token = try keys.sign(UserClaims(sub: "42", exp: Timestamp.now.secondsSinceEpoch + 900, role: "admin"))
-//     app.get("/me") { (jwt: JWT<UserClaims>) async in "user \(jwt.claims.sub)" }
+//     app.get("/me") { (jwt: JWT<UserClaims>) in "user \(jwt.claims.sub)" }
 //
 // A token is three base64url parts: a header naming the algorithm and key, the
 // claims, and a signature over the first two. Verifying one checks, in order:
@@ -167,10 +167,10 @@ public final class JWTKey: @unchecked Sendable {
     }
 
     /// The MAC of `input` under this HMAC secret, or a negative length.
-    private func hmac(_ input: UnsafeBufferPointer<UInt8>, into out: inout [UInt8]) -> Int {
+    private func hmac(_ input: UnsafeBufferPointer<UInt8>, into out: UnsafeMutableBufferPointer<UInt8>) -> Int {
         let data = input.baseAddress ?? UnsafePointer(bitPattern: 1)!
-        if let mac { return Int(gjw_mac_compute(mac, data, input.count, &out, out.count)) }
-        return Int(gjw_hmac(algorithm.code, secret, secret.count, data, input.count, &out, out.count))
+        if let mac { return Int(gjw_mac_compute(mac, data, input.count, out.baseAddress, out.count)) }
+        return Int(gjw_hmac(algorithm.code, secret, secret.count, data, input.count, out.baseAddress, out.count))
     }
 
     /// An HMAC secret, at least as many bytes as the algorithm's hash.
@@ -320,7 +320,9 @@ public final class JWTKey: @unchecked Sendable {
         var out = [UInt8](repeating: 0, count: 1024)
         let length: Int
         if algorithm.isHMAC {
-            length = input.withUnsafeBufferPointer { hmac($0, into: &out) }
+            length = input.withUnsafeBufferPointer { data in
+                out.withUnsafeMutableBufferPointer { hmac(data, into: $0) }
+            }
         } else {
             length = gjw_sign(handle, algorithm.code, input, input.count, &out, out.count)
         }
@@ -329,15 +331,25 @@ public final class JWTKey: @unchecked Sendable {
     }
 
     func verify(_ input: [UInt8], signature: [UInt8]) -> Bool {
-        if algorithm.isHMAC {
-            var mac = [UInt8](repeating: 0, count: 64)
-            let length = input.withUnsafeBufferPointer { hmac($0, into: &mac) }
-            guard length > 0, signature.count == length else { return false }
-            var difference: UInt8 = 0
-            for i in 0..<length { difference |= mac[i] ^ signature[i] }
-            return difference == 0
+        input.withUnsafeBufferPointer { input in
+            signature.withUnsafeBufferPointer { verify(input, signature: $0) }
         }
-        return gjw_verify(handle, algorithm.code, input, input.count, signature, signature.count) == 1
+    }
+
+    /// Whether `signature` is this key's over `input`, read where they lie.
+    func verify(_ input: UnsafeBufferPointer<UInt8>, signature: UnsafeBufferPointer<UInt8>) -> Bool {
+        if algorithm.isHMAC {
+            return withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 64) { mac in
+                let length = hmac(input, into: mac)
+                guard length > 0, signature.count == length else { return false }
+                var difference: UInt8 = 0
+                for i in 0..<length { difference |= mac[i] ^ signature[i] }
+                return difference == 0
+            }
+        }
+        let data = input.baseAddress ?? UnsafePointer(bitPattern: 1)!
+        let signed = signature.baseAddress ?? UnsafePointer(bitPattern: 1)!
+        return gjw_verify(handle, algorithm.code, data, input.count, signed, signature.count) == 1
     }
 }
 
@@ -401,21 +413,116 @@ struct JWTHeader: Codable, Sendable {
 }
 
 /// The registered claims, read from any token to check them.
-struct RegisteredClaims: Decodable {
+struct RegisteredClaims {
     var exp: Double?
     var nbf: Double?
     var iss: String?
-    var aud: Audience?
+    /// `aud`: one string, or an array of them.
+    var aud: [String]?
 
-    struct Audience: Decodable {
-        var values: [String]
-
-        init(from decoder: any Decoder) throws {
-            if let single = try? String(from: decoder) {
-                values = [single]
-            } else {
-                values = try [String](from: decoder)
+    /// Read from the claims' JSON as it lies, without a decoder: only the
+    /// four members checked here are read, and a whole-number time --
+    /// which every issuer writes -- is read without `strtod`. The first of
+    /// two members with the same name counts, as it does for the decoder the
+    /// claims themselves go through. Throws `malformed` for anything that is
+    /// not a JSON object, or a registered claim of the wrong type.
+    init(json: UnsafeBufferPointer<UInt8>) throws(JWTError) {
+        guard let base = json.baseAddress, json.count > 0 else { throw .malformed }
+        let count = json.count
+        var scanner = JSONScanner(base: base, count: count)
+        do {
+            try scanner.skipValue()
+            let end = scanner.index
+            scanner.skipWhitespace()
+            guard scanner.index == count else { throw JWTError.malformed }
+            scanner = JSONScanner(base: base, count: end)
+            scanner.skipWhitespace()
+            guard scanner.peek() == 0x7B else { throw JWTError.malformed }
+            scanner.index += 1
+            scanner.skipWhitespace()
+            if scanner.peek() == 0x7D { return }
+            var seen: UInt8 = 0
+            while true {
+                scanner.skipWhitespace()
+                let keyStart = scanner.index
+                try scanner.skipString()
+                let keyEnd = scanner.index
+                scanner.skipWhitespace()
+                scanner.index += 1  // :
+                scanner.skipWhitespace()
+                let value = scanner.index
+                // Compared as bytes. A name written with escapes -- which no
+                // issuer does -- is decoded first, as the decoder would.
+                var name: (UInt8, UInt8, UInt8)? = nil
+                let length = keyEnd - keyStart - 2
+                if length == 3 {
+                    name = (base[keyStart + 1], base[keyStart + 2], base[keyStart + 3])
+                } else if length > 3,
+                          UnsafeBufferPointer(start: base + keyStart + 1, count: length).contains(0x5C) {
+                    let text = Array(try JSONValue.text(base, from: keyStart, to: keyEnd).utf8)
+                    if text.count == 3 { name = (text[0], text[1], text[2]) }
+                }
+                if let (a, b, c) = name {
+                    switch (a, b, c) {
+                    case (0x65, 0x78, 0x70) where seen & 1 == 0:  // exp
+                        seen |= 1
+                        exp = try RegisteredClaims.time(base, end, value)
+                    case (0x6E, 0x62, 0x66) where seen & 2 == 0:  // nbf
+                        seen |= 2
+                        nbf = try RegisteredClaims.time(base, end, value)
+                    case (0x69, 0x73, 0x73) where seen & 4 == 0:  // iss
+                        seen |= 4
+                        if !JSONValue.isNull(base, end, at: value) {
+                            iss = try JSONValue.string(base, end, at: value, [])
+                        }
+                    case (0x61, 0x75, 0x64) where seen & 8 == 0:  // aud
+                        seen |= 8
+                        aud = try RegisteredClaims.audience(base, end, value)
+                    default:
+                        break
+                    }
+                }
+                try scanner.skipValue()
+                scanner.skipWhitespace()
+                guard let byte = scanner.peek(), byte == 0x2C else { return }
+                scanner.index += 1
             }
+        } catch {
+            throw .malformed
+        }
+    }
+
+    /// A NumericDate: seconds, whole or not. Null is absent.
+    private static func time(_ base: UnsafePointer<UInt8>, _ count: Int, _ at: Int) throws -> Double? {
+        if JSONValue.isNull(base, count, at: at) { return nil }
+        if let (magnitude, negative) = try? JSONValue.integer(base, count, at: at, [], expected: "Int"),
+           magnitude <= 1 << 53 {
+            return negative ? -Double(magnitude) : Double(magnitude)
+        }
+        return try JSONValue.double(base, count, at: at, [])
+    }
+
+    private static func audience(_ base: UnsafePointer<UInt8>, _ count: Int, _ at: Int) throws -> [String]? {
+        switch base[at] {
+        case 0x6E:
+            return JSONValue.isNull(base, count, at: at) ? nil : try [JSONValue.string(base, count, at: at, [])]
+        case 0x22:
+            return [try JSONValue.string(base, count, at: at, [])]
+        case 0x5B:
+            var values: [String] = []
+            var scanner = JSONScanner(base: base, count: count, at: at + 1)
+            scanner.skipWhitespace()
+            if scanner.peek() == 0x5D { return values }
+            while true {
+                scanner.skipWhitespace()
+                values.append(try JSONValue.string(base, count, at: scanner.index, []))
+                try scanner.skipValue()
+                scanner.skipWhitespace()
+                guard let byte = scanner.peek(), byte == 0x2C else { return values }
+                scanner.index += 1
+            }
+        default:
+            throw JWTError.malformed
         }
     }
 }
@@ -478,10 +585,39 @@ public final class JWTKeys: @unchecked Sendable {
         try check(token, as: type)
     }
 
+    /// Everything read where it lies in the token's bytes: the header and
+    /// its key from the cache when seen before, the signature checked over
+    /// the first two parts in place, and the claims decoded from a scratch
+    /// buffer on the stack. Nothing is allocated but the claims themselves.
     func check<Claims: Decodable>(_ token: String, as type: Claims.Type) throws -> Claims {
-        let parsed = try ParsedToken(token, headers: headers)
-        guard let key = key(for: parsed.header) else { throw JWTError.unknownKey }
-        return try parsed.claims(type, key: key, validation: validation, now: clock())
+        guard token.utf8.count <= ParsedToken.maxBytes else { throw JWTError.malformed }
+        var text = token
+        return try text.withUTF8 { all throws -> Claims in
+            let (first, second) = try ParsedToken.dots(all)
+            let headerPart = UnsafeBufferPointer(rebasing: all[0..<first])
+            let key: JWTKey?
+            if let known = headers.entry(for: headerPart) {
+                key = known.key
+            } else {
+                let header = try ParsedToken.header(headerPart)
+                key = self.key(for: header)
+                headers.keep(header, key: key, for: headerPart)
+            }
+            guard let key else { throw JWTError.unknownKey }
+            let payloadPart = UnsafeBufferPointer(rebasing: all[(first + 1)..<second])
+            let signaturePart = UnsafeBufferPointer(rebasing: all[(second + 1)...])
+            let verified = withUnsafeTemporaryAllocation(of: UInt8.self, capacity: signaturePart.count) { signature in
+                guard let length = base64URLDecode(signaturePart, into: signature) else { return false }
+                return key.verify(UnsafeBufferPointer(rebasing: all[0..<second]),
+                                  signature: UnsafeBufferPointer(rebasing: signature[0..<length]))
+            }
+            guard verified else { throw JWTError.badSignature }
+            return try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: payloadPart.count) { scratch in
+                guard let length = base64URLDecode(payloadPart, into: scratch) else { throw JWTError.malformed }
+                return try ParsedToken.validClaims(type, UnsafeBufferPointer(rebasing: scratch[0..<length]),
+                                                   validation: validation, now: clock())
+            }
+        }
     }
 
     func key(for header: JWTHeader) -> JWTKey? {
@@ -496,6 +632,8 @@ public final class JWTKeys: @unchecked Sendable {
 
 /// A token split and decoded, not yet trusted.
 struct ParsedToken {
+    static let maxBytes = 16 * 1024
+
     let header: JWTHeader
     let signingInput: [UInt8]
     let payload: [UInt8]
@@ -503,36 +641,22 @@ struct ParsedToken {
 
     /// Read from the token's bytes, as they are: the two dots found, each
     /// part decoded from base64url where it lies, and what is signed -- the
-    /// first two parts and the dot between -- taken as one slice. A header
-    /// seen before comes from `headers` without being decoded again.
-    init(_ token: String, headers: JWTHeaderCache? = nil) throws(JWTError) {
-        guard token.utf8.count <= 16 * 1024 else { throw .malformed }
+    /// first two parts and the dot between -- taken as one slice.
+    init(_ token: String) throws(JWTError) {
+        guard token.utf8.count <= ParsedToken.maxBytes else { throw .malformed }
         var text = token
         let read: Result<(JWTHeader, [UInt8], [UInt8], [UInt8]), JWTError> = text.withUTF8 { all in
-            let dot = UInt8(ascii: ".")
-            guard let first = all.firstIndex(of: dot),
-                  let second = all[(first + 1)...].firstIndex(of: dot),
-                  !all[(second + 1)...].contains(dot),
-                  first > 0, second > first + 1, second + 1 < all.count else { return .failure(.malformed) }
-            let headerPart = UnsafeBufferPointer(rebasing: all[0..<first])
-            let header: JWTHeader
-            if let known = headers?.header(for: headerPart) {
-                header = known
-            } else {
-                guard let bytes = base64URLDecode(headerPart),
-                      let decoded = try? JSONCoder.decode(JWTHeader.self, from: bytes) else {
+            do throws(JWTError) {
+                let (first, second) = try ParsedToken.dots(all)
+                let header = try ParsedToken.header(UnsafeBufferPointer(rebasing: all[0..<first]))
+                guard let payload = base64URLDecode(UnsafeBufferPointer(rebasing: all[(first + 1)..<second])),
+                      let signature = base64URLDecode(UnsafeBufferPointer(rebasing: all[(second + 1)...])) else {
                     return .failure(.malformed)
                 }
-                if decoded.crit != nil { return .failure(.unsupported("crit")) }
-                guard JWTAlgorithm(rawValue: decoded.alg) != nil else { return .failure(.unsupported(decoded.alg)) }
-                headers?.keep(decoded, for: headerPart)
-                header = decoded
+                return .success((header, Array(all[0..<second]), payload, signature))
+            } catch {
+                return .failure(error)
             }
-            guard let payload = base64URLDecode(UnsafeBufferPointer(rebasing: all[(first + 1)..<second])),
-                  let signature = base64URLDecode(UnsafeBufferPointer(rebasing: all[(second + 1)...])) else {
-                return .failure(.malformed)
-            }
-            return .success((header, Array(all[0..<second]), payload, signature))
         }
         switch read {
         case .success(let (header, signingInput, payload, signature)):
@@ -545,12 +669,38 @@ struct ParsedToken {
         }
     }
 
+    /// Where the token's two dots are: three non-empty parts, no more.
+    static func dots(_ all: UnsafeBufferPointer<UInt8>) throws(JWTError) -> (Int, Int) {
+        let dot = UInt8(ascii: ".")
+        guard let first = all.firstIndex(of: dot),
+              let second = all[(first + 1)...].firstIndex(of: dot),
+              !all[(second + 1)...].contains(dot),
+              first > 0, second > first + 1, second + 1 < all.count else { throw .malformed }
+        return (first, second)
+    }
+
+    /// The header part decoded and checked: an algorithm this knows, and no
+    /// `crit`.
+    static func header(_ part: UnsafeBufferPointer<UInt8>) throws(JWTError) -> JWTHeader {
+        guard let bytes = base64URLDecode(part),
+              let decoded = try? JSONCoder.decode(JWTHeader.self, from: bytes) else { throw .malformed }
+        if decoded.crit != nil { throw .unsupported("crit") }
+        guard JWTAlgorithm(rawValue: decoded.alg) != nil else { throw .unsupported(decoded.alg) }
+        return decoded
+    }
+
     func claims<Claims: Decodable>(_ type: Claims.Type, key: JWTKey, validation: JWTValidation,
                                    now: Int64) throws -> Claims {
         guard key.verify(signingInput, signature: signature) else { throw JWTError.badSignature }
-        guard let registered = try? JSONCoder.decode(RegisteredClaims.self, from: payload) else {
-            throw JWTError.malformed
+        return try payload.withUnsafeBufferPointer {
+            try ParsedToken.validClaims(type, $0, validation: validation, now: now)
         }
+    }
+
+    /// The claims of a signed token, once its registered claims pass.
+    static func validClaims<Claims: Decodable>(_ type: Claims.Type, _ payload: UnsafeBufferPointer<UInt8>,
+                                               validation: JWTValidation, now: Int64) throws -> Claims {
+        let registered = try RegisteredClaims(json: payload)
         let leeway = Double(validation.leewaySeconds)
         if let exp = registered.exp {
             guard Double(now) < exp + leeway else { throw JWTError.expired }
@@ -559,41 +709,48 @@ struct ParsedToken {
         }
         if let nbf = registered.nbf, Double(now) + leeway < nbf { throw JWTError.notYetValid }
         if let issuer = validation.issuer, registered.iss != issuer { throw JWTError.invalidClaim("iss") }
-        if let audience = validation.audience, !(registered.aud?.values.contains(audience) ?? false) {
+        if let audience = validation.audience, !(registered.aud?.contains(audience) ?? false) {
             throw JWTError.invalidClaim("aud")
         }
         do {
-            return try JSONCoder.decode(Claims.self, from: payload)
+            return try JSONCoder.decode(Claims.self, from: payload.baseAddress, count: payload.count)
         } catch {
             throw JWTError.invalidClaim("claims")
         }
     }
 }
 
-/// Headers a key set has decoded and found usable, by their bytes. A handful
-/// at most: one per issuer and key, in practice.
+/// Headers a key set has decoded and found usable, by their bytes, with the
+/// key each one names -- or none, for a header naming a key the set does not
+/// have. A handful at most: one per issuer and key, in practice.
 final class JWTHeaderCache: Sendable {
-    private let entries = Mutex<[(bytes: [UInt8], header: JWTHeader)]>([])
+    struct Entry: Sendable {
+        let bytes: [UInt8]
+        let header: JWTHeader
+        let key: JWTKey?
+    }
+
+    private let entries = Mutex<[Entry]>([])
     static let capacity = 8
 
-    func header(for bytes: UnsafeBufferPointer<UInt8>) -> JWTHeader? {
+    func entry(for bytes: UnsafeBufferPointer<UInt8>) -> Entry? {
         entries.withLock { entries in
             for entry in entries where entry.bytes.count == bytes.count {
                 let same = entry.bytes.withUnsafeBufferPointer {
                     memcmp($0.baseAddress!, bytes.baseAddress!, bytes.count) == 0
                 }
-                if same { return entry.header }
+                if same { return entry }
             }
             return nil
         }
     }
 
-    func keep(_ header: JWTHeader, for bytes: UnsafeBufferPointer<UInt8>) {
+    func keep(_ header: JWTHeader, key: JWTKey?, for bytes: UnsafeBufferPointer<UInt8>) {
         entries.withLock { entries in
             // Full, the cache stays as it is: headers that vary without end
             // are decoded each time rather than churning it.
             guard entries.count < JWTHeaderCache.capacity else { return }
-            entries.append((Array(bytes), header))
+            entries.append(Entry(bytes: Array(bytes), header: header, key: key))
         }
     }
 }
@@ -601,11 +758,24 @@ final class JWTHeaderCache: Sendable {
 /// base64url as JWS writes it -- no padding, though padding is let through --
 /// decoded from bytes. The standard alphabet's + and / are taken too.
 func base64URLDecode(_ input: UnsafeBufferPointer<UInt8>) -> [UInt8]? {
+    var failed = false
+    let out = [UInt8](unsafeUninitializedCapacity: input.count) { buffer, written in
+        if let length = base64URLDecode(input, into: buffer) {
+            written = length
+        } else {
+            failed = true
+        }
+    }
+    return failed ? nil : out
+}
+
+/// The same, into `out`, which has room for at least `input.count` bytes.
+/// Returns how many were written, or nil.
+func base64URLDecode(_ input: UnsafeBufferPointer<UInt8>, into out: UnsafeMutableBufferPointer<UInt8>) -> Int? {
     var count = input.count
     while count > 0 && input[count - 1] == UInt8(ascii: "=") { count -= 1 }
     if count % 4 == 1 { return nil }
-    var out: [UInt8] = []
-    out.reserveCapacity(count * 3 / 4)
+    var written = 0
     var accumulated: UInt32 = 0
     var bits = 0
     for i in 0..<count {
@@ -623,10 +793,11 @@ func base64URLDecode(_ input: UnsafeBufferPointer<UInt8>) -> [UInt8]? {
         bits += 6
         if bits >= 8 {
             bits -= 8
-            out.append(UInt8(truncatingIfNeeded: accumulated >> UInt32(bits)))
+            out[written] = UInt8(truncatingIfNeeded: accumulated >> UInt32(bits))
+            written += 1
         }
     }
-    return out
+    return written
 }
 
 // MARK: - In routes
@@ -638,6 +809,11 @@ enum JWTContextKey<Claims: Decodable>: RequestContextKey {
 /// A verified token and its claims, from `Authorization: Bearer`, checked by
 /// the verifier `app.jwtVerifier` registered.
 /// A request without a valid token is answered 401.
+///
+/// A synchronous route may take one: with `JWTKeys`, or a `JWKSVerifier`
+/// whose keys are in hand, a token is checked without awaiting anything. A
+/// synchronous route that finds a `JWKSVerifier` still to fetch its keys
+/// answers 503 and starts the fetch; an async route waits for it instead.
 public struct JWT<Claims: Decodable>: AsyncRequestExtractor {
     public let claims: Claims
     /// The token as it came.
@@ -648,6 +824,31 @@ public struct JWT<Claims: Decodable>: AsyncRequestExtractor {
         self.token = token
     }
 
+    public static var extractsSynchronously: Bool { true }
+
+    public static func extract(from request: borrowing Request, parameter: inout Int) throws -> JWT {
+        if let verified = request[context: JWTContextKey<Claims>.self] { return verified }
+        let token = try bearer(request)
+        let verifier = try request.state((any JWTVerifying).self)
+        do {
+            if let claims = try verifier.verifyNow(token, as: Claims.self) {
+                return JWT(claims: claims, token: token)
+            }
+        } catch let error as JWTError where error.status == .unauthorized {
+            request.worker.pointee.addHeader(request.slot, "www-authenticate", #"Bearer error="invalid_token""#)
+            throw error
+        }
+        // The verifier has to wait for something first -- its keys -- which
+        // a synchronous route cannot. It is started now, for the requests
+        // after this one.
+        let worker = request.worker
+        let pool = worker.pointee.handlerTasks ?? worker.pointee.makeHandlerTasks()
+        Task(executorPreference: pool.executor) {
+            _ = try? await verifier.verify(token, as: AnyClaims.self)
+        }
+        throw JWTError.keySetUnavailable
+    }
+
     public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> JWT {
         if let verified = request[context: JWTContextKey<Claims>.self] { return verified }
         let worker = request.worker
@@ -655,12 +856,12 @@ public struct JWT<Claims: Decodable>: AsyncRequestExtractor {
         let connection = request.connection
         let generation = connection.pointee.generation
         let requestId = connection.pointee.requestId
-        guard let header = request.header("authorization"), let token = parseBearer(header) else {
-            worker.pointee.addHeader(slot, "www-authenticate", "Bearer")
-            throw HTTPError.unauthorized
-        }
+        let token = try bearer(request)
         let verifier = try request.state((any JWTVerifying).self)
         do {
+            if let claims = try verifier.verifyNow(token, as: Claims.self) {
+                return JWT(claims: claims, token: token)
+            }
             return JWT(claims: try await verifier.verify(token, as: Claims.self), token: token)
         } catch let error as JWTError where error.status == .unauthorized {
             if worker.pointee.stillHolds(slot, generation: generation, requestId: requestId) {
@@ -669,16 +870,45 @@ public struct JWT<Claims: Decodable>: AsyncRequestExtractor {
             throw error
         }
     }
+
+    /// The token of `Authorization: Bearer`, or a 401 with the challenge.
+    private static func bearer(_ request: borrowing Request) throws -> String {
+        guard let header = request.header("authorization"), let token = parseBearer(header) else {
+            request.worker.pointee.addHeader(request.slot, "www-authenticate", "Bearer")
+            throw HTTPError.unauthorized
+        }
+        return token
+    }
+}
+
+/// Claims read for nothing: what a fetch started for a synchronous route
+/// checks its token as.
+private struct AnyClaims: Decodable {
+    init(from decoder: any Decoder) throws {}
 }
 
 /// What checks tokens for `JWT<Claims>` and `authenticate(jwt:)`: a `JWTKeys`
 /// with its keys in hand, or a `JWKSVerifier` that fetches them.
 public protocol JWTVerifying: AnyObject, Sendable {
     func verify<Claims: Decodable>(_ token: String, as type: Claims.Type) async throws -> Claims
+    /// The claims of `token`, checked without awaiting, or nil when this
+    /// verifier would first have to wait for something -- keys still to be
+    /// fetched, say. Throws what `verify` would. The default always waits.
+    func verifyNow<Claims: Decodable>(_ token: String, as type: Claims.Type) throws -> Claims?
+}
+
+extension JWTVerifying {
+    public func verifyNow<Claims: Decodable>(_ token: String, as type: Claims.Type) throws -> Claims? {
+        nil
+    }
 }
 
 extension JWTKeys: JWTVerifying {
     public func verify<Claims: Decodable>(_ token: String, as type: Claims.Type) async throws -> Claims {
+        try check(token, as: type)
+    }
+
+    public func verifyNow<Claims: Decodable>(_ token: String, as type: Claims.Type) throws -> Claims? {
         try check(token, as: type)
     }
 }
@@ -708,7 +938,12 @@ extension RouteBuilder {
             }
             let verifier = try request.state((any JWTVerifying).self)
             do {
-                let verified = try await verifier.verify(token, as: Claims.self)
+                let verified: Claims
+                if let now = try verifier.verifyNow(token, as: Claims.self) {
+                    verified = now
+                } else {
+                    verified = try await verifier.verify(token, as: Claims.self)
+                }
                 guard response.isActive else { throw HandlerWaitError.cancelled }
                 request[context: JWTContextKey<Claims>.self] = JWT(claims: verified, token: token)
                 return nil
@@ -725,7 +960,12 @@ extension RouteBuilder {
                 return Challenge("Bearer")
             }
             do {
-                let verified = try await verifier.verify(token, as: Claims.self)
+                let verified: Claims
+                if let now = try verifier.verifyNow(token, as: Claims.self) {
+                    verified = now
+                } else {
+                    verified = try await verifier.verify(token, as: Claims.self)
+                }
                 guard response.isActive else { throw HandlerWaitError.cancelled }
                 request[context: JWTContextKey<Claims>.self] = JWT(claims: verified, token: token)
                 return nil

@@ -6,7 +6,7 @@
 //         JWKSVerifier(url: "https://auth.example.com/.well-known/jwks.json",
 //                      validation: JWTValidation(issuer: "https://auth.example.com/", audience: "shop"))
 //     }
-//     app.get("/me") { (jwt: JWT<UserClaims>) async in jwt.claims.sub }
+//     app.get("/me") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
 //
 // The set is fetched on the first token, kept for `maxAgeSeconds`, and fetched
 // again after that. A token naming a `kid` the set does not have is how a
@@ -16,6 +16,9 @@
 // wait for that one fetch rather than starting their own. When a fetch fails,
 // the keys already in hand keep working; with none, the request is 503, and
 // the next attempt waits `minimumRefetchSeconds` too.
+//
+// A synchronous route cannot wait for a fetch: `verifyNow` answers from the
+// keys in hand, and when a fetch is due the route answers 503 and starts it.
 //
 // Only the algorithms in `algorithms` are accepted, and never an HMAC secret:
 // a key set is public, so an `oct` key in one is something to ignore, not
@@ -90,6 +93,25 @@ public final class JWKSVerifier: JWTVerifying, @unchecked Sendable {
             }
         }
         throw keys == nil ? JWTError.keySetUnavailable : JWTError.unknownKey
+    }
+
+    /// The claims when the keys are in hand and fresh enough that `verify`
+    /// would not fetch; nil when it would.
+    public func verifyNow<Claims: Decodable>(_ token: String, as type: Claims.Type) throws -> Claims? {
+        let now = clock()
+        let due = lastAttempt.map { now - $0 >= minimumRefetchSeconds } ?? true
+        if fetching || (due && (keys == nil || now - fetchedAt >= maxAgeSeconds)) { return nil }
+        let parsed = try ParsedToken(token)
+        guard let algorithm = JWTAlgorithm(rawValue: parsed.header.alg), algorithms.contains(algorithm) else {
+            throw JWTError.unsupported(parsed.header.alg)
+        }
+        guard let keys else { throw JWTError.keySetUnavailable }
+        if let key = keys.key(for: parsed.header) {
+            return try parsed.claims(type, key: key, validation: validation, now: keys.clock())
+        }
+        // A key ID the set does not have: `verify` fetches again if it may.
+        if due { return nil }
+        throw JWTError.unknownKey
     }
 
     /// Fetches the set once, however many requests ask at the same time.

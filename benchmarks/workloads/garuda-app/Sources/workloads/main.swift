@@ -90,7 +90,7 @@ app.get("/stream") { () async throws in
     }
 }
 
-app.get("/me") { (jwt: JWT<Claims>) async in
+app.get("/me") { (jwt: JWT<Claims>) in
     "user \(jwt.claims.sub)"
 }
 

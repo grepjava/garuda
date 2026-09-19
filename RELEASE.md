@@ -33,7 +33,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1022 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1025 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -1172,6 +1172,19 @@ The Python suites need `h2` and `aioquic`.
 - `garuda_connections_handed_off_total`, `garuda_connections_taken_over_total`
   and `garuda_accepts_deferred_total` count what balancing did. Balancing
   needs aviancore 0.6.4.
+- `JWT<Claims>` checks a token without awaiting whenever the keys are in
+  hand, and a synchronous route may take it: `app.get("/me") { (jwt:
+  JWT<UserClaims>) in ... }`. Checking a token no longer copies it into
+  arrays, looks up its key once per distinct header rather than per request,
+  and reads `exp`, `nbf`, `iss` and `aud` straight from the claims' bytes
+  instead of decoding them twice. On one pinned worker an HS256 `/me` went
+  from 41,300 to 62,600 requests a second as a synchronous route, and to
+  49,300 as an async one; axum's measured 64,000 to 67,000. A synchronous
+  route with a `JWKSVerifier` that has not fetched its keys yet answers 503
+  and starts the fetch; an async route waits for it, as before.
+  `JWTVerifying` has a new requirement, `verifyNow`, with a default that
+  always defers to `verify`. An `AsyncRequestExtractor` that can also answer
+  synchronously says so with `extractsSynchronously`.
 - `benchmarks/workloads.sh` runs Garuda under a balancing mode as
   `garuda:adaptive`, `garuda:accept` or `garuda:reuseport`, and has two new
   workloads: `skew`, quick requests on 56 connections while 8 more hold the

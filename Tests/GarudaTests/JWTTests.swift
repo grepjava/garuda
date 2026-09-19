@@ -261,6 +261,55 @@ struct JWTTests {
         #expect(throws: JWTError.invalidClaim("claims")) { try set.verify(try sign(good), as: Needs.self) }
     }
 
+    @Test func registeredClaimsAreReadFromTheTokensBytes() throws {
+        let key = try JWTKey.hmac([UInt8](repeating: 9, count: 32))
+        let set = try keys([key])
+        func token(_ claims: String) throws -> String {
+            let input = base64URLEncode(Array(#"{"alg":"HS256"}"#.utf8)) + "." + base64URLEncode(Array(claims.utf8))
+            return input + "." + base64URLEncode(try key.sign(Array(input.utf8)))
+        }
+        struct Subject: Decodable { let sub: String }
+        func subject(_ claims: String, _ keys: JWTKeys? = nil) throws -> String {
+            let signed = try token(claims)
+            return try (keys ?? set).verify(signed, as: Subject.self).sub
+        }
+
+        // A time with a fraction, or an exponent, is still a time.
+        #expect(try subject(#"{"sub":"a","exp":4102444800.5}"#) == "a")
+        #expect(try subject(#"{"sub":"a","exp":4.1e9}"#) == "a")
+        #expect(throws: JWTError.expired) { try subject(#"{"sub":"a","exp":1.5e9}"#) }
+        #expect(throws: JWTError.expired) { try subject(#"{"sub":"a","exp":-1}"#) }
+        // The first of two counts, as it does for the claims' own decoding.
+        #expect(throws: JWTError.expired) { try subject(#"{"exp":1,"sub":"a","exp":4102444800}"#) }
+        #expect(try subject(#"{"exp":4102444800,"sub":"a","exp":1}"#) == "a")
+        // A name written with escapes is the same name.
+        #expect(throws: JWTError.expired) { try subject(#"{"sub":"a","\u0065xp":1}"#) }
+        #expect(try subject(#"{"sub":"a","\u0065xp":4102444800}"#) == "a")
+        // Null is absent; a string is not a time; what is not an object is not claims.
+        #expect(throws: JWTError.invalidClaim("exp")) { try subject(#"{"sub":"a","exp":null}"#) }
+        #expect(throws: JWTError.malformed) { try subject(#"{"sub":"a","exp":"4102444800"}"#) }
+        #expect(throws: JWTError.malformed) { try subject(#"["sub"]"#) }
+        #expect(throws: JWTError.malformed) { try subject(#"{"sub":"a","exp":4102444800} x"#) }
+        #expect(throws: JWTError.malformed) { try subject(#"{"sub":"a","exp":4102444800"#) }
+
+        // aud: one, several, not this one, or not strings.
+        let api = try keys([key], JWTValidation(issuer: "shop", audience: "api"))
+        #expect(try subject(#"{"sub":"a","exp":4102444800,"iss":"shop","aud":"api"}"#, api) == "a")
+        #expect(try subject(#"{"sub":"a","exp":4102444800,"iss":"shop","aud":["web","api"]}"#, api) == "a")
+        #expect(throws: JWTError.invalidClaim("aud")) {
+            try subject(#"{"sub":"a","exp":4102444800,"iss":"shop","aud":["web"]}"#, api)
+        }
+        #expect(throws: JWTError.invalidClaim("aud")) {
+            try subject(#"{"sub":"a","exp":4102444800,"iss":"shop","aud":null}"#, api)
+        }
+        #expect(throws: JWTError.malformed) {
+            try subject(#"{"sub":"a","exp":4102444800,"iss":"shop","aud":[7]}"#, api)
+        }
+        #expect(throws: JWTError.invalidClaim("iss")) {
+            try subject(#"{"sub":"a","exp":4102444800,"iss":null,"aud":"api"}"#, api)
+        }
+    }
+
     @Test func keysAreChosenByKidAndAlgorithm() throws {
         let old = try JWTKey.generate(.ES256, keyID: "2025")
         let current = try JWTKey.generate(.EdDSA, keyID: "2026")
@@ -283,12 +332,16 @@ struct JWTTests {
         let app = Application()
         app.jwtVerifier { _ in set }
         app.get("/me") { (jwt: JWT<UserClaims>) async in "\(jwt.claims.sub) \(jwt.claims.role)" }
+        // The same, without a task.
+        app.get("/now") { (jwt: JWT<UserClaims>) in "\(jwt.claims.sub) now" }
+        app.get("/maybe") { (jwt: JWT<UserClaims>?) in jwt?.claims.sub ?? "nobody" }
         app.group("/admin") {
             app.authenticate(jwt: UserClaims.self, verifier: set)
             app.use { request, _ in
                 request.header("x-deny") != nil ? HTTPStatus.forbidden : nil
             }
             app.get("/stats") { (jwt: JWT<UserClaims>) async in "stats for \(jwt.claims.sub)" }
+            app.get("/whoami") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
         }
         return app
     }
@@ -310,7 +363,20 @@ struct JWTTests {
         let expired = try set.sign(UserClaims(sub: "ada", exp: Int(now) - 3600))
         #expect(try client.get("/me", headers: [("authorization", "Bearer \(expired)")]).status == 401)
 
+        // A synchronous route checks the same way.
+        #expect(try client.get("/now", headers: bearer).text == "ada now")
+        let missingNow = try client.get("/now")
+        #expect(missingNow.status == 401)
+        #expect(missingNow.header("www-authenticate") == "Bearer")
+        let invalidNow = try client.get("/now", headers: [("authorization", "Bearer \(tampered(token, part: 2))")])
+        #expect(invalidNow.status == 401)
+        #expect(invalidNow.header("www-authenticate") == #"Bearer error="invalid_token""#)
+        #expect(try client.get("/maybe", headers: bearer).text == "ada")
+        #expect(try client.get("/maybe").text == "nobody")
+
         #expect(try client.get("/admin/stats", headers: bearer).text == "stats for ada")
+        // Behind the middleware, a synchronous route takes the token it checked.
+        #expect(try client.get("/admin/whoami", headers: bearer).text == "ada")
         let refused = try client.get("/admin/stats", headers: [("authorization", "Bearer nonsense")])
         #expect(refused.status == 401)
         #expect(refused.header("www-authenticate") == #"Bearer error="invalid_token""#)

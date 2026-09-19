@@ -141,7 +141,7 @@ func addAccountRoutes(_ app: Application, _ configuration: StarterConfiguration)
             .summary("End every session of this account")
             .tags("auth")
 
-        app.get("/me") { (jwt: JWT<AccessClaims>) async -> JSON<Account> in
+        app.get("/me") { (jwt: JWT<AccessClaims>) -> JSON<Account> in
             // From the token, with no lookup: it carries who they are and what
             // they may do, as of when it was issued.
             JSON(Account(id: jwt.claims.userID ?? -1, email: jwt.claims.email, role: jwt.claims.role))

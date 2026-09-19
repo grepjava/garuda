@@ -244,10 +244,10 @@ app.post("/token") { (login: Body<Login>) async throws -> JSON<[String: String]>
     let token = try keys.sign(UserClaims(sub: "\(user.id)", exp: Int(Timestamp.now.secondsSinceEpoch) + 900, role: user.role))
     return JSON(["access_token": token, "token_type": "Bearer"])
 }
-app.get("/me") { (jwt: JWT<UserClaims>) async in "user \(jwt.claims.sub)" }
+app.get("/me") { (jwt: JWT<UserClaims>) in "user \(jwt.claims.sub)" }
 app.group("/admin") {
     app.authenticate(jwt: UserClaims.self, verifier: keys)
-    app.get("/stats") { (jwt: JWT<UserClaims>) async in "stats for \(jwt.claims.sub)" }
+    app.get("/stats") { (jwt: JWT<UserClaims>) in "stats for \(jwt.claims.sub)" }
 }
 app.get("/.well-known/jwks.json") { JSON(keys.publicJWKS) }
 ```
@@ -260,6 +260,10 @@ app.get("/.well-known/jwks.json") { JSON(keys.publicJWKS) }
   refused unless `requireExpiration` is off.
 - **Refused outright:** `alg: none`, a `crit` header, tokens over 16 KiB, RSA
   keys under 2048 bits, and HMAC secrets shorter than the hash.
+- **Synchronous or async routes:** `JWT<Claims>` checks a token without
+  awaiting whenever the keys are in hand, which they always are with
+  `JWTKeys`. A synchronous route saves starting a task for every request;
+  an async route that takes one does not await either when it need not.
 - **Keys are bound to one algorithm.** A token is checked only with a key of
   its `alg`, chosen by `kid` or as the only key of that algorithm. That rules
   out signing with HS256 and an RSA public key as the secret.
@@ -326,7 +330,7 @@ app.jwtVerifier { _ in
     JWKSVerifier(url: "https://auth.example.com/.well-known/jwks.json",
                  validation: JWTValidation(issuer: "https://auth.example.com/", audience: "shop"))
 }
-app.get("/me") { (jwt: JWT<UserClaims>) async in jwt.claims.sub }
+app.get("/me") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
 ```
 
 - `JWKSVerifier` fetches the provider's JWK Set on the first token, keeps it
@@ -337,6 +341,10 @@ app.get("/me") { (jwt: JWT<UserClaims>) async in jwt.claims.sub }
   made-up key IDs or a provider outage cannot turn into a flood of requests.
 - Requests that arrive during a fetch wait for it. If a fetch fails, the keys
   already in hand keep working; with none yet, the answer is 503.
+- A synchronous route cannot wait. One that finds the keys still to be
+  fetched, or due again, answers 503 and starts the fetch, and the requests
+  after it are checked with the keys it brings. Take `JWT` in an async route
+  instead if the first requests must wait rather than be refused.
 - Only asymmetric algorithms are trusted: `oct` keys and `use: enc` keys are
   ignored, and `algorithms` narrows the list further. An RSA key without `alg`
   counts as RS256.
@@ -620,4 +628,6 @@ app.get("/hello") { (me: SignedInUser?) async in "hello \(me?.user.username ?? "
 
 `E?` is nil where `E` would refuse, and `Result<E, any Error>` hands the
 refusal to the handler. A synchronous handler that takes an async extractor
-stops the program when the route is registered.
+stops the program when the route is registered, unless the extractor can also
+answer without awaiting and says so with `static var extractsSynchronously:
+Bool { true }` and a synchronous `extract`, as `JWT` does.

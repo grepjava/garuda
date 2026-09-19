@@ -38,13 +38,19 @@
 import AvianCore
 import AvianHTTP
 
-/// An extractor that awaits. Handlers that take one must be async.
+/// An extractor that awaits. Handlers that take one must be async, unless it
+/// says it can also be taken without awaiting (`extractsSynchronously`).
 public protocol AsyncRequestExtractor: RequestExtractor {
     static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Self
+    /// Whether a synchronous handler may take it too, through its
+    /// synchronous `extract`: one that usually has what it needs in hand and
+    /// can answer for itself when it does not. False by default.
+    static var extractsSynchronously: Bool { get }
 }
 
 extension AsyncRequestExtractor {
     public static var awaitsExtraction: Bool { true }
+    public static var extractsSynchronously: Bool { false }
 
     /// Never used for a route: registering a synchronous handler that takes
     /// an async extractor stops the program.
@@ -70,6 +76,8 @@ extension Optional: RequestExtractor where Wrapped: RequestExtractor {
 }
 
 extension Optional: AsyncRequestExtractor where Wrapped: AsyncRequestExtractor {
+    public static var extractsSynchronously: Bool { Wrapped.extractsSynchronously }
+
     public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Wrapped? {
         let start = parameter
         do {
@@ -97,6 +105,8 @@ extension Result: RequestExtractor where Success: RequestExtractor, Failure == a
 }
 
 extension Result: AsyncRequestExtractor where Success: AsyncRequestExtractor, Failure == any Error {
+    public static var extractsSynchronously: Bool { Success.extractsSynchronously }
+
     public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Result {
         let start = parameter
         do {
@@ -142,7 +152,7 @@ private func extractAwaiting<A: AsyncRequestExtractor>(_ type: A.Type, _ request
 
 /// Stops the program when a synchronous route takes an extractor that awaits.
 func requireSynchronousExtractor<E: RequestExtractor>(_ type: E.Type, _ method: HTTPMethod, _ pattern: String) {
-    precondition(!(E.self is any AsyncRequestExtractor.Type),
+    precondition((E.self as? any AsyncRequestExtractor.Type)?.extractsSynchronously ?? true,
                  "route \(pattern): \(E.self) awaits, so it needs an async handler; "
                     + "WebSocket and WebTransport routes take extractors that do not")
 }
