@@ -1,16 +1,15 @@
 # What every change is checked by.
 #
-# On a push or a pull request: the build, the unit tests, the handler code that
-# must not compile, the connectors against real PostgreSQL and Redis, and the
-# end-to-end suites that drive the release binary over HTTP/1.1. Those are the
-# ones fast enough to run each time and specific enough to be worth waiting
-# for.
+# On every push to main and every pull request: the build and unit tests on
+# Linux and macOS, the handler code that must not compile, the connectors
+# against real PostgreSQL and Redis, the end-to-end suites that drive the
+# release binary over HTTP/1.1, the protocol suites -- HTTP/2, HTTP/3,
+# WebSocket, WebTransport, uploads -- against clients built from h2 and
+# aioquic, a minute of the fuzzer under AddressSanitizer, and a build against
+# the versioned dependency. A pull request is checked by everything main is.
 #
-# Nightly, and on demand: the protocol suites -- HTTP/2, HTTP/3, WebSocket,
-# WebTransport, uploads -- which need a Python environment and a QUIC stack,
-# and the fuzzer under AddressSanitizer. A failure there is a bug to fix, not
-# a pull request to block, and the matrix is long enough that running it on
-# every push would teach people to ignore it.
+# Nightly, and on demand: the same, with ten minutes of fuzzing rather than
+# one.
 
 name: CI
 
@@ -196,12 +195,10 @@ jobs:
           bash scripts/reload-test.sh
 
   # HTTP/2, HTTP/3, WebSocket, WebTransport and uploads, against clients built
-  # from h2 and aioquic. Nightly: they need a Python environment and a QUIC
-  # stack, and they are slow enough that blocking a push on them would be a
-  # good way to have them turned off.
+  # from h2 and aioquic. On pull requests too: a change that breaks a protocol
+  # is cheaper to find before it merges than on main the next morning.
   protocols:
     name: linux · protocol suites
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -243,7 +240,6 @@ jobs:
 
   fuzz:
     name: linux · fuzz under AddressSanitizer
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
