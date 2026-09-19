@@ -487,6 +487,7 @@ public struct Worker: ~Copyable {
         c.pointee.tls = nil
         c.pointee.movableAfter = 0
         c.pointee.costUs = 0
+        c.pointee.holdUs = 0
         if arrival == .kernelTLS { c.pointee.flags.insert(.kernelTLS) }
 
         // A socket handed over keeps the options it was accepted with.
@@ -740,6 +741,7 @@ public struct Worker: ~Copyable {
 
             case .dispatching:
                 dispatch(slot)
+                if balancer.moves { noteHold(slot) }
                 // A streaming route is running with its body still to come:
                 // whatever of it is already here is its to read.
                 if table[slot].pointee.state == .dispatching
@@ -1646,6 +1648,10 @@ public struct Worker: ~Copyable {
         // Kept, the slot would hold the largest head it ever copied -- up to
         // the head limit -- for as long as the worker runs.
         c.pointee.headStore.destroy()
+        if c.pointee.holdUs >= BalancePolicy.heavyUs {
+            c.pointee.holdUs = 0
+            countHeavy(-1)
+        }
         table.release(slot)
         if balancer.active { publishLoad() }
 

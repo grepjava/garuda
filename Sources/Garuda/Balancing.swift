@@ -22,6 +22,13 @@
 //     A connection moves only between requests, with nothing buffered and
 //     nothing in flight, so the client never knows.
 //
+//   * Gathering. Moving quick connections helps only if some worker is free
+//     of slow ones. When every worker holds a connection whose requests hold
+//     its loop for milliseconds, the slow connections are gathered onto fewer
+//     workers instead, always toward the one holding the most, and the quick
+//     ones then move to the workers left free. Slow requests always keep at
+//     least half the workers.
+//
 // A TLS connection can move only when the kernel encrypts it both ways
 // (kernel TLS): an OpenSSL session is memory in this process, and cannot go
 // with the descriptor. HTTP/2, WebSocket and streaming connections never move.
@@ -71,6 +78,10 @@ struct WorkerLoad: Equatable {
     /// On one loop turn so long that its readings are stale: not free,
     /// whatever it last said.
     var stalled = false
+    /// Its slot on the load page, which orders workers that are otherwise
+    /// equal, and how many of its connections are heavy (BalancePolicy.heavyUs).
+    var slot = -1
+    var heavy = 0
 }
 
 enum BalancePolicy {
@@ -151,15 +162,93 @@ enum BalancePolicy {
     /// is as busy as this one waits there as long as it would have here, and
     /// pays for the move besides; uneven counts alone are the listener's to
     /// even out, as connections come and go.
+    ///
+    /// Heavy connections are not these moves' to make (gatherTarget): what
+    /// moves here is the quick ones, out from behind them.
     static func moveTarget<C: Collection>(_ me: WorkerLoad, _ others: C,
                                           capacity: Int) -> (target: WorkerLoad, count: Int)?
     where C.Element == WorkerLoad {
-        // One connection is the costliest, which never goes.
-        guard me.conns >= 2, me.wait >= waitFloorUs else { return nil }
+        let quick = me.conns - me.heavy
+        // Among connections alike, one is the costliest, which never goes;
+        // with the heavy ones counted apart, every quick one may.
+        guard me.heavy > 0 ? quick >= 1 : me.conns >= 2, me.wait >= waitFloorUs else { return nil }
         guard let target = others.filter({ $0.conns < capacity && $0.channel >= 0 && !$0.stalled })
                 .min(by: { ($0.wait, $0.conns) < ($1.wait, $1.conns) }) else { return nil }
         guard me.wait > 2 * target.wait + waitMarginUs else { return nil }
-        return (target, min(maxMovesPerRound, max(1, me.conns / 4), capacity - target.conns))
+        return (target, min(maxMovesPerRound, max(1, quick / 4), capacity - target.conns))
+    }
+
+    /// A connection whose requests hold the loop this long, smoothed, is
+    /// heavy: whatever else is on its worker waits that long behind it.
+    static let heavyUs: UInt32 = 500
+
+    /// Where this worker's heavy connections should go to free it for quick
+    /// ones, or nil.
+    ///
+    /// Moving quick connections needs a worker with a short wait to move
+    /// them to. When the slow connections arrived first, onto idle workers,
+    /// each worker has one and there is none: every quick request waits
+    /// behind a slow one wherever it goes. Gathering the slow connections
+    /// frees workers, and the quick ones then move there.
+    ///
+    /// Only when quick requests are waiting, and no worker without heavy
+    /// connections has time for them. The worker holding the fewest heavy
+    /// connections gives -- the highest slot among equals -- to the one
+    /// holding the most, the lowest slot among equals: every worker reading
+    /// the same page picks the same pair, and a heavy connection only ever
+    /// goes toward a worker with more of them, so it never comes back. Slow
+    /// requests keep at least half the workers; past that, they would pay
+    /// more than the quick ones gain.
+    static func gatherTarget<C: Collection>(_ me: WorkerLoad, _ others: C,
+                                            capacity: Int) -> (target: WorkerLoad, count: Int)?
+    where C.Element == WorkerLoad {
+        guard me.heavy > 0 else { return nil }
+        var workers = 1, holders = 1
+        var waiting = me.conns > me.heavy && me.wait >= waitFloorUs
+        var target: WorkerLoad?
+        let key = { (w: WorkerLoad) in (w.heavy, -w.slot) }
+        for other in others where other.channel >= 0 && !other.stalled {
+            workers += 1
+            if other.heavy == 0 {
+                // A worker free of them with time to spare: the quick ones
+                // can simply move there.
+                if other.wait < waitFloorUs && other.conns < capacity { return nil }
+            } else {
+                holders += 1
+                // Another gives first.
+                if key(other) < key(me) { return nil }
+                if other.conns < capacity, target.map({ key(other) > key($0) }) ?? true {
+                    target = other
+                }
+            }
+            if other.conns > other.heavy && other.wait >= waitFloorUs { waiting = true }
+        }
+        guard waiting, holders - 1 >= (workers + 1) / 2, let target else { return nil }
+        return (target, min(me.heavy, maxMovesPerRound, capacity - target.conns))
+    }
+
+    /// Below this, a worker is idle enough to take back a heavy connection.
+    static let spreadIdle = 250
+
+    /// Where one of this worker's gathered heavy connections should go back
+    /// to, or nil: the quick load that called for gathering has gone, and
+    /// two workers without heavy connections sit idle -- one takes it, one is
+    /// still free.
+    static func spreadTarget<C: Collection>(_ me: WorkerLoad, _ others: C,
+                                            capacity: Int) -> (target: WorkerLoad, count: Int)?
+    where C.Element == WorkerLoad {
+        guard me.heavy >= 2 else { return nil }
+        var idle = 0
+        var target: WorkerLoad?
+        for other in others where other.channel >= 0 && !other.stalled && other.heavy == 0
+            && other.busy < spreadIdle && other.conns < capacity {
+            idle += 1
+            if target.map({ (other.busy, other.conns) < ($0.busy, $0.conns) }) ?? true {
+                target = other
+            }
+        }
+        guard idle >= 2, let target else { return nil }
+        return (target, 1)
     }
 
     /// Below this wait nothing is worth moving, and a move must at least
@@ -281,6 +370,9 @@ struct Balancer {
     var aheadSince: UInt64 = 0
     var lastMove: UInt64 = 0
     var lastTick: UInt64 = 0
+
+    /// How many of this worker's connections are heavy.
+    var heavy = 0
 
     /// The page as last read, and the other workers in it: kept from one
     /// reading to the next, so that reading allocates nothing.
@@ -446,10 +538,11 @@ extension Worker {
                                               channel: Int(view.channel),
                                               accepting: view.accepting != 0,
                                               wait: Int(view.wait_us),
-                                              stalled: view.stalled != 0))
+                                              stalled: view.stalled != 0,
+                                              slot: Int(view.slot), heavy: Int(view.heavy)))
         }
         return WorkerLoad(busy: balancer.busy, conns: table.liveCount, channel: balancer.channel,
-                          wait: balancer.wait)
+                          wait: balancer.wait, slot: Int(balancer.loadSlot), heavy: balancer.heavy)
     }
 
     /// Whether to take the next connection off the shared listener. A worker
@@ -512,8 +605,15 @@ extension Worker {
             }
         }
         guard balancer.moves else { return }
-        guard let plan = BalancePolicy.moveTarget(me, balancer.others,
-                                                  capacity: config.maxConnections) else {
+        let capacity = config.maxConnections
+        var heavy = false
+        var plan = BalancePolicy.moveTarget(me, balancer.others, capacity: capacity)
+        if plan == nil {
+            plan = BalancePolicy.gatherTarget(me, balancer.others, capacity: capacity)
+                ?? BalancePolicy.spreadTarget(me, balancer.others, capacity: capacity)
+            heavy = plan != nil
+        }
+        guard let plan else {
             balancer.aheadSince = 0
             return
         }
@@ -521,11 +621,12 @@ extension Worker {
         guard nowMs &- balancer.aheadSince >= BalancePolicy.sustainMs,
               nowMs &- balancer.lastMove >= BalancePolicy.moveCooldownMs,
               plan.target.channel < balancer.sendFDs.count else { return }
-        let moved = handOff(count: plan.count, to: balancer.sendFDs[plan.target.channel], now: nowMs)
-        if moved > 0 {
-            balancer.lastMove = nowMs
-            balancer.aheadSince = 0
-        }
+        let moved = handOff(count: plan.count, to: balancer.sendFDs[plan.target.channel],
+                            now: nowMs, heavy: heavy)
+        // Tried either way: when nothing could go -- every candidate busy
+        // with a request -- the table is not scanned again every turn.
+        balancer.lastMove = nowMs
+        if moved > 0 { balancer.aheadSince = 0 }
     }
 
     // MARK: - Moving connections
@@ -553,6 +654,25 @@ extension Worker {
         return true
     }
 
+    /// A request on `slot` has been dispatched: how long it held the loop
+    /// joins the connection's reading, each request weighing an eighth, and
+    /// the worker's count of heavy connections follows it. A request answered
+    /// by an async handler holds the loop only until the handler is started.
+    mutating func noteHold(_ slot: Int) {
+        let c = table[slot]
+        guard c.pointee.state != .free, !c.pointee.isStream, c.pointee.requestStartUs > 0 else { return }
+        let held = min(av_monotonic_us() &- c.pointee.requestStartUs, 60_000_000)
+        let was = c.pointee.holdUs >= BalancePolicy.heavyUs
+        c.pointee.holdUs = UInt32((UInt64(c.pointee.holdUs) * 7 + held) / 8)
+        let now = c.pointee.holdUs >= BalancePolicy.heavyUs
+        if was != now { countHeavy(now ? 1 : -1) }
+    }
+
+    mutating func countHeavy(_ change: Int) {
+        balancer.heavy = max(0, balancer.heavy + change)
+        av_load_publish_heavy(balancer.loadSlot, UInt32(balancer.heavy))
+    }
+
     /// A request on `slot` has been answered: what it cost joins the
     /// connection's reading, each request weighing a quarter.
     mutating func noteCost(_ slot: Int) {
@@ -562,13 +682,16 @@ extension Worker {
     }
 
     /// Hands up to `count` idle connections to the worker receiving on
-    /// `chan`, the cheapest first. Returns how many went.
+    /// `chan`, the cheapest first -- or, when `heavy`, only heavy ones.
+    /// Returns how many went.
     ///
-    /// The costliest connection this worker holds never goes. Moving it
-    /// would move the load rather than share it -- the other worker would be
-    /// the busy one, and hand it back -- where moving the cheap ones out from
-    /// behind it is what shortens their wait.
-    mutating func handOff(count: Int, to chan: Int32, now: UInt64) -> Int {
+    /// Otherwise no heavy connection goes, nor the costliest this worker
+    /// holds. Moving those would move the load rather than share it -- the
+    /// other worker would be the busy one, and hand it back -- where moving
+    /// the cheap ones out from behind them is what shortens their wait.
+    /// Heavy connections go only where gathering or spreading them sends
+    /// them, which never sends one back.
+    mutating func handOff(count: Int, to chan: Int32, now: UInt64, heavy: Bool = false) -> Int {
         var candidates: [(slot: Int, cost: UInt32)] = []
         var costliest: UInt32 = 0
         var scan = 0
@@ -576,12 +699,14 @@ extension Worker {
             let c = table[scan]
             if c.pointee.state != .free && !c.pointee.isStream {
                 costliest = max(costliest, c.pointee.costUs)
-                if isMovable(scan, now: now) { candidates.append((scan, c.pointee.costUs)) }
+                if (c.pointee.holdUs >= BalancePolicy.heavyUs) == heavy && isMovable(scan, now: now) {
+                    candidates.append((scan, c.pointee.costUs))
+                }
             }
             scan += 1
         }
         candidates.sort { $0.cost < $1.cost }
-        if let last = candidates.last, last.cost >= costliest {
+        if !heavy, let last = candidates.last, last.cost >= costliest {
             candidates.removeLast()
         }
         var moved = 0

@@ -493,3 +493,52 @@ two runs each, requests a second:
 The kernel's software encryption is slower than OpenSSL's for bulk data, even
 when `sendfile` saves the copy, so `--ktls` stays off by default. What it
 buys here is HTTPS connections that can move between workers.
+
+### Gathering slow connections, 2026-09-19
+
+`skew` and `spike` at their defaults, 8 slow connections among 64, on all 8
+CPUs with nothing pinned, showed what the runs above had not: with a slow
+connection on every worker, `adaptive` served the quick requests at 20,000–
+24,000 requests a second on `skew` (p99 6.4–7.0 ms), less than `accept` and
+axum. Placement had spread the slow connections one per worker, and moving
+quick ones cannot help when every worker has a slow one. Gathering the slow
+connections onto fewer workers (ARCHITECTURE.md, Gathering slow connections)
+fixed it.
+
+Every workload, 8 workers, two rounds with the servers in opposite order,
+requests a second (p99 in ms):
+
+| workload | `adaptive` | `accept` | `reuseport` | axum |
+|---|---|---|---|---|
+| user | 142,024–171,468 (1.2–1.9) | 141,296–143,500 (2.5) | 141,700–142,265 (2.4–2.7) | 130,200–150,280 (1.2–1.3) |
+| json | 110,068–131,042 (2.7–3.3) | 109,629–111,769 (2.8–3.4) | 108,916–111,099 (3.4) | 112,556–122,438 (1.7–1.8) |
+| db | 42,646–46,142 (2.9–3.1) | 42,785–43,132 (2.7–2.9) | 42,729–43,583 (2.8–3.3) | 44,419–44,567 (2.5) |
+| stream | 36,619–36,855 (3.4) | 36,680–36,824 (3.4) | 36,468–36,954 (3.4–3.5) | 34,277–34,290 (3.5) |
+| me | 94,964–108,133 (3.8–4.1) | 95,781–96,112 (4.0–4.2) | 95,026–95,245 (3.8–3.9) | 113,140–113,833 (1.9) |
+| upload | 2,193–2,209 | 2,203–2,225 | 2,199–2,241 | 1,341–1,342 |
+| download | 2,067–2,071 | 2,070–2,074 | 2,064–2,069 | 2,073–2,078 |
+| relay | 12,128–12,161 (10.7–10.8) | 11,981–12,237 (10.7–10.9) | 11,740–11,940 (11.3–11.7) | 3,994–4,140 (43.9–44.5) |
+| churn | 37,588–37,864 (2.1) | 37,795–38,489 (2.0–2.1) | 37,853–38,127 (2.1–2.2) | 33,430–33,593 (3.4–3.5) |
+| h2 | 110,776–113,546 (1.0) | 112,533–113,785 (0.8–1.1) | 106,398–107,330 (3.0) | 104,824–105,658 (1.6) |
+| overload | 36,343–36,372 | 36,751–37,010 | 36,518–36,838 | 37,400–38,125 |
+| recovery | 148,609–151,209 (2.8–2.9) | 149,101–149,438 (2.9) | 149,331–149,578 (2.9) | 142,681–142,701 (1.2–1.3) |
+| skew | 70,497–70,742 (3.3–3.4) | 86,688–91,302 (3.9–4.2) | 20,733–43,394 (6.3–7.3) | 49,326–49,532 (3.2–3.6) |
+| spike | 120,857–129,553 (2.4–2.8) | 103,611–109,445 (3.6–3.9) | 70,002–79,167 (6.6–7.6) | 63,984–64,388 (3.0–3.1) |
+
+Whichever server ran first read higher on user and json, as before: the
+higher figures for `adaptive` and for axum are each from the round that
+server ran first in.
+
+- `adaptive` is the best balance. It is level with the other modes on
+  uniform load, takes 0.5 to 1.5 ms off the p99 of small requests and 2 ms
+  off HTTP/2's against `reuseport`, and is the only mode whose quick requests
+  keep a tail near axum's whether the slow requests come first or later.
+- `accept` serves more quick requests on `skew`, where the slow connections
+  happen to land on some workers and not others, but has the longer tail. It
+  falls behind `adaptive` when the slow requests start later.
+- `reuseport` is the worst of the three wherever connections differ.
+- Against axum, Garuda leads on throughput everywhere except json, me, db and overload,
+  and on upload, relay and churn by a wide margin. axum keeps the shorter p99
+  on json, me and recovery: small requests under closed-loop load, where
+  Tokio's threads take one another's work request by request.
+

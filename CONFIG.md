@@ -54,7 +54,10 @@ its own poller and connection table. Workers share no lock.
   clearly more than its share -- busier, or holding more connections --
   leaves new connections to the others until it catches up. And a worker
   where quick requests would wait behind slow ones hands some of its idle
-  HTTP/1 keep-alive connections to a worker where they would not. HTTPS
+  HTTP/1 keep-alive connections to a worker where they would not. When every
+  worker holds a slow connection, the slow ones are gathered onto fewer
+  workers, to free the others for the quick ones; slow requests keep at least
+  half the workers. HTTPS
   connections move only under `--ktls` ([Kernel TLS](#kernel-tls));
   HTTP/2, WebSocket and streams never move.
 - `accept`: the first half of `adaptive`, without moving connections.

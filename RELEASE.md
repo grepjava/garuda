@@ -33,7 +33,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1018 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1022 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -1142,7 +1142,16 @@ The Python suites need `h2` and `aioquic`.
   hands idle HTTP/1 keep-alive connections to a worker where they would not,
   passing the socket over a unix channel between requests, so the client
   never notices. The wait is estimated from how long the worker's loop turns
-  take, cheapest connections move first, and the costliest never moves. With
+  take, cheapest connections move first, and the costliest never moves. When
+  every worker holds a slow connection there is nowhere better for a quick
+  one to go, so the slow ones -- connections whose requests hold the loop
+  500 µs or more -- are gathered onto fewer workers, always toward the one
+  holding the most, and the quick ones move to the workers freed. Slow
+  requests keep at least half the workers, and get them back once the quick
+  load is gone. With 8 slow connections among 64 on 8 workers, that took the
+  quick requests from 20,000–24,000 requests a second to 70,000 when the slow
+  ones came first, and from 51,000–56,000 to 121,000–130,000 when they came a
+  second in, where axum served 49,000 and 64,000. With
   slow requests starting on workers that already held quick connections, the
   quick ones' p99 on the bench box went from 2.9–3.7 ms to 0.9–1.1 ms,
   level with axum's work stealing, at higher throughput than axum; on uniform
@@ -1162,7 +1171,7 @@ The Python suites need `h2` and `aioquic`.
   `Bool`.
 - `garuda_connections_handed_off_total`, `garuda_connections_taken_over_total`
   and `garuda_accepts_deferred_total` count what balancing did. Balancing
-  needs aviancore 0.6.3.
+  needs aviancore 0.6.4.
 - `benchmarks/workloads.sh` runs Garuda under a balancing mode as
   `garuda:adaptive`, `garuda:accept` or `garuda:reuseport`, and has two new
   workloads: `skew`, quick requests on 56 connections while 8 more hold the

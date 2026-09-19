@@ -559,10 +559,11 @@ spot, where Tokio catches a Rust panic in the task that raised it.
 Processes cannot steal work from each other the way Tokio's threads do.
 Instead a worker ahead of the others leaves new connections to them, and a
 worker where quick requests would wait behind slow ones hands idle HTTP/1
-keep-alive connections to one where they would not (`--balance`). With slow
-requests starting on workers that already held quick connections, that kept
-the quick requests' p99 to about 1 ms, level with axum, where the kernel's
-hash alone let it reach 3.7 ms. HTTPS connections move too under `--ktls`,
+keep-alive connections to one where they would not (`--balance`). When every
+worker holds a slow client, the slow ones are gathered onto fewer workers to
+free the rest. With 8 slow connections among 64 on 8 workers, starting a
+second in, the quick requests' p99 was 2.4–2.8 ms and axum's 3.0–3.1 ms, where
+the kernel's hash alone let it reach 7.6 ms. HTTPS connections move too under `--ktls`,
 where the kernel does the encryption. HTTP/2 connections, WebSockets and
 requests in progress stay on the worker that has them.
 
@@ -635,7 +636,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 1018 unit tests, and the fuzz corpus
+swift test                                   # 1022 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```

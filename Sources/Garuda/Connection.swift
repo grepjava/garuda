@@ -392,6 +392,11 @@ public struct Connection {
     /// --balance adaptive, which moves the cheap connections off a busy
     /// worker rather than the one making it busy.
     var costUs: UInt32 = 0
+    /// How long this connection's requests hold the loop, in microseconds
+    /// from dispatch until the loop gets back from it, smoothed. Past
+    /// BalancePolicy.heavyUs the connection is heavy. Kept only under
+    /// --balance adaptive.
+    var holdUs: UInt32 = 0
 
     @inlinable public init() {}
 

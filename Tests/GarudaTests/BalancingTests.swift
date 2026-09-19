@@ -13,8 +13,9 @@ import Darwin
 // connection travels with, a connection carried on by another worker, and a
 // worker that leaves a shared listener to the others while it is ahead.
 
-private func load(_ busy: Int, _ conns: Int, _ channel: Int = 0, wait: Int = 0) -> WorkerLoad {
-    WorkerLoad(busy: busy, conns: conns, channel: channel, wait: wait)
+private func load(_ busy: Int, _ conns: Int, _ channel: Int = 0, wait: Int = 0,
+                  heavy: Int = 0) -> WorkerLoad {
+    WorkerLoad(busy: busy, conns: conns, channel: channel, wait: wait, slot: channel, heavy: heavy)
 }
 
 /// Sends `request` on `fd` and turns `client` until one whole response with a
@@ -175,6 +176,81 @@ struct BalancingTests {
                                          capacity: 100) == nil)
     }
 
+    @Test func quickConnectionsMoveOutFromBehindHeavyOnesButHeavyOnesStay() throws {
+        // One heavy connection and one quick: the quick one may go.
+        let plan = try #require(BalancePolicy.moveTarget(load(1000, 2, 0, wait: 1_000, heavy: 1),
+                                                         [load(0, 0, 1)], capacity: 100))
+        #expect(plan.count == 1)
+        // Heavy ones only: nothing here is the ordinary moves' to send.
+        #expect(BalancePolicy.moveTarget(load(1000, 2, 0, wait: 1_000, heavy: 2),
+                                         [load(0, 0, 1)], capacity: 100) == nil)
+        // The count is of the quick ones.
+        let some = try #require(BalancePolicy.moveTarget(load(1000, 13, 0, wait: 1_000, heavy: 5),
+                                                         [load(0, 0, 1)], capacity: 100))
+        #expect(some.count == 2)
+    }
+
+    @Test func slowConnectionsAreGatheredToFreeWorkersForQuickOnes() throws {
+        // Eight workers, each with one slow connection; quick ones wait
+        // behind them on worker 5. Worker 7 -- the highest slot among those
+        // holding the fewest -- gives to worker 0, the lowest among the most.
+        var others = (0..<7).map { load(1000, 1, $0, wait: 1_000, heavy: 1) }
+        others[5] = load(1000, 57, 5, wait: 1_100, heavy: 1)
+        let me = load(1000, 1, 7, wait: 1_000, heavy: 1)
+        let plan = try #require(BalancePolicy.gatherTarget(me, others, capacity: 100))
+        #expect(plan.target.slot == 0 && plan.count == 1)
+        // Every other worker leaves it to worker 7.
+        for w in 0..<7 {
+            var rest = others.filter { $0.slot != w }
+            rest.append(me)
+            #expect(BalancePolicy.gatherTarget(others[w], rest, capacity: 100) == nil)
+        }
+        // Toward the one holding the most, whatever its slot.
+        others[3].heavy = 2
+        #expect(try #require(BalancePolicy.gatherTarget(me, others, capacity: 100)).target.slot == 3)
+        others[3].heavy = 1
+
+        // A worker free of slow connections with time to spare: the quick
+        // ones can simply move there.
+        var free = others
+        free[6] = load(100, 3, 6, wait: 20)
+        #expect(BalancePolicy.gatherTarget(me, free, capacity: 100) == nil)
+        // One free but flat out with quick ones: another is freed.
+        free[6] = load(1000, 56, 6, wait: 300)
+        #expect(BalancePolicy.gatherTarget(me, free, capacity: 100) != nil)
+
+        // Nothing quick waiting: slow requests are left alone.
+        let slowOnly = (0..<7).map { load(1000, 1, $0, wait: 1_000, heavy: 1) }
+        #expect(BalancePolicy.gatherTarget(me, slowOnly, capacity: 100) == nil)
+        // Slow requests keep at least half the workers: with four of eight
+        // already free, no fifth.
+        var half = (0..<7).map { load(1000, 14, $0, wait: 200) }
+        for w in 0..<3 { half[w] = load(1000, 3, w, wait: 1_000, heavy: 2) }
+        #expect(BalancePolicy.gatherTarget(load(1000, 2, 7, wait: 1_000, heavy: 1), half,
+                                           capacity: 100) == nil)
+        half[3] = load(1000, 3, 3, wait: 1_000, heavy: 1)
+        #expect(BalancePolicy.gatherTarget(load(1000, 2, 7, wait: 1_000, heavy: 1), half,
+                                           capacity: 100) != nil)
+        // Nothing heavy here: nothing to give.
+        #expect(BalancePolicy.gatherTarget(load(1000, 57, 7, wait: 1_000), others,
+                                           capacity: 100) == nil)
+    }
+
+    @Test func gatheredConnectionsSpreadBackOnceTheQuickLoadIsGone() throws {
+        // Two workers free and idle: one takes a slow connection back.
+        let plan = try #require(BalancePolicy.spreadTarget(
+            load(1000, 4, 0, wait: 2_000, heavy: 4),
+            [load(100, 2, 1), load(50, 1, 2), load(1000, 3, 3, wait: 2_000, heavy: 3)],
+            capacity: 100))
+        #expect(plan.target.slot == 2 && plan.count == 1)
+        // Only one idle: it stays free.
+        #expect(BalancePolicy.spreadTarget(load(1000, 4, 0, wait: 2_000, heavy: 4),
+                                           [load(100, 2, 1), load(600, 20, 2)], capacity: 100) == nil)
+        // A worker with a single one has nothing gathered to give back.
+        #expect(BalancePolicy.spreadTarget(load(1000, 1, 0, wait: 2_000, heavy: 1),
+                                           [load(0, 0, 1), load(0, 0, 2)], capacity: 100) == nil)
+    }
+
     @Test func theNoteRoundTripsAndRejectsWhatItDidNotWrite() {
         let note = HandoffNote(kernelTLS: true, port: 54_321, requestCount: 70_000,
                                address: Array("2001:db8::1".utf8))
@@ -251,6 +327,44 @@ struct BalancingTests {
         let count = b.worker.pointee.table[slot].pointee.requestCount
         // One request before the move and one after: the count came along.
         #expect(count == 2)
+    }
+
+    @Test func aHeavyConnectionIsCountedAndGoesOnlyWhenGathered() throws {
+        #expect(av_load_init(8) == 0)
+        let a = balancedApp().test
+        let toA = try handoffPair()
+        let toB = try handoffPair()
+        defer { for fd in [toA.receive, toA.send, toB.receive, toB.send] { _ = av_close(fd) } }
+        a.onWorker {
+            a.worker.pointee.startBalancing(loadSlot: 4, channel: 0, receiveFD: toA.receive,
+                                            sendFDs: [toA.send, toB.send], sharedListener: false)
+        }
+        defer { a.onWorker { a.worker.pointee.leaveBalancing() } }
+
+        let quick = try TestWire(a)
+        #expect(exchange(quick.fd, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n", turning: a) != nil)
+        let slow = try TestWire(a)
+        // One request holding the loop 3 ms is not yet a heavy connection --
+        // one slow request is not a trend -- and two are.
+        #expect(exchange(slow.fd, "GET /work HTTP/1.1\r\nHost: x\r\n\r\n", turning: a) != nil)
+        #expect(a.worker.pointee.balancer.heavy == 0)
+        #expect(exchange(slow.fd, "GET /work HTTP/1.1\r\nHost: x\r\n\r\n", turning: a) != nil)
+        #expect(a.worker.pointee.balancer.heavy == 1)
+        var views = [av_load_view](repeating: av_load_view(), count: 8)
+        let n = Int(av_load_snapshot(&views, 8, av_monotonic_us()))
+        #expect(views[0..<n].first(where: { $0.slot == 4 })?.heavy == 1)
+        #expect(a.worker.pointee.table[quick.slot].pointee.holdUs < BalancePolicy.heavyUs)
+
+        // An ordinary move takes the quick one and never the heavy one...
+        #expect(handOff(a, 4, to: toB.send) == 1)
+        #expect(a.worker.pointee.table[slow.slot].pointee.state != .free)
+        // ...which goes only when gathered, and takes its count with it.
+        let gathered = a.onWorker {
+            a.worker.pointee.handOff(count: 4, to: toB.send, now: av_monotonic_ms(), heavy: true)
+        }
+        #expect(gathered == 1)
+        #expect(live(a) == 0)
+        #expect(a.worker.pointee.balancer.heavy == 0)
     }
 
     @Test func aConnectionWithWorkInFlightStays() throws {

@@ -153,7 +153,7 @@ are spread (`Balancing.swift`):
 
 | Mode | Where a new connection goes | Connections already placed |
 |---|---|---|
-| `adaptive` (default) | one shared listener; a worker ahead of the others steps back | quick ones move off a worker where they would wait |
+| `adaptive` (default) | one shared listener; a worker ahead of the others steps back | quick ones move off a worker where they would wait; slow ones are gathered so that some workers stay free of them |
 | `accept` | as `adaptive` | stay where they landed |
 | `reuseport` | a listener per worker with `SO_REUSEPORT`; the kernel hashes the connection's addresses | stay where they landed |
 
@@ -174,7 +174,22 @@ p99 was:
 | `adaptive` | 0.9–1.2 ms | 0.9–1.1 ms |
 | axum | 1.1–1.2 ms | 1.1–1.2 ms |
 
-On uniform load the three modes measure the same. BENCHMARKS.md has the runs.
+With 8 workers, and 8 slow connections among 64 -- one for every worker --
+the quick requests fared as follows, over two runs each:
+
+| | `skew` req/s | `skew` p99 | `spike` req/s | `spike` p99 |
+|---|---:|---:|---:|---:|
+| `reuseport` | 21,000–43,000 | 6.3–7.3 ms | 70,000–79,000 | 6.6–7.6 ms |
+| `accept` | 87,000–91,000 | 3.9–4.2 ms | 104,000–109,000 | 3.6–3.9 ms |
+| `adaptive` | 70,000–71,000 | 3.3–3.4 ms | 121,000–130,000 | 2.4–2.8 ms |
+| axum | 49,000–50,000 | 3.2–3.6 ms | 64,000 | 3.0–3.1 ms |
+
+Before slow connections were gathered (below), `adaptive` managed 20,000–
+24,000 requests a second on `skew` at a p99 of 6.4–7.0 ms.
+
+On uniform load the three modes measure about the same, except that the
+shared listener takes 0.5 to 1.5 ms off the p99 of small requests and 2 ms
+off HTTP/2's. BENCHMARKS.md has the runs.
 
 #### The load page
 
@@ -188,6 +203,7 @@ worker it replaces. Each worker writes only its own line:
 - **connections**: how many it holds, written whenever that changes;
 - **accepting**: whether it is watching the shared listener right now;
 - **wait**: how long a request arriving now would wait (below);
+- **heavy**: how many of its connections are heavy (below);
 - **waiting since**: set while it waits. An idle loop does not turn, so it
   cannot refresh its reading; a reader discounts a waiting worker's busy
   reading to nothing over 20 ms instead.
@@ -255,9 +271,10 @@ its connections, at most 8, then waits 100 ms for the readings to catch up
 nothing buffered or waiting to be written, no file or body in flight, no
 handler parked, not WebSocket, HTTP/2 or half-closed, and either plaintext or
 TLS the kernel carries both ways (below). Cheapest first, by each
-connection's smoothed time from dispatch to answer. The costliest never goes:
-moving it would move the load rather than share it, while moving the cheap
-ones out from behind it is what shortens their wait.
+connection's smoothed time from dispatch to answer. Neither a heavy connection
+nor the costliest one goes: moving those would move the load rather than share
+it, while moving the cheap ones out from behind them is what shortens their
+wait.
 
 **How.** The supervisor makes one datagram unix socket pair per worker slot
 before the fork. The sending worker removes the socket from its poller, sends
@@ -274,6 +291,50 @@ millisecond while the others stay near 100 µs. After 100 ms each of the two
 sends 4 of its quick connections to the worker with the shortest wait, and
 again every 100 ms, until only the slow connections are left or the waits
 are within the margins.
+
+#### Gathering slow connections
+
+Moving quick connections needs a worker with a short wait to move them to.
+When slow connections arrive first, onto idle workers, placement spreads them
+evenly, and with as many slow connections as workers each worker gets one.
+Every quick request then waits behind a slow one wherever it goes, and there
+is nowhere better to move it. That is the case where Tokio's work stealing did
+better than moving connections: 20,000 quick requests a second against axum's
+49,000.
+
+So slow connections are gathered onto fewer workers, freeing the others for
+the quick ones (`BalancePolicy.gatherTarget`).
+
+- **Heavy.** Each connection keeps a smoothed reading of how long its requests
+  hold the loop, from dispatch until the loop gets back, each request weighing
+  an eighth (`holdUs`). Past 500 µs the connection is heavy. The second request
+  of 3 ms makes it so; one slow request among quick ones does not. A request
+  answered by an async handler holds the loop only until the handler starts,
+  so waiting on a database never makes a connection heavy. Each worker
+  publishes its count.
+- **When.** Quick requests are waiting (some worker holds connections that are
+  not heavy, with a wait of at least 100 µs), and no worker without heavy
+  connections has a wait under 100 µs. If one did, the ordinary moves above
+  would send the quick connections there.
+- **Who, and where to.** The worker holding the fewest heavy connections gives
+  -- the highest slot among equals -- to the one holding the most, the lowest
+  slot among equals. Every worker reading the same page picks the same pair,
+  and a heavy connection only ever moves toward a worker with more of them, so
+  it never comes back. It keeps the same 100 ms sustain and cooldown as other
+  moves.
+- **How far.** Slow requests always keep at least half the workers. Beyond
+  that they would pay more than the quick ones gain.
+- **Back again.** When a worker holds two or more gathered connections and two
+  workers without any sit idle (under 250 busy), it hands one back to the
+  idler of them, so slow requests get the CPU again once the quick load has
+  gone (`BalancePolicy.spreadTarget`).
+
+For example, 8 slow connections land one per worker, then 56 quick ones
+arrive. Worker 7 gives its slow connection to worker 0, and the ordinary moves
+send quick connections to worker 7. While worker 7 is flat out with them (its
+wait over 100 µs), worker 6 gives its slow one to worker 0 as well, and so on
+until the quick ones have enough room or four workers are free. The slow
+requests then share four workers instead of eight.
 
 **TLS.** An OpenSSL session lives in the memory of the process that did the
 handshake, so it cannot move with the descriptor. A TLS connection moves only
