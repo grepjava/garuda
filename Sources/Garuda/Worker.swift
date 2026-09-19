@@ -985,6 +985,17 @@ public struct Worker: ~Copyable {
 
     // MARK: - Writing
 
+    /// The most events one loop turn takes from the poller. The rest stay
+    /// ready for the next turn, which comes as soon as this one is done.
+    ///
+    /// A turn answers everything it took before it waits again, and a
+    /// request that arrives meanwhile waits for the whole turn. With 64
+    /// connections on one worker and no limit, a turn took all 64, and a
+    /// request that just missed one waited for most of two: the p99 was
+    /// twice the median. Capped at 32, the p99 of one worker's small requests
+    /// went from 1.0 ms to 0.65 at the same throughput (BENCHMARKS.md).
+    static let eventsPerTurn = 32
+
     /// How many finished responses wait for the end of an event batch before
     /// going out anyway. Holding a response costs its client the time the ones
     /// after it take to answer, so the batch is kept small.

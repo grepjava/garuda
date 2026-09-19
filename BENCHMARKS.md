@@ -571,3 +571,67 @@ Throughput on `me` went from 95,000–108,000 to level with axum or ahead. The
 p99 is where it was: Garuda's small requests have about twice axum's tail
 under closed-loop load on every route, which is a separate question from
 what any one handler costs.
+
+### Short turns and short time slices, 2026-09-19
+
+Garuda's p99 on small requests was about twice its median on every route,
+axum's about 1.1 times. Two causes, found one at a time.
+
+**Turns.** One pinned worker, 64 connections, `/user`, with the most events a
+loop turn takes from the poller varied (p50 / p99 in ms):
+
+| events per turn | req/s | p50 | p99 |
+|---|---:|---:|---:|
+| 256 (before) | 114,268–123,977 | 0.49–0.52 | 1.00–1.11 |
+| 64 | 120,243 | 0.50 | 1.03 |
+| 48 | 119,744 | 0.53 | 0.70 |
+| 32 | 119,953–121,574 | 0.51–0.53 | 0.63–0.67 |
+| 16 | 121,292 | 0.52 | 0.65 |
+| axum | 91,107–93,104 | 0.69–0.71 | 0.84–0.91 |
+
+On the same worker `/json` went from 1.94 to 1.18 ms and `/me` from 2.06 to
+1.23. How often responses are flushed made no difference. A turn now takes 32.
+
+**Time slices.** On 8 workers the cap changed nothing for `/json` and `/me`:
+their p99 stayed at 3 ms. Counted from `/proc/<pid>/schedstat` over a run of
+`/json`, the kernel took the CPU from Garuda's workers 3,213–3,587 times a
+second, against 697–808 for axum's threads, and they sat runnable but not
+running for 20–23 µs a request, against 10. The kernel's slice on this box is
+2.8 ms, and a worker that loses its CPU keeps every connection it owns waiting
+for it. With each worker asking for a shorter slice (8 workers, event cap on,
+p99 in ms):
+
+| | user | json | me |
+|---|---:|---:|---:|
+| kernel's slice (2.8 ms) | 0.92–1.08 | 3.06–3.09 | 3.04–3.07 |
+| 1 ms | 1.13–1.27 | 2.30–2.38 | 2.30–2.37 |
+| 300 µs | 1.07–1.20 | 1.97–2.02 | 1.89–2.04 |
+| 100 µs | 1.06–1.07 | 1.98–2.00 | 1.96–2.00 |
+| axum | 1.21–1.32 | 1.60–1.69 | 1.72–1.89 |
+| axum, 300 µs | 1.12–1.25 | 1.57–1.59 | 1.65–1.65 |
+
+Throughput did not move. Each worker now asks for 300 µs (`--sched-slice`).
+
+**Every workload after both**, 8 workers, two rounds in opposite order
+(p99 in ms):
+
+| workload | Garuda | axum |
+|---|---|---|
+| user | 138,012–164,897 (1.1–1.3) | 130,163–132,828 (1.3) |
+| json | 111,076–134,587 (1.7–2.1) | 113,000–113,189 (1.7–1.8) |
+| db | 42,984–45,506 (2.8–3.0) | 44,584–45,019 (2.5) |
+| stream | 35,743–35,948 (3.0–3.1) | 33,959–34,162 (3.5–3.6) |
+| me | 114,828–130,934 (1.8–2.0) | 113,659–113,883 (1.8–1.9) |
+| upload | 2,181–2,209 | 1,340–1,341 |
+| download | 2,065 | 2,079–2,085 |
+| relay | 11,463–11,545 (11.0–11.1) | 3,786–4,068 (44.1) |
+| churn | 37,848–38,298 (2.1) | 33,408–33,537 (3.4–3.5) |
+| h2 | 113,566–115,523 (1.0) | 104,809–105,209 (1.6) |
+| overload | 36,044–36,226 | 37,794–38,041 |
+| recovery | 145,439–146,873 (1.4) | 140,899–141,969 (1.3) |
+| skew | 63,430–73,623 (2.0–3.3) | 48,370–53,891 (3.4–3.7) |
+| spike | 85,714–118,768 (1.9–2.9) | 62,620–65,610 (3.0–3.2) |
+
+`spike` reads 89,000–112,000 over repeated runs with the slice on or off: where
+the slow connections land decides it.
+

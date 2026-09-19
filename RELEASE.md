@@ -33,7 +33,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1025 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1027 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -1169,9 +1169,19 @@ The Python suites need `h2` and `aioquic`.
   slower with the kernel encrypting. `--no-ktls` says so explicitly, and
   `ServerConfig.ktls` is a `KernelTLS` (`.off`, `.on`, `.auto`) rather than a
   `Bool`.
+- The p99 of small requests is level with axum's. It was twice the median
+  for two reasons, both measured. A loop turn took every ready event, up to
+  256, and answered all of them before looking again, so a request that just
+  missed a turn waited for most of two: a turn now takes at most 32. And a
+  worker owns its connections, so when the kernel gave its CPU to another
+  process every one of them waited out a whole scheduler slice, 2.8 ms on the
+  bench box: each worker now asks for 300 µs slices (`--sched-slice`, Linux
+  6.12 and later; `0` keeps the kernel's). On 8 workers, JSON's p99 went from
+  2.7–3.3 ms to 1.7–2.1 (axum 1.7), a JWT-checked request's from 3.8–4.1 to
+  1.8–2.0 (axum 1.8–1.9), and a path parameter's from 1.2–1.9 to 1.1–1.3
+  (axum 1.3), at the same throughput. Needs aviancore 0.6.5.
 - `garuda_connections_handed_off_total`, `garuda_connections_taken_over_total`
-  and `garuda_accepts_deferred_total` count what balancing did. Balancing
-  needs aviancore 0.6.4.
+  and `garuda_accepts_deferred_total` count what balancing did.
 - `JWT<Claims>` checks a token without awaiting whenever the keys are in
   hand, and a synchronous route may take it: `app.get("/me") { (jwt:
   JWT<UserClaims>) in ... }`. Checking a token no longer copies it into
@@ -1185,6 +1195,7 @@ The Python suites need `h2` and `aioquic`.
   `JWTVerifying` has a new requirement, `verifyNow`, with a default that
   always defers to `verify`. An `AsyncRequestExtractor` that can also answer
   synchronously says so with `extractsSynchronously`.
+- `benchmarks/workloads.sh` passes `GARUDA_FLAGS` on to Garuda.
 - `benchmarks/workloads.sh` runs Garuda under a balancing mode as
   `garuda:adaptive`, `garuda:accept` or `garuda:reuseport`, and has two new
   workloads: `skew`, quick requests on 56 connections while 8 more hold the

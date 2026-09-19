@@ -469,7 +469,7 @@ thread-local. `runSynchronousLoop` is:
 
 ```swift
 while running {
-    let n = poller.wait(timeoutMillis: quicPollTimeout(200))
+    let n = poller.wait(timeoutMillis: quicPollTimeout(200))   // at most 32 events
     if n > 0 { processEvents(n) }   // then flush the batch's HTTP/1 responses
     fireDueTimers()                 // TimerHeap -> ReadyQueue
     drainReadyQueue()               // at most 64 resumes
@@ -482,6 +482,27 @@ while running {
 
 The poll timeout is 200 ms, cut to the nearest QUIC or timer deadline (rounded
 up), and 0 while the ready queue holds work.
+
+**Short turns.** A turn takes at most 32 events (`Worker.eventsPerTurn`); the
+rest stay ready and are taken on the next turn, straight away. A turn answers
+everything it took before it waits again, so a request that arrives mid-turn
+waits for the rest of it. With 64 busy connections on one worker and no cap, a
+turn took all 64, and a request that just missed one waited for most of two:
+the p99 of small requests was twice their median. Capped at 32, it went from
+1.0 ms to 0.65 at the same throughput. Tokio does the same kind of thing: a
+worker thread checks for new I/O every 61 tasks.
+
+**Short time slices.** Each worker asks the kernel for a 300 µs scheduler
+slice (`--sched-slice`; EEVDF's custom slice, Linux 6.12 and later). A worker
+owns its connections, so when another thread takes its CPU, every one of them
+waits until the worker gets it back -- up to a whole slice, 2.8 ms by default
+on an 8-CPU machine. A Tokio thread that loses its CPU leaves its work to the
+other threads. With the load generator sharing the 8 CPUs, the kernel took the
+CPU from Garuda's workers 3,200 to 3,600 times a second, against 700 to 800
+for axum's threads, and the p99 of JSON and JWT requests sat at the default
+slice, about 3 ms. With 300 µs slices it came down to 1.7 to 2.1 ms, level with
+axum, at the same throughput. Where the machine is not oversubscribed the
+slice changes nothing: a worker that is not preempted never reaches its end.
 
 ### Connection slots and identity
 

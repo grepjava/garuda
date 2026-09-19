@@ -41,6 +41,7 @@ exits with status 2.
 | `--unix PATH` | none | listen on a unix socket instead of TCP |
 | `--workers N` | `1` | worker processes; `0` means one per CPU |
 | `--balance MODE` | `adaptive` | how workers share connections: `adaptive`, `accept` or `reuseport` |
+| `--sched-slice MICROS` | `300` | scheduler time slice each worker asks the kernel for, 100 to 100000; `0` keeps the kernel's |
 | `--backlog N` | `2048` | listen backlog |
 | `--root-path PATH` | none | prefix removed from the path before routes match |
 
@@ -73,6 +74,15 @@ why workers are processes rather than threads.
 ```bash
 garuda --workers 0 --balance reuseport   # the kernel's hash, as before
 ```
+
+**`--sched-slice`.** A worker owns its connections, so when another process
+takes its CPU, all of them wait until the worker gets it back: up to a whole
+scheduler slice, 2.8 ms by default on an 8-CPU machine. Each worker asks for
+300 µs slices instead, so it gets back sooner. It matters where the CPUs are
+shared -- with a sidecar, a database, or a load generator -- and changes
+nothing where they are not. It needs Linux 6.12 or later (EEVDF's custom
+slice); elsewhere, and with `0`, the kernel's own slice stands. A worker
+running under a real-time policy is left alone.
 
 **Unix sockets.** Every worker accepts on the one socket. A stale socket file
 at the path is removed at start-up, and the file is removed on exit. A unix

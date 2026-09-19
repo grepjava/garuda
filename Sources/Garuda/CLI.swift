@@ -64,6 +64,9 @@ public enum GarudaCLI {
                                        move quick ones off a worker where they
                                        would wait; default), accept (only the
                                        first), or reuseport (the kernel's hash)
+              --sched-slice MICROS     scheduler time slice each worker asks for,
+                                       100 to 100000, 0 = the kernel's (default
+                                       300; Linux 6.12 and later)
               --root-path PATH         mount prefix, taken off paths before routing
               --scheme http|https      scheme taken as the request's, behind a proxy
                                        that terminates TLS
@@ -535,6 +538,15 @@ public enum GarudaCLI {
                     config.balance = .reuseport
                 } else {
                     Log.error("--balance must be adaptive, accept or reuseport")
+                    failed = true
+                }
+            } else if matches(arg, "--sched-slice") {
+                guard let v = next("--sched-slice needs microseconds") else { break }
+                let micros = parseInt(v)
+                if micros == 0 || (100...100_000).contains(micros) {
+                    config.schedulerSliceMicroseconds = micros
+                } else {
+                    Log.error("--sched-slice must be 0, or 100 to 100000 microseconds")
                     failed = true
                 }
             } else if matches(arg, "--health-check-path") {

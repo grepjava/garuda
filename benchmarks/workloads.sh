@@ -42,6 +42,7 @@
 #   createdb bench      # once; the script makes and fills the table
 #   bash benchmarks/workloads.sh
 #   WORKLOADS="user db" DURATION=10s bash benchmarks/workloads.sh
+#   GARUDA_FLAGS="--sched-slice 0" bash benchmarks/workloads.sh   # more flags for Garuda
 #
 # Needs oha, python3, curl, psql, cargo for the first axum build, a PostgreSQL
 # that DATABASE_URL reaches, Linux's /proc, and ports 3000 and 3001.
@@ -131,7 +132,7 @@ start() {
         case "$1" in garuda:*) balance=(--balance "${1#garuda:}") ;; esac
         DATABASE_URL=$DATABASE_URL POOL_SIZE=$POOL_SIZE ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT/stream" \
             server_start "${PIN_SERVER[@]}" "$GARUDA_APP" \
-            --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${balance[@]}" ;;
+            --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${balance[@]}"             ${GARUDA_FLAGS:-} ;;
     axum)
         if [ ! -x "$AXUM_APP" ]; then
             (cd "$ROOT/benchmarks/workloads/axum" && "$CARGO" build --release) > "$OUT/cargo.log" 2>&1 \

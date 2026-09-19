@@ -27,6 +27,13 @@ public struct ServerConfig {
     /// How connections are shared among the workers (--balance). See
     /// `BalanceMode` and ARCHITECTURE.md.
     public var balance: BalanceMode = .adaptive
+    /// The scheduler time slice each worker asks the kernel for, in
+    /// microseconds (--sched-slice): 100 to 100,000, or 0 for the kernel's
+    /// own. A worker that loses its CPU keeps every connection it owns
+    /// waiting until it gets it back, for up to a whole slice -- 2.8 ms by
+    /// default on an 8-CPU machine. Linux 6.12 and later; elsewhere it
+    /// changes nothing.
+    public var schedulerSliceMicroseconds = 300
     /// `workers` with 0 resolved to the CPU count, which is what every part of
     /// start-up actually wants.
     public var resolvedWorkers: Int { workers > 0 ? workers : Int(av_cpu_count()) }

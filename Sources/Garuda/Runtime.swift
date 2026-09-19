@@ -1092,6 +1092,23 @@ enum GarudaRuntime {
 
     // MARK: - Worker
 
+    /// Asks the kernel to run this worker's thread in slices of `micros`
+    /// (--sched-slice). A worker owns its connections, so when another thread
+    /// takes its CPU every one of them waits until it is back -- for up to the
+    /// kernel's whole slice, 2.8 ms on an 8-CPU machine, where a thread pool
+    /// would carry on without it. A shorter slice brings it back sooner. Best
+    /// effort: where there is no custom slice, nothing changes.
+    static func requestSchedulerSlice(_ micros: Int) {
+        guard micros > 0 else { return }
+        if av_sched_set_slice(UInt64(micros) * 1_000) != 0 {
+            let error = av_errno()
+            Log.debug { line in
+                line.str("--sched-slice not applied: errno ")
+                line.int(Int(error))
+            }
+        }
+    }
+
     /// Builds one worker: poller, connection slab, TLS, QUIC listener.
     /// `listening: false` leaves the sockets unwatched, for a worker that has
     /// `app.prepare` to run first.
@@ -1101,10 +1118,11 @@ enum GarudaRuntime {
                            metricsSlot: Int = 0,
                            sharedListener: Bool = false,
                            listening: Bool = true) -> UnsafeMutablePointer<Worker>? {
-        guard let poller = Poller(maxEvents: 256) else {
+        guard let poller = Poller(maxEvents: Worker.eventsPerTurn) else {
             Log.error("cannot create the readiness poller")
             return nil
         }
+        requestSchedulerSlice(config.schedulerSliceMicroseconds)
 
         let workerPtr = UnsafeMutablePointer<Worker>.allocate(capacity: 1)
         workerPtr.initialize(to: Worker(config: config, listenFD: listenFD, poller: poller))
