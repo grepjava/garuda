@@ -1,5 +1,6 @@
 import Testing
 import CAvian
+import CAllocationCounter
 @testable import Garuda
 
 // An async handler runs on its worker's thread from its first line to its
@@ -55,6 +56,8 @@ struct HandlerThreadTests {
     @Test func anAsyncHandlerStaysOnItsWorkersThread() throws {
         let client = placesApp().test
         expectedWorker = UnsafeMutableRawPointer(client.worker)
+        garuda_test_watch_global_enqueues()
+        let global = garuda_test_global_enqueues_from_workers()
         let started = HandlerTaskPool.startedElsewhere
         let ran = HandlerTaskPool.ranElsewhere
         for path in ["/raw", "/typed", "/raw"] {
@@ -68,5 +71,16 @@ struct HandlerThreadTests {
         // handler's.
         #expect(HandlerTaskPool.startedElsewhere == started, "a new task started off its worker's thread")
         #expect(HandlerTaskPool.ranElsewhere == ran, "a request began off its worker's thread")
+        // Nor does any of it wait for a thread of the global pool.
+        #expect(garuda_test_global_enqueues_from_workers() == global,
+                "a job went to the global executor from the worker's thread")
+        // The watch sees what it is there to see: a detached task, made on the
+        // worker's thread, goes to the global executor.
+        let before = garuda_test_global_enqueues_from_workers()
+        let previous = av_worker_current()
+        av_worker_set_current(UnsafeMutableRawPointer(client.worker))
+        Task.detached {}
+        av_worker_set_current(previous)
+        #expect(garuda_test_global_enqueues_from_workers() == before + 1)
     }
 }
