@@ -184,6 +184,81 @@ struct CancellationTests {
         #expect(try client.get("/healthz").status == 200, "and back once it has caught up")
     }
 
+    /// Work the body started in child tasks is cancelled with it: Swift
+    /// passes cancellation down to children, and the body's task is a real
+    /// one of its own, not the pooled task, so there is somewhere for it to
+    /// start.
+    @Test func whatTheBodyStartedInChildTasksIsCancelledToo() throws {
+        cancelEvents = []
+        let outside = [OutsideWait(), OutsideWait()]
+        let app = Application()
+        app.onAsync(.get, "/fan-out") { _, response in
+            do {
+                try await response.cancellable {
+                    await withTaskGroup(of: Void.self) { group in
+                        for wait in outside {
+                            group.addTask {
+                                await withTaskCancellationHandler {
+                                    await wait.wait()
+                                } onCancel: {
+                                    wait.wasCancelled = true
+                                }
+                            }
+                        }
+                    }
+                }
+                cancelEvents.append("returned")
+            } catch let error as HandlerWaitError {
+                cancelEvents.append("\(error)")
+            }
+        }
+        app.get("/finish") { () -> String in
+            for wait in outside { wait.finish() }
+            return "ok"
+        }
+        let client = app.test
+        try client.abandon(Array("GET /fan-out HTTP/1.1\r\nHost: x\r\n\r\n".utf8), turns: 20)
+        for _ in 0..<40 where cancelEvents.isEmpty { client.turn() }
+        #expect(cancelEvents == ["cancelled"], "\(cancelEvents)")
+        #expect(outside.allSatisfy { $0.wasCancelled }, "every child is told, not only the body")
+        _ = try client.get("/finish")
+        for _ in 0..<20 where client.worker.pointee.abandonedWaits > 0 { client.turn() }
+        #expect(client.worker.pointee.abandonedWaits == 0, "and once they end, nothing is carried")
+    }
+
+    /// A worker shutting down ends every wait, the ones it does not own
+    /// included: a handler in one unwinds with `cancelled`, and its body is
+    /// told, rather than the shutdown leaving both parked for ever.
+    @Test func aWorkerShuttingDownEndsTheWait() throws {
+        cancelEvents = []
+        let outside = OutsideWait()
+        do {
+            let app = Application()
+            app.onAsync(.get, "/parked") { _, response in
+                do {
+                    try await response.cancellable {
+                        await withTaskCancellationHandler {
+                            await outside.wait()
+                        } onCancel: {
+                            outside.wasCancelled = true
+                        }
+                    }
+                    cancelEvents.append("returned")
+                } catch let error as HandlerWaitError {
+                    cancelEvents.append("\(error)")
+                }
+            }
+            let client = app.test
+            let wire = try TestWire(client)
+            wire.send("GET /parked HTTP/1.1\r\nHost: x\r\n\r\n")
+            for _ in 0..<40 { client.turn() }
+            #expect(cancelEvents.isEmpty, "still waiting while the worker runs")
+            // The client goes out of scope here, and its worker is destroyed.
+        }
+        #expect(cancelEvents == ["cancelled"], "\(cancelEvents)")
+        #expect(outside.wasCancelled)
+    }
+
     /// A typed handler takes the same thing as an extractor, since it has no
     /// response to ask.
     @Test func aTypedHandlerAsksForItAsAnExtractor() throws {
