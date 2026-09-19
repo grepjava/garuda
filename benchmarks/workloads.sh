@@ -13,7 +13,7 @@
 #   download  GET  /download     1 MiB answered from memory
 #   relay     GET  /relay        an origin's /stream fetched and streamed on as it arrives
 #   churn     GET  /user/12345   a new connection for every request
-#   h2        GET  /user/12345   over prior-knowledge HTTP/2
+#   h2        GET  /user/12345   over HTTP/2: prior knowledge in the clear, ALPN over TLS
 #   overload  GET  /db/517       at 16 times the connections, the pool far short of them;
 #             then /user/12345 at the usual 64, to see the server come back
 #   skew      GET  /user/12345   on 56 connections while 8 more ask for /spin, which
@@ -24,6 +24,10 @@
 #
 # SERVERS names what runs: garuda, axum, and garuda:MODE for Garuda under
 # --balance MODE (garuda:adaptive, garuda:accept, garuda:reuseport).
+#
+# TLS=1 runs both over HTTPS with the same self-signed P-256 certificate:
+# Garuda with OpenSSL, axum with rustls through axum-server. The relay's
+# origin stays in the clear.
 #
 # benchmarks/workloads/garuda-app is the Garuda side and
 # benchmarks/workloads/axum the axum side. Garuda runs WORKERS workers, one
@@ -76,8 +80,12 @@ if [ -n "$PIN" ]; then
     PIN_SERVER=(taskset -c "${PIN%%:*}")
     PIN_LOAD=(taskset -c "${PIN#*:}")
 fi
+TLS=${TLS:-0}
 PORT=3000
-BASE="http://127.0.0.1:$PORT"
+SCHEME=http
+H2_CURL=--http2-prior-knowledge
+[ "$TLS" = 1 ] && SCHEME=https && H2_CURL=--http2
+BASE="$SCHEME://127.0.0.1:$PORT"
 ORDER='{"id":42,"name":"garuda","tags":["fast","small","swift"]}'
 OUT=$(mktemp -d)
 began=$(date +%s)
@@ -125,6 +133,18 @@ PY
 )
 head -c 1048576 /dev/zero | tr '\0' 'u' > "$OUT/upload.bin"
 
+GARUDA_TLS=()
+AXUM_CERT=""
+AXUM_KEY=""
+if [ "$TLS" = 1 ]; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost \
+        -keyout "$OUT/key.pem" -out "$OUT/cert.pem" > /dev/null 2>&1 \
+        || { echo "workloads: cannot make a certificate with openssl"; exit 1; }
+    GARUDA_TLS=(--tls-cert "$OUT/cert.pem" --tls-key "$OUT/key.pem")
+    AXUM_CERT=$OUT/cert.pem
+    AXUM_KEY=$OUT/key.pem
+fi
+
 start() {
     case "$1" in
     garuda|garuda:*)
@@ -132,7 +152,8 @@ start() {
         case "$1" in garuda:*) balance=(--balance "${1#garuda:}") ;; esac
         DATABASE_URL=$DATABASE_URL POOL_SIZE=$POOL_SIZE ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT/stream" \
             server_start "${PIN_SERVER[@]}" "$GARUDA_APP" \
-            --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${balance[@]}"             ${GARUDA_FLAGS:-} ;;
+            --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${balance[@]}" \
+            "${GARUDA_TLS[@]}" ${GARUDA_FLAGS:-} ;;
     axum)
         if [ ! -x "$AXUM_APP" ]; then
             (cd "$ROOT/benchmarks/workloads/axum" && "$CARGO" build --release) > "$OUT/cargo.log" 2>&1 \
@@ -140,10 +161,11 @@ start() {
         fi
         DATABASE_URL=$DATABASE_URL POOL_SIZE=$((WORKERS * POOL_SIZE)) \
             ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT/stream" \
+            TLS_CERT=$AXUM_CERT TLS_KEY=$AXUM_KEY \
             server_start "${PIN_SERVER[@]}" "$AXUM_APP" ;;
     esac > "$OUT/$1.log" 2>&1
     for _ in $(seq 1 60); do
-        curl -s -o /dev/null --max-time 1 "$BASE/user/1" && return 0
+        curl -sk -o /dev/null --max-time 1 "$BASE/user/1" && return 0
         sleep 0.25
     done
     return 1
@@ -184,18 +206,18 @@ request() {
 check() {
     local body
     case "$1" in
-    user|churn) body=$(curl -s --max-time 2 "$BASE/user/12345"); [ "$body" = 12345 ] ;;
-    skew|spike) body=$(curl -s --max-time 2 "$BASE/spin/1000"); [ "$body" = 10097022301462541763 ] ;;
-    json) body=$(curl -s --max-time 2 -H 'content-type: application/json' -d "$ORDER" "$BASE/json")
+    user|churn) body=$(curl -sk --max-time 2 "$BASE/user/12345"); [ "$body" = 12345 ] ;;
+    skew|spike) body=$(curl -sk --max-time 2 "$BASE/spin/1000"); [ "$body" = 10097022301462541763 ] ;;
+    json) body=$(curl -sk --max-time 2 -H 'content-type: application/json' -d "$ORDER" "$BASE/json")
           [ "$body" = '{"id":42,"name":"garuda","tags":["fast","small","swift"],"count":3}' ] ;;
-    db|overload) body=$(curl -s --max-time 2 "$BASE/db/517"); [ "$body" = '{"id":517,"name":"item 517","price":619}' ] ;;
-    stream) body=$(curl -s --max-time 2 "$BASE/stream" | wc -c); [ "$body" -eq 65536 ] ;;
-    me) body=$(curl -s --max-time 2 -H "Authorization: Bearer $TOKEN" "$BASE/me"); [ "$body" = "user 42" ] ;;
-    upload) body=$(curl -s --max-time 5 -H 'content-type: application/octet-stream' \
+    db|overload) body=$(curl -sk --max-time 2 "$BASE/db/517"); [ "$body" = '{"id":517,"name":"item 517","price":619}' ] ;;
+    stream) body=$(curl -sk --max-time 2 "$BASE/stream" | wc -c); [ "$body" -eq 65536 ] ;;
+    me) body=$(curl -sk --max-time 2 -H "Authorization: Bearer $TOKEN" "$BASE/me"); [ "$body" = "user 42" ] ;;
+    upload) body=$(curl -sk --max-time 5 -H 'content-type: application/octet-stream' \
                    --data-binary "@$OUT/upload.bin" "$BASE/upload"); [ "$body" = 1048576 ] ;;
-    download) body=$(curl -s --max-time 5 "$BASE/download" | wc -c); [ "$body" -eq 1048576 ] ;;
-    relay) body=$(curl -s --max-time 5 "$BASE/relay" | wc -c); [ "$body" -eq 65536 ] ;;
-    h2) body=$(curl -s --max-time 2 --http2-prior-knowledge "$BASE/user/12345"); [ "$body" = 12345 ] ;;
+    download) body=$(curl -sk --max-time 5 "$BASE/download" | wc -c); [ "$body" -eq 1048576 ] ;;
+    relay) body=$(curl -sk --max-time 5 "$BASE/relay" | wc -c); [ "$body" -eq 65536 ] ;;
+    h2) body=$(curl -sk --max-time 2 "$H2_CURL" "$BASE/user/12345"); [ "$body" = 12345 ] ;;
     esac || { echo "$body" | head -c 200; echo; return 1; }
 }
 
@@ -231,7 +253,7 @@ measure() {
     mapfile -t args < <(request "$workload")
     rm -f "$json"
     before=$(cpu_ticks)
-    "${PIN_LOAD[@]}" "$OHA" -z "$duration" -c "$conns" --no-tui --output-format json \
+    "${PIN_LOAD[@]}" "$OHA" -z "$duration" -c "$conns" --no-tui --insecure --output-format json \
         -o "$json" "${args[@]}" > /dev/null 2>&1
     after=$(cpu_ticks)
     python3 - "$json" "$((after - before))" "$(getconf CLK_TCK)" "$(mem_kib)" <<'PY'

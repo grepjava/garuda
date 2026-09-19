@@ -187,6 +187,16 @@ async fn main() {
         .layer(DefaultBodyLimit::max(16 << 20))
         .with_state(state);
 
+    let cert = std::env::var("TLS_CERT").unwrap_or_default();
+    let key = std::env::var("TLS_KEY").unwrap_or_default();
+    if !cert.is_empty() && !key.is_empty() {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .expect("TLS_CERT and TLS_KEY");
+        let addr: std::net::SocketAddr = "0.0.0.0:3000".parse().unwrap();
+        axum_server::bind_rustls(addr, tls).serve(router.into_make_service()).await.unwrap();
+        return;
+    }
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, router).await.unwrap();
 }

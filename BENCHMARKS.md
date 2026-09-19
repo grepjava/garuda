@@ -635,3 +635,45 @@ Throughput did not move. Each worker now asks for 300 µs (`--sched-slice`).
 `spike` reads 89,000–112,000 over repeated runs with the slice on or off: where
 the slow connections land decides it.
 
+### Over HTTPS, 2026-09-19
+
+`TLS=1 bash benchmarks/workloads.sh`: Garuda with OpenSSL 3.5, axum with
+rustls 0.23 through axum-server, the same self-signed P-256 certificate, 8
+workers against Tokio's 8 threads, two rounds in opposite order (p99 in ms,
+server CPU per request in µs):
+
+| workload | Garuda | axum |
+|---|---|---|
+| user | 107,182–130,171 (1.6–1.7; 31–37) | 109,565–113,087 (1.4–1.5; 27–29) |
+| json | 82,893–98,484 (2.1–2.4; 48–56) | 96,433–96,563 (1.8–1.9; 37–38) |
+| db | 35,147–35,414 (3.5–3.6; 109) | 40,052–40,094 (2.8; 80) |
+| stream | 14,115–14,814 (7.3–7.7) | 8,847–13,544 (41.9–42.1) |
+| me | 87,403–100,398 (2.2–2.3; 47–54) | 101,344–107,291 (1.9–2.0; 33–36) |
+| upload | 2,134–2,135 | 1,340–1,345 |
+| download | 1,629–1,728 | 1,789–1,793 |
+| relay | 7,888–7,934 (13.7–14.6) | 3,196–3,366 (45.3–45.4) |
+| churn | 4,766–4,964 (26.0–28.2; 993–1,032) | 5,901–5,913 (16.7–16.8; 574–577) |
+| h2 | 82,145–83,354 (1.5–1.6; 46–47) | 89,350–89,504 (1.7–1.8; 36) |
+| overload | 28,029–28,529 | 32,553–32,584 |
+| recovery | 110,494–110,676 (1.6) | 116,243–117,678 (1.4) |
+| skew | 45,704–46,847 (4.5–4.7) | 51,009–51,364 (3.1–3.2) |
+| spike | 55,478–55,901 (4.2–4.3) | 63,119–63,614 (2.9–3.0) |
+
+In the clear Garuda leads or ties everywhere but `db`; over HTTPS axum leads
+on most small requests. What TLS adds to a request's CPU is the difference:
+11 to 17 µs for Garuda on `user`, `json` and `me`, 3 to 6 for axum, and on
+`churn`, a full handshake a request, 1,000 µs against 575.
+
+Found so far, one worker against one Tokio thread:
+
+- Each request cost two reads: OpenSSL read a record's 5-byte header and then
+  its body. With reads going ahead it is one, as for rustls (above; the
+  table is after that change, which moved the CPU per request by a microsecond
+  or two).
+- Keeping OpenSSL's buffers between requests rather than releasing them
+  (`SSL_MODE_RELEASE_BUFFERS`) is worth 2 to 5% and costs 34 KiB per idle
+  connection; not done.
+- A POST with a JSON body is where the gap is widest: 38,700 requests a
+  second on one worker against axum's 57,000 to 59,000, where in the clear it
+  is 63,600 against 70,500. Not found yet.
+

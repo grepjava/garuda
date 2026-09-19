@@ -1179,7 +1179,7 @@ The Python suites need `h2` and `aioquic`.
   6.12 and later; `0` keeps the kernel's). On 8 workers, JSON's p99 went from
   2.7–3.3 ms to 1.7–2.1 (axum 1.7), a JWT-checked request's from 3.8–4.1 to
   1.8–2.0 (axum 1.8–1.9), and a path parameter's from 1.2–1.9 to 1.1–1.3
-  (axum 1.3), at the same throughput. Needs aviancore 0.6.5.
+  (axum 1.3), at the same throughput.
 - `garuda_connections_handed_off_total`, `garuda_connections_taken_over_total`
   and `garuda_accepts_deferred_total` count what balancing did.
 - `JWT<Claims>` checks a token without awaiting whenever the keys are in
@@ -1195,7 +1195,14 @@ The Python suites need `h2` and `aioquic`.
   `JWTVerifying` has a new requirement, `verifyNow`, with a default that
   always defers to `verify`. An `AsyncRequestExtractor` that can also answer
   synchronously says so with `extractsSynchronously`.
-- `benchmarks/workloads.sh` passes `GARUDA_FLAGS` on to Garuda.
+- An HTTPS request costs one read rather than two: OpenSSL used to read each
+  TLS record's 5-byte header and then its body with separate system calls,
+  where it now reads what the socket has at once. Not under `--ktls`. Needs
+  aviancore 0.6.6.
+- `benchmarks/workloads.sh` passes `GARUDA_FLAGS` on to Garuda, and with
+  `TLS=1` runs every workload over HTTPS: Garuda with OpenSSL, axum with
+  rustls through axum-server, the same self-signed P-256 certificate for
+  both. `h2` then negotiates HTTP/2 by ALPN.
 - `benchmarks/workloads.sh` runs Garuda under a balancing mode as
   `garuda:adaptive`, `garuda:accept` or `garuda:reuseport`, and has two new
   workloads: `skew`, quick requests on 56 connections while 8 more hold the
