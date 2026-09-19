@@ -127,6 +127,12 @@ public struct Worker: ~Copyable {
     var tracer: (any Tracer)? = nil
     /// Each traced request's span, by slot, until it is answered.
     var requestSpans: [Int: RequestSpan] = [:]
+    /// The array a body being answered came from, while `respond` runs, so a
+    /// large one can be held rather than copied (`Connection.heldBody`).
+    var answeringFrom: [UInt8]? = nil
+    /// The smallest body worth holding: below it, a copy costs less than the
+    /// second iovec, and far less than the second write on TLS.
+    static let heldBodyMinimum = 64 * 1024
     static let readyDrainBudget = 64
     /// The tasks async handlers run on (HandlerTasks.swift), made on the first
     /// async request, and how many there may be.
@@ -451,6 +457,9 @@ public struct Worker: ~Copyable {
         c.pointee.fileFD = -1
         c.pointee.fileOffset = 0
         c.pointee.fileRemaining = 0
+        c.pointee.heldBody = nil
+        c.pointee.heldBodyOffset = 0
+        c.pointee.heldBodyEnd = 0
         c.pointee.interest = 0
         c.pointee.read = pool.take()
         c.pointee.write = ByteBuffer()
@@ -1043,12 +1052,10 @@ public struct Worker: ~Copyable {
         var moreFromFile = true
         while moreFromFile {
             moreFromFile = false
-            while c.pointee.write.readableBytes > 0 {
-                let n = connWrite(slot,
-                                  c.pointee.write.readPointer,
-                                  c.pointee.write.readableBytes)
+            while c.pointee.write.readableBytes > 0 || c.pointee.heldBodyEnd > 0 {
+                let n = writeOwed(slot)
                 if n > 0 {
-                    c.pointee.write.consume(n)
+                    consumeOwed(slot, n)
                     continue
                 }
                 let e = av_errno()
@@ -1460,10 +1467,54 @@ public struct Worker: ~Copyable {
 
     // MARK: - Teardown
 
+    /// Writes what the buffer owes and then the held body -- both in one
+    /// writev on a plain socket, the head and a large body together.
+    func writeOwed(_ slot: Int) -> Int {
+        let c = table[slot]
+        let buffered = c.pointee.write.readableBytes
+        guard c.pointee.heldBodyEnd > 0, let held = c.pointee.heldBody else {
+            return connWrite(slot, c.pointee.write.readPointer, buffered)
+        }
+        let offset = c.pointee.heldBodyOffset
+        let rest = c.pointee.heldBodyEnd - offset
+        return held.withUnsafeBufferPointer { all in
+            let tail = UnsafeRawPointer(all.baseAddress! + offset)
+            if buffered == 0 { return connWrite(slot, tail, rest) }
+            // TLS writes a record at a time anyway: the head, then the body.
+            if c.pointee.tls != nil { return connWrite(slot, c.pointee.write.readPointer, buffered) }
+            var parts = (iovec(iov_base: UnsafeMutableRawPointer(mutating: c.pointee.write.readPointer),
+                               iov_len: buffered),
+                         iovec(iov_base: UnsafeMutableRawPointer(mutating: tail), iov_len: rest))
+            return withUnsafePointer(to: &parts) {
+                $0.withMemoryRebound(to: iovec.self, capacity: 2) { av_writev(c.pointee.fd, $0, 2) }
+            }
+        }
+    }
+
+    /// Accounts for `n` bytes written: the buffer's first, then the held
+    /// body's, which is let go once it is all out.
+    mutating func consumeOwed(_ slot: Int, _ n: Int) {
+        let c = table[slot]
+        let fromBuffer = min(n, c.pointee.write.readableBytes)
+        if fromBuffer > 0 { c.pointee.write.consume(fromBuffer) }
+        guard n > fromBuffer else { return }
+        c.pointee.heldBodyOffset += n - fromBuffer
+        if c.pointee.heldBodyOffset >= c.pointee.heldBodyEnd { releaseHeldBody(slot) }
+    }
+
+    @inline(__always)
+    func releaseHeldBody(_ slot: Int) {
+        let c = table[slot]
+        c.pointee.heldBody = nil
+        c.pointee.heldBodyOffset = 0
+        c.pointee.heldBodyEnd = 0
+    }
+
     public mutating func closeConnection(_ slot: Int) {
         let c = table[slot]
         if c.pointee.state == .free { return }
         cancelOps(slot: slot)
+        if c.pointee.heldBodyEnd > 0 { releaseHeldBody(slot) }
         // A request cut off before its answer was done.
         if !requestSpans.isEmpty { endRequestSpan(slot) }
         // A streaming route's reader keeps what arrived before the end.

@@ -214,7 +214,7 @@ Latency at 256 connections, p50 / p99 in milliseconds:
 ## Requests that do work
 
 Hello-world measures the server. [benchmarks/workloads.sh](benchmarks/workloads.sh)
-measures four requests that do something, each answered with the same bytes by
+measures requests that do something, each answered with the same bytes by
 two applications written the way each framework documents:
 [workloads/garuda-app](benchmarks/workloads/garuda-app/Sources/workloads/main.swift)
 on Garuda's typed routes, and [workloads/axum](benchmarks/workloads/axum/src/main.rs)
@@ -226,6 +226,13 @@ on axum 0.8 with tokio-postgres and deadpool.
 | json | `POST /json`, 60 bytes | a JSON body decoded into a struct, another encoded |
 | db | `GET /db/517` | one row from PostgreSQL by primary key, as JSON; a pool of 32 connections either way |
 | stream | `GET /stream` | 64 KiB streamed as 16 chunks of 4 KiB, chunked |
+| me | `GET /me`, bearer token | an HS256 JWT verified and its subject answered: `JWT<Claims>` against jsonwebtoken |
+| upload | `POST /upload`, 1 MiB | a body read whole and its length answered |
+| download | `GET /download` | 1 MiB answered from memory |
+| relay | `GET /relay` | an origin's `/stream` fetched with the framework's HTTP client and streamed on as it arrives: `client.stream` against reqwest |
+| churn | `GET /user/12345` | a new connection for every request |
+| h2 | `GET /user/12345` | over prior-knowledge HTTP/2 |
+| overload | `GET /db/517` at 1,024 connections | a pool of 32 far short of them; then `user` at 64 connections straight after, as `recovery` |
 
 ```bash
 (cd benchmarks/workloads/garuda-app && swift build -c release)
@@ -234,11 +241,21 @@ DATABASE_URL='postgres://user:pass@127.0.0.1/db?sslmode=disable' bash benchmarks
 
 Each workload is checked before it is measured: a server that answers fast and
 wrong prints FAILED instead of a figure. Then closed-loop oha at 64
-connections, a 2 s warm-up and a 10 s run, Garuda with a worker per CPU
-against Tokio's default of a thread per CPU (`WORKERS` changes Garuda's), and
-32 connections to the database for either (`POOL_TOTAL`). The script makes and fills the table it reads.
-It takes under two minutes, and like vs-axum.sh it is a check between
-changes, not a figure to publish.
+connections, a 1 s warm-up and a 5 s run (`WARMUP`, `DURATION`), Garuda with
+a worker per CPU against Tokio's default of a thread per CPU (`WORKERS`
+changes Garuda's), and 32 connections to the database for either
+(`POOL_TOTAL`). The script makes and fills the table it reads. The relay's
+origin is the Garuda application on another port, the same for both, so what
+differs is the relaying.
+
+Each line says, beside requests a second and p50, p95 and p99: the server's
+CPU time per request, user and system together, which says what a figure
+cost; the server's memory after the run as proportional set size, which
+charges a page shared by several processes -- the Swift runtime, libssl --
+a share to each rather than whole to every one, so eight worker processes
+are not charged eight times for their libraries; and the requests that
+failed. It takes about three minutes; `WORKLOADS` picks some. Like
+vs-axum.sh it is a check between changes, not a figure to publish.
 
 ### First run, 2026-09-19
 
@@ -323,3 +340,43 @@ every backend another process competing for the same eight cores. What is
 left on Garuda's side is mostly the concurrency runtime: every
 `swift_task_switch` reads the task's preferred executor under a lock, a few
 percent of a database request.
+
+### Beyond the first four, 2026-09-19
+
+The first run of every workload, the same box, 5 s each. Memory here was
+still each process's resident set, summed, which charges each of Garuda's
+eight workers for the shared libraries again; the script now reports
+proportional set size.
+
+| workload | Garuda | p99 ms | CPU µs/req | axum | p99 ms | CPU µs/req |
+|---|---:|---:|---:|---:|---:|---:|
+| user | 173,106 | 1.035 | 19 | 129,628 | 1.370 | 24 |
+| json | 131,878 | 2.904 | 34 | 112,915 | 1.756 | 32 |
+| db | 47,186 | 3.285 | 77 | 44,840 | 2.477 | 72 |
+| stream | 37,665 | 3.350 | 87 | 34,431 | 3.462 | 73 |
+| me | 72,817 | 3.575 | 81 | 112,888 | 1.874 | 32 |
+| upload | 2,275 | 57.7 | 1,755 | 1,339 | 104.6 | 3,697 |
+| download | 1,326 | 105.7 | 3,855 | 2,080 | 56.3 | 1,913 |
+| relay | 12,180 | 11.0 | 368 | 4,090 | 43.9 | 546 |
+| churn | 38,886 | 2.180 | 60 | 34,126 | 3.377 | 88 |
+| h2 | 107,770 | 2.965 | 28 | 105,828 | 1.562 | 30 |
+| overload | 36,648 | 45.5 | 98 | 38,090 | 30.3 | 85 |
+| recovery | 149,649 | 2.775 | 22 | 142,285 | 1.256 | 21 |
+
+Two were well behind, and CPU per request says it was work, not waiting:
+
+- **download** spent twice axum's CPU on each megabyte. A profile put a
+  fifth of it in copying the body into the connection's write buffer and
+  as much again in the kernel zeroing fresh pages for that buffer, which
+  was allocated for each response and freed after it. A body of 64 KiB or
+  more answered from an array is now written from the array: the head and
+  the body go out in one writev, and the connection keeps the array until
+  it has gone. The same run afterwards: 2,074 against axum's 2,075, at
+  1,882 µs a request against 1,917.
+- **me**, a bearer token checked on every request, cost 81 µs against 32.
+
+Garuda's p99 is higher than axum's on the small requests, where its p50 is
+lower: requests are spread over eight processes by the kernel as they
+connect, and none can take another's work, where Tokio's threads steal it.
+Under overload each failed 26 requests of the 1,024 connections, and each
+served the next 64 connections at full rate straight after.

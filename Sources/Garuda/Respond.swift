@@ -507,7 +507,18 @@ extension Worker {
         }
         HTTPResponseWriter.writeConnection(&out.pointee, keepAlive: c.pointee.flags.contains(.keepAlive))
         HTTPResponseWriter.endHead(&out.pointee)
-        if sending > 0, let body { out.pointee.write(body, sending) }
+        if sending > 0, let body {
+            // A large body still in the handler's array -- not compressed
+            // into another buffer on the way -- is written from it.
+            if sending >= Worker.heldBodyMinimum, let array = answeringFrom,
+               array.withUnsafeBufferPointer({ $0.baseAddress == body }) {
+                c.pointee.heldBody = array
+                c.pointee.heldBodyOffset = 0
+                c.pointee.heldBodyEnd = sending
+            } else {
+                out.pointee.write(body, sending)
+            }
+        }
         if open {
             // Still the handler's: the head goes now, and the body as it is
             // written.

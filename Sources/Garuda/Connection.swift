@@ -148,6 +148,14 @@ public struct Connection {
     public var fileFD: Int32 = -1
     public var fileOffset: Int = 0
     public var fileRemaining: Int = 0
+    /// A large body a handler answered with as an array, written from that
+    /// array after the head rather than copied in behind it: bytes
+    /// `heldBodyOffset..<heldBodyEnd` of it are still to go. A copy of a
+    /// megabyte was most of what such a response cost, and the buffer it went
+    /// into was fresh pages from the kernel, zeroed, every time.
+    public var heldBody: [UInt8]? = nil
+    public var heldBodyOffset: Int = 0
+    public var heldBodyEnd: Int = 0
 
     public var generation: UInt32 = 0
     /// Identity of the current request on this connection. Bumped at

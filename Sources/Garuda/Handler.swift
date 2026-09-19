@@ -560,7 +560,15 @@ public struct Response: ~Copyable {
 
     public func send(status: HTTPStatus? = nil, _ body: [UInt8]) {
         let code = (status ?? self.status).code
+        guard body.count >= Worker.heldBodyMinimum else {
+            body.withUnsafeBufferPointer { answer(code, $0.baseAddress, $0.count) }
+            return
+        }
+        // Large enough to be written from the array itself, which the
+        // connection keeps until it has gone.
+        worker.pointee.answeringFrom = body
         body.withUnsafeBufferPointer { answer(code, $0.baseAddress, $0.count) }
+        worker.pointee.answeringFrom = nil
     }
 
     /// Calls `then` after `milliseconds`, with this request, unless the

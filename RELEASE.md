@@ -33,7 +33,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 995 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1001 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -1216,6 +1216,10 @@ The Python suites need `h2` and `aioquic`.
   it frees the others. The slot kept it instead, sized to the largest head it
   had ever held -- HTTP/2 and HTTP/3 streams and chunked uploads copy every
   head there -- for as long as the worker ran.
+- A body of 64 KiB or more answered from an array over HTTP/1.1 is written
+  from that array, in one writev with the head, instead of being copied into
+  the connection's write buffer, which for a large body was fresh pages from
+  the kernel every response. A 1 MiB download costs half the CPU it did.
 - A worker's connection tables release what their slots still reference when
   the worker is destroyed, rather than freeing the memory under it: handlers,
   contexts and protocol state were never released, once per worker at exit
