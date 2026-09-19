@@ -559,6 +559,15 @@ waiting, not computing. Run more workers than busy cores, and hand a call that
 blocks or computes for long to `try await blocking { … }`, which runs it on the
 worker's blocking pool while the worker serves other requests.
 
+#### On macOS 15, `Task.yield()` leaves the worker
+
+Swift 6.1's concurrency runtime, the one macOS 15 has, sends a task that calls
+`Task.yield()` to the global executor whatever executor it prefers. The
+handler still resumes on its worker, but only once a thread of the global
+pool is free to hand it back. Linux, and the runtime in newer macOS, keep it
+on the worker. A handler that wants to let others run is better served by an
+await on the engine, such as `response.sleep(milliseconds:)`.
+
 #### No Foundation
 
 Garuda brings its own JSON coder, `UUID` and `Timestamp`. If your code imports

@@ -45,7 +45,7 @@ struct LoggingTests {
         }
         app.onAsync(.get, "/later") { request, response in
             let log = request.log.with(["user": "ada"])
-            await Task.yield()
+            await loopYield()
             log.warning("after an await")
             response.send("ok")
         }

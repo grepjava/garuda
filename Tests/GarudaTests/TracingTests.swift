@@ -164,9 +164,9 @@ struct TracingTests {
             tracer.withSpan("render") { _ in response.send("ok") }
         }
         app.onAsync(.get, "/async") { _, response in
-            await Task.yield()
+            await loopYield()
             try await response.sleep(milliseconds: 1)
-            await tracer.withSpan("load") { _ in await Task.yield() }
+            await tracer.withSpan("load") { _ in await loopYield() }
             response.send("ok")
         }
         let client = app.test
@@ -186,7 +186,7 @@ struct TracingTests {
         let tracer = InMemoryTracer()
         let app = tracedApp(tracer)
         app.onAsync(.get, "/who") { _, response in
-            await Task.yield()
+            await loopYield()
             response.send(ServiceContext.current?.inMemorySpanContext?.spanID ?? "none")
         }
         let client = app.test

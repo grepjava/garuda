@@ -20,7 +20,7 @@ private func buildOnMainActor() {
     app.get("/typed") { () async throws -> String in "typed" }
     app.onAsync(.get, "/raw") { _, response in response.send("raw") }
     app.use { _, response in
-        await Task.yield()
+        await loopYield()
         response.addHeader("x-middleware", "ran")
         return nil
     }

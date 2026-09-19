@@ -26,7 +26,7 @@ struct ResponseObserverTests {
             app.get("/forbidden") { _, _ in throw HTTPError.forbidden("no") }
             app.get("/silent") { _, _ in }
             app.onAsync(.get, "/later") { _, _ in
-                await Task.yield()
+                await loopYield()
                 throw Boom()
             }
         }

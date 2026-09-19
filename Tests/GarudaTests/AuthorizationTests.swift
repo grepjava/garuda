@@ -94,7 +94,7 @@ struct AuthorizationTests {
         let app = Application()
         app.authenticate(bearer: CurrentPerson.self) { people[$0] }
         app.authorize(CurrentPerson.self, needs: "a member") { person async throws -> Bool in
-            await Task.yield()
+            await loopYield()
             return person.name != "mary"
         }
         app.get("/project") { "project" }

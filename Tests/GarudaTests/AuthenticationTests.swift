@@ -35,7 +35,7 @@ struct AuthenticationTests {
     @Test func anAsyncVerifierAndOneThatThrows() throws {
         let app = Application()
         app.authenticate(bearer: CurrentUser.self) { token async throws -> String? in
-            await Task.yield()
+            await loopYield()
             if token == "banned" { throw HTTPError.forbidden("banned") }
             return tokens[token]
         }

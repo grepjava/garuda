@@ -129,3 +129,13 @@ final class TestWire {
         return nil
     }
 }
+
+/// An await a handler in a test can make that stays on its worker's loop on
+/// every runtime: a millisecond on the worker's timers. `Task.yield()` will not
+/// do. On Swift 6.1's runtime, the one macOS 15 has, it sends the task to the
+/// global executor whatever executor the task prefers, and there it waits for
+/// a thread of the global pool -- which a test run in parallel may not have
+/// free for seconds.
+func loopYield() async {
+    _ = await Worker.waitTimed(currentWorker!, milliseconds: 1) { _ in }
+}

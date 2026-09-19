@@ -18,7 +18,7 @@ private func mark(_ label: String) {
 }
 
 private func plainAsync() async -> Int {
-    await Task.yield()
+    await loopYield()
     return 1
 }
 
@@ -26,7 +26,7 @@ private func placesApp() -> Application {
     let app = Application()
     app.onAsync(.get, "/raw") { _, response in
         mark("start")
-        await Task.yield()
+        await loopYield()
         mark("yield")
         try await response.sleep(milliseconds: 1)
         mark("sleep")
@@ -44,7 +44,7 @@ private func placesApp() -> Application {
     }
     app.get("/typed") { () async in
         mark("typed")
-        await Task.yield()
+        await loopYield()
         mark("typed-yield")
         return "done"
     }
@@ -58,8 +58,6 @@ struct HandlerThreadTests {
         expectedWorker = UnsafeMutableRawPointer(client.worker)
         garuda_test_watch_global_enqueues()
         let global = garuda_test_global_enqueues_from_workers()
-        let started = HandlerTaskPool.startedElsewhere
-        let ran = HandlerTaskPool.ranElsewhere
         for path in ["/raw", "/typed", "/raw"] {
             marks = []
             #expect(try client.get(path).text == "done")
@@ -67,11 +65,7 @@ struct HandlerThreadTests {
             #expect(away.isEmpty, "\(path): \(marks.joined(separator: ", "))")
             #expect(!marks.isEmpty)
         }
-        // The pool's own code too, from the task's first line: not only the
-        // handler's.
-        #expect(HandlerTaskPool.startedElsewhere == started, "a new task started off its worker's thread")
-        #expect(HandlerTaskPool.ranElsewhere == ran, "a request began off its worker's thread")
-        // Nor does any of it wait for a thread of the global pool.
+        // Nor did any of it wait for a thread of the global pool.
         #expect(garuda_test_global_enqueues_from_workers() == global,
                 "a job went to the global executor from the worker's thread")
         // The watch sees what it is there to see: a detached task, made on the

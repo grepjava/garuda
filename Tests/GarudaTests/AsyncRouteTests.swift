@@ -34,39 +34,39 @@ private func asyncRouteApp() -> Application {
 
     // Takes nothing, awaits, returns a string.
     app.get("/hello") { () async throws -> String in
-        await Task.yield()
+        await loopYield()
         return "hello"
     }
     // One path parameter across a wait.
     app.get("/person/:id") { (id: Path<Int>) async throws -> JSON<Person> in
-        await Task.yield()
+        await loopYield()
         return JSON(Person(id: id.value, name: "Ada"))
     }
     // Several extractors, in the order declared, plus state.
     app.get("/pick/:id") { (id: Path<Int>, query: Query<Search>,
                             directory: State<Directory>) async throws -> JSON<Chosen> in
-        await Task.yield()
+        await loopYield()
         let who = directory.value.name(id.value) ?? query.value.q
         return JSON(Chosen(who: who))
     }
     // A body decoded before the handler body runs.
     app.post("/people") { (body: Body<NewPerson>) async throws -> JSON<NewPerson> in
-        await Task.yield()
+        await loopYield()
         return JSON(body.value, status: .created)
     }
     // nil is the ordinary 404, from a task like anywhere else.
     app.get("/maybe/:id") { (id: Path<Int>) async throws -> JSON<Person>? in
-        await Task.yield()
+        await loopYield()
         return id.value == 1 ? JSON(Person(id: 1, name: "Ada")) : nil
     }
     // A conforming error thrown after a wait is still the answer, not a 500.
     app.get("/conflict") { () async throws -> String in
-        await Task.yield()
+        await loopYield()
         throw HTTPError(.conflict, "the name is taken")
     }
     // An error that conforms to nothing is a 500.
     app.get("/boom") { () async throws -> String in
-        await Task.yield()
+        await loopYield()
         throw Boom()
     }
     // The synchronous overload, spelled the same way, for the comparison.
