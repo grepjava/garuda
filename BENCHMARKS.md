@@ -542,3 +542,32 @@ server ran first in.
   on json, me and recovery: small requests under closed-loop load, where
   Tokio's threads take one another's work request by request.
 
+
+### Checking a JWT without awaiting, 2026-09-19
+
+`/me` checked its HS256 token in an async route, so every request started a
+task, and the check copied the token into arrays and decoded the claims
+twice. One pinned worker against one pinned Tokio thread, 64 connections,
+requests a second:
+
+| | before | after |
+|---|---:|---:|
+| `/me`, synchronous route | -- | 62,331–62,844 |
+| `/me`, async route | 41,278–41,445 | 49,164–49,434 |
+| axum | 64,132–67,320 | |
+
+The same token checked by hand in a raw handler reads 71,500: what is left
+between that and the extractor is finding the verifier and the bearer
+token's string, about 2 µs a request.
+
+All 8 workers, two rounds in opposite order (p99 in ms):
+
+| | Garuda | axum |
+|---|---|---|
+| me | 114,579–137,706 (2.9–3.1) | 113,983–124,915 (1.7–1.9) |
+| json | 111,739–127,774 (3.0–3.2) | 114,198–114,265 (1.7) |
+
+Throughput on `me` went from 95,000–108,000 to level with axum or ahead. The
+p99 is where it was: Garuda's small requests have about twice axum's tail
+under closed-loop load on every route, which is a separate question from
+what any one handler costs.
