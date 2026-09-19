@@ -201,7 +201,10 @@ struct AsyncOpsTests {
                 worker.fireDueTimers()
             }
             let elapsed = clock.now - start
-            #expect(elapsed >= .milliseconds(4))
+            // Less a microsecond: the timers keep whole microseconds and this
+            // clock nanoseconds, so a start truncated by the timers' clock
+            // can read up to one short here -- 3.9997 ms once on macOS.
+            #expect(elapsed >= .milliseconds(4) - .microseconds(1))
             worker.clearContinuation(slot)
         }
     }
