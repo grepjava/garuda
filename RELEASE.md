@@ -1160,6 +1160,14 @@ The Python suites need `h2` and `aioquic`.
   A reset side now counts as finished once the reset is sent.
 - An HTTPS/1.1 client request to a TLS 1.3 server could fail as `closed` when
   the server's session ticket arrived before its response.
+- A closed connection frees the buffer its request head was copied into, as
+  it frees the others. The slot kept it instead, sized to the largest head it
+  had ever held -- HTTP/2 and HTTP/3 streams and chunked uploads copy every
+  head there -- for as long as the worker ran.
+- A worker's connection tables release what their slots still reference when
+  the worker is destroyed, rather than freeing the memory under it: handlers,
+  contexts and protocol state were never released, once per worker at exit
+  and once per test that makes one.
 
 ### Not yet
 

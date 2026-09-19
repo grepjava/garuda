@@ -498,6 +498,9 @@ public struct ConnectionTable {
     }
 
     public func destroy() {
+        // Every slot was initialized, and holds references -- handlers,
+        // contexts, protocol state -- that are released only this way.
+        slots.deinitialize(count: capacity)
         slots.deallocate()
     }
 }

@@ -176,6 +176,9 @@ struct OutboundTable {
     }
 
     func destroy() {
+        // Every record was initialized, and what they reference is released
+        // only this way.
+        slots.deinitialize(count: capacity)
         slots.deallocate()
     }
 }

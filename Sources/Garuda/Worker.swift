@@ -1556,6 +1556,9 @@ public struct Worker: ~Copyable {
         c.pointee.traceContext.destroy()
         c.pointee.capture.abandon()
         c.pointee.cacheKey.destroy()
+        // Kept, the slot would hold the largest head it ever copied -- up to
+        // the head limit -- for as long as the worker runs.
+        c.pointee.headStore.destroy()
         table.release(slot)
 
         if acceptSuspended && !draining {
