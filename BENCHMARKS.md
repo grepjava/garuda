@@ -387,6 +387,12 @@ Two were well behind, and CPU per request says it was work, not waiting:
   an async route runs on, and generic metadata looked up for the claims
   type, none of it more than a few percent.
 
+Memory, read as proportional set size, was 60 MiB for Garuda's eight
+workers against 6 to 22 for axum. Each worker had readied all 4,096
+connection slots its table holds when it started, over a kilobyte apiece;
+a slot is now readied the first time one is needed, and the same workloads
+run in 16 to 20 MiB.
+
 Garuda's p99 is higher than axum's on the small requests, where its p50 is
 lower: requests are spread over eight processes by the kernel as they
 connect, and none can take another's work, where Tokio's threads steal it.

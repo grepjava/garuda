@@ -246,7 +246,7 @@ public struct Worker: ~Copyable {
             // Cancelled first, so that a task waiting on the engine unwinds
             // and can be ended.
             var slot = 0
-            while slot < table.capacity {
+            while slot < table.initialized {
                 let c = table[slot]
                 if c.pointee.state != .free && c.pointee.contKind == .task {
                     cancelOps(slot: slot)
@@ -1657,7 +1657,7 @@ public struct Worker: ~Copyable {
                     line.str(" connections still in flight; closing them")
                 }
                 var s = 0
-                while s < table.capacity {
+                while s < table.initialized {
                     if table[s].pointee.state != .free { closeConnection(s) }
                     s += 1
                 }
@@ -1668,7 +1668,7 @@ public struct Worker: ~Copyable {
         }
 
         var slot = 0
-        while slot < table.capacity {
+        while slot < table.initialized {
             let c = table[slot]
             defer { slot += 1 }
             guard c.pointee.state != .free else { continue }
@@ -1790,7 +1790,7 @@ public struct Worker: ~Copyable {
         // waiting for the answer, so closing one is a dropped request, not a
         // tidied-up socket. They stay, and the drain deadline bounds them.
         var slot = 0
-        while slot < table.capacity {
+        while slot < table.initialized {
             let c = table[slot]
             if c.pointee.state == .websocket {
                 sendCloseFrame(slot, code: WSCloseCode.goingAway,

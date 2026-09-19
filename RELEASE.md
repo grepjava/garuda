@@ -33,7 +33,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1005 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1008 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -1216,6 +1216,9 @@ The Python suites need `h2` and `aioquic`.
   it frees the others. The slot kept it instead, sized to the largest head it
   had ever held -- HTTP/2 and HTTP/3 streams and chunked uploads copy every
   head there -- for as long as the worker ran.
+- A worker readies a connection slot when it first needs one, not all of
+  `--max-connections` at start: an idle worker held 6.7 MiB and holds 1.4,
+  and eight workers under load use 16 to 20 MiB in all rather than 60.
 - Checking a bearer JWT costs about half what it did: the token is read from
   its bytes rather than split and decoded as strings, a key set keeps the
   headers it has decoded, and an HMAC key is set up once rather than for

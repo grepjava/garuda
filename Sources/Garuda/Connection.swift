@@ -461,24 +461,26 @@ public enum PollToken {
 }
 
 /// Fixed-capacity slab of connections with an embedded free list.
+///
+/// The slab is reserved whole and made ready a slot at a time, as the worker
+/// first needs each one: a slot is over a kilobyte, and a worker readied for
+/// 4,096 connections held more than 5 MiB of them from the start whether it
+/// ever had a dozen or not. Slots past `initialized` have never been touched,
+/// so the kernel has never given them memory.
 public struct ConnectionTable {
     @usableFromInline var slots: UnsafeMutablePointer<Connection>
     public let capacity: Int
-    @usableFromInline var firstFree: Int32
+    /// Slots given back, most recent first: -1 for none.
+    @usableFromInline var firstFree: Int32 = -1
+    /// How many slots, from the first, have ever been made ready. Anything
+    /// that walks the table walks these; the rest have never held anything.
+    public private(set) var initialized: Int = 0
     public private(set) var liveCount: Int = 0
 
     public init(capacity: Int) {
         precondition(capacity > 0 && capacity < (1 << 24), "connection table out of range")
         self.capacity = capacity
         slots = UnsafeMutablePointer<Connection>.allocate(capacity: capacity)
-        slots.initialize(repeating: Connection(), count: capacity)
-        // Thread the free list: slot i points at i+1, last points at -1.
-        var i = 0
-        while i < capacity {
-            slots[i].nextFree = Int32(i + 1 < capacity ? i + 1 : -1)
-            i += 1
-        }
-        firstFree = 0
     }
 
     @inlinable
@@ -489,9 +491,15 @@ public struct ConnectionTable {
     /// Claims a slot, or -1 when the table is full (which the caller turns into
     /// a 503 rather than an unbounded queue).
     public mutating func allocate() -> Int {
-        let slot = Int(firstFree)
-        if slot < 0 { return -1 }
-        firstFree = slots[slot].nextFree
+        var slot = Int(firstFree)
+        if slot >= 0 {
+            firstFree = slots[slot].nextFree
+        } else {
+            guard initialized < capacity else { return -1 }
+            slot = initialized
+            (slots + slot).initialize(to: Connection())
+            initialized += 1
+        }
         slots[slot].nextFree = -1
         slots[slot].generation &+= 1
         liveCount += 1
@@ -506,9 +514,9 @@ public struct ConnectionTable {
     }
 
     public func destroy() {
-        // Every slot was initialized, and holds references -- handlers,
-        // contexts, protocol state -- that are released only this way.
-        slots.deinitialize(count: capacity)
+        // Every slot made ready holds references -- handlers, contexts,
+        // protocol state -- that are released only this way.
+        slots.deinitialize(count: initialized)
         slots.deallocate()
     }
 }
