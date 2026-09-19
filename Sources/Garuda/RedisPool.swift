@@ -338,7 +338,11 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
     /// an `.error` among the replies, and the others still ran, as Redis does.
     public func transaction(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
         let replies = try await withConnection { connection throws(RedisClientError) in
-            try await connection.send([RedisCommand("MULTI")] + commands + [RedisCommand("EXEC")])
+            do throws(RedisClientError) {
+                return try await connection.send([RedisCommand("MULTI")] + commands + [RedisCommand("EXEC")])
+            } catch {
+                throw error.withoutReplies
+            }
         }
         // Nothing was watched, so EXEC always runs.
         guard let results = try transactionReplies(replies, commands: commands.count) else {
@@ -519,7 +523,12 @@ public struct RedisSession: RedisCommandSender, @unchecked Sendable {
     /// MULTI, the commands and EXEC in one round trip. Nil when a watched key
     /// changed and none of them ran.
     public func transaction(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue]? {
-        let replies = try await connection.send([RedisCommand("MULTI")] + commands + [RedisCommand("EXEC")])
+        let replies: [RedisValue]
+        do throws(RedisClientError) {
+            replies = try await connection.send([RedisCommand("MULTI")] + commands + [RedisCommand("EXEC")])
+        } catch {
+            throw error.withoutReplies
+        }
         return try transactionReplies(replies, commands: commands.count)
     }
 }

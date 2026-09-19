@@ -272,6 +272,33 @@ does not recognise counts as a write, which is the safe way to be wrong.
 `RedisPool` retries nothing at all, so it has no `replay` -- but it does throw
 `unknownOutcome` for a failure after the bytes went out, and so does a session.
 
+A batch can also fail part-way: a connection that answers the first commands
+of a pipeline and then goes, a cluster pipeline whose second slot's node is
+down after the first slot's has answered, a failover between one attempt and
+the next. That throws `RedisClientError.incomplete(replies:_:)`. `replies` has
+the answer to each command that was answered, at its place in the batch, and
+nil for each that was not; the error inside is why the rest failed. Anything
+answered ran or was refused, so the batch as a whole may not go again, and
+`mayHaveRun` says so even when the error inside is one that never reached the
+server:
+
+```swift
+do {
+    replies = try await redis.pipeline(commands)
+} catch let error as RedisClientError {
+    if case .incomplete(let answered, let rest) = error {
+        // answered[i] is nil for the commands still in question; `rest`
+        // is unknownOutcome if they may have run.
+    }
+}
+```
+
+A transaction is never part-answered: `MULTI`'s OK and a `QUEUED` are not
+answers anyone asked for, and a transaction ran whole or not at all, so its
+failure is the plain error or `unknownOutcome`. A cluster pipeline visits its
+slots in the order their first command comes, so which slots were tried is
+predictable.
+
 ### Not supported
 
 - Reads from replicas. Every command goes to the master, or in a cluster to

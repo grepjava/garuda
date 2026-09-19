@@ -103,13 +103,19 @@ public final class RedisSentinelPool: RedisCommandSender, @unchecked Sendable {
     /// the refused ones go to the new master. A refusal is proof that the
     /// command did not run, and an answer is proof that it did -- sending the
     /// whole batch again would repeat everything that already happened.
+    ///
+    /// When a later attempt fails, what earlier ones answered is not lost:
+    /// the error is `incomplete`, with those replies.
     public func pipeline(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
         guard !commands.isEmpty else { return [] }
-        var replies = [RedisValue](repeating: .null, count: commands.count)
+        var replies = [RedisValue?](repeating: nil, count: commands.count)
         var outstanding = Array(commands.indices)
         var attempt = 0
         while true {
             attempt += 1
+            // Going again, so not answered yet: a refusal kept here would
+            // read as the answer if this attempt failed.
+            for index in outstanding { replies[index] = nil }
             let batch = outstanding.map { commands[$0] }
             do throws(RedisClientError) {
                 let pool = try await master()
@@ -120,11 +126,32 @@ public final class RedisSentinelPool: RedisCommandSender, @unchecked Sendable {
                     replies[index] = answers[n]
                     if isFailover(answers[n]) { again.append(index) }
                 }
-                guard !again.isEmpty, attempt < maxAttempts else { return replies }
+                guard !again.isEmpty, attempt < maxAttempts else { return replies.map { $0 ?? .null } }
                 outstanding = again
             } catch {
-                guard attempt < maxAttempts, isFailover(error),
-                      replay.allows(error, batch) else { throw error }
+                // What this master answered before it failed stands; only
+                // what it did not answer is in question, and what it refused
+                // goes again whatever `replay` says.
+                var failure = error
+                var refused: [Int] = []
+                var unanswered = outstanding
+                if case .incomplete(let got, let inner) = error, got.count == outstanding.count {
+                    unanswered = []
+                    for (n, index) in outstanding.enumerated() {
+                        guard let reply = got[n] else {
+                            unanswered.append(index)
+                            continue
+                        }
+                        replies[index] = reply
+                        if isFailover(reply) { refused.append(index) }
+                    }
+                    failure = inner
+                }
+                guard attempt < maxAttempts, isFailover(failure),
+                      replay.allows(failure, unanswered.map { commands[$0] }) else {
+                    throw .settled(replies, failure)
+                }
+                outstanding = (refused + unanswered).sorted()
             }
             // Either the master has gone or it is not the master any more.
             // Both are answered by asking the sentinels.

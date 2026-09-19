@@ -622,6 +622,20 @@ The Python suites need `h2` and `aioquic`.
   write costs nothing, and `.nothing`. `RedisReads.only(_:)` is the table
   behind `.reads`, and treats anything it does not recognise as a write.
   Before this, a lost reply to `INCR` or `EXEC` was a retry.
+- A Redis batch that fails part-way says which part:
+  `RedisClientError.incomplete(replies:_:)` carries the answer to each command
+  that was answered and nil for each that was not, with why the rest failed
+  inside, and `mayHaveRun` is true whenever anything answered ran. Three paths
+  lost this. A connection that answered the first commands of a pipeline and
+  then went threw only `unknownOutcome`, with the answers it had read thrown
+  away. A cluster pipeline over several slots, whose later slot's node could
+  not be reached, threw a plain `connect` -- which says nothing ran -- after
+  the earlier slots' writes had run, so a caller retrying on it repeated them;
+  its slots also went in no set order, and now go in the order their first
+  command comes. A sentinel pool whose master failed over in the middle of a
+  batch lost what the old master had answered if the new one then failed. A
+  transaction is never part-answered: it stays the plain error or
+  `unknownOutcome`.
 - A cluster follows a redirect per command rather than per batch. A slot in
   the middle of migrating answers the keys it still has and redirects the keys
   it does not, so a pipeline comes back part answered and part redirected:

@@ -91,21 +91,58 @@ public enum RedisClientError: Error, Equatable {
     /// reply to `EXEC` does not mean the transaction was rolled back. So
     /// this is where a retry stops and the caller decides.
     indirect case unknownOutcome(RedisClientError)
+    /// A batch failed part-way. `replies` holds the answer to each command
+    /// that was answered, at its place in the batch, and nil for each that
+    /// was not; the error is why the rest failed, `unknownOutcome` when they
+    /// may have run. What was answered was settled -- run, or refused -- so
+    /// sending the whole batch again would repeat it: send the rest, if
+    /// anything.
+    indirect case incomplete(replies: [RedisValue?], RedisClientError)
 }
 
 extension RedisClientError {
     /// What went wrong, with `unknownOutcome` taken off: the connection
     /// closed, or timed out, or whatever it was.
     public var cause: RedisClientError {
-        if case .unknownOutcome(let inner) = self { return inner.cause }
+        switch self {
+        case .unknownOutcome(let inner): return inner.cause
+        case .incomplete(_, let inner): return inner.cause
+        default: return self
+        }
+    }
+
+    /// Whether the command -- or any command of the batch -- may already have
+    /// run. Nothing else is known about it: it is not that it did, and not
+    /// that it did not. A batch part-answered may have run if anything in it
+    /// was answered with other than a refusal.
+    public var mayHaveRun: Bool {
+        switch self {
+        case .unknownOutcome:
+            return true
+        case .incomplete(let replies, let inner):
+            if inner.mayHaveRun { return true }
+            return replies.contains { reply in
+                guard let reply else { return false }
+                if case .error = reply { return false }
+                return true
+            }
+        default:
+            return false
+        }
+    }
+
+    /// The failure without the part-answers, for a transaction: MULTI's OK
+    /// and a QUEUED are not answers anyone asked for, and a transaction ran
+    /// whole or not at all.
+    var withoutReplies: RedisClientError {
+        if case .incomplete(_, let inner) = self { return inner }
         return self
     }
 
-    /// Whether the command may already have run. Nothing else is known about
-    /// it: it is not that it did, and not that it did not.
-    public var mayHaveRun: Bool {
-        if case .unknownOutcome = self { return true }
-        return false
+    /// `error`, carrying `replies` if any of them were answered.
+    static func settled(_ replies: [RedisValue?], _ error: RedisClientError) -> RedisClientError {
+        guard replies.contains(where: { $0 != nil }) else { return error }
+        return .incomplete(replies: replies, error)
     }
 
     /// The same failure, marked as having happened after the bytes went out
@@ -269,9 +306,9 @@ final class RedisConnection {
         let bytes = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
         out.destroy()
         var sent = 0
+        var replies: [RedisValue] = []
         do {
             try await RedisConnection.writeAll(socket, bytes, ms, sent: &sent)
-            var replies: [RedisValue] = []
             replies.reserveCapacity(commands.count)
             while replies.count < commands.count {
                 let reply = try await next(ms)
@@ -285,7 +322,14 @@ final class RedisConnection {
         } catch {
             // A command half answered leaves a stream nobody can pick up.
             close()
-            throw sent > 0 ? error.afterSending() : error
+            let failure = sent > 0 ? error.afterSending() : error
+            // What was read before it failed was answered, and is the
+            // caller's: those commands ran or were refused, and saying only
+            // "unknown" would have them sent again.
+            guard !replies.isEmpty else { throw failure }
+            let answered = replies.map { Optional($0) }
+            throw .incomplete(replies: answered + Array(repeating: nil, count: commands.count - replies.count),
+                              failure)
         }
     }
 
