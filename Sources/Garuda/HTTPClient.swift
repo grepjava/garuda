@@ -115,10 +115,19 @@ public struct HTTPClient {
     let worker: UnsafeMutablePointer<Worker>
 
     /// How long any one wait may take: connecting, writing, or waiting for
-    /// more of a response. Not a budget for the whole exchange -- the engine
-    /// has no clock a handler can read, and a deadline set on the route is
-    /// what bounds a request overall.
+    /// more of a response. A peer that answers slowly but steadily is never
+    /// cut off by this; `totalTimeoutMilliseconds` is what bounds the whole.
     public var timeoutMilliseconds: UInt64 = 10_000
+    /// How long the whole exchange may take, redirects included: the lookup,
+    /// connecting, writing the request and reading the response to its end.
+    /// For `stream`, everything up to the response head, after which each
+    /// read of the body is bounded by `timeoutMilliseconds` alone -- a stream
+    /// may rightly run for as long as the caller keeps reading it. Nil, the
+    /// default, sets no budget beyond the per-wait one.
+    ///
+    /// For work that is not a route's, whose deadline would otherwise bound
+    /// it: a background job, a call made at startup, a retry loop.
+    public var totalTimeoutMilliseconds: UInt64? = nil
     public var maxHeadBytes: Int = 32 * 1024
     public var maxBodyBytes: Int = 8 * 1024 * 1024
     public var maxHeaders: Int = 100
@@ -153,9 +162,38 @@ public struct HTTPClient {
     /// nothing negotiates, and pointing it at an ordinary HTTP/1.1 server
     /// sends a preface that server will read as a malformed request.
     var forceHTTP2 = false
+    /// When the exchange under way must be over, on the monotonic clock, or 0
+    /// for no deadline beyond each wait's own. Set from
+    /// `totalTimeoutMilliseconds` when an exchange starts.
+    var deadline: UInt64 = 0
 
     init(worker: UnsafeMutablePointer<Worker>) {
         self.worker = worker
+    }
+
+    /// This client with the deadline for one exchange set, if it has a total.
+    func startingExchange() -> HTTPClient {
+        guard let total = totalTimeoutMilliseconds else { return self }
+        var started = self
+        started.deadline = av_monotonic_ms() &+ max(1, total)
+        return started
+    }
+
+    /// How long the next wait may take: `timeoutMilliseconds`, or what is
+    /// left of the exchange's deadline if that is sooner. `timedOut` once the
+    /// deadline has passed.
+    func waitBudget() throws(ClientError) -> UInt64 {
+        guard deadline != 0 else { return timeoutMilliseconds }
+        let now = av_monotonic_ms()
+        guard now < deadline else { throw .timedOut }
+        return min(timeoutMilliseconds, deadline &- now)
+    }
+
+    /// When a wait starting `now` gives up: `timeoutMilliseconds` on, or the
+    /// exchange's deadline if that is sooner.
+    func waitDeadline(from now: UInt64) -> UInt64 {
+        let own = now &+ timeoutMilliseconds
+        return deadline == 0 ? own : min(own, deadline)
     }
 }
 
@@ -188,6 +226,26 @@ extension HTTPClient {
     func exchange(_ method: HTTPMethod, _ url: String,
                   headers: [(String, String)],
                   body: [UInt8]) async throws(ClientError) -> ClientResponse {
+        switch try await start(method, url, headers: headers, body: body, streaming: false) {
+        case .h1(let head, let rest):
+            return try await readWhole(head, rest)
+        case .h2(let shared, let stream):
+            return try await finishShared(shared, stream)
+        }
+    }
+
+    /// Where a response's body is to be read from, once its head is in.
+    enum Started {
+        case h1(ClientHead, H1Body)
+        case h2(H2Shared, H2Stream)
+    }
+
+    /// Writes the request and reads up to the final response's head.
+    /// `streaming` is for a body the caller reads as it arrives: over HTTP/2
+    /// its window is then opened only as the caller takes what came.
+    func start(_ method: HTTPMethod, _ url: String,
+               headers: [(String, String)],
+               body: [UInt8], streaming: Bool) async throws(ClientError) -> Started {
 
         // The head is built first and entirely, while the URL's bytes are
         // still alive: everything the parser produced is a slice into them.
@@ -213,7 +271,8 @@ extension HTTPClient {
                 if let shared = reusableShared(key) {
                     let block = try encodeRequestBlock(plan, method: method, headers: headers,
                                                        hasBody: !body.isEmpty)
-                    return try await exchangeShared(shared, block: block, method: method, body: body)
+                    return .h2(shared, try await openShared(shared, block: block, method: method,
+                                                            body: body, streaming: streaming))
                 }
                 // Somebody is already opening one. Wait to see whether it comes
                 // up as a connection this can join, rather than opening a second
@@ -252,20 +311,30 @@ extension HTTPClient {
         }
 
         let socket: OutboundSocket
+        let budget: UInt64
+        do {
+            budget = try waitBudget()
+        } catch {
+            doneConnecting()
+            throw error
+        }
         do {
             if plan.secure {
                 socket = try await Worker.connectTLS(worker, name: plan.host, port: plan.port,
                                                      caFile: caFile, alpn: alpn,
-                                                     milliseconds: timeoutMilliseconds)
+                                                     milliseconds: budget)
             } else {
                 // A forced HTTP/2 connection is keyed apart from plaintext
                 // HTTP/1.1, so the pool can never hand one to the other.
                 socket = try await Worker.connect(worker, name: plan.host, port: plan.port,
                                                   tls: forceHTTP2 ? "\u{0}h2c" : "",
-                                                  milliseconds: timeoutMilliseconds)
+                                                  milliseconds: budget)
             }
         } catch {
             doneConnecting()
+            // The deadline passing during the connect is the exchange timing
+            // out, not the connection failing.
+            if deadline != 0, av_monotonic_ms() >= deadline { throw .timedOut }
             throw .connect(error)
         }
 
@@ -291,7 +360,8 @@ extension HTTPClient {
                 block = try encodeRequestBlock(plan, method: method, headers: headers,
                                                hasBody: !body.isEmpty)
             }
-            return try await exchangeShared(shared, block: block, method: method, body: body)
+            return .h2(shared, try await openShared(shared, block: block, method: method,
+                                                    body: body, streaming: streaming))
         }
         // HTTP/1.1 after all. Anyone who waited connects for themselves.
         doneConnecting()
@@ -299,7 +369,8 @@ extension HTTPClient {
         do {
             try await writeAll(socket, request.readPointer, request.readableBytes)
             if !body.isEmpty { try await writeAll(socket, body) }
-            return try await readResponse(socket, method: method)
+            let (head, rest) = try await readHead(socket, method: method)
+            return .h1(head, rest)
         } catch {
             // Nothing about a failed exchange says the connection is clean, and
             // a connection that is not clean must not be offered to anyone.
@@ -470,8 +541,9 @@ extension HTTPClient {
             }
             sent &+= n
             if sent < bytes.count {
+                let budget = try waitBudget()
                 do {
-                    try await socket.writable(milliseconds: timeoutMilliseconds)
+                    try await socket.writable(milliseconds: budget)
                 } catch {
                     throw error == .timedOut ? .timedOut
                         : error == .cancelled ? .cancelled : .closed
@@ -492,8 +564,9 @@ extension HTTPClient {
             }
             sent &+= n
             if sent < count {
+                let budget = try waitBudget()
                 do {
-                    try await socket.writable(milliseconds: timeoutMilliseconds)
+                    try await socket.writable(milliseconds: budget)
                 } catch {
                     throw error == .timedOut ? .timedOut
                         : error == .cancelled ? .cancelled : .closed
@@ -504,10 +577,30 @@ extension HTTPClient {
 
     // MARK: Reading
 
-    private func readResponse(_ socket: OutboundSocket,
-                              method: HTTPMethod) async throws(ClientError) -> ClientResponse {
+    /// The rest of the response, read whole and held to `maxBodyBytes`.
+    private func readWhole(_ head: ClientHead, _ body: H1Body) async throws(ClientError) -> ClientResponse {
+        if case .length(let wanted) = body.framing, wanted > maxBodyBytes {
+            body.close()
+            throw .bodyTooLarge
+        }
+        var bytes: [UInt8] = []
+        if case .length(let wanted) = body.framing { bytes.reserveCapacity(wanted) }
+        while let piece = try await body.next(self) {
+            if bytes.count + piece.count > maxBodyBytes {
+                body.close()
+                throw .bodyTooLarge
+            }
+            bytes.append(contentsOf: piece)
+        }
+        return ClientResponse(status: head.status, reason: head.reason, headers: head.headers,
+                              body: bytes, reusedConnection: body.reused)
+    }
+
+    /// Reads up to the end of the final response's head, and hands back the
+    /// body still to come on the connection.
+    func readHead(_ socket: OutboundSocket,
+                  method: HTTPMethod) async throws(ClientError) -> (ClientHead, H1Body) {
         var buffer = ByteBuffer(capacity: 8192)
-        defer { buffer.destroy() }
         let fields = UnsafeMutablePointer<HTTPHeaderRef>.allocate(capacity: max(1, maxHeaders))
         defer { fields.deallocate() }
 
@@ -515,121 +608,54 @@ extension HTTPClient {
         var headers: [ClientHeader] = []
         var reason = ""
 
-        // An informational response is a response, and then the real one
-        // follows on the same connection. Reading one as final would leave its
-        // successor sitting in the buffer to be read as a body.
-        while true {
-            let outcome = HTTPResponseParser.parse(buffer.readPointer, buffer.readableBytes,
-                                                   maxHeadSize: maxHeadBytes,
-                                                   maxHeaders: maxHeaders,
-                                                   headers: fields, head: &head)
-            switch outcome {
-            case .incomplete:
-                try await readMore(socket, into: &buffer)
-                continue
-            case .failure(let error):
-                throw error == .headTooLarge ? .headTooLarge : .malformedResponse(error)
-            case .complete:
-                break
-            }
-
-            if head.status >= 100 && head.status < 200 && head.status != 101 {
-                buffer.consume(head.headEnd)
-                head = HTTPResponseHead()
-                continue
-            }
-
-            let base = buffer.readPointer
-            reason = String(decoding: UnsafeBufferPointer(start: base + Int(head.reason.offset),
-                                                          count: head.reason.count), as: UTF8.self)
-            headers.reserveCapacity(head.headerCount)
-            for i in 0..<head.headerCount {
-                headers.append(ClientHeader(
-                    name: String(decoding: UnsafeBufferPointer(
-                        start: base + Int(fields[i].name.offset),
-                        count: fields[i].name.count), as: UTF8.self),
-                    value: String(decoding: UnsafeBufferPointer(
-                        start: base + Int(fields[i].value.offset),
-                        count: fields[i].value.count), as: UTF8.self)))
-            }
-            buffer.consume(head.headEnd)
-            break
-        }
-
-        let framing = head.framing(method: method)
-        var body: [UInt8] = []
-        var reusable = head.keepAlive
-
-        switch framing {
-        case .none:
-            break
-
-        case .length(let wanted):
-            if wanted > maxBodyBytes { throw .bodyTooLarge }
-            body.reserveCapacity(wanted)
-            while body.count < wanted {
-                if buffer.readableBytes == 0 { try await readMore(socket, into: &buffer) }
-                let take = min(wanted - body.count, buffer.readableBytes)
-                body.append(contentsOf: UnsafeBufferPointer(start: buffer.readPointer, count: take))
-                buffer.consume(take)
-            }
-
-        case .chunked:
-            var decoder = ChunkedDecoder()
-            var finished = false
-            while !finished {
-                if buffer.readableBytes == 0 { try await readMore(socket, into: &buffer) }
-                var consumed = 0
-                var tooLarge = false
-                let outcome = decoder.decode(buffer.readPointer, buffer.readableBytes,
-                                             consumed: &consumed) { p, n in
-                    if body.count + n > maxBodyBytes { tooLarge = true; return }
-                    body.append(contentsOf: UnsafeBufferPointer(start: p, count: n))
-                }
-                buffer.consume(consumed)
-                if tooLarge { throw .bodyTooLarge }
-                switch outcome {
-                case .needMore: continue
-                case .finished: finished = true
-                case .failure(let error): throw .malformedResponse(error)
-                }
-            }
-
-        case .untilClose:
-            // The body ends when the connection does, so reading it to the end
-            // is the same act as making the connection unusable.
-            reusable = false
+        do throws(ClientError) {
+            // An informational response is a response, and then the real one
+            // follows on the same connection. Reading one as final would leave
+            // its successor sitting in the buffer to be read as a body.
             while true {
-                // Drained before waiting, not after. The start of the body
-                // arrives in the same read as the head, and a peer that sent
-                // everything and closed has no readability left to offer -- so
-                // waiting first loses exactly the bytes that were already
-                // here. The length and chunked paths are safe from this
-                // because each has a reason to look at the buffer first; this
-                // one, having no length, had none.
-                if buffer.readableBytes > 0 {
-                    if body.count + buffer.readableBytes > maxBodyBytes { throw .bodyTooLarge }
-                    body.append(contentsOf: UnsafeBufferPointer(start: buffer.readPointer,
-                                                                count: buffer.readableBytes))
-                    buffer.consume(buffer.readableBytes)
-                }
-                do {
+                let outcome = HTTPResponseParser.parse(buffer.readPointer, buffer.readableBytes,
+                                                       maxHeadSize: maxHeadBytes,
+                                                       maxHeaders: maxHeaders,
+                                                       headers: fields, head: &head)
+                switch outcome {
+                case .incomplete:
                     try await readMore(socket, into: &buffer)
-                } catch ClientError.closed {
+                    continue
+                case .failure(let error):
+                    throw error == .headTooLarge ? .headTooLarge : .malformedResponse(error)
+                case .complete:
                     break
                 }
+
+                if head.status >= 100 && head.status < 200 && head.status != 101 {
+                    buffer.consume(head.headEnd)
+                    head = HTTPResponseHead()
+                    continue
+                }
+
+                let base = buffer.readPointer
+                reason = String(decoding: UnsafeBufferPointer(start: base + Int(head.reason.offset),
+                                                              count: head.reason.count), as: UTF8.self)
+                headers.reserveCapacity(head.headerCount)
+                for i in 0..<head.headerCount {
+                    headers.append(ClientHeader(
+                        name: String(decoding: UnsafeBufferPointer(
+                            start: base + Int(fields[i].name.offset),
+                            count: fields[i].name.count), as: UTF8.self),
+                        value: String(decoding: UnsafeBufferPointer(
+                            start: base + Int(fields[i].value.offset),
+                            count: fields[i].value.count), as: UTF8.self)))
+                }
+                buffer.consume(head.headEnd)
+                break
             }
+        } catch {
+            buffer.destroy()
+            throw error
         }
-
-        // Anything still in the buffer belongs to a message this exchange did
-        // not ask for. Handing the connection on with that on it is what makes
-        // the next caller read somebody else's answer.
-        if buffer.readableBytes > 0 { reusable = false }
-
-        if reusable { socket.release() } else { socket.close() }
-
-        return ClientResponse(status: head.status, reason: reason, headers: headers,
-                              body: body, reusedConnection: reusable)
+        let body = H1Body(socket: socket, buffer: buffer, framing: head.framing(method: method),
+                          keepAlive: head.keepAlive)
+        return (ClientHead(status: head.status, reason: reason, headers: headers), body)
     }
 
     /// Waits for more and takes it. A peer that closes is `.closed`, which the
@@ -641,8 +667,9 @@ extension HTTPClient {
             // OpenSSL may be holding decrypted bytes the socket has already
             // given up, and no poll will ever mention those again.
             if !socket.hasBufferedInput {
+                let budget = try waitBudget()
                 do {
-                    try await socket.readable(milliseconds: timeoutMilliseconds)
+                    try await socket.readable(milliseconds: budget)
                 } catch {
                     throw error == .timedOut ? .timedOut
                         : error == .cancelled ? .cancelled : .closed
@@ -672,5 +699,140 @@ extension HTTPClient {
             // it, because a readable plaintext socket always has data or a
             // real end. The ticket is consumed now, so the next wait blocks.
         }
+    }
+}
+
+/// A response's status line and fields, before its body.
+struct ClientHead {
+    var status: Int
+    var reason: String
+    var headers: [ClientHeader]
+}
+
+/// A response body on an HTTP/1.1 connection, read as it arrives.
+///
+/// The connection is this body's until it ends: once the last byte is read it
+/// goes back to the pool if both ends mean to keep it and nothing is left on
+/// it, and is closed otherwise. A body given up on part way is closed, since
+/// what is left on the connection is the rest of it.
+final class H1Body {
+    let socket: OutboundSocket
+    private var buffer: ByteBuffer
+    let framing: HTTPBodyFraming
+    private var remaining = 0
+    private var decoder = ChunkedDecoder()
+    private var keepAlive: Bool
+    private var finished = false
+    private var settled = false
+    /// Whether the connection went back to the pool.
+    private(set) var reused = false
+
+    init(socket: OutboundSocket, buffer: ByteBuffer, framing: HTTPBodyFraming, keepAlive: Bool) {
+        self.socket = socket
+        self.buffer = buffer
+        self.framing = framing
+        self.keepAlive = keepAlive
+        if case .length(let wanted) = framing { remaining = wanted }
+    }
+
+    deinit {
+        buffer.destroy()
+    }
+
+    /// The next piece of the body, never empty, or nil once it has ended.
+    func next(_ client: HTTPClient) async throws(ClientError) -> [UInt8]? {
+        do throws(ClientError) {
+            return try await read(client)
+        } catch {
+            close()
+            throw error
+        }
+    }
+
+    private func read(_ client: HTTPClient) async throws(ClientError) -> [UInt8]? {
+        while !finished {
+            switch framing {
+            case .none:
+                finished = true
+
+            case .length:
+                if remaining == 0 {
+                    finished = true
+                    continue
+                }
+                if buffer.readableBytes == 0 { try await client.readMore(socket, into: &buffer) }
+                let take = min(remaining, buffer.readableBytes)
+                let piece = Array(UnsafeBufferPointer(start: buffer.readPointer, count: take))
+                buffer.consume(take)
+                remaining -= take
+                // Settled as soon as the last byte is in, so the connection
+                // is back in the pool whether or not the caller asks again.
+                if remaining == 0 {
+                    finished = true
+                    settle()
+                }
+                return piece
+
+            case .chunked:
+                if buffer.readableBytes == 0 { try await client.readMore(socket, into: &buffer) }
+                var consumed = 0
+                var piece: [UInt8] = []
+                let outcome = decoder.decode(buffer.readPointer, buffer.readableBytes,
+                                             consumed: &consumed) { p, n in
+                    piece.append(contentsOf: UnsafeBufferPointer(start: p, count: n))
+                }
+                buffer.consume(consumed)
+                switch outcome {
+                case .needMore:
+                    break
+                case .finished:
+                    finished = true
+                    settle()
+                case .failure(let error):
+                    throw .malformedResponse(error)
+                }
+                if !piece.isEmpty { return piece }
+
+            case .untilClose:
+                // The body ends when the connection does, so reading it to the
+                // end is the same act as making the connection unusable.
+                keepAlive = false
+                // Drained before waiting, not after. The start of the body
+                // arrives in the same read as the head, and a peer that sent
+                // everything and closed has no readability left to offer.
+                if buffer.readableBytes > 0 {
+                    let piece = Array(UnsafeBufferPointer(start: buffer.readPointer,
+                                                          count: buffer.readableBytes))
+                    buffer.consume(buffer.readableBytes)
+                    return piece
+                }
+                do {
+                    try await client.readMore(socket, into: &buffer)
+                } catch ClientError.closed {
+                    finished = true
+                }
+            }
+        }
+        settle()
+        return nil
+    }
+
+    /// Hands the connection back, or closes it. Once.
+    private func settle() {
+        guard !settled else { return }
+        settled = true
+        // Anything still in the buffer belongs to a message this exchange did
+        // not ask for. Handing the connection on with that on it is what makes
+        // the next caller read somebody else's answer.
+        reused = finished && keepAlive && buffer.readableBytes == 0
+        if reused { socket.release() } else { socket.close() }
+    }
+
+    /// Gives up on the rest: the connection is closed, with the rest of the
+    /// body on it.
+    func close() {
+        guard !settled else { return }
+        settled = true
+        socket.close()
     }
 }

@@ -892,6 +892,31 @@ The Python suites need `h2` and `aioquic`.
 
 ### HTTP client
 
+- `client.stream` returns a `ClientResponseStream` once the response head is
+  in, and the body is read from it as it arrives: `next()` a piece at a time,
+  `collect()` the rest, `nextEvent()` the body as server-sent events, and
+  `cancel()` to give up the rest. For a large file relayed on, an upstream's
+  events, a model's tokens -- anything that should not be held whole. A
+  streamed body is not held to `maxBodyBytes`, and a caller that stops reading
+  stops the upstream rather than filling memory: over HTTP/1.1 the bytes wait
+  in the kernel, and over HTTP/2 the stream's window is opened only as the
+  caller takes what came. Read to its end, the connection is kept; given up
+  on, it is closed or its stream reset. No compression is asked for, so a
+  relay gets the body as the server sent it. The events follow the HTML
+  standard's format: any line ending, a leading byte order mark, comments,
+  an `id` that carries over, `retry`, and an event cut off by the end of the
+  body not returned.
+- `client.totalTimeoutMilliseconds` bounds the whole exchange, redirects
+  included -- the connect, the request and the response to its end -- where
+  `timeoutMilliseconds` bounds each wait and a peer answering slowly but
+  steadily was never cut off. For work no route deadline covers: a job, a
+  call at startup, a retry loop. For `stream`, it bounds everything up to the
+  head.
+- Each HTTP/2 stream's silence is measured with its own request's
+  `timeoutMilliseconds`. The request reading the shared connection used to
+  renew every stream's deadline with its own timeout, so a patient request's
+  stream could time out on an impatient neighbour's clock, or the reverse.
+
 - `request.client` makes HTTP requests from a handler: `get`, `head`, `post`
   and `send`. It speaks HTTP/1.1, and HTTP/2 over TLS when the server offers
   it. An HTTP/2 connection is shared by every request to the same origin.

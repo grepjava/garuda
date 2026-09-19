@@ -74,40 +74,99 @@ extension HTTPClient {
     public func send(_ method: HTTPMethod, _ url: String,
                      headers: [(String, String)] = [],
                      body: [UInt8] = []) async throws(ClientError) -> ClientResponse {
+        // The whole of it, redirects included, inside one budget if there is
+        // one: the deadline is set once, here, and every wait below reads it.
+        let client = startingExchange()
         var method = method
         var url = url
         var headers = headers
         var body = body
         var followed = 0
         while true {
-            let response = try await exchange(method, url, headers: headers, body: body)
-            guard let next = redirect(response, from: url) else {
-                var answer = try decoded(response)
+            let response = try await client.exchange(method, url, headers: headers, body: body)
+            guard let next = client.redirect(response.status, response.header("location"), from: url) else {
+                var answer = try client.decoded(response)
                 answer.url = url
                 return answer
             }
             guard followed < redirects.limit else { throw .tooManyRedirects }
             followed += 1
-
-            let status = response.status
-            if (status == 303 && method != .head) || ((status == 301 || status == 302) && method == .post) {
-                method = .get
-                body = []
-                headers.removeAll { named($0.0, "content-type") || named($0.0, "content-length") }
-            }
-            if ClientOrigin(next) != ClientOrigin(url) {
-                headers.removeAll {
-                    named($0.0, "authorization") || named($0.0, "cookie") || named($0.0, "proxy-authorization")
-                }
-            }
+            client.follow(response.status, to: next, from: url, &method, &headers, &body)
             url = next
+        }
+    }
+
+    /// Sends a request and returns as soon as the response head is in, with
+    /// the body still to be read from the result as it arrives.
+    ///
+    ///     let upstream = try await request.client.stream(.get, "https://api.example.com/events")
+    ///     while let event = try await upstream.nextEvent() { ... }
+    ///
+    /// For what should not be held whole: a large file relayed on, an
+    /// upstream's server-sent events, a model's tokens as they are produced.
+    /// A body read this way is not held to `maxBodyBytes`, and waits on the
+    /// connection rather than filling memory when the caller stops reading.
+    ///
+    /// The body comes as the server sent it: no compression is asked for,
+    /// and a caller that sends its own `Accept-Encoding` gets what the server
+    /// encoded, with its Content-Encoding, which is what a relay wants.
+    /// Redirects are followed as `redirects` allows. `totalTimeoutMilliseconds`
+    /// bounds everything up to the head.
+    public func stream(_ method: HTTPMethod = .get, _ url: String,
+                       headers: [(String, String)] = [],
+                       body: [UInt8] = []) async throws(ClientError) -> ClientResponseStream {
+        var client = startingExchange()
+        client.decompress = false
+        var method = method
+        var url = url
+        var headers = headers
+        var body = body
+        var followed = 0
+        while true {
+            let started = try await client.start(method, url, headers: headers, body: body, streaming: true)
+            let response = ClientResponseStream(client, started, url: url)
+            guard let next = client.redirect(response.status, response.header("location"), from: url) else {
+                // The budget was for getting here. The body is read for as
+                // long as the caller wants it, a wait at a time.
+                response.startReading()
+                return response
+            }
+            // A redirect's own body is short, and reading it keeps the
+            // connection for the request it points at.
+            if (try? await response.collect(limit: maxBodyBytes)) == nil { response.cancel() }
+            guard followed < redirects.limit else { throw .tooManyRedirects }
+            followed += 1
+            client.follow(response.status, to: next, from: url, &method, &headers, &body)
+            url = next
+        }
+    }
+
+    /// What following a redirect does to the request: 303 turns any method
+    /// but HEAD into a GET without a body, as 301 and 302 do after a POST, and
+    /// leaving the origin drops the credentials meant for the one asked.
+    func follow(_ status: Int, to next: String, from url: String,
+                _ method: inout HTTPMethod, _ headers: inout [(String, String)], _ body: inout [UInt8]) {
+        if (status == 303 && method != .head) || ((status == 301 || status == 302) && method == .post) {
+            method = .get
+            body = []
+            headers.removeAll { named($0.0, "content-type") || named($0.0, "content-length") }
+        }
+        if ClientOrigin(next) != ClientOrigin(url) {
+            headers.removeAll {
+                named($0.0, "authorization") || named($0.0, "cookie") || named($0.0, "proxy-authorization")
+            }
         }
     }
 
     /// Where `response` redirects to, when it is a redirect the policy allows.
     func redirect(_ response: ClientResponse, from url: String) -> String? {
-        guard redirects.limit > 0, [301, 302, 303, 307, 308].contains(response.status),
-              let location = response.header("location"),
+        redirect(response.status, response.header("location"), from: url)
+    }
+
+    /// Where a response redirects to, when it is a redirect the policy allows.
+    func redirect(_ status: Int, _ location: String?, from url: String) -> String? {
+        guard redirects.limit > 0, [301, 302, 303, 307, 308].contains(status),
+              let location,
               let next = resolveReference(location, against: url),
               let from = ClientOrigin(url), let to = ClientOrigin(next) else { return nil }
         if from.secure && !to.secure { return nil }

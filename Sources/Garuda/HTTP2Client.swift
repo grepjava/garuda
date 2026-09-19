@@ -110,15 +110,35 @@ final class H2Stream {
     /// The peer reset it, so nothing needs sending back.
     var closedByPeer = false
     /// When this request gives up if nothing happens. Pushed back by every
-    /// frame for the stream, so it bounds silence rather than the exchange.
+    /// frame for the stream, so it bounds silence rather than the exchange --
+    /// up to `exchangeDeadline`, which it never passes.
     var deadline: UInt64
+    /// How far each frame pushes `deadline`: the request's own
+    /// `timeoutMilliseconds`, whoever happens to be reading the connection.
+    let waitMilliseconds: UInt64
+    /// When the whole exchange must be over, or 0 for no such bound. Cleared
+    /// once a streamed response's head is in, after which only silence ends it.
+    var exchangeDeadline: UInt64
+    /// Read by the caller as it arrives, so its window is opened as the
+    /// caller takes the bytes rather than as they come, and no body limit
+    /// applies: the window is what bounds what waits here.
+    var streaming = false
     /// The request's task, while it is parked waiting for this stream.
     var waiter: UnsafeContinuation<Void, Never>? = nil
 
-    init(method: HTTPMethod, recvWindow: Int, deadline: UInt64) {
+    init(method: HTTPMethod, recvWindow: Int, waitMilliseconds: UInt64, exchangeDeadline: UInt64) {
         self.method = method
         self.recvWindow = recvWindow
-        self.deadline = deadline
+        self.waitMilliseconds = waitMilliseconds
+        self.exchangeDeadline = exchangeDeadline
+        deadline = 0
+        renew(at: av_monotonic_ms())
+    }
+
+    /// Something happened on the stream at `now`.
+    func renew(at now: UInt64) {
+        let own = now &+ waitMilliseconds
+        deadline = exchangeDeadline == 0 ? own : min(own, exchangeDeadline)
     }
 }
 
@@ -406,14 +426,26 @@ extension HTTPClient {
         return Array(UnsafeBufferPointer(start: block.readPointer, count: block.readableBytes))
     }
 
-    /// One request on a shared connection.
-    func exchangeShared(_ shared: H2Shared, block: [UInt8], method: HTTPMethod,
-                        body: [UInt8]) async throws(ClientError) -> ClientResponse {
+    /// One request on a shared connection, up to its final response head.
+    func openShared(_ shared: H2Shared, block: [UInt8], method: HTTPMethod,
+                    body: [UInt8], streaming: Bool) async throws(ClientError) -> H2Stream {
         let stream = H2Stream(method: method, recvWindow: shared.conn.initialWindowSize,
-                              deadline: av_monotonic_ms() &+ timeoutMilliseconds)
+                              waitMilliseconds: timeoutMilliseconds, exchangeDeadline: deadline)
+        stream.streaming = streaming
         do {
             try await openStream(shared, stream, block: block, endStream: body.isEmpty)
             if !body.isEmpty { try await sendBody(shared, stream, body) }
+            try await waitFor(shared, stream) { stream.sawFinalHeaders || stream.done }
+        } catch {
+            abandon(shared, stream)
+            throw error
+        }
+        return stream
+    }
+
+    /// The rest of a response, read whole.
+    func finishShared(_ shared: H2Shared, _ stream: H2Stream) async throws(ClientError) -> ClientResponse {
+        do {
             try await waitFor(shared, stream) { stream.done }
         } catch {
             abandon(shared, stream)
@@ -422,8 +454,53 @@ extension HTTPClient {
         finish(shared, stream)
         let keeps = shared.dead == nil && !shared.goaway
         return ClientResponse(status: stream.status, reason: "", headers: stream.headers,
-                              body: method == .head ? [] : stream.body,
+                              body: stream.method == .head ? [] : stream.body,
                               reusedConnection: keeps)
+    }
+
+    /// The next piece of a streamed response's body, never empty, or nil at
+    /// its end. What was taken is given back to the peer as window, so a
+    /// caller that reads slowly holds the peer to one window's worth here.
+    func nextShared(_ shared: H2Shared, _ stream: H2Stream) async throws(ClientError) -> [UInt8]? {
+        do {
+            try await waitFor(shared, stream) { !stream.body.isEmpty || stream.done }
+        } catch {
+            abandon(shared, stream)
+            throw error
+        }
+        guard !stream.body.isEmpty, stream.method != .head else {
+            finish(shared, stream)
+            return nil
+        }
+        var piece: [UInt8] = []
+        swap(&piece, &stream.body)
+        if !stream.done {
+            let grant = shared.conn.initialWindowSize - stream.recvWindow
+            if grant >= shared.conn.initialWindowSize / 2 {
+                shared.queueWindowUpdate(stream.id, grant)
+                stream.recvWindow += grant
+                // Sent now if nobody holds the lock -- whoever does flushes it
+                // on the way out. Left queued with nobody writing, the peer
+                // would wait for credit while this waits for data.
+                if !shared.writerActive, shared.dead == nil {
+                    do {
+                        try await lock(shared)
+                    } catch {
+                        abandon(shared, stream)
+                        throw error
+                    }
+                    await unlock(shared, stream)
+                }
+            }
+        } else {
+            finish(shared, stream)
+        }
+        return piece
+    }
+
+    /// Gives up on a streamed response: the peer is told to stop sending.
+    func cancelShared(_ shared: H2Shared, _ stream: H2Stream) {
+        abandon(shared, stream)
     }
 
     /// Allocates the stream's id and writes its HEADERS, both under the lock.
@@ -512,7 +589,7 @@ extension HTTPClient {
             }
             await unlock(shared, stream)
             sent += n
-            stream.deadline = av_monotonic_ms() &+ timeoutMilliseconds
+            stream.renew(at: av_monotonic_ms())
         }
     }
 
@@ -829,7 +906,7 @@ extension HTTPClient {
                     if stream.sendWindow > H2FrameHeader.maxWindowSize {
                         failStream(shared, stream, .protocolError, reset: .flowControlError)
                     }
-                    stream.deadline = now &+ timeoutMilliseconds
+                    stream.renew(at: now)
                     shared.wake(stream)
                 }
             }
@@ -898,7 +975,7 @@ extension HTTPClient {
             conn.headerBlock.clear()
             guard let stream = shared.streams[conn.headerStream], !stream.done,
                   stream.error == nil else { return nil }
-            stream.deadline = now &+ timeoutMilliseconds
+            stream.renew(at: now)
             let endsStream = conn.headerEndsStream
 
             if stream.sawFinalHeaders {
@@ -959,7 +1036,7 @@ extension HTTPClient {
                 return nil
             }
             let length = end - start
-            if stream.body.count + length > maxBodyBytes {
+            if !stream.streaming && stream.body.count + length > maxBodyBytes {
                 failStream(shared, stream, .bodyTooLarge, reset: .cancel)
                 return nil
             }
@@ -967,11 +1044,14 @@ extension HTTPClient {
                                                                count: length))
             if header.flags.contains(.endStream) {
                 stream.done = true
-            } else if stream.recvWindow < conn.initialWindowSize / 2 {
+            } else if !stream.streaming && stream.recvWindow < conn.initialWindowSize / 2 {
+                // A streamed body's window opens as the caller takes it
+                // (`nextShared`), so a caller that stops reading stops the
+                // peer rather than growing this buffer.
                 shared.queueWindowUpdate(stream.id, conn.initialWindowSize - stream.recvWindow)
                 stream.recvWindow = conn.initialWindowSize
             }
-            stream.deadline = now &+ timeoutMilliseconds
+            stream.renew(at: now)
             shared.wake(stream)
 
         case .priority:

@@ -161,7 +161,28 @@ speaks HTTP/1.1, and HTTP/2 over TLS when the server offers it. It resolves
 names on the worker's poller and keeps connections for reuse. It asks for
 gzip, deflate, brotli and zstd and decodes what comes back, and it follows
 redirects only when `client.redirects` says to: `.sameOrigin()`, `.any()` or
-`.matching { url in … }`.
+`.matching { url in … }`. `client.timeoutMilliseconds` bounds each wait;
+`client.totalTimeoutMilliseconds` bounds the whole exchange, redirects included,
+for work no route deadline covers.
+
+`client.stream` returns once the response head is in, and the body is read as
+it arrives -- a large file relayed on, an upstream's server-sent events, a
+model's tokens -- rather than held whole:
+
+```swift
+app.onAsync(.get, "/relay") { request, response in
+    let client = request.client                  // read before the first await
+    let upstream = try await client.stream(.get, "https://llm.example/v1/stream")
+    let body = response.stream(contentType: "text/event-stream")
+    while let event = try await upstream.nextEvent() {
+        try await body.write("data: \(event.data)\n\n")
+    }
+}
+```
+
+A streamed body is not held to `maxBodyBytes`. A caller that stops reading
+stops the upstream: over HTTP/1.1 by TCP's window, over HTTP/2 because the
+stream's window opens only as the caller reads. `cancel()` gives up the rest.
 
 ### State, groups and middleware
 
@@ -456,7 +477,7 @@ offer. This is where Garuda stands, area by area.
 | Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints | Done |
 | WebSockets | `WebSocketUpgrade` | `app.webSocket`, whole messages, pings and permessage-deflate by the engine | Done, over HTTP/1.1, HTTP/2 and HTTP/3 |
 | WebTransport | None in hyper | `app.webTransport` | Done |
-| HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression | Done |
+| HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed responses and server-sent events, a whole-exchange budget | Done |
 | PostgreSQL | sqlx, tokio-postgres | Native driver on the poller | Done |
 | Redis | redis-rs, fred | Native driver on the poller: RESP3 and RESP2, TLS, ACL, pipelines, transactions, pub/sub | Done |
 | SQLite | sqlx, rusqlite | The system's libsqlite3 on the blocking pool: a writer and readers per worker, WAL, migrations | Done |

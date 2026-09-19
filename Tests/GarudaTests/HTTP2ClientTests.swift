@@ -26,6 +26,8 @@ nonisolated(unsafe) private var bodyLimitWanted = 8 * 1024 * 1024
 /// is the right answer in production and a tax on a suite that runs in
 /// tenths of a second.
 nonisolated(unsafe) private var timeoutWanted: UInt64 = 10_000
+/// Holds `/stream-gated` from reading until the test sets it.
+nonisolated(unsafe) private var gateOpen = false
 /// What each of several concurrent requests saw, by the name of its route.
 nonisolated(unsafe) private var outcomes: [String: String] = [:]
 nonisolated(unsafe) private var originURL = ""
@@ -483,6 +485,22 @@ private func h2ClientApp() -> Application {
         do {
             let answer = try await client.head(urlWanted)
             outcome = "\(answer.status)|\(answer.body.count)"
+        } catch {
+            outcome = "\(error)"
+        }
+        response.send(outcome)
+    }
+    // Opens a stream and leaves it unread until the test opens the gate, then
+    // reads it to the end: what a caller that is slower than its peer does.
+    app.onAsync(.get, "/stream-gated") { request, response in
+        var client = request.client
+        client.forceHTTP2 = true
+        do {
+            let stream = try await client.stream(.get, urlWanted)
+            while !gateOpen { try await response.sleep(milliseconds: 2) }
+            var count = 0
+            while let piece = try await stream.next() { count += piece.count }
+            outcome = "\(stream.status)|\(count)"
         } catch {
             outcome = "\(error)"
         }
@@ -1191,6 +1209,51 @@ struct HTTP2ClientTests {
         let updates = origin.frames(ofType: .windowUpdate)
         #expect(updates.contains { $0.streamID == 0 }, "no connection credit returned")
         #expect(updates.contains { $0.streamID == 1 }, "no stream credit returned")
+    }
+
+    @Test func aStreamedResponseOpensItsWindowOnlyAsTheCallerReads() throws {
+        // A caller reading a stream more slowly than the peer sends must hold
+        // the peer back, not let the client buffer without bound. So the
+        // stream's window is returned as the caller takes the bytes, never as
+        // they arrive: while the caller holds off, no WINDOW_UPDATE goes out
+        // for the stream, and the peer, out of credit, has to stop.
+        //
+        // A second request waits on the same connection for an answer that
+        // does not come, so the connection is being read -- and the stream's
+        // frames delivered -- the whole time the first caller is not reading.
+        // With nobody reading, the frames would sit in the kernel whatever
+        // the client did, and the test would prove nothing.
+        reset()
+        gateOpen = false
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        let chunk = String(repeating: "s", count: 16_384)
+        origin.respond = { request in
+            guard request.path == "/big" else { return [] }
+            return [responseHeaders(status: 200, stream: request.stream)]
+                + (0..<3).map { _ in dataFrame(chunk, stream: request.stream, endStream: false) }
+        }
+        urlWanted = origin.url + "/big"
+        originURL = origin.url
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/stream-gated"])
+        #expect(turn(client, origin) { origin.requests.contains { $0.path == "/big" } })
+        let stream = origin.requests.first { $0.path == "/big" }?.stream ?? 0
+        let readers = try start(client, ["/multi/a"])
+        #expect(turn(client, origin) { origin.requests.contains { $0.path == "/a" } })
+        // Long enough for the reader to have taken in all three frames.
+        turn(client, origin, turns: 500) { false }
+        let early = origin.frames(ofType: .windowUpdate).filter { $0.streamID == stream }
+        #expect(early.isEmpty, "stream credit returned before the caller read anything")
+
+        gateOpen = true
+        #expect(turn(client, origin, turns: 40_000) {
+            origin.frames(ofType: .windowUpdate).contains { $0.streamID == stream }
+        }, "reading gives the credit back")
+        // The rest, which a peer holding to its window could only send now.
+        origin.queue(0, (0..<3).map { i in dataFrame(chunk, stream: stream, endStream: i == 2) })
+        #expect(turn(client, origin, turns: 60_000) { !outcome.isEmpty })
+        #expect(outcome == "200|\(16_384 * 6)")
+        withExtendedLifetime(wires + readers) {}
     }
 
     @Test func aRaisedInitialWindowAppliesToAStreamAlreadyOpen() throws {

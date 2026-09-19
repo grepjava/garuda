@@ -56,6 +56,13 @@ final class TestWire {
         return got
     }
 
+    /// Everything that has arrived and not been taken, as text, left where
+    /// it is: for a response with no length to wait for, such as a stream.
+    func arrived() -> String {
+        pending()
+        return String(decoding: UnsafeBufferPointer(start: buffer, count: got), as: UTF8.self)
+    }
+
     /// Turns until `ready` is true, or the turns run out. Returns whether it
     /// became true, so a test can assert on it rather than hoping.
     @discardableResult
