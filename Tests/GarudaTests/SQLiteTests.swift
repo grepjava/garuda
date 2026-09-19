@@ -696,7 +696,10 @@ struct SQLiteDatabaseTests {
         // on a slow runner 50 ms was not always enough, and the write that
         // should have been refused went through.
         #expect(mainHolder.turn(until: { mainHeld.value }, turns: 5_000_000))
-        #expect(try client.get("/other-write").text == "busy 5")
+        let heldAt = av_monotonic_ms()
+        let refused = try client.get("/other-write").text
+        let heldFor = av_monotonic_ms() &- heldAt
+        #expect(refused == "busy 5", "answered \(refused) \(heldFor) ms after the lock was taken")
         #expect((mainHolder.receive(turns: 5_000_000) ?? "").hasSuffix("released"))
         #expect(try client.get("/other-write").text == "written")
         other.db.close()
