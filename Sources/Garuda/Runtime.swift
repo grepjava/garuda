@@ -6,10 +6,13 @@
 // The supervisor creates the listening sockets and the workers inherit them
 // across fork. How many there are depends on the address family:
 //
-//   * TCP: one socket per worker slot, all with SO_REUSEPORT, so each worker
-//     gets an independent accept queue in the kernel. There is no shared accept
-//     lock, no thundering herd, and the kernel spreads connections by hashing
-//     the four-tuple.
+//   * TCP under --balance adaptive or accept: one socket every worker accepts
+//     from, watched so that the kernel wakes one waiting worker per connection
+//     (Balancing.swift). A connection goes to a worker with time for it.
+//   * TCP under --balance reuseport: one socket per worker slot, all with
+//     SO_REUSEPORT, so each worker gets an independent accept queue in the
+//     kernel, which spreads connections by hashing the four-tuple -- blind to
+//     how busy each worker is.
 //   * Unix: one socket, because a path can only be bound once, and every worker
 //     accepts from it. Letting each worker bind for itself would have every one
 //     of them unlink and replace the socket the previous had just published,
@@ -105,9 +108,10 @@ enum GarudaRuntime {
                 Log.error("this build has no TLS support; rebuild against OpenSSL")
                 return 1
             }
-            // --ktls, before any context is built: the option is read when each
-            // one is, here and in every worker after the fork.
-            if config.ktls {
+            // Kernel TLS, before any context is built: the option is read when
+            // each one is, here and in every worker after the fork.
+            switch config.ktls {
+            case .on:
                 if av_tls_enable_ktls(1) == 0 {
                     Log.warn("--ktls: this OpenSSL has no kernel TLS; encrypting in the process")
                 } else if av_tls_kernel_ready() == 0 {
@@ -115,12 +119,31 @@ enum GarudaRuntime {
                 } else {
                     Log.info("kernel TLS requested (--ktls)")
                 }
+            case .auto:
+                // Only where it will be had. With the module missing, every
+                // connection would ask the kernel for it and be refused.
+                if av_tls_kernel_ready() != 0 && av_tls_enable_ktls(1) != 0 {
+                    Log.info("kernel TLS: on (the kernel encrypts once OpenSSL has done the handshake)")
+                } else {
+                    Log.debug { $0.str("kernel TLS: not available here; encrypting in the process") }
+                }
+            case .off:
+                _ = av_tls_enable_ktls(0)
             }
             guard let context = makeTLSContext(config) else { return 1 }
             context.logCertificateNames()
         }
 
         let workerCount = config.resolvedWorkers
+
+        // --balance: the page every worker publishes its load on. A slot per
+        // metrics slot, for the same overlap at a reload.
+        if workerCount > 1 && config.balance != .reuseport {
+            if av_load_init(Int32(workerCount * 2)) != 0 {
+                Log.error("cannot map the shared load page")
+                return 1
+            }
+        }
 
         // Before any fork: children inherit the mapping, and a page mapped
         // after one would be private to whoever mapped it.
@@ -385,6 +408,15 @@ enum GarudaRuntime {
                 return 1
             }
             for i in 0..<count { listeners[i] = fd }
+        } else if config.balance != .reuseport {
+            // --balance: one socket every worker accepts from, so that a
+            // connection goes to a worker with time for it rather than to
+            // whichever the kernel's hash picks. Its one queue is held here for
+            // the supervisor's whole life, so a reload loses nothing from it.
+            guard let fd = openListener(config, reusePort: false, unlinkStale: false) else {
+                return 1
+            }
+            for i in 0..<count { listeners[i] = fd }
         } else {
             for i in 0..<count {
                 guard let fd = openListener(config, reusePort: true, unlinkStale: false) else {
@@ -397,6 +429,32 @@ enum GarudaRuntime {
             }
         }
         defer { removeUnixPath(config) }
+
+        // --balance adaptive: a channel per worker slot for handing it idle
+        // connections. Made here, like the listeners, so that a replacement
+        // receives on the channel its predecessor did and nothing sent to the
+        // slot is lost in between. After an exec these are new: the workers
+        // adopted from the previous image hold the old ones, and only hand
+        // connections to each other.
+        var channels: [(receive: Int32, send: Int32)] = []
+        if config.balance == .adaptive && workers > 1 && av_load_enabled() != 0 {
+            for _ in 0..<workers {
+                var pair: (Int32, Int32) = (-1, -1)
+                let made = withUnsafeMutableBytes(of: &pair) {
+                    av_handoff_pair($0.baseAddress!.assumingMemoryBound(to: Int32.self))
+                }
+                if made != 0 {
+                    Log.warn("cannot create the channels for moving connections; --balance adaptive works as accept")
+                    for made in channels { _ = av_close(made.receive); _ = av_close(made.send) }
+                    channels = []
+                    break
+                }
+                channels.append((pair.0, pair.1))
+            }
+        }
+        defer { for made in channels { _ = av_close(made.receive); _ = av_close(made.send) } }
+        var sharedListener = count > 1
+        for i in 1..<max(1, count) where listeners[i] != listeners[0] { sharedListener = false }
 
         let signalFD = av_signal_pipe_init()
         // A supervisor that exec'd this image blocked these first, so that
@@ -439,7 +497,8 @@ enum GarudaRuntime {
         /// letting it drop the handles on every other slot's.
         func spawn(_ slot: Int) -> (pid: pid_t, ready: Int32) {
             spawnWorker(config, listeners: listeners, listenerCount: count,
-                        index: slot, metricsSlot: metricsSlotOf[slot])
+                        index: slot, metricsSlot: metricsSlotOf[slot],
+                        channels: channels, sharedListener: sharedListener)
         }
 
         for i in 0..<workers {
@@ -838,6 +897,9 @@ enum GarudaRuntime {
                 var status: Int32 = 0
                 let pid = av_waitpid(-1, &status, 1)
                 if pid <= 0 { break }
+                // Whatever slot of the load page it held, it holds no more; a
+                // worker that crashed did not say so itself.
+                av_load_reap(pid)
 
                 // The ACME helper is not a worker and never counted as one.
                 if acmePid > 0 && pid == acmePid {
@@ -952,7 +1014,9 @@ enum GarudaRuntime {
                             listeners: UnsafeMutablePointer<Int32>,
                             listenerCount: Int,
                             index: Int,
-                            metricsSlot: Int) -> (pid: pid_t, ready: Int32) {
+                            metricsSlot: Int,
+                            channels: [(receive: Int32, send: Int32)] = [],
+                            sharedListener: Bool = false) -> (pid: pid_t, ready: Int32) {
         var fds: (Int32, Int32) = (-1, -1)
         let piped = withUnsafeMutableBytes(of: &fds) { raw in
             av_pipe(raw.baseAddress!.assumingMemoryBound(to: Int32.self))
@@ -995,6 +1059,12 @@ enum GarudaRuntime {
             _ = av_close(listeners[k])
         }
 
+        // Of the channels, this worker keeps the one it receives on and every
+        // one it may send on; the other receiving ends are the other workers'.
+        for (k, channel) in channels.enumerated() where k != index {
+            _ = av_close(channel.receive)
+        }
+
         var fd = mine
         if fd < 0 {
             guard let opened = openListener(config, reusePort: true, unlinkStale: false) else {
@@ -1002,7 +1072,17 @@ enum GarudaRuntime {
             }
             fd = opened
         }
-        let ok = runWorker(config, listenFD: fd, index: index, metricsSlot: metricsSlot)
+        var balance = BalanceSetup(sharedListener: sharedListener && fd == mine)
+        if av_load_enabled() != 0 {
+            balance.loadSlot = metricsSlot
+            balance.channel = index
+            if index < channels.count {
+                balance.receiveFD = channels[index].receive
+                balance.sendFDs = channels.map { $0.send }
+            }
+        }
+        let ok = runWorker(config, listenFD: fd, index: index, metricsSlot: metricsSlot,
+                           balance: balance)
         exitProcess(ok ? 0 : 1)
     }
 
@@ -1019,6 +1099,7 @@ enum GarudaRuntime {
                            listenFD: Int32,
                            controlFD: Int32,
                            metricsSlot: Int = 0,
+                           sharedListener: Bool = false,
                            listening: Bool = true) -> UnsafeMutablePointer<Worker>? {
         guard let poller = Poller(maxEvents: 256) else {
             Log.error("cannot create the readiness poller")
@@ -1035,6 +1116,9 @@ enum GarudaRuntime {
         }
         workerPtr.pointee.signalFD = controlFD
         workerPtr.pointee.busSlot = metricsSlot
+        // Before the listener is registered: a shared one is watched
+        // exclusively.
+        workerPtr.pointee.balancer.sharedListener = sharedListener
 
         if config.metricsPort != 0 {
             Metrics.bind(slot: metricsSlot)
@@ -1155,10 +1239,12 @@ enum GarudaRuntime {
     }
 
     static func runWorker(_ config: ServerConfig, listenFD: Int32,
-                          index: Int = 0, metricsSlot: Int = 0) -> Bool {
+                          index: Int = 0, metricsSlot: Int = 0,
+                          balance: BalanceSetup = BalanceSetup()) -> Bool {
         guard let workerPtr = makeWorker(config, listenFD: listenFD,
                                          controlFD: av_signal_pipe_init(),
                                          metricsSlot: metricsSlot,
+                                         sharedListener: balance.sharedListener,
                                          listening: application?.pointee.onPrepare == nil) else {
             return false
         }
@@ -1203,8 +1289,16 @@ enum GarudaRuntime {
         if let jobs = application?.pointee.scheduledJobs {
             startScheduledJobs(workerPtr, index: index, jobs: jobs)
         }
+        // Last before serving: the other workers start handing connections
+        // over as soon as this one appears on the load page.
+        if balance.loadSlot >= 0 {
+            workerPtr.pointee.startBalancing(loadSlot: balance.loadSlot, channel: balance.channel,
+                                             receiveFD: balance.receiveFD, sendFDs: balance.sendFDs,
+                                             sharedListener: balance.sharedListener)
+        }
         logReady(config)
         runSynchronousLoop(workerPtr)
+        workerPtr.pointee.leaveBalancing()
         // Before the state they use is torn down.
         stopScheduledJobs(workerPtr) {
             let n = workerPtr.pointee.poller.wait(timeoutMillis: 10)
@@ -1224,8 +1318,14 @@ enum GarudaRuntime {
 
     static func runSynchronousLoop(_ worker: UnsafeMutablePointer<Worker>) {
         while worker.pointee.running {
-            let timeout = worker.pointee.quicPollTimeout(200)
+            var timeout = worker.pointee.quicPollTimeout(200)
+            let balancing = worker.pointee.balancer.active
+            if balancing {
+                timeout = worker.pointee.balanceTimeout(timeout)
+                worker.pointee.loadBeforeWait()
+            }
             let n = worker.pointee.poller.wait(timeoutMillis: timeout)
+            if balancing { worker.pointee.loadAfterWait() }
             if n > 0 { worker.pointee.processEvents(n) }
             worker.pointee.fireDueTimers()
             worker.pointee.drainReadyQueue()
@@ -1233,6 +1333,7 @@ enum GarudaRuntime {
             if worker.pointee.broadcastPending { worker.pointee.deliverBroadcasts() }
             worker.pointee.quicTick()
             worker.pointee.sweepTimeouts()
+            if balancing { worker.pointee.balanceTick() }
             if worker.pointee.draining && worker.pointee.quiescent {
                 worker.pointee.running = false
             }

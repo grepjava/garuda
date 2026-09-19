@@ -655,7 +655,7 @@ extension Worker {
             }
         }
         if c.pointee.isStream { return c.pointee.h2Scheme ? "https" : "http" }
-        if c.pointee.tls != nil { return "https" }
+        if c.pointee.isSecure { return "https" }
         return strcmp(config.scheme, "https") == 0 ? "https" : "http"
     }
 

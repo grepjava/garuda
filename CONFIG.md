@@ -40,13 +40,36 @@ exits with status 2.
 | `--port PORT` | `8000` | TCP port, and the HTTP/3 UDP port unless `--quic-port` is given |
 | `--unix PATH` | none | listen on a unix socket instead of TCP |
 | `--workers N` | `1` | worker processes; `0` means one per CPU |
+| `--balance MODE` | `adaptive` | how workers share connections: `adaptive`, `accept` or `reuseport` |
 | `--backlog N` | `2048` | listen backlog |
 | `--root-path PATH` | none | prefix removed from the path before routes match |
 
 Every server runs a supervisor process, even with one worker. The supervisor
 owns the listening sockets and restarts a worker that crashes. Each worker has
-its own `SO_REUSEPORT` socket, poller and connection table. Workers share no
-lock.
+its own poller and connection table. Workers share no lock.
+
+**`--balance`.** How connections are spread over the workers:
+
+- `adaptive` (the default): one socket for every worker. A worker with
+  clearly more than its share -- busier, or holding more connections --
+  leaves new connections to the others until it catches up. And a worker
+  where quick requests would wait behind slow ones hands some of its idle
+  HTTP/1 keep-alive connections to a worker where they would not. HTTPS
+  connections move only under `--ktls` ([Kernel TLS](#kernel-tls));
+  HTTP/2, WebSocket and streams never move.
+- `accept`: the first half of `adaptive`, without moving connections.
+- `reuseport`: each worker has its own `SO_REUSEPORT` socket, and the kernel
+  picks one by hashing the connection's addresses. It ignores load and cost,
+  so a few long-lived connections can land unevenly, and on macOS they all
+  land on one worker.
+
+With one worker there is nothing to balance, and the flag changes nothing.
+[ARCHITECTURE.md](ARCHITECTURE.md#balancing-connections) has how it works and
+why workers are processes rather than threads.
+
+```bash
+garuda --workers 0 --balance reuseport   # the kernel's hash, as before
+```
 
 **Unix sockets.** Every worker accepts on the one socket. A stale socket file
 at the path is removed at start-up, and the file is removed on exit. A unix
@@ -134,7 +157,8 @@ for `/user/7`.
 | `--tls-cert PATH` | none | PEM certificate chain; repeatable, paired with `--tls-key` in order |
 | `--tls-key PATH` | none | PEM private key for the matching `--tls-cert` |
 | `--tls-ciphers LIST` | OpenSSL's | OpenSSL cipher list for TLS 1.2; TLS 1.3 suites are not configurable |
-| `--ktls` | off | let the Linux kernel encrypt, so static files use `sendfile` over HTTPS |
+| `--ktls` | off | let the Linux kernel encrypt TLS, so static files use `sendfile` over HTTPS and idle HTTPS connections can move between workers |
+| `--no-ktls` | on | keep all of TLS in the process |
 | `--acme-domain NAME` | none | get and renew a certificate for NAME; repeatable |
 | `--acme-email ADDR` | none | contact address for the ACME account |
 | `--acme-cache DIR` | `./acme` | where the account key and certificate are kept |
@@ -228,11 +252,18 @@ Start with a short value such as `300`. A browser that has seen a long
 
 ### Kernel TLS
 
-`--ktls` has the Linux kernel encrypt after OpenSSL completes the handshake. A
-`--static-dir` file sent over HTTPS/1.1 then goes out with `sendfile`, as it
-does in the clear. It needs the `tls` kernel module and an OpenSSL built with
-kernel TLS. Without either, the server logs a warning and OpenSSL encrypts as
-usual. HTTP/2 and HTTP/3 still read files, because their bytes are framed.
+`--ktls` lets the Linux kernel take over encrypting and decrypting once
+OpenSSL completes the handshake. A `--static-dir` file sent over HTTPS/1.1
+then goes out with `sendfile`, as it does in the clear, and under `--balance
+adaptive` an idle HTTPS connection can move to another worker. It needs the
+`tls` kernel module and an OpenSSL built with kernel TLS; without either, the
+server logs a warning and OpenSSL encrypts as usual. HTTP/2 and HTTP/3 still
+read files, because their bytes are framed.
+
+It is off by default. Where the kernel encrypts in software, as it does
+without a NIC that offloads TLS, large HTTPS responses measured 22 to 28%
+slower than with OpenSSL doing it, and small ones the same.
+[TRANSPORT.md](TRANSPORT.md#kernel-tls) has the details.
 
 ```bash
 sudo modprobe tls
@@ -358,8 +389,8 @@ garuda --static-dir /static=/srv/app/static --static-dir /media=/srv/app/media
   with its `index.html`, and `--static-listing` lists one that has no index.
   Without either, a directory falls through to the routes as any unserved
   path does.
-- On plaintext HTTP/1.1 the file goes out with `sendfile(2)`. Over TLS (without
-  `--ktls`), HTTP/2 and HTTP/3 it is read and then encrypted or framed.
+- On plaintext HTTP/1.1 the file goes out with `sendfile(2)`. Over TLS without
+  kernel TLS, HTTP/2 and HTTP/3 it is read and then encrypted or framed.
 
 ### `--static-index` and `--static-listing`
 
@@ -636,6 +667,8 @@ all workers.
 | `garuda_buffer_pool_hits_total`, `garuda_buffer_pool_misses_total` | counters |
 | `garuda_requests_rate_limited_total` | counter |
 | `garuda_cache_hits_total`, `_misses_total`, `_stores_total` | counters, with `--cache-size` |
+| `garuda_connections_handed_off_total`, `_taken_over_total` | counters, with `--balance adaptive` |
+| `garuda_accepts_deferred_total` | counter, with `--balance adaptive` or `accept` |
 | `garuda_workers` | gauge |
 | `garuda_route_requests_total{method, route, status}` | counter |
 | `garuda_route_request_duration_seconds{method, route}` | histogram |

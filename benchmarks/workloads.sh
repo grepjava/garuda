@@ -16,6 +16,14 @@
 #   h2        GET  /user/12345   over prior-knowledge HTTP/2
 #   overload  GET  /db/517       at 16 times the connections, the pool far short of them;
 #             then /user/12345 at the usual 64, to see the server come back
+#   skew      GET  /user/12345   on 56 connections while 8 more ask for /spin, which
+#             holds the CPU for about 2 ms a request: what the quick requests
+#             pay for sharing a server with slow ones (cpu counts both)
+#   spike     the same, but the slow requests start a second into the run, on
+#             workers that already hold quick connections
+#
+# SERVERS names what runs: garuda, axum, and garuda:MODE for Garuda under
+# --balance MODE (garuda:adaptive, garuda:accept, garuda:reuseport).
 #
 # benchmarks/workloads/garuda-app is the Garuda side and
 # benchmarks/workloads/axum the axum side. Garuda runs WORKERS workers, one
@@ -54,6 +62,8 @@ DURATION=${DURATION:-5s}
 WARMUP=${WARMUP:-1s}
 WORKLOADS=${WORKLOADS:-"user json db stream me upload download relay churn h2 overload"}
 SERVERS=${SERVERS:-"garuda axum"}
+SKEW_CONNS=${SKEW_CONNS:-8}
+SPIN=${SPIN:-2000000}
 ORIGIN_PORT=${ORIGIN_PORT:-3001}
 ORIGIN_WORKERS=${ORIGIN_WORKERS:-2}
 # "server_cpus:load_cpus" for taskset, as in frameworks.sh; empty runs both
@@ -116,10 +126,12 @@ head -c 1048576 /dev/zero | tr '\0' 'u' > "$OUT/upload.bin"
 
 start() {
     case "$1" in
-    garuda)
+    garuda|garuda:*)
+        local balance=()
+        case "$1" in garuda:*) balance=(--balance "${1#garuda:}") ;; esac
         DATABASE_URL=$DATABASE_URL POOL_SIZE=$POOL_SIZE ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT/stream" \
             server_start "${PIN_SERVER[@]}" "$GARUDA_APP" \
-            --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" ;;
+            --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${balance[@]}" ;;
     axum)
         if [ ! -x "$AXUM_APP" ]; then
             (cd "$ROOT/benchmarks/workloads/axum" && "$CARGO" build --release) > "$OUT/cargo.log" 2>&1 \
@@ -153,7 +165,7 @@ start_origin() {
 # The oha arguments for a workload, one to a line.
 request() {
     case "$1" in
-    user) printf '%s\n' "$BASE/user/12345" ;;
+    user|skew|spike) printf '%s\n' "$BASE/user/12345" ;;
     json) printf '%s\n' -m POST -T application/json -d "$ORDER" "$BASE/json" ;;
     db|overload) printf '%s\n' "$BASE/db/517" ;;
     stream) printf '%s\n' "$BASE/stream" ;;
@@ -172,6 +184,7 @@ check() {
     local body
     case "$1" in
     user|churn) body=$(curl -s --max-time 2 "$BASE/user/12345"); [ "$body" = 12345 ] ;;
+    skew|spike) body=$(curl -s --max-time 2 "$BASE/spin/1000"); [ "$body" = 10097022301462541763 ] ;;
     json) body=$(curl -s --max-time 2 -H 'content-type: application/json' -d "$ORDER" "$BASE/json")
           [ "$body" = '{"id":42,"name":"garuda","tags":["fast","small","swift"],"count":3}' ] ;;
     db|overload) body=$(curl -s --max-time 2 "$BASE/db/517"); [ "$body" = '{"id":517,"name":"item 517","price":619}' ] ;;
@@ -245,7 +258,7 @@ PY
 
 report() {
     awk -v w="$1" -v s="$2" '
-        { printf "%-9s %-7s %9s req/s   p50 %8s   p95 %8s   p99 %9s ms   cpu %5s us/req   mem %5s MiB   errors %s\n",
+        { printf "%-9s %-16s %9s req/s   p50 %8s   p95 %8s   p99 %9s ms   cpu %5s us/req   mem %5s MiB   errors %s\n",
                  w, s, $1, $2, $3, $4, $5, $6, $7
           fflush() }'
 }
@@ -268,7 +281,7 @@ for server in $SERVERS; do
     fi
     for workload in $WORKLOADS; do
         if ! check "$workload"; then
-            printf '%-9s %-7s FAILED: the answer above is not the expected one\n' "$workload" "$server"
+            printf '%-9s %-16s FAILED: the answer above is not the expected one\n' "$workload" "$server"
             continue
         fi
         if [ "$workload" = overload ]; then
@@ -277,6 +290,25 @@ for server in $SERVERS; do
             # Straight after, with nothing to settle: what a client arriving
             # once the surge has passed gets.
             measure user "$DURATION" "$CONNS" | report recovery "$server"
+            continue
+        fi
+        if [ "$workload" = skew ]; then
+            "${PIN_LOAD[@]}" "$OHA" -z 60s -c "$SKEW_CONNS" --no-tui "$BASE/spin/$SPIN" \
+                > /dev/null 2>&1 &
+            spinner=$!
+            measure skew "$WARMUP" $((CONNS - SKEW_CONNS)) > /dev/null
+            measure skew "$DURATION" $((CONNS - SKEW_CONNS)) | report skew "$server"
+            kill "$spinner" 2>/dev/null
+            wait "$spinner" 2>/dev/null
+            continue
+        fi
+        if [ "$workload" = spike ]; then
+            ( sleep 1; exec "${PIN_LOAD[@]}" "$OHA" -z 60s -c "$SKEW_CONNS" --no-tui \
+                  "$BASE/spin/$SPIN" > /dev/null 2>&1 ) &
+            spinner=$!
+            measure spike "$DURATION" $((CONNS - SKEW_CONNS)) | report spike "$server"
+            kill "$spinner" 2>/dev/null
+            wait "$spinner" 2>/dev/null
             continue
         fi
         measure "$workload" "$WARMUP" "$CONNS" > /dev/null

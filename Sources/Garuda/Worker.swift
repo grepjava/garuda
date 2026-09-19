@@ -104,6 +104,8 @@ public struct Worker: ~Copyable {
     public var drainDeadline: UInt64 = 0
     public var lastSweep: UInt64 = 0
     public var acceptSuspended = false
+    /// Sharing connections with the other workers (Balancing.swift).
+    var balancer = Balancer()
 
     /// Pooled waits (timers for now) and the ready queue of slots to resume.
     var asyncOps: AsyncOpPool
@@ -281,7 +283,7 @@ public struct Worker: ~Copyable {
     // MARK: - Registration
 
     public mutating func registerListener() -> Bool {
-        guard poller.add(listenFD, .read, token: PollToken.listener) else {
+        guard armListener() else {
             Log.error("failed to register the listening socket")
             return false
         }
@@ -316,6 +318,8 @@ public struct Worker: ~Copyable {
                 acceptConnections()
             case PollToken.signals:
                 handleSignals()
+            case PollToken.handoff:
+                receiveHandoffs()
             case PollToken.quic:
                 handleQUICEvent(mask)
             case PollToken.metrics:
@@ -399,8 +403,11 @@ public struct Worker: ~Copyable {
         // Bounded per wakeup so one busy listener cannot starve established
         // connections of service.
         var budget = 64
+        var accepted = 0
         while budget > 0 {
             budget -= 1
+            // A worker ahead of the others leaves the rest to them.
+            if balancer.active && !mayAccept(accepted: accepted) { return }
             var peer = (Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0),
                         Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0),
                         Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0), Int8(0),
@@ -420,7 +427,7 @@ public struct Worker: ~Copyable {
                     // than spinning on a listener that stays readable.
                     Metrics.add(AV_M_CONNECTIONS_REJECTED)
                     Log.warn("out of file descriptors; pausing accepts")
-                    _ = poller.modify(listenFD, [], token: PollToken.listener)
+                    disarmListener()
                     acceptSuspended = true
                     return
                 }
@@ -433,6 +440,7 @@ public struct Worker: ~Copyable {
                 while n < 48 && p[n] != 0 { n += 1 }
                 _ = adoptConnection(fd, address: p, addressLength: n, port: port)
             }
+            accepted += 1
         }
     }
 
@@ -441,15 +449,19 @@ public struct Worker: ~Copyable {
     /// and what the test client does with its end of a socket pair. Returns
     /// the slot, or -1 when the table is full or the socket could not be
     /// registered, in which case the descriptor has been dealt with.
+    ///
+    /// A connection another worker handed over (`arrival`) has already served
+    /// requests there, and has its TLS, if any, in the kernel.
     mutating func adoptConnection(_ fd: Int32, address: UnsafePointer<UInt8>, addressLength: Int,
-                                  port: UInt16) -> Int {
+                                  port: UInt16, arrival: Arrival = .accepted) -> Int {
         let slot = table.allocate()
         if slot < 0 {
             rejectOverCapacity(fd)
             return -1
         }
-        Metrics.add(AV_M_CONNECTIONS_ACCEPTED)
+        if arrival == .accepted { Metrics.add(AV_M_CONNECTIONS_ACCEPTED) }
         Metrics.set(AV_M_CONNECTIONS_ACTIVE, UInt64(table.liveCount))
+        if balancer.active { publishLoad() }
         let c = table[slot]
         c.pointee.fd = fd
         c.pointee.state = .readingHead
@@ -473,8 +485,12 @@ public struct Worker: ~Copyable {
         c.pointee.remotePort = 0
         c.pointee.responseRemaining = -1
         c.pointee.tls = nil
+        c.pointee.movableAfter = 0
+        c.pointee.costUs = 0
+        if arrival == .kernelTLS { c.pointee.flags.insert(.kernelTLS) }
 
-        if config.tcpNoDelay { _ = av_set_nodelay(fd, 1) }
+        // A socket handed over keeps the options it was accepted with.
+        if config.tcpNoDelay && arrival == .accepted { _ = av_set_nodelay(fd, 1) }
 
         c.pointee.remoteAddr.write(address, addressLength)
         c.pointee.remotePort = port
@@ -486,7 +502,7 @@ public struct Worker: ~Copyable {
             return -1
         }
         c.pointee.interest = PollMask.read.rawValue
-        if tlsContext != nil && !beginTLS(slot) { return -1 }
+        if tlsContext != nil && arrival == .accepted && !beginTLS(slot) { return -1 }
         return slot
     }
 
@@ -893,7 +909,7 @@ public struct Worker: ~Copyable {
 
     mutating func dispatch(_ slot: Int) {
         table[slot].pointee.routeIndex = -1
-        if config.accessLog || Metrics.enabled || observesResponses {
+        if config.accessLog || Metrics.enabled || observesResponses || balancer.moves {
             table[slot].pointee.requestStartUs = av_monotonic_us()
         }
         // Everything below reads the header table, and a request whose body
@@ -1238,6 +1254,7 @@ public struct Worker: ~Copyable {
         clearContinuation(slot)
         c.pointee.flags.insert(.servedRequest)
         c.pointee.lastActivity = av_monotonic_ms()
+        if balancer.moves && c.pointee.requestStartUs > 0 { noteCost(slot) }
         setInterest(slot, .read)
         // A pipelined request may already be sitting in the read buffer.
         if c.pointee.read.readableBytes > 0 {
@@ -1529,7 +1546,8 @@ public struct Worker: ~Copyable {
         if c.pointee.fileFD >= 0 { finishFile(slot) }
         // Likewise a compressor for a response that never finished.
         c.pointee.encoder.destroy()
-        Metrics.add(AV_M_CONNECTIONS_CLOSED)
+        let handedOff = c.pointee.flags.contains(.handedOff)
+        if !handedOff { Metrics.add(AV_M_CONNECTIONS_CLOSED) }
         // Written here rather than only when this worker happens to serve a
         // scrape: a gauge nobody updates is a number from whenever it last was
         // true, which for the other workers is never.
@@ -1602,6 +1620,11 @@ public struct Worker: ~Copyable {
         c.pointee.remoteAddr.destroy()
 
         endTLS(slot)
+        // A connection whose TLS is the kernel's says goodbye the same way
+        // OpenSSL would have -- unless it is carrying on in another worker.
+        if c.pointee.flags.contains(.kernelTLS) && !handedOff && c.pointee.fd >= 0 {
+            _ = av_ktls_close_notify(c.pointee.fd)
+        }
         if c.pointee.fd >= 0 {
             _ = poller.remove(c.pointee.fd)
             _ = av_close(c.pointee.fd)
@@ -1624,10 +1647,11 @@ public struct Worker: ~Copyable {
         // the head limit -- for as long as the worker runs.
         c.pointee.headStore.destroy()
         table.release(slot)
+        if balancer.active { publishLoad() }
 
         if acceptSuspended && !draining {
             acceptSuspended = false
-            _ = poller.modify(listenFD, .read, token: PollToken.listener)
+            armListener()
         }
     }
 
@@ -1808,11 +1832,17 @@ public struct Worker: ~Copyable {
         // the queue keeps being served by whoever takes over the slot. Leaving
         // it polled instead would have a draining worker compete for
         // connections it is about to stop serving.
-        _ = poller.modify(listenFD, [], token: PollToken.listener)
+        //
+        // Removed rather than silenced: a listener shared with other workers
+        // stays open in them, so closing this handle alone would leave it
+        // registered here.
+        disarmListener()
         if listenFD >= 0 {
             _ = av_close(listenFD)
             listenFD = -1
         }
+        // Nor is it offered connections by the others any more.
+        stopBalancing()
         // The redirect port too: this worker's socket leaves the SO_REUSEPORT
         // group, so the kernel stops handing it connections nobody will serve.
         closeRedirectListener()

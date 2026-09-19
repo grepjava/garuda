@@ -233,6 +233,8 @@ on axum 0.8 with tokio-postgres and deadpool.
 | churn | `GET /user/12345` | a new connection for every request |
 | h2 | `GET /user/12345` | over prior-knowledge HTTP/2 |
 | overload | `GET /db/517` at 1,024 connections | a pool of 32 far short of them; then `user` at 64 connections straight after, as `recovery` |
+| skew | `GET /user/12345` on 56 connections | while 8 more ask for `/spin`, which holds the CPU about 2 ms a request: what quick requests pay for sharing a server with slow ones |
+| spike | as skew | with the slow requests starting a second into the run, on workers that already hold quick connections |
 
 ```bash
 (cd benchmarks/workloads/garuda-app && swift build -c release)
@@ -396,5 +398,98 @@ run in 16 to 20 MiB.
 Garuda's p99 is higher than axum's on the small requests, where its p50 is
 lower: requests are spread over eight processes by the kernel as they
 connect, and none can take another's work, where Tokio's threads steal it.
-Under overload each failed 26 requests of the 1,024 connections, and each
-served the next 64 connections at full rate straight after.
+[Spreading connections](#spreading-connections-2026-09-19) below is what came
+of that. Under overload each failed 26 requests of the 1,024 connections, and
+each served the next 64 connections at full rate straight after.
+
+### Spreading connections, 2026-09-19
+
+`--balance` (ARCHITECTURE.md, Balancing connections) replaces the kernel's
+hash with one shared listener that a worker ahead of the others steps back
+from (`accept`), and adds moving quick connections off a worker where they
+would wait (`adaptive`, now the default). `SERVERS="garuda:reuseport
+garuda:accept garuda:adaptive axum"` runs each.
+
+**How connections land.** 64 connections opened at once against 8 workers,
+three runs each, per worker:
+
+| mode | connections per worker |
+|---|---|
+| `reuseport` | 4 4 6 9 10 10 10 11 · 4 5 7 8 8 10 10 12 · 2 4 5 7 10 12 12 12 |
+| `accept` | 4 6 7 8 8 10 10 11 · 4 4 4 4 8 9 12 19 · 0 4 4 5 11 13 13 14 |
+| `adaptive` | 4 4 4 4 7 8 10 23 · 0 4 4 4 5 11 12 24 · 0 4 4 4 6 11 12 23 |
+
+Neither shared-listener mode spreads a burst of connections evenly yet. A
+worker that steps back does so for one turn, and the burst outlasts it.
+Moving leaves a connection alone unless it would wait less elsewhere, and on
+uniform load it would not.
+On uniform load it made no difference to the tail: with requests all alike,
+a worker holding 15 connections and one holding 4 are both answering as fast
+as they can.
+
+**Where it matters: slow requests.** Load generator pinned to four CPUs and
+four workers to the other four (`WORKERS=4 PIN=0-3:4-7`), 62 connections of
+quick requests and 2 of `/spin`, two to four runs each. Figures are the
+quick requests':
+
+| | skew req/s | skew p99 | spike req/s | spike p99 |
+|---|---:|---:|---:|---:|
+| `reuseport` | 118,000–183,000 | 2.8–3.5 ms | 125,000–153,000 | 2.9–3.7 ms |
+| `accept` | 113,000–176,000 | 0.6–1.3 ms | 124,000–149,000 | 3.0–3.6 ms |
+| `adaptive` | 111,000–134,000 | 0.9–1.2 ms | 120,000–137,000 | 0.9–1.1 ms |
+| axum | 93,000–103,000 | 1.1–1.3 ms | 106,000–114,000 | 1.1–1.2 ms |
+
+Under the kernel's hash, quick connections share workers with the slow ones
+and wait behind them. With the slow requests there from the start, placement
+alone fixes it: their workers are busier, step back, and the quick
+connections land on the others. When the slow requests start later, only
+moving connections can: `adaptive` sends the quick ones to the workers with
+the shortest expected wait, and their tail matches axum's work stealing at
+higher throughput. The wide ranges are real: each run places the slow
+connections afresh.
+
+Getting there took three wrong turns, each visible in these workloads:
+
+- Moving connections whenever connection counts were uneven shuffled them
+  between workers that were all flat out, and each moved request waited
+  behind a 2 ms one on arrival. Now only a shorter expected wait moves
+  anything.
+- Moving by busyness alone sent quick connections to a worker half busy with
+  slow requests: less busy, but a longer wait. The wait is now worked out
+  from how long the loop's turns take, which is long both behind one slow
+  request and behind many quick ones.
+- Watching the shared listener with `EPOLLEXCLUSIVE` told a waiting
+  connection to one worker only, and when that worker stepped back the rest
+  of the queue waited for the next connection to wake someone. With a new
+  connection per request that fell to 3,300 requests a second, with 60
+  connections queued and every worker idle. Every worker is woken now, and
+  a worker steps back only for one that is accepting.
+
+**Uniform load.** The same pinned setup, two runs each, requests a second
+(p99 in ms):
+
+| workload | `reuseport` | `adaptive` | axum |
+|---|---|---|---|
+| user | 151,591 (0.54) | 150,745–151,322 (0.54–0.60) | 147,654–149,278 (0.57–0.62) |
+| json | 101,729 (1.35) | 100,628–100,850 (1.28–1.49) | 113,891–114,830 (1.03–1.04) |
+| db | 35,840–38,663 (2.7–2.9) | 35,887–36,004 (3.0–3.1) | 37,891–37,944 (2.6–2.8) |
+| stream | 40,460–41,103 (1.9–2.2) | 40,261–40,393 (1.9) | 36,533–36,652 (2.2–2.3) |
+| me | 77,965–78,853 (1.7–2.3) | 77,954–78,619 (1.6–1.7) | 109,669–111,502 (1.0–1.1) |
+| download | 2,177–2,197 | 2,188–2,201 | 2,216–2,229 |
+| churn | 39,985–40,076 (1.9) | 39,768–39,959 (1.9) | 33,652–33,906 (3.5–3.9) |
+| h2 | 100,535–101,485 (0.8) | 101,828–105,333 (0.8–0.9) | 101,261–101,287 (0.9) |
+
+The first run of the day read higher on this box whatever ran first (user
+184,230 and json 118,642 for `reuseport`), and is left out.
+
+**Kernel TLS.** The same four workers over HTTPS, OpenSSL 3.5 and kernel 7.0,
+two runs each, requests a second:
+
+| | HTTP/1.1 `/user` | HTTP/2 `/user` | HTTP/1.1 1 MiB from memory | HTTP/1.1 1 MiB file |
+|---|---:|---:|---:|---:|
+| OpenSSL encrypting | 113,826–124,794 | 79,007–91,908 | 2,447–2,471 | 2,204–2,207 |
+| `--ktls` | 116,859–123,789 | 79,708–92,121 | 1,753–1,829 | 1,712–1,718 |
+
+The kernel's software encryption is slower than OpenSSL's for bulk data, even
+when `sendfile` saves the copy, so `--ktls` stays off by default. What it
+buys here is HTTPS connections that can move between workers.

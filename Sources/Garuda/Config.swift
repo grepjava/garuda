@@ -20,10 +20,13 @@ public struct ServerConfig {
     public var ipv6Only = false
 
     // --- concurrency ---
-    /// Worker processes. Each gets its own poller, its own connection slab and,
-    /// via SO_REUSEPORT, its own accept queue -- so there is no shared lock and
-    /// no thundering herd. 0 means "one per CPU".
+    /// Worker processes. Each gets its own poller and its own connection slab,
+    /// and shares nothing with the others while it serves. 0 means "one per
+    /// CPU".
     public var workers = 1
+    /// How connections are shared among the workers (--balance). See
+    /// `BalanceMode` and ARCHITECTURE.md.
+    public var balance: BalanceMode = .adaptive
     /// `workers` with 0 resolved to the CPU count, which is what every part of
     /// start-up actually wants.
     public var resolvedWorkers: Int { workers > 0 ? workers : Int(av_cpu_count()) }
@@ -312,9 +315,15 @@ public struct ServerConfig {
     /// to and the span that sent it -- in the access log. Never generated, and
     /// never changed on its way to the application.
     public var traceContext = false
-    /// --ktls: have the kernel encrypt TLS where it can, so a --static-dir file
-    /// goes out with sendfile over HTTPS as it does in the clear.
-    public var ktls = false
+    /// Kernel TLS (--ktls): have the Linux kernel encrypt and decrypt once
+    /// OpenSSL has done the handshake. A --static-dir file then goes out with
+    /// sendfile over HTTPS as it does in the clear, and an idle HTTPS
+    /// connection can be handed to another worker. Off unless asked for: with
+    /// the kernel encrypting in software, large HTTPS responses measured a
+    /// quarter slower than with OpenSSL doing it (BENCHMARKS.md). `.auto`
+    /// uses it wherever OpenSSL and the kernel both can, and says nothing
+    /// where not; `.on` warns.
+    public var ktls: KernelTLS = .off
     public var logLevel: LogLevel = .info
     public var accessLog = false
     /// Emit the access log as one JSON object per line, for a collector that

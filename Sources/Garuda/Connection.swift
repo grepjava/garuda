@@ -126,6 +126,14 @@ public struct ConnFlags: OptionSet, Sendable {
     /// The request's route reads its body as it arrives (`onStreamingBody`),
     /// so it was dispatched at its head and the body is still coming.
     public static let bodyStreaming = ConnFlags(rawValue: 1 << 23)
+    /// TLS on this connection is the kernel's alone: it came from another
+    /// worker, whose OpenSSL session could not come with it, and the kernel
+    /// has encrypted and decrypted it since the handshake (Balancing.swift).
+    /// It is read and written like plaintext and is HTTPS all the same.
+    public static let kernelTLS = ConnFlags(rawValue: 1 << 24)
+    /// The descriptor has gone to another worker. Closing the slot closes
+    /// only this process's copy, with nothing said on the wire.
+    public static let handedOff = ConnFlags(rawValue: 1 << 25)
 
     /// Everything that describes one request rather than the connection.
     /// Cleared when a keep-alive connection starts its next request; missing
@@ -375,8 +383,21 @@ public struct Connection {
     /// A WebSocket on a stream: bytes received and not yet credited back to
     /// the peer, held while the handler's queue is full.
     var wsUncredited: Int = 0
+    /// When this connection may next be handed to another worker, in
+    /// monotonic milliseconds: not until it has been here a while, so a
+    /// connection is never passed back and forth.
+    var movableAfter: UInt64 = 0
+    /// What this connection's requests have cost its worker lately, in
+    /// microseconds from dispatch to answer, smoothed. Kept only under
+    /// --balance adaptive, which moves the cheap connections off a busy
+    /// worker rather than the one making it busy.
+    var costUs: UInt32 = 0
 
     @inlinable public init() {}
+
+    /// Whether the connection is encrypted, whoever does the encrypting.
+    @inlinable
+    public var isSecure: Bool { tls != nil || flags.contains(.kernelTLS) }
 
     @inlinable
     public var isIdle: Bool { state == .readingHead && read.isEmpty }
@@ -394,6 +415,9 @@ public struct Connection {
 public enum PollToken {
     public static let listener: UInt64 = .max
     public static let signals: UInt64 = .max - 1
+    /// The channel other workers hand connections to this one on
+    /// (--balance adaptive).
+    public static let handoff: UInt64 = .max - 2
     /// The QUIC socket. One descriptor serves every QUIC connection, so unlike
     /// TCP there is no per-connection token.
     public static let quic: UInt64 = .max - 3

@@ -33,7 +33,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1008 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1018 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 6
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -1131,6 +1131,43 @@ The Python suites need `h2` and `aioquic`.
 
 ### Server
 
+- Workers share connections by load. Until now each worker had its own
+  `SO_REUSEPORT` socket and the kernel placed a connection by hashing its
+  addresses, blind to load and to cost: 64 keep-alive connections on 8
+  workers landed 3 on one and 13 on another, and quick requests on a worker
+  that happened to hold a slow client waited behind it. Now, by default
+  (`--balance adaptive`), every worker accepts from one socket, and a worker
+  ahead of the others -- busier, or holding more connections -- leaves new
+  ones to them. And a worker where quick requests would wait behind slow ones
+  hands idle HTTP/1 keep-alive connections to a worker where they would not,
+  passing the socket over a unix channel between requests, so the client
+  never notices. The wait is estimated from how long the worker's loop turns
+  take, cheapest connections move first, and the costliest never moves. With
+  slow requests starting on workers that already held quick connections, the
+  quick ones' p99 on the bench box went from 2.9–3.7 ms to 0.9–1.1 ms,
+  level with axum's work stealing, at higher throughput than axum; on uniform
+  load nothing changed. `--balance accept` places connections without
+  moving them, and `--balance reuseport` is the old behaviour. Workers stay
+  processes, so a trap still ends only the worker it happened in.
+  ARCHITECTURE.md has how it works and how it compares with Tokio.
+- Under `--ktls`, idle HTTPS connections move between workers too, where the
+  kernel carries TLS both ways: the OpenSSL session is given up to the
+  kernel, and the next worker reads and writes the socket while the kernel
+  encrypts, closing it with a `close_notify` of its own. OpenSSL 3.0 hands
+  the kernel only TLS 1.2's receiving side, so under it TLS 1.3 connections
+  stay where they are; 3.5 hands over both. `--ktls` stays off by default:
+  without a NIC that offloads TLS, large HTTPS responses measured 22 to 28%
+  slower with the kernel encrypting. `--no-ktls` says so explicitly, and
+  `ServerConfig.ktls` is a `KernelTLS` (`.off`, `.on`, `.auto`) rather than a
+  `Bool`.
+- `garuda_connections_handed_off_total`, `garuda_connections_taken_over_total`
+  and `garuda_accepts_deferred_total` count what balancing did. Balancing
+  needs aviancore 0.6.3.
+- `benchmarks/workloads.sh` runs Garuda under a balancing mode as
+  `garuda:adaptive`, `garuda:accept` or `garuda:reuseport`, and has two new
+  workloads: `skew`, quick requests on 56 connections while 8 more hold the
+  CPU for about 2 ms a request, and `spike`, the same with the slow requests
+  starting a second into the run.
 - `Worker` is `~Copyable`. Nothing in Garuda meant to copy one, and nothing
   did in the source, but calling a method that does not mutate it -- through
   the pointer every handler holds, or from inside one that does -- had the

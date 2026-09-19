@@ -222,7 +222,7 @@ extension Worker {
         c.pointee.cacheKey.clear()
         if c.pointee.isStream {
             c.pointee.cacheKey.write(c.pointee.h2Scheme ? "https" : "http")
-        } else if c.pointee.tls != nil {
+        } else if c.pointee.isSecure {
             c.pointee.cacheKey.write("https")
         } else {
             let scheme = config.scheme

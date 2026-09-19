@@ -59,7 +59,7 @@ swift build -c release \
     -Xcc -I"$OPENSSL_PREFIX/include" -Xlinker -L"$OPENSSL_PREFIX/lib"
 ```
 
-Linux-only features, such as `--ktls`, are not available on macOS.
+Linux-only features, such as kernel TLS, are not available on macOS.
 
 ---
 
@@ -270,9 +270,11 @@ garuda --host 127.0.0.1 --port 8000 --workers 0 --forwarded-allow-ips 127.0.0.1
 
 ## Kernel TLS
 
-`--ktls` lets `--static-dir` files go out with `sendfile` over HTTPS/1.1. It
+`--ktls` lets `--static-dir` files go out with `sendfile` over HTTPS/1.1, and
+lets `--balance adaptive` move idle HTTPS connections between workers. It
 needs Linux, the `tls` kernel module, and an OpenSSL built with kernel TLS
-support.
+support. Without a NIC that offloads TLS it is slower for large responses
+(TRANSPORT.md has the numbers), which is why it is off by default.
 
 ```bash
 sudo modprobe tls

@@ -8,6 +8,7 @@
 //   POST /upload     a body read whole, and its length answered
 //   GET  /download   1 MiB answered from memory
 //   GET  /relay      ORIGIN_URL fetched and streamed on as it arrives
+//   GET  /spin/:n    n rounds of FNV-1a, answered as a decimal: CPU a request holds
 //
 // benchmarks/workloads/axum/src/main.rs answers the same requests with the
 // same bytes. DATABASE_URL names the database; the script makes the table.
@@ -100,6 +101,14 @@ app.post("/upload") { request, response in
 
 app.get("/download") { _, response in
     response.send(bytes: blob, contentType: "application/octet-stream")
+}
+
+app.get("/spin/:n") { (n: Path<Int>) in
+    var hash: UInt64 = 1_469_598_103_934_665_603
+    for i in 0..<max(0, n.value) {
+        hash = (hash ^ UInt64(i & 0xff)) &* 1_099_511_628_211
+    }
+    return String(hash)
 }
 
 app.onAsync(.get, "/relay") { request, response in

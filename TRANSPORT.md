@@ -107,11 +107,78 @@ a cleartext one.
   common name). HTTP/3 always serves the default pair.
 - **ACME**: under `--acme-domain`, a client offering `acme-tls/1` gets the
   `tls-alpn-01` challenge certificate and is closed (RFC 8737).
-- **`--ktls`** sets `SSL_OP_ENABLE_KTLS`. When the kernel took the send side, a
-  `--static-dir` file goes out with `SSL_sendfile`; otherwise it is read and
-  encrypted in the process.
+- **Kernel TLS** under `--ktls`: see below.
 - `--hsts` adds `Strict-Transport-Security` to TLS responses. `--redirect-http`
   answers plain HTTP on another port with a redirect to https.
+
+### Kernel TLS
+
+On Linux, once OpenSSL has finished the handshake it can hand the session's
+keys and record sequence numbers to the kernel (`SSL_OP_ENABLE_KTLS`). The
+kernel then encrypts what the socket sends and, where it can, decrypts what it
+receives. The TLS state lives in the socket rather than in the process, which
+gives two things:
+
+- a `--static-dir` file goes out with `SSL_sendfile`, from the page cache to
+  the socket, as it does in the clear;
+- an idle HTTPS connection can be handed to another worker
+  ([ARCHITECTURE.md](ARCHITECTURE.md#balancing-connections)), because the
+  descriptor carries all of TLS with it.
+
+**When it is on.** Under `--ktls`, when both of these hold, and otherwise the
+server warns and encrypts in the process:
+
+- OpenSSL was built with kernel TLS (`OPENSSL_NO_KTLS` not defined, as in
+  Ubuntu 24.04's and 26.04's);
+- the kernel's `tls` module is loaded (`/proc/net/tls_stat` exists). A process
+  that is not root cannot load it: `sudo modprobe tls`, or list it in
+  `/etc/modules-load.d/`. A container needs it loaded on the host.
+
+`ServerConfig.ktls = .auto` turns it on where it can be had without the
+warning.
+
+**Why it is off by default.** Without a NIC that offloads TLS, the kernel
+encrypts in software, and on the bench box (kernel 7.0, OpenSSL 3.5) that was
+slower than OpenSSL for bulk data: a 1 MiB response from memory went from
+2,460 to 1,790 requests a second over HTTP/1.1, and a 1 MiB static file,
+`sendfile` and all, from 2,205 to 1,715. Small requests and HTTP/2 measured
+the same either way. It pays where a NIC encrypts, or where moving HTTPS
+connections between workers matters more than bulk throughput.
+
+**Per connection.** The kernel takes over only what it supports: AES-GCM and
+ChaCha20-Poly1305, which is what browsers and most clients negotiate. Each
+direction is decided separately at the end of the handshake:
+
+- the sending side needs a kernel from 4.13, or 5.1 for TLS 1.3;
+- the receiving side needs 4.17, or 5.2 for TLS 1.3, and an OpenSSL that hands
+  it over. OpenSSL 3.0 hands over TLS 1.2's receiving side but not TLS 1.3's,
+  so under 3.0 a TLS 1.3 connection gets `sendfile` but cannot move to another
+  worker. OpenSSL 3.5 hands over both.
+
+A connection the kernel took neither way is served exactly as before.
+
+**Moving a connection.** When a worker hands an HTTPS connection to another
+(`av_tls_release_to_kernel`), both directions must be the kernel's and OpenSSL
+must hold nothing: no decrypted bytes not yet read, nothing half written, no
+shutdown under way. The worker then frees its OpenSSL session without sending
+anything and passes the descriptor on. The next worker marks the connection
+`.kernelTLS`, reads and writes it with `read(2)`, `writev(2)` and
+`sendfile(2)`, and still treats it as HTTPS: `request.scheme` is `https`, and
+the response cache files its answers under https.
+
+With nobody holding an OpenSSL session, two things work differently:
+
+- **Records that are not application data.** The kernel decrypts application
+  data only. A client's alert, or a TLS 1.3 key update on a kernel that cannot
+  apply one itself, fails the next read with `EIO`, and the connection is
+  closed. Clients send key updates rarely; one that does reconnects.
+- **Closing.** The worker sends `close_notify` itself, as an alert record the
+  kernel encrypts (`av_ktls_close_notify`), then closes the socket. A
+  connection that was handed on sends nothing: it goes on in the other worker.
+
+**What never moves**, kernel TLS or not: a connection whose TLS is still
+OpenSSL's, HTTP/2 (its HPACK tables and streams belong to the worker),
+WebSocket, a streamed response or body, and HTTP/3.
 
 ---
 

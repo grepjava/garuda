@@ -75,11 +75,12 @@ opaque handles behind functions in the shim.
 ```mermaid
 flowchart TB
     subgraph S["Supervisor (Runtime.swift)"]
-        LS["TCP listeners: one per worker slot, SO_REUSEPORT<br/>unix socket: one, shared"]
+        LS["TCP listener: one, shared (--balance adaptive, accept)<br/>or one per worker slot, SO_REUSEPORT (reuseport)<br/>unix socket: one, shared"]
+        HC["hand-off channels: one per worker slot<br/>(--balance adaptive)"]
         SP["signal pipe<br/>SIGTERM, SIGINT, SIGQUIT, SIGHUP"]
         RW["ReloadWatcher (--reload)"]
     end
-    SHM[("shared mmap<br/>metrics page, rate-limit table,<br/>response cache")]
+    SHM[("shared mmap<br/>metrics page, load page,<br/>rate-limit table, response cache")]
     ACME["ACME helper process<br/>(--acme-domain)"]
     W1["worker 1"]
     WN["worker N"]
@@ -90,6 +91,7 @@ flowchart TB
     WN -- "readiness byte" --> S
     W1 --- SHM
     WN --- SHM
+    W1 -. "idle connections, SCM_RIGHTS" .-> WN
     W1 -. "own sockets, SO_REUSEPORT:<br/>QUIC UDP, metrics, --redirect-http" .- NET((network))
 ```
 
@@ -98,19 +100,24 @@ flowchart TB
 Everything runs under a supervisor, including a single worker
 (`GarudaRuntime.runSupervisor`). Before the first fork it:
 
-- opens the listening sockets. TCP gets one socket per worker slot, each with
-  `SO_REUSEPORT`, so each worker has its own accept queue. A unix socket is one
-  descriptor shared by every worker, because a path binds once;
+- opens the listening sockets. By default (`--balance adaptive`, and
+  `accept`), TCP gets one socket that every worker accepts from. Under
+  `--balance reuseport` it gets one socket per worker slot, each with
+  `SO_REUSEPORT`, so each worker has its own accept queue. A unix socket is always one descriptor shared by every
+  worker, because a path binds once;
+- under `--balance adaptive`, makes one hand-off channel per worker slot
+  ([Balancing connections](#balancing-connections));
 - maps the shared pages (below);
 - compiles the application's routes (`Application.compile`), so every worker
   inherits the same read-only table.
 
 Workers are forked with `av_fork_worker`, which blocks the piped signals across
-the fork so none is lost. A child closes every other slot's listener. The
-supervisor keeps all listeners open for its whole life. The kernel assigns a
+the fork so none is lost. A child closes every other slot's listener and every
+other slot's receiving end of the hand-off channels. The supervisor keeps all
+listeners and channels open for its whole life. The kernel assigns a
 connection to a socket in the `SO_REUSEPORT` group when the SYN arrives, so a
 socket that closed would take its queue with it. A replacement worker inherits
-the same socket instead.
+the same socket instead; with one shared socket the question does not arise.
 
 Each worker opens its own QUIC UDP socket, metrics listener and
 `--redirect-http` listener, also with `SO_REUSEPORT`.
@@ -122,11 +129,13 @@ file means the worker died during start-up.
 
 ### Shared memory
 
-Three tables are anonymous shared mappings created before the fork:
+Four tables are anonymous shared mappings created before the fork:
 
 - **Metrics** (`avian_metrics.c`): two counter slots per worker, cache-line
   aligned. A replacement worker takes the other slot of its pair, so it never
   writes over the worker it replaces.
+- **Load** (`avian_load.c`, unless `--balance reuseport`): one cache line per
+  metrics slot, where each worker publishes how loaded it is. See below.
 - **Rate limit** (`avian_ratelimit.c`, `--rate-limit`): GCRA per client
   address, atomic entries, open addressing with a per-server random seed.
 - **Response cache** (`avian_cache.c`, `--cache-size`): size-classed slots with
@@ -135,6 +144,182 @@ Three tables are anonymous shared mappings created before the fork:
 
 Everything else is per worker: connections, buffers, timers, handler tasks,
 outbound connections, the DNS cache, and anything built by `app.state`.
+
+### Balancing connections
+
+Workers share nothing while they serve, so nothing inside a worker knows
+whether another has more than its share. `--balance` decides how connections
+are spread (`Balancing.swift`):
+
+| Mode | Where a new connection goes | Connections already placed |
+|---|---|---|
+| `adaptive` (default) | one shared listener; a worker ahead of the others steps back | quick ones move off a worker where they would wait |
+| `accept` | as `adaptive` | stay where they landed |
+| `reuseport` | a listener per worker with `SO_REUSEPORT`; the kernel hashes the connection's addresses | stay where they landed |
+
+**Why it matters.** The kernel's hash ignores load. In one benchmark run, 64
+keep-alive connections on 8 workers landed 3 on one worker and 13 on another.
+Worse, it ignores cost: a worker that happens to hold a connection making
+two-millisecond requests keeps every quick request on it waiting behind them.
+On macOS `SO_REUSEPORT` gives every connection to one socket.
+
+On the bench box, with 4 workers, 62 connections asking for a path parameter
+and 2 asking for a route that holds the CPU for 2 ms, the quick requests'
+p99 was:
+
+| | slow requests from the start (`skew`) | slow requests from a second in (`spike`) |
+|---|---|---|
+| `reuseport` | 2.8–3.5 ms | 2.9–3.7 ms |
+| `accept` | 0.6–1.3 ms | 3.0–3.6 ms |
+| `adaptive` | 0.9–1.2 ms | 0.9–1.1 ms |
+| axum | 1.1–1.2 ms | 1.1–1.2 ms |
+
+On uniform load the three modes measure the same. BENCHMARKS.md has the runs.
+
+#### The load page
+
+`avian_load.c` maps one cache line per metrics slot before the first fork,
+which is two per worker slot so a replacement never shares a line with the
+worker it replaces. Each worker writes only its own line:
+
+- **busy**: the share of its time the loop spent working rather than waiting
+  in `epoll_wait`, in thousandths, measured over 10 ms windows and smoothed,
+  each window weighing a quarter;
+- **connections**: how many it holds, written whenever that changes;
+- **accepting**: whether it is watching the shared listener right now;
+- **wait**: how long a request arriving now would wait (below);
+- **waiting since**: set while it waits. An idle loop does not turn, so it
+  cannot refresh its reading; a reader discounts a waiting worker's busy
+  reading to nothing over 20 ms instead.
+
+A worker pays two clock reads and a few relaxed stores to its own line per
+loop turn and per connection. It reads the others' lines once per accept pass
+and once every 2 ms in its balance tick.
+
+#### Placement: one shared listener
+
+The supervisor opens one TCP socket, and every worker watches it. Every idle
+worker is woken for a new connection, and a busy one sees it on its next turn.
+Each takes the connection it was woken for, if it is still there. Before each
+further accept in the same pass, it reads the load page and steps back if it
+is **ahead** (`BalancePolicy.standing`) of a worker that is accepting:
+
+- **busier**: at least 500 busy and 250 busier than the least busy; or
+- **more connections**: more than the fewest by max(3, an eighth), counted
+  only against workers about as free as itself. A worker holding fewer
+  because it is flat out with them is no yardstick.
+
+Stepping back removes the listener from its poller. The worker takes it back
+the moment it is no longer ahead, checked every loop turn with the loop
+waiting at most 1 ms at a time, and after 50 ms whatever the readings say.
+
+Two details keep a queued connection from waiting on nobody:
+
+- Only accepting workers are compared against. Otherwise workers could each
+  defer to another that had just stepped back itself, and leave connections
+  queued with all of them idle. A worker with nobody accepting to defer to
+  takes everything.
+- The listener is not registered with `EPOLLEXCLUSIVE`. An exclusive wake-up
+  tells a waiting connection to one worker only, and if that one then stepped
+  back, the rest of the queue would wait for the next arrival to wake someone
+  else. It is used only where nobody steps back: a unix socket under
+  `reuseport`, or a single worker.
+
+kqueue wakes every worker the same way, so macOS behaves as Linux does.
+
+#### Moving idle connections
+
+Placement cannot fix connections already placed, and cannot know which
+connections will turn out to be slow. Under `adaptive`, a worker moves idle
+connections to another worker where they would wait less.
+
+**The wait.** A worker serves in turns: it collects what is ready, works
+through all of it, and waits again. A request that arrives mid-turn waits for
+the rest of that turn. So the expected wait is the share of time spent working
+times the mean remaining length of a turn:
+
+    wait = busy · E[T²] / (2 · E[T])
+
+where T is how long each turn worked. The second moment is what matters. It
+is long where one request takes milliseconds, and long where many quick
+requests arrive together, and two workers equally busy differ by exactly
+that. Half busy with 2 ms requests reads 500 µs; flat out with turns of 44
+quick requests at 15 µs each reads 330 µs.
+
+**When.** A worker with a wait of at least 100 µs that has stayed more than
+twice that of another worker, plus 100 µs, for 100 ms sends it a quarter of
+its connections, at most 8, then waits 100 ms for the readings to catch up
+(`BalancePolicy.moveTarget`).
+
+**Which.** HTTP/1 connections between requests that have served at least one:
+nothing buffered or waiting to be written, no file or body in flight, no
+handler parked, not WebSocket, HTTP/2 or half-closed, and either plaintext or
+TLS the kernel carries both ways (below). Cheapest first, by each
+connection's smoothed time from dispatch to answer. The costliest never goes:
+moving it would move the load rather than share it, while moving the cheap
+ones out from behind it is what shortens their wait.
+
+**How.** The supervisor makes one datagram unix socket pair per worker slot
+before the fork. The sending worker removes the socket from its poller, sends
+the descriptor with `SCM_RIGHTS` together with a note (the peer's address and
+port, the requests served, whether TLS is the kernel's), and closes its own
+copy. The receiving worker adopts it as it would an accepted connection. A
+request the client sends meanwhile waits in the socket and is read by the new
+worker. A connection that moved stays put for a second. A connection the
+channel cannot take right now stays where it is.
+
+For example, 4 workers hold 16 quick connections each when two clients start
+calling a route that takes 2 ms. Their two workers' waits climb to around a
+millisecond while the others stay near 100 µs. After 100 ms each of the two
+sends 4 of its quick connections to the worker with the shortest wait, and
+again every 100 ms, until only the slow connections are left or the waits
+are within the margins.
+
+**TLS.** An OpenSSL session lives in the memory of the process that did the
+handshake, so it cannot move with the descriptor. A TLS connection moves only
+when the kernel encrypts and decrypts it both ways (`--ktls`, [kernel
+TLS](TRANSPORT.md#kernel-tls)). The worker then frees its OpenSSL session
+without a word on the wire (`av_tls_release_to_kernel`), and the next worker
+reads and writes the socket as plaintext while the kernel does TLS.
+
+**What never moves:** a request in progress, HTTP/2 connections (their HPACK
+tables and streams are the worker's), WebSocket and other streams, and
+HTTP/3, whose packets arrive on each worker's own UDP socket.
+
+#### Why processes rather than threads
+
+Tokio, the runtime behind axum, balances by moving tasks between threads of
+one process. An idle thread takes ready tasks from a busy one's queue, at any
+`await`, so it rebalances TLS and HTTP/2 connections and requests in flight.
+Garuda's workers are processes instead, for two reasons:
+
+- **A trap ends a process.** A force-unwrapped `nil`, an index out of range,
+  integer overflow or a failed `precondition` stops a Swift process at once:
+  nothing unwinds and nothing can catch it. In Rust the same bugs are panics,
+  which unwind, and Tokio contains one to the task that raised it. In
+  Garuda a trap ends one worker and the connections it held; the supervisor
+  starts a replacement on the same listener, and the other workers never
+  notice. Threads would lose every connection on every thread.
+- **Nothing is shared on a request's path**: no locks, no atomics, no
+  cross-thread wake-ups. That is where Garuda's median latency comes from.
+
+Moving an HTTP/1 connection between requests is about the granularity at
+which Tokio moves an HTTP/1 connection's task. What processes give up is
+moving TLS without kernel TLS, HTTP/2, and requests in flight.
+
+#### Restarts
+
+Under `accept` and `adaptive` the one listener belongs to the supervisor for
+its whole life, so a queued connection is never lost when a worker is
+replaced. A draining worker removes the listener from its poller, marks its
+load slot draining so that nobody hands it anything more, and stops reading
+its channel. Anything already sent waits in the channel, which belongs to the
+slot, for the replacement. The supervisor clears the load slot of every worker
+it reaps, since a worker that crashed cleared nothing itself.
+
+After a `--reload` exec, the new supervisor maps a new load page and makes new
+channels. Workers adopted from the previous image hand connections only to
+each other until they are replaced.
 
 ### Reload and signals
 
@@ -170,7 +355,8 @@ Shutdown:
 - `SIGINT`, `SIGQUIT`: drain now. A second one cuts a drain delay short.
 - Draining closes keep-alive connections idle between requests (not freshly
   accepted ones that may already hold a request), stops polling and closes the
-  listener, and ends the loop once the connection table is empty.
+  listener, leaves the load page and its hand-off channel, and ends the loop
+  once the connection table is empty.
 - `--graceful-timeout` bounds in-flight requests. A `SIGALRM` watchdog
   `_exit`s the worker 10 s after that, and the supervisor `SIGKILL`s any worker
   alive past drain delay + grace period + 2 s.
@@ -454,7 +640,7 @@ Built on it:
   that stay in place, never copied.
 - `setInterest` skips `epoll_ctl` when the mask is unchanged.
 - `accept4`, `TCP_NODELAY`, `sendfile` for static files (`SSL_sendfile` under
-  `--ktls`), `recvmmsg` and UDP GSO for QUIC.
+  kernel TLS), `recvmmsg` and UDP GSO for QUIC.
 
 Classes are used where the cost is per process or per connection:
 `H2Connection`, `H3Connection`, `QUICConnection`, `QUICListener`, the handler

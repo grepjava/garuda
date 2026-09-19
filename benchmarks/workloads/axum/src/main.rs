@@ -129,6 +129,14 @@ async fn download() -> Response {
     ([(header::CONTENT_TYPE, "application/octet-stream")], Bytes::from_static(&BLOB)).into_response()
 }
 
+async fn spin(Path(n): Path<u64>) -> String {
+    let mut hash: u64 = 1_469_598_103_934_665_603;
+    for i in 0..n {
+        hash = (hash ^ (i & 0xff)).wrapping_mul(1_099_511_628_211);
+    }
+    hash.to_string()
+}
+
 async fn relay(State(state): State<AppState>) -> Response {
     match state.http.get(&*state.origin).send().await {
         Ok(upstream) => (
@@ -174,6 +182,7 @@ async fn main() {
         .route("/upload", post(upload))
         .route("/download", get(download))
         .route("/relay", get(relay))
+        .route("/spin/{n}", get(spin))
         // Garuda's --max-body default.
         .layer(DefaultBodyLimit::max(16 << 20))
         .with_state(state);

@@ -118,6 +118,15 @@ public enum Metrics {
             simple(&out, "garuda_cache_stores_total", "counter",
                    "Responses stored in the response cache.", sum(AV_M_CACHE_STORES))
         }
+        simple(&out, "garuda_connections_handed_off_total", "counter",
+               "Idle connections a busy worker gave to a less busy one (--balance adaptive).",
+               sum(AV_M_CONNECTIONS_HANDED_OFF))
+        simple(&out, "garuda_connections_taken_over_total", "counter",
+               "Connections a worker took over from a busier one (--balance adaptive).",
+               sum(AV_M_CONNECTIONS_TAKEN_OVER))
+        simple(&out, "garuda_accepts_deferred_total", "counter",
+               "Times a worker ahead of the others stopped accepting for a moment.",
+               sum(AV_M_ACCEPTS_DEFERRED))
         // Half the slots: they come in pairs, one for a worker and one for the
         // replacement that overlaps it during a reload.
         simple(&out, "garuda_workers", "gauge",

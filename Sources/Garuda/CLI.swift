@@ -59,6 +59,11 @@ public enum GarudaCLI {
               --port PORT              port to bind (default 8000)
               --unix PATH              listen on a unix socket instead
               --workers N              worker processes, 0 = one per CPU (default 1)
+              --balance MODE           how workers share connections: adaptive (hand
+                                       new ones to a worker with time for them, and
+                                       move quick ones off a worker where they
+                                       would wait; default), accept (only the
+                                       first), or reuseport (the kernel's hash)
               --root-path PATH         mount prefix, taken off paths before routing
               --scheme http|https      scheme taken as the request's, behind a proxy
                                        that terminates TLS
@@ -98,8 +103,11 @@ public enum GarudaCLI {
               --tls-key PATH           PEM private key for the preceding --tls-cert
               --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
               --ktls                   let the Linux kernel encrypt TLS, so --static-dir
-                                       files go out with sendfile over HTTPS too
-                                       (needs the tls module: modprobe tls)
+                                       files go out with sendfile over HTTPS and idle
+                                       HTTPS connections can move between workers;
+                                       warns where it cannot (needs the tls module:
+                                       modprobe tls)
+              --no-ktls                encrypt TLS in the process only (the default)
               --acme-domain NAME       get and renew a certificate for NAME from an
                                        ACME CA (Let's Encrypt by default), answering
                                        tls-alpn-01 on this port (repeatable)
@@ -514,7 +522,21 @@ public enum GarudaCLI {
             } else if matches(arg, "--trace-context") {
                 config.traceContext = true
             } else if matches(arg, "--ktls") {
-                config.ktls = true
+                config.ktls = .on
+            } else if matches(arg, "--no-ktls") {
+                config.ktls = .off
+            } else if matches(arg, "--balance") {
+                guard let v = next("--balance needs adaptive, accept or reuseport") else { break }
+                if strcmp(v, "adaptive") == 0 {
+                    config.balance = .adaptive
+                } else if strcmp(v, "accept") == 0 {
+                    config.balance = .accept
+                } else if strcmp(v, "reuseport") == 0 {
+                    config.balance = .reuseport
+                } else {
+                    Log.error("--balance must be adaptive, accept or reuseport")
+                    failed = true
+                }
             } else if matches(arg, "--health-check-path") {
                 guard let v = next("--health-check-path needs a path") else { break }
                 if v[0] != 47 {   // '/'

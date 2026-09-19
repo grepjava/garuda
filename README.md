@@ -488,6 +488,7 @@ offer. This is where Garuda stands, area by area.
 |---|---|---|---|
 | Route dispatch | Every handler is a future the runtime polls | A synchronous handler is a direct call on the worker thread | Done |
 | Async handlers | `async fn` on a work-stealing pool | Reused tasks on the worker's own executor, no allocation per request | Done |
+| Spreading load over cores | Idle threads steal tasks from busy ones | A worker ahead of the others leaves new connections to them; quick connections stuck behind slow requests move to a worker where they would not wait | Done, [differs](#one-process-per-worker) |
 | Typed extraction | `Path`, `Query`, `Json`, `Form`, `Multipart` | `Path`, `Query`, `Body`, `Form`, `Multipart` | Done |
 | Custom extractors | `FromRequestParts`, `FromRequest`, `Option<T>`, `Result<T, E>` | `RequestExtractor`, `AsyncRequestExtractor`, `E?`, `Result<E, any Error>` | Done |
 | OpenAPI | utoipa or aide, with derive macros | `app.openAPI`, `app.swaggerUI`; schemas read from `Decodable` types | Done |
@@ -551,6 +552,20 @@ at a time. The cost: in-memory state is per worker, and a pool of 8 database
 connections is 8 per worker. Keep shared state in a database, and size pools as
 the total divided by `--workers`.
 
+A crash staying in one worker matters more in Swift than in Rust: a
+force-unwrapped `nil` or an index out of range ends a Swift process on the
+spot, where Tokio catches a Rust panic in the task that raised it.
+
+Processes cannot steal work from each other the way Tokio's threads do.
+Instead a worker ahead of the others leaves new connections to them, and a
+worker where quick requests would wait behind slow ones hands idle HTTP/1
+keep-alive connections to one where they would not (`--balance`). With slow
+requests starting on workers that already held quick connections, that kept
+the quick requests' p99 to about 1 ms, level with axum, where the kernel's
+hash alone let it reach 3.7 ms. HTTPS connections move too under `--ktls`,
+where the kernel does the encryption. HTTP/2 connections, WebSockets and
+requests in progress stay on the worker that has them.
+
 #### A handler that computes without awaiting holds its worker
 
 A worker is one thread, and staying on it is what removes the scheduling hop. A
@@ -587,7 +602,8 @@ These work without any handler code, set by flags:
   QUIC, TLS 1.3 key schedule and QPACK are Swift, over OpenSSL's crypto
   primitives.
 - **TLS** through OpenSSL, with several certificates chosen by SNI, and kernel
-  TLS (`--ktls`) so static files use `sendfile` over HTTPS.
+  TLS (`--ktls`) so static files use `sendfile` over HTTPS and HTTPS
+  connections can move between workers.
 - **ACME** certificates (`--acme-domain`), obtained and renewed with tls-alpn-01
   on the port already served.
 - **Static files** (`--static-dir`) with `sendfile`, `ETag` and byte ranges,
@@ -619,7 +635,7 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 1008 unit tests, and the fuzz corpus
+swift test                                   # 1018 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
 bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
 ```
