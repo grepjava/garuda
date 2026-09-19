@@ -89,6 +89,9 @@ The Python suites need `h2` and `aioquic`.
 - `app.test` serves the application from a worker in the test process over a
   socket pair: `try app.test.get("/user/42")` returns the status, headers and
   body.
+  A request that times out says on the log where it stood: what was sent and
+  received, the request's state and what it was waiting on, and whether the
+  loop kept turning.
 - The `garuda` binary serves the-benchmarker's contract through this API.
   `garuda-conformance` holds the routes the end-to-end suites need.
 

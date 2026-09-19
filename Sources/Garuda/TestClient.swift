@@ -264,11 +264,22 @@ public final class TestClient {
         let (client, slot, generation) = try connect()
         defer { hangUp(client, slot: slot, generation: generation) }
 
-        let deadline = av_monotonic_ms() + timeoutMillis
+        let began = av_monotonic_ms()
+        let deadline = began + timeoutMillis
         var written = 0
         var received: [UInt8] = []
         var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+        // For the report a timeout makes: whether this thread kept turning the
+        // loop and the request went unanswered, or the thread itself stood
+        // still.
+        var turns = 0
+        var lastTurn = began
+        var longestGap: UInt64 = 0
         while true {
+            let now = av_monotonic_ms()
+            longestGap = max(longestGap, now &- lastTurn)
+            lastTurn = now
+            turns += 1
             if written < bytes.count {
                 let n = bytes.withUnsafeBufferPointer {
                     av_write(client, $0.baseAddress! + written, bytes.count - written)
@@ -292,8 +303,36 @@ public final class TestClient {
                 return response
             }
             if closed { throw TestClientError.closed(received: received.count) }
-            if av_monotonic_ms() > deadline { throw TestClientError.timedOut }
+            if av_monotonic_ms() > deadline {
+                reportTimeout(slot: slot, generation: generation, sent: written, of: bytes.count,
+                              received: received.count, turns: turns, longestGap: longestGap,
+                              elapsed: av_monotonic_ms() &- began)
+                throw TestClientError.timedOut
+            }
         }
+    }
+
+    /// What the worker knew of a request that timed out, on the log: a
+    /// timeout alone says nothing of where the request stood.
+    private func reportTimeout(slot: Int, generation: UInt32, sent: Int, of total: Int, received: Int,
+                               turns: Int, longestGap: UInt64, elapsed: UInt64) {
+        var line = "test client: no response after \(elapsed) ms; sent \(sent) of \(total) bytes, "
+            + "received \(received); \(turns) turns, the longest \(longestGap) ms apart"
+        let c = worker.pointee.table[slot]
+        if c.pointee.state == .free || c.pointee.generation != generation {
+            line += "; the connection is gone"
+        } else {
+            line += "; the request is \(c.pointee.state), waiting as \(c.pointee.contKind) "
+                + "(\(c.pointee.contState), task \(c.pointee.contTask))"
+        }
+        if let pool = worker.pointee.handlerTasks {
+            line += "; handler tasks \(pool.count), \(pool.idleCount) idle; "
+                + "their executor has \(pool.executor.count) jobs queued"
+                + (pool.executor.hasWork ? " and work waiting" : " and nothing waiting")
+        } else {
+            line += "; no handler tasks yet"
+        }
+        Log.error { out in line.withCString { out.cstr($0) } }
     }
 
     /// One turn of the worker's loop, as `runSynchronousLoop` takes it, with
