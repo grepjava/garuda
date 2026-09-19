@@ -158,6 +158,14 @@ The Python suites need `h2` and `aioquic`.
   right and what it asks for is not allowed, where 400 stays a body that is
   not the type at all. `try value.validated()` checks a value that came from a
   queue or a file rather than a request.
+- Whether a decoded type has rules is asked once for that type rather than
+  once a request. Asking the runtime -- `value as? any Validated` -- costs
+  about half a microsecond whether the answer is yes or no, and `Body<T>`,
+  `Query<T>` and `Form<T>` asked it every time they decoded; the answer
+  cannot change while the process runs. A type with rules is still found by
+  its dynamic type, so a subclass with rules of its own is not missed. The
+  `json` workload went from 62,400 requests a second on one worker to 66,000,
+  which is what leaving the check out altogether measures.
 - An error that knows which fields are at fault says so: an answer carries
   `"fields":[{"field":"email","message":"must look like an email address"}]`
   beside `error`, so a form can put every message where it belongs. Validation

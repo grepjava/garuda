@@ -292,11 +292,19 @@ public struct Validation: Sendable {
 }
 
 extension Validation {
+    /// Which types have rules, asked of the runtime once each. Asking about a
+    /// type that has none used to cost half a microsecond of every request
+    /// that decoded one, which was more than checking the rules of a type
+    /// that has them.
+    private static let hasRules = ConformanceCache { $0 is any Validated.Type }
+
     /// The rules of whatever was just decoded, when its type has any. `Body`,
-    /// `Query` and `Form` call this; the cast is what makes the conformance
-    /// enough on its own, and what a type without one pays.
+    /// `Query` and `Form` call this; the conformance is what makes a type
+    /// validated, so a type without one need do nothing to opt out.
     static func check<Value>(_ value: Value) throws {
-        guard let validated = value as? any Validated else { return }
+        // The dynamic type, so that a subclass with rules is still found,
+        // exactly as the cast alone would have found it.
+        guard hasRules.holds(type(of: value)), let validated = value as? any Validated else { return }
         let problems = validated.validationProblems
         guard problems.isEmpty else { throw ValidationError(problems) }
     }
