@@ -677,3 +677,56 @@ Found so far, one worker against one Tokio thread:
   second on one worker against axum's 57,000 to 59,000, where in the clear it
   is 63,600 against 70,500. Not found yet.
 
+### Where a JSON POST spends its time, 2026-09-20
+
+`/json` is the widest gap left, so the route was taken apart a stage at a
+time: one worker pinned to a core, 64 connections from three others, every
+route answering the same 55 bytes, so that only the work before the answer
+differs. Two rounds, CPU per request in microseconds:
+
+| route | what it does | µs a request |
+|---|---|---|
+| get-text | GET, no extractor, a constant string | 7.9–8.6 |
+| post-text | POST, the body arrives and is not read | 8.1–8.8 |
+| raw-body | POST, the body read and not parsed | 8.1 |
+| raw-decode | and `JSONCoder.decode` | 11.8–11.9 |
+| raw-full | and `send(json:)` | 14.4–14.7 |
+| post-decode | `Body<Order>` in place of the raw read | 13.1–13.3 |
+| json | the route as it ships | 15.6–16.0 |
+| gen-decode | the raw read, decoded by written-out code | 8.9 |
+| gen-full | and encoded by written-out code | 10.6–10.7 |
+
+What each stage costs, by subtraction:
+
+- **Parsing a POST and taking its body in: 0.2 µs.** Reading the body is
+  free; it has already arrived, and the handler is only lent it. Nothing in
+  the request path accounts for the gap.
+- **Codable decoding: 3.8 µs. Codable encoding: 2.5 µs.** Together they are
+  6.3 of the 7.7 µs that separates `/json` from a GET answering a constant.
+- **Extraction and the answer's type: 2.4 µs**, split evenly between
+  `Body<Order>` and returning `JSON<Receipt>` rather than calling
+  `send(json:)`. The profile says where it goes: `getCache`,
+  `_swift_getGenericMetadata`, `__swift_instantiateConcreteTypeFromMangledName`
+  and `tryCast` are about 6% of the worker's time, and generic metadata is
+  looked up again for every request.
+- **Written-out code, of the kind a macro would generate, decodes in 0.8 µs
+  and encodes in 1.7.** Decoding is 4.8 times faster, and the pair together
+  cost about what Codable's encoding alone costs. End to end that is
+  14.4 µs down to 10.7, or 69,300 requests a second up to 93,800: a third
+  more, on one worker, against axum's 70,500.
+
+Two things this corrects. A microbenchmark on a quiet dev box measured the
+same Codable work at 1.5 µs decoding and 1.0 encoding, less than half what
+it costs in the server, because a tight loop keeps the metadata caches and
+the instruction cache warm and a server does not. And the JSON coder's own
+scanner is not what costs: Garuda's coder is about three times faster than
+Foundation's on the same types, and yyjson, the C parser, reads this body in
+0.12 µs. What costs is Codable itself — its containers, its existentials
+and the metadata it looks up for each of them. A parser swap cannot reach
+that, which is why `swift-yyjson`, yyjson behind `Codable`, measured 1.7
+times slower than Garuda's own coder rather than faster.
+
+The written-out decoder takes the happy path only — no escapes, no unknown
+keys — so generated code that handles everything would give a little of that
+back.
+
