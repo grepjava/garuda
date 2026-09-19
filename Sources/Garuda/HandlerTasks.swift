@@ -179,9 +179,15 @@ final class HandlerTaskPool: @unchecked Sendable {
         runReady()
     }
 
+    /// For tests: how many times a task started, or began a request, on some
+    /// thread other than its worker's.
+    nonisolated(unsafe) static var startedElsewhere = 0
+    nonisolated(unsafe) static var ranElsewhere = 0
+
     private func spawn(_ index: Int, first: Work) {
         let pool = self
         Task(executorPreference: executor) {
+            if av_worker_current() != UnsafeMutableRawPointer(pool.worker) { HandlerTaskPool.startedElsewhere += 1 }
             var next: Work? = first
             while let work = next {
                 await pool.run(index, work)
@@ -245,6 +251,7 @@ final class HandlerTaskPool: @unchecked Sendable {
 
     private nonisolated(nonsending) func run(_ index: Int, _ work: Work) async {
         let worker = self.worker
+        if av_worker_current() != UnsafeMutableRawPointer(worker) { HandlerTaskPool.ranElsewhere += 1 }
         let c = worker.pointee.table[work.slot]
         // Cancelled between being handed over and starting.
         guard c.pointee.state != .free, c.pointee.generation == work.generation,

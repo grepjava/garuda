@@ -55,6 +55,8 @@ struct HandlerThreadTests {
     @Test func anAsyncHandlerStaysOnItsWorkersThread() throws {
         let client = placesApp().test
         expectedWorker = UnsafeMutableRawPointer(client.worker)
+        let started = HandlerTaskPool.startedElsewhere
+        let ran = HandlerTaskPool.ranElsewhere
         for path in ["/raw", "/typed", "/raw"] {
             marks = []
             #expect(try client.get(path).text == "done")
@@ -62,5 +64,9 @@ struct HandlerThreadTests {
             #expect(away.isEmpty, "\(path): \(marks.joined(separator: ", "))")
             #expect(!marks.isEmpty)
         }
+        // The pool's own code too, from the task's first line: not only the
+        // handler's.
+        #expect(HandlerTaskPool.startedElsewhere == started, "a new task started off its worker's thread")
+        #expect(HandlerTaskPool.ranElsewhere == ran, "a request began off its worker's thread")
     }
 }
