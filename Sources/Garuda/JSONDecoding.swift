@@ -571,6 +571,37 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
         try reader(key).decoded(type)
     }
 
+    // An optional member, found with one walk of the object. The standard
+    // library's own `decodeIfPresent` asks `contains`, then `decodeNil`, then
+    // `decode`: three walks for every optional field of every value decoded.
+
+    /// A reader for `key` when it is there and not null.
+    private func presentReader(_ key: Key) throws -> JSONValueReader? {
+        guard let index = try offset(of: key), !JSONValue.isNull(base, count, at: index) else { return nil }
+        return JSONValueReader(base: base, count: count, index: index, container: path, step: .key(key))
+    }
+
+    func decodeIfPresent(_ type: Bool.Type, forKey key: Key) throws -> Bool? { try presentReader(key)?.bool() }
+    func decodeIfPresent(_ type: String.Type, forKey key: Key) throws -> String? { try presentReader(key)?.string() }
+    func decodeIfPresent(_ type: Double.Type, forKey key: Key) throws -> Double? { try presentReader(key)?.double() }
+    func decodeIfPresent(_ type: Float.Type, forKey key: Key) throws -> Float? {
+        try presentReader(key).map { Float(try $0.double()) }
+    }
+    func decodeIfPresent(_ type: Int.Type, forKey key: Key) throws -> Int? { try presentReader(key)?.signed(Int.self) }
+    func decodeIfPresent(_ type: Int8.Type, forKey key: Key) throws -> Int8? { try presentReader(key)?.signed(Int8.self) }
+    func decodeIfPresent(_ type: Int16.Type, forKey key: Key) throws -> Int16? { try presentReader(key)?.signed(Int16.self) }
+    func decodeIfPresent(_ type: Int32.Type, forKey key: Key) throws -> Int32? { try presentReader(key)?.signed(Int32.self) }
+    func decodeIfPresent(_ type: Int64.Type, forKey key: Key) throws -> Int64? { try presentReader(key)?.signed(Int64.self) }
+    func decodeIfPresent(_ type: UInt.Type, forKey key: Key) throws -> UInt? { try presentReader(key)?.unsigned(UInt.self) }
+    func decodeIfPresent(_ type: UInt8.Type, forKey key: Key) throws -> UInt8? { try presentReader(key)?.unsigned(UInt8.self) }
+    func decodeIfPresent(_ type: UInt16.Type, forKey key: Key) throws -> UInt16? { try presentReader(key)?.unsigned(UInt16.self) }
+    func decodeIfPresent(_ type: UInt32.Type, forKey key: Key) throws -> UInt32? { try presentReader(key)?.unsigned(UInt32.self) }
+    func decodeIfPresent(_ type: UInt64.Type, forKey key: Key) throws -> UInt64? { try presentReader(key)?.unsigned(UInt64.self) }
+
+    func decodeIfPresent<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T? {
+        try presentReader(key)?.decoded(type)
+    }
+
     func nestedContainer<NestedKey: CodingKey>(
         keyedBy type: NestedKey.Type, forKey key: Key
     ) throws -> KeyedDecodingContainer<NestedKey> {

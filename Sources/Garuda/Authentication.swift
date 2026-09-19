@@ -272,23 +272,39 @@ private func credentials(_ header: String, scheme: String) -> Substring? {
 }
 
 /// The token68 of a Bearer header, or nil.
+///
+/// Read as bytes: it is on the path of every request a token guards.
 func parseBearer(_ header: String) -> String? {
-    guard let token = credentials(header, scheme: "bearer") else { return nil }
-    // token68: letters, digits, -._~+/ and trailing =.
-    var seenEquals = false
-    for byte in token.utf8 {
-        switch byte {
-        case UInt8(ascii: "="):
-            seenEquals = true
-        case UInt8(ascii: "a")...UInt8(ascii: "z"), UInt8(ascii: "A")...UInt8(ascii: "Z"),
-             UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "-"), UInt8(ascii: "."),
-             UInt8(ascii: "_"), UInt8(ascii: "~"), UInt8(ascii: "+"), UInt8(ascii: "/"):
-            if seenEquals { return nil }
-        default:
-            return nil
+    var header = header
+    return header.withUTF8 { bytes -> String? in
+        let scheme = 6
+        guard bytes.count > scheme + 1 else { return nil }
+        var i = 0
+        for expected in "bearer".utf8 {
+            guard asciiLower(bytes[i]) == expected else { return nil }
+            i += 1
         }
+        guard bytes[i] == 0x20 else { return nil }
+        while i < bytes.count && bytes[i] == 0x20 { i += 1 }
+        guard i < bytes.count else { return nil }
+        let start = i
+        // token68: letters, digits, -._~+/ and trailing =.
+        var seenEquals = false
+        while i < bytes.count {
+            switch bytes[i] {
+            case UInt8(ascii: "="):
+                seenEquals = true
+            case UInt8(ascii: "a")...UInt8(ascii: "z"), UInt8(ascii: "A")...UInt8(ascii: "Z"),
+                 UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "-"), UInt8(ascii: "."),
+                 UInt8(ascii: "_"), UInt8(ascii: "~"), UInt8(ascii: "+"), UInt8(ascii: "/"):
+                if seenEquals { return nil }
+            default:
+                return nil
+            }
+            i += 1
+        }
+        return String(decoding: UnsafeBufferPointer(rebasing: bytes[start...]), as: UTF8.self)
     }
-    return String(token)
 }
 
 /// The user name and password of a Basic header, or nil for one that is not

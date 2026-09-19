@@ -178,6 +178,56 @@ struct JWTTests {
         #expect(throws: JWTError.self) { try JWTKeys([]) }
     }
 
+    @Test func aHeaderSeenBeforeVouchesForNothingElse() throws {
+        let key = try JWTKey.hmac([UInt8](repeating: 7, count: 32))
+        let set = try keys([key])
+        let good = try set.sign(UserClaims(sub: "a", exp: Int(now) + 60))
+        #expect(try set.verify(good, as: UserClaims.self).sub == "a")
+        // The header is now known; the payload and signature are still checked.
+        #expect(throws: JWTError.self) { try set.verify(tampered(good, part: 1), as: UserClaims.self) }
+        #expect(throws: JWTError.badSignature) { try set.verify(tampered(good, part: 2), as: UserClaims.self) }
+        #expect(try set.verify(good, as: UserClaims.self).sub == "a")
+
+        // A header refused once is refused again: only usable headers are kept.
+        let payload = base64URLEncode(Array(#"{"sub":"a","exp":4102444800,"role":"user"}"#.utf8))
+        let crit = base64URLEncode(Array(#"{"alg":"HS256","crit":["b64"]}"#.utf8)) + "." + payload + ".AAAA"
+        let unknown = base64URLEncode(Array(#"{"alg":"HS999"}"#.utf8)) + "." + payload + ".AAAA"
+        for _ in 0..<2 {
+            #expect(throws: JWTError.unsupported("crit")) { try set.verify(crit, as: UserClaims.self) }
+            #expect(throws: JWTError.unsupported("HS999")) { try set.verify(unknown, as: UserClaims.self) }
+        }
+
+        // More headers than the cache keeps: each still verifies, whether it
+        // was kept or decoded again.
+        for n in 0..<(JWTHeaderCache.capacity + 4) {
+            let header = base64URLEncode(Array(#"{"alg":"HS256","typ":"JWT\#(n)"}"#.utf8))
+            let input = header + "." + payload
+            let token = input + "." + base64URLEncode(try key.sign(Array(input.utf8)))
+            for _ in 0..<2 { #expect(try set.verify(token, as: UserClaims.self).sub == "a") }
+        }
+    }
+
+    @Test func base64URLIsDecodedFromBytesAsFromText() {
+        var seed: UInt64 = 0x9E37_79B9_7F4A_7C15
+        for length in 0..<70 {
+            var bytes: [UInt8] = []
+            for _ in 0..<length {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                bytes.append(UInt8(truncatingIfNeeded: seed >> 33))
+            }
+            let encoded = base64URLEncode(bytes)
+            let decoded = Array(encoded.utf8).withUnsafeBufferPointer { base64URLDecode($0) }
+            #expect(decoded == bytes)
+            #expect(decoded == base64Decode(encoded))
+        }
+        for bad in ["A", "AB!C", "AB C", "ABCDE"] {
+            #expect(Array(bad.utf8).withUnsafeBufferPointer { base64URLDecode($0) } == nil)
+        }
+        // Padding, and the standard alphabet, are let through.
+        #expect(Array("-_8=".utf8).withUnsafeBufferPointer { base64URLDecode($0) }
+                == Array("+/8=".utf8).withUnsafeBufferPointer { base64URLDecode($0) })
+    }
+
     @Test func registeredClaimsAreChecked() throws {
         let secret = [UInt8](repeating: 7, count: 32)
         let set = try keys([try .hmac(secret)], JWTValidation(issuer: "shop", audience: "api", leewaySeconds: 30))

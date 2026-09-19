@@ -46,6 +46,15 @@ typedef struct gjw_key gjw_key;
 int gjw_hmac(int alg, const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len,
              uint8_t *out, size_t out_cap);
 
+/* An HMAC keyed once, for many MACs under the same key: the digest looked
+ * up and the key's pads hashed at the start, not for every token. */
+typedef struct gjw_mac gjw_mac;
+gjw_mac *gjw_mac_new(int alg, const uint8_t *key, size_t key_len);
+void gjw_mac_free(gjw_mac *mac);
+/* The MAC of `data`, from a copy of the keyed state, so threads may share
+ * one `gjw_mac`. Returns the MAC's length. */
+int gjw_mac_compute(const gjw_mac *mac, const uint8_t *data, size_t data_len, uint8_t *out, size_t out_cap);
+
 /* A key from PEM: a public key, a certificate, or a private key (PKCS #8, or
  * the traditional RSA and EC forms). `has_private` says which it was. */
 gjw_key *gjw_key_from_pem(const char *pem, size_t len, int *has_private);

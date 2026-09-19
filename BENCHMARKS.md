@@ -374,6 +374,18 @@ Two were well behind, and CPU per request says it was work, not waiting:
   it has gone. The same run afterwards: 2,074 against axum's 2,075, at
   1,882 µs a request against 1,917.
 - **me**, a bearer token checked on every request, cost 81 µs against 32.
+  The token was split and base64-decoded as Swift strings, a character at a
+  time; its header, the same on every token an issuer writes, was decoded
+  again each time; the HMAC looked its digest up and hashed the key's pads
+  for every token; and every optional field the JSON coder read -- four in
+  the registered claims -- walked the object three times, since the
+  container left `decodeIfPresent` to the standard library's default. Now
+  the token is read from its bytes, a key set keeps the headers it has
+  decoded, an HMAC key is set up once, and an optional member is found in
+  one walk. The same run afterwards: 115,884 against axum's 129,923, at 43
+  µs a request against 28. What is left is spread thin: the HMAC, the task
+  an async route runs on, and generic metadata looked up for the claims
+  type, none of it more than a few percent.
 
 Garuda's p99 is higher than axum's on the small requests, where its p50 is
 lower: requests are spread over eight processes by the kernel as they

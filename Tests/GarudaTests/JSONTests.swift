@@ -229,6 +229,42 @@ struct JSONDecodingTests {
         #expect(throws: JSONError.self) { try decode(Double.self, "-1e400") }
     }
 
+    @Test func anOptionalMemberIsMissingNullOrItsValue() throws {
+        struct Optionals: Decodable, Equatable {
+            var flag: Bool?
+            var name: String?
+            var ratio: Double?
+            var small: Float?
+            var count: Int?
+            var tiny: Int8?
+            var wide: Int64?
+            var bytes: UInt8?
+            var big: UInt64?
+            var author: Author?
+            var tags: [String]?
+        }
+        let none = Optionals()
+        #expect(try decode(Optionals.self, "{}") == none)
+        #expect(try decode(Optionals.self, """
+            {"flag":null,"name":null,"ratio":null,"small":null,"count":null,"tiny":null,
+             "wide":null,"bytes":null,"big":null,"author":null,"tags":null}
+            """) == none)
+        let all = Optionals(flag: false, name: "n", ratio: 0.5, small: 1.5, count: -3, tiny: -8, wide: 1 << 40,
+                            bytes: 255, big: UInt64.max, author: Author(name: "Ada", age: 36), tags: ["a"])
+        #expect(try decode(Optionals.self, """
+            {"tags":["a"],"author":{"name":"Ada","age":36},"big":18446744073709551615,"bytes":255,
+             "wide":1099511627776,"tiny":-8,"count":-3,"small":1.5,"ratio":0.5,"name":"n","flag":false}
+            """) == all)
+        // Present and of the wrong type is still an error, not nil.
+        #expect(throws: JSONError.typeMismatch(path: "count", expected: "Int")) {
+            try decode(Optionals.self, #"{"count":"3"}"#)
+        }
+        #expect(throws: JSONError.self) { try decode(Optionals.self, #"{"bytes":256}"#) }
+        #expect(throws: JSONError.typeMismatch(path: "author.age", expected: "Int")) {
+            try decode(Optionals.self, #"{"author":{"name":"Ada","age":"x"}}"#)
+        }
+    }
+
     @Test func aValueOfTheWrongShapeSaysWhereItIs() throws {
         #expect(throws: JSONError.typeMismatch(path: "age", expected: "Int")) {
             try decode(Author.self, #"{"name":"Ada","age":"old"}"#)

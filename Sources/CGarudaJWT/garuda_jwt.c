@@ -1,5 +1,6 @@
 #include "garuda_jwt.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <openssl/bio.h>
@@ -37,6 +38,52 @@ int gjw_hmac(int alg, const uint8_t *key, size_t key_len, const uint8_t *data, s
     static const uint8_t empty = 0;
     if (!HMAC(md, key_len ? key : &empty, (int)key_len, data_len ? data : &empty, data_len, out, &len)) return -1;
     return (int)len;
+}
+
+struct gjw_mac {
+    EVP_MAC_CTX *keyed;
+    size_t size;
+};
+
+gjw_mac *gjw_mac_new(int alg, const uint8_t *key, size_t key_len) {
+    const char *digest = alg == GJW_HS256 ? "SHA256" : alg == GJW_HS384 ? "SHA384" : alg == GJW_HS512 ? "SHA512" : NULL;
+    if (!digest || key_len == 0) return NULL;
+    EVP_MAC *hmac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    if (!hmac) return NULL;
+    EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(hmac);
+    /* The context holds its own reference. */
+    EVP_MAC_free(hmac);
+    if (!ctx) return NULL;
+    OSSL_PARAM params[2] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, (char *)digest, 0),
+        OSSL_PARAM_construct_end(),
+    };
+    gjw_mac *mac = malloc(sizeof *mac);
+    if (!mac || !EVP_MAC_init(ctx, key, key_len, params)) {
+        free(mac);
+        EVP_MAC_CTX_free(ctx);
+        return NULL;
+    }
+    mac->keyed = ctx;
+    mac->size = EVP_MAC_CTX_get_mac_size(ctx);
+    return mac;
+}
+
+void gjw_mac_free(gjw_mac *mac) {
+    if (!mac) return;
+    EVP_MAC_CTX_free(mac->keyed);
+    free(mac);
+}
+
+int gjw_mac_compute(const gjw_mac *mac, const uint8_t *data, size_t data_len, uint8_t *out, size_t out_cap) {
+    if (!mac || out_cap < mac->size) return -1;
+    EVP_MAC_CTX *ctx = EVP_MAC_CTX_dup(mac->keyed);
+    if (!ctx) return -1;
+    static const uint8_t empty = 0;
+    size_t len = 0;
+    int ok = EVP_MAC_update(ctx, data_len ? data : &empty, data_len) && EVP_MAC_final(ctx, out, &len, out_cap);
+    EVP_MAC_CTX_free(ctx);
+    return ok ? (int)len : -1;
 }
 
 static int classify(EVP_PKEY *pkey) {

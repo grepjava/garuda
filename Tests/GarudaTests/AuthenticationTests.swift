@@ -67,6 +67,26 @@ struct AuthenticationTests {
         #expect(try client.get("/admin", headers: [("authorization", noColon)]).status == 401)
     }
 
+    @Test func aBearerHeaderIsReadAsTheToken68ItCarries() {
+        let cases: [(String, String?)] = [
+            ("Bearer abc.def-_~+/", "abc.def-_~+/"),
+            ("bearer   abc", "abc"),
+            ("BEARER abc==", "abc=="),
+            ("Bearer abc=d", nil),
+            ("Bearer a b", nil),
+            ("Bearer ümlaut", nil),
+            ("Bearer", nil),
+            ("Bearer ", nil),
+            ("Bearer    ", nil),
+            ("Bearerabc", nil),
+            ("Basic abc", nil),
+            ("", nil),
+        ]
+        for (header, token) in cases {
+            #expect(parseBearer(header) == token, "\(header)")
+        }
+    }
+
     @Test func theExtractorsParseTheSameHeaders() throws {
         let app = Application()
         app.get("/token") { (bearer: BearerToken) in bearer.token }

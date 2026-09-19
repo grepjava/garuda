@@ -38,6 +38,12 @@
 // public half; signing needs the private one.
 //===----------------------------------------------------------------------===//
 
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+import Synchronization
 import AvianCore
 import AvianHTTP
 import CGarudaJWT
@@ -141,6 +147,8 @@ public final class JWTKey: @unchecked Sendable {
     public let keyID: String?
     let secret: [UInt8]
     let handle: OpaquePointer?
+    /// An HMAC secret keyed once, for every token it checks.
+    private let mac: OpaquePointer?
     /// Whether this key can sign: an HMAC secret or a private key.
     public let canSign: Bool
 
@@ -150,10 +158,19 @@ public final class JWTKey: @unchecked Sendable {
         self.secret = secret
         self.handle = handle
         self.canSign = canSign
+        mac = algorithm.isHMAC ? gjw_mac_new(algorithm.code, secret, secret.count) : nil
     }
 
     deinit {
         if let handle { gjw_key_free(handle) }
+        if let mac { gjw_mac_free(mac) }
+    }
+
+    /// The MAC of `input` under this HMAC secret, or a negative length.
+    private func hmac(_ input: UnsafeBufferPointer<UInt8>, into out: inout [UInt8]) -> Int {
+        let data = input.baseAddress ?? UnsafePointer(bitPattern: 1)!
+        if let mac { return Int(gjw_mac_compute(mac, data, input.count, &out, out.count)) }
+        return Int(gjw_hmac(algorithm.code, secret, secret.count, data, input.count, &out, out.count))
     }
 
     /// An HMAC secret, at least as many bytes as the algorithm's hash.
@@ -303,7 +320,7 @@ public final class JWTKey: @unchecked Sendable {
         var out = [UInt8](repeating: 0, count: 1024)
         let length: Int
         if algorithm.isHMAC {
-            length = Int(gjw_hmac(algorithm.code, secret, secret.count, input, input.count, &out, out.count))
+            length = input.withUnsafeBufferPointer { hmac($0, into: &out) }
         } else {
             length = gjw_sign(handle, algorithm.code, input, input.count, &out, out.count)
         }
@@ -314,7 +331,7 @@ public final class JWTKey: @unchecked Sendable {
     func verify(_ input: [UInt8], signature: [UInt8]) -> Bool {
         if algorithm.isHMAC {
             var mac = [UInt8](repeating: 0, count: 64)
-            let length = Int(gjw_hmac(algorithm.code, secret, secret.count, input, input.count, &mac, mac.count))
+            let length = input.withUnsafeBufferPointer { hmac($0, into: &mac) }
             guard length > 0, signature.count == length else { return false }
             var difference: UInt8 = 0
             for i in 0..<length { difference |= mac[i] ^ signature[i] }
@@ -376,7 +393,7 @@ public struct JWTValidation: Sendable {
     }
 }
 
-struct JWTHeader: Codable {
+struct JWTHeader: Codable, Sendable {
     var alg: String
     var typ: String?
     var kid: String?
@@ -412,6 +429,8 @@ public final class JWTKeys: @unchecked Sendable {
     public let validation: JWTValidation
     /// Seconds since the epoch; tests set their own.
     var clock: @Sendable () -> Int64 = { Timestamp.now.secondsSinceEpoch }
+    /// Headers already decoded: an issuer writes the same one on every token.
+    let headers = JWTHeaderCache()
 
     /// Keys as given, unchecked: a published set may repeat or omit a `kid`,
     /// and the first key that matches a token is the one tried.
@@ -460,7 +479,7 @@ public final class JWTKeys: @unchecked Sendable {
     }
 
     func check<Claims: Decodable>(_ token: String, as type: Claims.Type) throws -> Claims {
-        let parsed = try ParsedToken(token)
+        let parsed = try ParsedToken(token, headers: headers)
         guard let key = key(for: parsed.header) else { throw JWTError.unknownKey }
         return try parsed.claims(type, key: key, validation: validation, now: clock())
     }
@@ -482,20 +501,48 @@ struct ParsedToken {
     let payload: [UInt8]
     let signature: [UInt8]
 
-    init(_ token: String) throws(JWTError) {
+    /// Read from the token's bytes, as they are: the two dots found, each
+    /// part decoded from base64url where it lies, and what is signed -- the
+    /// first two parts and the dot between -- taken as one slice. A header
+    /// seen before comes from `headers` without being decoded again.
+    init(_ token: String, headers: JWTHeaderCache? = nil) throws(JWTError) {
         guard token.utf8.count <= 16 * 1024 else { throw .malformed }
-        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 3, !parts[0].isEmpty, !parts[1].isEmpty, !parts[2].isEmpty,
-              let headerBytes = base64Decode(String(parts[0])),
-              let payload = base64Decode(String(parts[1])),
-              let signature = base64Decode(String(parts[2])) else { throw .malformed }
-        guard let header = try? JSONCoder.decode(JWTHeader.self, from: headerBytes) else { throw .malformed }
-        if header.crit != nil { throw .unsupported("crit") }
-        guard JWTAlgorithm(rawValue: header.alg) != nil else { throw .unsupported(header.alg) }
-        self.header = header
-        signingInput = Array(parts[0].utf8) + [0x2E] + Array(parts[1].utf8)
-        self.payload = payload
-        self.signature = signature
+        var text = token
+        let read: Result<(JWTHeader, [UInt8], [UInt8], [UInt8]), JWTError> = text.withUTF8 { all in
+            let dot = UInt8(ascii: ".")
+            guard let first = all.firstIndex(of: dot),
+                  let second = all[(first + 1)...].firstIndex(of: dot),
+                  !all[(second + 1)...].contains(dot),
+                  first > 0, second > first + 1, second + 1 < all.count else { return .failure(.malformed) }
+            let headerPart = UnsafeBufferPointer(rebasing: all[0..<first])
+            let header: JWTHeader
+            if let known = headers?.header(for: headerPart) {
+                header = known
+            } else {
+                guard let bytes = base64URLDecode(headerPart),
+                      let decoded = try? JSONCoder.decode(JWTHeader.self, from: bytes) else {
+                    return .failure(.malformed)
+                }
+                if decoded.crit != nil { return .failure(.unsupported("crit")) }
+                guard JWTAlgorithm(rawValue: decoded.alg) != nil else { return .failure(.unsupported(decoded.alg)) }
+                headers?.keep(decoded, for: headerPart)
+                header = decoded
+            }
+            guard let payload = base64URLDecode(UnsafeBufferPointer(rebasing: all[(first + 1)..<second])),
+                  let signature = base64URLDecode(UnsafeBufferPointer(rebasing: all[(second + 1)...])) else {
+                return .failure(.malformed)
+            }
+            return .success((header, Array(all[0..<second]), payload, signature))
+        }
+        switch read {
+        case .success(let (header, signingInput, payload, signature)):
+            self.header = header
+            self.signingInput = signingInput
+            self.payload = payload
+            self.signature = signature
+        case .failure(let error):
+            throw error
+        }
     }
 
     func claims<Claims: Decodable>(_ type: Claims.Type, key: JWTKey, validation: JWTValidation,
@@ -521,6 +568,65 @@ struct ParsedToken {
             throw JWTError.invalidClaim("claims")
         }
     }
+}
+
+/// Headers a key set has decoded and found usable, by their bytes. A handful
+/// at most: one per issuer and key, in practice.
+final class JWTHeaderCache: Sendable {
+    private let entries = Mutex<[(bytes: [UInt8], header: JWTHeader)]>([])
+    static let capacity = 8
+
+    func header(for bytes: UnsafeBufferPointer<UInt8>) -> JWTHeader? {
+        entries.withLock { entries in
+            for entry in entries where entry.bytes.count == bytes.count {
+                let same = entry.bytes.withUnsafeBufferPointer {
+                    memcmp($0.baseAddress!, bytes.baseAddress!, bytes.count) == 0
+                }
+                if same { return entry.header }
+            }
+            return nil
+        }
+    }
+
+    func keep(_ header: JWTHeader, for bytes: UnsafeBufferPointer<UInt8>) {
+        entries.withLock { entries in
+            // Full, the cache stays as it is: headers that vary without end
+            // are decoded each time rather than churning it.
+            guard entries.count < JWTHeaderCache.capacity else { return }
+            entries.append((Array(bytes), header))
+        }
+    }
+}
+
+/// base64url as JWS writes it -- no padding, though padding is let through --
+/// decoded from bytes. The standard alphabet's + and / are taken too.
+func base64URLDecode(_ input: UnsafeBufferPointer<UInt8>) -> [UInt8]? {
+    var count = input.count
+    while count > 0 && input[count - 1] == UInt8(ascii: "=") { count -= 1 }
+    if count % 4 == 1 { return nil }
+    var out: [UInt8] = []
+    out.reserveCapacity(count * 3 / 4)
+    var accumulated: UInt32 = 0
+    var bits = 0
+    for i in 0..<count {
+        let byte = input[i]
+        let value: UInt8
+        switch byte {
+        case UInt8(ascii: "A")...UInt8(ascii: "Z"): value = byte &- UInt8(ascii: "A")
+        case UInt8(ascii: "a")...UInt8(ascii: "z"): value = byte &- UInt8(ascii: "a") &+ 26
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): value = byte &- UInt8(ascii: "0") &+ 52
+        case UInt8(ascii: "-"), UInt8(ascii: "+"): value = 62
+        case UInt8(ascii: "_"), UInt8(ascii: "/"): value = 63
+        default: return nil
+        }
+        accumulated = (accumulated << 6) | UInt32(value)
+        bits += 6
+        if bits >= 8 {
+            bits -= 8
+            out.append(UInt8(truncatingIfNeeded: accumulated >> UInt32(bits)))
+        }
+    }
+    return out
 }
 
 // MARK: - In routes
