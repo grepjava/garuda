@@ -77,6 +77,14 @@ nothing relevant.
 
 ## Unreleased
 
+## 1.0.1 — 2026-09-20
+
+Documentation only. `Sources/` and `Package.swift` are byte-identical to
+1.0.0, so the library and the binaries are unchanged; this release exists
+because 1.0.0 shipped documentation written before it was released. It told a
+reader that nothing had been released, to depend on `branch: "main"`, and to
+install Swift 6.1 where the manifest requires 6.2 -- which fails the build.
+
 - `DEPLOYMENT.md` says how Garuda is published: what the Swift Package Index
   needs, how a release reaches it, what its compatibility matrix will and will
   not show, and the release checklist. `.spi.yml` asks the index to build DocC
