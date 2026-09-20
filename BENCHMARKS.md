@@ -332,45 +332,66 @@ Garuda is ahead on eleven of the fourteen and behind on three: `db` by 2%,
 ### The same over HTTPS
 
 `TLS=1`, the same run: Garuda on OpenSSL 3.5, axum on rustls 0.23 through
-axum-server, the same self-signed P-256 certificate.
+axum-server, the same self-signed P-256 certificate. Taken after the error
+queue moved off the hot path (aviancore 0.6.7), which is worth two to three
+microseconds of CPU on every TLS request.
 
 | workload | Garuda | axum |
 |---|---|---|
-| user | **127,253** (1.55; 32) | 109,694 (1.49; 29) |
-| json | **103,125** (2.02; 44) | 96,032 (1.84; 37) |
-| db | 34,321 (3.61; 113) | **39,945** (2.81; 81) |
-| stream | **14,075** (7.9; 260) | 10,651 (42.0; 144) |
-| me | 97,568 (2.35; 49) | **104,492** (1.95; 34) |
-| upload | **2,125** (62; 1,827) | 1,335 (114; 3,434) |
-| download | 1,679 (77; 2,368) | **1,794** (49; 1,790) |
-| relay | **7,927** (13.6; 574) | 2,970 (46.7; 741) |
-| churn | 4,855 (26.6; 1,018) | **5,907** (16.6; 576) |
-| h2 | 83,560 (1.35; 46) | **90,338** (1.75; 36) |
-| overload | 28,095 (70; 139) | **32,632** (37; 100) |
-| recovery | 109,446 (1.66; 36) | **116,894** (1.44; 26) |
-| skew | 46,482 (4.56; 106) | **51,373** (3.20; 70) |
-| spike | 55,752 (4.29; 86) | **62,347** (2.98; 56) |
+| user | **128,996** (1.60; 31) | 109,391 (1.40; 29) |
+| json | **104,934** (2.07; 42) | 97,353 (1.75; 37) |
+| db | 34,935 (3.99; 106) | **39,155** (3.34; 77) |
+| stream | **12,572** (9.3; 260) | 12,215 (42.0; 128) |
+| me | 100,625 (2.23; 46) | **104,283** (1.86; 34) |
+| upload | **2,295** (56; 1,558) | 1,323 (119; 3,447) |
+| download | 1,589 (59; 2,313) | **1,758** (50; 1,810) |
+| relay | **7,937** (13.9; 565) | 3,113 (45.0; 660) |
+| churn | 4,850 (24.9; 995) | **5,853** (17.4; 578) |
+| h2 | 88,946 (1.20; 43) | **91,703** (1.66; 35) |
+| overload | 28,371 (69; 132) | **32,639** (47; 96) |
+| recovery | 113,880 (1.60; 33) | **117,210** (1.39; 26) |
+| skew | 45,919 (4.50; 110) | **52,205** (3.08; 69) |
+| spike | 55,489 (4.24; 88) | **64,075** (2.83; 55) |
 
 In the clear Garuda leads eleven of fourteen; over HTTPS it leads five. The
-difference is what TLS adds to a request's CPU, and it is not the same for the
-two:
+difference is what TLS adds to a request's CPU, and it is not the same for
+the two:
 
-| request | Garuda, clear → HTTPS | axum, clear → HTTPS |
+| request | Garuda, clear -> HTTPS | axum, clear -> HTTPS |
 |---|---|---|
-| user | 20 → 32 µs (+12) | 24 → 29 µs (+5) |
-| json | 29 → 44 µs (+15) | 32 → 37 µs (+5) |
-| me | 35 → 49 µs (+14) | 32 → 34 µs (+2) |
-| churn | 65 → 1,018 µs (+953) | 94 → 576 µs (+482) |
+| user | 20 -> 31 us (+11) | 24 -> 29 us (+5) |
+| json | 29 -> 42 us (+13) | 32 -> 37 us (+5) |
+| me | 35 -> 46 us (+11) | 32 -> 34 us (+2) |
+| churn | 65 -> 995 us (+930) | 94 -> 578 us (+484) |
 
 OpenSSL costs Garuda two to three times what rustls costs axum per request,
 and on `churn`, which is a full handshake a request, nearly twice. That is
 where the HTTPS gap comes from, not from the request handling: `user` is 29%
-ahead in the clear and 16% ahead over TLS, and the whole of that narrowing is
-the 7 microseconds of extra TLS CPU.
+ahead in the clear and 18% ahead over TLS.
 
-`json` is the one that moved. It is now 7% ahead over HTTPS, where the same
-request was behind before the JSON work: reading and writing the type
-directly saves enough to cover part of what OpenSSL costs.
+Profiling both servers on one pinned worker found where it goes. On a
+keep-alive request OpenSSL is 22% of Garuda's CPU, and the largest single
+symbol in it was `ERR_clear_error` at 1.37% of the whole process -- three
+times what encrypting the data cost -- which is now off the hot path. What
+is left is the record layer's own bookkeeping: `EVP_CIPHER_CTX_ctrl` and
+`EVP_CIPHER_CTX_get_iv_length` about 0.7% together, and the buffer
+allocation `SSL_MODE_RELEASE_BUFFERS` asks for, about 0.7%. On a handshake
+72% of Garuda's CPU is OpenSSL, and it is EVP object churn rather than
+mathematics: `EVP_PKEY_generate` 11.8%, `EVP_PKEY_fromdata` and its
+parameters 8.5%, algorithm fetching 2.9%. For contrast axum's handshake is
+`aws_lc` RDRAND 25.9%, SHA-512 15.2% and X25519 8.3% -- primitives, not
+bookkeeping. Both negotiate the same TLS 1.3 with the same cipher and the
+same X25519MLKEM768 group, both resume sessions, and kernel TLS is a
+regression here rather than a win (below), so none of those explain it.
+
+**kernel TLS is not worth switching on here.** The same sweep with
+`--ktls`: every one of the fourteen workloads slower, by 2 to 9% -- `user`
+120,473, `json` 98,451, `download` 1,532, `skew` 45,716 -- while axum's rows
+moved under 1%, so the box was steady. This machine has no NIC TLS offload,
+so software kTLS buys a copy and pays for setting it up, and the connection
+migration it allows does not cover that. It stays off by default, which is
+what `--ktls` already documents.
+
 ## What changed, and when
 
 The figures above are of one tree. These are the changes that moved them,
@@ -378,17 +399,24 @@ newest first, so that a number can be traced to a commit. None of them is
 re-measured here: each was measured against the tree before it, and those
 trees are gone.
 
+- `fc66653` `@PostgresRow` writes a type's reader, so a result row does not
+  go through `Codable`. It made no difference to `db` that can be told from
+  noise, which is recorded with it.
+- `b9189f2` aviancore 0.6.7: OpenSSL's error queue is cleared on the way out
+  of a failure rather than before every read and write. Two to three
+  microseconds of CPU off every TLS request.
 - `b1cbbb0` `@JSON` writes a type's JSON reading and writing, so a type does
   not go through `Codable`.
 - `4ce7a9f` `JSONReadable` and `JSONWritable`: the coder takes a type's own
   code when it has it.
-- `58de76c` whether a decoded type has validation rules is asked once for that
-  type, not once a request.
+- `58de76c` whether a decoded type has validation rules is asked once for
+  that type, not once a request.
 - `e9fc721` at most 32 events a loop turn, and 300 µs scheduler slices, so a
   small request's p99 is not twice its median.
 - `7f859cd` a JWT is checked without awaiting when the keys are in hand.
-- `0b60d22` slow connections are gathered onto fewer workers when every worker
-  holds one.
-- `82e4241` `--balance adaptive`: connections are shared among workers by load.
+- `0b60d22` slow connections are gathered onto fewer workers when every
+  worker holds one.
+- `82e4241` `--balance adaptive`: connections are shared among workers by
+  load.
 - `754b34a` TLS records are read ahead, so a request costs one read and not
   two.
