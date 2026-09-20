@@ -392,6 +392,49 @@ so software kTLS buys a copy and pays for setting it up, and the connection
 migration it allows does not cover that. It stays off by default, which is
 what `--ktls` already documents.
 
+### What the TLS library itself costs
+
+The profile above says the HTTPS gap is OpenSSL's bookkeeping rather than
+Garuda's integration. That is a claim about a library, so it can be measured
+without a server in the way. `benchmarks/tls-probes` compiles one source
+against OpenSSL 3.5.5 and against BoringSSL -- swift-nio-ssl's vendored copy,
+whose prefix header maps the ordinary names onto prefixed ones, so both arms
+are the same program -- and runs a client and a server in one process over a
+socketpair, counting `CLOCK_PROCESS_CPUTIME_ID`. One core, five alternating
+pairs, ECDSA P-256, the `user` workload's record shape.
+
+Two things had to be pinned first. OpenSSL 3.5 offers X25519MLKEM768 by
+default while BoringSSL takes classical X25519, and OpenSSL leads with
+AES-256-GCM while BoringSSL takes AES-128-GCM; unpinned, the run measures
+those policies rather than the libraries. Both are held at X25519 and
+AES-128-GCM-SHA256, and both arms print what they negotiated.
+
+| | OpenSSL 3.5.5 | BoringSSL | |
+|---|---|---|---|
+| handshake | 752.6 us | **447.7 us** | 40.5% cheaper |
+| record pair, measured | 9.62 us | 8.09 us | 15.9% cheaper |
+| record pair, less the 4.43 us socketpair floor | 5.19 us | **3.66 us** | 29.5% cheaper |
+
+The five pairs do not overlap on either figure: OpenSSL spanned 749.0-757.0
+us of handshake and BoringSSL 447.0-448.8. The floor is the same round trip
+with no TLS at all, and subtracting it separates the library's work from the
+syscall bill both arms pay.
+
+Against the profile shares, that projects to about 6.5% of process CPU on a
+keep-alive HTTPS request (22% of CPU, 29.5% cheaper) and about 29% of it on
+a handshake (72%, 40.5% cheaper). **That projection is arithmetic on a
+profile, not a throughput measurement**, and this tree has already seen a
+profile share fail to turn into throughput once: `@PostgresRow` removed the
+Codable cost the profile attributed 1.5% to and moved `/db` not at all.
+Nothing here has been measured through a server, and swapping the library
+would mean porting `avian_crypto.c`, `avian_acme.c` and `CGarudaJWT` too, so
+this records what the library costs and not a decision to change it.
+
+Note what the comparison does **not** support. swift-nio-ssl is not a third
+option: it vendors this same BoringSSL, so its Swift API cannot be faster
+than the measurement above, and reaching it would mean a memory-BIO buffer
+pump and a SwiftNIO dependency in a server that does its own I/O.
+
 ## What changed, and when
 
 The figures above are of one tree. These are the changes that moved them,

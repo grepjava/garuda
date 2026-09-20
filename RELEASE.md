@@ -1293,6 +1293,12 @@ The Python suites need `h2` and `aioquic`.
   TLS record's 5-byte header and then its body with separate system calls,
   where it now reads what the socket has at once. Not under `--ktls`. Needs
   aviancore 0.6.6.
+- `benchmarks/tls-probes` measures what the TLS library itself costs, with no
+  server in the way: one source compiled against OpenSSL and against
+  BoringSSL, a client and a server in one process over a socketpair, plus the
+  same round trip with no TLS for the syscall floor. The group and the cipher
+  suite are pinned, because the two libraries choose differently by default
+  and an unpinned run measures that choice. BENCHMARKS.md records the result.
 - `benchmarks/workloads.sh` passes `GARUDA_FLAGS` on to Garuda, and with
   `TLS=1` runs every workload over HTTPS: Garuda with OpenSSL, axum with
   rustls through axum-server, the same self-signed P-256 certificate for
