@@ -35,7 +35,7 @@ let package = Package(
     dependencies: [
         // The protocol and systems layers: syscalls, TLS, buffers, the poller,
         // HTTP/1.1, HTTP/2, HTTP/3 and QUIC.
-        .package(url: "https://github.com/grepjava/aviancore", from: "0.6.6"),
+        .package(url: "https://github.com/grepjava/aviancore", from: "0.6.7"),
         // The tracing API the Swift server ecosystem shares: Garuda starts
         // spans, and whichever tracer the application bootstraps records
         // them. No Foundation, no threads of its own.

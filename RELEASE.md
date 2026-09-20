@@ -173,6 +173,11 @@ The Python suites need `h2` and `aioquic`.
   Reading and writing them directly, the `json` workload's request went from
   15.6 to 13.2 microseconds on one worker, 64,000 requests a second to
   75,900.
+- HTTPS costs less per request: aviancore 0.6.7 clears OpenSSL's error queue
+  on the way out of a failure rather than before every read and write, which
+  profiling put at 1.37% of the server's whole CPU -- more than three times
+  what encrypting the data cost. One pinned worker serving HTTPS went from
+  about 76,600 requests a second to 79,100 over three alternating pairs.
 - `@JSON` writes those two conformances, so a type opts out of `Codable`'s
   cost with one line rather than two methods:
 
