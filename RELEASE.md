@@ -77,6 +77,15 @@ nothing relevant.
 
 ## Unreleased
 
+- `DEPLOYMENT.md` also covers the-benchmarker submission: that it goes to
+  `web-frameworks` rather than `website`, the three-route contract, what a
+  Swift entry contains, and that their CI builds and route-checks but never
+  benchmarks. `benchmarks/web-frameworks/swift/garuda` is the entry itself,
+  built against the published tag and route-checked.
+- `benchmarks/ntex` adds an ntex arm, written here because the suite has none,
+  and `benchmarks/fw-arms.sh` runs the framework comparison with each server
+  in its own invocation and the arms rotated.
+
 ## 1.0.1 — 2026-09-20
 
 Documentation only. `Sources/` and `Package.swift` are byte-identical to
