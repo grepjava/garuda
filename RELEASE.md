@@ -1293,12 +1293,28 @@ The Python suites need `h2` and `aioquic`.
   TLS record's 5-byte header and then its body with separate system calls,
   where it now reads what the socket has at once. Not under `--ktls`. Needs
   aviancore 0.6.6.
+- Garuda's TLS record layer and handshake can be built against BoringSSL
+  instead of OpenSSL, through aviancore's `AVIAN_TLS_BORINGSSL`. Measured over
+  HTTPS against the same tree on OpenSSL, CPU a request falls on thirteen of
+  the fourteen workloads and rises on none, and `churn` -- a full handshake a
+  request -- gains **40%** while its CPU drops from 1,017 to 582 microseconds.
+  `user` and `h2` go the other way by 4 to 7%, because BoringSSL ignores
+  `SSL_CTX_set_read_ahead` and so reads a record's header and body separately:
+  exactly 2.00 read syscalls a request against OpenSSL's 1.00. BENCHMARKS.md
+  has the table and the method.
 - `benchmarks/tls-probes` measures what the TLS library itself costs, with no
   server in the way: one source compiled against OpenSSL and against
   BoringSSL, a client and a server in one process over a socketpair, plus the
   same round trip with no TLS for the syscall floor. The group and the cipher
   suite are pinned, because the two libraries choose differently by default
   and an unpinned run measures that choice. BENCHMARKS.md records the result.
+- `benchmarks/tls-arms.sh` runs the HTTPS sweep with the measurement order
+  taken out of it: each arm in an invocation of its own so that every one is
+  the server measured first, and the arms rotated between rounds so each takes
+  each position. This matters because a server measured second reads lower on
+  the bench box, and not by the same amount for every server, so the default
+  order was flattering Garuda. The HTTPS figures in BENCHMARKS.md were
+  re-measured this way and the previous ones withdrawn.
 - `benchmarks/workloads.sh` passes `GARUDA_FLAGS` on to Garuda, and with
   `TLS=1` runs every workload over HTTPS: Garuda with OpenSSL, axum with
   rustls through axum-server, the same self-signed P-256 certificate for

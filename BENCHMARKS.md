@@ -171,6 +171,16 @@ Server logs go to a temporary directory that is removed at the end.
   some 30% below what `vs-axum.sh` reads in 87 seconds, for every server
   alike: the CPU cannot hold its clocks that long. Never read a sweep's figure
   against a short run's.
+- **The order servers are measured in is part of the measurement, and it does
+  not cancel.** `workloads.sh` runs one server through every workload and then
+  the next. Whichever goes second reads lower -- but not equally: on this box
+  Garuda loses about 17% on `user` and axum about 1%, so the default
+  `SERVERS="garuda axum"` quietly flatters Garuda. Whatever is measured first
+  in a whole session reads highest of all. To compare servers, give each an
+  invocation of its own with `SERVERS` naming one, rotate them between rounds
+  so each takes each position, and read the rounds together. Comparing two
+  builds of the *same* server is safe as long as both are measured in the same
+  position.
 
 ## Requests that do work
 
@@ -331,31 +341,97 @@ Garuda is ahead on eleven of the fourteen and behind on three: `db` by 2%,
 
 ### The same over HTTPS
 
-`TLS=1`, the same run: Garuda on OpenSSL 3.5, axum on rustls 0.23 through
-axum-server, the same self-signed P-256 certificate. Taken after the error
-queue moved off the hot path (aviancore 0.6.7), which is worth two to three
-microseconds of CPU on every TLS request.
+> **The figures below replace an earlier table that was measured wrong.**
+> `workloads.sh` runs one server through every workload and then the next,
+> and on this box whichever runs **second reads lower** -- Garuda by about
+> 17% on `user`, axum by about 1%. Because the bias is not the same for the
+> two, running them in one invocation does not cancel it, and the default
+> `SERVERS="garuda axum"` puts Garuda first. The old table was taken that way
+> and **overstated Garuda throughout**; it claimed 128,996 on `user` against
+> axum's 109,391, where measuring each first gives 115,293 against 109,530.
+> A second effect compounds it: whatever is measured first in a session reads
+> highest of all, which is where that 128,996 came from.
+>
+> Everything below gives **each arm an invocation of its own**, so every one
+> is the server measured first, and **rotates the arms over three rounds** so
+> each takes each position exactly once. Figures are the mean of the three.
 
-| workload | Garuda | axum |
+`TLS=1`: Garuda on OpenSSL 3.5.5, the same Garuda with its record layer built
+against BoringSSL, and axum on rustls 0.23 through axum-server, all on the
+same self-signed P-256 certificate. Requests a second, with (p99 ms; CPU
+microseconds a request).
+
+| workload | Garuda, OpenSSL | Garuda, BoringSSL | axum |
+|---|---|---|---|
+| user | 115,293 (1.52; 34) | 106,851 (1.47; 34) | **109,530** (1.50; 29) |
+| json | 94,273 (2.19; 47) | 94,630 (1.93; 45) | **95,542** (1.90; 38) |
+| db | 35,663 (3.46; 107) | 38,606 (3.22; 96) | **39,800** (2.83; 81) |
+| stream | 14,659 (7.44; 245) | **15,154** (6.91; 227) | 10,213 (42.0; 122) |
+| me | 92,034 (2.29; 51) | 91,485 (2.20; 50) | **101,948** (1.96; 35) |
+| upload | 2,127 (58.7; 1,811) | **2,205** (63.1; 1,733) | 1,332 (116; 3,443) |
+| download | 1,705 (75.0; 2,327) | 1,668 (56.8; 2,026) | **1,800** (49.6; 1,799) |
+| relay | 8,013 (14.4; 562) | **8,830** (13.2; 490) | 3,171 (44.8; 638) |
+| churn | 4,834 (26.9; 1,017) | **6,783** (15.8; 582) | 5,896 (16.8; 577) |
+| h2 | 82,320 (1.52; 45) | 79,333 (1.66; 41) | **89,575** (1.76; 36) |
+| overload | 28,777 (65.9; 134) | 30,672 (52.2; 119) | **32,649** (39.0; 101) |
+| recovery | 111,005 (1.57; 35) | 116,306 (1.44; 31) | **116,424** (1.46; 27) |
+| skew | 47,066 (4.58; 105) | 51,135 (3.33; 85) | **51,328** (3.17; 70) |
+| spike | 56,370 (4.20; 84) | 62,279 (3.21; 68) | **62,676** (2.99; 56) |
+
+Measured this way Garuda leads four of fourteen over HTTPS on BoringSSL, and
+is within about a percent of axum on `json`, `recovery`, `skew` and `spike`
+where the old table showed a wider gap in either direction. The honest
+summary is that over TLS the two are close on most small-request workloads,
+Garuda is well ahead where it streams or relays, and axum is ahead on `me`
+and `h2`.
+
+**BoringSSL against OpenSSL, the same tree otherwise.** The record layer and
+handshake compiled against each (`AVIAN_TLS_BORINGSSL`; the libraries live in
+one binary because swift-nio-ssl's copy carries a `CNIOBoringSSL` symbol
+prefix, so ACME and JWT keep OpenSSL). **CPU a request falls on thirteen of
+the fourteen and rises on none**, which is a steadier signal than throughput
+on a box whose absolute level drifts:
+
+| | throughput | CPU a request |
 |---|---|---|
-| user | **128,996** (1.60; 31) | 109,391 (1.40; 29) |
-| json | **104,934** (2.07; 42) | 97,353 (1.75; 37) |
-| db | 34,935 (3.99; 106) | **39,155** (3.34; 77) |
-| stream | **12,572** (9.3; 260) | 12,215 (42.0; 128) |
-| me | 100,625 (2.23; 46) | **104,283** (1.86; 34) |
-| upload | **2,295** (56; 1,558) | 1,323 (119; 3,447) |
-| download | 1,589 (59; 2,313) | **1,758** (50; 1,810) |
-| relay | **7,937** (13.9; 565) | 3,113 (45.0; 660) |
-| churn | 4,850 (24.9; 995) | **5,853** (17.4; 578) |
-| h2 | 88,946 (1.20; 43) | **91,703** (1.66; 35) |
-| overload | 28,371 (69; 132) | **32,639** (47; 96) |
-| recovery | 113,880 (1.60; 33) | **117,210** (1.39; 26) |
-| skew | 45,919 (4.50; 110) | **52,205** (3.08; 69) |
-| spike | 55,489 (4.24; 88) | **64,075** (2.83; 55) |
+| churn | **+40.3%** | 1,017 -> **582 us** |
+| spike | +10.5% | 84 -> 68 |
+| relay | +10.2% | 562 -> 490 |
+| skew | +8.6% | 105 -> 85 |
+| db | +8.3% | 107 -> 96 |
+| overload | +6.6% | 134 -> 119 |
+| recovery | +4.8% | 35 -> 31 |
+| h2 | -3.6% | 45 -> 41 |
+| user | -7.3% | 34 -> 34 |
 
-In the clear Garuda leads eleven of fourteen; over HTTPS it leads five. The
-difference is what TLS adds to a request's CPU, and it is not the same for
-the two:
+`churn` is a handshake a request, and it is the one that moves most, exactly
+as the library probe above predicted: 40.5% cheaper a handshake there, 40.3%
+more throughput here. Two measurements of different things agreeing is the
+reason to believe either.
+
+**Why `user` and `h2` go the other way, and it is not the cryptography.**
+Both use *less* CPU on BoringSSL and still read lower, which is the signature
+of an extra syscall rather than extra work. aviancore 0.6.6 asked OpenSSL to
+read what the socket has in one call instead of a record's 5-byte header and
+then its body in two. BoringSSL lists `SSL_CTX_set_read_ahead` among its
+no-ops -- its header says the function "returns one", and that is all it does
+-- so the request is silently ignored. Counted off the worker while it
+served `/user/12345`:
+
+| | read syscalls | requests | reads a request |
+|---|---|---|---|
+| OpenSSL | 256,092 | 255,802 | **1.00** |
+| BoringSSL | 635,988 | 317,690 | **2.00** |
+
+Exactly one against exactly two. So the keep-alive figures above are what
+BoringSSL gives *while paying an extra read per request*, and a greedy BIO
+that restores read-ahead should recover that ground. Until that is written
+and measured, the `user` and `h2` rows stand as they are.
+
+In the clear Garuda leads eleven of fourteen; over HTTPS, measured the way
+above, it leads four. The difference is what TLS adds to a request's CPU,
+and it is not the same for the two. The figures in the next table are the
+OpenSSL build, which is what the profiling below was done on:
 
 | request | Garuda, clear -> HTTPS | axum, clear -> HTTPS |
 |---|---|---|
@@ -366,8 +442,9 @@ the two:
 
 OpenSSL costs Garuda two to three times what rustls costs axum per request,
 and on `churn`, which is a full handshake a request, nearly twice. That is
-where the HTTPS gap comes from, not from the request handling: `user` is 29%
-ahead in the clear and 18% ahead over TLS.
+where the HTTPS gap comes from rather than from the request handling -- and
+building the record layer against BoringSSL closes most of the `churn` half
+of it, which is the strongest evidence that the diagnosis was right.
 
 Profiling both servers on one pinned worker found where it goes. On a
 keep-alive request OpenSSL is 22% of Garuda's CPU, and the largest single
