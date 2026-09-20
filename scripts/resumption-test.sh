@@ -15,10 +15,14 @@
 # What that does NOT mean here, stated because the obvious inference is wrong.
 # Garuda's server does not call `av_tls_flush_control`, and measured against
 # it the session file is **1,628 bytes whether or not the saving connection
-# makes a request** -- the deferral does not show on this path. Peregrine's
-# server writes 0 bytes without a request; this one does not. So the request
-# below is not what makes these checks assert something, and a comment
-# claiming otherwise would be describing a different server.
+# makes a request**, with `-ign_eof` held constant across both arms. The
+# deferral does not show on this path, so the request below is not what makes
+# these checks assert anything.
+#
+# The variable that decides whether a session file is written at all appears
+# to be `-ign_eof` -- whether `s_client` stays open rather than tearing down
+# on stdin EOF -- and not the request. That is reported from another codebase
+# and is not verified here; what is verified here is the line above.
 #
 # The request stays because the third check needs one -- a server can resume a
 # session and still fail to serve on it -- and because a saving connection
