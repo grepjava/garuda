@@ -749,4 +749,5 @@ work and reports it on the health check instead.
 | [CONNECTORS.md](CONNECTORS.md) | The HTTP client and database drivers: limits and future work |
 | [BENCHMARKS.md](BENCHMARKS.md) | Benchmark method and results |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What an application may depend on, and what a release may change |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Publishing: the Swift Package Index listing, and the release checklist |
 | [RELEASE.md](RELEASE.md) | Changes |

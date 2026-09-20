@@ -77,6 +77,10 @@ nothing relevant.
 
 ## Unreleased
 
+- `DEPLOYMENT.md` says how Garuda is published: what the Swift Package Index
+  needs, how a release reaches it, what its compatibility matrix will and will
+  not show, and the release checklist. `.spi.yml` asks the index to build DocC
+  for the four library targets.
 - The kernel-TLS costs quoted in 1.0.0's notes are withdrawn, and that entry
   now says so. A rotated seven-round re-measurement put the difference at
   1 MiB and 16 MiB inside run-to-run variation; no magnitude replaces the 8%

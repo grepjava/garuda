@@ -1,0 +1,16 @@
+# Swift Package Index build settings.
+#
+# Schema: https://swiftpackageindex.com/swiftpackageindex/spimanifest/documentation
+#
+# `documentation_targets` asks the index to build and host DocC for these
+# targets. The executables are left out: they are the benchmark application and
+# the conformance server, not API anyone imports. `garuda-server` is what the
+# README's quick start runs; it is documented in the markdown, not in DocC.
+version: 1
+builder:
+  configs:
+    - documentation_targets:
+        - Garuda
+        - GarudaUploads
+        - GarudaJSON
+        - GarudaSQL
