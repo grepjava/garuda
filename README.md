@@ -20,7 +20,7 @@ strict on every protocol it speaks, safe by construction, pleasant to build an
 API in, and fast. Handlers run on the worker thread that read the request, with
 no scheduling hop before a response that can be sent at once.
 
-**Released: 1.0.0.** Routes, groups and middleware; synchronous and async
+**Released: 1.0.** Routes, groups and middleware; synchronous and async
 handlers; typed extraction and answers; per-worker state; deadlines; an HTTP
 client; PostgreSQL, Redis and SQLite drivers; streamed responses and request
 bodies; server-sent events; WebSockets; resumable uploads; WebTransport. All
