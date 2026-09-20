@@ -84,7 +84,9 @@ nothing relevant.
   built against the published tag and route-checked.
 - `benchmarks/ntex` adds an ntex arm, written here because the suite has none,
   and `benchmarks/fw-arms.sh` runs the framework comparison with each server
-  in its own invocation and the arms rotated.
+  in its own invocation and the arms rotated. It now stops at the first arm
+  that fails to start, rather than finishing a rotation that is missing one:
+  such a sweep runs faster than a working one, which reads like progress.
 
 ## 1.0.1 — 2026-09-20
 
