@@ -63,6 +63,10 @@ VAPOR=${VAPOR:-$HOME/swiftbench/vapor-framework/.build/release/server}
 AXUM=${AXUM:-$ROOT/benchmarks/axum/target/release/server}
 # The suite's rust/actix entry (benchmarks/actix/), built the same way.
 ACTIX=${ACTIX:-$ROOT/benchmarks/actix/target/release/server}
+# ntex (benchmarks/ntex/). Written here rather than copied: the suite has no
+# ntex entry at the revision the others were taken from, so it follows the same
+# contract and the same release profile and nothing more.
+NTEX=${NTEX:-$ROOT/benchmarks/ntex/target/release/server}
 # The suite's java/vertx entry (benchmarks/vertx/), built with `mvn package`
 # and run as java/vertx/config.yaml runs it, on the JDK that JAVA names.
 VERTX=${VERTX:-$ROOT/benchmarks/vertx/target/server.jar}
@@ -118,6 +122,69 @@ OUT=$(mktemp -d)
 server_trap_cleanup
 server_require_port_free "$PORT" || exit 1
 
+# Servers a previous arm failed to clean up are the reason a later arm in a
+# long sweep reads low: they hold CPU and the port. serverlib stops what this
+# script started, and this catches anything it did not -- an earlier sweep
+# killed mid-run, or a crash that outlived its supervisor. Only the binaries
+# named here are signalled, by their full path, so nothing else on the machine
+# is touched. The bracketed character keeps each pattern from matching this
+# script's own command line.
+reap_servers() {
+    local p pat left
+    for p in "$GARUDA" "$HUMMINGBIRD" "$VAPOR" "$AXUM" "$ACTIX" "$NTEX"; do
+        [ -n "$p" ] || continue
+        # /path/to/server -> /path/to/serve[r]
+        pat="${p%?}[${p: -1}]"
+        pkill -f "$pat" 2>/dev/null
+    done
+    pkill -f "jav[a] -jar .*server.jar" 2>/dev/null
+    pkill -f "bu[n] .*app\.ts" 2>/dev/null
+    pkill -f "bu[n] run cluster\.ts" 2>/dev/null
+    sleep 1
+    left=0
+    for p in "$GARUDA" "$HUMMINGBIRD" "$VAPOR" "$AXUM" "$ACTIX" "$NTEX"; do
+        [ -n "$p" ] || continue
+        pat="${p%?}[${p: -1}]"
+        left=$((left + $(pgrep -cf "$pat" 2>/dev/null || echo 0)))
+    done
+    [ "$left" -gt 0 ] && echo "reap: $left still up" >&2
+    return 0
+}
+
+# Between the repeat runs at a level, the server under test must stay up --
+# killing it would end the measurement. This takes only the others, so a
+# straggler from an earlier arm cannot sit alongside the one being measured.
+# The binary an arm runs, so reaping can spare it.
+binary_for() {
+    case "$1" in
+    garuda) printf '%s' "$GARUDA" ;;
+    hummingbird) printf '%s' "$HUMMINGBIRD" ;;
+    vapor) printf '%s' "$VAPOR" ;;
+    axum) printf '%s' "$AXUM" ;;
+    actix) printf '%s' "$ACTIX" ;;
+    ntex) printf '%s' "$NTEX" ;;
+    vertx) printf '%s' "$VERTX" ;;
+    elysia-bun) printf '%s' "bun" ;;
+    esac
+}
+
+reap_others() {
+    local keep=$1 p pat
+    for p in "$GARUDA" "$HUMMINGBIRD" "$VAPOR" "$AXUM" "$ACTIX" "$NTEX"; do
+        [ -n "$p" ] || continue
+        [ "$p" = "$keep" ] && continue
+        pat="${p%?}[${p: -1}]"
+        pkill -f "$pat" 2>/dev/null
+    done
+    [ "$keep" = "$VERTX" ] || pkill -f "jav[a] -jar .*server.jar" 2>/dev/null
+    case "$keep" in
+    *bun*) ;;
+    *) pkill -f "bu[n] .*app\.ts" 2>/dev/null
+       pkill -f "bu[n] run cluster\.ts" 2>/dev/null ;;
+    esac
+    return 0
+}
+
 start() {
     local server=$1 framework=$2
     case "$server" in
@@ -131,10 +198,11 @@ start() {
     vapor)
         SERVER_HOSTNAME=127.0.0.1 SERVER_PORT=$PORT VAPOR_ENV=production \
             server_start "${PIN_SERVER[@]}" "$VAPOR" serve ;;
-    axum|actix)
+    axum|actix|ntex)
         [ "$PORT" = 3000 ] || { echo "$server listens on 3000; PORT=$PORT"; return 1; }
         local binary=$AXUM
         [ "$server" = actix ] && binary=$ACTIX
+        [ "$server" = ntex ] && binary=$NTEX
         if [ ! -x "$binary" ]; then
             # rust/Dockerfile's build command; the profile repeats Cargo.toml's.
             (cd "$ROOT/benchmarks/$server" && "$CARGO" build --release \
@@ -231,10 +299,13 @@ for framework in $FRAMEWORKS; do
     for server in $SERVERS; do
         # Each framework pairs only with its own servers.
         case "$framework:$server" in
-        swift:garuda|swift:hummingbird|swift:vapor|rust:axum|rust:actix|java:vertx|elysia:elysia-bun) ;;
+        swift:garuda|swift:hummingbird|swift:vapor|rust:axum|rust:actix|rust:ntex|java:vertx|elysia:elysia-bun) ;;
         *) continue ;;
         esac
         server_stop
+        # Before every arm, not only after: what matters is that this arm
+        # starts on a machine with nothing of the last one left on it.
+        reap_servers
         if ! start "$server" "$framework"; then
             printf '%s\t%s\t%s\tFAILED TO START\n' "$framework" "$server" "$WORKERS"
             tail -5 "$OUT/$server-$framework.log"
@@ -244,6 +315,7 @@ for framework in $FRAMEWORKS; do
         for c in $CONNS; do
             runs=""
             for _ in $(seq 1 "$RUNS"); do
+                reap_others "$(binary_for "$server")"
                 runs="$runs$(one_run "$c")"$'\n'
             done
             if [ "$AGG" = mean ]; then
@@ -261,4 +333,5 @@ for framework in $FRAMEWORKS; do
     done
 done
 server_stop
+reap_servers
 rm -rf "$OUT"

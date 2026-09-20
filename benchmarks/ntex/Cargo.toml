@@ -1,0 +1,25 @@
+# ntex, written to the same contract and built with the same release profile as
+# benchmarks/axum and benchmarks/actix, so the three differ in the framework
+# and nothing else. the-benchmarker has no ntex entry at the revision this was
+# taken from, so unlike the others this is not a copy of an upstream directory.
+[package]
+name = "server"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false
+strip = false
+
+[dependencies]
+# The tokio runtime rather than ntex's own, so that the comparison with axum
+# is the framework and not the reactor underneath it.
+ntex = { version = "2", features = ["tokio"] }
