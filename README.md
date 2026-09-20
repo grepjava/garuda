@@ -641,12 +641,10 @@ These work without any handler code, set by flags:
   `SIGHUP` or when the executable is rebuilt (`--reload`).
 - **Unix sockets**, multiple **workers**, and **trusted proxy headers**
   (`--forwarded-allow-ips`).
-
 - **Compression** of handler responses (`--compress`) and a **response cache**
   shared by the workers (`--cache-size`).
 
-`garuda --help` lists every
-flag, and [CONFIG.md](CONFIG.md) explains them.
+`garuda --help` lists every flag, and [CONFIG.md](CONFIG.md) explains them.
 
 ### Signals
 
@@ -731,7 +729,8 @@ work and reports it on the health check instead.
 - `multipart/byteranges`: a request for several ranges at once is answered
   with the whole file.
 - QUIC session resumption and 0-RTT.
-- TLS over TCP in Swift: it is OpenSSL.
+- TLS over TCP in Swift: the record layer is BoringSSL.
+- Kernel TLS: BoringSSL has none, so `--ktls` is accepted and ignored.
 - Windows, except through WSL 2.
 
 ## Documentation

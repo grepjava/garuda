@@ -563,13 +563,14 @@ wider than any ordering drift seen on that box. The pinned-core probe above
 predicted 40.5% cheaper handshakes; a different codebase on a different box
 found 44.6%.
 
-**kernel TLS is not worth switching on here.** The same sweep with
-`--ktls`: every one of the fourteen workloads slower, by 2 to 9% -- `user`
-120,473, `json` 98,451, `download` 1,532, `skew` 45,716 -- while axum's rows
-moved under 1%, so the box was steady. This machine has no NIC TLS offload,
-so software kTLS buys a copy and pays for setting it up, and the connection
-migration it allows does not cover that. It stays off by default, which is
-what `--ktls` already documents.
+**Kernel TLS was not worth switching on here even when it existed**, which
+is part of why losing it was an acceptable trade. Measured while OpenSSL
+still held the record layer, the same sweep with `--ktls` made every one of
+the fourteen workloads slower by 2 to 9% -- `user` 120,473, `json` 98,451,
+`download` 1,532, `skew` 45,716 -- while axum's rows moved under 1%, so the
+box was steady. This machine has no NIC TLS offload, so software kTLS buys a
+copy and pays to set it up. It is unavailable now in any case: `--ktls` is
+accepted and ignored.
 
 ### What the TLS library itself costs
 

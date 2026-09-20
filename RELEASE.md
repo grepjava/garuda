@@ -77,6 +77,13 @@ nothing relevant.
 
 ## Unreleased
 
+- The documentation says what 1.0 made true. It had claimed nothing was
+  released, told readers to depend on `branch: "main"`, asked for Swift 6.1
+  where the manifest requires 6.2, and described TLS as OpenSSL with working
+  kernel TLS. TRANSPORT.md also contradicted itself on whether HTTP/3 selects
+  a certificate by SNI -- it does. COMPATIBILITY.md is rewritten for a
+  released project, the kernel TLS sections say what is now true in a
+  fraction of the space, and the test counts match a verified run.
 - The greedy BIO is ruled out as the cause of HTTP/2's 3% deficit against
   OpenSSL. Measured one binary against itself with aviancore's new
   `AVIAN_NO_GREEDY=1`, five rotated rounds with the first discarded:

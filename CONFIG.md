@@ -265,30 +265,21 @@ Start with a short value such as `300`. A browser that has seen a long
 
 ### Kernel TLS
 
-**The flag does nothing now.** The TLS record layer is BoringSSL's, and
-BoringSSL has no kernel TLS, so every build encrypts in the process. `--ktls`
-is still accepted, and still says at start-up that it is encrypting in the
-process, so that a command line carrying it keeps working.
+**`--ktls` does nothing.** The record layer is BoringSSL, which has no kernel
+TLS, so every build encrypts in the process. The flag is still accepted, and
+the server says at start-up that it is encrypting in the process, so an
+existing command line keeps working.
 
-What it bought, while OpenSSL still did the record layer: a `--static-dir`
-file sent over HTTPS/1.1 went out with `sendfile`, as it does in the clear,
-and under `--balance adaptive` an idle HTTPS connection could move to another
-worker. HTTP/2 and HTTP/3 read files either way, because their bytes are
-framed.
+While OpenSSL held the record layer it bought two things: a `--static-dir`
+file over HTTPS/1.1 went out with `sendfile`, and an idle HTTPS connection
+could move between workers under `--balance adaptive`. HTTP/2 and HTTP/3 never
+benefited, their bytes being framed.
 
-What that costs, measured once and not yet confirmed: static files over
-HTTPS/1.1 go out about **8% slower at 1 MiB and 14% slower at 16 MiB**, for
-about 15% more CPU a gibibyte. Below about 64 KiB it costs nothing --
-BoringSSL is 19% ahead there despite having no kernel TLS. And it costs
-nothing at all over HTTP/2, which could never use `sendfile` anyway, since
-its bytes are framed first. Treat the three magnitudes as provisional: they
-come from a run whose arm order was not rotated, and a re-run that rotates it
-is outstanding. What is not in doubt is which sizes are affected and which
-are not.
-
-It is paid back on everything else TLS does: a handshake is 40 to 45% cheaper
-and CPU a request falls on every workload measured.
-[BENCHMARKS.md](BENCHMARKS.md) has both halves.
+Losing it costs throughput on large files over HTTPS/1.1 and nothing else --
+nothing below about 64 KiB, nothing over HTTP/2 -- against a handshake 40 to
+45% cheaper and CPU a request down on every workload.
+[BENCHMARKS.md](BENCHMARKS.md) has the figures, which are provisional pending
+a re-measurement, and the method.
 
 A build that needs kernel TLS can have it: aviancore built without
 `AVIAN_TLS_BORINGSSL` puts the record layer back on OpenSSL.
