@@ -423,6 +423,8 @@ enum PostgresRowShape {
     /// `query([String].self, "select tags from notes")`: one array column
     /// asked for as a list is that column, not a row of columns.
     case onlyCell
+    /// The type reads itself, from `@PostgresRow` or by hand.
+    case readable(any PostgresReadable.Type)
     case keyed
 
     init<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows) {
@@ -433,6 +435,12 @@ enum PostgresRowShape {
         if rows.columns.count == 1, isArrayColumn.holds(Row.self),
            PostgresType.elementType(of: rows.columns[0].typeOID) != nil {
             self = .onlyCell
+            return
+        }
+        // Asked after the two shapes above, so that a type which reads itself
+        // and is also a single array column keeps meaning what it did.
+        if let reader = PostgresFastPath.reader(for: Row.self) {
+            self = .readable(reader)
             return
         }
         self = .keyed
@@ -448,6 +456,9 @@ private func decodeRow<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows, _
     switch shape {
     case .bytes: return try decoding.onlyCell().decode([UInt8].self) as! Row
     case .onlyCell: return try decoding.onlyCell().decode(Row.self)
+    case .readable(let reader):
+        let cursor = PostgresRowReader(rows: rows, row: row, index: index)
+        return try reader.readRow(cursor) as! Row
     case .keyed: return try Row(from: decoding)
     }
 }

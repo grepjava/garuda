@@ -1,8 +1,8 @@
 import SwiftCompilerPlugin
 import SwiftSyntaxMacros
 
-/// The plugin the compiler loads. One macro so far.
+/// The plugin the compiler loads.
 @main
 struct GarudaMacrosPlugin: CompilerPlugin {
-    let providingMacros: [any Macro.Type] = [JSONMacro.self]
+    let providingMacros: [any Macro.Type] = [JSONMacro.self, PostgresRowMacro.self]
 }

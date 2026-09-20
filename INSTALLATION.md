@@ -125,8 +125,10 @@ let package = Package(
 
 Two more products are there when you want them: `GarudaUploads` for the IETF
 resumable upload protocol, and `GarudaJSON` for `@JSON`, which writes a type's
-JSON reading and writing out instead of leaving it to `Codable`. `GarudaJSON`
-is separate because it is the only part of Garuda that needs swift-syntax: a
+JSON reading and writing out instead of leaving it to `Codable`. `GarudaSQL`
+carries `@PostgresRow`, which does the same for a result row, from the same
+plugin. Those two are separate because they are the only part of Garuda that
+needs swift-syntax: a
 target that does not depend on it never builds the macro plugin, although the
 package is still fetched when Garuda's dependencies are resolved.
 

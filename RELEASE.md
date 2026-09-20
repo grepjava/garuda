@@ -33,7 +33,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1064 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1069 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 11
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -173,6 +173,36 @@ The Python suites need `h2` and `aioquic`.
   Reading and writing them directly, the `json` workload's request went from
   15.6 to 13.2 microseconds on one worker, 64,000 requests a second to
   75,900.
+- `@PostgresRow` writes the conformance that lets a type read itself out of a
+  result row instead of going through `Codable`, the same bargain `@JSON`
+  makes for a request body:
+
+  ```swift
+  import GarudaSQL
+
+  @PostgresRow struct Item: Codable {
+      let id: Int32
+      let name: String
+      let price: Int32
+  }
+  ```
+
+  Nothing at the call site changes: the same `first(Item.self, "select ...")`.
+  A property is read from the column of its own name, and what that column
+  decodes to is what `Codable` decoded it to -- the same binary and text
+  paths, the same errors, a NULL into a non-optional property refused rather
+  than read as zero. An optional property keeps meaning what
+  `decodeIfPresent` meant, so a column the result leaves out is nil rather
+  than an error. The pool asks once per result whether the type wants this,
+  and a type without the attribute is decoded exactly as before. It comes
+  from the same plugin as `@JSON`, in its own product, `GarudaSQL`.
+
+  **What it is worth, measured:** on the `db` workload -- one row of three
+  columns -- nothing that can be told from noise, because what `Codable`
+  costs there is a fraction of a percent of a request that is mostly a
+  round trip to PostgreSQL. The containers do leave the profile. Where it
+  should pay is a result of many rows, where the container is built and torn
+  down for each one; that is not measured here.
 - A result's rows are decoded without asking the runtime the same question
   once a row. What a result is -- a `[UInt8]` scalar, one array column asked
   for as a list, or properties by name -- depends on the type asked for and

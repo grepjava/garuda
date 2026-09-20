@@ -3,6 +3,7 @@ import CAvian
 import AvianCore
 import GarudaPostgres
 @testable import Garuda
+import GarudaSQL
 
 // The PostgreSQL driver against a real server.
 //
@@ -579,5 +580,98 @@ struct PostgresIntegrationTests {
             return (rows.text(row: 0, column: 0) ?? "") + "|" + (rows.text(row: 0, column: 1) ?? "")
         }
         #expect(text.hasPrefix("UTF8|ISO"))
+    }
+}
+
+// MARK: - A row read without Codable
+
+// `@PostgresRow` writes the reader; these check it reads what Codable read.
+// Each is a real query, because what a column decodes to depends on whether
+// the server sent it in text or binary, and only a server decides that.
+
+@PostgresRow private struct MacroPerson: Codable, Equatable {
+    var id: Int
+    var name: String
+}
+
+private struct PlainPerson: Codable, Equatable {
+    var id: Int
+    var name: String
+}
+
+@PostgresRow private struct MacroSparse: Codable, Equatable {
+    var id: Int32
+    var nickname: String?
+    var score: Double?
+}
+
+private struct PlainSparse: Codable, Equatable {
+    var id: Int32
+    var nickname: String?
+    var score: Double?
+}
+
+// Part of the suite above rather than a suite of its own: `onWorker` drives
+// one test application through file-scope state, so two suites running at
+// once would read each other's answers.
+extension PostgresIntegrationTests {
+    @Test func itReadsWhatCodableReads() throws {
+        let text = try onConnection { connection in
+            let rows = try await connection.query(
+                "select 7 as id, 'ana' as name union all select 8, 'bo' order by id")
+            let mine = try decodeAll(MacroPerson.self, rows)
+            let plain = try decodeAll(PlainPerson.self, rows)
+            let same = mine.map(\.id) == plain.map(\.id) && mine.map(\.name) == plain.map(\.name)
+            let read = mine == [MacroPerson(id: 7, name: "ana"), MacroPerson(id: 8, name: "bo")]
+            return "\(read)|\(same)"
+        }
+        #expect(text == "true|true")
+    }
+
+    @Test func aNullOptionalIsNilAndSoIsAColumnThatIsNotThere() throws {
+        let text = try onConnection { connection in
+            let withNulls = try await connection.query(
+                "select 1::int4 as id, null::text as nickname, null::float8 as score")
+            let narrow = try await connection.query("select 2::int4 as id")
+            let a = try decodeAll(MacroSparse.self, withNulls)[0]
+            let b = try decodeAll(PlainSparse.self, withNulls)[0]
+            let c = try decodeAll(MacroSparse.self, narrow)[0]
+            let d = try decodeAll(PlainSparse.self, narrow)[0]
+            return "\(a == MacroSparse(id: 1, nickname: nil, score: nil))"
+                 + "|\(a.nickname == b.nickname && a.score == b.score)"
+                 + "|\(c == MacroSparse(id: 2, nickname: nil, score: nil))"
+                 + "|\(c.nickname == d.nickname)"
+        }
+        #expect(text == "true|true|true|true")
+    }
+
+    @Test func aFilledOptionalIsRead() throws {
+        let text = try onConnection { connection in
+            let rows = try await connection.query(
+                "select 3::int4 as id, 'bo'::text as nickname, 1.5::float8 as score")
+            let one = try decodeAll(MacroSparse.self, rows)[0]
+            return "\(one == MacroSparse(id: 3, nickname: "bo", score: 1.5))"
+        }
+        #expect(text == "true")
+    }
+
+    // A NULL into a property that is not optional, and a column the result
+    // does not carry at all: both are errors for Codable, and both have to
+    // stay errors here or a generated reader quietly invents values.
+    @Test func aNullOrAMissingColumnForANonOptionalIsRefused() throws {
+        let text = try onConnection { connection in
+            var outcomes: [String] = []
+            for sql in ["select 4 as id, null::text as name", "select 5 as id"] {
+                let rows = try await connection.query(sql)
+                do {
+                    _ = try decodeAll(MacroPerson.self, rows)
+                    outcomes.append("decoded")
+                } catch let error as PostgresDecodingError {
+                    outcomes.append("\(error)")
+                }
+            }
+            return outcomes.joined(separator: "|")
+        }
+        #expect(text == "null(column: \"name\")|missingColumn(\"name\")")
     }
 }

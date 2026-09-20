@@ -135,7 +135,10 @@ import GarudaJSON
 ```
 
 Nothing at the call site changes -- the same `Body<Order>`, the same
-`JSON(order)` -- and the type keeps `Codable` for everything else. The macro
+`JSON(order)` -- and the type keeps `Codable` for everything else.
+`@PostgresRow`, from `GarudaSQL`, does the same for a database row: a
+property is read from the column of its own name, and `first(Item.self, ...)`
+is written the same way either way. The macro
 writes the reading and the writing out longhand; the bytes are the same ones
 Codable sent, and the `json` workload's request went from 15.6 microseconds to
 13.2 on one worker. It lives in its own module because it is the only part of

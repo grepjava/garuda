@@ -31,6 +31,8 @@ let package = Package(
         // that needs swift-syntax: an application that does not import it
         // never builds the macro plugin.
         .library(name: "GarudaJSON", targets: ["GarudaJSON"]),
+        // `@PostgresRow`, from the same plugin.
+        .library(name: "GarudaSQL", targets: ["GarudaSQL"]),
     ],
     dependencies: [
         // The protocol and systems layers: syscalls, TLS, buffers, the poller,
@@ -85,6 +87,10 @@ let package = Package(
         .target(name: "GarudaJSON", dependencies: ["Garuda", "GarudaMacros"],
                 swiftSettings: sharedSwiftSettings),
 
+        // The declaration of `@PostgresRow`: `import GarudaSQL`.
+        .target(name: "GarudaSQL", dependencies: ["Garuda", "GarudaMacros"],
+                swiftSettings: sharedSwiftSettings),
+
         // The `garuda` executable. Its module is not named `garuda`, which a
         // case-insensitive file system would take for the `Garuda` module.
         .executableTarget(name: "garuda-server", dependencies: ["Garuda"],
@@ -110,7 +116,8 @@ let package = Package(
 
         .testTarget(name: "GarudaTests",
                     dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
-                                   "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT", "Garuda", "GarudaFuzzTargets",
+                                   "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT", "Garuda", "GarudaSQL",
+                                   "GarudaFuzzTargets",
                                    "CAllocationCounter",
                                    .product(name: "Tracing", package: "swift-distributed-tracing"),
                                    .product(name: "InMemoryTracing", package: "swift-distributed-tracing")],

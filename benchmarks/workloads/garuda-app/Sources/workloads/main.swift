@@ -23,6 +23,7 @@ import Darwin
 #endif
 import Garuda
 import GarudaJSON
+import GarudaSQL
 
 // The three types the JSON workloads carry read and write themselves rather
 // than going through Codable. `@JSON` writes that out; serde's derive on the
@@ -41,7 +42,7 @@ import GarudaJSON
     let count: Int
 }
 
-@JSON struct Item: Codable {
+@JSON @PostgresRow struct Item: Codable {
     let id: Int32
     let name: String
     let price: Int32
