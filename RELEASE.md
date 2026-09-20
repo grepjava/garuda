@@ -77,6 +77,15 @@ nothing relevant.
 
 ## Unreleased
 
+- The greedy BIO is ruled out as the cause of HTTP/2's 3% deficit against
+  OpenSSL. Measured one binary against itself with aviancore's new
+  `AVIAN_NO_GREEDY=1`, five rotated rounds with the first discarded:
+  switching the BIO off moves `h2` from 78,961 to 77,967 requests a second
+  and CPU a request from 38.5 to 40.0, the wrong direction for the
+  hypothesis. The cause of the deficit is unknown and nothing is queued to
+  test. The same run corrects the BIO's own worth to about 1% on `user`,
+  against the nine points implied by the figures either side of when it
+  landed; BENCHMARKS.md marks that attribution unconfirmed.
 - `scripts/resumption-test.sh` checks that a TLS session ticket shortens the
   next connection, over TLS 1.3 and TLS 1.2, and that a resumed connection
   still serves its request -- a server can resume a session and then fail on

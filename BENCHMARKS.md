@@ -493,9 +493,35 @@ So: BoringSSL makes a request about 13% cheaper in CPU whichever transport
 carries it, and HTTP/1.1 turns that into throughput where HTTP/2 does not.
 That is the measurement, and the cause is not known. The tail is not part of
 it: the one measurement that said h2's p99 worsened did not survive
-alternating the arm order. The next thing to test is the greedy BIO itself,
-on and off against this cell, since it is the piece of the change HTTP/2
-exercises differently.
+alternating the arm order.
+
+**It is not the greedy BIO either.** One binary against itself, the BIO
+switched off at run time with `AVIAN_NO_GREEDY=1` so that the two arms differ
+by one branch rather than by a build, five rotated rounds with the first
+discarded and the lead balanced two-all across the rest:
+
+| rounds 2-5 | greedy on | greedy off | |
+|---|---|---|---|
+| `user` req/s | 106,647 / 107,612 / 107,417 / 107,462 | 106,578 / 105,022 / 106,267 / 107,508 | +0.9% |
+| `h2` req/s | 78,759 / 78,717 / 79,925 / 78,442 | 78,437 / 77,929 / 78,052 / 77,450 | +1.3% |
+| `h2` CPU a request | 38.5 us | 40.0 us | -3.8% |
+| `h2` p99 | 1.631 ms | 1.672 ms | -2.4% |
+
+Turning the BIO off makes `h2` **worse**, not better, and every one of the
+four greedy readings beats every plain one. Whatever HTTP/2 is losing, it is
+not this. That was the last standing hypothesis, and the cause is now
+unknown with nothing queued to test.
+
+**A second thing came out of that run, and it is a correction.** The switch
+is worth about **1%** on `user`, not the roughly nine points implied above by
+`user` going from -7.3% to +1.9% against OpenSSL when the BIO landed. Both
+cannot be right. The A/B here is the better measurement -- one binary, one
+branch, rotated rounds -- and the 9-point figure came from comparing two
+separately-taken measurements rather than from an A/B, so it carries whatever
+else moved between them. The arithmetic also favours 1%: on keep-alive
+traffic the BIO saves one `read` a request, 2.00 to 1.00, and one syscall is
+not worth nine percent. **The -7.3%-to-+1.9% attribution should be treated as
+unconfirmed until it is re-measured the way this table was.**
 
 In the clear Garuda leads eleven of fourteen; over HTTPS, measured the way
 above, it leads four. The difference is what TLS adds to a request's CPU,
