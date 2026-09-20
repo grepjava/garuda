@@ -123,6 +123,13 @@ let package = Package(
 )
 ```
 
+Two more products are there when you want them: `GarudaUploads` for the IETF
+resumable upload protocol, and `GarudaJSON` for `@JSON`, which writes a type's
+JSON reading and writing out instead of leaving it to `Codable`. `GarudaJSON`
+is separate because it is the only part of Garuda that needs swift-syntax: a
+target that does not depend on it never builds the macro plugin, although the
+package is still fetched when Garuda's dependencies are resolved.
+
 `Application.run()` reads the flags in [CONFIG.md](CONFIG.md), so your binary is
 started the same way as `garuda`. [README.md](README.md) has a first
 application, and [HANDLER-API.md](HANDLER-API.md) the API's roadmap.

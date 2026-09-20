@@ -9,6 +9,8 @@
 #
 # Tests/CompileFail/control holds code that must compile, so that a harness
 # that cannot find the Garuda module does not pass everything by failing it.
+# The `@JSON` cases need the macro plugin, which `swift build` leaves beside
+# the modules.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -30,6 +32,7 @@ compile() {
         -Xcc -I"$AVIAN/Sources/CAvian/include" \
         -Xcc -I"$ROOT/Sources/CGarudaJWT/include" \
         -Xcc -I"$ROOT/Sources/CGarudaSQLite/include" \
+        -load-plugin-executable "$BUILD/GarudaMacros-tool#GarudaMacros" \
         "$1" 2>&1
 }
 

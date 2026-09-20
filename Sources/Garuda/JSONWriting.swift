@@ -224,6 +224,18 @@ public protocol JSONWritable {
     func write(json output: inout JSONOutput)
 }
 
+extension JSONOutput {
+    /// Writes a value that writes itself.
+    ///
+    /// Generated code spells every member the same way -- `output.write(x)` --
+    /// and this is what catches the ones that are neither a number, a string
+    /// nor a boolean: another type with `@JSON` on it.
+    @inlinable
+    public mutating func write(_ value: some JSONWritable) {
+        value.write(json: &self)
+    }
+}
+
 extension Optional: JSONWritable where Wrapped: JSONWritable {
     public func write(json output: inout JSONOutput) {
         switch self {

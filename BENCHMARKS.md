@@ -738,10 +738,17 @@ workload, one run each. Requests a second, then p99 in milliseconds and the
 server's CPU per request in microseconds where they say something.
 
 Both applications are written the way each framework's documentation writes
-one, and both now generate their JSON code: serde's derive on the axum side,
-and on Garuda's the `JSONReadable` and `JSONWritable` conformances for
-`Order`, `Receipt` and `Item`, written out by hand because `@JSON` is not
-written yet. Everything else in the two applications is unchanged.
+one, and both generate their JSON code: serde's derive on the axum side, and
+`@JSON` on Garuda's, over `Order`, `Receipt` and `Item`. Everything else in
+the two applications is unchanged.
+
+The table below was taken with those three conformances written out by hand,
+an hour before the macro existed. `json` was then re-run against the macro
+build to check that what it generates costs the same: **144,052 requests a
+second against 142,778**, which is the same figure twice. In that re-run axum
+read 134,698 rather than the 113,313 below, because a single workload is a
+short run and the whole sweep is not -- a long sweep reads lower for every
+server on this box -- so only the two Garuda figures are comparable here.
 
 | workload | Garuda | axum |
 |---|---|---|

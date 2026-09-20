@@ -121,7 +121,25 @@ app.post("/login") { (form: Form<Credentials>) in Redirect(to: "/") }
   each message goes whichever of the two refused the request.
 
 JSON goes through Garuda's own coder over `Encodable` and `Decodable`, which
-reads only the keys a type asks for, straight from the request bytes.
+reads only the keys a type asks for, straight from the request bytes. `@JSON`
+takes a type off `Codable` altogether:
+
+```swift
+import GarudaJSON
+
+@JSON struct Order: Codable {
+    let id: Int
+    let name: String
+    let tags: [String]
+}
+```
+
+Nothing at the call site changes -- the same `Body<Order>`, the same
+`JSON(order)` -- and the type keeps `Codable` for everything else. The macro
+writes the reading and the writing out longhand; the bytes are the same ones
+Codable sent, and the `json` workload's request went from 15.6 microseconds to
+13.2 on one worker. It lives in its own module because it is the only part of
+Garuda that needs swift-syntax.
 
 ### The raw layer
 

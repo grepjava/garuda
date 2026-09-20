@@ -11,6 +11,8 @@ let package = Package(
         .package(name: "garuda", path: "../../.."),
     ],
     targets: [
-        .executableTarget(name: "workloads", dependencies: [.product(name: "Garuda", package: "garuda")]),
+        .executableTarget(name: "workloads",
+                          dependencies: [.product(name: "Garuda", package: "garuda"),
+                                         .product(name: "GarudaJSON", package: "garuda")]),
     ]
 )

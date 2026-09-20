@@ -1,4 +1,5 @@
 // swift-tools-version: 6.2
+import CompilerPluginSupport
 import PackageDescription
 
 // Garuda — a pure-Swift web framework. No Foundation.
@@ -26,6 +27,10 @@ let package = Package(
         .executable(name: "garuda-conformance", targets: ["garuda-conformance"]),
         .library(name: "Garuda", targets: ["Garuda"]),
         .library(name: "GarudaUploads", targets: ["GarudaUploads"]),
+        // `@JSON`. A separate product because it is the only thing in Garuda
+        // that needs swift-syntax: an application that does not import it
+        // never builds the macro plugin.
+        .library(name: "GarudaJSON", targets: ["GarudaJSON"]),
     ],
     dependencies: [
         // The protocol and systems layers: syscalls, TLS, buffers, the poller,
@@ -35,6 +40,10 @@ let package = Package(
         // spans, and whichever tracer the application bootstraps records
         // them. No Foundation, no threads of its own.
         .package(url: "https://github.com/apple/swift-distributed-tracing", from: "1.3.0"),
+        // Only the `GarudaJSON` plugin builds against this. It is still
+        // resolved by everyone who depends on Garuda, because SwiftPM resolves
+        // a package's dependencies whether or not a product uses them.
+        .package(url: "https://github.com/swiftlang/swift-syntax", from: "602.0.0"),
     ],
     targets: [
         // Database protocols as byte-level state machines: no sockets, no
@@ -59,6 +68,21 @@ let package = Package(
         // Resumable uploads (draft-ietf-httpbis-resumable-upload), built on the
         // public handler API alone: `import GarudaUploads`.
         .target(name: "GarudaUploads", dependencies: [avian("AvianHTTP"), "Garuda"],
+                swiftSettings: sharedSwiftSettings),
+
+        // `@JSON` reads the members off a declaration and writes the
+        // `JSONReadable` and `JSONWritable` conformances a hand is otherwise
+        // asked to write. It runs in the compiler, so it is its own plugin.
+        .macro(name: "GarudaMacros",
+               dependencies: [.product(name: "SwiftSyntax", package: "swift-syntax"),
+                              .product(name: "SwiftSyntaxBuilder", package: "swift-syntax"),
+                              .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                              .product(name: "SwiftDiagnostics", package: "swift-syntax"),
+                              .product(name: "SwiftCompilerPlugin", package: "swift-syntax")],
+               swiftSettings: sharedSwiftSettings),
+
+        // The declaration of `@JSON`: `import GarudaJSON`.
+        .target(name: "GarudaJSON", dependencies: ["Garuda", "GarudaMacros"],
                 swiftSettings: sharedSwiftSettings),
 
         // The `garuda` executable. Its module is not named `garuda`, which a
@@ -90,6 +114,9 @@ let package = Package(
                                    "CAllocationCounter",
                                    .product(name: "Tracing", package: "swift-distributed-tracing"),
                                    .product(name: "InMemoryTracing", package: "swift-distributed-tracing")],
+                    swiftSettings: [.swiftLanguageMode(.v6)]),
+        .testTarget(name: "GarudaJSONTests",
+                    dependencies: ["Garuda", "GarudaJSON"],
                     swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "GarudaUploadsTests",
                     dependencies: [avian("CAvian"), avian("AvianHTTP"), "Garuda", "GarudaUploads"],

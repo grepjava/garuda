@@ -33,8 +33,8 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1027 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
-bash scripts/compile-fail-test.sh      # 6
+swift test                             # 1064 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+bash scripts/compile-fail-test.sh      # 11
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
 bash scripts/compress-test.sh          # 76, and garuda-conformance
@@ -172,8 +172,35 @@ The Python suites need `h2` and `aioquic`.
   body and 2.5 to encode a small answer, on a request that is otherwise 8.
   Reading and writing them directly, the `json` workload's request went from
   15.6 to 13.2 microseconds on one worker, 64,000 requests a second to
-  75,900. Writing the conformances out is dull and easy to get wrong, and a
-  macro to write them is next.
+  75,900.
+- `@JSON` writes those two conformances, so a type opts out of `Codable`'s
+  cost with one line rather than two methods:
+
+  ```swift
+  import GarudaJSON
+
+  @JSON struct Order: Codable {
+      let id: Int
+      let name: String
+      let tags: [String]
+  }
+  ```
+
+  It reads the stored members off the declaration and writes out the reading
+  and the writing longhand, in the order the members are declared, under their
+  own names. What it generates is what Codable sent, byte for byte: a missing
+  key is an error unless the member is optional, a nil member is left out of
+  the object rather than written as null (a nil inside an array is still
+  null), and a `let` that already holds a value is written and not read, which
+  is what Codable does with one too. `static`, computed and `lazy` members are
+  no more part of the JSON than they are for Codable. It comes as its own
+  module, `GarudaJSON`, because it is the only part of Garuda that needs
+  swift-syntax: an application that never imports it never builds the plugin.
+  Where the macro cannot be sure of the bytes -- a dictionary or a set member,
+  whose order nothing fixes; a generic struct; an initializer in the body,
+  which would have replaced the memberwise one it reads through -- it stops
+  the build and says what to write instead, rather than falling back to
+  Codable quietly and leaving someone wondering why the type is slow.
 - Whether a decoded type has rules is asked once for that type rather than
   once a request. Asking the runtime -- `value as? any Validated` -- costs
   about half a microsecond whether the answer is yes or no, and `Body<T>`,

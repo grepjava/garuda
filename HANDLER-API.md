@@ -210,6 +210,33 @@ cannot show -- a custom `init(from:)` that parses a string -- a type states
 with `OpenAPISchemaDescribing`. Route methods return an `OpenAPIOperation`
 for the rest, so a summary sits beside the route it describes.
 
+### `@JSON` is a macro, where schemas are not
+
+The section above gets OpenAPI schemas out of the `Decodable` conformance a
+route already has, and does not ask anyone to annotate a type. Reading and
+writing JSON is the one place that argument does not hold, and the difference
+is what the compiler can be asked for. A schema is a description, and decoding
+a type once with a recording decoder produces it exactly. Speed is not a
+description: `Codable` decides at run time what a macro can decide at compile
+time -- which member comes next, what type it is, where it goes -- and no
+amount of reading the conformance recovers that. Measured on a small body, the
+deciding is 3.8 microseconds to decode and 2.5 to encode, on a request that is
+otherwise 8.
+
+So `@JSON` writes the `JSONReadable` and `JSONWritable` conformances out, and
+is opt-in twice over: a type without it is decoded and encoded exactly as
+before, and an application that does not import `GarudaJSON` never builds a
+macro plugin at all. That is why it is a separate module rather than part of
+`Garuda`.
+
+It refuses rather than guesses. A dictionary or a set member, whose order
+nothing fixes; a generic struct, whose conformance would need constraints; an
+initializer in the body, which replaces the memberwise initializer the
+generated reader delegates to -- each stops the build with a message naming
+what to write instead. The alternative, falling back to `Codable` for the
+shapes it cannot do, would be the worst of both: the type looks opted in and
+is not, and nothing says so.
+
 ### CORS is a policy of a scope, not a middleware in order
 
 `app.cors` does not take a place among the `use` calls. The innermost scope's
