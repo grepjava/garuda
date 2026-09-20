@@ -526,38 +526,50 @@ regression here rather than a win (below), so none of those explain it.
 request-shaped: the largest body any of them moves is a megabyte, and most
 move a few hundred bytes. They say nothing about a server sending large files
 through `sendfile`, which is the one place kernel TLS earns its keep -- and
-BoringSSL has none, so the switch costs something these rows cannot show.
+BoringSSL has none, so whatever the switch costs there, these rows cannot
+show it.
 
-Peregrine, built on the same aviancore, measured it: one worker, static files,
-`--ktls` on OpenSSL against BoringSSL where the flag is inert.
+Peregrine, built on the same aviancore, measured it on a 4-CPU box: one
+worker, `--static-dir`, seven rounds over three arms with the lead rotating
+and the first round discarded, so each arm led exactly twice.
 
-**These three rows are provisional -- do not quote them yet.** They come from
-two rounds that both ran the baseline arm first, the same structure that
-invented a -7.8% above. Peregrine is re-running them over four rounds
-rotating which arm leads, and these figures will be replaced by that run
-whichever way it comes out. They stay on the page rather than disappearing
-because the direction is also what the mechanism predicts, and because a
-number marked withdrawn is harder to quote by accident than one that was
-silently removed.
+**Static files are where BoringSSL wins by the largest margin.** Against
+OpenSSL without kernel TLS, throughput and CPU move together in every cell and
+the sign matches every earlier run:
 
-| file (provisional) | with kernel TLS | BoringSSL | |
+| file | HTTPS/1.1 | CPU a GiB | HTTP/2 | CPU a GiB |
+|---|---|---|---|---|
+| 64 KiB | +23.5% | -19.4% | +44.8% | -30.8% |
+| 1 MiB | +31.1% | -22.9% | +44.2% | -31.0% |
+| 16 MiB | +30.8% | -22.8% | +35.3% | -25.8% |
+
+**Against OpenSSL *with* kernel TLS, that box cannot resolve the difference,
+and no magnitude should be quoted.** Per round across the six kept rounds,
+HTTPS/1.1, BoringSSL against kTLS:
+
+| file | per-round | mean | spread |
 |---|---|---|---|
-| 64 KiB | 1,009 MiB/s | **1,205** | BoringSSL +19.4% |
-| 1 MiB | **1,895** | 1,736 | -8.4% |
-| 16 MiB | **1,721** | 1,485 | -13.7%, and 15% more CPU a GiB |
+| 64 KiB | +20.3 +35.1 +1.0 +24.8 +24.1 +12.2 | +19.6% | 34 points |
+| 1 MiB | -5.7 +7.0 -24.1 -2.0 +3.1 -5.5 | -4.5% | 31 points |
+| 16 MiB | -0.2 -0.3 -10.1 -2.3 -1.4 -7.3 | -3.6% | 10 points |
 
-So on those provisional figures losing kernel TLS costs about 8% at a
-megabyte and 14% at sixteen, and nothing below about 64 KiB, where BoringSSL
-is ahead anyway. **It costs that on HTTP/1.1 only.** Kernel TLS never helped
-HTTP/2 even when it was
-available -- Peregrine measures h2 as slower with `--ktls` than without it --
-because framed bytes cannot go out by `sendfile` in the first place.
+At 1 MiB the sign changes three times around a 4.5-point mean. That is not a
+measurement. Three runs have now produced -18.6%, -13.7%, -5.0%, -4.5% and
+-3.6% for nominally one quantity, and the earlier -8.4% and -13.7% published
+here are **withdrawn, not confirmed at a smaller value**. What stands: at
+64 KiB BoringSSL is ahead; at 1 MiB and 16 MiB the difference is inside
+run-to-run variation on that hardware. A magnitude for large-file kernel TLS
+needs a quiet dedicated machine.
+
+**It was never an HTTP/2 question.** Kernel TLS is consistently *worse* than
+no kernel TLS over h2 -- 37.6% more CPU a GiB at 1 MiB -- because framed bytes
+cannot go out by `sendfile` in the first place.
 
 Peregrine also measures the handshake through a whole server, on another
 machine, over five pairs: **CPU a request down 44.6%**, 0.361 ms to 0.200.
 The throughput half of that measurement, 2,791 to 4,889 requests a second,
-came from the same unalternated runs and is held with the kernel-TLS rows
-above. The CPU figure is kept because its two distributions do not overlap at
+came from an unalternated run and is withdrawn. The CPU figure is kept
+because its two distributions do not overlap at
 all across the five pairs -- 0.352 to 0.376 ms against 0.190 to 0.209 -- a gap
 wider than any ordering drift seen on that box. The pinned-core probe above
 predicted 40.5% cheaper handshakes; a different codebase on a different box

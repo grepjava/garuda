@@ -275,11 +275,14 @@ file over HTTPS/1.1 went out with `sendfile`, and an idle HTTPS connection
 could move between workers under `--balance adaptive`. HTTP/2 and HTTP/3 never
 benefited, their bytes being framed.
 
-Losing it costs throughput on large files over HTTPS/1.1 and nothing else --
-nothing below about 64 KiB, nothing over HTTP/2 -- against a handshake 40 to
-45% cheaper and CPU a request down on every workload.
-[BENCHMARKS.md](BENCHMARKS.md) has the figures, which are provisional pending
-a re-measurement, and the method.
+What losing it costs has been measured three times and comes out differently
+each time: at 1 MiB and 16 MiB the difference between BoringSSL and
+OpenSSL-with-kernel-TLS is inside run-to-run variation on the box available,
+so **no magnitude is quoted**. At 64 KiB BoringSSL is ahead. Over HTTP/2
+kernel TLS was always the slower of the two, framed bytes never having been
+able to use `sendfile`. Against that: a handshake 40 to 45% cheaper, CPU a
+request down on every workload, and static files 23 to 45% faster than
+OpenSSL without kernel TLS. [BENCHMARKS.md](BENCHMARKS.md) has the method.
 
 A build that needs kernel TLS can have it: aviancore built without
 `AVIAN_TLS_BORINGSSL` puts the record layer back on OpenSSL.

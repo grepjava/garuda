@@ -77,6 +77,11 @@ nothing relevant.
 
 ## Unreleased
 
+- The kernel-TLS costs quoted in 1.0.0's notes are withdrawn, and that entry
+  now says so. A rotated seven-round re-measurement put the difference at
+  1 MiB and 16 MiB inside run-to-run variation; no magnitude replaces the 8%
+  and 14% that were there. What the same run does establish is that static
+  files are 23 to 45% faster on BoringSSL than on OpenSSL without kernel TLS.
 - The documentation says what 1.0 made true. It had claimed nothing was
   released, told readers to depend on `branch: "main"`, asked for Swift 6.1
   where the manifest requires 6.2, and described TLS as OpenSSL with working
@@ -1346,13 +1351,13 @@ nothing relevant.
 
   **What it gives up is kernel TLS**, which BoringSSL does not have, so
   `--ktls` is accepted and ignored and every build encrypts in the process.
-  That costs something only where `sendfile` earned its keep: large static
-  files over HTTPS/1.1, by a margin currently measured at roughly 8% at 1 MiB
-  and 14% at 16 MiB. Those two magnitudes are provisional -- they come from a
-  run whose arm order was not rotated -- and a rotated re-measurement is
-  outstanding; which sizes are affected is not in doubt. Nothing below about
-  64 KiB is affected, and nothing over HTTP/2, whose framed bytes could never
-  take `sendfile` anyway.
+What that costs could not be measured. A rotated seven-round run puts the
+  difference between BoringSSL and OpenSSL-with-kernel-TLS inside run-to-run
+  variation at 1 MiB and 16 MiB, after earlier runs suggested 8% and 14%; five
+  different values have now come back for nominally one quantity, so **no
+  magnitude is quoted**. At 64 KiB BoringSSL is ahead, and over HTTP/2 kernel
+  TLS was always the slower of the two. Against OpenSSL *without* kernel TLS,
+  static files are 23 to 45% faster.
 - `benchmarks/tls-probes` measures what the TLS library itself costs, with no
   server in the way: one source compiled against OpenSSL and against
   BoringSSL, a client and a server in one process over a socketpair, plus the

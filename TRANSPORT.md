@@ -124,10 +124,12 @@ and an idle HTTPS connection could be handed to another worker, because with
 the keys in the socket the descriptor carried all of TLS with it. HTTP/2 and
 HTTP/3 never benefited -- framed bytes cannot go out by `sendfile`.
 
-What that costs is measured in [BENCHMARKS.md](BENCHMARKS.md): large files
-over HTTPS/1.1 only, nothing under about 64 KiB and nothing over HTTP/2, set
-against a handshake 40 to 45% cheaper and CPU a request down on every workload
-measured. A build that needs kernel TLS can have it: aviancore built without
+What that costs, if anything, is at most an HTTPS/1.1 large-file question:
+over HTTP/2 kernel TLS was always the slower of the two, and at 64 KiB
+BoringSSL is ahead of it. At 1 MiB and above the difference is inside
+run-to-run variation on the hardware available, so
+[BENCHMARKS.md](BENCHMARKS.md) quotes no magnitude. Set against a handshake
+40 to 45% cheaper and CPU a request down on every workload measured. A build that needs kernel TLS can have it: aviancore built without
 `AVIAN_TLS_BORINGSSL` puts the record layer back on OpenSSL.
 
 Connection migration therefore moves plaintext HTTP/1.1 connections only. What
