@@ -19,10 +19,18 @@
 # deferral does not show on this path, so the request below is not what makes
 # these checks assert anything.
 #
-# The variable that decides whether a session file is written at all appears
-# to be `-ign_eof` -- whether `s_client` stays open rather than tearing down
-# on stdin EOF -- and not the request. That is reported from another codebase
-# and is not verified here; what is verified here is the line above.
+# What decides whether a session file is written at all is `-ign_eof`, not the
+# request. Measured against this server, all four cells, TLS 1.3:
+#
+#                      -ign_eof        no -ign_eof
+#   with a request     1,628 bytes     no file written
+#   no request         1,628 bytes     no file written
+#
+# Without `-ign_eof`, `s_client` tears down on stdin EOF before the ticket
+# arrives and `-sess_out` never writes. Note the difference between "no file
+# written" and "0 bytes": a harness that runs `stat` on the missing path and
+# reports a size will hand back a finding that is not there. `s_client` exits
+# 0 in all four cells, so its status says nothing either.
 #
 # The request stays because the third check needs one -- a server can resume a
 # session and still fail to serve on it -- and because a saving connection
