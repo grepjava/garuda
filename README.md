@@ -28,6 +28,10 @@ tested. [COMPATIBILITY.md](COMPATIBILITY.md) says what a release may change,
 and [Status](#status) below lists what is missing.
 
 <p align="center">
+  <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/features.png" alt="What Garuda has: HTTP/1.1, HTTP/2 and HTTP/3 over QUIC; TLS 1.2 and 1.3; ACME; WebSocket over HTTP/1.1, HTTP/2 and HTTP/3; WebTransport; server-sent events; cross-worker broadcast; resumable uploads; streamed bodies; static files with ranges; brotli, zstd and gzip; typed extraction; OpenAPI; PostgreSQL, Redis and SQLite; JWT and JWKS; metrics and health checks. Not built in: QUIC 0-RTT, kernel TLS, multipart/byteranges, Redis replica reads, Windows outside WSL 2." width="960">
+</p>
+
+<p align="center">
   <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/benchmark-256.png" alt="Requests per second at 256 connections: ntex 181,303, axum 176,794, Garuda 174,575, Elysia on Bun 167,754, Hummingbird 62,068, Vapor 48,359" width="900">
 </p>
 

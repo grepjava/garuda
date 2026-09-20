@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="600" viewBox="0 0 1100 600" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1100" height="600" fill="#ffffff"/>
+<text x="40" y="52" font-size="27" font-weight="700" fill="#1b1b1b">What Garuda has, and what it has not</text>
+<text x="40" y="84" font-size="16" fill="#6b7280">every line below is implemented and tested · the protocols are in TRANSPORT.md, the rest in the documentation table</text>
+<rect x="40" y="115" width="26" height="3" fill="#c2410c"/>
+<text x="40" y="138" font-size="17" font-weight="700" fill="#1b1b1b">Protocols</text>
+<text x="40" y="176" font-size="14.5" fill="#1b1b1b">HTTP/1.1, HTTP/2, HTTP/3 over QUIC</text>
+<text x="40" y="201" font-size="14.5" fill="#1b1b1b">TLS 1.2 and 1.3, SNI, ALPN</text>
+<text x="40" y="226" font-size="14.5" fill="#1b1b1b">ACME certificates, renewed in place</text>
+<text x="40" y="251" font-size="14.5" fill="#1b1b1b">One worker per CPU, reload with no drops</text>
+<rect x="380" y="115" width="26" height="3" fill="#c2410c"/>
+<text x="380" y="138" font-size="17" font-weight="700" fill="#1b1b1b">Real-time</text>
+<text x="380" y="176" font-size="14.5" fill="#1b1b1b">WebSocket over HTTP/1.1 (RFC 6455),</text>
+<text x="392" y="201" font-size="14.5" fill="#1b1b1b">HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220)</text>
+<text x="380" y="226" font-size="14.5" fill="#1b1b1b">permessage-deflate (RFC 7692)</text>
+<text x="380" y="251" font-size="14.5" fill="#1b1b1b">WebTransport over HTTP/3</text>
+<text x="380" y="276" font-size="14.5" fill="#1b1b1b">Server-sent events, with Last-Event-ID</text>
+<text x="380" y="301" font-size="14.5" fill="#1b1b1b">Broadcast across workers, with replay</text>
+<rect x="720" y="115" width="26" height="3" fill="#c2410c"/>
+<text x="720" y="138" font-size="17" font-weight="700" fill="#1b1b1b">Bodies and files</text>
+<text x="720" y="176" font-size="14.5" fill="#1b1b1b">Resumable uploads: the IETF protocol</text>
+<text x="720" y="201" font-size="14.5" fill="#1b1b1b">Streamed responses, with backpressure</text>
+<text x="720" y="226" font-size="14.5" fill="#1b1b1b">Streamed request bodies, flow-controlled</text>
+<text x="720" y="251" font-size="14.5" fill="#1b1b1b">Static files, byte ranges, listings</text>
+<text x="720" y="276" font-size="14.5" fill="#1b1b1b">brotli, zstd and gzip, as the client accepts</text>
+<text x="720" y="301" font-size="14.5" fill="#1b1b1b">103 Early Hints and other interim responses</text>
+<rect x="40" y="333" width="26" height="3" fill="#c2410c"/>
+<text x="40" y="356" font-size="17" font-weight="700" fill="#1b1b1b">Handlers</text>
+<text x="40" y="394" font-size="14.5" fill="#1b1b1b">Typed path, query, body, form, multipart</text>
+<text x="40" y="419" font-size="14.5" fill="#1b1b1b">Custom and async extractors, optional</text>
+<text x="40" y="444" font-size="14.5" fill="#1b1b1b">Groups, nested routers, 405 with Allow</text>
+<text x="40" y="469" font-size="14.5" fill="#1b1b1b">Middleware before the handler and on send</text>
+<text x="40" y="494" font-size="14.5" fill="#1b1b1b">Deadlines, cancellation, blocking pool</text>
+<text x="40" y="519" font-size="14.5" fill="#1b1b1b">OpenAPI and Swagger UI from the types</text>
+<rect x="380" y="333" width="26" height="3" fill="#c2410c"/>
+<text x="380" y="356" font-size="17" font-weight="700" fill="#1b1b1b">Data</text>
+<text x="380" y="394" font-size="14.5" fill="#1b1b1b">PostgreSQL driver on the poller</text>
+<text x="380" y="419" font-size="14.5" fill="#1b1b1b">Redis and Valkey: RESP3, cluster, pub/sub</text>
+<text x="380" y="444" font-size="14.5" fill="#1b1b1b">SQLite: WAL, migrations, reader per worker</text>
+<text x="380" y="469" font-size="14.5" fill="#1b1b1b">HTTP client: HTTP/1.1 and HTTP/2, SSE</text>
+<rect x="720" y="333" width="26" height="3" fill="#c2410c"/>
+<text x="720" y="356" font-size="17" font-weight="700" fill="#1b1b1b">Security and operations</text>
+<text x="720" y="394" font-size="14.5" fill="#1b1b1b">JWT and JWKS, sessions, CSRF, CORS</text>
+<text x="720" y="419" font-size="14.5" fill="#1b1b1b">Rate limits, allowed hosts, address filter</text>
+<text x="720" y="444" font-size="14.5" fill="#1b1b1b">Security headers, request IDs, trace context</text>
+<text x="720" y="469" font-size="14.5" fill="#1b1b1b">Access log, OpenTelemetry spans</text>
+<text x="720" y="494" font-size="14.5" fill="#1b1b1b">Prometheus metrics, health check, drain</text>
+<text x="40" y="578" font-size="14" fill="#6b7280">Not built in: QUIC 0-RTT and session resumption · kernel TLS · multipart/byteranges · reads from Redis replicas · Windows outside WSL 2</text>
+</svg>

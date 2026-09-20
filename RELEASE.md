@@ -87,10 +87,11 @@ nothing relevant.
   in its own invocation and the arms rotated. It now stops at the first arm
   that fails to start, rather than finishing a rotation that is missing one:
   such a sweep runs faster than a working one, which reads like progress.
-- The README opens with a throughput chart of the six servers at 256
-  connections, drawn by `benchmarks/chart.py` from the sweep log kept in
-  `benchmarks/results/`, so the picture cannot drift from the figures.
-  BENCHMARKS.md gains the rotated run behind it, with every round.
+- The README opens with two charts: what Garuda speaks and what it does not
+  (`scripts/feature-chart.py`), and the six servers' throughput at 256
+  connections (`benchmarks/chart.py`, drawn from the sweep log kept in
+  `benchmarks/results/`, so the picture cannot drift from the figures).
+  BENCHMARKS.md gains the rotated run behind the second, with every round.
 
 ## 1.0.1 — 2026-09-20
 
