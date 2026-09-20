@@ -22,10 +22,23 @@
 #
 # The request stays because the third check needs one -- a server can resume a
 # session and still fail to serve on it -- and because a saving connection
-# that behaves like a real client is the case worth testing. The check that
-# stops the rest being vacuous is the last one: a connection offering no
-# ticket must report New, which is what distinguishes real resumption from a
-# server that says Reused to everything.
+# that behaves like a real client is the case worth testing.
+#
+# Which check catches what, established by constructing each failure rather
+# than by reasoning about it:
+#
+#   a server that issues no ticket    the non-empty-file check catches it
+#                                     first. Fed an empty session file the
+#                                     other two fail as well: s_client prints
+#                                     neither New nor Reused and the request
+#                                     gets no 200.
+#   a server that claims Reused for   the last check catches it, and only
+#   every connection                  that one -- a connection offering no
+#                                     ticket must report New.
+#
+# So there is no single load-bearing assertion; there are two guards for two
+# different failures. Removing either leaves a real way for this file to go
+# green against a broken server.
 #
 # Needs the release build (or GARUDA, or the path as the first argument),
 # curl, openssl, and python3 for picking a free port; PORT overrides it.
