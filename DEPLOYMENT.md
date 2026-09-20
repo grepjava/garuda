@@ -213,9 +213,13 @@ repository's rake tasks from `config.yaml`. Do not write them by hand.
 **Their shared Swift build stage already installs `libssl-dev` and
 `zlib1g-dev`**, which are Garuda's only system dependencies, so the
 language-level image needs no change. The runtime stage is `swift:6.3-slim`
-plus curl; it is worth confirming that `libssl.so.3` and `libz.so.1` are in
-it, since the other Swift entries reach TLS through a vendored BoringSSL and
-would not prove it.
+plus curl, and it carries `libssl.so.3`, `libcrypto.so.3` and `libz.so.1`
+(Ubuntu 24.04, checked with `ldconfig -p` in the image). That is worth
+checking rather than assuming: the other Swift entries reach TLS through a
+vendored BoringSSL and would run whether or not OpenSSL were there.
+
+Built through their template, the image answers all three routes and is 442 MB
+against a 403 MB base -- 39 MB added, which is the binary and curl.
 
 ### Checking an entry before opening the pull request
 
