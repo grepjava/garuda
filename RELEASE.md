@@ -173,6 +173,14 @@ The Python suites need `h2` and `aioquic`.
   Reading and writing them directly, the `json` workload's request went from
   15.6 to 13.2 microseconds on one worker, 64,000 requests a second to
   75,900.
+- A result's rows are decoded without asking the runtime the same question
+  once a row. What a result is -- a `[UInt8]` scalar, one array column asked
+  for as a list, or properties by name -- depends on the type asked for and
+  on the columns, never on which row, so it is worked out once for the result
+  and used for every row of it. Asking whether a type conforms costs about
+  half a microsecond whether the answer is yes or no, and a thousand rows
+  asked it a thousand times; the answer is now remembered per type, as it
+  already is for validation rules.
 - HTTPS costs less per request: aviancore 0.6.7 clears OpenSSL's error queue
   on the way out of a failure rather than before every read and write, which
   profiling put at 1.37% of the server's whole CPU -- more than three times

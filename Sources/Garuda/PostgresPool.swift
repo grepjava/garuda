@@ -130,7 +130,7 @@ public final class PostgresPool: @unchecked Sendable {
                                       _ values: any PostgresBindable...) async throws -> Row? {
         let rows = try await run(sql, values)
         guard rows.count > 0 else { return nil }
-        return try decodeRow(type, rows, 0, columnIndex(rows))
+        return try decodeRow(type, rows, 0, columnIndex(rows), PostgresRowShape(type, rows))
     }
 
     /// Runs a statement and returns how many rows it affected.
@@ -351,7 +351,7 @@ public struct PostgresTransaction {
                                       _ values: any PostgresBindable...) async throws -> Row? {
         let rows = try await connection.query(sql, values: values.map(\.postgresValue))
         guard rows.count > 0 else { return nil }
-        return try decodeRow(type, rows, 0, columnIndex(rows))
+        return try decodeRow(type, rows, 0, columnIndex(rows), PostgresRowShape(type, rows))
     }
 
     @discardableResult
@@ -406,28 +406,50 @@ struct PostgresColumnIndex {
 
 func decodeAll<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows) throws -> [Row] {
     let index = columnIndex(rows)
+    let shape = PostgresRowShape(type, rows)
     var out: [Row] = []
     out.reserveCapacity(rows.count)
-    for r in 0..<rows.count { out.append(try decodeRow(type, rows, r, index)) }
+    for r in 0..<rows.count { out.append(try decodeRow(type, rows, r, index, shape)) }
     return out
 }
 
+/// What a result's rows are, which depends on the type asked for and on the
+/// columns -- never on which row. Worked out once for a result and then used
+/// for every row of it, so that a thousand rows do not ask the runtime a
+/// thousand times what one answer covers.
+enum PostgresRowShape {
+    /// A `[UInt8]` is a scalar here, not the list of numbers Decodable makes.
+    case bytes
+    /// `query([String].self, "select tags from notes")`: one array column
+    /// asked for as a list is that column, not a row of columns.
+    case onlyCell
+    case keyed
+
+    init<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows) {
+        if Row.self == [UInt8].self { self = .bytes; return }
+        // The column count first: it is free, where asking the runtime
+        // whether a type conforms costs about half a microsecond whether the
+        // answer is yes or no, so it is asked once a type and remembered.
+        if rows.columns.count == 1, isArrayColumn.holds(Row.self),
+           PostgresType.elementType(of: rows.columns[0].typeOID) != nil {
+            self = .onlyCell
+            return
+        }
+        self = .keyed
+    }
+}
+
+private let isArrayColumn = ConformanceCache { $0 is any PostgresArrayColumn.Type }
+
 private func decodeRow<Row: Decodable>(_ type: Row.Type, _ rows: PostgresRows, _ row: Int,
-                                       _ index: PostgresColumnIndex) throws -> Row {
+                                       _ index: PostgresColumnIndex,
+                                       _ shape: PostgresRowShape) throws -> Row {
     let decoding = PostgresRowDecoding(rows: rows, row: row, index: index)
-    // Bytes are a scalar here, not the list of numbers Decodable makes them.
-    if Row.self == [UInt8].self {
-        return try decoding.onlyCell().decode([UInt8].self) as! Row
+    switch shape {
+    case .bytes: return try decoding.onlyCell().decode([UInt8].self) as! Row
+    case .onlyCell: return try decoding.onlyCell().decode(Row.self)
+    case .keyed: return try Row(from: decoding)
     }
-    // `query([String].self, "select tags from notes")`: one array column
-    // asked for as a list is that column, not a row of columns.
-    // The column count first: it is free, and the conformance check is a
-    // lookup in the runtime's tables.
-    if rows.columns.count == 1, Row.self is any PostgresArrayColumn.Type,
-       PostgresType.elementType(of: rows.columns[0].typeOID) != nil {
-        return try decoding.onlyCell().decode(Row.self)
-    }
-    return try Row(from: decoding)
 }
 
 /// Decodes one row: properties by column name, or a single scalar from a
