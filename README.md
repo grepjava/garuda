@@ -20,13 +20,12 @@ strict on every protocol it speaks, safe by construction, pleasant to build an
 API in, and fast. Handlers run on the worker thread that read the request, with
 no scheduling hop before a response that can be sent at once.
 
-**Status: early, and the API will change.** Routes, groups and middleware,
-synchronous and async handlers, typed extraction and answers, per-worker state,
-deadlines, an HTTP client, PostgreSQL, Redis and SQLite drivers, streamed responses and request
-bodies, server-sent events, WebSockets, resumable uploads and WebTransport all
-work and are tested. Nothing has been released.
-[HANDLER-API.md](HANDLER-API.md) has the roadmap, and [Status](#status) below
-lists what is tested and what is missing.
+**Released: 1.0.0.** Routes, groups and middleware; synchronous and async
+handlers; typed extraction and answers; per-worker state; deadlines; an HTTP
+client; PostgreSQL, Redis and SQLite drivers; streamed responses and request
+bodies; server-sent events; WebSockets; resumable uploads; WebTransport. All
+tested. [COMPATIBILITY.md](COMPATIBILITY.md) says what a release may change,
+and [Status](#status) below lists what is missing.
 
 ## Quick start
 
@@ -41,7 +40,7 @@ depends on the `Garuda` library:
 
 ```swift
 // Package.swift
-dependencies: [.package(url: "https://github.com/grepjava/garuda", branch: "main")],
+dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "1.0.0")],
 targets: [.executableTarget(name: "app", dependencies: [.product(name: "Garuda", package: "garuda")])]
 ```
 
@@ -505,36 +504,38 @@ port: parsing, routing, middleware, handlers, timers and the response path.
 it is a useful reference for what a production web framework is expected to
 offer. This is where Garuda stands, area by area.
 
-| Area | axum (Tokio) | Garuda | Status |
-|---|---|---|---|
-| Route dispatch | Every handler is a future the runtime polls | A synchronous handler is a direct call on the worker thread | Done |
-| Async handlers | `async fn` on a work-stealing pool | Reused tasks on the worker's own executor, no allocation per request | Done |
-| Spreading load over cores | Idle threads steal tasks from busy ones | A worker ahead of the others leaves new connections to them; quick connections stuck behind slow requests move to a worker where they would not wait | Done, [differs](#one-process-per-worker) |
-| Typed extraction | `Path`, `Query`, `Json`, `Form`, `Multipart` | `Path`, `Query`, `Body`, `Form`, `Multipart` | Done |
-| Custom extractors | `FromRequestParts`, `FromRequest`, `Option<T>`, `Result<T, E>` | `RequestExtractor`, `AsyncRequestExtractor`, `E?`, `Result<E, any Error>` | Done |
-| OpenAPI | utoipa or aide, with derive macros | `app.openAPI`, `app.swaggerUI`; schemas read from `Decodable` types | Done |
-| State | `State<T>`, one `Arc` shared by every thread | `State<T>`, built in each worker process | Done, [differs](#one-process-per-worker) |
-| Request-scoped values | `Extension<T>` | `request[context:]`, `Context<Key>` | Done |
-| Errors as responses | `IntoResponse` | `ResponseError`, `HTTPError` | Done |
-| Protocols | HTTP/1.1 and HTTP/2 through hyper | HTTP/1.1, HTTP/2 and HTTP/3 | Done |
-| TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME | Done |
-| Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` | Done |
-| Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response | Done, [differs](#middleware-does-not-wrap-the-handler) |
-| Ready-made middleware | tower-http, tower-sessions, axum-extra | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate`, `JWT<Claims>`, `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, cookies, `app.sessions`, `app.csrfProtection`, `app.securityHeaders`, `app.trailingSlash`, `app.requestDecompression`, `app.allowedHosts`, `app.addressFilter` | Done |
-| Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure | Done |
-| Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` | Done |
-| Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay | Done |
-| Streaming request bodies | `Body::into_data_stream` | `onStreamingBody`, with a limit per route and flow control back to the client | Done |
-| Resumable uploads | None built in; tus through other crates | `GarudaUploads`: the IETF resumable upload protocol | Done |
-| Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints | Done |
-| WebSockets | `WebSocketUpgrade` | `app.webSocket`, whole messages, pings and permessage-deflate by the engine | Done, over HTTP/1.1, HTTP/2 and HTTP/3 |
-| WebTransport | None in hyper | `app.webTransport` | Done |
-| HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed responses and server-sent events, a whole-exchange budget | Done |
-| PostgreSQL | sqlx, tokio-postgres | Native driver on the poller | Done |
-| Redis | redis-rs, fred | Native driver on the poller: RESP3 and RESP2, TLS, ACL, pipelines, transactions, pub/sub | Done |
-| SQLite | sqlx, rusqlite | The system's libsqlite3 on the blocking pool: a writer and readers per worker, WAL, migrations | Done |
-| Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker | Done |
-| Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine | Done |
+| Area | axum (Tokio) | Garuda |
+|---|---|---|
+| Route dispatch | Every handler is a future the runtime polls | A synchronous handler is a direct call on the worker thread |
+| Async handlers | `async fn` on a work-stealing pool | Reused tasks on the worker's own executor, no allocation per request |
+| Spreading load over cores | Idle threads steal tasks from busy ones | A worker ahead of the others leaves new connections to them; quick connections stuck behind slow requests move to a worker where they would not wait ([differs](#one-process-per-worker)) |
+| Typed extraction | `Path`, `Query`, `Json`, `Form`, `Multipart` | `Path`, `Query`, `Body`, `Form`, `Multipart` |
+| Custom extractors | `FromRequestParts`, `FromRequest`, `Option<T>`, `Result<T, E>` | `RequestExtractor`, `AsyncRequestExtractor`, `E?`, `Result<E, any Error>` |
+| OpenAPI | utoipa or aide, with derive macros | `app.openAPI`, `app.swaggerUI`; schemas read from `Decodable` types |
+| State | `State<T>`, one `Arc` shared by every thread | `State<T>`, built in each worker process ([differs](#one-process-per-worker)) |
+| Request-scoped values | `Extension<T>` | `request[context:]`, `Context<Key>` |
+| Errors as responses | `IntoResponse` | `ResponseError`, `HTTPError` |
+| Protocols | HTTP/1.1 and HTTP/2 through hyper | HTTP/1.1, HTTP/2 and HTTP/3 |
+| TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME |
+| Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` |
+| Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response ([differs](#middleware-does-not-wrap-the-handler)) |
+| Ready-made middleware | tower-http, tower-sessions, axum-extra | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate`, `JWT<Claims>`, `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, cookies, `app.sessions`, `app.csrfProtection`, `app.securityHeaders`, `app.trailingSlash`, `app.requestDecompression`, `app.allowedHosts`, `app.addressFilter` |
+| Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure |
+| Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` |
+| Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay |
+| Streaming request bodies | `Body::into_data_stream` | `onStreamingBody`, with a limit per route and flow control back to the client |
+| Resumable uploads | None built in; tus through other crates | `GarudaUploads`: the IETF resumable upload protocol |
+| Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints |
+| WebSockets | `WebSocketUpgrade` | `app.webSocket`, whole messages, pings and permessage-deflate by the engine (over HTTP/1.1, HTTP/2 and HTTP/3) |
+| WebTransport | None in hyper | `app.webTransport` |
+| HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed responses and server-sent events, a whole-exchange budget |
+| PostgreSQL | sqlx, tokio-postgres | Native driver on the poller |
+| Redis | redis-rs, fred | Native driver on the poller: RESP3 and RESP2, TLS, ACL, pipelines, transactions, pub/sub |
+| SQLite | sqlx, rusqlite | The system's libsqlite3 on the blocking pool: a writer and readers per worker, WAL, migrations |
+| Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker |
+| Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine |
+
+Every row is implemented and tested.
 
 For performance, [BENCHMARKS.md](BENCHMARKS.md) has the method and every run,
 including hello-world comparisons with axum that measure what the server adds to
@@ -584,9 +585,10 @@ keep-alive connections to one where they would not (`--balance`). When every
 worker holds a slow client, the slow ones are gathered onto fewer workers to
 free the rest. With 8 slow connections among 64 on 8 workers, starting a
 second in, the quick requests' p99 was 2.4–2.8 ms and axum's 3.0–3.1 ms, where
-the kernel's hash alone let it reach 7.6 ms. HTTPS connections move too under `--ktls`,
-where the kernel does the encryption. HTTP/2 connections, WebSockets and
-requests in progress stay on the worker that has them.
+the kernel's hash alone let it reach 7.6 ms. HTTPS connections do not move:
+the record layer is BoringSSL and encrypts in the process, so the session
+cannot travel with the descriptor. HTTP/2 connections, WebSockets and requests
+in progress stay on the worker that has them.
 
 #### A handler that computes without awaiting holds its worker
 
@@ -623,9 +625,9 @@ These work without any handler code, set by flags:
   **HTTP/2** over TLS and cleartext, and **HTTP/3** over QUIC (`--http3`).
   QUIC, TLS 1.3 key schedule and QPACK are Swift, over OpenSSL's crypto
   primitives.
-- **TLS** through OpenSSL, with several certificates chosen by SNI, and kernel
-  TLS (`--ktls`) so static files use `sendfile` over HTTPS and HTTPS
-  connections can move between workers.
+- **TLS** on a vendored BoringSSL, with several certificates chosen by SNI on
+  both TCP and QUIC. OpenSSL is still linked for cryptography, ACME and QUIC.
+  There is no kernel TLS, so `--ktls` is accepted and ignored.
 - **ACME** certificates (`--acme-domain`), obtained and renewed with tls-alpn-01
   on the port already served.
 - **Static files** (`--static-dir`) with `sendfile`, `ETag` and byte ranges,
@@ -657,9 +659,9 @@ flag, and [CONFIG.md](CONFIG.md) explains them.
 ## Tests
 
 ```bash
-swift test                                   # 1027 unit tests, and the fuzz corpus
+swift test                                   # 1069 unit tests, and the fuzz corpus
 (cd Examples && swift test)                  # 14  the examples, through app.test
-bash scripts/compile-fail-test.sh            # 6   handler code that must not compile
+bash scripts/compile-fail-test.sh            # 11  handler code that must not compile
 ```
 
 The end-to-end suites run against a release build. Each takes a binary path as
@@ -675,6 +677,7 @@ bash scripts/cache-test.sh                   # 85  --cache-size
 bash scripts/ratelimit-test.sh               # 18  --rate-limit
 bash scripts/redirect-test.sh                # 22  --redirect-http, --hsts
 bash scripts/sni-test.sh                     # 11  certificates by SNI
+bash scripts/resumption-test.sh              #  7  session tickets resume, TLS 1.3 and 1.2
 bash scripts/acme-test.sh                    # 12  --acme-domain, needs Pebble
 bash scripts/request-id-test.sh              # 12  --request-id
 bash scripts/trace-context-test.sh           # 17  --trace-context
@@ -682,14 +685,14 @@ bash scripts/drain-test.sh                   # 14  --drain-delay
 bash scripts/reload-test.sh                  #  7  SIGHUP under load
 python3 scripts/feature-test.py              # 62  shutdown, supervision, unix sockets, slow clients
 python3 scripts/http2-test.py                # 54  against the h2 library
-python3 scripts/http3-test.py                # 53  against aioquic
+python3 scripts/http3-test.py                # 72  against aioquic
 python3 scripts/router-streams-test.py       # 41  routes over HTTP/2 and HTTP/3
 python3 scripts/handler-test.py              # 143 the handler API over all three protocols
 python3 scripts/websocket-test.py            # 104 handshake, framing violations, closing, pings, deflate
 python3 scripts/websocket-streams-test.py    # 94  WebSocket over HTTP/2 and HTTP/3
 python3 scripts/webtransport-test.py         # 46  sessions, streams, datagrams
 python3 scripts/upload-test.py               # 35  streamed request bodies, 1xx, resumable uploads
-python3 scripts/broadcast-test.py            # 35  topics across workers, Last-Event-ID, keep-alive
+python3 scripts/broadcast-test.py            # 36  topics across workers, Last-Event-ID, keep-alive
 ```
 
 The shell suites need `curl` and `openssl`. The Python suites are clients only,
@@ -707,17 +710,18 @@ on a pull request: they are slow and want a QUIC stack.
 
 ## Status
 
-A handler waiting on something other than the engine (its own continuation,
-say) is not unwound when its request is cancelled. It resumes to find
-`response.isCancelled` set, and anything it sends is dropped. Wrap such a wait
-in `response.cancellable { … }` and it is given up on when the request ends;
-what it cannot do is stop work that ignores cancellation, which the worker
-counts and reports on the health check instead.
+Garuda is 1.0, so a breaking change to the public API needs a major version.
+[COMPATIBILITY.md](COMPATIBILITY.md) says what that covers and how much notice
+a change gets. Pin with `from: "1.0.0"`.
 
-Garuda is before 1.0, so a minor release may still break the public API.
-What that covers, how much notice a change gets, and what has to be true
-before 1.0 are in [COMPATIBILITY.md](COMPATIBILITY.md). Pin with
-`.upToNextMinor(from:)` until then.
+### Known limits
+
+A handler waiting on something other than the engine -- its own continuation,
+say -- is not unwound when its request is cancelled. It resumes to find
+`response.isCancelled` set, and anything it sends is dropped. Wrap the wait in
+`response.cancellable { … }` and it is given up on when the request ends. What
+that cannot do is stop work which ignores cancellation; the worker counts such
+work and reports it on the health check instead.
 
 ### Not supported
 

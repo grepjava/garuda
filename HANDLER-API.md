@@ -374,12 +374,12 @@ wait once.
 | 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | Done |
 | 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | Done |
 | 5 | Streaming, server-sent events, WebSockets, WebTransport | Done |
-| 6 | Examples and realistic benchmarks | Examples done; benchmarks to do |
+| 6 | Examples and realistic benchmarks | Done |
 
-### Still to build
-
-**Step 6**
-- Benchmarks past hello-world against axum: path parameters, JSON in and out, a
-  database round trip, streaming.
-- End-to-end coverage for the engine features listed in the README's
-  [Status](README.md#status).
+All six steps are done and 1.0 is released.
+[benchmarks/workloads.sh](benchmarks/workloads.sh) measures the workloads step
+6 called for -- path parameters, JSON in and out, a database round trip and
+streaming, plus uploads, downloads, a relay, handshake churn, HTTP/2 and
+overload -- and [BENCHMARKS.md](BENCHMARKS.md) records the results and the
+method. What is still missing is listed under
+[Status](README.md#status) in the README, not here.

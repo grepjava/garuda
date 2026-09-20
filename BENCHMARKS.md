@@ -153,51 +153,44 @@ Server logs go to a temporary directory that is removed at the end.
 
 ## Caveats
 
+**Reading the numbers here.**
+
 - **Compare within one table.** Figures from different sessions move by tens
-  of percent, and by more on a machine whose CPUs are shared with anything
-  else. Never set a number from one session beside a number from another.
-- **Single runs need care.** They move by 20–30%. vs-axum.sh is a check
-  between changes. Quote frameworks.sh with three runs at every level.
+  of percent. Never set one beside another.
+- **Single runs move by 20-30%.** `vs-axum.sh` is a check between changes;
+  quote `frameworks.sh` with three runs at every level.
+- **A long sweep and a short run are different measurements.** A 20-minute
+  `frameworks.sh` sweep settles about 30% below what `vs-axum.sh` reads in 87
+  seconds, for every server alike: the CPU cannot hold its clocks that long.
 - **Give Garuda a worker count that matches the machine.** Every other server
-  here sizes its threads from the CPU count. Garuda does not: `--workers` is
-  whatever it is told, and a count that does not match costs more than the
-  difference between any two of these servers.
+  here sizes its threads from the CPU count; Garuda takes what `--workers`
+  says. A mismatch costs more than the gap between any two of these servers.
+
+**Taking a measurement.** Each of these was learned by having it invent a
+result:
+
+- **Position is part of the measurement.** Whichever server runs second reads
+  lower, and not equally -- Garuda loses about 17% on `user`, axum about 1% --
+  so the default `SERVERS="garuda axum"` flatters Garuda. Whatever runs first
+  in a session reads highest of all. Give each arm its own invocation, rotate
+  which leads, and read the rounds together. Two builds of the *same* server
+  are safe in the same position.
+- **Do not touch the box while it measures.** A round taken while its own
+  session edited a file and grepped the tree read at roughly *half* speed in
+  every HTTPS cell. On four CPUs, editing a file is not nothing.
+- **Publish the spread, not the mean.** A mean hides a contaminated round. One
+  cell read -18.6% over rounds 2-4, -13.7% over all four and -5.0% over
+  rounds 2-3: three defensible subsets, three answers. Report an unstable cell
+  as unstable.
+- **Discarding rounds can introduce the bias it removes.** Dropping a warm-up
+  and a spoiled round can leave a remainder where one arm never leads -- and
+  leading is the inflated position. Check the balance of lead positions in
+  what survives.
+- **A before-and-after is not an A/B.** Two measurements either side of a
+  change carry everything else that moved between them. Where it matters, put
+  both arms in one binary behind a switch and rotate.
 - **The load generator shares the server's CPUs** unless `PIN` separates them.
   A closed-loop figure can be the load generator's limit.
-- **Use a dedicated machine** for figures that matter, with nothing else
-  running and no builds or tests alongside. Not even light work: a round
-  measured on Peregrine's box while its own session edited a file, ran an
-  `awk` scan over the tree and grepped a script came in at roughly *half*
-  speed in every HTTPS cell. Editing a file is not nothing on four CPUs with
-  the tree on a Windows mount.
-- **Keep every round, and publish the spread, not just the mean.** A mean
-  hides a contaminated round; the per-round values show it as one arm reading
-  half what it reads everywhere else. This is not hypothetical: on the run
-  above, the same cell reads -18.6% over rounds 2-4, -13.7% over all four and
-  -5.0% over rounds 2-3, so three defensible subsets give three different
-  answers. A cell that unstable needs more rounds, and the honest report is
-  that the cell is unstable rather than whichever subset reads best.
-- **Discarding rounds can introduce the bias it removes.** Dropping a warm-up
-  round and a spoiled round can leave a remainder in which one arm never
-  takes the leading position -- and leading is the inflated position, so that
-  arm is the only one never inflated. Check what the surviving rounds do to
-  the balance of lead positions before trusting them; if the lead is no
-  longer balanced, the run is spoiled whichever direction the residue points.
-- **A long sweep and a short run are different measurements.** On the bench
-  box a full `frameworks.sh` sweep takes about 20 minutes and its rates settle
-  some 30% below what `vs-axum.sh` reads in 87 seconds, for every server
-  alike: the CPU cannot hold its clocks that long. Never read a sweep's figure
-  against a short run's.
-- **The order servers are measured in is part of the measurement, and it does
-  not cancel.** `workloads.sh` runs one server through every workload and then
-  the next. Whichever goes second reads lower -- but not equally: on this box
-  Garuda loses about 17% on `user` and axum about 1%, so the default
-  `SERVERS="garuda axum"` quietly flatters Garuda. Whatever is measured first
-  in a whole session reads highest of all. To compare servers, give each an
-  invocation of its own with `SERVERS` naming one, rotate them between rounds
-  so each takes each position, and read the rounds together. Comparing two
-  builds of the *same* server is safe as long as both are measured in the same
-  position.
 
 ## Requests that do work
 
@@ -451,54 +444,31 @@ worker while it served `/user/12345`:
 | BoringSSL, plain | 664,534 | 331,944 | **2.00** |
 | BoringSSL, greedy BIO | 351,665 | 351,413 | **1.00** |
 
-`user` went from 7% behind OpenSSL to 2% ahead with that one change, and
-`json` from level to 8% ahead.
+`user` was recorded going from 7% behind OpenSSL to 2% ahead when the BIO
+landed, and `json` from level to 8% ahead. **Treat those two as
+unconfirmed.** They compare measurements taken either side of a change rather
+than an A/B, so they carry whatever else moved between them, and a later A/B
+(below) puts the BIO's worth at about 1%. One saved `read` a request cannot
+be worth nine points.
 
-**`h2` is the one that is still behind**, by 3%, and what it is has been
-narrowed by elimination rather than explained.
+### What HTTP/2's 3% is not
 
-It is not the read count, which the greedy BIO restored to 1.00. It is not
-`av_tls_pending` answering one rather than a byte count, since every caller
-tests it against zero. It is not the cryptography: `h2` spends 40
-microseconds a request against OpenSSL's 46, so the saving is there and does
-not become throughput.
+`h2` is the one workload still behind OpenSSL. Each of these was checked
+rather than assumed, and each came back negative:
 
-And it is not write batching, which was the obvious remaining guess -- that a
-small HTTP/2 response leaves as a HEADERS write and a DATA write under one
-library and coalesces under the other. Peregrine counted them with `strace`
-over 2,000 requests: **2.03 writes a request on OpenSSL against 2.02 on
-BoringSSL for h2, and 1.02 against 1.01 for HTTP/1.1.** Identical. Both
-libraries take two writes for an h2 response and neither coalesces them, so
-the 13% of CPU that BoringSSL saves is going somewhere other than the write
-path.
+| candidate | why not |
+|---|---|
+| the read count | the greedy BIO restored it to 1.00, same as OpenSSL |
+| `av_tls_pending` answering 1 rather than a byte count | every caller tests it against zero |
+| the cryptography | `h2` spends 40 us a request against OpenSSL's 46 -- the saving is there and does not become throughput |
+| write batching | `strace` over 2,000 requests: 2.03 writes a request on OpenSSL against 2.02 on BoringSSL for h2, 1.02 against 1.01 for HTTP/1.1 |
+| the greedy BIO itself | switching it off makes `h2` *slower*, table below |
+| this machine | Peregrine reproduced the shape on another codebase and box: CPU a request -13% on both transports, matching here to a tenth of a point |
 
-The effect is not this machine, and one part of what follows has since been
-withdrawn. Peregrine reproduced the shape on its own codebase and its own
-box, with four workers against eight and a five-byte body against twenty:
-**HTTP/1.1 +2.6% where h2 is -0.7%, CPU a request -13% on both transports.**
-Two servers, two machines, the same CPU saving to a tenth of a point.
-
-The latency half of that is gone. Peregrine's run put the baseline arm first
-every time; re-run over six rounds alternating which arm leads, the box's own
-drift across the fifteen minutes accounted for the whole effect. An apparent
--7.8% at eight connections became +3.7% the other way, and p99 went from
-"worse in every round" to 1.351 ms against 1.336 -- indistinguishable. Its
-throughput rows above came from the same unalternated structure, so they are
-not independent confirmation of the -3% measured here. What survives is CPU a
-request, down 10-13% at sixteen and sixty-four connections -- and it survives
-because it landed on the same value as this machine's -13%, measured
-separately, not because of the method that produced it.
-
-So: BoringSSL makes a request about 13% cheaper in CPU whichever transport
-carries it, and HTTP/1.1 turns that into throughput where HTTP/2 does not.
-That is the measurement, and the cause is not known. The tail is not part of
-it: the one measurement that said h2's p99 worsened did not survive
-alternating the arm order.
-
-**It is not the greedy BIO either.** One binary against itself, the BIO
-switched off at run time with `AVIAN_NO_GREEDY=1` so that the two arms differ
-by one branch rather than by a build, five rotated rounds with the first
-discarded and the lead balanced two-all across the rest:
+The greedy BIO was the last hypothesis. One binary against itself, the BIO
+off at run time with `AVIAN_NO_GREEDY=1` so the arms differ by a branch and
+not a build, five rotated rounds with the first discarded and the lead
+balanced two-all:
 
 | rounds 2-5 | greedy on | greedy off | |
 |---|---|---|---|
@@ -507,21 +477,17 @@ discarded and the lead balanced two-all across the rest:
 | `h2` CPU a request | 38.5 us | 40.0 us | -3.8% |
 | `h2` p99 | 1.631 ms | 1.672 ms | -2.4% |
 
-Turning the BIO off makes `h2` **worse**, not better, and every one of the
-four greedy readings beats every plain one. Whatever HTTP/2 is losing, it is
-not this. That was the last standing hypothesis, and the cause is now
-unknown with nothing queued to test.
+Every greedy reading beats every plain one. **So the cause is unknown, and
+nothing is queued to test.** What stands: BoringSSL makes a request about 13%
+cheaper in CPU whichever transport carries it, HTTP/1.1 turns that into
+throughput and HTTP/2 does not.
 
-**A second thing came out of that run, and it is a correction.** The switch
-is worth about **1%** on `user`, not the roughly nine points implied above by
-`user` going from -7.3% to +1.9% against OpenSSL when the BIO landed. Both
-cannot be right. The A/B here is the better measurement -- one binary, one
-branch, rotated rounds -- and the 9-point figure came from comparing two
-separately-taken measurements rather than from an A/B, so it carries whatever
-else moved between them. The arithmetic also favours 1%: on keep-alive
-traffic the BIO saves one `read` a request, 2.00 to 1.00, and one syscall is
-not worth nine percent. **The -7.3%-to-+1.9% attribution should be treated as
-unconfirmed until it is re-measured the way this table was.**
+One earlier claim here has been withdrawn outright. Peregrine's figure of
+h2's p99 worsening, and its -7.8% at eight connections, were artefacts of
+running the baseline arm first every time; alternated, the -7.8% became
++3.7% and the p99 gap vanished (1.351 ms against 1.336). Its CPU figures
+survive, because they agree with numbers measured separately here rather
+than because of the method that produced them.
 
 In the clear Garuda leads eleven of fourteen; over HTTPS, measured the way
 above, it leads four. The difference is what TLS adds to a request's CPU,

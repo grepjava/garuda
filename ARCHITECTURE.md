@@ -336,12 +336,11 @@ wait over 100 µs), worker 6 gives its slow one to worker 0 as well, and so on
 until the quick ones have enough room or four workers are free. The slow
 requests then share four workers instead of eight.
 
-**TLS.** An OpenSSL session lives in the memory of the process that did the
-handshake, so it cannot move with the descriptor. A TLS connection moves only
-when the kernel encrypts and decrypts it both ways (`--ktls`, [kernel
-TLS](TRANSPORT.md#kernel-tls)). The worker then frees its OpenSSL session
-without a word on the wire (`av_tls_release_to_kernel`), and the next worker
-reads and writes the socket as plaintext while the kernel does TLS.
+**TLS connections do not move.** The session lives in the memory of the
+process that did the handshake, so it cannot travel with the descriptor. Only
+the kernel holding the keys would let it, and BoringSSL has no kernel TLS
+([TRANSPORT.md](TRANSPORT.md#kernel-tls-not-available)). The machinery for it
+is still here and compiles out; an OpenSSL build restores it.
 
 **What never moves:** a request in progress, HTTP/2 connections (their HPACK
 tables and streams are the worker's), WebSocket and other streams, and
@@ -366,7 +365,7 @@ Garuda's workers are processes instead, for two reasons:
 
 Moving an HTTP/1 connection between requests is about the granularity at
 which Tokio moves an HTTP/1 connection's task. What processes give up is
-moving TLS without kernel TLS, HTTP/2, and requests in flight.
+moving TLS, HTTP/2, and requests in flight.
 
 #### Restarts
 
@@ -721,8 +720,8 @@ Built on it:
   overwritten by another request's parse has its head parsed again from bytes
   that stay in place, never copied.
 - `setInterest` skips `epoll_ctl` when the mask is unchanged.
-- `accept4`, `TCP_NODELAY`, `sendfile` for static files (`SSL_sendfile` under
-  kernel TLS), `recvmmsg` and UDP GSO for QUIC.
+- `accept4`, `TCP_NODELAY`, `sendfile` for static files in the clear,
+  `recvmmsg` and UDP GSO for QUIC.
 
 Classes are used where the cost is per process or per connection:
 `H2Connection`, `H3Connection`, `QUICConnection`, `QUICListener`, the handler

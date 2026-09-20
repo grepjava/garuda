@@ -14,9 +14,9 @@ library to your own package and build your application.
 
 | | |
 |---|---|
-| **Swift** | 6.1 or newer (`swift-tools-version: 6.1`). CI uses 6.1.2. |
+| **Swift** | 6.2 or newer (`swift-tools-version: 6.2`). CI uses 6.3.3. |
 | **OS** | Linux, or macOS 15 or newer. Linux is the primary platform. Windows is not supported; WSL 2 works. |
-| **OpenSSL** | Development files. The package links `libssl` and `libcrypto`. |
+| **OpenSSL** | Development files. The package links `libssl` and `libcrypto` for cryptography, ACME and QUIC. The TLS record layer is a vendored BoringSSL and needs nothing installed. |
 | **zlib** | Development files. The package links `libz`. |
 | **CA certificates** | The system trust store, for ACME and outbound HTTPS, unless you pass `--acme-ca-bundle`. |
 
@@ -106,14 +106,14 @@ Add the package and depend on the `Garuda` product. It includes the handler
 API, the HTTP client and the PostgreSQL driver.
 
 ```swift
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
     name: "app",
     platforms: [.macOS(.v15)],
     dependencies: [
-        .package(url: "https://github.com/grepjava/garuda", branch: "main"),
+        .package(url: "https://github.com/grepjava/garuda", from: "1.0.0"),
     ],
     targets: [
         .executableTarget(name: "app", dependencies: [
