@@ -363,27 +363,31 @@ microseconds a request).
 
 | workload | Garuda, OpenSSL | Garuda, BoringSSL | axum |
 |---|---|---|---|
-| user | 115,293 (1.52; 34) | 106,851 (1.47; 34) | **109,530** (1.50; 29) |
-| json | 94,273 (2.19; 47) | 94,630 (1.93; 45) | **95,542** (1.90; 38) |
-| db | 35,663 (3.46; 107) | 38,606 (3.22; 96) | **39,800** (2.83; 81) |
-| stream | 14,659 (7.44; 245) | **15,154** (6.91; 227) | 10,213 (42.0; 122) |
-| me | 92,034 (2.29; 51) | 91,485 (2.20; 50) | **101,948** (1.96; 35) |
-| upload | 2,127 (58.7; 1,811) | **2,205** (63.1; 1,733) | 1,332 (116; 3,443) |
-| download | 1,705 (75.0; 2,327) | 1,668 (56.8; 2,026) | **1,800** (49.6; 1,799) |
-| relay | 8,013 (14.4; 562) | **8,830** (13.2; 490) | 3,171 (44.8; 638) |
-| churn | 4,834 (26.9; 1,017) | **6,783** (15.8; 582) | 5,896 (16.8; 577) |
-| h2 | 82,320 (1.52; 45) | 79,333 (1.66; 41) | **89,575** (1.76; 36) |
-| overload | 28,777 (65.9; 134) | 30,672 (52.2; 119) | **32,649** (39.0; 101) |
-| recovery | 111,005 (1.57; 35) | 116,306 (1.44; 31) | **116,424** (1.46; 27) |
-| skew | 47,066 (4.58; 105) | 51,135 (3.33; 85) | **51,328** (3.17; 70) |
-| spike | 56,370 (4.20; 84) | 62,279 (3.21; 68) | **62,676** (2.99; 56) |
+| user | 106,690 (1.59; 36) | 108,701 (1.49; 32) | **109,810** (1.49; 29) |
+| json | 88,867 (2.23; 50) | 96,029 (1.99; 44) | **96,048** (1.88; 37) |
+| db | 35,495 (3.56; 108) | 39,038 (3.19; 94) | **39,791** (2.84; 80) |
+| stream | 14,262 (7.60; 253) | **14,693** (7.17; 238) | 10,974 (42.0; 142) |
+| me | 90,420 (2.35; 52) | 95,508 (2.19; 47) | **103,350** (1.97; 34) |
+| upload | 2,177 (57.1; 1,756) | **2,182** (55.6; 1,739) | 1,329 (116; 3,465) |
+| download | 1,664 (70.7; 2,336) | 1,688 (59.5; 2,043) | **1,805** (49.3; 1,804) |
+| relay | 7,945 (14.2; 565) | **8,724** (15.1; 495) | 3,085 (46.1; 667) |
+| churn | 4,875 (26.8; 1,010) | **6,850** (15.1; 574) | 5,894 (16.7; 574) |
+| h2 | 82,178 (1.46; 46) | 79,749 (1.63; 40) | **90,133** (1.75; 36) |
+| overload | 28,521 (62.4; 134) | 31,000 (60.1; 118) | **32,566** (36.2; 100) |
+| recovery | 111,236 (1.59; 34) | **118,992** (1.41; 29) | 116,703 (1.44; 26) |
+| skew | 47,365 (4.44; 104) | 50,518 (3.30; 86) | **51,291** (3.20; 70) |
+| spike | 56,208 (4.29; 84) | **63,232** (3.15; 66) | 62,344 (2.95; 56) |
 
-Measured this way Garuda leads four of fourteen over HTTPS on BoringSSL, and
-is within about a percent of axum on `json`, `recovery`, `skew` and `spike`
-where the old table showed a wider gap in either direction. The honest
-summary is that over TLS the two are close on most small-request workloads,
-Garuda is well ahead where it streams or relays, and axum is ahead on `me`
-and `h2`.
+The three rounds are read without the session's first, for the reason under
+Caveats: whatever is measured first of all reads high, and rotating the arms
+cannot cancel that because only one arm can hold that slot. It was worth
+about 20% on the one row it touched -- OpenSSL's `user` read 130,965 there
+against 103,657 and 109,723 in its other two rounds -- which is enough to
+invert a comparison.
+
+On BoringSSL Garuda leads six of fourteen over HTTPS, ties `json` to within
+20 requests a second, and is within two percent on `user`, `skew` and `db`.
+axum keeps `me`, `h2`, `download` and `overload`.
 
 **BoringSSL against OpenSSL, the same tree otherwise.** The record layer and
 handshake compiled against each (`AVIAN_TLS_BORINGSSL`; the libraries live in
@@ -394,39 +398,52 @@ on a box whose absolute level drifts:
 
 | | throughput | CPU a request |
 |---|---|---|
-| churn | **+40.3%** | 1,017 -> **582 us** |
-| spike | +10.5% | 84 -> 68 |
-| relay | +10.2% | 562 -> 490 |
-| skew | +8.6% | 105 -> 85 |
-| db | +8.3% | 107 -> 96 |
-| overload | +6.6% | 134 -> 119 |
-| recovery | +4.8% | 35 -> 31 |
-| h2 | -3.6% | 45 -> 41 |
-| user | -7.3% | 34 -> 34 |
+| churn | **+40.5%** | 1,010 -> **574 us** |
+| spike | +12.5% | 84 -> 66 |
+| db | +10.0% | 108 -> 94 |
+| relay | +9.8% | 565 -> 495 |
+| overload | +8.7% | 134 -> 118 |
+| json | +8.1% | 50 -> 44 |
+| recovery | +7.0% | 34 -> 29 |
+| skew | +6.7% | 104 -> 86 |
+| me | +5.6% | 52 -> 47 |
+| stream | +3.0% | 253 -> 238 |
+| user | +1.9% | 36 -> 32 |
+| download | +1.5% | 2,336 -> 2,043 |
+| upload | +0.3% | 1,756 -> 1,739 |
+| h2 | **-3.0%** | 46 -> 40 |
 
 `churn` is a handshake a request, and it is the one that moves most, exactly
-as the library probe above predicted: 40.5% cheaper a handshake there, 40.3%
+as the library probe above predicted: 40.5% cheaper a handshake there, 40.5%
 more throughput here. Two measurements of different things agreeing is the
 reason to believe either.
 
-**Why `user` and `h2` go the other way, and it is not the cryptography.**
-Both use *less* CPU on BoringSSL and still read lower, which is the signature
-of an extra syscall rather than extra work. aviancore 0.6.6 asked OpenSSL to
-read what the socket has in one call instead of a record's 5-byte header and
-then its body in two. BoringSSL lists `SSL_CTX_set_read_ahead` among its
-no-ops -- its header says the function "returns one", and that is all it does
--- so the request is silently ignored. Counted off the worker while it
-served `/user/12345`:
+**Read ahead had to be written by hand.** BoringSSL lists
+`SSL_CTX_set_read_ahead` among its no-ops -- its header says the function
+"returns one", and that is all it does -- so its record layer asks the socket
+for a record's 5-byte header and then for the body, where OpenSSL asks once.
+That was worth about 7% on `user` and it was visible as a contradiction
+before it was understood: BoringSSL spent *less* CPU a request and still read
+lower, which is the shape of an extra syscall rather than extra work.
+aviancore now gives BoringSSL a BIO that reads greedily. Counted off the
+worker while it served `/user/12345`:
 
 | | read syscalls | requests | reads a request |
 |---|---|---|---|
-| OpenSSL | 256,092 | 255,802 | **1.00** |
-| BoringSSL | 635,988 | 317,690 | **2.00** |
+| OpenSSL | 238,338 | 238,054 | **1.00** |
+| BoringSSL, plain | 664,534 | 331,944 | **2.00** |
+| BoringSSL, greedy BIO | 351,665 | 351,413 | **1.00** |
 
-Exactly one against exactly two. So the keep-alive figures above are what
-BoringSSL gives *while paying an extra read per request*, and a greedy BIO
-that restores read-ahead should recover that ground. Until that is written
-and measured, the `user` and `h2` rows stand as they are.
+`user` went from 7% behind OpenSSL to 2% ahead with that one change, and
+`json` from level to 8% ahead.
+
+**`h2` is the one that is still behind**, by 3%, and it is not the read count
+and not the cryptography: it spends 40 microseconds a request against
+OpenSSL's 46 and still reads lower, and its p50 and p99 are both worse where
+every other workload's improved. It is not `av_tls_pending` reporting one
+rather than a byte count either -- every caller tests it against zero. Why
+HTTP/2 in particular should lose is not yet known, and the row stands as
+measured.
 
 In the clear Garuda leads eleven of fourteen; over HTTPS, measured the way
 above, it leads four. The difference is what TLS adds to a request's CPU,

@@ -1295,13 +1295,15 @@ The Python suites need `h2` and `aioquic`.
   aviancore 0.6.6.
 - Garuda's TLS record layer and handshake can be built against BoringSSL
   instead of OpenSSL, through aviancore's `AVIAN_TLS_BORINGSSL`. Measured over
-  HTTPS against the same tree on OpenSSL, CPU a request falls on thirteen of
-  the fourteen workloads and rises on none, and `churn` -- a full handshake a
-  request -- gains **40%** while its CPU drops from 1,017 to 582 microseconds.
-  `user` and `h2` go the other way by 4 to 7%, because BoringSSL ignores
-  `SSL_CTX_set_read_ahead` and so reads a record's header and body separately:
-  exactly 2.00 read syscalls a request against OpenSSL's 1.00. BENCHMARKS.md
-  has the table and the method.
+  HTTPS against the same tree on OpenSSL, **CPU a request falls on all
+  fourteen workloads and throughput rises on thirteen**. `churn` -- a full
+  handshake a request -- gains **40.5%** with its CPU cut from 1,010 to 574
+  microseconds, which is what the standalone library probe predicted to
+  within a tenth of a point. Then `spike` +12.5%, `db` +10.0%, `relay` +9.8%,
+  `overload` +8.7%, `json` +8.1%, `recovery` +7.0%, `skew` +6.7%, `me` +5.6%.
+  `h2` is the exception at -3.0%, for reasons not yet understood: it spends
+  less CPU a request than OpenSSL and still reads lower. BENCHMARKS.md has the
+  table and the method.
 - `benchmarks/tls-probes` measures what the TLS library itself costs, with no
   server in the way: one source compiled against OpenSSL and against
   BoringSSL, a client and a server in one process over a socketpair, plus the
