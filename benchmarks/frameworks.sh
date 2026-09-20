@@ -141,13 +141,18 @@ reap_servers() {
     pkill -f "bu[n] .*app\.ts" 2>/dev/null
     pkill -f "bu[n] run cluster\.ts" 2>/dev/null
     sleep 1
+    # `pgrep -c` prints 0 and exits 1 when nothing matches, so `|| echo 0`
+    # appends a second zero and the arithmetic sees two lines rather than one.
     left=0
     for p in "$GARUDA" "$HUMMINGBIRD" "$VAPOR" "$AXUM" "$ACTIX" "$NTEX"; do
         [ -n "$p" ] || continue
         pat="${p%?}[${p: -1}]"
-        left=$((left + $(pgrep -cf "$pat" 2>/dev/null || echo 0)))
+        local n
+        n=$(pgrep -cf "$pat" 2>/dev/null | head -1)
+        [ -n "$n" ] || n=0
+        left=$((left + n))
     done
-    [ "$left" -gt 0 ] && echo "reap: $left still up" >&2
+    [ "$left" -gt 0 ] && echo "reap: $left server(s) survived the reap" >&2
     return 0
 }
 
