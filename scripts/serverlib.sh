@@ -38,6 +38,14 @@
 # which is also what to hand anything that walks the process tree.
 
 SERVER_PID=""
+# Every server this script has started and not yet stopped. `server_start`
+# overwrites SERVER_PID, so a harness that starts a second server while the
+# first is still up loses the only handle to the first and leaks it -- which
+# is what static-test.sh did, leaving a supervisor and two workers behind on
+# every run. Those survivors are not harmless: a later suite in a long
+# sequence fails on assertions about cross-worker delivery and passes when run
+# alone, which reads exactly like a real bug.
+SERVER_PIDS=""
 
 # Seconds to wait for a graceful stop before insisting.
 SERVER_STOP_TIMEOUT=${SERVER_STOP_TIMEOUT:-10}
@@ -50,6 +58,7 @@ server_start() {
     "$@" &
     SERVER_PID=$!
     set +m
+    SERVER_PIDS="$SERVER_PIDS $SERVER_PID"
 }
 
 # Every descendant of $1, plus $1 itself, as a space-separated list.
@@ -67,10 +76,26 @@ server_descendants() {
     echo "$out" | xargs
 }
 
-# Stops the server and everything it started. Safe to call when nothing is
-# running, and safe to call twice.
+# Stops the most recently started server and everything it started. Safe to
+# call when nothing is running, and safe to call twice.
 server_stop() {
     [ -n "${SERVER_PID:-}" ] || return 0
+    server_stop_pid "$SERVER_PID"
+    SERVER_PID=""
+    return 0
+}
+
+# Stops one server by the pid `server_start` returned for it.
+server_stop_pid() {
+    local SERVER_PID=$1
+    [ -n "$SERVER_PID" ] || return 0
+    # Taken off the list first, so that a second stop of the same server is a
+    # no-op rather than a second round of signals.
+    local keep="" p
+    for p in $SERVER_PIDS; do
+        [ "$p" = "$SERVER_PID" ] || keep="$keep $p"
+    done
+    SERVER_PIDS=$keep
 
     # Taken while the tree is still intact, and only ever processes this script
     # is the ancestor of.
@@ -96,6 +121,18 @@ server_stop() {
     # shellcheck disable=SC2086 -- a deliberate list of pids.
     kill -KILL $owned 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
+    return 0
+}
+
+# Stops every server this script started, whichever order they were started in.
+# This is what a harness wants on the way out: `server_stop` alone reaches only
+# the last one, and anything started before it stays up holding its port.
+server_stop_all() {
+    local p
+    for p in $SERVER_PIDS; do
+        server_stop_pid "$p"
+    done
+    SERVER_PIDS=""
     SERVER_PID=""
     return 0
 }
@@ -115,8 +152,8 @@ server_require_port_free() {
 
 # `server_stop` on the way out, however the script ends.
 server_trap_cleanup() {
-    trap 'server_stop; exit 130' INT TERM
-    trap 'server_stop' EXIT
+    trap 'server_stop_all; exit 130' INT TERM
+    trap 'server_stop_all' EXIT
 }
 
 # Milliseconds on a clock that never steps, for timing a test: WSL2 once set

@@ -37,7 +37,11 @@ let package = Package(
     dependencies: [
         // The protocol and systems layers: syscalls, TLS, buffers, the poller,
         // HTTP/1.1, HTTP/2, HTTP/3 and QUIC.
-        .package(url: "https://github.com/grepjava/aviancore", from: "0.6.7"),
+        // upToNextMinor, not `from:`. aviancore is below 1.0, so a minor
+        // release there may change something as large as which library TLS is
+        // built against -- 0.7.0 did exactly that. `from:` would take such a
+        // release without anyone looking at it.
+        .package(url: "https://github.com/grepjava/aviancore", .upToNextMinor(from: "0.7.1")),
         // The tracing API the Swift server ecosystem shares: Garuda starts
         // spans, and whichever tracer the application bootstraps records
         // them. No Foundation, no threads of its own.

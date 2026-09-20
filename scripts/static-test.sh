@@ -43,7 +43,7 @@ is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$3" "$2"; fi; }
 
 # shellcheck source=scripts/serverlib.sh
 . "$HERE/serverlib.sh"
-trap 'server_stop; rm -rf "$WORK"' EXIT
+trap 'server_stop_all; rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/assets/deep" "$WORK/secret" "$WORK/assets-sibling"
 echo "body { color: red }"   > "$WORK/assets/site.css"
@@ -297,6 +297,8 @@ is "not even one with an index"              "$(code $H/static/pages)" "404"
 is "and the route root is still not served"  "$(code $H/static/)" "404"
 
 # --- over TLS ------------------------------------------------------------
+# The plaintext server above is finished with, and nothing below uses it.
+server_stop
 # sendfile cannot encrypt, so TLS takes the read-and-buffer path. It has to
 # produce the same bytes.
 openssl req -x509 -newkey rsa:2048 -keyout "$WORK/s.key" -out "$WORK/s.pem" \

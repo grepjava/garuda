@@ -170,8 +170,8 @@ for `/user/7`.
 | `--tls-cert PATH` | none | PEM certificate chain; repeatable, paired with `--tls-key` in order |
 | `--tls-key PATH` | none | PEM private key for the matching `--tls-cert` |
 | `--tls-ciphers LIST` | OpenSSL's | OpenSSL cipher list for TLS 1.2; TLS 1.3 suites are not configurable |
-| `--ktls` | off | let the Linux kernel encrypt TLS, so static files use `sendfile` over HTTPS and idle HTTPS connections can move between workers |
-| `--no-ktls` | on | keep all of TLS in the process |
+| `--ktls` | — | accepted and ignored: the TLS record layer is BoringSSL's, which has no kernel TLS |
+| `--no-ktls` | — | accepted and ignored, for the same reason |
 | `--acme-domain NAME` | none | get and renew a certificate for NAME; repeatable |
 | `--acme-email ADDR` | none | contact address for the ACME account |
 | `--acme-cache DIR` | `./acme` | where the account key and certificate are kept |
@@ -265,23 +265,33 @@ Start with a short value such as `300`. A browser that has seen a long
 
 ### Kernel TLS
 
-`--ktls` lets the Linux kernel take over encrypting and decrypting once
-OpenSSL completes the handshake. A `--static-dir` file sent over HTTPS/1.1
-then goes out with `sendfile`, as it does in the clear, and under `--balance
-adaptive` an idle HTTPS connection can move to another worker. It needs the
-`tls` kernel module and an OpenSSL built with kernel TLS; without either, the
-server logs a warning and OpenSSL encrypts as usual. HTTP/2 and HTTP/3 still
-read files, because their bytes are framed.
+**The flag does nothing now.** The TLS record layer is BoringSSL's, and
+BoringSSL has no kernel TLS, so every build encrypts in the process. `--ktls`
+is still accepted, and still says at start-up that it is encrypting in the
+process, so that a command line carrying it keeps working.
 
-It is off by default. Where the kernel encrypts in software, as it does
-without a NIC that offloads TLS, large HTTPS responses measured 22 to 28%
-slower than with OpenSSL doing it, and small ones the same.
-[TRANSPORT.md](TRANSPORT.md#kernel-tls) has the details.
+What it bought, while OpenSSL still did the record layer: a `--static-dir`
+file sent over HTTPS/1.1 went out with `sendfile`, as it does in the clear,
+and under `--balance adaptive` an idle HTTPS connection could move to another
+worker. HTTP/2 and HTTP/3 read files either way, because their bytes are
+framed.
 
-```bash
-sudo modprobe tls
-garuda --ktls --tls-cert cert.pem --tls-key key.pem --static-dir /static=/srv/app/static
-```
+What that costs, measured once and not yet confirmed: static files over
+HTTPS/1.1 go out about **8% slower at 1 MiB and 14% slower at 16 MiB**, for
+about 15% more CPU a gibibyte. Below about 64 KiB it costs nothing --
+BoringSSL is 19% ahead there despite having no kernel TLS. And it costs
+nothing at all over HTTP/2, which could never use `sendfile` anyway, since
+its bytes are framed first. Treat the three magnitudes as provisional: they
+come from a run whose arm order was not rotated, and a re-run that rotates it
+is outstanding. What is not in doubt is which sizes are affected and which
+are not.
+
+It is paid back on everything else TLS does: a handshake is 40 to 45% cheaper
+and CPU a request falls on every workload measured.
+[BENCHMARKS.md](BENCHMARKS.md) has both halves.
+
+A build that needs kernel TLS can have it: aviancore built without
+`AVIAN_TLS_BORINGSSL` puts the record layer back on OpenSSL.
 
 ---
 

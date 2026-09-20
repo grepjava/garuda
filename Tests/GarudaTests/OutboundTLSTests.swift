@@ -189,6 +189,12 @@ private func outboundTLSApp() -> Application {
             // is provably unread-and-readable at the moment it is handed back.
             // Without this the test would be a race on whether the ticket beat
             // the release, and would pass for whichever reason it liked.
+            //
+            // The peer has to be asked to send it: BoringSSL holds the ticket
+            // until the first application write, so that it travels with the
+            // response rather than costing a write of its own, and this peer
+            // never writes any. OpenSSL has already sent it and the flush does
+            // nothing there. `after` is what pokes the peer -- see the caller.
             try await first.readable(milliseconds: 2_000)
             first.release()
             // Nothing suspends between the release and this, so no poll has
@@ -550,7 +556,13 @@ struct OutboundTLSTests {
         caFileWanted = certPath
         hostnameWanted = "alpha.example"
         let client = outboundTLSApp().test
-        #expect(try exchange(client, peer, "/tls-churn").hasSuffix("churned"))
+        // The peer sends its session ticket once the handshake is through, and
+        // nothing else: a connection whose only readable byte is a ticket is
+        // the whole point of the test.
+        let churned = try exchange(client, peer, "/tls-churn") { session in
+            av_tls_flush_control(session) == 0
+        }
+        #expect(churned.hasSuffix("churned"))
         #expect(client.worker.pointee.outboundOpened == 1)
     }
 

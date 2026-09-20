@@ -165,7 +165,24 @@ Server logs go to a temporary directory that is removed at the end.
 - **The load generator shares the server's CPUs** unless `PIN` separates them.
   A closed-loop figure can be the load generator's limit.
 - **Use a dedicated machine** for figures that matter, with nothing else
-  running and no builds or tests alongside.
+  running and no builds or tests alongside. Not even light work: a round
+  measured on Peregrine's box while its own session edited a file, ran an
+  `awk` scan over the tree and grepped a script came in at roughly *half*
+  speed in every HTTPS cell. Editing a file is not nothing on four CPUs with
+  the tree on a Windows mount.
+- **Keep every round, and publish the spread, not just the mean.** A mean
+  hides a contaminated round; the per-round values show it as one arm reading
+  half what it reads everywhere else. This is not hypothetical: on the run
+  above, the same cell reads -18.6% over rounds 2-4, -13.7% over all four and
+  -5.0% over rounds 2-3, so three defensible subsets give three different
+  answers. A cell that unstable needs more rounds, and the honest report is
+  that the cell is unstable rather than whichever subset reads best.
+- **Discarding rounds can introduce the bias it removes.** Dropping a warm-up
+  round and a spoiled round can leave a remainder in which one arm never
+  takes the leading position -- and leading is the inflated position, so that
+  arm is the only one never inflated. Check what the surviving rounds do to
+  the balance of lead positions before trusting them; if the lead is no
+  longer balanced, the run is spoiled whichever direction the residue points.
 - **A long sweep and a short run are different measurements.** On the bench
   box a full `frameworks.sh` sweep takes about 20 minutes and its rates settle
   some 30% below what `vs-axum.sh` reads in 87 seconds, for every server
@@ -437,13 +454,48 @@ worker while it served `/user/12345`:
 `user` went from 7% behind OpenSSL to 2% ahead with that one change, and
 `json` from level to 8% ahead.
 
-**`h2` is the one that is still behind**, by 3%, and it is not the read count
-and not the cryptography: it spends 40 microseconds a request against
-OpenSSL's 46 and still reads lower, and its p50 and p99 are both worse where
-every other workload's improved. It is not `av_tls_pending` reporting one
-rather than a byte count either -- every caller tests it against zero. Why
-HTTP/2 in particular should lose is not yet known, and the row stands as
-measured.
+**`h2` is the one that is still behind**, by 3%, and what it is has been
+narrowed by elimination rather than explained.
+
+It is not the read count, which the greedy BIO restored to 1.00. It is not
+`av_tls_pending` answering one rather than a byte count, since every caller
+tests it against zero. It is not the cryptography: `h2` spends 40
+microseconds a request against OpenSSL's 46, so the saving is there and does
+not become throughput.
+
+And it is not write batching, which was the obvious remaining guess -- that a
+small HTTP/2 response leaves as a HEADERS write and a DATA write under one
+library and coalesces under the other. Peregrine counted them with `strace`
+over 2,000 requests: **2.03 writes a request on OpenSSL against 2.02 on
+BoringSSL for h2, and 1.02 against 1.01 for HTTP/1.1.** Identical. Both
+libraries take two writes for an h2 response and neither coalesces them, so
+the 13% of CPU that BoringSSL saves is going somewhere other than the write
+path.
+
+The effect is not this machine, and one part of what follows has since been
+withdrawn. Peregrine reproduced the shape on its own codebase and its own
+box, with four workers against eight and a five-byte body against twenty:
+**HTTP/1.1 +2.6% where h2 is -0.7%, CPU a request -13% on both transports.**
+Two servers, two machines, the same CPU saving to a tenth of a point.
+
+The latency half of that is gone. Peregrine's run put the baseline arm first
+every time; re-run over six rounds alternating which arm leads, the box's own
+drift across the fifteen minutes accounted for the whole effect. An apparent
+-7.8% at eight connections became +3.7% the other way, and p99 went from
+"worse in every round" to 1.351 ms against 1.336 -- indistinguishable. Its
+throughput rows above came from the same unalternated structure, so they are
+not independent confirmation of the -3% measured here. What survives is CPU a
+request, down 10-13% at sixteen and sixty-four connections -- and it survives
+because it landed on the same value as this machine's -13%, measured
+separately, not because of the method that produced it.
+
+So: BoringSSL makes a request about 13% cheaper in CPU whichever transport
+carries it, and HTTP/1.1 turns that into throughput where HTTP/2 does not.
+That is the measurement, and the cause is not known. The tail is not part of
+it: the one measurement that said h2's p99 worsened did not survive
+alternating the arm order. The next thing to test is the greedy BIO itself,
+on and off against this cell, since it is the piece of the change HTTP/2
+exercises differently.
 
 In the clear Garuda leads eleven of fourteen; over HTTPS, measured the way
 above, it leads four. The difference is what TLS adds to a request's CPU,
@@ -477,6 +529,47 @@ parameters 8.5%, algorithm fetching 2.9%. For contrast axum's handshake is
 bookkeeping. Both negotiate the same TLS 1.3 with the same cipher and the
 same X25519MLKEM768 group, both resume sessions, and kernel TLS is a
 regression here rather than a win (below), so none of those explain it.
+
+**What the workloads below do not cover, and it matters.** These fourteen are
+request-shaped: the largest body any of them moves is a megabyte, and most
+move a few hundred bytes. They say nothing about a server sending large files
+through `sendfile`, which is the one place kernel TLS earns its keep -- and
+BoringSSL has none, so the switch costs something these rows cannot show.
+
+Peregrine, built on the same aviancore, measured it: one worker, static files,
+`--ktls` on OpenSSL against BoringSSL where the flag is inert.
+
+**These three rows are provisional -- do not quote them yet.** They come from
+two rounds that both ran the baseline arm first, the same structure that
+invented a -7.8% above. Peregrine is re-running them over four rounds
+rotating which arm leads, and these figures will be replaced by that run
+whichever way it comes out. They stay on the page rather than disappearing
+because the direction is also what the mechanism predicts, and because a
+number marked withdrawn is harder to quote by accident than one that was
+silently removed.
+
+| file (provisional) | with kernel TLS | BoringSSL | |
+|---|---|---|---|
+| 64 KiB | 1,009 MiB/s | **1,205** | BoringSSL +19.4% |
+| 1 MiB | **1,895** | 1,736 | -8.4% |
+| 16 MiB | **1,721** | 1,485 | -13.7%, and 15% more CPU a GiB |
+
+So on those provisional figures losing kernel TLS costs about 8% at a
+megabyte and 14% at sixteen, and nothing below about 64 KiB, where BoringSSL
+is ahead anyway. **It costs that on HTTP/1.1 only.** Kernel TLS never helped
+HTTP/2 even when it was
+available -- Peregrine measures h2 as slower with `--ktls` than without it --
+because framed bytes cannot go out by `sendfile` in the first place.
+
+Peregrine also measures the handshake through a whole server, on another
+machine, over five pairs: **CPU a request down 44.6%**, 0.361 ms to 0.200.
+The throughput half of that measurement, 2,791 to 4,889 requests a second,
+came from the same unalternated runs and is held with the kernel-TLS rows
+above. The CPU figure is kept because its two distributions do not overlap at
+all across the five pairs -- 0.352 to 0.376 ms against 0.190 to 0.209 -- a gap
+wider than any ordering drift seen on that box. The pinned-core probe above
+predicted 40.5% cheaper handshakes; a different codebase on a different box
+found 44.6%.
 
 **kernel TLS is not worth switching on here.** The same sweep with
 `--ktls`: every one of the fourteen workloads slower, by 2 to 9% -- `user`

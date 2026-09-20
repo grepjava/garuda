@@ -105,11 +105,9 @@ public enum GarudaCLI {
                                        SNI, using the names inside each certificate
               --tls-key PATH           PEM private key for the preceding --tls-cert
               --tls-ciphers LIST       OpenSSL cipher list for TLS 1.2
-              --ktls                   let the Linux kernel encrypt TLS, so --static-dir
-                                       files go out with sendfile over HTTPS and idle
-                                       HTTPS connections can move between workers;
-                                       warns where it cannot (needs the tls module:
-                                       modprobe tls)
+              --ktls                   accepted and ignored: the TLS record layer is
+                                       BoringSSL's, which has no kernel TLS
+              --no-ktls                accepted and ignored, for the same reason
               --no-ktls                encrypt TLS in the process only (the default)
               --acme-domain NAME       get and renew a certificate for NAME from an
                                        ACME CA (Let's Encrypt by default), answering

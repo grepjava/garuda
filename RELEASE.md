@@ -4,9 +4,10 @@
 
 # Releases
 
-**Garuda has not been released.** No tag or package has been published. The
-tags `v1.0.0` to `v1.1.5` in this repository predate Garuda and do not describe
-it.
+**1.0.0 is Garuda's first release.** The tags `v1.0.0` to `v1.1.5` that were
+in this repository predated Garuda and described a different project; they
+have been deleted rather than left where they would be read as its history.
+Nothing below them was ever published as Garuda.
 
 **Keeping this file.** A change someone using Garuda would notice gets a line
 under [Unreleased](#unreleased) in the commit that makes it. When a version is
@@ -61,9 +62,21 @@ python3 scripts/broadcast-test.py      # 36, runs garuda-conformance
 
 The Python suites need `h2` and `aioquic`.
 
+`GARUDA_REDIS` is `host:port:password`, and the password is not optional for a
+full run: the suite has tests that a wrong password is refused and that an ACL
+user is held to its keys, so it wants a server with `requirepass` set **and** a
+user `app` with password `app-secret` allowed only keys under `app:`. Given
+`host:port` with no password the suite still runs and those two fail, which
+reads as a Redis bug and is not one. Give the run a server nothing else is
+using -- a suite that finds a password it did not set, or does not find one it
+expected, fails everywhere at once with an authentication error that names
+nothing relevant.
+
 ---
 
 ## Unreleased
+
+## 1.0.0 — 2026-09-20
 
 ### Applications and routes
 
@@ -1293,8 +1306,11 @@ The Python suites need `h2` and `aioquic`.
   TLS record's 5-byte header and then its body with separate system calls,
   where it now reads what the socket has at once. Not under `--ktls`. Needs
   aviancore 0.6.6.
-- Garuda's TLS record layer and handshake can be built against BoringSSL
-  instead of OpenSSL, through aviancore's `AVIAN_TLS_BORINGSSL`. Measured over
+- **Garuda's TLS record layer and handshake are BoringSSL's**, through
+  aviancore, which vendors it. `avian_crypto.c`, ACME and QUIC's primitives
+  go on calling OpenSSL, which is still linked and still required; a build
+  without `AVIAN_TLS_BORINGSSL` puts the record layer back on OpenSSL and is
+  the only way to compare the two. Measured over
   HTTPS against the same tree on OpenSSL, **CPU a request falls on all
   fourteen workloads and throughput rises on thirteen**. `churn` -- a full
   handshake a request -- gains **40.5%** with its CPU cut from 1,010 to 574
@@ -1304,6 +1320,16 @@ The Python suites need `h2` and `aioquic`.
   `h2` is the exception at -3.0%, for reasons not yet understood: it spends
   less CPU a request than OpenSSL and still reads lower. BENCHMARKS.md has the
   table and the method.
+
+  **What it gives up is kernel TLS**, which BoringSSL does not have, so
+  `--ktls` is accepted and ignored and every build encrypts in the process.
+  That costs something only where `sendfile` earned its keep: large static
+  files over HTTPS/1.1, by a margin currently measured at roughly 8% at 1 MiB
+  and 14% at 16 MiB. Those two magnitudes are provisional -- they come from a
+  run whose arm order was not rotated -- and a rotated re-measurement is
+  outstanding; which sizes are affected is not in doubt. Nothing below about
+  64 KiB is affected, and nothing over HTTP/2, whose framed bytes could never
+  take `sendfile` anyway.
 - `benchmarks/tls-probes` measures what the TLS library itself costs, with no
   server in the way: one source compiled against OpenSSL and against
   BoringSSL, a client and a server in one process over a socketpair, plus the
@@ -1405,6 +1431,15 @@ The Python suites need `h2` and `aioquic`.
 
 ### Fixed
 
+- The end-to-end harness stopped leaking servers between suites.
+  `scripts/serverlib.sh` kept one `SERVER_PID`, so a script that started a
+  second server while the first was still up lost the only handle to the
+  first: `static-test.sh` left a supervisor and two workers behind on every
+  run. They accumulated over a long sequence until `broadcast-test.py` lost
+  cross-worker delivery assertions at the end of a 23-suite run and passed
+  every time on its own -- which reads exactly like a bug in whatever was
+  changed most recently, and is not. The library now tracks every server it
+  starts, `server_stop_all` stops all of them, and the traps use it.
 - A QUIC stream reset before it had sent anything could be forgotten before its
   RESET_STREAM went out, keeping its stream credit until the connection closed.
   A reset side now counts as finished once the reset is sent.
