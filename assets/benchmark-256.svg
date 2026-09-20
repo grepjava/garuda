@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="518" viewBox="0 0 1100 518" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1100" height="518" fill="#ffffff"/>
+<text x="40" y="52" font-size="27" font-weight="700" fill="#1b1b1b">Requests per second, a worker per CPU, 256 connections</text>
+<text x="40" y="84" font-size="16" fill="#6b7280">the-benchmarker/web-frameworks applications and load command · higher is better · bar is the median round, whisker the lowest and highest</text>
+<text x="158" y="152" text-anchor="end" font-size="17" font-weight="400" fill="#1b1b1b">ntex</text>
+<rect x="172" y="128" width="784.9" height="34" fill="#9ca3af"/>
+<path d="M939.4 138.0 V152.0 M939.4 145.0 H980.0 M980.0 138.0 V152.0" stroke="#1b1b1b" stroke-width="1.6" fill="none" opacity="0.55"/>
+<text x="992.0" y="152" font-size="17" font-weight="400" fill="#1b1b1b">181,303</text>
+<text x="158" y="208" text-anchor="end" font-size="17" font-weight="400" fill="#1b1b1b">axum</text>
+<rect x="172" y="184" width="765.4" height="34" fill="#9ca3af"/>
+<path d="M933.5 194.0 V208.0 M933.5 201.0 H949.5 M949.5 194.0 V208.0" stroke="#1b1b1b" stroke-width="1.6" fill="none" opacity="0.55"/>
+<text x="961.5" y="208" font-size="17" font-weight="400" fill="#1b1b1b">176,794</text>
+<text x="158" y="264" text-anchor="end" font-size="17" font-weight="700" fill="#1b1b1b">Garuda</text>
+<rect x="172" y="240" width="755.8" height="34" fill="#c2410c"/>
+<path d="M921.1 250.0 V264.0 M921.1 257.0 H939.5 M939.5 250.0 V264.0" stroke="#1b1b1b" stroke-width="1.6" fill="none" opacity="0.55"/>
+<text x="951.5" y="264" font-size="17" font-weight="700" fill="#1b1b1b">174,575</text>
+<text x="158" y="320" text-anchor="end" font-size="17" font-weight="400" fill="#1b1b1b">Elysia on Bun</text>
+<rect x="172" y="296" width="726.3" height="34" fill="#9ca3af"/>
+<path d="M881.8 306.0 V320.0 M881.8 313.0 H914.5 M914.5 306.0 V320.0" stroke="#1b1b1b" stroke-width="1.6" fill="none" opacity="0.55"/>
+<text x="926.5" y="320" font-size="17" font-weight="400" fill="#1b1b1b">167,754</text>
+<text x="158" y="376" text-anchor="end" font-size="17" font-weight="400" fill="#1b1b1b">Hummingbird</text>
+<rect x="172" y="352" width="268.7" height="34" fill="#9ca3af"/>
+<path d="M436.9 362.0 V376.0 M436.9 369.0 H442.4 M442.4 362.0 V376.0" stroke="#1b1b1b" stroke-width="1.6" fill="none" opacity="0.55"/>
+<text x="454.4" y="376" font-size="17" font-weight="400" fill="#1b1b1b">62,068</text>
+<text x="158" y="432" text-anchor="end" font-size="17" font-weight="400" fill="#1b1b1b">Vapor</text>
+<rect x="172" y="408" width="209.4" height="34" fill="#9ca3af"/>
+<path d="M380.8 418.0 V432.0 M380.8 425.0 H383.3 M383.3 418.0 V432.0" stroke="#1b1b1b" stroke-width="1.6" fill="none" opacity="0.55"/>
+<text x="395.3" y="432" font-size="17" font-weight="400" fill="#1b1b1b">48,359</text>
+<text x="1060" y="498" text-anchor="end" font-size="14" fill="#6b7280">zrk open-loop ramp to 500,000/s · median of 6 rotated rounds · 8 CPUs · method in BENCHMARKS.md</text>
+</svg>

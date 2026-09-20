@@ -27,6 +27,17 @@ bodies; server-sent events; WebSockets; resumable uploads; WebTransport. All
 tested. [COMPATIBILITY.md](COMPATIBILITY.md) says what a release may change,
 and [Status](#status) below lists what is missing.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/benchmark-256.png" alt="Requests per second at 256 connections: ntex 181,303, axum 176,794, Garuda 174,575, Elysia on Bun 167,754, Hummingbird 62,068, Vapor 48,359" width="900">
+</p>
+
+Every server runs the same three-route application and the same load command,
+each in an invocation of its own, and the six rotate so that no server is
+always measured last. **Garuda's range and axum's overlap, so these rounds do
+not separate them**; ntex is ahead of both, and Garuda is 2.8x Hummingbird and
+3.6x Vapor. [BENCHMARKS.md](BENCHMARKS.md) has the method, the rounds behind
+each bar, and the runs where Garuda is slower.
+
 ## Quick start
 
 ```bash

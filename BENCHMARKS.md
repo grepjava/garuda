@@ -302,6 +302,51 @@ Latency at 256 connections, p50 / p99 in milliseconds:
   these 8 CPUs, Garuda read 166,490 / 144,825 / 140,511 and placed fourth. The
   other five size themselves and cannot be got wrong this way.
 
+### Hello world again, with the measurement order taken out
+
+The run above measures every server inside one invocation, in a fixed order,
+and whichever goes later reads lower. This one does not: each server is
+measured in an invocation of its own and the six rotate by one each round, so
+over rounds 2-7 every server occupies every position exactly once. Round 1 is
+discarded. `benchmarks/fw-arms.sh`, 256 connections, 8 workers, three 15-second
+runs per arm, 2026-09-20. No server recorded an error in any round.
+
+| entry | lowest round | median | highest round | spread |
+|---|---:|---:|---:|---:|
+| ntex 2.18 | 177,252 | **181,303** | 186,634 | 5.2% |
+| axum 0.8.9 | 175,890 | **176,794** | 179,579 | 2.1% |
+| Garuda 1.0.1 | 173,025 | **174,575** | 177,289 | 2.4% |
+| elysia-bun | 163,953 | **167,754** | 171,494 | 4.5% |
+| Hummingbird 2.26.0 | 61,186 | **62,068** | 62,468 | 2.1% |
+| Vapor 4.122.1 | 48,233 | **48,359** | 48,797 | 1.2% |
+
+p99 at 256 connections, median of the six rounds: ntex 3,149 ms, axum
+3,469 ms, Garuda 3,489 ms, elysia-bun 3,847 ms, Hummingbird 7,660 ms, Vapor
+8,446 ms.
+
+What this says, and what it does not:
+
+- **Garuda is third, 1.3% behind axum and 3.7% behind ntex.** The first of
+  those is not a result: Garuda's rounds span 173.0k-177.3k and axum's
+  175.9k-179.6k, so the two overlap and six rounds cannot separate them. ntex
+  clears Garuda's range, barely, in every round.
+- **Garuda is 4.1% ahead of elysia-bun, 2.8x Hummingbird and 3.6x Vapor**, and
+  those gaps are far outside any arm's spread.
+- **Round 1 is why the discard exists.** Garuda's round-1 reading was 197,741 --
+  **13.3% above its own median and above every one of its six balanced
+  rounds**. No other arm's round-1 excess reached 3% (ntex +2.6%, elysia +1.4%,
+  axum -0.8%, Vapor 0.0%, Hummingbird -2.7%). Why the effect is this large for
+  this one server on a cold machine is not explained here; it is recorded
+  because a one-round comparison would have reported Garuda in first place by
+  12%.
+- **Position within a round is now small.** Each arm's first-position round
+  lands within 2.2% of its own median, in both directions. Running one server
+  per invocation is what buys that; the 17% order bias measured earlier came
+  from sharing an invocation.
+- A three-second unrotated smoke test taken the same evening read Garuda
+  226k, ntex 231k and axum 184k. Every one of those is wrong, Garuda's by 29%.
+  Short single runs are not a cheap version of this table.
+
 ### Requests that do work, against axum
 
 `bash benchmarks/workloads.sh` with `skew` and `spike` added: 8 Garuda workers

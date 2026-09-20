@@ -87,6 +87,10 @@ nothing relevant.
   in its own invocation and the arms rotated. It now stops at the first arm
   that fails to start, rather than finishing a rotation that is missing one:
   such a sweep runs faster than a working one, which reads like progress.
+- The README opens with a throughput chart of the six servers at 256
+  connections, drawn by `benchmarks/chart.py` from the sweep log kept in
+  `benchmarks/results/`, so the picture cannot drift from the figures.
+  BENCHMARKS.md gains the rotated run behind it, with every round.
 
 ## 1.0.1 — 2026-09-20
 

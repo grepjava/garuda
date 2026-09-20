@@ -1,0 +1,129 @@
+# 2026-09-20 23:00:19  conns=256 runs=3 duration=15s workers=8
+# 6 arms, 7 rounds, round 1 discarded as warm-up.
+# Rounds 2-7 give every arm every position exactly once.
+===== round 1  position 1  arm=garuda =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	garuda	8	256	197741 168.640 1023.232 2493.440 3822.592 0	[197741 198594 173782 ]
+===== round 1  position 2  arm=axum =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	axum	8	256	175425 754.944 2017.792 2911.232 3492.864 0	[190585 173623 175425 ]
+===== round 1  position 3  arm=ntex =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	ntex	8	256	185959 1076.736 2352.128 3134.464 3613.696 0	[189130 185959 181962 ]
+===== round 1  position 4  arm=vapor =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	vapor	8	256	48344 2685.952 5126.144 6952.960 8087.552 0	[48344 48354 48115 ]
+===== round 1  position 5  arm=hummingbird =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	hummingbird	8	256	60421 2888.704 5281.792 6813.696 7747.584 0	[60993 60191 60421 ]
+===== round 1  position 6  arm=elysia-bun =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+elysia	elysia-bun	8	256	170072 558.848 1670.656 2640.896 3447.808 0	[170072 174214 166594 ]
+===== round 2  position 1  arm=axum =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	axum	8	256	176654 722.176 1963.520 2878.464 3456.000 0	[190474 175876 176654 ]
+===== round 2  position 2  arm=ntex =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	ntex	8	256	182675 870.144 2013.696 2817.024 3372.032 0	[185100 181705 182675 ]
+===== round 2  position 3  arm=vapor =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	vapor	8	256	48797 3281.920 5826.560 7444.480 8425.472 0	[48677 48797 49030 ]
+===== round 2  position 4  arm=hummingbird =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	hummingbird	8	256	61186 2878.464 5265.408 6789.120 7723.008 0	[61682 61186 60603 ]
+===== round 2  position 5  arm=elysia-bun =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+elysia	elysia-bun	8	256	171494 496.768 1457.664 2481.152 3908.608 0	[171494 165239 172056 ]
+===== round 2  position 6  arm=garuda =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	garuda	8	256	177289 493.952 1612.288 3171.328 4528.128 0	[173243 177289 183211 ]
+===== round 3  position 1  arm=ntex =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	ntex	8	256	177252 386.688 1488.384 3441.664 4806.656 0	[180381 177252 175293 ]
+===== round 3  position 2  arm=vapor =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	vapor	8	256	48274 3240.960 5814.272 7444.480 8441.856 0	[48315 48274 48022 ]
+===== round 3  position 3  arm=hummingbird =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	hummingbird	8	256	62274 2196.480 4499.456 6199.296 7243.776 0	[62274 61824 62707 ]
+===== round 3  position 4  arm=elysia-bun =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+elysia	elysia-bun	8	256	168927 648.960 1856.000 3419.136 4741.120 0	[169355 168927 162260 ]
+===== round 3  position 5  arm=garuda =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	garuda	8	256	173941 820.992 2079.232 2960.384 3607.552 0	[169238 174456 173941 ]
+===== round 3  position 6  arm=axum =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	axum	8	256	179579 702.720 1995.264 2898.944 3476.480 0	[189399 172946 179579 ]
+===== round 4  position 1  arm=vapor =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	vapor	8	256	48444 3312.640 5834.752 7456.768 8450.048 0	[47769 48472 48444 ]
+===== round 4  position 2  arm=hummingbird =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	hummingbird	8	256	61373 2874.368 5244.928 6772.736 7698.432 0	[61002 61373 61547 ]
+===== round 4  position 3  arm=elysia-bun =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+elysia	elysia-bun	8	256	167860 960.256 2300.928 3228.672 3785.728 0	[169895 162390 167860 ]
+===== round 4  position 4  arm=garuda =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	garuda	8	256	175211 517.504 1566.208 2339.840 2954.240 0	[175211 173455 178685 ]
+===== round 4  position 5  arm=axum =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	axum	8	256	176933 739.072 1989.120 2878.464 3462.144 0	[187888 176933 176411 ]
+===== round 4  position 6  arm=ntex =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	ntex	8	256	186634 324.992 1152.512 1860.096 2546.688 0	[186634 183865 189223 ]
+===== round 5  position 1  arm=hummingbird =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	hummingbird	8	256	62468 2847.744 5216.256 6719.488 7645.184 0	[62738 62468 61978 ]
+===== round 5  position 2  arm=elysia-bun =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+elysia	elysia-bun	8	256	163953 539.904 1623.552 2569.216 3234.816 0	[163953 166426 163414 ]
+===== round 5  position 3  arm=garuda =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	garuda	8	256	173025 766.720 2013.696 2905.088 3478.528 0	[174477 173025 171872 ]
+===== round 5  position 4  arm=axum =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	axum	8	256	177868 706.304 1978.880 2872.320 3445.760 0	[185426 177013 177868 ]
+===== round 5  position 5  arm=ntex =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	ntex	8	256	183124 509.568 1370.624 2044.416 2714.624 0	[184577 174298 183124 ]
+===== round 5  position 6  arm=vapor =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	vapor	8	256	48233 3253.248 5842.944 7460.864 8458.240 0	[48091 48317 48233 ]
+===== round 6  position 1  arm=elysia-bun =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+elysia	elysia-bun	8	256	164472 777.472 2052.608 3351.552 4683.776 0	[170432 164472 157642 ]
+===== round 6  position 2  arm=garuda =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	garuda	8	256	174363 894.720 2116.608 2964.480 3499.008 0	[171359 174363 180311 ]
+===== round 6  position 3  arm=axum =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	axum	8	256	175890 762.624 2018.816 2931.712 3509.248 0	[197170 175890 175445 ]
+===== round 6  position 4  arm=ntex =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	ntex	8	256	178681 440.448 1426.944 2309.120 2925.568 0	[178681 174780 182299 ]
+===== round 6  position 5  arm=vapor =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	vapor	8	256	48258 3265.536 5818.368 7464.960 8474.624 0	[47639 48258 48309 ]
+===== round 6  position 6  arm=hummingbird =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	hummingbird	8	256	62016 2851.840 5224.448 6744.064 7673.856 0	[62263 62016 61402 ]
+===== round 7  position 1  arm=garuda =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	garuda	8	256	174787 515.200 1617.408 2411.520 3017.728 0	[174787 169534 175322 ]
+===== round 7  position 2  arm=axum =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	axum	8	256	176165 767.744 1979.904 2933.760 3509.248 0	[191072 176165 174428 ]
+===== round 7  position 3  arm=ntex =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+rust	ntex	8	256	179931 942.848 2219.008 3068.928 3625.984 0	[178773 185880 179931 ]
+===== round 7  position 4  arm=vapor =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	vapor	8	256	48655 3257.344 5806.080 7424.000 8417.280 0	[48521 48930 48655 ]
+===== round 7  position 5  arm=hummingbird =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+swift	hummingbird	8	256	62120 2171.904 4446.208 6162.432 7219.200 0	[62120 62355 61638 ]
+===== round 7  position 6  arm=elysia-bun =====
+framework	server	workers	connections	req/s p50_ms p75_ms p90_ms p99_ms errors	runs
+elysia	elysia-bun	8	256	167647 571.648 1647.104 2573.312 3308.544 0	[167647 166836 167823 ]
