@@ -42,6 +42,68 @@ struct Item: Codable {
     let price: Int32
 }
 
+// The three types the JSON workloads carry read and write themselves rather
+// than going through Codable. This is what `@JSON` generates; it is written
+// out here because the macro is not written yet, and serde's derive on the
+// axum side is the same bargain.
+
+extension Order: JSONReadable {
+    init(json reader: inout JSONReader) throws {
+        var id: Int?
+        var name: String?
+        var tags: [String]?
+        try reader.beginObject()
+        while let key = try reader.nextKey() {
+            if key.matches("id") {
+                id = try reader.read(Int.self, named: "id")
+            } else if key.matches("name") {
+                name = try reader.read(String.self, named: "name")
+            } else if key.matches("tags") {
+                tags = try reader.read([String].self, named: "tags")
+            } else {
+                try reader.skipValue()
+            }
+        }
+        guard let id else { throw JSONError.missingKey(path: "id") }
+        guard let name else { throw JSONError.missingKey(path: "name") }
+        guard let tags else { throw JSONError.missingKey(path: "tags") }
+        self.init(id: id, name: name, tags: tags)
+    }
+}
+
+extension Receipt: JSONWritable {
+    func write(json output: inout JSONOutput) {
+        output.beginObject()
+        output.key("id")
+        output.write(id)
+        output.key("name")
+        output.write(name)
+        output.key("tags")
+        output.beginArray()
+        for tag in tags {
+            output.element()
+            output.write(tag)
+        }
+        output.endArray()
+        output.key("count")
+        output.write(count)
+        output.endObject()
+    }
+}
+
+extension Item: JSONWritable {
+    func write(json output: inout JSONOutput) {
+        output.beginObject()
+        output.key("id")
+        output.write(id)
+        output.key("name")
+        output.write(name)
+        output.key("price")
+        output.write(price)
+        output.endObject()
+    }
+}
+
 let databaseURL = getenv("DATABASE_URL").map { String(cString: $0) }
     ?? "postgres://garuda:garuda-secret@127.0.0.1:5432/bench?sslmode=disable"
 // Per worker. The script runs four workers, so 32 connections in all: axum's

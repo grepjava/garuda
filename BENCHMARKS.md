@@ -730,3 +730,58 @@ The written-out decoder takes the happy path only — no escapes, no unknown
 keys — so generated code that handles everything would give a little of that
 back.
 
+### Every workload against axum, 2026-09-20
+
+`bash benchmarks/workloads.sh` with `skew` and `spike` added to the list: 8
+Garuda workers against Tokio's 8 threads, 64 connections, 5 seconds a
+workload, one run each. Requests a second, then p99 in milliseconds and the
+server's CPU per request in microseconds where they say something.
+
+Both applications are written the way each framework's documentation writes
+one, and both now generate their JSON code: serde's derive on the axum side,
+and on Garuda's the `JSONReadable` and `JSONWritable` conformances for
+`Order`, `Receipt` and `Item`, written out by hand because `@JSON` is not
+written yet. Everything else in the two applications is unchanged.
+
+| workload | Garuda | axum |
+|---|---|---|
+| user | **160,070** (1.19; 20) | 130,108 (1.37; 24) |
+| json | **142,778** (1.56; 30) | 113,313 (1.74; 32) |
+| db | 44,230 (2.67; 83) | **44,659** (2.49; 72) |
+| stream | **36,071** (3.04; 88) | 34,317 (3.48; 74) |
+| me | **128,831** (1.84; 35) | 112,922 (1.87; 32) |
+| upload | **2,162** (1,912) | 1,342 (3,678) |
+| download | 2,072 | **2,082** |
+| relay | **11,538** (10.9; 381) | 4,029 (43.6; 566) |
+| churn | **37,581** (2.13; 64) | 33,322 (3.49; 93) |
+| h2 | **115,565** (0.96; 29) | 104,403 (1.63; 31) |
+| overload | 35,565 | **37,391** |
+| recovery | **150,559** | 142,341 |
+| skew | **72,973** (2.43; 89) | 47,118 (3.77; 149) |
+| spike | **107,038** (2.55; 54) | 61,934 (3.07; 102) |
+
+Garuda is ahead on eleven of the fourteen, level on `db` and `download`, and
+behind on `overload` by 5%. Where it is ahead by most, it is for a reason
+that has been measured rather than guessed:
+
+- `skew` and `spike`, by 55% and 73%, from gathering slow connections onto
+  fewer workers so that quick requests have somewhere to go.
+- `relay` by nearly three times, and at a quarter of the p99: the client
+  streams a response on as it arrives rather than holding it.
+- `json` by 26%, from reading and writing that type's JSON directly. Against
+  Codable the same sweep is level with axum, which is where it sat before.
+- `churn`, `h2` and `user` by 13%, 11% and 23%, with a p99 below axum's on
+  all three, from the short turns and short scheduler slices.
+
+The tail is now Garuda's on every small request: 1.56 against 1.74 on `json`,
+0.96 against 1.63 on `h2`, 1.19 against 1.37 on `user`. It used to be about
+twice axum's.
+
+Where it is not ahead: `db` is a Postgres round trip either way and the
+difference is the driver's 11 microseconds of CPU; `overload` is 16 times the
+connections against a pool far short of them, where what is being measured is
+mostly how a pool queues.
+
+A worker is a process, so memory starts higher -- 13 MiB against axum's 5 --
+and grows more slowly: 38 against 44 by the end of the run.
+
