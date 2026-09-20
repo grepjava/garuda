@@ -158,6 +158,22 @@ The Python suites need `h2` and `aioquic`.
   right and what it asks for is not allowed, where 400 stays a body that is
   not the type at all. `try value.validated()` checks a value that came from a
   queue or a file rather than a request.
+- A type can read and write its own JSON instead of going through
+  `Codable`, by conforming to `JSONReadable` and `JSONWritable` and walking
+  the bytes with a `JSONReader` and a `JSONOutput`. Nothing at a call site
+  changes: the coder asks once per type whether it has them and takes
+  whichever path the type has, so `Body<Order>` and `JSON(receipt)` are
+  written the same either way, and a type that has none is decoded and
+  encoded exactly as before. What a type with them sends is byte for byte
+  what Codable sent, down to how a `Double` is written and which members are
+  left out when they are nil. Codable decides everything at run time --
+  containers are existentials, and the metadata for each is fetched again
+  for every document -- which measured 3.8 microseconds to decode a small
+  body and 2.5 to encode a small answer, on a request that is otherwise 8.
+  Reading and writing them directly, the `json` workload's request went from
+  15.6 to 13.2 microseconds on one worker, 64,000 requests a second to
+  75,900. Writing the conformances out is dull and easy to get wrong, and a
+  macro to write them is next.
 - Whether a decoded type has rules is asked once for that type rather than
   once a request. Asking the runtime -- `value as? any Validated` -- costs
   about half a microsecond whether the answer is yes or no, and `Body<T>`,

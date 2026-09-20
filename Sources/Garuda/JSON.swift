@@ -44,6 +44,8 @@ public enum JSONCoder {
 
     /// The JSON bytes for `value`.
     public static func encode(_ value: some Encodable) throws -> [UInt8] {
+        // A type with a writer of its own writes itself. JSONFastPath.swift.
+        if let bytes = try JSONFastPath.bytes(value) { return bytes }
         let writer = JSONWriter()
         defer { writer.destroy() }
         try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, path: .root))
@@ -53,6 +55,14 @@ public enum JSONCoder {
     /// The JSON bytes for `value`, appended to `buffer`. For a response that
     /// is written straight into the connection's own buffer.
     static func encode(_ value: some Encodable, into buffer: inout ByteBuffer) throws {
+        // A type with a writer of its own writes itself. JSONFastPath.swift.
+        if let written = try JSONFastPath.bytes(value) {
+            written.withUnsafeBufferPointer { bytes in
+                guard let base = bytes.baseAddress, bytes.count > 0 else { return }
+                buffer.write(base, bytes.count)
+            }
+            return
+        }
         let writer = JSONWriter()
         defer { writer.destroy() }
         try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, path: .root))
@@ -65,6 +75,12 @@ public enum JSONCoder {
     /// bookkeeping for every one.
     static func encode<R>(_ value: some Encodable, with writer: JSONWriter,
                           _ body: (UnsafePointer<UInt8>?, Int) throws -> R) throws -> R {
+        // A type with a writer of its own writes itself. JSONFastPath.swift.
+        if try JSONFastPath.write(value, into: &writer.fast) {
+            return try writer.fast.bytes.withUnsafeBufferPointer {
+                try body($0.baseAddress, $0.count)
+            }
+        }
         writer.reset()
         defer { writer.trim() }
         try value.encode(to: JSONEncoding(writer: writer, level: -1, key: nil, path: .root))
@@ -89,6 +105,10 @@ final class JSONWriter {
     // runtime's check on every access to these was a few percent of encoding
     // an answer.
     @exclusivity(unchecked) private var buffer = ByteBuffer()
+    /// Where a type that writes its own JSON writes it. Kept with the
+    /// writer so that a worker reuses one buffer for its answers and two
+    /// threads never share one. JSONFastPath.swift.
+    @exclusivity(unchecked) var fast = JSONOutput()
     /// The containers still open, outermost first.
     @exclusivity(unchecked) private var open: [Kind] = []
     /// Whether each open container has had an element written into it.
