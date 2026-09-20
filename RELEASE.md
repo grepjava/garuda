@@ -43,6 +43,7 @@ bash scripts/cache-test.sh             # 85, runs garuda-conformance
 bash scripts/ratelimit-test.sh         # 18
 bash scripts/redirect-test.sh          # 22
 bash scripts/sni-test.sh               # 11
+bash scripts/resumption-test.sh        # 7
 bash scripts/acme-test.sh              # 12, needs Pebble (PEBBLE_DIR)
 bash scripts/request-id-test.sh        # 12
 bash scripts/trace-context-test.sh     # 17
@@ -75,6 +76,12 @@ nothing relevant.
 ---
 
 ## Unreleased
+
+- `scripts/resumption-test.sh` checks that a TLS session ticket shortens the
+  next connection, over TLS 1.3 and TLS 1.2, and that a resumed connection
+  still serves its request -- a server can resume a session and then fail on
+  it. A connection offering no ticket must report a full handshake, which is
+  what separates real resumption from a server that claims it for everything.
 
 ## 1.0.0 — 2026-09-20
 
