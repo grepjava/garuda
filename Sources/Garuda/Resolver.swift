@@ -404,6 +404,10 @@ extension Worker {
     /// The id alone is not enough. Checking the echoed question too means an
     /// attacker who guesses the id but not the name gets nothing, and a stale
     /// reply to an earlier question cannot be mistaken for this one.
+    // Swift 6.4's CopyPropagation crashes verifying ownership of this
+    // function at -O (github.com/swiftlang/swift/issues/90408). Keep it
+    // off the optimiser until a toolchain that carries the fix is required.
+    @_optimize(none)
     private static func believe(_ buffer: [UInt8], count: Int, id: UInt16,
                                 name: String, type: DNSRecordType) -> Answer {
         let parsed: DNSResponse
