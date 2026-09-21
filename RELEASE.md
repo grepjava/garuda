@@ -34,7 +34,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1092 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1093 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 11
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -78,12 +78,15 @@ nothing relevant.
 ## Unreleased
 
 - An append to a resumable upload reads the upload's state again once it holds
-  the lock. The checks it made -- that the upload is still going, and how long
-  it was declared to be -- came from a read taken before the wait, and the
-  request it waited for is the one most likely to have changed them. Two
-  requests completing at the same offset both passed, so the completion handler
-  ran twice for one upload. An append that waited out a completion is now the
-  409 it would have been had it arrived a moment later.
+  the lock, and goes by what it reads. The checks it made -- that the upload is
+  still going, and how long it was declared to be -- came from a read taken
+  before the wait, and the request it waited for is the one most likely to have
+  changed them. Two requests completing at the same offset both passed, so the
+  completion handler ran twice for one upload; and an append that was never
+  told a length ran past one declared while it waited, since nothing it held
+  said where to stop. An append that waited out a completion is now the 409 it
+  would have been had it arrived a moment later, and one that waited out a
+  length is held to it.
 
 - The answer a completed upload was given is replayed with its `Location`. A
   handler that moves the bytes somewhere and answers `303` was replayed as a

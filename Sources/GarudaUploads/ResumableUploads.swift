@@ -437,12 +437,19 @@ final class UploadService: @unchecked Sendable {
                            "the offset does not match the upload's",
                            [("expected-offset", handle.offset), ("provided-offset", offset)])
         }
-        if let declared = current.length, let length, declared != length {
-            handle.release()
-            return problem(response, .badRequest, UploadProblem.inconsistentLength,
-                           "the upload's length changed", [])
+        // A length declared while this request waited is one it never saw, and
+        // taking it is what holds these bytes to it: without it the transfer
+        // below has nothing to stop at.
+        if let declared = current.length {
+            if let length, length != declared {
+                handle.release()
+                return problem(response, .badRequest, UploadProblem.inconsistentLength,
+                               "the upload's length changed", [])
+            }
+            length = declared
+        } else if let length {
+            try store.update(id, length: length, complete: false)
         }
-        if let length, length != current.length { try store.update(id, length: length, complete: false) }
         try await transfer(handle, body, &response, complete: complete, length: length,
                            resumable: true, interim: interim, creating: false,
                            contentDigest: contentDigest, wantsDigest: wantsSHA256(request))

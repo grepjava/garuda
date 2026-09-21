@@ -417,6 +417,45 @@ struct ResumableUploadTests {
         #expect(completed.isEmpty, "the handler did not run for an upload another request completed")
     }
 
+    @Test func anAppendTakesALengthDeclaredWhileItWaited() throws {
+        // The request this one waits for can be the one that declares how
+        // long the upload is. Nothing told this one, so unless it reads the
+        // length under the lock it has nothing to stop its bytes at.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let client = app.test
+        let created = try client.post("/files", body: pattern(10), headers: [("Upload-Complete", "?0")])
+        let location = try #require(header(created, "location"))
+        let id = String(location.dropFirst(9))
+        let busy = try #require(try store.acquire(id))
+
+        let (socket, _, _) = try client.connect()
+        let head = "PATCH \(location) HTTP/1.1\r\nHost: x\r\nContent-Type: application/partial-upload\r\n"
+            + "Upload-Offset: 10\r\nUpload-Complete: ?0\r\nContent-Length: 20\r\n\r\n"
+        let request = Array(head.utf8) + pattern(20, from: 10)
+        _ = request.withUnsafeBufferPointer { write(socket, $0.baseAddress!, $0.count) }
+        // The holder declares a length this request would run past.
+        let released = av_monotonic_ms() + 100
+        var received: [UInt8] = []
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        var answer: TestResponse? = nil
+        let deadline = av_monotonic_ms() + 5000
+        while answer == nil && av_monotonic_ms() < deadline {
+            if av_monotonic_ms() >= released {
+                try store.update(id, length: 20, complete: false)
+                busy.release()
+            }
+            client.turn()
+            let n = chunk.withUnsafeMutableBufferPointer { av_read(socket, $0.baseAddress!, $0.count) }
+            if n > 0 { received += chunk[0..<n] }
+            answer = try TestResponse.parse(received, bodyless: false, closed: false)
+        }
+        busy.release()
+        _ = close(socket)
+        #expect(try #require(answer).status == 400)
+        #expect(try #require(try store.info(id)).offset <= 20, "it stopped at the length")
+    }
+
     @Test func aResumeSupersedesAnAppendStillWaitingOnThisWorker() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
         let app = uploadApp(store)
