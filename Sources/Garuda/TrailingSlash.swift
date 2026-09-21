@@ -11,8 +11,9 @@
 //
 // Either only looks when no route matched the path as it came, so a route
 // that is registered with the slash keeps its own requests and a request that
-// matched pays nothing. A path the trimmed form would make start with `//` is
-// never redirected: a browser reads `Location: //host` as another site.
+// matched pays nothing. A path the trimmed form would make start with `//` or
+// `/\` is never redirected: a browser reads `Location: //host` as another
+// site, and reads a backslash there as the second slash of one.
 //===----------------------------------------------------------------------===//
 
 import AvianCore
@@ -52,14 +53,15 @@ extension Worker {
     }
 
     /// Answers 308 to the request's path without its trailing slashes, with
-    /// its query. False, answering nothing, when that path would begin `//`.
+    /// its query. False, answering nothing, when that path would begin `//`
+    /// or `/\`, either of which names another host to a browser.
     mutating func redirectWithoutTrailingSlash(_ slot: Int) -> Bool {
         let c = table[slot]
         let headBase = c.pointee.headBase()
         let path = c.pointee.head.path.span(in: headBase)
         var trimmed = path.count
         while trimmed > 1 && path.base[trimmed &- 1] == 0x2F { trimmed &-= 1 }
-        if trimmed >= 2 && path.base[1] == 0x2F { return false }
+        if trimmed >= 2 && (path.base[1] == 0x2F || path.base[1] == 0x5C) { return false }
         var location = Array(UnsafeBufferPointer(start: path.base, count: trimmed))
         let query = c.pointee.head.query.span(in: headBase)
         if query.count > 0 {

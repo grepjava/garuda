@@ -125,6 +125,26 @@ struct FormTests {
         #expect(echoed.body == picture)
     }
 
+    @Test func boundaryBytesInsideAPartAreContent() throws {
+        // A file that holds the delimiter without the framing that makes one:
+        // RFC 2046 gives a delimiter a line of its own, so neither of these
+        // ends the part, and cutting there would lose the rest of the file.
+        let boundary = "GarudaTest9"
+        var file = Array("prefix--\(boundary)--suffix\r\n".utf8)
+        file += Array("--\(boundary)tail\r\n".utf8)
+        file += Array("end".utf8)
+
+        let body = multipart(boundary: boundary, [
+            ("Content-Disposition: form-data; name=\"avatar\"; filename=\"log.txt\"", file),
+            field("title", "kept whole"),
+        ])
+        let client = formApp().test
+        let headers = [("content-type", "multipart/form-data; boundary=\(boundary)")]
+        #expect(try client.post("/avatar", body: body, headers: headers).body == file)
+        #expect(try client.post("/upload", body: body, headers: headers)
+            .json(Summary.self).title == "kept whole")
+    }
+
     @Test func aQuotedBoundaryIsRead() throws {
         let boundary = "simple-boundary"
         let body = multipart(boundary: boundary, [field("title", "quoted")])

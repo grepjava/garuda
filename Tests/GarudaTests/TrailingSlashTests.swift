@@ -98,5 +98,9 @@ struct TrailingSlashTests {
         let doubled = try client.get("//evil.example/")
         #expect(doubled.status == 405)
         #expect(doubled.header("location") == nil)
+        // A browser reads the backslash as the slash that would follow it.
+        let backslash = try client.get("/\\evil.example/")
+        #expect(backslash.status == 405)
+        #expect(backslash.header("location") == nil)
     }
 }

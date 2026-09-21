@@ -56,6 +56,9 @@ public struct UploadInfo: Codable, Sendable, Equatable {
 public struct UploadAnswer: Sendable, Equatable {
     public var status: Int
     public var contentType: String?
+    /// The `Location` it answered with, when it had one: a redirect replayed
+    /// without it is a status that says nothing.
+    public var location: String?
     public var body: [UInt8]
     /// When the upload it answers was created, so the answer can be expired
     /// along with the upload it belongs to, even once that upload is gone.
@@ -226,17 +229,27 @@ public final class FileUploadStore: @unchecked Sendable {
 
     func donePath(_ id: String) -> String { "\(directory)/\(id).done" }
 
+    /// The first line of a remembered answer, naming the layout of the rest.
+    /// An answer written before there was a version line begins with its
+    /// status, which is three digits, so the two never read as each other.
+    private static let answerVersion = "2"
+
     /// Remembers what the completed upload was answered with, so a client
     /// whose connection died before the answer reached it can ask again.
     ///
-    /// The file is the status, when the upload was created, the content type,
-    /// a newline, and then the body as it was. A header value cannot hold a
-    /// newline and the first two are numbers, so there is nothing to escape
-    /// and nothing to parse wrongly.
-    public func remember(_ id: String, status: Int, contentType: String?, body: [UInt8],
-                         createdAt: Int) throws {
+    /// The file is the version line; the status, when the upload was created
+    /// and the content type; the `Location`; and then the body as it was. A
+    /// header value cannot hold a newline and the numbers come first on their
+    /// line, so there is nothing to escape and nothing to parse wrongly.
+    public func remember(_ id: String, status: Int, contentType: String?,
+                         location: String? = nil, body: [UInt8], createdAt: Int) throws {
         guard FileUploadStore.isValidID(id) else { throw UploadStoreError.notFound }
-        var bytes = Array("\(status) \(createdAt) \(contentType ?? "")\n".utf8)
+        var bytes = Array("""
+            \(FileUploadStore.answerVersion)
+            \(status) \(createdAt) \(contentType ?? "")
+            \(location ?? "")
+            """.utf8)
+        bytes.append(UInt8(ascii: "\n"))
         bytes += body
         try writeFile(bytes, to: donePath(id))
     }
@@ -246,13 +259,35 @@ public final class FileUploadStore: @unchecked Sendable {
     public func answer(_ id: String) throws -> UploadAnswer? {
         guard FileUploadStore.isValidID(id) else { return nil }
         guard let bytes = try readFile(donePath(id)) else { return nil }
+        var rest = bytes[...]
+        // An answer a server wrote before there was a version line has no
+        // `Location` and no line to say so; the rest of it reads the same.
+        guard let first = FileUploadStore.line(&rest) else { return nil }
+        guard first == FileUploadStore.answerVersion else {
+            return FileUploadStore.answer(head: first, location: nil, body: Array(rest))
+        }
+        guard let head = FileUploadStore.line(&rest),
+              let location = FileUploadStore.line(&rest) else { return nil }
+        return FileUploadStore.answer(head: head, location: location.isEmpty ? nil : location,
+                                      body: Array(rest))
+    }
+
+    /// The bytes up to the next newline, taking them and it off `bytes`.
+    private static func line(_ bytes: inout ArraySlice<UInt8>) -> String? {
         guard let newline = bytes.firstIndex(of: UInt8(ascii: "\n")) else { return nil }
-        let head = String(decoding: bytes[..<newline], as: UTF8.self)
-            .split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
-        guard head.count == 3, let status = Int(head[0]), let createdAt = Int(head[1]) else { return nil }
-        let type = String(head[2])
+        defer { bytes = bytes[(newline + 1)...] }
+        return String(decoding: bytes[..<newline], as: UTF8.self)
+    }
+
+    /// One remembered answer, from the line that holds its numbers.
+    private static func answer(head: String, location: String?,
+                               body: [UInt8]) -> UploadAnswer? {
+        let fields = head.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+        guard fields.count == 3, let status = Int(fields[0]),
+              let createdAt = Int(fields[1]) else { return nil }
+        let type = String(fields[2])
         return UploadAnswer(status: status, contentType: type.isEmpty ? nil : type,
-                            body: Array(bytes[(newline + 1)...]), createdAt: createdAt)
+                            location: location, body: body, createdAt: createdAt)
     }
 
     /// Removes every upload created more than `seconds` ago. Returns how

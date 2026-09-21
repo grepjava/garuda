@@ -413,6 +413,22 @@ final class UploadService: @unchecked Sendable {
         } catch UploadStoreError.notFound {
             return response.send(status: .notFound)
         }
+        // Taking the lock can wait on a request that is still appending, and
+        // what that request did is not in the `info` read before the wait: it
+        // may have completed the upload, or declared its length. Reading it
+        // again under the lock is what makes the checks above hold now.
+        guard let current = try store.info(id) else {
+            handle.release()
+            return response.send(status: .notFound)
+        }
+        if current.complete {
+            handle.release()
+            response.addHeader("Upload-Complete", "?1")
+            response.addHeader("Upload-Offset", "\(current.offset)")
+            return problem(response, .conflict, UploadProblem.mismatchingOffset,
+                           "the upload is already complete",
+                           [("expected-offset", current.offset), ("provided-offset", offset)])
+        }
         if handle.offset != offset {
             handle.release()
             response.addHeader("Upload-Offset", "\(handle.offset)")
@@ -421,7 +437,12 @@ final class UploadService: @unchecked Sendable {
                            "the offset does not match the upload's",
                            [("expected-offset", handle.offset), ("provided-offset", offset)])
         }
-        if length != info.length { try store.update(id, length: length, complete: false) }
+        if let declared = current.length, let length, declared != length {
+            handle.release()
+            return problem(response, .badRequest, UploadProblem.inconsistentLength,
+                           "the upload's length changed", [])
+        }
+        if let length, length != current.length { try store.update(id, length: length, complete: false) }
         try await transfer(handle, body, &response, complete: complete, length: length,
                            resumable: true, interim: interim, creating: false,
                            contentDigest: contentDigest, wantsDigest: wantsSHA256(request))
@@ -554,7 +575,9 @@ final class UploadService: @unchecked Sendable {
                 for i in 0..<span.count { bytes.append(span[i]) }
                 return bytes
             }
-            try? store.remember(id, status: status, contentType: type, body: body, createdAt: created)
+            try? store.remember(id, status: status, contentType: type,
+                                location: outgoing.header("location"), body: body,
+                                createdAt: created)
         }
         try answer.write(to: response)
     }
@@ -573,6 +596,9 @@ final class UploadService: @unchecked Sendable {
         if replaying, let answer = try? store.answer(id),
            Int(time(nil)) - answer.createdAt <= limits.maxAge {
             if let type = answer.contentType { response.addHeader("Content-Type", type) }
+            // A handler that answered with a redirect said where the upload
+            // went. Without the field the status alone says nothing.
+            if let location = answer.location { response.addHeader("Location", location) }
             response.addHeader("Upload-Complete", "?1")
             return response.send(status: HTTPStatus(answer.status), answer.body)
         }

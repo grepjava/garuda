@@ -148,7 +148,7 @@ enum MultipartParser {
         var delimiter: [UInt8] = [0x2D, 0x2D]
         delimiter.append(contentsOf: boundary)
 
-        guard var at = find(base, count, delimiter, from: 0) else {
+        guard var at = findDelimiter(base, count, delimiter, from: 0) else {
             throw MultipartError.malformed("no boundary in the body")
         }
         var parts: [MultipartPart] = []
@@ -166,7 +166,7 @@ enum MultipartParser {
             }
             let header = try headers(base, from: at, to: headersEnd)
             let bodyStart = headersEnd + 4
-            guard let next = find(base, count, delimiter, from: bodyStart) else {
+            guard let next = findDelimiter(base, count, delimiter, from: bodyStart) else {
                 throw MultipartError.malformed("a part has no closing boundary")
             }
             // The CRLF before the delimiter belongs to the framing, not the part.
@@ -250,6 +250,27 @@ enum MultipartParser {
                 text = text.dropFirst().dropLast()
             }
             return String(text)
+        }
+        return nil
+    }
+
+    /// Where a boundary delimiter that frames a line next appears at or after
+    /// `from`. RFC 2046 gives the delimiter a line of its own: one that does
+    /// not begin the body follows a CRLF, and every one is followed either by
+    /// a line ending or by the `--` that closes the body. The same bytes
+    /// inside a part's content meet neither test, and are content: a file that
+    /// happens to hold `--boundary--` is stored whole rather than cut there.
+    private static func findDelimiter(_ base: UnsafePointer<UInt8>, _ count: Int,
+                                      _ delimiter: [UInt8], from: Int) -> Int? {
+        var at = from
+        while let i = find(base, count, delimiter, from: at) {
+            let opensLine = i == 0 || (i >= 2 && base[i - 2] == cCR && base[i - 1] == cLF)
+            let end = i + delimiter.count
+            let closesLine = end + 1 < count
+                && ((base[end] == 0x2D && base[end + 1] == 0x2D)
+                    || (base[end] == cCR && base[end + 1] == cLF))
+            if opensLine && closesLine { return i }
+            at = i + 1
         }
         return nil
     }

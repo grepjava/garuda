@@ -36,6 +36,13 @@ private func contents(_ path: String) -> [UInt8] {
     return out
 }
 
+private func writeBytes(_ bytes: [UInt8], to path: String) {
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+    precondition(fd >= 0)
+    defer { _ = close(fd) }
+    _ = bytes.withUnsafeBufferPointer { write(fd, $0.baseAddress!, $0.count) }
+}
+
 /// An application serving uploads to /files, recording each one it completes.
 private func uploadApp(_ store: FileUploadStore, limits: UploadLimits = UploadLimits()) -> Application {
     completed = []
@@ -128,6 +135,21 @@ struct FileUploadStoreTests {
         let store = try FileUploadStore(directory: temporaryDirectory())
         #expect(try store.info("../../etc/passwd") == nil)
         #expect(throws: UploadStoreError.notFound) { try store.acquire("nothex") }
+    }
+
+    @Test func anAnswerWrittenBeforeTheVersionLineIsStillRead() throws {
+        // Answers outlive the build that wrote them: they are in the
+        // directory when the server restarts on a newer one.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let info = try store.create(length: 10, contentType: nil, contentDisposition: nil)
+        writeBytes(Array("201 1700000000 text/plain; charset=utf-8\nstored 10".utf8),
+                   to: store.donePath(info.id))
+        let answer = try #require(try store.answer(info.id))
+        #expect(answer.status == 201)
+        #expect(answer.contentType == "text/plain; charset=utf-8")
+        #expect(answer.location == nil)
+        #expect(answer.body == Array("stored 10".utf8))
+        #expect(answer.createdAt == 1_700_000_000)
     }
 
     @Test func expiredUploadsAreRemoved() throws {
@@ -352,6 +374,47 @@ struct ResumableUploadTests {
         _ = close(socket)
         #expect(answer?.status == 201)
         #expect(completed.map(\.bytes) == [pattern(15)])
+    }
+
+    @Test func anAppendThatWaitedOutACompletionIsRefused() throws {
+        // The request this one waits for can be the one that completes the
+        // upload. What it read before the wait says the upload is still
+        // going; only what it reads under the lock says what it is now.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let client = app.test
+        let created = try client.post("/files", body: pattern(10), headers: [("Upload-Complete", "?0")])
+        let location = try #require(header(created, "location"))
+        let id = String(location.dropFirst(9))
+        let busy = try #require(try store.acquire(id))
+
+        let (socket, _, _) = try client.connect()
+        let head = "PATCH \(location) HTTP/1.1\r\nHost: x\r\nContent-Type: application/partial-upload\r\n"
+            + "Upload-Offset: 10\r\nUpload-Complete: ?1\r\nContent-Length: 0\r\n\r\n"
+        _ = Array(head.utf8).withUnsafeBufferPointer { write(socket, $0.baseAddress!, $0.count) }
+        // The holder completes the upload while this request is waiting on it.
+        let released = av_monotonic_ms() + 100
+        var received: [UInt8] = []
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        var answer: TestResponse? = nil
+        let deadline = av_monotonic_ms() + 5000
+        while answer == nil && av_monotonic_ms() < deadline {
+            if av_monotonic_ms() >= released {
+                try store.update(id, length: 10, complete: true)
+                busy.release()
+            }
+            client.turn()
+            let n = chunk.withUnsafeMutableBufferPointer { av_read(socket, $0.baseAddress!, $0.count) }
+            if n > 0 { received += chunk[0..<n] }
+            answer = try TestResponse.parse(received, bodyless: false, closed: false)
+        }
+        busy.release()
+        _ = close(socket)
+        let refused = try #require(answer)
+        #expect(refused.status == 409)
+        #expect(header(refused, "upload-complete") == "?1")
+        #expect(header(refused, "upload-offset") == "10")
+        #expect(completed.isEmpty, "the handler did not run for an upload another request completed")
     }
 
     @Test func aResumeSupersedesAnAppendStillWaitingOnThisWorker() throws {
@@ -750,6 +813,30 @@ struct ResumableUploadTests {
         #expect(head.status == 204)
         #expect(header(head, "upload-offset") == "10")
         #expect(header(head, "upload-complete") == "?1")
+    }
+
+    @Test func anAnswerThatRedirectsIsReplayedWithWhereItPoints() throws {
+        // A handler that put the bytes somewhere answers with where they
+        // went. A replay that keeps only the status is a redirect to nowhere.
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = Application()
+        app.resumableUploads("/files", store: store, progressInterval: 0) { _ in
+            Redirect(to: "/pictures/1", status: .seeOther)
+        }
+        let client = app.test
+        let created = try client.post("/files", body: pattern(10), headers: [("Upload-Complete", "?0")])
+        let location = try #require(header(created, "location"))
+        let finished = try client.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"),
+            ("Upload-Offset", "10"), ("Upload-Complete", "?1"),
+        ])
+        #expect(finished.status == 303)
+        #expect(header(finished, "location") == "/pictures/1")
+
+        let again = try client.get(location)
+        #expect(again.status == 303)
+        #expect(header(again, "location") == "/pictures/1")
+        #expect(header(again, "upload-complete") == "?1")
     }
 
     @Test func anAnswerOutlivesTheBytesItIsAbout() throws {

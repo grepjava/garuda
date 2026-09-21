@@ -34,7 +34,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1069 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1092 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 11
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 93
@@ -76,6 +76,30 @@ nothing relevant.
 ---
 
 ## Unreleased
+
+- An append to a resumable upload reads the upload's state again once it holds
+  the lock. The checks it made -- that the upload is still going, and how long
+  it was declared to be -- came from a read taken before the wait, and the
+  request it waited for is the one most likely to have changed them. Two
+  requests completing at the same offset both passed, so the completion handler
+  ran twice for one upload. An append that waited out a completion is now the
+  409 it would have been had it arrived a moment later.
+
+- The answer a completed upload was given is replayed with its `Location`. A
+  handler that moves the bytes somewhere and answers `303` was replayed as a
+  `303` with nowhere to go, which is worse than not replaying it at all. The
+  stored answer now carries the field, and is written in a layout that says
+  which one it is, so an answer a previous build wrote still reads.
+
+- A `multipart/form-data` part ends at a boundary delimiter, not at bytes that
+  merely look like one. RFC 2046 gives the delimiter a line of its own, and the
+  parse did not ask for that framing: a file holding `--boundary--` anywhere in
+  it was cut there and the rest of it thrown away, silently and with a 200. An
+  occurrence that does not open and close a line is content.
+
+- `trailingSlash(.redirect)` refuses a path whose trimmed form would begin
+  `/\` as it already refused `//`. A browser reads the backslash as the second
+  slash, so `Location: /\evil.example` sent the client to another host.
 
 - A request that waits on an HTTP/2 connect another request started is bounded
   by its own timeout. Joining the connect is right -- it saves a second
