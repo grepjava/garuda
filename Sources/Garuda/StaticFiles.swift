@@ -203,14 +203,25 @@ extension Worker {
             }
             guard matches else { continue }
             // The prefix has to end on a segment boundary, so /staticky is not
-            // a request for the /static route.
-            if n > prefixLength && decoded[prefixLength] != UInt8(ascii: "/") { continue }
+            // a request for the /static route. "/" is the whole tree (same as
+            // --spa-fallback): every path is under it.
+            if prefixLength > 1 && n > prefixLength
+                && decoded[prefixLength] != UInt8(ascii: "/") {
+                continue
+            }
+
+            // Under "/", keep the leading slash so av_static_open joins
+            // directory + "/path". Other prefixes already leave a leading
+            // slash on the remainder (e.g. /static + /file.js).
+            let relativeOffset =
+                (prefixLength == 1 && route.prefix.pointee == Int8(UInt8(ascii: "/")))
+                ? 0 : prefixLength
 
             var size: Int64 = 0
             var mtime: Int64 = 0
             var fd: Int32 = decoded.withUnsafeBufferPointer { buffer in
-                let relative = buffer.baseAddress! + prefixLength
-                return relative.withMemoryRebound(to: CChar.self, capacity: n - prefixLength + 1) {
+                let relative = buffer.baseAddress! + relativeOffset
+                return relative.withMemoryRebound(to: CChar.self, capacity: n - relativeOffset + 1) {
                     av_static_open(route.directory, $0, &size, &mtime)
                 }
             }
@@ -219,7 +230,7 @@ extension Worker {
                 // to have answered.
                 if config.staticIndex,
                    serveDirectory(slot, route: route, decoded: &decoded, n: n,
-                                  prefixLength: prefixLength) {
+                                  prefixLength: relativeOffset) {
                     return true
                 }
                 continue
@@ -242,9 +253,9 @@ extension Worker {
                     var altSize: Int64 = 0
                     var altMtime: Int64 = 0
                     let altFD: Int32 = alternate.withUnsafeBufferPointer { buffer in
-                        let relative = buffer.baseAddress! + prefixLength
+                        let relative = buffer.baseAddress! + relativeOffset
                         return relative.withMemoryRebound(
-                            to: CChar.self, capacity: n + suffixLength - prefixLength + 1) {
+                            to: CChar.self, capacity: n + suffixLength - relativeOffset + 1) {
                             av_static_open(route.directory, $0, &altSize, &altMtime)
                         }
                     }
