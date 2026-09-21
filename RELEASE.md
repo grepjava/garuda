@@ -77,6 +77,14 @@ nothing relevant.
 
 ## Unreleased
 
+- A directory redirect keeps exactly one leading slash. Under `--static-dir
+  /=DIR`, a request for `//name` walks to a local directory called `name` --
+  the empty segment is skipped -- and the 301 copied the path in as it arrived,
+  making `Location: //name/`: a protocol-relative URL, which a browser reads as
+  another host rather than a path. Backslashes are stripped with the slashes,
+  because a browser reads one as a separator. `scripts/static-test.sh` also
+  covers a route at the root, which nothing exercised before.
+
 - `@JSON` and `@PostgresRow` refuse a `CodingKeys` that renames or omits a
   member, and `@JSON` refuses an `encode(to:)` written by hand, instead of
   ignoring them. Both attributes take precedence over `Codable`, so adding one

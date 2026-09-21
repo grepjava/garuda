@@ -275,6 +275,44 @@ is "a listing over HTTP/2 is the same" \
 
 server_stop
 
+# --- a route at the root -------------------------------------------------
+# `--static-dir /=DIR` serves the whole path space, which makes the redirect to
+# a trailing slash the one place a request can name something that is not a
+# path at all: "//name" walks to a local directory called name, because the
+# empty segment is skipped, and copied into Location as it arrived it becomes
+# "//name/" -- a protocol-relative URL, which sends the browser to that host.
+mkdir -p "$WORK/root/sub" "$WORK/root/example.com"
+echo "at the root" > "$WORK/root/top.txt"
+echo "in sub"      > "$WORK/root/sub/one.txt"
+echo "not theirs"  > "$WORK/root/example.com/one.txt"
+
+server_require_port_free "$PORT" || exit 1
+server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
+    --static-dir "/=$WORK/root" --static-listing \
+    > "$WORK/root.log" 2>&1
+wait_for_port "$PORT"
+H="http://127.0.0.1:$PORT"
+
+is "a root route serves a file at the top" "$(body $H/top.txt)" "at the root"
+is "a root route lists a directory"        "$(code $H/sub/)" "200"
+is "and redirects one without its slash"   "$(code $H/sub)" "301"
+is "to a path under the root" \
+   "$(curl -sS -I --max-time 10 $H/sub | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}')" \
+   "/sub/"
+# The finding itself. Location must stay a path: one leading slash, whatever
+# the request had.
+is "a doubled leading slash redirects to one" \
+   "$(curl -sS -I --max-time 10 --path-as-is "$H//example.com" | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}')" \
+   "/example.com/"
+is "and three are no different" \
+   "$(curl -sS -I --max-time 10 --path-as-is "$H///example.com" | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}')" \
+   "/example.com/"
+is "a query still survives it" \
+   "$(curl -sS -I --max-time 10 --path-as-is "$H//example.com?a=1" | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}')" \
+   "/example.com/?a=1"
+
+server_stop
+
 # --- an index without listings -------------------------------------------
 server_require_port_free "$PORT" || exit 1
 server_start "$BIN" --port "$PORT" --workers 2 --log-level error \

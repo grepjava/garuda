@@ -119,7 +119,22 @@ extension Worker {
         let query = c.pointee.head.query
         var target = [UInt8]()
         target.reserveCapacity(Int(path.length) + Int(query.length) + 2)
-        for i in 0..<Int(path.length) { target.append((base + Int(path.offset))[i]) }
+        // Exactly one leading slash, whatever the request had. Under a route
+        // at the root, "//example.com" walks to a local directory named
+        // example.com -- the empty segment is skipped -- and copied into
+        // Location as it arrived it stops being a path at all: "//example.com/"
+        // is a protocol-relative URL, and the browser goes to that host.
+        // Backslashes are stripped with them, because a browser reads one as a
+        // separator and would turn "/\evil.com/" back into an authority.
+        let start = base + Int(path.offset)
+        var i = 0
+        while i < Int(path.length),
+              start[i] == UInt8(ascii: "/") || start[i] == UInt8(ascii: "\\") { i += 1 }
+        target.append(UInt8(ascii: "/"))
+        while i < Int(path.length) {
+            target.append(start[i])
+            i += 1
+        }
         target.append(UInt8(ascii: "/"))
         if query.length > 0 {
             target.append(UInt8(ascii: "?"))
