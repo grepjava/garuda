@@ -34,6 +34,13 @@ public struct PostgresRowMacro: ExtensionMacro {
             .compactMap({ $0.decl.as(InitializerDeclSyntax.self) }).first {
             throw Problem.error(at: written, .rowHasInitializer)
         }
+        // A property is read from the column of its own name, where Codable
+        // would have read it from the column 'CodingKeys' named. Adding the
+        // attribute must not quietly change which column a property comes
+        // from -- a renamed column would simply stop being found.
+        if let keys = JSONMacro.codingKeysDeclaration(structure) {
+            throw Problem.error(at: keys, .rowCodingKeys)
+        }
         // A conformance the type already declares is not in `protocols`.
         if !protocols.isEmpty,
            !protocols.contains(where: { $0.trimmedDescription == "PostgresReadable" }) {
@@ -71,4 +78,7 @@ extension Problem {
     static let rowHasInitializer = Problem(
         "'@PostgresRow' reads a row by calling the memberwise initializer, which this initializer replaces. Move it into an extension, or write 'PostgresReadable' by hand.",
         "row.hasInitializer")
+    static let rowCodingKeys = Problem(
+        "'@PostgresRow' reads each property from the column of its own name and does not read 'CodingKeys'. Codable would have used the names in it, so keeping both means the column a property is read from depends on which path ran: remove 'CodingKeys', name the columns in the query instead ('select display_name as name'), or drop '@PostgresRow'.",
+        "row.codingKeys")
 }

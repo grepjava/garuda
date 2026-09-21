@@ -28,5 +28,11 @@
 ///
 /// A `let` that already holds a value is not read, exactly as `Codable` does
 /// not read one. `static`, computed and `lazy` properties are not columns.
+///
+/// A `CodingKeys` in the body is an error rather than something ignored:
+/// `Codable` would read a property from the column it names, this reads it
+/// from the column of the property's own name, and which one applied would
+/// depend on which path ran. Rename in the query instead -- `select
+/// display_name as name` -- or leave the attribute off.
 @attached(extension, conformances: PostgresReadable, names: named(init(row:)))
 public macro PostgresRow() = #externalMacro(module: "GarudaMacros", type: "PostgresRowMacro")

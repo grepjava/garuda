@@ -77,6 +77,15 @@ nothing relevant.
 
 ## Unreleased
 
+- `@JSON` and `@PostgresRow` refuse a `CodingKeys` that renames or omits a
+  member, and `@JSON` refuses an `encode(to:)` written by hand, instead of
+  ignoring them. Both attributes take precedence over `Codable`, so adding one
+  to a type that had either used to change what the type sent -- a renamed key
+  reverting to the member name, an omitted member starting to be published, a
+  renamed column quietly not being found. The promise is that a type keeps its
+  `Codable` conformance and cannot tell the difference; an attribute that
+  cannot keep it now says so at compile time.
+
 - The HTTP/2 client no longer trusts what a response says about itself. A
   `:status` of many digits was accumulated before it was counted, so a peer
   could overflow the arithmetic and trap the worker, taking every other request

@@ -38,6 +38,17 @@ public struct JSONMacro: ExtensionMacro {
             .compactMap({ $0.decl.as(InitializerDeclSyntax.self) }).first {
             throw Problem.error(at: written, .hasInitializer)
         }
+        // What this writes takes precedence over Codable, so anything telling
+        // Codable to send something other than the members under their own
+        // names would quietly stop being honoured. The promise is that a type
+        // keeps its Codable conformance and cannot tell the difference; the
+        // only way to keep it is to refuse these rather than ignore them.
+        if let keys = codingKeysDeclaration(structure) {
+            throw Problem.error(at: keys, .codingKeys)
+        }
+        if let written = customEncodeDeclaration(structure) {
+            throw Problem.error(at: written, .customEncode)
+        }
 
         let members = try readMembers(of: structure)
         let name = type.trimmedDescription
@@ -69,6 +80,39 @@ public struct JSONMacro: ExtensionMacro {
         /// A `let` with a value of its own cannot be read back into, exactly
         /// as Codable cannot: it is written, and not read.
         var readable: Bool
+    }
+
+    /// The `CodingKeys` the struct declares in its body, which renames or
+    /// omits members, or nil.
+    ///
+    /// Only the body can be seen. A `CodingKeys` in an extension is invisible
+    /// to any macro, which is itself a reason not to pair one of these
+    /// attributes with a hand-written Codable form.
+    static func codingKeysDeclaration(_ structure: StructDeclSyntax) -> Syntax? {
+        for item in structure.memberBlock.members {
+            if let keys = item.decl.as(EnumDeclSyntax.self), keys.name.text == "CodingKeys" {
+                return Syntax(keys)
+            }
+            if let keys = item.decl.as(TypeAliasDeclSyntax.self), keys.name.text == "CodingKeys" {
+                return Syntax(keys)
+            }
+        }
+        return nil
+    }
+
+    /// An `encode(to:)` written by hand, or nil. `init(from:)` needs no such
+    /// check: an initializer in the body is already refused, because reading
+    /// delegates to the memberwise one it would have replaced.
+    static func customEncodeDeclaration(_ structure: StructDeclSyntax) -> Syntax? {
+        for item in structure.memberBlock.members {
+            guard let method = item.decl.as(FunctionDeclSyntax.self),
+                  method.name.text == "encode" else { continue }
+            let parameters = method.signature.parameterClause.parameters
+            if parameters.count == 1, parameters.first?.firstName.text == "to" {
+                return Syntax(method)
+            }
+        }
+        return nil
     }
 
     static func readMembers(of structure: StructDeclSyntax) throws -> [Member] {
@@ -303,6 +347,12 @@ struct Problem: DiagnosticMessage, Error {
     static let destructured = Problem(
         "'@JSON' cannot read or write a destructured binding. Declare one property a line.",
         "json.destructured")
+    static let codingKeys = Problem(
+        "'@JSON' writes every member under its own name and does not read 'CodingKeys'. Keeping both would send one shape through the fast path and another through Codable, for the same type: remove 'CodingKeys' and let the member names be the keys, or drop '@JSON' and leave Codable as it is.",
+        "json.codingKeys")
+    static let customEncode = Problem(
+        "'@JSON' writes the JSON itself and takes precedence over Codable, so this 'encode(to:)' would stop being called. Drop '@JSON', or write 'JSONWritable' by hand to say the same thing.",
+        "json.customEncode")
     static let dictionary = Problem(
         "'@JSON' cannot write a dictionary member, because nothing fixes the order of its keys. Use a struct, or write 'JSONWritable' by hand.",
         "json.dictionary")

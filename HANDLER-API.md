@@ -237,6 +237,21 @@ what to write instead. The alternative, falling back to `Codable` for the
 shapes it cannot do, would be the worst of both: the type looks opted in and
 is not, and nothing says so.
 
+A `CodingKeys` that renames or omits a member, and an `encode(to:)` of the
+type's own, are refused for a sharper reason: they are not shapes the macro
+cannot manage but instructions it would silently overrule. The generated code
+takes precedence over `Codable`, so a type whose `CodingKeys` sent
+`display_name` would go on sending `display_name` through `JSONDecoder` and
+start sending `name` through a route -- and a member the keys left out would
+start being published. Adding an attribute for speed must not change what a
+type sends, so both stop the build. Name the members what the JSON calls them,
+or leave `Codable` to do it alone. The same applies to `@PostgresRow`, which
+reads each property from the column of its own name: with a `CodingKeys` in
+the way, which column that is would depend on which path ran. Note that only
+the type's body is visible to a macro -- a `CodingKeys` in an extension cannot
+be seen, and is a reason not to pair either attribute with a Codable form
+written by hand.
+
 ### CORS is a policy of a scope, not a middleware in order
 
 `app.cors` does not take a place among the `use` calls. The innermost scope's

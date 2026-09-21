@@ -30,6 +30,14 @@
 /// member, a generic struct, an initializer in the body -- each is an error
 /// naming what to do instead, rather than a quiet fall back to `Codable` that
 /// would leave you wondering why the type is slow.
+///
+/// For the same reason it refuses a `CodingKeys` that renames or omits a
+/// member, and an `encode(to:)` written by hand: this conformance is used in
+/// preference to `Codable`, so either one would go on describing what
+/// `JSONDecoder` sends while a route sent something else. Only the type's body
+/// is visible here, so a `CodingKeys` in an extension cannot be caught --
+/// which is a reason to keep this attribute and a hand-written `Codable` form
+/// apart.
 @attached(extension, conformances: JSONReadable, JSONWritable,
           names: named(init(json:)), named(write(json:)))
 public macro JSON() = #externalMacro(module: "GarudaMacros", type: "JSONMacro")
