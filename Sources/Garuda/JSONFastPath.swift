@@ -66,8 +66,11 @@ enum JSONFastPath {
 extension JSONReadable {
     /// Reads one of these from a whole document. Static, so that it can be
     /// called on the conformance the cache holds.
+    ///
+    /// The document was proved to be JSON by whoever called in, so this takes
+    /// the entry point that does not scan it again.
     fileprivate static func decodeJSON(from base: UnsafePointer<UInt8>,
                                        count: Int) throws -> Self {
-        try JSONReader.decode(Self.self, from: base, count: count)
+        try JSONReader.decodeValidated(Self.self, from: base, count: count)
     }
 }

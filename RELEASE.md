@@ -77,6 +77,13 @@ nothing relevant.
 
 ## Unreleased
 
+- `JSONReader.decode`, the public whole-document entry point, proves its input
+  is JSON before reading it. The reader is written for a document the coder has
+  already scanned -- it steps over a separator where it finds one rather than
+  requiring one -- so calling it directly could return a value out of bytes
+  that were not JSON: `[1 2,]` read back as `[1, 2]`. A request body is not
+  scanned twice; the fast path takes an entry point that skips it.
+
 - A directory redirect keeps exactly one leading slash. Under `--static-dir
   /=DIR`, a request for `//name` walks to a local directory called `name` --
   the empty segment is skipped -- and the 301 copied the path in as it arrived,

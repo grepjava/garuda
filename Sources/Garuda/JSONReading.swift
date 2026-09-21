@@ -90,6 +90,26 @@ public struct JSONReader {
     public static func decode<T: JSONReadable>(_ type: T.Type = T.self,
                                                from base: UnsafePointer<UInt8>,
                                                count: Int) throws -> T {
+        // Proved to be JSON first. Everything below is written for a document
+        // already known to be one: a separator is stepped over where it is
+        // found rather than required, and what is inside an escape is not
+        // looked at twice. That is sound for a body the coder scanned on the
+        // way in, and it means bytes that never were JSON -- `[1 2,]` -- would
+        // otherwise come back as a value. A request body pays for this once,
+        // not twice: `JSONCoder` scans and then comes in through
+        // `decodeValidated`.
+        var scanner = JSONScanner(base: base, count: count)
+        try scanner.skipValue()
+        let end = scanner.index
+        scanner.skipWhitespace()
+        guard scanner.index == count else { throw JSONError.trailingBytes(offset: end) }
+        return try decodeValidated(type, from: base, count: count)
+    }
+
+    /// Reads `type` out of bytes already proved to be a whole JSON document.
+    static func decodeValidated<T: JSONReadable>(_ type: T.Type = T.self,
+                                                 from base: UnsafePointer<UInt8>,
+                                                 count: Int) throws -> T {
         var reader = JSONReader(base: base, count: count)
         let value = try T(json: &reader)
         reader.skipSpace()

@@ -303,4 +303,44 @@ struct JSONFastPathTests {
         #expect(read.id == 1)
         #expect(read.note == nil)
     }
+
+    // MARK: Reading a document directly
+
+    @Test func theReaderRefusesWhatIsNotJSON() throws {
+        // `JSONReader` is written for a document already proved to be JSON: it
+        // steps over a separator where it finds one rather than requiring it,
+        // and does not look inside an escape twice. That is sound for a body
+        // the coder scanned on the way in, and it means the public entry point
+        // has to do the proving -- otherwise bytes that never were JSON come
+        // back as a value.
+        for bad in [#"[1 2,]"#,                       // no comma, then a stray one
+                    #"[1,,2]"#,                       // an empty element
+                    #"{"sku":"a" "quantity":1}"#,     // no comma between members
+                    #"{"sku":"a",}"#,                 // a trailing comma
+                    #"[tru]"#,                        // a literal that is not one
+                    #"{"sku":"a-1","quantity":}"#] {  // a member with no value
+            #expect(throws: (any Error).self, "\(bad) is not JSON") {
+                try reader([Int].self, bad)
+            }
+        }
+    }
+
+    @Test func theReaderStillReadsWhatIsJSON() throws {
+        #expect(try reader([Int].self, "[1, 2, 3]") == [1, 2, 3])
+        #expect(try reader(Line.self, #"{"sku":"a-1","quantity":2}"#)
+                == Line(sku: "a-1", quantity: 2))
+    }
+
+    @Test func theReaderRefusesBytesAfterTheDocument() throws {
+        #expect(throws: (any Error).self) { try reader([Int].self, "[1,2] junk") }
+    }
+}
+
+/// Straight through `JSONReader`, which is what an application calling the
+/// public entry point does -- not through `JSONCoder`, which scans first.
+private func reader<T: JSONReadable>(_ type: T.Type, _ json: String) throws -> T {
+    let bytes = Array(json.utf8)
+    return try bytes.withUnsafeBufferPointer { buffer in
+        try JSONReader.decode(type, from: buffer.baseAddress!, count: buffer.count)
+    }
 }
