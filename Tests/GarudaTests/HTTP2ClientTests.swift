@@ -38,6 +38,10 @@ nonisolated(unsafe) private var originURL = ""
 /// A timeout for one of the concurrent routes, where the test needs requests
 /// with different patience in flight at once.
 nonisolated(unsafe) private var timeoutsWanted: [String: UInt64] = [:]
+/// What the request that waits on another's connect saw, and how long it took.
+nonisolated(unsafe) private var joinerOutcome = ""
+nonisolated(unsafe) private var joinerElapsed: UInt64? = nil
+nonisolated(unsafe) private var starterOutcome = ""
 
 /// One frame, as the origin saw it.
 private struct SeenFrame {
@@ -1508,6 +1512,81 @@ struct HTTP2ClientTests {
         #expect(origin.accepted == 1)
         #expect(origin.frames(ofType: .headers).map(\.streamID) == [1, 3])
         withExtendedLifetime(wires) {}
+    }
+
+    @Test func waitingOnAnothersConnectIsBoundedByThisRequestsOwnTimeout() throws {
+        // Two requests to a place that accepts and then says nothing, so the
+        // TLS handshake never finishes. The first is given half a second, the
+        // second thirty milliseconds; the second arrives while the first is
+        // still connecting and waits on it rather than opening a second
+        // connection to the same place.
+        //
+        // Sharing the connect is right. Sharing the first request's patience is
+        // not: the second was given thirty milliseconds, and before this it sat
+        // there for the whole five hundred, because the only thing that woke a
+        // joiner was the connect it had joined finishing.
+        joinerOutcome = ""
+        joinerElapsed = nil
+        starterOutcome = ""
+        let listener = "127.0.0.1".withCString { av_listen_tcp($0, 0, 16, 0, 0) }
+        #expect(listener >= 0)
+        guard listener >= 0 else { return }
+        defer { _ = av_close(listener) }
+        // https, so the connect includes a handshake that will never be answered.
+        let url = "https://127.0.0.1:\(av_local_port(listener))/"
+
+        let app = Application()
+        app.onAsync(.get, "/starter") { request, response in
+            var client = request.client
+            client.timeoutMilliseconds = 500
+            client.totalTimeoutMilliseconds = 500
+            do {
+                _ = try await client.get(url)
+                starterOutcome = "answered"
+            } catch {
+                starterOutcome = "\(error)"
+            }
+            response.send("done")
+        }
+        app.onAsync(.get, "/joiner") { request, response in
+            var client = request.client
+            client.timeoutMilliseconds = 30
+            client.totalTimeoutMilliseconds = 30
+            let start = av_monotonic_ms()
+            do {
+                _ = try await client.get(url)
+                joinerOutcome = "answered"
+            } catch {
+                joinerOutcome = "\(error)"
+            }
+            joinerElapsed = av_monotonic_ms() - start
+            response.send("done")
+        }
+
+        let client = app.test
+        let starter = try TestWire(client)
+        let joiner = try TestWire(client)
+        starter.send("GET /starter HTTP/1.1\r\nHost: test\r\n\r\n")
+        // Only once the connect is registered is there anything to join.
+        #expect(starter.turn(until: { !client.worker.pointee.outboundH2Connecting.isEmpty },
+                            turns: 10_000))
+        joiner.send("GET /joiner HTTP/1.1\r\nHost: test\r\n\r\n")
+        #expect(joiner.turn(until: { joinerElapsed != nil }, turns: 200_000))
+
+        #expect(joinerOutcome == "timedOut")
+        if let elapsed = joinerElapsed {
+            // Its own thirty milliseconds, with room for a slow machine, and
+            // nowhere near the five hundred it used to wait.
+            #expect(elapsed < 200, "a 30 ms request took \(elapsed) ms")
+        }
+        // And the request that started the connect was left to its own patience
+        // rather than cut short by the joiner giving up.
+        #expect(starterOutcome == "")
+        #expect(joiner.turn(until: { !starterOutcome.isEmpty }, turns: 200_000))
+        // Whether the wait ran out inside the connect or after it decides which
+        // of the two timeouts is reported, and that is not what is being tested.
+        #expect(starterOutcome.contains("timedOut"), "the starter saw \(starterOutcome)")
+        withExtendedLifetime((starter, joiner)) {}
     }
 
     @Test func aResetStreamFailsOnlyItsOwnRequest() throws {

@@ -77,6 +77,13 @@ nothing relevant.
 
 ## Unreleased
 
+- A request that waits on an HTTP/2 connect another request started is bounded
+  by its own timeout. Joining the connect is right -- it saves a second
+  connection to the same origin -- but the joiner was woken only when that
+  connect finished, so a request given 30 ms sat through the 500 ms the other
+  request was prepared to wait. The connect itself is left to run: whoever
+  started it keeps its own patience.
+
 - A JWK Set that arrives holding no key the verifier can use now withdraws keys
   that have aged past `maxAgeSeconds`, instead of being treated as a fetch that
   failed. A provider pulling a compromised key publishes an empty set, and that

@@ -58,6 +58,18 @@ import AvianHTTP
 // MARK: - State
 
 /// Settings, flow control and HPACK for one connection.
+/// A request parked on a connect another request started, and when its own
+/// patience runs out.
+///
+/// The deadline is the waiter's own. Joining a connect saves opening a second
+/// one to the same place, but it must not lend whoever started it the right to
+/// decide how long anybody else waits: a request given 30 milliseconds that sat
+/// out somebody else's 500 was never given 30 milliseconds.
+struct H2ConnectWaiter {
+    let resume: UnsafeContinuation<Void, Never>
+    let deadline: UInt64
+}
+
 final class H2ClientConnection {
     var decoder: HPACKDecoder
 
@@ -274,7 +286,26 @@ extension Worker {
         for shared in all { shared.markDead(.cancelled) }
         let waiting = outboundH2Connecting.values.flatMap { $0 }
         outboundH2Connecting.removeAll()
-        for k in waiting { k.resume() }
+        for waiter in waiting { waiter.resume.resume() }
+    }
+
+    /// Wakes the requests whose wait on another request's connect has run out.
+    ///
+    /// The connect itself is left alone: the request that started it has its own
+    /// patience, which may be longer, and cancelling it would punish it for
+    /// somebody else's deadline. The woken requests find no connection and give
+    /// up, which is what their own timeout asked for.
+    mutating func expireConnectWaiters(now: UInt64) {
+        var expired: [H2ConnectWaiter] = []
+        for (key, waiters) in outboundH2Connecting {
+            guard waiters.contains(where: { now >= $0.deadline }) else { continue }
+            // The key stays whether or not anyone is left waiting on it: its
+            // presence is what says a connect is under way.
+            outboundH2Connecting[key] = waiters.filter { now < $0.deadline }
+            expired.append(contentsOf: waiters.filter { now >= $0.deadline })
+        }
+        // Resumed once the table is settled, never while walking it.
+        for waiter in expired { waiter.resume.resume() }
     }
 
     /// Closes shared connections nobody has used for a while, or that cannot

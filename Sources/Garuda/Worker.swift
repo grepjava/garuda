@@ -192,7 +192,7 @@ public struct Worker: ~Copyable {
     /// waiting to see how that goes. Without this, a burst of requests to
     /// somewhere new each finds no connection and opens its own -- which is
     /// the exact case multiplexing exists to absorb.
-    var outboundH2Connecting: [OutboundKey: [UnsafeContinuation<Void, Never>]] = [:]
+    var outboundH2Connecting: [OutboundKey: [H2ConnectWaiter]] = [:]
     /// Tasks in a `waitTimed`, by id (TimedWait.swift).
     var timedWaits: [Int32: TimedWaiter] = [:]
     var nextTimedWait: Int32 = 0
@@ -1678,6 +1678,10 @@ public struct Worker: ~Copyable {
         let now = av_monotonic_ms()
         // Ahead of the once-a-second throttle, so a delay ends when it says.
         if drainAt != 0 && now >= drainAt { beginDraining() }
+        // Ahead of it for the same reason: a request waiting on another's
+        // connect is owed its own timeout, which is measured in tens of
+        // milliseconds and would mean nothing noticed once a second.
+        if !outboundH2Connecting.isEmpty { expireConnectWaiters(now: now) }
         if now &- lastSweep < 1000 { return }
         lastSweep = now
         dates.refresh()

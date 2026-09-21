@@ -267,6 +267,11 @@ extension HTTPClient {
         let key = sharedKey(plan)
         var connecting = false
         if mayUseHTTP2 {
+            // Waiting on somebody else's connect is one of this request's waits,
+            // and gets one wait's budget as reading a socket would. Taken once,
+            // so that being woken and finding the connect still going cannot
+            // renew it.
+            let joinUntil = waitDeadline(from: av_monotonic_ms())
             while true {
                 if let shared = reusableShared(key) {
                     let block = try encodeRequestBlock(plan, method: method, headers: headers,
@@ -278,9 +283,14 @@ extension HTTPClient {
                 // up as a connection this can join, rather than opening a second
                 // alongside it.
                 guard worker.pointee.outboundH2Connecting[key] != nil else { break }
+                // Its patience is not this request's. A connect outlasting this
+                // budget is this request timing out, not this request waiting on
+                // for as long as whoever started it is prepared to.
+                guard av_monotonic_ms() < joinUntil else { throw ClientError.timedOut }
                 let worker = self.worker
                 await withUnsafeContinuation { k in
-                    worker.pointee.outboundH2Connecting[key]?.append(k)
+                    worker.pointee.outboundH2Connecting[key]?
+                        .append(H2ConnectWaiter(resume: k, deadline: joinUntil))
                 }
             }
             worker.pointee.outboundH2Connecting[key] = []
@@ -294,7 +304,7 @@ extension HTTPClient {
             guard connecting else { return }
             connecting = false
             let waiting = worker.pointee.outboundH2Connecting.removeValue(forKey: key) ?? []
-            for k in waiting { k.resume() }
+            for waiter in waiting { waiter.resume.resume() }
         }
 
         // Forced HTTP/2 knows its protocol before connecting, so a field it
