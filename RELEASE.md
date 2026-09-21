@@ -102,7 +102,8 @@ nothing relevant.
 
 - `@JSON` and `@PostgresRow` refuse a `CodingKeys` that renames or omits a
   member, and `@JSON` refuses an `encode(to:)` written by hand, instead of
-  ignoring them. Both attributes take precedence over `Codable`, so adding one
+  ignoring them. One inside a `#if` is refused in every branch, since a macro
+  is expanded before the branch is chosen. Both attributes take precedence over `Codable`, so adding one
   to a type that had either used to change what the type sent -- a renamed key
   reverting to the member name, an omitted member starting to be published, a
   renamed column quietly not being found. The promise is that a type keeps its

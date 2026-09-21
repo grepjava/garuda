@@ -247,10 +247,15 @@ start being published. Adding an attribute for speed must not change what a
 type sends, so both stop the build. Name the members what the JSON calls them,
 or leave `Codable` to do it alone. The same applies to `@PostgresRow`, which
 reads each property from the column of its own name: with a `CodingKeys` in
-the way, which column that is would depend on which path ran. Note that only
-the type's body is visible to a macro -- a `CodingKeys` in an extension cannot
-be seen, and is a reason not to pair either attribute with a Codable form
-written by hand.
+the way, which column that is would depend on which path ran.
+
+Both branches of a `#if` count. A macro is expanded before the branches are
+chosen, so it cannot know which one this build takes, and a `CodingKeys` that
+only a debug build compiles is refused along with the rest -- a type whose JSON
+depended on the configuration is worse than one that will not build. What
+cannot be caught is a declaration outside the type's body: an extension is
+invisible to any macro, which is the reason not to pair either attribute with a
+`Codable` form written by hand.
 
 ### CORS is a policy of a scope, not a middleware in order
 

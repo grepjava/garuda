@@ -79,6 +79,6 @@ extension Problem {
         "'@PostgresRow' reads a row by calling the memberwise initializer, which this initializer replaces. Move it into an extension, or write 'PostgresReadable' by hand.",
         "row.hasInitializer")
     static let rowCodingKeys = Problem(
-        "'@PostgresRow' reads each property from the column of its own name and does not read 'CodingKeys'. Codable would have used the names in it, so keeping both means the column a property is read from depends on which path ran: remove 'CodingKeys', name the columns in the query instead ('select display_name as name'), or drop '@PostgresRow'.",
+        "'@PostgresRow' reads each property from the column of its own name and does not read 'CodingKeys'. Codable would have used the names in it, so keeping both means the column a property is read from depends on which path ran: remove 'CodingKeys', name the columns in the query instead ('select display_name as name'), or drop '@PostgresRow'. One inside a '#if' counts too -- a macro is expanded before the branch is chosen.",
         "row.codingKeys")
 }

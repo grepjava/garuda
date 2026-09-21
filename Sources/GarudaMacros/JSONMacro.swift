@@ -82,6 +82,30 @@ public struct JSONMacro: ExtensionMacro {
         var readable: Bool
     }
 
+    /// Every declaration in the struct's body, including the ones inside `#if`,
+    /// in every branch.
+    ///
+    /// A macro is expanded before the branches are chosen and cannot know which
+    /// one this build takes, so all of them count. That makes the checks below
+    /// conservative -- a `CodingKeys` only a debug build compiles is still
+    /// refused -- and conservative is the answer that holds: a type whose JSON
+    /// depended on the configuration would be worse than one that will not
+    /// build.
+    static func declarations(in structure: StructDeclSyntax) -> [DeclSyntax] {
+        var found: [DeclSyntax] = []
+        func walk(_ members: MemberBlockItemListSyntax) {
+            for item in members {
+                found.append(item.decl)
+                guard let conditional = item.decl.as(IfConfigDeclSyntax.self) else { continue }
+                for clause in conditional.clauses {
+                    if case .decls(let nested)? = clause.elements { walk(nested) }
+                }
+            }
+        }
+        walk(structure.memberBlock.members)
+        return found
+    }
+
     /// The `CodingKeys` the struct declares in its body, which renames or
     /// omits members, or nil.
     ///
@@ -89,11 +113,11 @@ public struct JSONMacro: ExtensionMacro {
     /// to any macro, which is itself a reason not to pair one of these
     /// attributes with a hand-written Codable form.
     static func codingKeysDeclaration(_ structure: StructDeclSyntax) -> Syntax? {
-        for item in structure.memberBlock.members {
-            if let keys = item.decl.as(EnumDeclSyntax.self), keys.name.text == "CodingKeys" {
+        for decl in declarations(in: structure) {
+            if let keys = decl.as(EnumDeclSyntax.self), keys.name.text == "CodingKeys" {
                 return Syntax(keys)
             }
-            if let keys = item.decl.as(TypeAliasDeclSyntax.self), keys.name.text == "CodingKeys" {
+            if let keys = decl.as(TypeAliasDeclSyntax.self), keys.name.text == "CodingKeys" {
                 return Syntax(keys)
             }
         }
@@ -104,8 +128,8 @@ public struct JSONMacro: ExtensionMacro {
     /// check: an initializer in the body is already refused, because reading
     /// delegates to the memberwise one it would have replaced.
     static func customEncodeDeclaration(_ structure: StructDeclSyntax) -> Syntax? {
-        for item in structure.memberBlock.members {
-            guard let method = item.decl.as(FunctionDeclSyntax.self),
+        for decl in declarations(in: structure) {
+            guard let method = decl.as(FunctionDeclSyntax.self),
                   method.name.text == "encode" else { continue }
             let parameters = method.signature.parameterClause.parameters
             if parameters.count == 1, parameters.first?.firstName.text == "to" {
@@ -348,10 +372,10 @@ struct Problem: DiagnosticMessage, Error {
         "'@JSON' cannot read or write a destructured binding. Declare one property a line.",
         "json.destructured")
     static let codingKeys = Problem(
-        "'@JSON' writes every member under its own name and does not read 'CodingKeys'. Keeping both would send one shape through the fast path and another through Codable, for the same type: remove 'CodingKeys' and let the member names be the keys, or drop '@JSON' and leave Codable as it is.",
+        "'@JSON' writes every member under its own name and does not read 'CodingKeys'. Keeping both would send one shape through the fast path and another through Codable, for the same type: remove 'CodingKeys' and let the member names be the keys, or drop '@JSON' and leave Codable as it is. One inside a '#if' counts too -- a macro is expanded before the branch is chosen.",
         "json.codingKeys")
     static let customEncode = Problem(
-        "'@JSON' writes the JSON itself and takes precedence over Codable, so this 'encode(to:)' would stop being called. Drop '@JSON', or write 'JSONWritable' by hand to say the same thing.",
+        "'@JSON' writes the JSON itself and takes precedence over Codable, so this 'encode(to:)' would stop being called. Drop '@JSON', or write 'JSONWritable' by hand to say the same thing. One inside a '#if' counts too -- a macro is expanded before the branch is chosen.",
         "json.customEncode")
     static let dictionary = Problem(
         "'@JSON' cannot write a dictionary member, because nothing fixes the order of its keys. Use a struct, or write 'JSONWritable' by hand.",

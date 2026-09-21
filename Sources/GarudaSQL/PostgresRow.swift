@@ -29,7 +29,8 @@
 /// A `let` that already holds a value is not read, exactly as `Codable` does
 /// not read one. `static`, computed and `lazy` properties are not columns.
 ///
-/// A `CodingKeys` in the body is an error rather than something ignored:
+/// A `CodingKeys` in the body, including one inside a `#if`, is an error rather
+/// than something ignored:
 /// `Codable` would read a property from the column it names, this reads it
 /// from the column of the property's own name, and which one applied would
 /// depend on which path ran. Rename in the query instead -- `select

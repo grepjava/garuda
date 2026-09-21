@@ -34,10 +34,11 @@
 /// For the same reason it refuses a `CodingKeys` that renames or omits a
 /// member, and an `encode(to:)` written by hand: this conformance is used in
 /// preference to `Codable`, so either one would go on describing what
-/// `JSONDecoder` sends while a route sent something else. Only the type's body
-/// is visible here, so a `CodingKeys` in an extension cannot be caught --
-/// which is a reason to keep this attribute and a hand-written `Codable` form
-/// apart.
+/// `JSONDecoder` sends while a route sent something else. One inside a `#if`
+/// is refused too, in every branch -- a macro is expanded before the branch is
+/// chosen. Only the type's body is visible here, so a `CodingKeys` in an
+/// extension cannot be caught, which is a reason to keep this attribute and a
+/// hand-written `Codable` form apart.
 @attached(extension, conformances: JSONReadable, JSONWritable,
           names: named(init(json:)), named(write(json:)))
 public macro JSON() = #externalMacro(module: "GarudaMacros", type: "JSONMacro")
