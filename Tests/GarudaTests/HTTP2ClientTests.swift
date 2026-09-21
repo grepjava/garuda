@@ -21,6 +21,10 @@ nonisolated(unsafe) private var urlWanted = ""
 nonisolated(unsafe) private var headersWanted: [(String, String)] = []
 nonisolated(unsafe) private var bodyWanted: [UInt8] = []
 nonisolated(unsafe) private var bodyLimitWanted = 8 * 1024 * 1024
+nonisolated(unsafe) private var headLimitWanted = 32 * 1024
+/// A body limit per concurrent route, where the test needs two requests in
+/// flight whose limits differ.
+nonisolated(unsafe) private var bodyLimitsWanted: [String: Int] = [:]
 /// How long the client under test should wait on any one read or write. Short
 /// for the tests that prove something never arrives: the default ten seconds
 /// is the right answer in production and a tax on a suite that runs in
@@ -386,6 +390,31 @@ private func rawFrame(type: H2FrameType, flags: H2Flags = [], stream: UInt32 = 1
     return Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
 }
 
+/// A header block as a HEADERS frame and as many CONTINUATION frames as it
+/// needs, none larger than the default maximum frame size. One oversized frame
+/// is a protocol error on its own, which would prove nothing about a head limit.
+private func splitHeaders(_ whole: [UInt8], stream: UInt32 = 1,
+                          endStream: Bool = false, chunk: Int = 16_384) -> [[UInt8]] {
+    let block = Array(whole[H2FrameHeader.size...])
+    var frames: [[UInt8]] = []
+    var offset = 0
+    while offset < block.count {
+        let take = min(chunk, block.count - offset)
+        let piece = Array(block[offset..<(offset + take)])
+        var flags: H2Flags = []
+        if offset + take == block.count { flags.insert(.endHeaders) }
+        if frames.isEmpty {
+            if endStream { flags.insert(.endStream) }
+            frames.append(rawFrame(type: .headers, flags: flags, stream: stream, payload: piece))
+        } else {
+            frames.append(rawFrame(type: .continuation, flags: flags,
+                                   stream: stream, payload: piece))
+        }
+        offset += take
+    }
+    return frames
+}
+
 private func windowUpdate(_ stream: UInt32, _ increment: Int) -> [UInt8] {
     rawFrame(type: .windowUpdate, stream: stream, payload: u32(UInt32(increment)))
 }
@@ -446,6 +475,7 @@ private func h2ClientApp() -> Application {
     app.onAsync(.get, "/fetch") { request, response in
         var client = request.client
         client.maxBodyBytes = bodyLimitWanted
+        client.maxHeadBytes = headLimitWanted
         client.forceHTTP2 = true
         do {
             let answer = try await client.get(urlWanted, headers: headersWanted)
@@ -527,6 +557,7 @@ private func h2ClientApp() -> Application {
             var client = request.client
             client.forceHTTP2 = true
             client.timeoutMilliseconds = timeoutsWanted[name] ?? timeoutWanted
+            if let limit = bodyLimitsWanted[name] { client.maxBodyBytes = limit }
             let result: String
             do {
                 let answer = try await client.get(originURL + "/" + name)
@@ -567,6 +598,8 @@ struct HTTP2ClientTests {
         headersWanted = []
         bodyWanted = []
         bodyLimitWanted = 8 * 1024 * 1024
+        headLimitWanted = 32 * 1024
+        bodyLimitsWanted = [:]
         timeoutWanted = 10_000
     }
 
@@ -814,7 +847,10 @@ struct HTTP2ClientTests {
         // number and four would parse as a different one, and either way the
         // caller would be handed a status the peer never sent.
         reset()
-        for text in ["20", "2000", "", "abc"] {
+        // The long one is not merely wrong: accumulating those digits into an
+        // Int before counting them overflows and traps, which took the worker
+        // and every other request on it over one field a peer chose.
+        for text in ["20", "2000", "", "abc", String(repeating: "9", count: 24), "099"] {
             guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
             var block = ByteBuffer(capacity: 64)
             defer { block.destroy() }
@@ -905,6 +941,158 @@ struct HTTP2ClientTests {
         bodyLimitWanted = 4
         origin.script = [responseHeaders(status: 200), dataFrame("far too much")]
         #expect(try run("/fetch", origin) == "bodyTooLarge")
+    }
+
+    @Test func aDecodedHeadLargerThanTheLimitEndsTheStreamOnly() throws {
+        // The gap this closes: a list whose *encoded* form is well inside the
+        // limit and whose decoded form is nowhere near it. Each field costs the
+        // two lengths plus 32 once decoded, so many tiny fields expand several
+        // times over -- and the frame size bounds none of it.
+        //
+        // The block was decoded to keep the HPACK table in step and then
+        // thrown away, so this ends the one stream and keeps the connection.
+        // Ending the connection would punish every other request on it.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        headLimitWanted = 4096
+        let whole = responseHeaders(status: 200,
+                                    fields: Array(repeating: ("a", "b"), count: 500),
+                                    endStream: true)
+        let frames = splitHeaders(whole, endStream: true)
+        // Stated, not assumed: were the block itself over the budget, the
+        // assembly guard would answer first and this would prove nothing.
+        let encoded = frames.reduce(0) { $0 + $1.count - H2FrameHeader.size }
+        #expect(encoded < headLimitWanted)
+        origin.script = frames
+        urlWanted = origin.url + "/x"
+        let client = h2ClientApp().test
+        let wire = try TestWire(client)
+        wire.send("GET /fetch HTTP/1.1\r\nHost: test\r\n\r\n")
+        _ = wire.turn(until: { origin.pump(); return !outcome.isEmpty }, turns: 20_000)
+        _ = wire.receive()
+        #expect(outcome == "headTooLarge")
+        #expect(origin.frames(ofType: .rstStream).count == 1)
+        #expect(client.worker.pointee.outboundH2.count == 1)
+    }
+
+    @Test func aHeadBlockThatKeepsGoingIsRefused() throws {
+        // CONTINUATION may repeat as long as the peer likes, and until the last
+        // one arrives nothing has been decoded. Assembling it without a bound
+        // lets the peer choose how much memory a worker spends, and the
+        // per-frame cap bounds one frame rather than the sequence.
+        //
+        // A block assembled only in part cannot be decoded, so the HPACK table
+        // would no longer describe what was read: this one ends the connection.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        headLimitWanted = 4096
+        // Distinct fields, so HPACK cannot fold them and the encoded block
+        // itself passes the budget.
+        let fields = (0..<2000).map { ("x-\($0)", "value-\($0)") }
+        let frames = splitHeaders(responseHeaders(status: 200, fields: fields,
+                                                 endStream: true), endStream: true)
+        #expect(frames.reduce(0) { $0 + $1.count - H2FrameHeader.size } > headLimitWanted)
+        origin.script = frames
+        #expect(try run("/fetch", origin) == "headTooLarge")
+    }
+
+    @Test func eachStreamKeepsItsOwnBodyLimit() throws {
+        // One connection, two requests, different limits. Whoever happens to be
+        // reading the connection must not lend its limit to the other stream:
+        // before this, an eight-byte body inside its own request's limit failed
+        // because the request reading at that moment allowed four.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        bodyLimitsWanted = ["a": 4, "b": 1000]
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        origin.answerHeld({ $0.path == "/b" }, answer("12345678"))
+        origin.answerHeld({ $0.path == "/a" }, answer("ok"))
+        #expect(turn(client, origin) { outcomes.count == 2 })
+        #expect(outcomes["b"] == "200|12345678")
+        #expect(outcomes["a"] == "200|ok")
+        withExtendedLifetime(wires) {}
+    }
+
+    // MARK: What the head promised
+
+    @Test func aBodyShorterThanContentLengthIsRefused() throws {
+        // RFC 9113 8.1.1. END_STREAM is the peer saying the response is whole;
+        // three bytes where ten were promised is a truncated download, and
+        // handing it back as a 200 is how a relay corrupts what it copies.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [responseHeaders(status: 200, fields: [("content-length", "10")]),
+                         dataFrame("abc")]
+        #expect(try run("/fetch", origin) == "protocolError")
+    }
+
+    @Test func aBodyLongerThanContentLengthIsRefused() throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [responseHeaders(status: 200, fields: [("content-length", "2")]),
+                         dataFrame("far more than two")]
+        #expect(try run("/fetch", origin) == "protocolError")
+    }
+
+    @Test func aBodyMatchingContentLengthIsAccepted() throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [responseHeaders(status: 200, fields: [("content-length", "5")]),
+                         dataFrame("hello")]
+        #expect(try run("/fetch", origin) == "200|hello|true")
+    }
+
+    @Test func aContentLengthWithNoBodyAtAllIsRefused() throws {
+        // The head ends the stream while promising ten bytes.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [responseHeaders(status: 200, fields: [("content-length", "10")],
+                                        endStream: true)]
+        #expect(try run("/fetch", origin) == "protocolError")
+    }
+
+    @Test func twoContentLengthsThatDisagreeAreRefused() throws {
+        // A smuggling vector, and nothing here should be guessing which was
+        // meant.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [responseHeaders(status: 200, fields: [("content-length", "3"),
+                                                              ("content-length", "5")]),
+                         dataFrame("abc")]
+        #expect(try run("/fetch", origin).hasPrefix("malformedResponse"))
+    }
+
+    @Test func aContentLengthTooLongToBeANumberIsRefused() throws {
+        // A hundred digits multiplied into an Int traps, which is the worker
+        // gone; it is refused before it is read.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        let huge = String(repeating: "9", count: 100)
+        origin.script = [responseHeaders(status: 200, fields: [("content-length", huge)]),
+                         dataFrame("abc")]
+        #expect(try run("/fetch", origin).hasPrefix("malformedResponse"))
+    }
+
+    @Test func aHeadResponseKeepsItsContentLengthWithoutABody() throws {
+        // The length describes what a GET would have sent. No body follows, and
+        // nothing is owed on this one.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [responseHeaders(status: 200, fields: [("content-length", "1234")],
+                                        endStream: true)]
+        #expect(try run("/head", origin) == "200|0")
+    }
+
+    @Test func aBodylessStatusKeepsItsContentLength() throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [responseHeaders(status: 304, fields: [("content-length", "1234")],
+                                        endStream: true)]
+        #expect(try run("/fetch", origin) == "304||true")
     }
 
     @Test func aConnectionSpecificHeaderIsRefused() throws {

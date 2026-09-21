@@ -84,6 +84,11 @@ final class H2ClientConnection {
     var headerStream: UInt32 = 0
     var headerEndsStream = false
     var expectingContinuation = false
+    /// The head limit of the stream the block being assembled belongs to,
+    /// taken when its HEADERS arrived. A block comes in as many CONTINUATION
+    /// frames as the peer cares to send, so the per-frame cap bounds none of
+    /// this and something has to.
+    var headBudget = Int.max
 
     init() {
         decoder = HPACKDecoder(maxTableSize: 4096)
@@ -116,6 +121,17 @@ final class H2Stream {
     /// How far each frame pushes `deadline`: the request's own
     /// `timeoutMilliseconds`, whoever happens to be reading the connection.
     let waitMilliseconds: UInt64
+    /// This request's own limits. A connection is shared, and whoever happens
+    /// to be reading it must not lend its limits to another stream: that both
+    /// fails responses inside their own limit and lets one past a tighter one.
+    let maxHeadBytes: Int
+    let maxBodyBytes: Int
+    /// What Content-Length promised, or -1 where the head named no length or
+    /// none is owed (HEAD, 204, 304). DATA payload bytes are counted against
+    /// it so that a stream ended early is refused rather than handed over as
+    /// a whole response: RFC 9113 8.1.1 makes that mismatch malformed.
+    var declaredLength = -1
+    var receivedLength = 0
     /// When the whole exchange must be over, or 0 for no such bound. Cleared
     /// once a streamed response's head is in, after which only silence ends it.
     var exchangeDeadline: UInt64
@@ -126,11 +142,14 @@ final class H2Stream {
     /// The request's task, while it is parked waiting for this stream.
     var waiter: UnsafeContinuation<Void, Never>? = nil
 
-    init(method: HTTPMethod, recvWindow: Int, waitMilliseconds: UInt64, exchangeDeadline: UInt64) {
+    init(method: HTTPMethod, recvWindow: Int, waitMilliseconds: UInt64, exchangeDeadline: UInt64,
+         maxHeadBytes: Int, maxBodyBytes: Int) {
         self.method = method
         self.recvWindow = recvWindow
         self.waitMilliseconds = waitMilliseconds
         self.exchangeDeadline = exchangeDeadline
+        self.maxHeadBytes = maxHeadBytes
+        self.maxBodyBytes = maxBodyBytes
         deadline = 0
         renew(at: av_monotonic_ms())
     }
@@ -430,7 +449,8 @@ extension HTTPClient {
     func openShared(_ shared: H2Shared, block: [UInt8], method: HTTPMethod,
                     body: [UInt8], streaming: Bool) async throws(ClientError) -> H2Stream {
         let stream = H2Stream(method: method, recvWindow: shared.conn.initialWindowSize,
-                              waitMilliseconds: timeoutMilliseconds, exchangeDeadline: deadline)
+                              waitMilliseconds: timeoutMilliseconds, exchangeDeadline: deadline,
+                              maxHeadBytes: maxHeadBytes, maxBodyBytes: maxBodyBytes)
         stream.streaming = streaming
         do {
             try await openStream(shared, stream, block: block, endStream: body.isEmpty)
@@ -955,10 +975,23 @@ extension HTTPClient {
                 conn.headerStream = header.streamID
                 conn.headerEndsStream = header.flags.contains(.endStream)
                 conn.headerBlock.clear()
+                // The stream's own limit, or this client's where the stream
+                // has already gone: the block is decoded either way, to keep
+                // HPACK in step, so it is held to something either way.
+                conn.headBudget = shared.streams[header.streamID]?.maxHeadBytes ?? maxHeadBytes
             } else {
                 guard conn.expectingContinuation, header.streamID == conn.headerStream else {
                     return .protocolError
                 }
+            }
+            // Encoded bytes are the cheap outer guard. HPACK only expands --
+            // an indexed field is one byte and a whole header line -- so a
+            // block already past the budget here cannot decode to something
+            // inside it. This ends the connection, because a block assembled
+            // in part cannot be decoded, and dropping it would leave the HPACK
+            // table describing bytes nobody read.
+            guard conn.headerBlock.readableBytes + (end - start) <= conn.headBudget else {
+                return .headTooLarge
             }
             conn.headerBlock.reserve(end - start)
             conn.headerBlock.write(payload + start, end - start)
@@ -969,7 +1002,8 @@ extension HTTPClient {
             // and skipping one block decodes every later one to nonsense.
             var status = 0
             var fields: [ClientHeader] = []
-            guard decodeBlock(conn, &status, &fields) else {
+            var tooLarge = false
+            guard decodeBlock(conn, &status, &fields, &tooLarge) else {
                 return .malformedResponse(.badHeader)
             }
             conn.headerBlock.clear()
@@ -978,12 +1012,18 @@ extension HTTPClient {
             stream.renew(at: now)
             let endsStream = conn.headerEndsStream
 
+            if tooLarge {
+                // Decoded to keep the table in step and then dropped, so this
+                // ends the one stream and not the connection.
+                failStream(shared, stream, .headTooLarge, reset: .cancel)
+                return nil
+            }
             if stream.sawFinalHeaders {
                 // Trailers. Read to keep HPACK in step, and not kept.
                 if !endsStream {
                     failStream(shared, stream, .protocolError, reset: .protocolError)
                 } else {
-                    stream.done = true
+                    endOfStream(shared, stream)
                 }
             } else if status == 0 {
                 // No :status, or one that was not three digits. Guessing 200
@@ -997,10 +1037,17 @@ extension HTTPClient {
                                reset: .protocolError)
                 }
             } else {
-                stream.status = status
-                stream.headers = fields
-                stream.sawFinalHeaders = true
-                if endsStream { stream.done = true }
+                let owed = owedLength(status: status, method: stream.method, fields: fields)
+                if owed == badLength {
+                    failStream(shared, stream, .malformedResponse(.conflictingFraming),
+                               reset: .protocolError)
+                } else {
+                    stream.status = status
+                    stream.headers = fields
+                    stream.sawFinalHeaders = true
+                    stream.declaredLength = owed
+                    if endsStream { endOfStream(shared, stream) }
+                }
             }
             shared.wake(stream)
 
@@ -1036,14 +1083,21 @@ extension HTTPClient {
                 return nil
             }
             let length = end - start
-            if !stream.streaming && stream.body.count + length > maxBodyBytes {
+            if !stream.streaming && stream.body.count + length > stream.maxBodyBytes {
                 failStream(shared, stream, .bodyTooLarge, reset: .cancel)
+                return nil
+            }
+            // Padding is framing, not content, so only the payload counts.
+            stream.receivedLength += length
+            if stream.declaredLength >= 0 && stream.receivedLength > stream.declaredLength {
+                // Already past what was promised; no need for END_STREAM.
+                failStream(shared, stream, .protocolError, reset: .protocolError)
                 return nil
             }
             stream.body.append(contentsOf: UnsafeBufferPointer(start: payload + start,
                                                                count: length))
             if header.flags.contains(.endStream) {
-                stream.done = true
+                endOfStream(shared, stream)
             } else if !stream.streaming && stream.recvWindow < conn.initialWindowSize / 2 {
                 // A streamed body's window opens as the caller takes it
                 // (`nextShared`), so a caller that stops reading stops the
@@ -1077,29 +1131,93 @@ extension HTTPClient {
         shared.wake(stream)
     }
 
+    /// Ends a stream the peer says is over, or refuses it where the body was
+    /// not the length the head promised. A short body is the case that matters:
+    /// without this a truncated download is handed back as a whole response,
+    /// which HTTP/1.1 never does -- there the missing bytes end as `closed`.
+    private func endOfStream(_ shared: H2Shared, _ stream: H2Stream) {
+        guard stream.declaredLength < 0 || stream.receivedLength == stream.declaredLength else {
+            failStream(shared, stream, .protocolError, reset: .protocolError)
+            return
+        }
+        stream.done = true
+    }
+
+    /// What `owedLength` returns for a Content-Length that cannot be believed.
+    private var badLength: Int { -2 }
+
+    /// How many body bytes the head promised, `-1` for no promise, or
+    /// `badLength`. A HEAD and a 204 or 304 carry a length describing what a
+    /// GET would have sent and no body follows, so nothing is owed on those.
+    private func owedLength(status: Int, method: HTTPMethod, fields: [ClientHeader]) -> Int {
+        guard method != .head, status != 204, status != 304 else { return -1 }
+        var found = -1
+        for field in fields {
+            guard field.name.lowercased() == "content-length" else { continue }
+            let text = field.value.utf8
+            // Bounded before it is read. A peer is free to send a hundred
+            // digits, and multiplying those into an Int traps and takes the
+            // worker with it; 18 digits is past any body that could arrive.
+            guard !text.isEmpty, text.count <= 18 else { return badLength }
+            var value = 0
+            for c in text {
+                guard c >= cZero, c <= cNine else { return badLength }
+                value = value * 10 + Int(c - cZero)
+            }
+            // Two that disagree is a smuggling vector, and nothing here should
+            // be guessing which one was meant.
+            if found >= 0 && found != value { return badLength }
+            found = value
+        }
+        return found
+    }
+
     /// Decodes the assembled block. False when HPACK itself failed, which ends
     /// the connection: its table can no longer be trusted. A missing or
     /// malformed :status leaves `status` at 0 for the stream to refuse.
     private func decodeBlock(_ conn: H2ClientConnection, _ status: inout Int,
-                             _ fields: inout [ClientHeader]) -> Bool {
+                             _ fields: inout [ClientHeader],
+                             _ tooLarge: inout Bool) -> Bool {
         var found = 0
         var collected: [ClientHeader] = []
+        // RFC 9113 counts a header list as the two lengths plus 32 for what
+        // holding the field costs. HPACK turns one byte into a whole line, so
+        // this, and not the frame size, is what bounds the memory a head takes.
+        var listSize = 0
+        var over = false
+        let budget = conn.headBudget
         do {
             try conn.decoder.decode(conn.headerBlock.readPointer,
                                     conn.headerBlock.readableBytes) { span in
+                listSize += span.nameLength + span.valueLength + 32
+                if listSize > budget {
+                    // Every later field is still decoded, because the table
+                    // has to end where the peer thinks it does. None is kept.
+                    over = true
+                    collected.removeAll(keepingCapacity: false)
+                }
+                if over { return }
                 if span.nameLength > 0 && span.name[0] == UInt8(ascii: ":") {
                     if equalsExact(span.name, span.nameLength, ":status") {
+                        // Length first. A peer is free to send ":status:
+                        // 999...9" with as many digits as it likes, and
+                        // accumulating those before counting them overflows
+                        // `value` and traps -- taking the worker, and every
+                        // other request on it, over one bad field. Three
+                        // bytes is the only length HTTP/2 allows.
+                        guard span.valueLength == 3 else { return }
                         var value = 0
-                        var digits = 0
                         var i = 0
-                        while i < span.valueLength {
+                        while i < 3 {
                             let c = span.value[i]
                             guard c >= cZero, c <= cNine else { return }
                             value = value * 10 + Int(c - cZero)
-                            digits += 1
                             i += 1
                         }
-                        if digits == 3 { found = value }
+                        // Below 100 is not a status any more, and letting one
+                        // through would hand the caller a final response the
+                        // peer never named. 0 is what the stream refuses on.
+                        if value >= 100 { found = value }
                     }
                     return
                 }
@@ -1116,6 +1234,7 @@ extension HTTPClient {
         }
         status = found
         fields = collected
+        tooLarge = over
         return true
     }
 }

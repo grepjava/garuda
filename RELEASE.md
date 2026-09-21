@@ -77,6 +77,16 @@ nothing relevant.
 
 ## Unreleased
 
+- The HTTP/2 client no longer trusts what a response says about itself. A
+  `:status` of many digits was accumulated before it was counted, so a peer
+  could overflow the arithmetic and trap the worker, taking every other request
+  on it; a head is now held to `maxHeadBytes` both as it assembles across
+  CONTINUATION and as it decodes, which is where HPACK can turn a small block
+  into a large list; each stream keeps its own `maxBodyBytes` rather than
+  whichever request happened to be reading the shared connection; and a body
+  shorter or longer than the `Content-Length` the head declared is refused
+  instead of being reported as a whole response, as HTTP/1.1 already did.
+
 - `DEPLOYMENT.md` also covers the-benchmarker submission: that it goes to
   `web-frameworks` rather than `website`, the three-route contract, what a
   Swift entry contains, and that their CI builds and route-checks but never
