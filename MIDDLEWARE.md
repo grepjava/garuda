@@ -490,7 +490,11 @@ app.concurrencyLimit(8) {
 - **`concurrencyLimit(max)`** lets `max` of those handlers run at once in each
   worker process and answers the next one 503. With four workers, up to
   `4 × max` run in total. Middleware is not counted, and a request that goes
-  away gives its place back.
+  away gives its place back. A handler that streams its body keeps its place
+  until the body has been written, whether it wrote inline with
+  `response.stream()` or returned a `StreamingBody` or an `EventStream` for the
+  task to write: the writing is the long part, and a limit that stopped
+  counting at the return would not bound it.
 
 Both nest, and both work on a `Router`.
 

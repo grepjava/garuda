@@ -148,6 +148,56 @@ struct RequestLimitsTests {
         #expect(try client.get("/limited/quick", headers: [("authorization", "yes")]).text == "quick")
     }
 
+    /// A limit of one over two ways of streaming: a body returned from a typed
+    /// handler, whose producer runs after the handler is done, and one written
+    /// inline, which runs while it is still running.
+    private func streamingLimitApp() -> Application {
+        let app = Application()
+        app.concurrencyLimit(1) {
+            app.get("/returned") { () async -> StreamingBody in
+                StreamingBody(contentType: "text/plain") { body in
+                    try await body.write("a")
+                    try await body.sleep(milliseconds: 150)
+                    try await body.write("b")
+                }
+            }
+            app.onAsync(.get, "/inline") { _, response in
+                let body = response.stream()
+                try await body.write("a")
+                try await response.sleep(milliseconds: 150)
+                try await body.write("b")
+            }
+            app.get("/quick") { _, response in response.send("quick") }
+        }
+        return app
+    }
+
+    @Test func aReturnedStreamingBodyKeepsItsPlaceUntilItHasWritten() throws {
+        // The handler returns as soon as it has described the body; the
+        // producer writes it afterwards, on the same task. Giving the place
+        // back when the handler returned let the next request in while this one
+        // was still writing -- and a streamed body is exactly the long-running
+        // work a limit of one is meant to bound.
+        let client = streamingLimitApp().test
+        let first = try Pending(client, "GET /returned HTTP/1.1\r\nHost: x\r\n\r\n")
+        for _ in 0..<20 { client.turn() }
+        #expect(try client.get("/quick").status == 503)
+        #expect(try first.response()?.text == "ab")
+        // And back once the writing has ended.
+        #expect(try client.get("/quick").text == "quick")
+    }
+
+    @Test func anInlineStreamedBodyKeepsItsPlaceToo() throws {
+        // This one always did -- the writing happens inside the handler -- and
+        // is here so that the two ways of streaming are held to one rule.
+        let client = streamingLimitApp().test
+        let first = try Pending(client, "GET /inline HTTP/1.1\r\nHost: x\r\n\r\n")
+        for _ in 0..<20 { client.turn() }
+        #expect(try client.get("/quick").status == 503)
+        #expect(try first.response()?.text == "ab")
+        #expect(try client.get("/quick").text == "quick")
+    }
+
     @Test func permitsUnderNestedLimitsAreAllOrNothing() {
         let outer = ConcurrencyLimiter(max: 2)
         let inner = ConcurrencyLimiter(max: 1)

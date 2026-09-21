@@ -228,6 +228,14 @@ final class HandlerTaskPool: @unchecked Sendable {
         let request = Request(worker: worker, slot: work.slot)
         var response = Response(worker: worker, slot: work.slot,
                                 generation: work.generation, requestId: work.requestId)
+        // A limited handler that returned a streamed body parked its place
+        // rather than giving it back when it returned, because the body below
+        // had not been written yet. It goes back here: after the writing, after
+        // a throw, or at once where the body never ran.
+        defer {
+            worker.pointee.releaseParkedPermit(work.slot, generation: work.generation,
+                                               requestId: work.requestId)
+        }
         do {
             try await work.handler(request, &response)
             // A handler that returned a streamed body (`StreamingBody`,

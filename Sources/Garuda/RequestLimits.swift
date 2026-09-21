@@ -47,6 +47,10 @@ extension Application {
 
     /// Lets at most `max` handlers of the routes registered inside `register`
     /// run at once in each worker, and answers 503 past that.
+    ///
+    /// A handler that streams its body holds its place until the body has been
+    /// written, including one that returns a `StreamingBody` or an
+    /// `EventStream` for the task to write after the handler itself is done.
     public func concurrencyLimit(_ max: Int, _ register: () -> Void) {
         precondition(compiled == nil, "concurrency limit added after the application was compiled")
         precondition(max > 0, "a concurrency limit is at least 1")
@@ -65,6 +69,66 @@ extension Router {
     public func concurrencyLimit(_ max: Int, _ register: () -> Void) {
         precondition(max > 0, "a concurrency limit is at least 1")
         scoped(register) { .concurrencyLimit(max, $0) }
+    }
+}
+
+/// One handler's place while the handler runs, and what becomes of it when the
+/// handler returns.
+///
+/// A handler that returned a `StreamingBody` or an `EventStream` has not
+/// finished: its head has been sent and the body is written afterwards, on the
+/// same task, by the producer it left behind. Giving the place back when the
+/// handler returned would let `concurrencyLimit(1)` admit the next request
+/// while this one is still writing -- which is the case the limit exists for,
+/// since a streamed body is the long one. So the place goes to the body, and
+/// `HandlerTasks` gives it back once the writing has ended.
+struct PermitHold {
+    let worker: UnsafeMutablePointer<Worker>
+    let slot: Int
+    let generation: UInt32
+    let requestId: UInt32
+    let permit: LimitPermit
+
+    init(_ worker: UnsafeMutablePointer<Worker>, _ slot: Int, _ generation: UInt32,
+         _ requestId: UInt32, _ permit: LimitPermit) {
+        self.worker = worker
+        self.slot = slot
+        self.generation = generation
+        self.requestId = requestId
+        self.permit = permit
+    }
+
+    /// The handler has returned. Parks the place with a body still to be
+    /// written, or gives it back now.
+    func done() {
+        if !worker.pointee.parkPermit(slot, generation: generation, requestId: requestId,
+                                      permit) {
+            permit.release()
+        }
+    }
+}
+
+extension Worker {
+    /// Parks `permit` with a streamed body the handler left to be written.
+    /// False where there is no such body, and the caller gives it back itself.
+    func parkPermit(_ slot: Int, generation: UInt32, requestId: UInt32,
+                    _ permit: LimitPermit) -> Bool {
+        let c = table[slot]
+        guard let context = c.pointee.context, context.streamProducer != nil,
+              context.generation == generation, context.requestId == requestId else {
+            return false
+        }
+        context.streamPermit = permit
+        return true
+    }
+
+    /// Gives back a place parked with a streamed body, if there is one. Called
+    /// once the task has finished with the request, whether the body was
+    /// written, threw part way, or never ran at all.
+    func releaseParkedPermit(_ slot: Int, generation: UInt32, requestId: UInt32) {
+        guard let context = table[slot].pointee.context,
+              context.generation == generation, context.requestId == requestId else { return }
+        context.streamPermit.take()?.release()
     }
 }
 
@@ -132,7 +196,9 @@ extension Routes {
                 response.send(status: .serviceUnavailable)
                 return
             }
-            defer { permit.release() }
+            let hold = PermitHold(request.worker, request.slot,
+                                  response.generation, response.requestId, permit)
+            defer { hold.done() }
             try await asyncHandler(request, &response)
         }
         // Called on the worker: a full scope is answered there, without
@@ -143,7 +209,9 @@ extension Routes {
                 return
             }
             request.worker.pointee.runOnTask(request.slot) { request, response in
-                defer { permit.release() }
+                let hold = PermitHold(request.worker, request.slot,
+                                      response.generation, response.requestId, permit)
+                defer { hold.done() }
                 try await asyncHandler(request, &response)
             }
         }

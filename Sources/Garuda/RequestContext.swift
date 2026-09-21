@@ -29,6 +29,10 @@ final class RequestContext {
     var sendHooks: [SendHook] = []
     /// The body a returned `StreamingBody` writes once the handler is done.
     var streamProducer: StreamProducer? = nil
+    /// A place under a `concurrencyLimit` that the handler held and the body
+    /// above has taken over, because the handler returned before the body was
+    /// written. Given back when the task is done with the request.
+    var streamPermit: LimitPermit? = nil
 
     init(generation: UInt32, requestId: UInt32) {
         self.generation = generation

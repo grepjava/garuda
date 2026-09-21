@@ -77,6 +77,14 @@ nothing relevant.
 
 ## Unreleased
 
+- A handler under `concurrencyLimit` that returns a `StreamingBody` or an
+  `EventStream` keeps its place until the body has been written. The producer
+  runs after the handler returns, and the place was given back at the return,
+  so a limit of one admitted the next request while the first was still
+  writing -- and a streamed body is the long-running work such a limit exists
+  to bound. A body written inline with `response.stream()` always did hold its
+  place; the two now behave alike.
+
 - `JSONReader.decode`, the public whole-document entry point, proves its input
   is JSON before reading it. The reader is written for a document the coder has
   already scanned -- it steps over a separator where it finds one rather than
