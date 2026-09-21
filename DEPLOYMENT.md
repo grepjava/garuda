@@ -57,39 +57,44 @@ ignored rather than reported.
 ### What the compatibility matrix will show, and why
 
 The index builds every package across Swift versions and platforms and prints
-a grid. **Garuda will not be green everywhere, and two of the gaps are
-expected rather than faults.**
+a grid. **Garuda will not be green everywhere, and neither gap is a fault in
+the package: one platform is out of scope, the other needs a flag the index's
+builders cannot pass.**
 
 - **iOS, tvOS, watchOS, visionOS: will fail.** Garuda is a server. It forks
   worker processes, binds listening sockets and uses epoll or kqueue. It
   declares `platforms: [.macOS(.v15)]` and nothing else. These builds are
   attempted anyway and their failure is correct information.
-- **macOS: expected to fail, and this one is fixable.** aviancore links
-  `libssl` and `libcrypto` but declares no search path for them. On Linux the
-  headers are where the compiler already looks. On macOS they are in
-  Homebrew's prefix, which is why [INSTALLATION.md](INSTALLATION.md#macos)
-  tells a developer to pass them by hand:
+- **macOS: builds, with two flags the index's builders cannot pass.** The row
+  will be red, and it reports a gap in the manifest rather than in the port:
+  CI builds Garuda and runs the unit tests on a `macos-15` runner on every
+  push. What the index cannot supply is a header search path. aviancore links
+  `libssl` and `libcrypto` but declares no path to them; on Linux the headers
+  are where the compiler already looks, and on macOS they are in Homebrew's
+  prefix, which is why [INSTALLATION.md](INSTALLATION.md#macos) has a
+  developer pass them:
 
   ```bash
   swift build -Xcc -I"$(brew --prefix openssl@3)/include" \
               -Xlinker -L"$(brew --prefix openssl@3)/lib"
   ```
 
-  The index's builders run a plain `swift build`. They cannot pass those
-  flags, so the macOS build fails to find `openssl/ssl.h`.
+  The index's builders run a plain `swift build`, so theirs fails to find
+  `openssl/ssl.h`. A developer who followed INSTALLATION.md does not hit this.
 - **Linux: expected to pass.** The official Swift container images carry
   `zlib1g-dev`, and `libssl-dev` arrives with the toolchain's own
   dependencies. This has not been verified against the index's builder image;
   the Linux CI job here is the closest evidence.
 
-### Fixing the macOS build
+### Teaching the manifest where OpenSSL is
 
-The macOS failure is worth fixing, because it is not only the index's problem:
-every macOS developer hits it, and the flags in INSTALLATION.md are a
-workaround for a manifest that does not describe its own dependency.
+Two flags in an installation guide are a workaround for a manifest that does
+not describe its own dependency. Removing the need for them would spare every
+macOS developer the flags, and it is the only route to a green macOS row.
 
-The fix is a `systemLibrary` target in **aviancore** with a `pkgConfig` name,
-which makes pkg-config supply the include and link paths on every platform:
+The change is a `systemLibrary` target in **aviancore** with a `pkgConfig`
+name, which makes pkg-config supply the include and link paths on every
+platform:
 
 ```swift
 .systemLibrary(
@@ -129,9 +134,10 @@ aviancore to stop needing OpenSSL -- BoringSSL now covers the record layer and
 the handshake, leaving `avian_crypto.c`, ACME and QUIC's primitives on
 OpenSSL. That is a project, not a manifest edit, and it is not on the roadmap.
 
-So the macOS row stays red, and the honest reading of the matrix is that this
-is a Linux server package which builds on macOS with two flags. CI proves that
-on every push.
+So the macOS row stays red. The honest reading of the matrix is that Garuda
+is a Linux server package which also builds and tests on macOS, given two
+flags that CI passes on every push and the index's builders have no way to
+pass.
 
 ### Is a Mac needed for any of this?
 
