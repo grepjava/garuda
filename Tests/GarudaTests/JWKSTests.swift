@@ -99,6 +99,49 @@ struct JWKSTests {
         #expect(verifier.fetches == 3)
     }
 
+    @Test func anEmptySetWithdrawsKeysThatHaveAged() async throws {
+        // A provider answering with no keys is not a provider that is down. It
+        // is one saying there is nothing to trust, which is what pulling a
+        // compromised key looks like -- and keys held past their age on the
+        // strength of it would verify tokens for as long as the process lived,
+        // making the withdrawal mean nothing.
+        let key = try JWTKey.generate(.ES256, keyID: "k")
+        var empty = false
+        let (verifier, clock) = verifier {
+            try JSONCoder.encode(JWKSet(keys: empty ? [] : [key.publicJWK!]))
+        }
+        #expect(try await verifier.verify(try token(key), as: Claims.self).sub == "ada")
+
+        // Still inside their age, so they stand: this fetch is one any client
+        // can prompt with a `kid` nobody has, and a provider blinking should
+        // not cost the keys the operator said to trust for an hour.
+        empty = true
+        clock.seconds += 60
+        await #expect(throws: JWTError.unknownKey) {
+            try await verifier.verify(try token(try JWTKey.generate(.ES256, keyID: "other")),
+                                      as: Claims.self)
+        }
+        #expect(try await verifier.verify(try token(key), as: Claims.self).sub == "ada")
+
+        // Past it, and the set has said there is nothing: refused.
+        clock.seconds += 3600
+        await #expect(throws: JWTError.keySetUnavailable) {
+            try await verifier.verify(try token(key), as: Claims.self)
+        }
+        // And back once the provider publishes again.
+        empty = false
+        clock.seconds += 60
+        #expect(try await verifier.verify(try token(key), as: Claims.self).sub == "ada")
+    }
+
+    @Test func anEmptySetFromTheFirstFetchIsRefused() async throws {
+        let key = try JWTKey.generate(.ES256, keyID: "k")
+        let (verifier, _) = verifier { try JSONCoder.encode(JWKSet(keys: [])) }
+        await #expect(throws: JWTError.keySetUnavailable) {
+            try await verifier.verify(try token(key), as: Claims.self)
+        }
+    }
+
     @Test func onlyKeysWorthTrustingAreKept() async throws {
         let rsa = try JWTKey.generate(.RS256, keyID: "rsa")
         let ec = try JWTKey.generate(.ES384, keyID: "ec")

@@ -77,6 +77,15 @@ nothing relevant.
 
 ## Unreleased
 
+- A JWK Set that arrives holding no key the verifier can use now withdraws keys
+  that have aged past `maxAgeSeconds`, instead of being treated as a fetch that
+  failed. A provider pulling a compromised key publishes an empty set, and that
+  answer used to leave the old keys verifying tokens for as long as the process
+  lived. Keys still inside their age are kept, since an unknown `kid` from any
+  client can prompt the fetch and a provider blinking should not cost the hour
+  the operator asked for; they are not carried past it. A fetch that genuinely
+  fails still keeps what is in hand.
+
 - A handler under `concurrencyLimit` that returns a `StreamingBody` or an
   `EventStream` keeps its place until the body has been written. The producer
   runs after the handler returns, and the place was given back at the return,

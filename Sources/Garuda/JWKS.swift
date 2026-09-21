@@ -17,6 +17,14 @@
 // the keys already in hand keep working; with none, the request is 503, and
 // the next attempt waits `minimumRefetchSeconds` too.
 //
+// A set that arrives and holds no key this verifier can use is not a fetch that
+// failed -- it is the provider saying there is nothing to trust, which is what
+// pulling a compromised key looks like. Keys already past `maxAgeSeconds` are
+// dropped on such an answer, so tokens are refused rather than verified against
+// a set the provider has withdrawn. Keys still inside their age are kept, since
+// that is the window they were to be trusted for and an unknown `kid` from any
+// client can prompt this fetch; they are not carried past it.
+//
 // A synchronous route cannot wait for a fetch: `verifyNow` answers from the
 // keys in hand, and when a fetch is due the route answers 503 and starts it.
 //
@@ -128,6 +136,13 @@ public final class JWKSVerifier: JWTVerifying, @unchecked Sendable {
             if !usable.isEmpty {
                 keys = JWTKeys(uncheckedKeys: usable, validation: validation)
                 fetchedAt = now
+            } else if now - fetchedAt >= maxAgeSeconds {
+                // The provider answered, and what it published holds nothing
+                // this verifier can use. Keeping keys past their age on the
+                // strength of that would make a withdrawn key verify for as
+                // long as the process lives. A fetch that *failed* is the other
+                // case, and lands in neither branch: those keys stay.
+                keys = nil
             }
         }
         fetching = false
