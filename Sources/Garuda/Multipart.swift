@@ -258,8 +258,12 @@ enum MultipartParser {
     /// `from`. RFC 2046 gives the delimiter a line of its own: one that does
     /// not begin the body follows a CRLF, and every one is followed either by
     /// a line ending or by the `--` that closes the body. The same bytes
-    /// inside a part's content meet neither test, and are content: a file that
-    /// happens to hold `--boundary--` is stored whole rather than cut there.
+    /// mid-line inside a part's content meet neither test, and are content: a
+    /// file that happens to hold `--boundary--` within a line is stored whole
+    /// rather than cut there. Content carrying the framing as well is the same
+    /// bytes in the same place as a real delimiter, so it does end the part:
+    /// framing alone cannot tell the two apart, which is why RFC 2046 puts
+    /// choosing a boundary absent from the content on the sender.
     private static func findDelimiter(_ base: UnsafePointer<UInt8>, _ count: Int,
                                       _ delimiter: [UInt8], from: Int) -> Int? {
         var at = from

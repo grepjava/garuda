@@ -96,9 +96,12 @@ nothing relevant.
 
 - A `multipart/form-data` part ends at a boundary delimiter, not at bytes that
   merely look like one. RFC 2046 gives the delimiter a line of its own, and the
-  parse did not ask for that framing: a file holding `--boundary--` anywhere in
-  it was cut there and the rest of it thrown away, silently and with a 200. An
-  occurrence that does not open and close a line is content.
+  parse did not ask for that framing: a file holding `--boundary--` mid-line was
+  cut there and the rest of it thrown away, silently and with a 200. An
+  occurrence that does not open and close a line is content. One that does open
+  and close a line is the same bytes in the same place as a real delimiter and
+  still ends the part, which is why RFC 2046 makes choosing a boundary absent
+  from the content the sender's job.
 
 - `trailingSlash(.redirect)` refuses a path whose trimmed form would begin
   `/\` as it already refused `//`. A browser reads the backslash as the second

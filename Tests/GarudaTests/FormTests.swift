@@ -129,6 +129,7 @@ struct FormTests {
         // A file that holds the delimiter without the framing that makes one:
         // RFC 2046 gives a delimiter a line of its own, so neither of these
         // ends the part, and cutting there would lose the rest of the file.
+        // Where that stops is pinned by the test below.
         let boundary = "GarudaTest9"
         var file = Array("prefix--\(boundary)--suffix\r\n".utf8)
         file += Array("--\(boundary)tail\r\n".utf8)
@@ -143,6 +144,38 @@ struct FormTests {
         #expect(try client.post("/avatar", body: body, headers: headers).body == file)
         #expect(try client.post("/upload", body: body, headers: headers)
             .json(Summary.self).title == "kept whole")
+    }
+
+    @Test func framedBoundaryBytesInsideAPartStillEndIt() throws {
+        // The other side of the line drawn above. Content that carries a
+        // delimiter's framing as well as its bytes is, byte for byte and
+        // position for position, a delimiter; no parse reading framing alone
+        // can say otherwise. RFC 2046 answers this by making it the sender's
+        // job to pick a boundary the content does not hold, and every client
+        // that matters picks a random one. So this is what the parse does, and
+        // the guarantee above is about unframed occurrences only.
+        let boundary = "GarudaTest10"
+        let headers = [("content-type", "multipart/form-data; boundary=\(boundary)")]
+        let client = formApp().test
+
+        // A closing delimiter's framing: the part ends there, and the rest is
+        // epilogue, which RFC 2046 says to ignore.
+        let closing = Array("head\r\n--\(boundary)--\r\ntail".utf8)
+        let closingBody = multipart(boundary: boundary, [
+            ("Content-Disposition: form-data; name=\"avatar\"; filename=\"log.txt\"", closing),
+        ])
+        #expect(try client.post("/avatar", body: closingBody, headers: headers).body
+            == Array("head".utf8))
+
+        // A part delimiter's framing: what follows is read as the next part's
+        // headers, finds no blank line, and the body is refused rather than
+        // quietly truncated.
+        let opening = Array("head\r\n--\(boundary)\r\ntail".utf8)
+        let openingBody = multipart(boundary: boundary, [
+            ("Content-Disposition: form-data; name=\"avatar\"; filename=\"log.txt\"", opening),
+        ])
+        #expect(try client.post("/avatar", body: openingBody, headers: headers).status
+            == .badRequest)
     }
 
     @Test func aQuotedBoundaryIsRead() throws {
