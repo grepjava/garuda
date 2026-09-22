@@ -318,7 +318,7 @@ public struct RedisRefreshTokenStore: RefreshTokenStore {
     }
 
     public func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
-        _ = try await redis.pipeline([
+        let replies = try await redis.pipeline([
             RedisCommand("SET", prefix + "f:" + family, "active", "PX", ttl(expiresAt)),
             RedisCommand("SADD", prefix + "s:" + subject, family),
             // The index must outlive the family that ends last, so its expiry
@@ -332,6 +332,25 @@ public struct RedisRefreshTokenStore: RefreshTokenStore {
                 + "return redis.call('PTTL', KEYS[1])",
                          1, prefix + "s:" + subject, ttl(expiresAt)),
         ])
+        // A pipeline answers each command on its own, so one the server
+        // refuses -- NOPERM on the index, OOM, WRONGTYPE -- comes back as a
+        // value beside the ones that worked, and nothing is thrown. Ignoring
+        // it would leave the family set and the subject's index without it,
+        // and that index is what `revokeSubject` walks: a logout everywhere
+        // that answers success and leaves the session running. The login is
+        // failed instead, before a token is handed out against the family.
+        for reply in replies {
+            if case .error(let error) = reply { throw RedisClientError.server(error) }
+        }
+        // The script answers with the index's own TTL, so a non-positive one
+        // says the key is not there and the `SADD` added nothing -- the same
+        // unreachable family, without the server having called anything an
+        // error. A sender answering something other than an integer is left
+        // alone: what is read here is the script's own answer.
+        if replies.count > 2, case .integer(let indexTTL) = replies[2], indexTTL <= 0 {
+            throw RedisClientError.server(RedisServerError(
+                "ERR the subject index did not take refresh family \(family)"))
+        }
     }
 
     public func insert(_ record: RefreshTokenRecord) async throws {

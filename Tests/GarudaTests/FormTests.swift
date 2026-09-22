@@ -178,6 +178,39 @@ struct FormTests {
             == .badRequest)
     }
 
+    @Test func aQuotedParameterKeepsWhatLooksLikeASeparator() throws {
+        // RFC 2183 gives `filename` a quoted-string and RFC 7578 keeps it, so
+        // a name holding a `;` or an escaped `\"` is one a client may send.
+        // Splitting on every `;` cut the name in half and left the rest to be
+        // read as a parameter of its own.
+        let boundary = "GarudaTest11"
+        let body = multipart(boundary: boundary, [
+            ("Content-Disposition: form-data; name=\"avatar\"; filename=\"report;2026.txt\"",
+             Array("contents".utf8)),
+            ("Content-Disposition: form-data; name=\"quoted\"; filename=\"say \\\"hi\\\".txt\"",
+             Array("x".utf8)),
+        ])
+        let response = try formApp().test.post(
+            "/upload", body: body,
+            headers: [("content-type", "multipart/form-data; boundary=\(boundary)")])
+        #expect(response.status == .ok)
+        let summary = try response.json(Summary.self)
+        #expect(summary.names == ["avatar", "quoted"])
+        #expect(summary.filename == "report;2026.txt")
+
+        // The escaped quotes come off with the quoting, leaving the name the
+        // client meant.
+        let parts = try body.withUnsafeBufferPointer {
+            try MultipartParser.parse($0.baseAddress!, $0.count, boundary: Array(boundary.utf8))
+        }
+        #expect(parts.last?.filename == "say \"hi\".txt")
+
+        // And the boundary parameter is read the same way, past a quoted
+        // parameter that holds a separator of its own.
+        #expect(Multipart.boundary(of: "multipart/form-data; note=\"a;b\"; boundary=\(boundary)")
+            == boundary)
+    }
+
     @Test func aQuotedBoundaryIsRead() throws {
         let boundary = "simple-boundary"
         let body = multipart(boundary: boundary, [field("title", "quoted")])

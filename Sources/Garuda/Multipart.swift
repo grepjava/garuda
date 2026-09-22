@@ -86,21 +86,60 @@ public struct Multipart: RequestExtractor {
 
     /// The `boundary=` parameter of a content type, quoted or not.
     static func boundary(of contentType: String) -> String? {
-        var rest = Substring(contentType)
-        while let semicolon = rest.firstIndex(of: ";") {
-            rest = rest[rest.index(after: semicolon)...]
-            let parameter = rest.prefix { $0 != ";" }
-            guard let equals = parameter.firstIndex(of: "=") else { continue }
-            let name = parameter[..<equals].trimmingASCIISpace().lowercased()
-            guard name == "boundary" else { continue }
-            var value = parameter[parameter.index(after: equals)...].trimmingASCIISpace()
-            if value.first == "\"" && value.last == "\"" && value.count >= 2 {
-                value = value.dropFirst().dropLast()
-            }
-            return String(value)
-        }
-        return nil
+        headerParameter("boundary", in: Substring(contentType))
     }
+}
+
+/// A `name=value` parameter of a header value, with a quoted one's quotes
+/// taken off and its `\` escapes undone.
+///
+/// The split into parameters is made outside quotes only. RFC 2183 gives
+/// `filename` a quoted-string and RFC 7578 keeps it, so `filename="report;2026.txt"`
+/// is a name a client may legitimately send; splitting on every `;` would cut
+/// that value in half and read the rest of the name as a parameter of its own.
+func headerParameter(_ wanted: String, in value: Substring) -> String? {
+    var rest = value
+    // What stands before the first parameter is the media type or the
+    // disposition, which carries no quotes of its own.
+    while let semicolon = unquotedIndex(of: ";", in: rest) {
+        rest = rest[rest.index(after: semicolon)...]
+        let parameter = rest[..<(unquotedIndex(of: ";", in: rest) ?? rest.endIndex)]
+        guard let equals = parameter.firstIndex(of: "=") else { continue }
+        let name = parameter[..<equals].trimmingASCIISpace().lowercased()
+        guard name == wanted else { continue }
+        return unquoted(parameter[parameter.index(after: equals)...].trimmingASCIISpace())
+    }
+    return nil
+}
+
+/// Where `character` first stands outside a quoted string, or nil.
+private func unquotedIndex(of character: Character, in text: Substring) -> Substring.Index? {
+    var quoted = false
+    var escaped = false
+    var i = text.startIndex
+    while i < text.endIndex {
+        let c = text[i]
+        if escaped { escaped = false }
+        else if quoted && c == "\\" { escaped = true }
+        else if c == "\"" { quoted.toggle() }
+        else if c == character && !quoted { return i }
+        i = text.index(after: i)
+    }
+    return nil
+}
+
+/// A quoted-string with its quotes off and its `\` escapes undone, or the
+/// text as it stands when it is not one.
+private func unquoted(_ text: Substring) -> String {
+    guard text.count >= 2, text.first == "\"", text.last == "\"" else { return String(text) }
+    var out = ""
+    var escaped = false
+    for c in text.dropFirst().dropLast() {
+        if escaped { out.append(c); escaped = false }
+        else if c == "\\" { escaped = true }
+        else { out.append(c) }
+    }
+    return out
 }
 
 /// What a multipart body can be wrong about.
@@ -223,8 +262,8 @@ enum MultipartParser {
                 let value = line[line.index(after: colon)...].trimmingASCIISpace()
                 switch name {
                 case "content-disposition":
-                    header.name = parameter("name", in: value)
-                    header.filename = parameter("filename", in: value)
+                    header.name = headerParameter("name", in: value)
+                    header.filename = headerParameter("filename", in: value)
                 case "content-type":
                     header.contentType = String(value)
                 default:
@@ -234,24 +273,6 @@ enum MultipartParser {
             lineStart = lineEnd + 2
         }
         return header
-    }
-
-    /// A `name="value"` parameter of a header, quoted or not.
-    private static func parameter(_ wanted: String, in value: Substring) -> String? {
-        var rest = value
-        while let semicolon = rest.firstIndex(of: ";") {
-            rest = rest[rest.index(after: semicolon)...]
-            let parameter = rest.prefix { $0 != ";" }
-            guard let equals = parameter.firstIndex(of: "=") else { continue }
-            let name = parameter[..<equals].trimmingASCIISpace().lowercased()
-            guard name == wanted else { continue }
-            var text = parameter[parameter.index(after: equals)...].trimmingASCIISpace()
-            if text.first == "\"" && text.last == "\"" && text.count >= 2 {
-                text = text.dropFirst().dropLast()
-            }
-            return String(text)
-        }
-        return nil
     }
 
     /// Where a boundary delimiter that frames a line next appears at or after

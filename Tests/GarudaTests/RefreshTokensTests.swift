@@ -235,8 +235,43 @@ private func exerciseStore(_ store: any RefreshTokenStore) async throws -> Strin
 
 private let storeExpectation = "true true true false true true false true"
 
+/// A server that takes the family and refuses to index it, as a Redis ACL
+/// without `SADD` on the subject keys does.
+private struct IndexRefusingRedis: RedisCommandSender {
+    func send(_ command: RedisCommand) async throws(RedisClientError) -> RedisValue { .simpleString("OK") }
+    func pipeline(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
+        [.simpleString("OK"), .error(RedisServerError("NOPERM no permissions for SADD")), .integer(-2)]
+    }
+}
+
+/// The same refusal without the server calling it one: the `SADD` answers
+/// and adds nothing, so the script finds no index key to read a TTL from.
+private struct IndexLosingRedis: RedisCommandSender {
+    func send(_ command: RedisCommand) async throws(RedisClientError) -> RedisValue { .simpleString("OK") }
+    func pipeline(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
+        [.simpleString("OK"), .integer(0), .integer(-2)]
+    }
+}
+
 @Suite("Refresh token stores", .serialized)
 struct RefreshTokenStoreTests {
+    @Test func aRedisFamilyTheSubjectIndexDidNotTakeIsNotALogin() async throws {
+        // `revokeSubject` signs out everywhere by walking the subject's index,
+        // so a family missing from it is a session no logout can reach. The
+        // pipeline answers each command on its own and throws for none of
+        // them, so the store has to read the replies: a login that cannot be
+        // revoked must fail here rather than hand out a token.
+        for store in [RedisRefreshTokenStore(IndexRefusingRedis()),
+                      RedisRefreshTokenStore(IndexLosingRedis())] {
+            var refused = false
+            do {
+                try await store.createFamily("family", subject: "ada",
+                                             expiresAt: Timestamp.now.secondsSinceEpoch + 3600)
+            } catch { refused = true }
+            #expect(refused)
+        }
+    }
+
     @Test func memory() async throws {
         #expect(try await exerciseStore(MemoryRefreshTokenStore()) == storeExpectation)
     }

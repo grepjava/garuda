@@ -94,6 +94,30 @@ nothing relevant.
   stored answer now carries the field, and is written in a layout that says
   which one it is, so an answer a previous build wrote still reads.
 
+- A send on a WebSocket whose connection has ended is refused before it is
+  written. The engine gives a released slot to the next connection, and the
+  check the send made was of the slot rather than of the socket, so a handler
+  still holding an ended socket -- a room or a broadcast list holding everyone's
+  -- wrote its message to whoever had taken the slot. One connection's message
+  reached another connection's client. The send now reads the socket's own
+  state, and throws `WebSocketError.closed` as it does for a socket closed
+  while the handler runs.
+
+- A `multipart/form-data` parameter keeps a `;` inside its quotes. RFC 2183
+  gives `filename` a quoted-string, so `filename="report;2026.txt"` is a name a
+  browser may send; the split into parameters was made on every `;`, which cut
+  that name to `"report` and read the rest as a parameter of its own. The split
+  is made outside quotes now, and a quoted value's `\` escapes are undone, so
+  `filename="say \"hi\".txt"` arrives as the name it says.
+
+- `RedisRefreshTokenStore.createFamily` fails a login whose family the subject
+  index did not take. The commands go in one pipeline, which answers each on
+  its own and throws for none, and the replies were discarded: a `SADD` the
+  server refused -- an ACL without it, an `OOM` -- left the family good and the
+  subject's index without it. `revokeSubject` walks that index, so signing out
+  everywhere reported success and left the session running. The replies are
+  read, and a refused or empty index fails the login before a token is issued.
+
 - A `multipart/form-data` part ends at a boundary delimiter, not at bytes that
   merely look like one. RFC 2046 gives the delimiter a line of its own, and the
   parse did not ask for that framing: a file holding `--boundary--` mid-line was

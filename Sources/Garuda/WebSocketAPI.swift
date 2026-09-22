@@ -128,6 +128,7 @@ public final class WebSocket: @unchecked Sendable {
 
     /// Sends a text message.
     public func send(_ text: String) async throws {
+        try sendable()
         var text = text
         let sent = text.withUTF8 { worker.pointee.sendWebSocketMessage(slot, opcode: .text, $0.baseAddress, $0.count) }
         try await settle(sent)
@@ -135,6 +136,7 @@ public final class WebSocket: @unchecked Sendable {
 
     /// Sends a binary message.
     public func send(_ bytes: [UInt8]) async throws {
+        try sendable()
         let sent = bytes.withUnsafeBufferPointer {
             worker.pointee.sendWebSocketMessage(slot, opcode: .binary, $0.baseAddress, $0.count)
         }
@@ -182,6 +184,20 @@ public final class WebSocket: @unchecked Sendable {
         }
         channel.sleeps.removeAll { $0 == waitID }
         if outcome == .cancelled || channel.gone { throw WebSocketError.closed }
+    }
+
+    /// Refuses a send on a socket whose connection has ended, before the
+    /// slot is addressed at all. The engine hands a released slot to the next
+    /// connection, and the engine's own check -- that the slot is a WebSocket
+    /// with no close sent -- is then true of that connection rather than this
+    /// one. So a handler still holding an ended socket, one that kept it past
+    /// its own handler or shares it with another route, would be writing its
+    /// message to whoever holds the slot now. `settle` checks `gone` again for
+    /// a connection that ends while a large message waits for room; this is
+    /// what keeps the bytes from going out to a stranger in the first place.
+    private func sendable() throws {
+        onWorker()
+        guard !channel.gone else { throw WebSocketError.closed }
     }
 
     private func settle(_ sent: Bool) async throws {

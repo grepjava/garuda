@@ -17,6 +17,13 @@ private final class Seen: @unchecked Sendable {
     var text = ""
 }
 
+/// Keeps one handler's socket where another handler can reach it, which is
+/// what a chat room or a broadcast list does with every socket it holds.
+private final class HeldSocket: @unchecked Sendable {
+    var socket: WebSocket?
+    var refused = false
+}
+
 @Suite("WebSocket handlers", .serialized)
 struct WebSocketHandlerTests {
 
@@ -184,6 +191,36 @@ struct WebSocketHandlerTests {
         // Turned without reading a single frame.
         for _ in 0..<50 { client.turn() }
         #expect(senderEvents == [], "\(senderEvents)")
+    }
+
+    @Test func aSendOnAnEndedSocketCannotReachWhoeverTookItsSlot() throws {
+        // A handler that keeps other handlers' sockets -- a room, a broadcast
+        // list -- still holds one after its connection ends, and the engine is
+        // free to give that slot to the next connection. The send has to be
+        // refused for the socket it was called on, not for whatever is in the
+        // slot now: the engine's own check reads the slot, and the new
+        // connection passes it.
+        let held = HeldSocket()
+        let app = Application()
+        app.webSocket("/first") { (ws: WebSocket) async throws in
+            held.socket = ws
+            while try await ws.receive() != nil {}
+        }
+        app.webSocket("/second") { (ws: WebSocket) async throws in
+            do { try await held.socket?.send("the first connection's private message") }
+            catch { held.refused = true }
+            try await ws.send("the second connection's own message")
+        }
+        let client = app.test
+        let first = try client.webSocket("/first")
+        try first.close()
+        for _ in 0..<10 { client.turn() }
+
+        let second = try client.webSocket("/second")
+        // The point of the test: without the reuse there is nothing to leak into.
+        #expect(first.slot == second.slot)
+        #expect(held.refused)
+        #expect(try second.receive() == .text("the second connection's own message"))
     }
 
     @Test func aRoutersWebSocketTakesThePrefix() throws {
