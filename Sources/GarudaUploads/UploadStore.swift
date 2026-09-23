@@ -50,6 +50,13 @@ public struct UploadInfo: Codable, Sendable, Equatable {
     /// The `Repr-Digest` the client declared for the whole upload, as the
     /// field's text. Checked once the last byte is in (ResumableUploads.swift).
     public var reprDigest: String?
+    /// What the application's `onCreate` recorded about the request that
+    /// created this upload, kept for the request that completes it -- which is
+    /// a different request, and may be on a different worker. Written by the
+    /// server and never by a client, which is what makes it somewhere to keep
+    /// whose upload this is. Nil for an upload created without the hook, and
+    /// for one a build without it created.
+    public var metadata: [String: String]?
 }
 
 /// What a completed upload was answered with, kept so it can be given again.
@@ -147,7 +154,8 @@ public final class FileUploadStore: @unchecked Sendable {
 
     /// Starts an upload with nothing in it.
     public func create(length: Int?, contentType: String?, contentDisposition: String?,
-                       reprDigest: String? = nil) throws -> UploadInfo {
+                       reprDigest: String? = nil,
+                       metadata: [String: String] = [:]) throws -> UploadInfo {
         var id = ""
         for byte in (0..<16).map({ _ in UInt8.random(in: 0...255) }) {
             let hex: [Character] = Array("0123456789abcdef")
@@ -159,7 +167,8 @@ public final class FileUploadStore: @unchecked Sendable {
         _ = close(fd)
         let info = UploadInfo(id: id, offset: 0, length: length, complete: false,
                               createdAt: Int(time(nil)), contentType: contentType,
-                              contentDisposition: contentDisposition, reprDigest: reprDigest)
+                              contentDisposition: contentDisposition, reprDigest: reprDigest,
+                              metadata: metadata.isEmpty ? nil : metadata)
         try save(info)
         return info
     }

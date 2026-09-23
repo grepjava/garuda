@@ -55,6 +55,14 @@
 //     It outlives the bytes, so a handler that files them away and removes the
 //     upload still answers the client that lost its answer. HEAD is left
 //     exactly as the draft describes.
+//   * What the application knows about an upload. The request that creates
+//     one and the request that completes it are different requests, so
+//     `onCreate` is given the creating request -- already authenticated by
+//     whatever guards the routes -- and what it returns is kept on the upload
+//     and handed to `onComplete` as `metadata`. The server writes it and no
+//     client can reach it, which is what makes it the place for whose upload
+//     this is; `contentType` and `contentDisposition` come from the client and
+//     are not. A throw from it refuses the upload before anything is written.
 //   * Progress. A 104 with the current offset every `progressInterval` bytes.
 //   * Expiry. Uploads older than `maxAge` are removed, complete or not, when
 //     the next one is created; the handler should move a finished upload's
@@ -128,6 +136,11 @@ public struct CompletedUpload: Sendable {
     /// Where the bytes are.
     public var path: String { store.dataPath(info.id) }
     public var length: Int { info.offset }
+    /// What `onCreate` recorded when this upload was created, and empty when
+    /// there was no hook. It came from the server, so unlike `info.contentType`
+    /// and `info.contentDisposition` -- which are whatever the client sent --
+    /// it can be trusted: whose upload this is belongs here.
+    public var metadata: [String: String] { info.metadata ?? [:] }
 
     /// The SHA-256 of the upload's bytes, read from the file when it has not
     /// been computed already. Nil only if the file cannot be read.
@@ -144,6 +157,26 @@ public struct CompletedUpload: Sendable {
 
 public typealias UploadCompletion = (CompletedUpload) async throws -> any ResponseConvertible
 
+/// What an application records on an upload as it is created, from the request
+/// that creates it:
+///
+///     app.authenticate(jwt: Claims.self)
+///     app.resumableUploads("/photos", store: store, onCreate: { request in
+///         var parameter = 0
+///         let jwt = try JWT<Claims>.extract(from: request, parameter: &parameter)
+///         return ["user": jwt.claims.sub]
+///     }) { upload in
+///         try file(upload, for: upload.metadata["user"])
+///         return JSON(["id": upload.info.id], status: .created)
+///     }
+///
+/// The creating request has been through whatever middleware guards the
+/// routes, so this is where the identity that established belongs: the request
+/// that finishes the upload is a later one, and finds it as
+/// `CompletedUpload.metadata`. Throwing refuses the upload before a byte of it
+/// is written -- an `HTTPError` with the status it names.
+public typealias UploadCreation = (borrowing Request) throws -> [String: String]
+
 /// The draft iteration this implements (Appendix B).
 public let uploadDraftInteropVersion = 9
 
@@ -151,16 +184,19 @@ extension RouteBuilder {
     /// Serves resumable uploads to `pattern`, keeping them in `store` and
     /// calling `onComplete` once each has all its bytes. `uploads` is the path
     /// each upload's own URL is made under, and has to be as the client sees
-    /// it.
+    /// it. `onCreate` is called on the request that creates an upload, and what
+    /// it returns is kept on the upload for `onComplete` to read.
     public func resumableUploads(_ pattern: String, methods: [HTTPMethod] = [.post],
                                  uploads: String = "/uploads",
                                  store: FileUploadStore, limits: UploadLimits = UploadLimits(),
                                  progressInterval: Int = 8 << 20,
+                                 onCreate: sending UploadCreation? = nil,
                                  onComplete: sending @escaping UploadCompletion) {
         var prefix = uploads
         while prefix.count > 1 && prefix.hasSuffix("/") { prefix.removeLast() }
         let service = UploadService(store: store, limits: limits, uploads: prefix,
-                                    progressInterval: progressInterval, onComplete: onComplete)
+                                    progressInterval: progressInterval, onCreate: onCreate,
+                                    onComplete: onComplete)
         // The limits are enforced here rather than by the engine, so that a
         // 413 says what they are.
         for method in methods {
@@ -207,16 +243,20 @@ final class UploadService: @unchecked Sendable {
     let uploads: String
     let progressInterval: Int
     let onComplete: UploadCompletion
+    /// Called on each request that creates an upload, for whatever the
+    /// application wants kept with it.
+    let onCreate: UploadCreation?
     private var lastExpiry = 0
     /// The request appending to each upload on this worker, by upload id.
     private var appending: [String: RequestBodyStream] = [:]
 
     init(store: FileUploadStore, limits: UploadLimits, uploads: String, progressInterval: Int,
-         onComplete: @escaping UploadCompletion) {
+         onCreate: UploadCreation? = nil, onComplete: @escaping UploadCompletion) {
         self.store = store
         self.limits = limits
         self.uploads = uploads
         self.progressInterval = progressInterval
+        self.onCreate = onCreate
         self.onComplete = onComplete
     }
 
@@ -314,9 +354,14 @@ final class UploadService: @unchecked Sendable {
             return response.send(status: .badRequest,
                                  "Repr-Digest names no digest this server checks")
         }
+        // Before anything is on disk: a hook that refuses this request --
+        // because of who sent it, or what it asked for -- leaves nothing
+        // behind to wait out `maxAge`.
+        var metadata: [String: String] = [:]
+        if let onCreate { metadata = try onCreate(request) }
         let info = try store.create(length: length, contentType: request.header("content-type"),
                                     contentDisposition: request.header("content-disposition"),
-                                    reprDigest: reprDigest)
+                                    reprDigest: reprDigest, metadata: metadata)
         guard let handle = try store.acquire(info.id) else {
             return response.send(status: .serviceUnavailable)
         }

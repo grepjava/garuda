@@ -500,6 +500,35 @@ then gets `RequestBodyError.incomplete`.
 mid-upload asks how much arrived and sends the rest, over any protocol and on
 any worker. `response.sendInterim` sends 1xx responses such as 103 Early Hints.
 
+The request that creates an upload and the request that completes it are
+different requests -- often minutes apart, and on any worker -- so `onCreate`
+is given the creating one, already through whatever middleware guards the
+routes, and what it returns is kept on the upload for the completion handler:
+
+```swift
+app.authenticate(jwt: Claims.self)
+app.resumableUploads("/photos", store: store, onCreate: { request in
+    var parameter = 0
+    let jwt = try JWT<Claims>.extract(from: request, parameter: &parameter)
+    return ["user": jwt.claims.sub]                    // server-set metadata
+}) { upload in
+    try record(upload.path, owner: upload.metadata["user"])
+    return HTTPStatus.created
+}
+```
+
+The server writes that metadata and no client can reach it, which is what makes
+it the place for whose upload this is -- `Content-Type` and
+`Content-Disposition` come from the client and are not. A throw from `onCreate`
+refuses the upload before anything is written, so a request turned away leaves
+nothing behind to expire.
+
+A 104 is an interim response, and an intermediary is free to drop one: a CDN or
+a reverse proxy in front of the server may give the client only the final 201.
+A client should read the upload's URL from the 104 when it arrives and from the
+`Location` of the 201 when it does not, which is what a client creating an
+upload with an empty body does anyway.
+
 ### Testing
 
 ```swift

@@ -152,6 +152,25 @@ struct FileUploadStoreTests {
         #expect(answer.createdAt == 1_700_000_000)
     }
 
+    @Test func metadataIsKeptForAsLongAsTheUploadIs() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let info = try store.create(length: nil, contentType: nil, contentDisposition: nil,
+                                    metadata: ["user": "ada"])
+        #expect(try store.info(info.id)?.metadata == ["user": "ada"])
+        // Every write to an upload's state goes through a read of it, so this
+        // is where metadata would be dropped if it were dropped anywhere.
+        try store.update(info.id, length: 5, complete: true)
+        #expect(try store.info(info.id)?.metadata == ["user": "ada"])
+
+        // An upload a build without metadata created: its state is in the
+        // directory when the server restarts on a newer one.
+        let older = try store.create(length: nil, contentType: nil, contentDisposition: nil)
+        writeBytes(Array("{\"id\":\"\(older.id)\",\"offset\":0,\"complete\":false,\"createdAt\":1700000000}".utf8),
+                   to: store.infoPath(older.id))
+        let read = try #require(try store.info(older.id))
+        #expect(read.metadata == nil && read.createdAt == 1_700_000_000)
+    }
+
     @Test func expiredUploadsAreRemoved() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
         let info = try store.create(length: nil, contentType: nil, contentDisposition: nil)
@@ -963,6 +982,73 @@ struct ResumableUploadTests {
         #expect(try app.test.delete(location).status == 204)
         #expect(try app.test.head(location).status == 404)
         #expect(try app.test.delete(location).status == 404)
+    }
+
+    @Test func whatOnCreateRecordsIsThereWhenTheUploadCompletes() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        completed = []
+        let app = Application()
+        // What an application behind `authenticate` does: the identity the
+        // middleware established is read where there is a request to read it
+        // from, and kept for the request that has none.
+        app.resumableUploads("/files", store: store, progressInterval: 0, onCreate: { request in
+            // The extractors a handler uses work here too: `JWT<Claims>` reads
+            // what `authenticate(jwt:)` established exactly like this.
+            var parameter = 0
+            let bearer = try BearerToken.extract(from: request, parameter: &parameter)
+            return ["user": bearer.token, "album": request.query]
+        }) { upload in
+            completed.append((upload.info, contents(upload.path)))
+            return Text("\(upload.metadata["user"] ?? "-") \(upload.metadata["album"] ?? "-")",
+                        status: .created)
+        }
+        let created = try app.test.post("/files?album=sea", body: pattern(100),
+                                       headers: [("Upload-Complete", "?0"), ("Upload-Length", "150"),
+                                                 ("Authorization", "Bearer ada")])
+        #expect(created.status == 201)
+        let location = try #require(header(created, "location"))
+
+        // The request that finishes the upload carries no identity at all.
+        let last = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "100"),
+            ("Upload-Complete", "?1")], body: pattern(50, from: 100))
+        #expect(last.status == 201)
+        #expect(last.text == "ada album=sea")
+        #expect(completed.map(\.bytes) == [pattern(150)])
+        #expect(completed.first?.info.metadata == ["user": "ada", "album": "album=sea"])
+    }
+
+    @Test func anUploadWithoutTheHookHasNoMetadata() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        #expect(try app.test.post("/files", body: "plain body").status == 201)
+        #expect(completed.first?.info.metadata == nil)
+        #expect(completed.first.map { CompletedUpload(info: $0.info, store: store, sha256: nil).metadata } == [:])
+    }
+
+    @Test func anUploadOnCreateRefusesIsNeverCreated() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        completed = []
+        let app = Application()
+        app.resumableUploads("/files", store: store, progressInterval: 0, onCreate: { request in
+            guard request.header("authorization") != nil else {
+                throw HTTPError(.forbidden, "who is uploading this")
+            }
+            return [:]
+        }) { upload in
+            completed.append((upload.info, contents(upload.path)))
+            return Text("stored \(upload.length)", status: .created)
+        }
+        let refused = try app.test.post("/files", body: pattern(10), headers: draft)
+        #expect(refused.status == 403)
+        // Nothing to sweep up: the hook ran before the upload existed.
+        #expect(try listUploads(store).isEmpty)
+        #expect(completed.isEmpty)
+
+        let allowed = try app.test.post("/files", body: pattern(10),
+                                        headers: draft + [("Authorization", "Bearer ada")])
+        #expect(allowed.status == 201)
+        #expect(completed.count == 1)
     }
 
     @Test func optionsAdvertisesTheLimits() throws {

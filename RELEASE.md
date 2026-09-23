@@ -77,6 +77,21 @@ nothing relevant.
 
 ## Unreleased
 
+- `resumableUploads` takes an `onCreate` hook, and what it returns is kept on
+  the upload as `metadata` for the handler that completes it. The request that
+  creates an upload is authenticated by whatever guards the routes, and the one
+  that completes it is a different request arriving later, so an application
+  had nowhere to put who an upload belonged to: `UploadInfo` carried only
+  `Content-Type` and `Content-Disposition`, which come from the client and can
+  say anything. The alternative was a second, authenticated route to commit
+  each upload, which leaves the thing being uploaded non-existent until that
+  second call arrives, and leaves bytes behind for `maxAge` when it never does.
+  `onCreate` is given the creating request, so identity and whatever else the
+  application knows go on the upload where no client can reach them and
+  `CompletedUpload.metadata` finds them; throwing from it refuses the upload
+  before anything is written, `HTTPError` with the status it names. Uploads
+  written by a build without metadata still read.
+
 - An append to a resumable upload reads the upload's state again once it holds
   the lock, and goes by what it reads. The checks it made -- that the upload is
   still going, and how long it was declared to be -- came from a read taken
