@@ -77,6 +77,30 @@ nothing relevant.
 
 ## Unreleased
 
+- Resumable uploads mounted inside a group work. `resumableUploads` registers
+  its own routes through the builder it is called on, so a group's prefix went
+  in front of them, and two things were then wrong at once: the `Location` it
+  advertised left the prefix out, so a client that followed it to resume was
+  answered 404 -- and passing the prefix in as `uploads` only registered it
+  twice -- while the handlers for HEAD, GET, PATCH and DELETE read the upload's
+  id as the route's first parameter, which under `group("/users/:user")` is the
+  user. Inside a group, resuming an upload could not work at all. An upload's
+  URL is now worked out from the request that created it, so it is the path the
+  client used with `uploads` on the end, and the id is read as the last
+  parameter, after any a group captured. `uploads` is relative to where the
+  routes are mounted, which is what it already was for an application outside
+  any group.
+
+- An answer to a completed upload whose body is streamed is no longer
+  remembered as an empty one. The answer is kept by a hook that runs as the
+  response goes out, and a streamed body is written after that, so a handler
+  returning `StreamingBody` had an empty body stored with its status: a client
+  that lost the answer and asked for it again with GET was given a 200 with
+  nothing in it, in place of the receipt it was owed. Nothing is remembered for
+  a streamed answer now -- the GET answers as it does for an upload nothing is
+  remembered about, and says so with `Upload-Complete` -- and the log says
+  which upload it was.
+
 - `resumableUploads` takes an `onCreate` hook, and what it returns is kept on
   the upload as `metadata` for the handler that completes it. The request that
   creates an upload is authenticated by whatever guards the routes, and the one

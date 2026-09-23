@@ -54,7 +54,11 @@
 //     speaks about the upload and not about what the application made of it.
 //     It outlives the bytes, so a handler that files them away and removes the
 //     upload still answers the client that lost its answer. HEAD is left
-//     exactly as the draft describes.
+//     exactly as the draft describes. An answer whose body is streamed is the
+//     one kind that is not remembered: those bytes are written after the
+//     answer has gone, so there is nothing yet to keep, and the GET answers as
+//     it does for an upload nothing is remembered about. A handler whose
+//     answer should survive a lost connection returns it whole.
 //   * What the application knows about an upload. The request that creates
 //     one and the request that completes it are different requests, so
 //     `onCreate` is given the creating request -- already authenticated by
@@ -183,9 +187,12 @@ public let uploadDraftInteropVersion = 9
 extension RouteBuilder {
     /// Serves resumable uploads to `pattern`, keeping them in `store` and
     /// calling `onComplete` once each has all its bytes. `uploads` is the path
-    /// each upload's own URL is made under, and has to be as the client sees
-    /// it. `onCreate` is called on the request that creates an upload, and what
-    /// it returns is kept on the upload for `onComplete` to read.
+    /// each upload's own URL is made under, relative to wherever these routes
+    /// are mounted: inside `group("/api")`, `uploads: "/uploads"` both serves
+    /// and advertises `/api/uploads/:id`, and inside `group("/users/:user")` it
+    /// is that user's path and then `/uploads`. `onCreate` is called on the
+    /// request that creates an upload, and what it returns is kept on the
+    /// upload for `onComplete` to read.
     public func resumableUploads(_ pattern: String, methods: [HTTPMethod] = [.post],
                                  uploads: String = "/uploads",
                                  store: FileUploadStore, limits: UploadLimits = UploadLimits(),
@@ -194,9 +201,14 @@ extension RouteBuilder {
                                  onComplete: sending @escaping UploadCompletion) {
         var prefix = uploads
         while prefix.count > 1 && prefix.hasSuffix("/") { prefix.removeLast() }
+        // An upload's URL is the creating request's path with this pattern's
+        // segments taken off and `uploads` put on, so a pattern whose last
+        // segment stands for any number of them leaves nothing to count.
+        precondition(!pattern.contains("*"),
+                     "resumableUploads cannot serve a pattern with *rest: \(pattern)")
         let service = UploadService(store: store, limits: limits, uploads: prefix,
-                                    progressInterval: progressInterval, onCreate: onCreate,
-                                    onComplete: onComplete)
+                                    pattern: pattern, progressInterval: progressInterval,
+                                    onCreate: onCreate, onComplete: onComplete)
         // The limits are enforced here rather than by the engine, so that a
         // 413 says what they are.
         for method in methods {
@@ -241,6 +253,9 @@ final class UploadService: @unchecked Sendable {
     let store: FileUploadStore
     let limits: UploadLimits
     let uploads: String
+    /// The pattern the create routes were registered with, which says how much
+    /// of a creating request's path belongs to the groups around them.
+    let pattern: String
     let progressInterval: Int
     let onComplete: UploadCompletion
     /// Called on each request that creates an upload, for whatever the
@@ -250,17 +265,51 @@ final class UploadService: @unchecked Sendable {
     /// The request appending to each upload on this worker, by upload id.
     private var appending: [String: RequestBodyStream] = [:]
 
-    init(store: FileUploadStore, limits: UploadLimits, uploads: String, progressInterval: Int,
-         onCreate: UploadCreation? = nil, onComplete: @escaping UploadCompletion) {
+    init(store: FileUploadStore, limits: UploadLimits, uploads: String, pattern: String,
+         progressInterval: Int, onCreate: UploadCreation? = nil,
+         onComplete: @escaping UploadCompletion) {
         self.store = store
         self.limits = limits
         self.uploads = uploads
+        self.pattern = pattern
         self.progressInterval = progressInterval
         self.onCreate = onCreate
         self.onComplete = onComplete
     }
 
-    func location(_ id: String) -> String { "\(uploads)/\(id)" }
+    /// Where the upload lives, as the client sees it: the path this request
+    /// arrived at, less the segments of the pattern the create routes were
+    /// registered with, and then `uploads` and the id.
+    ///
+    /// Read from the request rather than assumed to be `uploads`, because the
+    /// engine mounts these routes under the prefix of every group they were
+    /// registered in and this module is never told what that is -- a `Router`
+    /// does not know it either until it is merged, and a group's prefix can
+    /// carry parameters of its own. A URL that left the prefix out was a URL
+    /// the client could not resume from.
+    func location(_ id: String, for request: borrowing Request) -> String {
+        "\(mounted(request))/\(id)"
+    }
+
+    /// The uploads prefix as the client sees it, worked out from a request to
+    /// a create route.
+    func mounted(_ request: borrowing Request) -> String {
+        var path = request.path
+        var segments = pattern.split(separator: "/").count
+        while segments > 0, let slash = path.lastIndex(of: "/") {
+            path = String(path[path.startIndex..<slash])
+            segments -= 1
+        }
+        return path + uploads
+    }
+
+    /// The upload's id, which is the last parameter the route captured: the
+    /// uploads routes name one at the end, and anything before it was captured
+    /// by a group the application mounted them in.
+    func id(of request: borrowing Request) -> String {
+        let count = request.parameterCount
+        return count > 0 ? request.parameter(count - 1) : ""
+    }
 
     /// Whether the client speaks the iteration of the draft this does.
     func speaksDraft(_ request: borrowing Request) -> Bool {
@@ -366,15 +415,16 @@ final class UploadService: @unchecked Sendable {
             return response.send(status: .serviceUnavailable)
         }
         let interim = resumable && speaksDraft(request)
+        let url = location(info.id, for: request)
         if interim {
             response.sendInterim(status: HTTPStatus(104), headers: [
                 ("Upload-Draft-Interop-Version", "\(uploadDraftInteropVersion)"),
-                ("Location", location(info.id)),
+                ("Location", url),
                 ("Upload-Limit", limits.field(remaining: limits.maxAge)),
             ])
         }
         try await transfer(handle, body, &response, complete: complete, length: length,
-                           resumable: resumable, interim: interim, creating: true,
+                           resumable: resumable, interim: interim, creating: true, at: url,
                            contentDigest: contentDigest, wantsDigest: wantsSHA256(request))
     }
 
@@ -382,7 +432,7 @@ final class UploadService: @unchecked Sendable {
 
     func append(_ request: borrowing Request, _ response: inout Response,
                 _ body: RequestBodyStream) async throws {
-        let id = request.parameter(0)
+        let id = id(of: request)
         guard let type = request.header("content-type"),
               type.split(separator: ";").first?.lowercased().filter({ $0 != " " }) == "application/partial-upload"
         else {
@@ -503,7 +553,8 @@ final class UploadService: @unchecked Sendable {
     /// Stores the body as it arrives, and answers once it has all come.
     func transfer(_ handle: UploadHandle, _ body: RequestBodyStream, _ response: inout Response,
                   complete: Bool, length: Int?, resumable: Bool, interim: Bool,
-                  creating: Bool, contentDigest: [UInt8]?, wantsDigest: Bool) async throws {
+                  creating: Bool, at url: String? = nil,
+                  contentDigest: [UInt8]?, wantsDigest: Bool) async throws {
         let id = handle.id
         appending[id] = body
         defer {
@@ -571,7 +622,7 @@ final class UploadService: @unchecked Sendable {
             response.addHeader("Upload-Complete", "?0")
             response.addHeader("Upload-Offset", "\(offset)")
             if creating {
-                response.addHeader("Location", location(id))
+                if let url { response.addHeader("Location", url) }
                 response.addHeader("Upload-Limit", limits.field(remaining: limits.maxAge))
                 return response.send(status: .created)
             }
@@ -619,6 +670,16 @@ final class UploadService: @unchecked Sendable {
         let store = self.store
         let created = info.createdAt
         response.onSend { outgoing in
+            // A streamed body is written after this runs, so there is nothing
+            // here to remember: storing the status with an empty body would
+            // answer a client that came back for its receipt with a success
+            // that says nothing. Nothing is stored instead, and the GET
+            // answers as it does for an upload that has no remembered answer.
+            if outgoing.isStreaming {
+                AppLog.warning("a streamed answer to a completed upload is not remembered",
+                               ["upload": .string(id)])
+                return
+            }
             let status = outgoing.status.code
             let type = outgoing.header("content-type")
             let body = outgoing.withBody { span in
@@ -639,7 +700,7 @@ final class UploadService: @unchecked Sendable {
     func offset(_ request: borrowing Request, _ response: inout Response,
                 replaying: Bool = false) async throws {
         response.addHeader("Cache-Control", "no-store")
-        let id = request.parameter(0)
+        let id = id(of: request)
         // An offset is only worth giving once nothing is still adding to it.
         try await supersede(id, response)
         // A GET for an upload that finished is the client asking for the
@@ -673,7 +734,7 @@ final class UploadService: @unchecked Sendable {
     }
 
     func cancel(_ request: borrowing Request, _ response: inout Response) async throws {
-        let id = request.parameter(0)
+        let id = id(of: request)
         try await supersede(id, response)
         do {
             // Everything, the answer included: the client asked for this

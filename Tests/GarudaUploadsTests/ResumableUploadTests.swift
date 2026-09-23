@@ -1051,6 +1051,94 @@ struct ResumableUploadTests {
         #expect(completed.count == 1)
     }
 
+    @Test func uploadsMountedInAGroupSayWhereTheyReallyAre() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        completed = []
+        let app = Application()
+        app.group("/api") {
+            app.resumableUploads("/files", store: store, progressInterval: 0) { upload in
+                completed.append((upload.info, contents(upload.path)))
+                return Text("stored \(upload.length)", status: .created)
+            }
+        }
+        let created = try app.test.post("/api/files", body: pattern(100),
+                                        headers: [("Upload-Complete", "?0"), ("Upload-Length", "150"),
+                                                  ("Upload-Draft-Interop-Version", "9")])
+        #expect(created.status == 201)
+        let location = try #require(header(created, "location"))
+        #expect(location.hasPrefix("/api/uploads/"))
+        // The 104 and the 201 name the same place.
+        #expect(created.interim.first?.headers.first { $0.name.lowercased() == "location" }?.value == location)
+
+        // And it is a URL the client can use: everything the draft asks of an
+        // upload's own URL works there.
+        let probe = try app.test.head(location)
+        #expect(probe.status == 204)
+        #expect(header(probe, "upload-offset") == "100")
+        let last = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "100"),
+            ("Upload-Complete", "?1")], body: pattern(50, from: 100))
+        #expect(last.status == 201)
+        #expect(completed.map(\.bytes) == [pattern(150)])
+        #expect(try app.test.get(location).text == "stored 150")
+        #expect(try app.test.delete(location).status == 204)
+    }
+
+    @Test func aGroupsOwnParametersDoNotTakeTheUploadsPlace() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        completed = []
+        let app = Application()
+        app.group("/users/:user") {
+            app.resumableUploads("/files", store: store, progressInterval: 0, onCreate: { request in
+                // The group's parameter, which is still the first one.
+                ["user": request.parameter(0)]
+            }) { upload in
+                completed.append((upload.info, contents(upload.path)))
+                return Text("stored for \(upload.metadata["user"] ?? "-")", status: .created)
+            }
+        }
+        let created = try app.test.post("/users/ada/files", body: pattern(100),
+                                        headers: [("Upload-Complete", "?0"), ("Upload-Length", "150")])
+        let location = try #require(header(created, "location"))
+        #expect(location.hasPrefix("/users/ada/uploads/"))
+
+        let probe = try app.test.head(location)
+        #expect(probe.status == 204)
+        #expect(header(probe, "upload-offset") == "100")
+        let last = try app.test.request("PATCH", location, headers: [
+            ("Content-Type", "application/partial-upload"), ("Upload-Offset", "100"),
+            ("Upload-Complete", "?1")], body: pattern(50, from: 100))
+        #expect(last.status == 201)
+        #expect(last.text == "stored for ada")
+        #expect(completed.map(\.bytes) == [pattern(150)])
+
+        // Another user's path is another upload's URL, and the id is read from
+        // the right end of it either way.
+        #expect(try app.test.head("/users/bob/uploads/0123456789abcdef0123456789abcdef").status == 404)
+    }
+
+    @Test func aStreamedAnswerIsNotRememberedAsAnEmptyOne() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = Application()
+        app.resumableUploads("/files", store: store, progressInterval: 0) { _ in
+            StreamingBody(contentType: "text/plain") { body in
+                try await body.write("receipt")
+            }
+        }
+        let created = try app.test.post("/files", body: pattern(10), headers: draft)
+        #expect(created.text == "receipt")
+        let location = try #require(uploadURL(created))
+
+        // The receipt was written after the answer was already on its way, so
+        // there was nothing to remember. Better the upload's state than a
+        // success with an empty body where the receipt should be.
+        let replay = try app.test.get(location)
+        #expect(replay.status == 204)
+        #expect(replay.text.isEmpty)
+        #expect(header(replay, "upload-complete") == "?1")
+        #expect(header(replay, "upload-offset") == "10")
+    }
+
     @Test func optionsAdvertisesTheLimits() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
         let app = uploadApp(store, limits: UploadLimits(maxSize: 5, minSize: 2, maxAppendSize: 3, minAppendSize: 1, maxAge: 9))

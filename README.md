@@ -523,6 +523,11 @@ it the place for whose upload this is -- `Content-Type` and
 refuses the upload before anything is written, so a request turned away leaves
 nothing behind to expire.
 
+`uploads` is relative to wherever the routes are mounted, so a group carries
+them whole: inside `group("/api")` the uploads live at `/api/uploads/:id` and
+that is what the `Location` says, and inside `group("/users/:user")` each
+upload's URL sits under the user whose request created it.
+
 A 104 is an interim response, and an intermediary is free to drop one: a CDN or
 a reverse proxy in front of the server may give the client only the final 201.
 A client should read the upload's URL from the 104 when it arrives and from the
