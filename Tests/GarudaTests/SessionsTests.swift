@@ -159,6 +159,67 @@ struct SessionsTests {
         #expect(try client.get("/s/read", headers: [("cookie", "id=\(id)")]).text == "- - true")
     }
 
+    @Test func aRequestStillHoldingADestroyedSessionCannotBringItBack() async throws {
+        let store = MemorySessionStore()
+        try await store.save(id: "old", data: ["user": "ada"], ttlMilliseconds: 60_000)
+        // Two requests from one client, each with its own copy.
+        let stale = Session(store: store, ttlMilliseconds: 60_000)
+        let other = Session(store: store, ttlMilliseconds: 60_000)
+        for session in [stale, other] {
+            session.cookieSent = true
+            session.id = "old"
+            session.values = ["user": "ada"]
+        }
+        try await other.destroy()
+
+        await #expect(throws: HTTPError.self) { try await stale.set("theme", "dark") }
+        #expect(try await store.load(id: "old", ttlMilliseconds: 60_000) == nil)
+        #expect(stale.id == nil && stale.isEmpty)
+        // The cookie is left to the request that ended it.
+        #expect(stale.cookieChange == .none)
+        #expect(store.count == 0)
+    }
+
+    @Test func aRequestStillHoldingARenewedSessionCannotRenewOrChangeIt() async throws {
+        let store = MemorySessionStore()
+        try await store.save(id: "old", data: ["user": "ada"], ttlMilliseconds: 60_000)
+        let stale = Session(store: store, ttlMilliseconds: 60_000)
+        let other = Session(store: store, ttlMilliseconds: 60_000)
+        for session in [stale, other] {
+            session.cookieSent = true
+            session.id = "old"
+            session.values = ["user": "ada"]
+        }
+        try await other.renew()
+        let moved = try #require(other.id)
+
+        await #expect(throws: HTTPError.self) { try await stale.renew() }
+        #expect(stale.id == nil && stale.isEmpty)
+        #expect(store.count == 1)
+        stale.id = "old"
+        stale.values = ["user": "ada"]
+        await #expect(throws: HTTPError.self) { try await stale.set("theme", "dark") }
+        #expect(try await store.load(id: "old", ttlMilliseconds: 60_000) == nil)
+        #expect(try await store.load(id: moved, ttlMilliseconds: 60_000) == ["user": "ada"])
+    }
+
+    @Test func theMemoryStoreReplacesAndRemovesOnlyLiveSessions() async throws {
+        let store = MemorySessionStore()
+        nonisolated(unsafe) var now: UInt64 = 1_000_000
+        store.clock = { now }
+        #expect(try await !store.replace(id: "a", data: ["k": "v"], ttlMilliseconds: 150))
+        #expect(store.count == 0)
+        try await store.save(id: "a", data: ["k": "v"], ttlMilliseconds: 150)
+        #expect(try await store.replace(id: "a", data: ["k": "w"], ttlMilliseconds: 150))
+        #expect(try await store.load(id: "a", ttlMilliseconds: 150) == ["k": "w"])
+        now += 200_000
+        #expect(try await !store.replace(id: "a", data: ["k": "x"], ttlMilliseconds: 150))
+        #expect(try await !store.remove(id: "a"))
+        try await store.save(id: "b", data: ["k": "v"], ttlMilliseconds: 150)
+        #expect(try await store.remove(id: "b"))
+        #expect(try await !store.remove(id: "b"))
+    }
+
     @Test func theMemoryStoreExpiresIdleSessions() async throws {
         let store = MemorySessionStore()
         nonisolated(unsafe) var now: UInt64 = 1_000_000
@@ -232,6 +293,19 @@ struct SQLiteSessionsTests {
 
                 try await store.delete(id: "one")
                 out.append(written(try await store.load(id: "one", ttlMilliseconds: 60_000)))
+
+                // Only a live session is replaced or removed.
+                let absent = try await store.replace(id: "one", data: ["k": "v"], ttlMilliseconds: 60_000)
+                try await store.save(id: "two", data: ["k": "v"], ttlMilliseconds: 60_000)
+                let present = try await store.replace(id: "two", data: ["k": "w"], ttlMilliseconds: 60_000)
+                out.append("\(absent) \(present) \(written(try await store.load(id: "two", ttlMilliseconds: 60_000)))")
+                try await store.save(id: "brief", data: ["k": "v"], ttlMilliseconds: 1)
+                _ = await Worker.waitTimed(currentWorker!, milliseconds: 20) { _ in }
+                let expired = try await store.replace(id: "brief", data: ["k": "w"], ttlMilliseconds: 60_000)
+                let removedExpired = try await store.remove(id: "brief")
+                let removed = try await store.remove(id: "two")
+                let again = try await store.remove(id: "two")
+                out.append("\(expired) \(removedExpired) \(removed) \(again)")
                 return out.joined(separator: " | ")
             } catch {
                 return "threw \(error)"
@@ -240,7 +314,7 @@ struct SQLiteSessionsTests {
         let client = app.test
         client.timeoutMillis = 15_000
         #expect(try client.get("/run").text
-            == #"quote=a "b" é,user=ada | - | 1 | user=grace | true true | -"#)
+            == #"quote=a "b" é,user=ada | - | 1 | user=grace | true true | - | false true k=w | false false true false"#)
     }
 
     @Test func sessionsWorkOverTheSQLiteStore() throws {
@@ -305,6 +379,12 @@ struct RedisSessionsTests {
                 return "bye"
             }
         }
+        app.get("/stale/:id") { (id: Path<String>, redis: State<RedisPool>) async throws -> String in
+            let store = RedisSessionStore(redis.value, prefix: prefix)
+            let replaced = try await store.replace(id: id.value, data: ["k": "v"], ttlMilliseconds: 30_000)
+            let removed = try await store.remove(id: id.value)
+            return "\(replaced) \(removed) \(try await redis.value.pttl(prefix + id.value) ?? -9)"
+        }
         app.get("/ttl/:id") { (id: Path<String>, redis: State<RedisPool>) async throws -> String in
             "\(try await redis.value.pttl(prefix + id.value) ?? -9)"
         }
@@ -318,6 +398,7 @@ struct RedisSessionsTests {
         #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "2")
         #expect(try client.post("/s/logout", headers: [("cookie", "id=\(id)")]).text == "bye")
         #expect(try client.get("/ttl/\(id)").text == "-9")
+        #expect(try client.get("/stale/\(id)").text == "false false -9")
         #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "1")
     }
 }

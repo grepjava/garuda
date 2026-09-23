@@ -295,10 +295,24 @@ final class UploadService: @unchecked Sendable {
     /// a create route.
     func mounted(_ request: borrowing Request) -> String {
         var path = request.path
-        var segments = pattern.split(separator: "/").count
-        while segments > 0, let slash = path.lastIndex(of: "/") {
+        // The route is the group's prefix and the pattern, so the pattern is
+        // the end of the path, one slash for each of its own: empty segments
+        // count, as the router keeps them. A pattern of `/` is a group's own
+        // root, the prefix alone, and outside any group it is `/`.
+        if pattern == "/" {
+            while path.hasSuffix("/") { path.removeLast() }
+            return path + uploads
+        }
+        // A pattern that does not end in a slash matched a path that does only
+        // under trailingSlash(.ignore), which matched it with those slashes
+        // taken off; the path still has them.
+        if !pattern.hasSuffix("/") {
+            while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        }
+        var slashes = pattern.utf8.count(where: { $0 == UInt8(ascii: "/") })
+        while slashes > 0, let slash = path.lastIndex(of: "/") {
             path = String(path[path.startIndex..<slash])
-            segments -= 1
+            slashes -= 1
         }
         return path + uploads
     }

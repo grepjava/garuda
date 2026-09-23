@@ -30,6 +30,13 @@
 // `renew` moves the data to a new ID, which a login should do so that an ID
 // planted in the browser before it does not carry the signed-in user.
 //
+// Each request loads its own copy of the session, so two requests from one
+// client can each hold it. A change to a session another request has since
+// destroyed or renewed away is refused rather than stored: storing it would
+// make the old ID a live session again, signed in, after the logout that
+// ended it. The store checks and writes in one step, and the request that
+// lost is answered 409 with its session emptied.
+//
 // Each worker is a process, so a `MemorySessionStore` holds the sessions of
 // one worker: with --workers above 1 a client's next request can reach a
 // worker that never saw its session. It is for --workers 1 and tests; use
@@ -53,6 +60,35 @@ public protocol SessionStore: Sendable {
 
     /// Removes session `id`, if there is one.
     func delete(id: String) async throws
+
+    /// Stores `data` as session `id` only if the session is live, in one step
+    /// with the check, pushing its expiry out to `ttlMilliseconds` from now.
+    /// Returns whether it was stored.
+    ///
+    /// A change to a session the request loaded is written with this, so that
+    /// a request still holding a session another request destroyed cannot
+    /// write it back. The default loads and then saves, which another request
+    /// can come between: a store of your own should do both at once.
+    func replace(id: String, data: [String: String], ttlMilliseconds: Int) async throws -> Bool
+
+    /// Removes session `id` and returns whether it was live, in one step.
+    /// `renew` moves a session only when this finds it. The default loads and
+    /// then deletes, which another request can come between.
+    func remove(id: String) async throws -> Bool
+}
+
+extension SessionStore {
+    public func replace(id: String, data: [String: String], ttlMilliseconds: Int) async throws -> Bool {
+        guard try await load(id: id, ttlMilliseconds: ttlMilliseconds) != nil else { return false }
+        try await save(id: id, data: data, ttlMilliseconds: ttlMilliseconds)
+        return true
+    }
+
+    public func remove(id: String) async throws -> Bool {
+        guard try await load(id: id, ttlMilliseconds: 1) != nil else { return false }
+        try await delete(id: id)
+        return true
+    }
 }
 
 /// How sessions are found and how long they live.
@@ -134,6 +170,9 @@ public final class Session: RequestExtractor, @unchecked Sendable {
     /// Makes any number of changes and stores them with one write. A session
     /// left empty is deleted; an empty session that had no ID stays without
     /// one, costing nothing.
+    ///
+    /// Throws 409 Conflict, and leaves the session empty, when another request
+    /// has destroyed or renewed the session since this one loaded it.
     public func update(_ change: (inout [String: String]) throws -> Void) async throws {
         var changed = values
         try change(&changed)
@@ -141,10 +180,14 @@ public final class Session: RequestExtractor, @unchecked Sendable {
             if id != nil { try await destroy() }
             return
         }
-        let target = id ?? newSessionID()
-        try await store.save(id: target, data: changed, ttlMilliseconds: ttlMilliseconds)
-        if id == nil {
-            id = target
+        if let id {
+            guard try await store.replace(id: id, data: changed, ttlMilliseconds: ttlMilliseconds) else {
+                throw ended()
+            }
+        } else {
+            let fresh = newSessionID()
+            try await store.save(id: fresh, data: changed, ttlMilliseconds: ttlMilliseconds)
+            id = fresh
             cookieChange = .send
         }
         values = changed
@@ -152,13 +195,20 @@ public final class Session: RequestExtractor, @unchecked Sendable {
 
     /// Moves the session to a new ID, keeping its data, and deletes the old
     /// one. Call it when the client signs in or its rights change.
+    ///
+    /// Throws 409 Conflict, and leaves the session empty, when another request
+    /// has destroyed or renewed the session since this one loaded it.
     public func renew() async throws {
         guard let old = id else { return }
+        // The old ID goes first, and only a session that was still there
+        // moves: saving first would give a destroyed session a new ID.
+        guard try await store.remove(id: old) else { throw ended() }
+        id = nil
+        cookieChange = cookieSent ? .remove : .none
         let fresh = newSessionID()
         try await store.save(id: fresh, data: values, ttlMilliseconds: ttlMilliseconds)
         id = fresh
         cookieChange = .send
-        try await store.delete(id: old)
     }
 
     /// Deletes the session and tells the client to forget its cookie.
@@ -167,6 +217,17 @@ public final class Session: RequestExtractor, @unchecked Sendable {
         id = nil
         values = [:]
         if cookieSent || cookieChange == .send { cookieChange = .remove }
+    }
+
+    /// Empties a session another request ended, and returns the error that
+    /// says so. The cookie is left alone: the request that ended the session
+    /// has already said what the client should hold, perhaps a renewed ID,
+    /// and a removal sent now would take that with it.
+    private func ended() -> HTTPError {
+        id = nil
+        values = [:]
+        cookieChange = .none
+        return HTTPError(.conflict, "the session ended while this request was using it")
     }
 }
 
@@ -290,6 +351,18 @@ public final class MemorySessionStore: SessionStore, @unchecked Sendable {
     public func delete(id: String) async throws {
         sessions[id] = nil
     }
+
+    public func replace(id: String, data: [String: String], ttlMilliseconds: Int) async throws -> Bool {
+        let now = clock()
+        guard let entry = sessions[id], entry.expires > now else { return false }
+        sessions[id] = (data, now + UInt64(ttlMilliseconds) * 1000)
+        return true
+    }
+
+    public func remove(id: String) async throws -> Bool {
+        guard let entry = sessions.removeValue(forKey: id) else { return false }
+        return entry.expires > clock()
+    }
 }
 
 /// Sessions in Redis, each a JSON string under `prefix` and its ID, expiring
@@ -316,6 +389,15 @@ public struct RedisSessionStore: SessionStore {
 
     public func delete(id: String) async throws {
         _ = try await redis.del(prefix + id)
+    }
+
+    public func replace(id: String, data: [String: String], ttlMilliseconds: Int) async throws -> Bool {
+        try await redis.set(prefix + id, try JSONCoder.encode(data), expireMilliseconds: ttlMilliseconds,
+                            condition: .ifPresent)
+    }
+
+    public func remove(id: String) async throws -> Bool {
+        try await redis.del(prefix + id) > 0
     }
 }
 
@@ -382,6 +464,18 @@ public struct SQLiteSessionStore: SessionStore {
 
     public func delete(id: String) async throws {
         try await database.execute("DELETE FROM \(table) WHERE id = ?", id)
+    }
+
+    public func replace(id: String, data: [String: String], ttlMilliseconds: Int) async throws -> Bool {
+        let text = String(decoding: try JSONCoder.encode(data), as: UTF8.self)
+        let now = nowMilliseconds()
+        return try await database.execute(
+            "UPDATE \(table) SET data = ?, expires = ? WHERE id = ? AND expires > ?",
+            text, now + Int64(ttlMilliseconds), id, now) > 0
+    }
+
+    public func remove(id: String) async throws -> Bool {
+        try await database.execute("DELETE FROM \(table) WHERE id = ? AND expires > ?", id, nowMilliseconds()) > 0
     }
 
     private func nowMilliseconds() -> Int64 {

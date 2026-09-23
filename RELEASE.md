@@ -77,6 +77,41 @@ nothing relevant.
 
 ## Unreleased
 
+- A request still holding a session that another request has destroyed can
+  no longer bring it back. Each request loads its own copy of the session, and
+  a change was written under the copy's ID whether or not the session was
+  still there: a logout in one tab, then a `set` from a request another tab
+  had started before it, stored the signed-in data under the old ID again, and
+  the cookie the logout was meant to end worked once more. `renew` from such a
+  request did the same under a new ID. A change to a session the request
+  loaded is now written only if the session is still live, checked and written
+  in one step by the store, and `renew` moves the session only if it was still
+  there; otherwise the call throws 409 Conflict and the request's copy is left
+  empty, with no Set-Cookie: the cookie is left to the request that ended the
+  session, which may have sent a renewed one. `SessionStore` has two new
+  requirements for this, `replace` and `remove`. Both have defaults, so a
+  store of your own still compiles, but the defaults check and write in two
+  steps; the memory, Redis and SQLite stores do it in one.
+
+- CSRF protection no longer takes an origin on another port for the site
+  itself. Without Sec-Fetch-Site, `Origin` is compared with `Host`, and `:80`
+  and `:443` were both dropped from each before comparing, whatever the
+  scheme: `https://example.com:80` passed for Host `example.com:443`, though
+  they are different origins and a page on one could post to the other. An
+  origin's port is now read against its own scheme, and a Host without a port
+  stands for that scheme's default.
+
+- An upload created at a pattern with an empty segment, such as `/files/` or
+  `/files//new`, now gets a URL that works. The URL is worked out by taking
+  the pattern off the end of the request's path, and the pattern's segments
+  were counted with the empty ones dropped, though the router keeps them:
+  inside `group("/api")`, a POST to `/api/files/` was sent to
+  `/api/files/uploads/<id>`, which answers 404, rather than
+  `/api/uploads/<id>`. A pattern of `/` outside any group was sent to
+  `//uploads/<id>`. Under `trailingSlash(.ignore)`, a POST to `/api/files/`
+  for the pattern `/files` counted the slash the router had ignored, and was
+  sent to `/api/files/uploads/<id>` too.
+
 - Resumable uploads mounted inside a group work. `resumableUploads` registers
   its own routes through the builder it is called on, so a group's prefix went
   in front of them, and two things were then wrong at once: the `Location` it

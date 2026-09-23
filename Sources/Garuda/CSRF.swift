@@ -77,8 +77,15 @@ func isCrossOriginRefused(method: HTTPMethod, fetchSite: String?, origin: String
         }
     }
     guard let origin else { return false }
-    guard let from = originHost(origin.lowercased()), let host else { return true }
-    return withoutDefaultPort(from) != withoutDefaultPort(host.lowercased())
+    let lowered = origin.lowercased()
+    guard let from = originHost(lowered), let host else { return true }
+    // The origin's port is read against its own scheme: `https://h:80` is
+    // not `https://h`. Host carries no scheme, and a proxy in front may have
+    // changed it, so a Host without a port stands for the origin's default.
+    let fallback: Substring = lowered.hasPrefix("https://") ? "443" : "80"
+    let (fromName, fromPort) = splitPort(from)
+    let (hostName, hostPort) = splitPort(host.lowercased())
+    return fromName != hostName || (fromPort ?? fallback) != (hostPort ?? fallback)
 }
 
 /// The host and port of an origin, `scheme://host[:port]`, or nil when it is
@@ -98,10 +105,11 @@ func originHost(_ origin: String) -> String? {
     return String(host)
 }
 
-/// `host` without `:80` or `:443`, which a browser leaves out of Origin and
-/// a client may put in Host.
-private func withoutDefaultPort(_ host: String) -> Substring {
-    if host.hasSuffix(":443") { return host.dropLast(4) }
-    if host.hasSuffix(":80") { return host.dropLast(3) }
-    return host[...]
+/// `host[:port]` as its name and port, with nil for no port or an empty one.
+/// A colon inside `[...]` is part of an IPv6 address.
+private func splitPort(_ authority: String) -> (Substring, Substring?) {
+    guard let colon = authority.lastIndex(of: ":"),
+          authority.lastIndex(of: "]").map({ $0 < colon }) ?? true else { return (authority[...], nil) }
+    let port = authority[authority.index(after: colon)...]
+    return (authority[..<colon], port.isEmpty ? nil : port)
 }

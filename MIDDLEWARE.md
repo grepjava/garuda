@@ -378,6 +378,10 @@ app.post("/logout") { (session: Session) async throws -> HTTPStatus in
   as the response is sent.
 - The ID is 32 random bytes and is never taken from the client. `renew()` moves
   the data to a new ID; call it at login.
+- **A session another request ended stays ended.** Two requests from one
+  client each load their own copy. When one destroys or renews the session, a
+  change or `renew` by the other throws 409 and empties its copy, rather than
+  writing the old ID back as a live, signed-in session.
 - `SessionConfiguration(cookieName:idleTimeoutSeconds:)` sets the cookie (`id`,
   `Path=/`, `HttpOnly`, `SameSite=Lax`, `Secure` over HTTPS) and the timeout (a
   day). Give `cookie.maxAge` to keep the cookie past the browser session.
@@ -388,7 +392,11 @@ app.post("/logout") { (session: Session) async throws -> HTTPStatus in
 | `RedisSessionStore(pool, prefix:)` | Several workers or servers | JSON with a PX expiry; needs Redis 6.2+ or Valkey for GETEX |
 | `SQLiteSessionStore(db, table:)` | One machine, several workers | `createTable()` or `schema(table:)` in a migration; `deleteExpired()` now and then |
 
-A store of your own implements `SessionStore`: `load`, `save` and `delete`.
+A store of your own implements `SessionStore`: `load`, `save` and `delete`,
+and `replace` (store only if the session is live) and `remove` (delete and say
+whether it was live). Those two have defaults that load first and then write,
+which another request can come between; do each in one step, as the bundled
+stores do.
 
 ### CSRF protection
 
@@ -400,8 +408,9 @@ A request other than GET, HEAD or OPTIONS is refused with 403 when the browser
 says another site's page started it:
 
 - `Sec-Fetch-Site: cross-site` or `same-site`.
-- Without `Sec-Fetch-Site`, an `Origin` naming a host other than the request's
-  Host, or `null`.
+- Without `Sec-Fetch-Site`, an `Origin` naming a host or port other than the
+  request's Host, or `null`. A port is read against the origin's own scheme:
+  `https://example.com:80` is not `example.com:443`.
 
 `same-origin`, `none`, and requests with neither header (not made by a browser
 page) pass. An origin in `trustedOrigins` always passes; list any origin your

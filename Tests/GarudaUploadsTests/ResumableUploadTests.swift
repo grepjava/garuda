@@ -1084,6 +1084,53 @@ struct ResumableUploadTests {
         #expect(try app.test.delete(location).status == 204)
     }
 
+    @Test(arguments: [
+        // Empty segments are kept by the router, so they are counted.
+        ("/api", "/files/", "/api/files/", "/api/uploads/"),
+        ("/api", "/files//new", "/api/files//new", "/api/uploads/"),
+        // A group's own root is the prefix itself.
+        ("/api", "/", "/api", "/api/uploads/"),
+        ("", "/", "/", "/uploads/"),
+        ("", "/files/", "/files/", "/uploads/"),
+    ])
+    func anUploadsURLIsRightWhateverSlashesThePatternHas(group: String, route: String, post: String,
+                                                         prefix: String) throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = Application()
+        let register = {
+            app.resumableUploads(route, store: store, progressInterval: 0) { upload in
+                Text("stored \(upload.length)", status: .created)
+            }
+        }
+        if group.isEmpty { register() } else { app.group(group, register) }
+        let created = try app.test.post(post, body: pattern(100),
+                                        headers: [("Upload-Complete", "?0"), ("Upload-Length", "150")])
+        #expect(created.status == 201)
+        let location = try #require(header(created, "location"))
+        #expect(location.hasPrefix(prefix))
+        #expect(location.dropFirst(prefix.count).allSatisfy { $0 != "/" })
+        let probe = try app.test.head(location)
+        #expect(probe.status == 204)
+        #expect(header(probe, "upload-offset") == "100")
+    }
+
+    @Test func aTrailingSlashTheRouterIgnoredIsNotTakenForAPatternSegment() throws {
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = Application()
+        app.trailingSlash(.ignore)
+        app.group("/api") {
+            app.resumableUploads("/files", store: store, progressInterval: 0) { upload in
+                Text("stored \(upload.length)", status: .created)
+            }
+        }
+        let created = try app.test.post("/api/files//", body: pattern(100),
+                                        headers: [("Upload-Complete", "?0"), ("Upload-Length", "150")])
+        #expect(created.status == 201)
+        let location = try #require(header(created, "location"))
+        #expect(location.hasPrefix("/api/uploads/"))
+        #expect(try app.test.head(location).status == 204)
+    }
+
     @Test func aGroupsOwnParametersDoNotTakeTheUploadsPlace() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
         completed = []
