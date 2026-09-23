@@ -201,6 +201,14 @@ struct SessionsTests {
         await #expect(throws: HTTPError.self) { try await stale.set("theme", "dark") }
         #expect(try await store.load(id: "old", ttlMilliseconds: 60_000) == nil)
         #expect(try await store.load(id: moved, ttlMilliseconds: 60_000) == ["user": "ada"])
+
+        // Emptying it is refused the same way, and leaves the renewed cookie
+        // the other request sent alone.
+        stale.id = "old"
+        stale.values = ["user": "ada"]
+        await #expect(throws: HTTPError.self) { try await stale.update { $0.removeAll() } }
+        #expect(stale.cookieChange == .none)
+        #expect(try await store.load(id: moved, ttlMilliseconds: 60_000) == ["user": "ada"])
     }
 
     @Test func theMemoryStoreReplacesAndRemovesOnlyLiveSessions() async throws {

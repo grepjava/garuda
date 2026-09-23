@@ -27,7 +27,9 @@ struct CSRFTests {
         #expect(try client.request("HEAD", "/form", headers: crossSite).status == 200)
     }
 
-    @Test(arguments: [
+    // Typed apart from @Test: inline, this many tuples can outrun the type
+    // checker.
+    static let judged: [([(String, String)], String)] = [
         // Sec-Fetch-Site decides when it is there.
         ([("sec-fetch-site", "same-origin")], "posted"),
         ([("sec-fetch-site", "none")], "posted"),
@@ -60,7 +62,9 @@ struct CSRFTests {
         ([("sec-fetch-site", "cross-site"), ("origin", "https://admin.example.com")], "posted"),
         ([("origin", "https://admin.example.com")], "posted"),
         ([("sec-fetch-site", "cross-site"), ("origin", "https://admin.example.com:8443")], "403"),
-    ])
+    ]
+
+    @Test(arguments: judged)
     func anUnsafeRequestIsJudgedByWhereTheBrowserSaysItCameFrom(headers: [(String, String)], expected: String) throws {
         let response = try app().test.post("/form", headers: headers)
         #expect((response.status == 403 ? "403" : response.text) == expected)

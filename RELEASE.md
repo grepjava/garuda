@@ -85,8 +85,8 @@ nothing relevant.
   the cookie the logout was meant to end worked once more. `renew` from such a
   request did the same under a new ID. A change to a session the request
   loaded is now written only if the session is still live, checked and written
-  in one step by the store, and `renew` moves the session only if it was still
-  there; otherwise the call throws 409 Conflict and the request's copy is left
+  in one step by the store, and `renew` moves the session, and a change that
+  empties it deletes it, only if it was still there; otherwise the call throws 409 Conflict and the request's copy is left
   empty, with no Set-Cookie: the cookie is left to the request that ended the
   session, which may have sent a renewed one. `SessionStore` has two new
   requirements for this, `replace` and `remove`. Both have defaults, so a

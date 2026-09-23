@@ -177,7 +177,15 @@ public final class Session: RequestExtractor, @unchecked Sendable {
         var changed = values
         try change(&changed)
         if changed.isEmpty {
-            if id != nil { try await destroy() }
+            // Emptied is deleted, but only if it is still there: a session
+            // another request renewed lives on under the new ID, and a removal
+            // sent from here would take the client's renewed cookie with it.
+            if let old = id {
+                guard try await store.remove(id: old) else { throw ended() }
+                id = nil
+                values = [:]
+                if cookieSent || cookieChange == .send { cookieChange = .remove }
+            }
             return
         }
         if let id {
