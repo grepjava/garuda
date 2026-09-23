@@ -281,6 +281,21 @@ async def basics():
             is_("a GET is answered", status, 200)
             check("a date is present", b"date" in headers, headers)
 
+            # RFC 9114 4.3.1: a Host beside :authority must be the same, and a
+            # client or proxy may send both. Rebuilt as two Host lines, every
+            # such request was once refused.
+            status, _, _ = await client.request("GET", "/", headers=[(b"host", b"localhost")])
+            is_("a Host the same as :authority is served", status, 200)
+            status, _, _ = await client.request("GET", "/", headers=[(b"host", b"LocalHost")])
+            is_("and compared without regard to case", status, 200)
+            # A reset stream never ends, so a refusal is the wait running out.
+            sid = client.start("GET", "/", headers=[(b"host", b"elsewhere.example")])
+            try:
+                status, _, _ = await client.collect(sid, timeout=3)
+            except asyncio.TimeoutError:
+                status = "refused"
+            is_("a Host that differs from :authority is refused", status, "refused")
+
 
 async def hsts():
     print("\nStrict-Transport-Security")

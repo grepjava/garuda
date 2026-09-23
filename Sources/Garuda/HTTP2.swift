@@ -615,6 +615,22 @@ extension Worker {
 
     enum HeaderOutcome { case ok, malformed, compression }
 
+    /// Which of `:authority` and a Host field, each an offset and length into
+    /// `base`, the rebuilt head's one Host line is: `:authority` when it is
+    /// there and not empty, else Host. Nil, a malformed request, when both
+    /// are there and differ -- RFC 9113 section 8.3.1 and RFC 9114 section
+    /// 4.3.1. A client or a proxy may send both, and the same.
+    func requestHost(_ base: UnsafePointer<UInt8>, _ authority: (Int, Int)?,
+                     _ host: (Int, Int)?) -> (Int, Int)? {
+        guard let authority, authority.1 > 0 else { return host ?? (0, 0) }
+        guard let host else { return authority }
+        guard host.1 == authority.1 else { return nil }
+        for i in 0..<host.1 where asciiLower(base[host.0 + i]) != asciiLower(base[authority.0 + i]) {
+            return nil
+        }
+        return authority
+    }
+
     /// Rebuilds the request as HTTP/1.1 text and parses it.
     ///
     /// Everything downstream -- the handlers, the forwarded-header logic,
@@ -632,6 +648,7 @@ extension Worker {
         var sawMethod = false, sawPath = false, sawScheme = false, sawAuthority = false, sawProtocol = false
         var malformed = false
         var sawRegular = false
+        var hostAt = (0, 0), sawHost = false
 
         var fields = ByteBuffer()
         defer { fields.destroy() }
@@ -684,6 +701,12 @@ extension Worker {
                     malformed = true; return
                 }
             }
+            if equalsLowercased(span.name, span.nameLength, "host") {
+                // Written once below: the parser refuses a second Host.
+                if sawHost { malformed = true; return }
+                sawHost = true; hostAt = stash(span)
+                return
+            }
             fields.write(span.name, span.nameLength)
             fields.write(": ")
             fields.write(span.value, span.valueLength)
@@ -699,6 +722,9 @@ extension Worker {
         if pathAt.1 == 0 || methodAt.1 == 0 { return .malformed }
 
         let base0 = UnsafePointer(pseudo.pointer(at: 0))
+        guard let host = requestHost(base0, sawAuthority ? authorityAt : nil, sawHost ? hostAt : nil) else {
+            return .malformed
+        }
         let isConnect = equalsExact(base0 + methodAt.0, methodAt.1, "CONNECT")
         if sawProtocol != isConnect { return .malformed }
         if isConnect && (!sawAuthority || authorityAt.1 == 0 || protocolAt.1 == 0) { return .malformed }
@@ -716,9 +742,9 @@ extension Worker {
         head.writeByte(cSP)
         head.write(base0 + pathAt.0, pathAt.1)
         head.write(" HTTP/1.1\r\n")
-        if sawAuthority && authorityAt.1 > 0 {
+        if host.1 > 0 {
             head.write("host: ")
-            head.write(base0 + authorityAt.0, authorityAt.1)
+            head.write(base0 + host.0, host.1)
             head.writeCRLF()
         }
         if fields.readableBytes > 0 {

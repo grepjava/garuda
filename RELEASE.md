@@ -77,6 +77,27 @@ nothing relevant.
 
 ## Unreleased
 
+- An HTTP/2 or HTTP/3 request carrying a Host field beside `:authority` is
+  served. Clients and proxies may send both, and RFC 9113 and RFC 9114 only
+  ask that they match; the request was rebuilt as HTTP/1.1 text with a Host
+  line from `:authority` and then the client's own, and the parser refuses a
+  second Host, so every such request was reset as malformed. There is now one
+  Host line, and a Host that differs from `:authority`, ignoring case, is
+  refused as the RFCs say.
+
+- A response head too large for one request no longer ends an HTTP/2
+  connection that other requests share. The encoded block was held to the
+  limit of the request it answered while it was assembled, and past that
+  limit the connection ended -- so on a connection shared by clients with
+  different `maxHeadBytes`, the tightest one failed every request on it. The
+  block is now held to the largest limit of any request on the connection,
+  and one past its own request's limit fails that request alone.
+
+- The HTTP/2 client refuses a response whose pseudo-fields are out of place: a
+  `:status` after other fields, a second `:status`, a request pseudo-field
+  such as `:path`, one it does not know, or a `:status` in trailers. RFC 9113
+  makes each malformed; a second `:status` replaced the first.
+
 - A request still holding a session that another request has destroyed can
   no longer bring it back. Each request loads its own copy of the session, and
   a change was written under the copy's ID whether or not the session was

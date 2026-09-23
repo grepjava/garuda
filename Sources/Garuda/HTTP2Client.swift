@@ -179,6 +179,11 @@ final class H2Shared {
     let socket: OutboundSocket
     let conn = H2ClientConnection()
     var streams: [UInt32: H2Stream] = [:]
+    /// The largest head limit of any stream opened here: what a header block
+    /// may come to, encoded, before the connection is ended over it. One
+    /// stream's own limit is not the connection's -- a block past it but
+    /// within this is decoded and fails that stream alone.
+    var headCap = 0
 
     /// Bytes read and not yet dispatched. Belongs to the connection, not to
     /// whoever read them: a reader that puts the baton down leaves a partial
@@ -568,6 +573,7 @@ extension HTTPClient {
         shared.conn.nextStreamID &+= 2
         stream.sendWindow = shared.conn.peerInitialWindowSize
         shared.streams[stream.id] = stream
+        shared.headCap = max(shared.headCap, stream.maxHeadBytes)
 
         var out = ByteBuffer(capacity: block.count + 32)
         defer { out.destroy() }
@@ -1015,13 +1021,16 @@ extension HTTPClient {
                     return .protocolError
                 }
             }
-            // Encoded bytes are the cheap outer guard. HPACK only expands --
-            // an indexed field is one byte and a whole header line -- so a
-            // block already past the budget here cannot decode to something
-            // inside it. This ends the connection, because a block assembled
-            // in part cannot be decoded, and dropping it would leave the HPACK
-            // table describing bytes nobody read.
-            guard conn.headerBlock.readableBytes + (end - start) <= conn.headBudget else {
+            // Encoded bytes are the cheap outer guard, and bound what is held.
+            // This ends the connection, because a block assembled in part
+            // cannot be decoded, and dropping it would leave the HPACK table
+            // describing bytes nobody read -- so it is held to the connection's
+            // cap, not to the stream's own limit, which a tighter request on a
+            // shared connection would otherwise impose on every other stream.
+            // A block past the stream's limit and within the cap is decoded,
+            // and fails that stream alone: HPACK only expands, so it cannot
+            // decode to something inside the limit.
+            guard conn.headerBlock.readableBytes + (end - start) <= max(conn.headBudget, shared.headCap) else {
                 return .headTooLarge
             }
             conn.headerBlock.reserve(end - start)
@@ -1047,6 +1056,11 @@ extension HTTPClient {
                 // Decoded to keep the table in step and then dropped, so this
                 // ends the one stream and not the connection.
                 failStream(shared, stream, .headTooLarge, reset: .cancel)
+                return nil
+            }
+            if status < 0 || (stream.sawFinalHeaders && status != 0) {
+                // A pseudo-field out of place, or any in trailers.
+                failStream(shared, stream, .malformedResponse(.badHeader), reset: .protocolError)
                 return nil
             }
             if stream.sawFinalHeaders {
@@ -1205,7 +1219,8 @@ extension HTTPClient {
 
     /// Decodes the assembled block. False when HPACK itself failed, which ends
     /// the connection: its table can no longer be trusted. A missing or
-    /// malformed :status leaves `status` at 0 for the stream to refuse.
+    /// malformed :status leaves `status` at 0 for the stream to refuse, and
+    /// pseudo-fields out of place leave it at -1.
     private func decodeBlock(_ conn: H2ClientConnection, _ status: inout Int,
                              _ fields: inout [ClientHeader],
                              _ tooLarge: inout Bool) -> Bool {
@@ -1216,6 +1231,9 @@ extension HTTPClient {
         // this, and not the frame size, is what bounds the memory a head takes.
         var listSize = 0
         var over = false
+        // RFC 9113 section 8.3: pseudo-fields come before the rest, and a
+        // response has one, :status, once. Anything else makes it malformed.
+        var sawRegular = false, sawStatus = false, misplaced = false
         let budget = conn.headBudget
         do {
             try conn.decoder.decode(conn.headerBlock.readPointer,
@@ -1229,7 +1247,12 @@ extension HTTPClient {
                 }
                 if over { return }
                 if span.nameLength > 0 && span.name[0] == UInt8(ascii: ":") {
-                    if equalsExact(span.name, span.nameLength, ":status") {
+                    guard !sawRegular, !sawStatus, equalsExact(span.name, span.nameLength, ":status") else {
+                        misplaced = true
+                        return
+                    }
+                    sawStatus = true
+                    do {
                         // Length first. A peer is free to send ":status:
                         // 999...9" with as many digits as it likes, and
                         // accumulating those before counting them overflows
@@ -1252,6 +1275,7 @@ extension HTTPClient {
                     }
                     return
                 }
+                sawRegular = true
                 collected.append(ClientHeader(
                     name: String(decoding: UnsafeBufferPointer(start: span.name,
                                                                count: span.nameLength),
@@ -1263,7 +1287,7 @@ extension HTTPClient {
         } catch {
             return false
         }
-        status = found
+        status = misplaced ? -1 : found
         fields = collected
         tooLarge = over
         return true

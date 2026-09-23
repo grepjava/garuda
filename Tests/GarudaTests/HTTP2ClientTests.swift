@@ -25,6 +25,7 @@ nonisolated(unsafe) private var headLimitWanted = 32 * 1024
 /// A body limit per concurrent route, where the test needs two requests in
 /// flight whose limits differ.
 nonisolated(unsafe) private var bodyLimitsWanted: [String: Int] = [:]
+nonisolated(unsafe) private var headLimitsWanted: [String: Int] = [:]
 /// How long the client under test should wait on any one read or write. Short
 /// for the tests that prove something never arrives: the default ten seconds
 /// is the right answer in production and a tax on a suite that runs in
@@ -379,6 +380,28 @@ private func responseHeaders(status: Int, fields: [(String, String)] = [],
                                                        count: block.readableBytes)))
 }
 
+/// A HEADERS frame of exactly `fields`, pseudo-fields included, in order.
+private func literalHeaders(_ fields: [(String, String)], stream: UInt32 = 1,
+                            endStream: Bool = true) -> [UInt8] {
+    var block = ByteBuffer(capacity: 256)
+    defer { block.destroy() }
+    let encoder = HPACKEncoder()
+    for (name, value) in fields {
+        let n = Array(name.utf8), v = Array(value.utf8)
+        n.withUnsafeBufferPointer { np in
+            v.withUnsafeBufferPointer { vp in
+                encoder.encode(name: np.baseAddress!, nameLength: np.count,
+                               value: vp.baseAddress!, valueLength: vp.count, into: &block)
+            }
+        }
+    }
+    var flags: H2Flags = [.endHeaders]
+    if endStream { flags.insert(.endStream) }
+    return rawFrame(type: .headers, flags: flags, stream: stream,
+                    payload: Array(UnsafeBufferPointer(start: block.readPointer,
+                                                       count: block.readableBytes)))
+}
+
 private func dataFrame(_ text: String, stream: UInt32 = 1, endStream: Bool = true) -> [UInt8] {
     rawFrame(type: .data, flags: endStream ? .endStream : [], stream: stream,
              payload: Array(text.utf8))
@@ -562,6 +585,7 @@ private func h2ClientApp() -> Application {
             client.forceHTTP2 = true
             client.timeoutMilliseconds = timeoutsWanted[name] ?? timeoutWanted
             if let limit = bodyLimitsWanted[name] { client.maxBodyBytes = limit }
+            if let limit = headLimitsWanted[name] { client.maxHeadBytes = limit }
             let result: String
             do {
                 let answer = try await client.get(originURL + "/" + name)
@@ -604,6 +628,7 @@ struct HTTP2ClientTests {
         bodyLimitWanted = 8 * 1024 * 1024
         headLimitWanted = 32 * 1024
         bodyLimitsWanted = [:]
+        headLimitsWanted = [:]
         timeoutWanted = 10_000
     }
 
@@ -875,6 +900,29 @@ struct HTTP2ClientTests {
         }
     }
 
+    @Test(arguments: [
+        // RFC 9113 section 8.3: pseudo-fields first, and a response has only
+        // :status, once.
+        [("x-thing", "first"), (":status", "200")],
+        [(":status", "200"), (":status", "204")],
+        [(":status", "200"), (":path", "/")],
+        [(":status", "200"), (":made-up", "x")],
+    ])
+    func pseudoFieldsOutOfPlaceAreRefused(fields: [(String, String)]) throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [literalHeaders(fields)]
+        #expect(try run("/fetch", origin).hasPrefix("malformedResponse"))
+    }
+
+    @Test func aStatusInTrailersIsRefused() throws {
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [responseHeaders(status: 200), dataFrame("hello", endStream: false),
+                         literalHeaders([(":status", "200")])]
+        #expect(try run("/fetch", origin).hasPrefix("malformedResponse"))
+    }
+
     @Test func aPushPromiseIsRefusedBecausePushWasDeclined() throws {
         reset()
         guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
@@ -1018,6 +1066,32 @@ struct HTTP2ClientTests {
         #expect(turn(client, origin) { outcomes.count == 2 })
         #expect(outcomes["b"] == "200|12345678")
         #expect(outcomes["a"] == "200|ok")
+        withExtendedLifetime(wires) {}
+    }
+
+    @Test func eachStreamKeepsItsOwnHeadLimitWithoutEndingTheConnection() throws {
+        // One connection, two requests, different head limits. A head past the
+        // tighter one fails that request alone: the connection, and the other
+        // request on it, go on. Before this, the block was held to the stream's
+        // own limit while it was assembled, and past it the connection ended.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.hold = true
+        originURL = origin.url
+        headLimitsWanted = ["a": 512, "b": 32 * 1024]
+        let client = h2ClientApp().test
+        let wires = try start(client, ["/multi/a", "/multi/b"])
+        #expect(turn(client, origin) { origin.held.count == 2 })
+        let big = String(repeating: "x", count: 2000)
+        origin.answerHeld({ $0.path == "/a" }) { request in
+            [responseHeaders(status: 200, fields: [("x-thing", big)], stream: request.stream),
+             dataFrame("too big", stream: request.stream)]
+        }
+        origin.answerHeld({ $0.path == "/b" }, answer("fine"))
+        #expect(turn(client, origin) { outcomes.count == 2 })
+        #expect(outcomes["a"] == "headTooLarge")
+        #expect(outcomes["b"] == "200|fine")
+        #expect(client.worker.pointee.outboundH2.count == 1)
         withExtendedLifetime(wires) {}
     }
 

@@ -851,6 +851,7 @@ extension Worker {
         var sawAuthority = false, sawProtocol = false
         var sawRegular = false
         var malformed = false
+        var hostAt = (0, 0), sawHost = false
 
         func stash(_ span: HPACKSpan) -> (Int, Int) {
             let at = pseudo.readableBytes
@@ -898,6 +899,12 @@ extension Worker {
                         malformed = true; return
                     }
                 }
+                if equalsLowercased(span.name, span.nameLength, "host") {
+                    // Written once below: the parser refuses a second Host.
+                    if sawHost { malformed = true; return }
+                    sawHost = true; hostAt = stash(span)
+                    return
+                }
                 fields.write(span.name, span.nameLength)
                 fields.write(": ")
                 fields.write(span.value, span.valueLength)
@@ -911,6 +918,9 @@ extension Worker {
         if !sawMethod || methodAt.1 == 0 { return .malformed }
 
         let base0 = UnsafePointer(pseudo.pointer(at: 0))
+        guard let host = requestHost(base0, sawAuthority ? authorityAt : nil, sawHost ? hostAt : nil) else {
+            return .malformed
+        }
         let isConnect = equalsExact(base0 + methodAt.0, methodAt.1, "CONNECT")
         if isConnect {
             // Extended CONNECT carries :protocol, :scheme and :path; the plain
@@ -934,9 +944,9 @@ extension Worker {
         head.writeByte(cSP)
         head.write(base0 + pathAt.0, pathAt.1)
         head.write(" HTTP/1.1\r\n")
-        if sawAuthority && authorityAt.1 > 0 {
+        if host.1 > 0 {
             head.write("host: ")
-            head.write(base0 + authorityAt.0, authorityAt.1)
+            head.write(base0 + host.0, host.1)
             head.writeCRLF()
         }
         if fields.readableBytes > 0 {

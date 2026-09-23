@@ -280,6 +280,26 @@ def test_basics():
         status, _, body, _ = c.collect([s2])
         is_("the path survives HPACK", (status.get(s2), body.get(s2)),
             (200, b"survives-hpack"))
+
+        # RFC 9113 8.3.1: a Host beside :authority must be the same, and a
+        # client or proxy may well send both. It was once rebuilt as two Host
+        # lines, which the parser refuses, so every such request was reset.
+        authority = "127.0.0.1:%d" % c.port
+        s3 = c.request(path="/", extra=[("host", authority)])
+        s4 = c.request(path="/", extra=[("host", authority.upper())])
+        status, _, _, _ = c.collect([s3, s4])
+        is_("a Host the same as :authority is served", status.get(s3), 200)
+        is_("and compared without regard to case", status.get(s4), 200)
+        c.close()
+
+        # One that differs is malformed. h2 refuses to send it, so it is told
+        # not to look.
+        c = Client(server)
+        c.conn.config.validate_outbound_headers = False
+        s5 = c.request(path="/", extra=[("host", "elsewhere.example")])
+        c.collect([s5])
+        check("a Host that differs from :authority is reset", s5 in c.reset,
+              "status %s" % c.status.get(s5))
         c.close()
 
 
