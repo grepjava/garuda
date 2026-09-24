@@ -300,6 +300,15 @@ def test_basics():
         c.collect([s5])
         check("a Host that differs from :authority is reset", s5 in c.reset,
               "status %s" % c.status.get(s5))
+        # An empty :authority is not the same as a Host that names something.
+        s6 = c.conn.get_next_available_stream_id()
+        c.conn.send_headers(s6, [(":method", "GET"), (":scheme", "http"),
+                                 (":authority", ""), (":path", "/"),
+                                 ("host", authority)], end_stream=True)
+        c.flush()
+        c.collect([s6])
+        check("an empty :authority beside a Host is reset", s6 in c.reset,
+              "status %s" % c.status.get(s6))
         c.close()
 
 

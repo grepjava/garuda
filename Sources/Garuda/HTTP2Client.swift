@@ -446,8 +446,10 @@ extension HTTPClient {
                     let empty: StaticString = ""
                     let vp = v.baseAddress ?? empty.utf8Start
                     // Connection-specific fields have no meaning in HTTP/2 and
-                    // make a message malformed, RFC 9113 section 8.2.2.
-                    if HTTP2.isConnectionSpecific(np, n.count) { return false }
+                    // make a message malformed, RFC 9113 section 8.2.2 -- all
+                    // but "te: trailers", which gRPC, for one, sends.
+                    if HTTP2.isConnectionSpecific(np, n.count),
+                       !(n.count == 2 && equalsLowercased(vp, v.count, "trailers")) { return false }
                     if !HTTP2.validFieldName(np, n.count) { return false }
                     if !HTTP2.validFieldValue(vp, v.count) { return false }
                     let kind = HTTPRequestWriter.classify(ByteSpan(np, n.count))
@@ -1077,7 +1079,9 @@ extension HTTPClient {
                            reset: .protocolError)
             } else if status >= 100 && status < 200 {
                 // Informational: the real answer follows on the same stream.
-                if endsStream {
+                // Never 101, which RFC 9113 section 8.8 makes malformed: a
+                // connection that switched protocols is not HTTP/2's to have.
+                if endsStream || status == 101 {
                     failStream(shared, stream, .malformedResponse(.badStatusLine),
                                reset: .protocolError)
                 }

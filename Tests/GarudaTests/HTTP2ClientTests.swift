@@ -1193,6 +1193,27 @@ struct HTTP2ClientTests {
         }
     }
 
+    @Test func teTrailersIsSent() throws {
+        // RFC 9113 section 8.2.2: TE is the one connection-specific field an
+        // HTTP/2 request may carry, and only as "trailers". gRPC sends it.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        headersWanted = [("TE", "trailers")]
+        origin.script = [responseHeaders(status: 200, endStream: true)]
+        #expect(try run("/fetch", origin).hasPrefix("200"))
+        #expect(origin.requestField("te") == "trailers")
+    }
+
+    @Test func aSwitchingProtocolsResponseIsRefused() throws {
+        // RFC 9113 section 8.8: a client treats 101 as malformed, rather than
+        // as an informational response with the real one to come.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.script = [literalHeaders([(":status", "101")], endStream: false),
+                         responseHeaders(status: 200, endStream: true)]
+        #expect(try run("/fetch", origin).hasPrefix("malformedResponse"))
+    }
+
     @Test func thePeersHeaderTableSizeDoesNotShrinkOurDecoder() throws {
         // SETTINGS_HEADER_TABLE_SIZE bounds the table of whoever *receives*
         // the setting's sender's blocks -- here, the server's own decoder,

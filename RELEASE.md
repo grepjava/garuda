@@ -83,7 +83,7 @@ nothing relevant.
   line from `:authority` and then the client's own, and the parser refuses a
   second Host, so every such request was reset as malformed. There is now one
   Host line, and a Host that differs from `:authority`, ignoring case, is
-  refused as the RFCs say.
+  refused as the RFCs say -- an empty `:authority` beside a Host included.
 
 - A response head too large for one request no longer ends an HTTP/2
   connection that other requests share. The encoded block was held to the
@@ -92,6 +92,11 @@ nothing relevant.
   different `maxHeadBytes`, the tightest one failed every request on it. The
   block is now held to the largest limit of any request on the connection,
   and one past its own request's limit fails that request alone.
+
+- The HTTP/2 client sends `te: trailers`, the one connection-specific field
+  RFC 9113 lets an HTTP/2 request carry, and which gRPC needs; it was refused
+  with every other. It refuses a 101 response, which RFC 9113 makes
+  malformed, rather than waiting for a final response after it.
 
 - The HTTP/2 client refuses a response whose pseudo-fields are out of place: a
   `:status` after other fields, a second `:status`, a request pseudo-field

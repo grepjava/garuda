@@ -616,13 +616,14 @@ extension Worker {
     enum HeaderOutcome { case ok, malformed, compression }
 
     /// Which of `:authority` and a Host field, each an offset and length into
-    /// `base`, the rebuilt head's one Host line is: `:authority` when it is
-    /// there and not empty, else Host. Nil, a malformed request, when both
-    /// are there and differ -- RFC 9113 section 8.3.1 and RFC 9114 section
-    /// 4.3.1. A client or a proxy may send both, and the same.
+    /// `base`, the rebuilt head's one Host line is: whichever is there. Nil, a
+    /// malformed request, when both are there and differ -- RFC 9113 section
+    /// 8.3.1 and RFC 9114 section 4.3.1 -- an empty `:authority` included,
+    /// which is not the same as a Host that names something. A client or a
+    /// proxy may send both, and the same.
     func requestHost(_ base: UnsafePointer<UInt8>, _ authority: (Int, Int)?,
                      _ host: (Int, Int)?) -> (Int, Int)? {
-        guard let authority, authority.1 > 0 else { return host ?? (0, 0) }
+        guard let authority else { return host ?? (0, 0) }
         guard let host else { return authority }
         guard host.1 == authority.1 else { return nil }
         for i in 0..<host.1 where asciiLower(base[host.0 + i]) != asciiLower(base[authority.0 + i]) {

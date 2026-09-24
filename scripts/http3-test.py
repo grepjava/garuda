@@ -295,6 +295,12 @@ async def basics():
             except asyncio.TimeoutError:
                 status = "refused"
             is_("a Host that differs from :authority is refused", status, "refused")
+            sid = client.start("GET", "/", authority="", headers=[(b"host", b"localhost")])
+            try:
+                status, _, _ = await client.collect(sid, timeout=3)
+            except asyncio.TimeoutError:
+                status = "refused"
+            is_("an empty :authority beside a Host is refused", status, "refused")
 
 
 async def hsts():
