@@ -87,9 +87,9 @@ nothing relevant.
 
 - The HTTP/2 client no longer leaves requests waiting for good when a shared
   connection ends while several are queued to write on it. Only the first of
-  them was told; it failed without letting the others go, so the rest waited
-  until their request timeout, or with none set, for as long as the worker
-  ran. Each now fails at once with `closed`. The lock also goes straight to
+  them was told; it failed without letting the others go, and the rest
+  waited for as long as the worker ran -- a request's timeout does not reach
+  a writer queued for the lock. Each now fails at once with `closed`. The lock also goes straight to
   the next writer in line, so a request cannot lose its turn to one that
   arrived later.
 
