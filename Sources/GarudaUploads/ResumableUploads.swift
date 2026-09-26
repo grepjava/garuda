@@ -405,7 +405,7 @@ final class UploadService: @unchecked Sendable {
             return response.send(status: .badRequest,
                                  "Content-Digest names no digest this server checks")
         }
-        let now = Int(time(nil))
+        let now = store.clock()
         if now - lastExpiry >= 60 {
             lastExpiry = now
             store.removeExpired(olderThan: limits.maxAge)
@@ -721,7 +721,7 @@ final class UploadService: @unchecked Sendable {
         // answer it did not get. HEAD is left as the draft describes it, so a
         // client following the draft sees exactly what the draft says.
         if replaying, let answer = try? store.answer(id),
-           Int(time(nil)) - answer.createdAt <= limits.maxAge {
+           store.clock() - answer.createdAt <= limits.maxAge {
             if let type = answer.contentType { response.addHeader("Content-Type", type) }
             // A handler that answered with a redirect said where the upload
             // went. Without the field the status alone says nothing.
@@ -735,7 +735,7 @@ final class UploadService: @unchecked Sendable {
         response.addHeader("Upload-Offset", "\(info.offset)")
         response.addHeader("Upload-Complete", info.complete ? "?1" : "?0")
         if let length = info.length { response.addHeader("Upload-Length", "\(length)") }
-        let remaining = info.createdAt + limits.maxAge - Int(time(nil))
+        let remaining = info.createdAt + limits.maxAge - store.clock()
         response.addHeader("Upload-Limit", limits.field(remaining: remaining))
         response.send(status: .noContent)
     }
@@ -787,7 +787,7 @@ final class UploadService: @unchecked Sendable {
     /// The upload, unless it does not exist or has outlived `maxAge`.
     func live(_ id: String) throws -> UploadInfo? {
         guard let info = try store.info(id) else { return nil }
-        if Int(time(nil)) - info.createdAt > limits.maxAge {
+        if store.clock() - info.createdAt > limits.maxAge {
             try? store.forget(id)
             return nil
         }

@@ -137,6 +137,10 @@ public final class UploadHandle {
 
 public final class FileUploadStore: @unchecked Sendable {
     public let directory: String
+    /// Seconds since the epoch, which ages every upload and answer. Tests
+    /// set their own, before the store is used: sleeping past a second on
+    /// the wall clock failed whenever WSL stepped that clock back.
+    var clock: @Sendable () -> Int = { Int(time(nil)) }
 
     /// Uses `directory`, creating it if it does not exist.
     public init(directory: String) throws {
@@ -166,7 +170,7 @@ public final class FileUploadStore: @unchecked Sendable {
         if fd < 0 { throw UploadStoreError.system("open", errno) }
         _ = close(fd)
         let info = UploadInfo(id: id, offset: 0, length: length, complete: false,
-                              createdAt: Int(time(nil)), contentType: contentType,
+                              createdAt: clock(), contentType: contentType,
                               contentDisposition: contentDisposition, reprDigest: reprDigest,
                               metadata: metadata.isEmpty ? nil : metadata)
         try save(info)
@@ -316,7 +320,7 @@ public final class FileUploadStore: @unchecked Sendable {
             if name.hasSuffix(".done") { answers.append(String(name.dropLast(5))) }
         }
         closedir(dir)
-        let cutoff = Int(time(nil)) - seconds
+        let cutoff = clock() - seconds
         var removed = 0
         for id in ids {
             guard let info = try? info(id), info.createdAt < cutoff else { continue }

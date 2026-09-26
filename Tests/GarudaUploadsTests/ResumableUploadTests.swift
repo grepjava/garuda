@@ -945,10 +945,12 @@ struct ResumableUploadTests {
 
     @Test func anAnswerExpiresWithTheUploadItIsAbout() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
+        nonisolated(unsafe) var now = 1_000_000
+        store.clock = { now }
         let app = uploadApp(store, limits: UploadLimits(maxAge: 0))
         let created = try app.test.post("/files", body: pattern(5), headers: draft)
         let location = try #require(uploadURL(created))
-        usleep(1_100_000)
+        now += 1
         #expect(try app.test.get(location).status == 404, "past maxAge, there is nothing to replay")
         // And the next sweep takes the file with it.
         _ = store.removeExpired(olderThan: 0)
@@ -957,10 +959,12 @@ struct ResumableUploadTests {
 
     @Test func anUploadPastItsAgeIsGone() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
+        nonisolated(unsafe) var now = 1_000_000
+        store.clock = { now }
         let app = uploadApp(store, limits: UploadLimits(maxAge: 0))
         let created = try app.test.post("/files", body: pattern(5), headers: [("Upload-Complete", "?0")])
         let location = try #require(header(created, "location"))
-        usleep(1_100_000)
+        now += 1
         #expect(try app.test.head(location).status == 404)
     }
 
