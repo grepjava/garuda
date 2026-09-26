@@ -1731,6 +1731,51 @@ struct HTTP2ClientTests {
         withExtendedLifetime(wires) {}
     }
 
+    @Test func writersWaitingForTheLockAllHearThatTheConnectionWent() throws {
+        // An upload holds the write lock on a socket the origin has stopped
+        // reading, and two requests queue behind it. When the connection
+        // goes, the first queued writer was resumed, saw it dead, and threw
+        // -- without passing the lock on, so the second waited for good.
+        reset()
+        guard let origin = FakeH2Origin() else { Issue.record("no socket"); return }
+        origin.creditInLump = 1 << 30
+        origin.hold = true
+        originURL = origin.url
+        urlWanted = origin.url + "/upload"
+        bodyWanted = [UInt8](repeating: 0x61, count: 64 << 20)
+        timeoutWanted = 60_000
+        timeoutsWanted = ["a": 60_000, "b": 60_000]
+        let client = h2ClientApp().test
+        var wires = try start(client, ["/post"])
+        // Past the first DATA, which is what earns the lump of credit.
+        #expect(turn(client, origin) { origin.requestBody.count > 0 })
+        func shared() -> H2Shared? { client.worker.pointee.outboundH2.values.first }
+        // The origin is no longer pumped, so the socket fills.
+        var blocked = false
+        for _ in 0..<200_000 where !blocked {
+            client.turn()
+            blocked = shared()?.blockedWriter != nil
+        }
+        #expect(blocked)
+        wires += try start(client, ["/multi/a", "/multi/b"])
+        var queued = false
+        for _ in 0..<20_000 where !queued {
+            client.turn()
+            queued = (shared().map { $0.writeQueue.count - $0.writeQueueHead } ?? 0) == 2
+        }
+        #expect(queued)
+        origin.closePeer(0)
+        var ended = false
+        for _ in 0..<200_000 where !ended {
+            client.turn()
+            ended = outcomes.count == 2 && !outcome.isEmpty
+        }
+        #expect(ended, "outcomes \(outcomes), upload \(outcome)")
+        #expect(outcomes["a"] == "closed")
+        #expect(outcomes["b"] == "closed")
+        withExtendedLifetime(wires) {}
+    }
+
     @Test func aGoawayRefusesOnlyTheStreamsThePeerNeverProcessed() throws {
         // Streams above the last one a GOAWAY names were never looked at, and
         // are refused -- which is what makes them safe to send again. Streams

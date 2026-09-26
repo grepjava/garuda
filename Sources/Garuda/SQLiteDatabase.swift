@@ -39,12 +39,12 @@ public final class SQLiteDatabase: @unchecked Sendable {
 
     private var writer: SQLiteConnection?
     private var writerBusy = false
-    private var writerWaiting: [Int32] = []
+    private var writerWaiting = PoolWaiters<SQLiteConnection>()
 
     private var idleReaders: [SQLiteConnection] = []
     /// Readers that exist, idle or in use, including one being opened.
     private var openReaders = 0
-    private var readerWaiting: [Int32] = []
+    private var readerWaiting = PoolWaiters<SQLiteConnection>()
 
     /// SQL SQLite has said cannot write, learned on the writer.
     private var readOnlySQL: Set<String> = []
@@ -178,10 +178,12 @@ public final class SQLiteDatabase: @unchecked Sendable {
         for connection in idleReaders { connection.close() }
         openReaders -= idleReaders.count
         idleReaders.removeAll()
-        let worker = currentWorker
-        for id in writerWaiting + readerWaiting { _ = worker?.pointee.wakeTimed(id) }
-        writerWaiting.removeAll()
-        readerWaiting.removeAll()
+        // Each wait wakes to find the database closed. Nothing is handed
+        // over from here on, since a release now closes what it is given.
+        if let worker = currentWorker {
+            while writerWaiting.wakeOldest(on: worker) != nil {}
+            while readerWaiting.wakeOldest(on: worker) != nil {}
+        }
     }
 
     // MARK: Routing
@@ -240,6 +242,11 @@ public final class SQLiteDatabase: @unchecked Sendable {
 
     // MARK: Connections
 
+    // A connection given back while requests wait goes straight to the
+    // oldest of them (PoolWaiters.swift). Marked free with that request only
+    // woken, it went to whoever asked next before the woken one ran, and the
+    // woken one queued again at the back.
+
     private func acquireWriter() async throws -> SQLiteConnection {
         while true {
             guard !closed, let writer else { throw SQLiteClientError.closed }
@@ -247,17 +254,20 @@ public final class SQLiteDatabase: @unchecked Sendable {
                 writerBusy = true
                 return writer
             }
-            try await wait(in: \.writerWaiting)
+            if let handed = try await wait(in: \.writerWaiting, release: releaseWriter) { return handed }
         }
     }
 
     private func releaseWriter(_ connection: SQLiteConnection) {
-        writerBusy = false
         if closed {
+            writerBusy = false
             connection.close()
             writer = nil
+            return
         }
-        wakeOne(\.writerWaiting)
+        // Still busy when handed over: it has a new holder.
+        if let worker = currentWorker, writerWaiting.handOver(connection, on: worker) { return }
+        writerBusy = false
     }
 
     private func acquireReader() async throws -> SQLiteConnection {
@@ -277,7 +287,7 @@ public final class SQLiteDatabase: @unchecked Sendable {
                     throw error
                 }
             }
-            try await wait(in: \.readerWaiting)
+            if let handed = try await wait(in: \.readerWaiting, release: releaseReader) { return handed }
         }
     }
 
@@ -285,13 +295,17 @@ public final class SQLiteDatabase: @unchecked Sendable {
         if closed {
             connection.close()
             openReaders -= 1
-        } else {
-            idleReaders.append(connection)
+            return
         }
-        wakeOne(\.readerWaiting)
+        if let worker = currentWorker, readerWaiting.handOver(connection, on: worker) { return }
+        idleReaders.append(connection)
     }
 
-    private func wait(in queue: ReferenceWritableKeyPath<SQLiteDatabase, [Int32]>) async throws {
+    /// Waits for a connection: the one handed over, or nil when woken with
+    /// none -- the database closing, or room to open a reader -- to look
+    /// again.
+    private func wait(in queue: ReferenceWritableKeyPath<SQLiteDatabase, PoolWaiters<SQLiteConnection>>,
+                      release: (SQLiteConnection) -> Void) async throws -> SQLiteConnection? {
         guard let worker = currentWorker else {
             // Nothing to wait on off a worker, and nothing else there could
             // be holding the connection for long.
@@ -301,31 +315,31 @@ public final class SQLiteDatabase: @unchecked Sendable {
         let outcome = await Worker.waitTimed(worker, milliseconds: configuration.acquireTimeoutMilliseconds,
                                              forRequest: true) {
             id = $0
-            self[keyPath: queue].append($0)
+            self[keyPath: queue].add($0)
         }
         switch outcome {
         case .woken:
-            // Woken just before its request ended: the wake is passed on.
-            if worker.pointee.currentRequestEnded {
-                wakeOne(queue)
-                throw SQLiteClientError.cancelled
+            let handed = self[keyPath: queue].take(id)
+            // Woken just before its request ended, or its database closed:
+            // what it was given is passed on.
+            if worker.pointee.currentRequestEnded || closed {
+                if let handed { release(handed) } else { wakeOne(queue) }
+                throw closed ? SQLiteClientError.closed : SQLiteClientError.cancelled
             }
-            return
+            return handed
         case .timedOut:
-            self[keyPath: queue].removeAll { $0 == id }
+            self[keyPath: queue].remove(id)
             throw SQLiteClientError.poolTimedOut
         case .cancelled:
-            self[keyPath: queue].removeAll { $0 == id }
+            self[keyPath: queue].remove(id)
             throw SQLiteClientError.cancelled
         }
     }
 
-    /// Wakes the oldest wait still waiting; see PostgresPool.wakeOne.
-    private func wakeOne(_ queue: ReferenceWritableKeyPath<SQLiteDatabase, [Int32]>) {
+    /// Wakes the oldest wait still waiting, with nothing handed to it.
+    private func wakeOne(_ queue: ReferenceWritableKeyPath<SQLiteDatabase, PoolWaiters<SQLiteConnection>>) {
         guard let worker = currentWorker else { return }
-        while !self[keyPath: queue].isEmpty {
-            if worker.pointee.wakeTimed(self[keyPath: queue].removeFirst()) { return }
-        }
+        self[keyPath: queue].wakeOldest(on: worker)
     }
 
     /// For tests.

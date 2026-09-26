@@ -77,6 +77,22 @@ nothing relevant.
 
 ## Unreleased
 
+- A request waiting for an `SQLiteDatabase` connection gets the next one given
+  back. The connection was marked free and the waiter only woken, so whoever
+  asked before the waiter ran took it first -- often the handler that had
+  just given it back, starting its next statement -- and the waiter queued
+  again at the back. A handler running statements back to back could hold
+  the writer until it was done with all of them. Connections are now handed
+  straight to the oldest waiter, as the PostgreSQL and Redis pools already did.
+
+- The HTTP/2 client no longer leaves requests waiting for good when a shared
+  connection ends while several are queued to write on it. Only the first of
+  them was told; it failed without letting the others go, so the rest waited
+  until their request timeout, or with none set, for as long as the worker
+  ran. Each now fails at once with `closed`. The lock also goes straight to
+  the next writer in line, so a request cannot lose its turn to one that
+  arrived later.
+
 - A JSON object decoded into a `Dictionary` whose values are ordinary
   `Decodable` types -- not `@JSON` ones -- is read in linear time. Each key was
   found by walking every member before it, so a `Body<[String: Item]>` of

@@ -194,7 +194,10 @@ final class H2Shared {
 
     var readerActive = false
     var writerActive = false
+    /// Writers waiting for the lock, oldest first from `writeQueueHead` on:
+    /// the front is taken by moving the head, not by shifting the rest down.
     var writeQueue: [UnsafeContinuation<Void, Never>] = []
+    var writeQueueHead = 0
     /// A lock holder whose socket is full, waiting for the reader to see it
     /// writable.
     var blockedWriter: H2Stream? = nil
@@ -233,6 +236,27 @@ final class H2Shared {
     /// request, which finds `dead` and leaves the same way, and so on; a lock
     /// holder always unlocks on its way out. A wake here that no input can make
     /// necessary reads as a safeguard while providing none.
+    /// Gives the write lock to the oldest writer waiting for it, still held,
+    /// or frees it when nobody is. Handed over rather than freed and the
+    /// waiter woken, so that nobody who arrives before the waiter runs takes
+    /// it first, over and over.
+    func passWriteLock() {
+        guard writeQueueHead < writeQueue.count else {
+            writerActive = false
+            return
+        }
+        let next = writeQueue[writeQueueHead]
+        writeQueueHead += 1
+        if writeQueueHead == writeQueue.count {
+            writeQueue.removeAll(keepingCapacity: true)
+            writeQueueHead = 0
+        } else if writeQueueHead >= 64 && writeQueueHead * 2 >= writeQueue.count {
+            writeQueue.removeFirst(writeQueueHead)
+            writeQueueHead = 0
+        }
+        next.resume()
+    }
+
     func markDead(_ error: ClientError) {
         guard dead == nil else { return }
         dead = error
@@ -701,12 +725,19 @@ extension HTTPClient {
     // MARK: The write lock
 
     private func lock(_ shared: H2Shared) async throws(ClientError) {
-        while shared.writerActive {
-            if let dead = shared.dead { throw dead }
-            await withUnsafeContinuation { shared.writeQueue.append($0) }
-        }
         if let dead = shared.dead { throw dead }
-        shared.writerActive = true
+        guard shared.writerActive else {
+            shared.writerActive = true
+            return
+        }
+        // Resumed holding the lock (`passWriteLock`).
+        await withUnsafeContinuation { shared.writeQueue.append($0) }
+        if let dead = shared.dead {
+            // Passed on, or the writers behind this one would wait for good:
+            // each is resumed only by the one before it letting go.
+            shared.passWriteLock()
+            throw dead
+        }
     }
 
     /// Releases the lock, flushing queued control frames first: whoever holds
@@ -721,8 +752,7 @@ extension HTTPClient {
             // records; the stream that happened to be flushing is not at fault.
             try? await writeLocked(shared, stream, bytes)
         }
-        shared.writerActive = false
-        if !shared.writeQueue.isEmpty { shared.writeQueue.removeFirst().resume() }
+        shared.passWriteLock()
     }
 
     /// Writes all of `bytes`, holding the lock.

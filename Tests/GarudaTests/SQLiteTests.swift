@@ -575,6 +575,44 @@ struct SQLiteDatabaseTests {
         #expect(try client.get("/count").text == "5")
     }
 
+    @Test func theWriterGoesToTheRequestThatWaitedForIt() throws {
+        // Given back and only its waiter woken, the writer went to whoever
+        // asked next before the waiter ran: here the handler that gave it
+        // back, starting its next transaction, every time, until it had run
+        // all four. Handed over, the waiting request is next.
+        let file = TemporaryDatabase("handover")
+        let app = Application()
+        let path = file.path
+        nonisolated(unsafe) var order: [String] = []
+        app.state { _ in
+            let db = try SQLiteDatabase(SQLiteConfiguration(path: path))
+            databaseForTests = db
+            return db
+        }
+        app.get("/greedy") { (db: State<SQLiteDatabase>) async throws -> String in
+            for i in 0..<4 {
+                try await db.value.transaction { _ in
+                    order.append("greedy\(i)")
+                    await pause(20)
+                }
+            }
+            return "greedy"
+        }
+        app.get("/other") { (db: State<SQLiteDatabase>) async throws -> String in
+            try await db.value.transaction { _ in order.append("other") }
+            return "other"
+        }
+        let client = app.test
+        let greedy = try TestWire(client)
+        greedy.send("GET /greedy HTTP/1.1\r\nHost: test\r\n\r\n")
+        #expect(greedy.turn(until: { !order.isEmpty }, turns: 200_000))
+        let other = try TestWire(client)
+        other.send("GET /other HTTP/1.1\r\nHost: test\r\n\r\n")
+        #expect(other.receive(turns: 2_000_000)?.hasSuffix("other") == true)
+        #expect(greedy.receive(turns: 2_000_000)?.hasSuffix("greedy") == true)
+        #expect(order == ["greedy0", "other", "greedy1", "greedy2", "greedy3"], "\(order)")
+    }
+
     @Test func aWaitForTheWriterGivesUpAtItsDeadline() throws {
         let file = TemporaryDatabase("deadline")
         let app = Application()
