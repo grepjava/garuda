@@ -223,6 +223,13 @@ public struct ServerConfig {
     /// name in the directory, which is a different decision from serving the
     /// files themselves.
     public var staticListing = false
+    /// The most entries a listing shows; 0 for no limit. A listing is built
+    /// on the worker's thread, with a `stat` for every entry, so without a
+    /// limit a directory of a million files holds every other request on
+    /// the worker while it is read, and answers with a page of tens of
+    /// megabytes. Past the limit the directory is not read further, and the
+    /// page says that more are not listed.
+    public var staticListingLimit = 10_000
     /// A response declaring fewer bytes than this is sent as it is. Below
     /// about a kilobyte the saving is smaller than the framing.
     public var compressMinimumLength = 1024

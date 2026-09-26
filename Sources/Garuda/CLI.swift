@@ -167,6 +167,8 @@ public enum GarudaCLI {
                                        index.html
               --static-listing         answer a --static-dir directory that has no
                                        index.html with a listing of it
+              --static-listing-limit N list at most N entries (default 10000; 0 for
+                                       no limit)
               --request-start-header   give handlers request.requestStart, when the
                                        request arrived, for APM agents that report
                                        queue time
@@ -510,6 +512,9 @@ public enum GarudaCLI {
                 config.compressStatic = true
             } else if matches(arg, "--static-index") {
                 config.staticIndex = true
+            } else if matches(arg, "--static-listing-limit") {
+                guard let v = next("--static-listing-limit needs a count") else { break }
+                config.staticListingLimit = max(0, parseInt(v))
             } else if matches(arg, "--static-listing") {
                 config.staticListing = true
                 config.staticIndex = true

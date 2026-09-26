@@ -37,7 +37,7 @@ swift build -c release
 swift test                             # 1093 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 11
 bash scripts/integration-test.sh       # 36
-bash scripts/static-test.sh            # 93
+bash scripts/static-test.sh            # 105
 bash scripts/compress-test.sh          # 76, and garuda-conformance
 bash scripts/cache-test.sh             # 85, runs garuda-conformance
 bash scripts/ratelimit-test.sh         # 18
@@ -76,6 +76,13 @@ nothing relevant.
 ---
 
 ## Unreleased
+
+- A `--static-listing` page shows at most 10,000 entries, and says when there
+  are more; `--static-listing-limit N` sets the limit, and 0 lifts it. A
+  listing is built on the worker with a `stat` for every entry, so a
+  directory of a million files held every other request on that worker while
+  it was read, and answered with tens of megabytes of HTML. Past the limit
+  the directory is not read further.
 
 - A handler reading a streaming request body over HTTP/1.1 no longer holds up
   every other request on its worker while the client keeps sending. Each

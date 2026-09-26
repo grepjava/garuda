@@ -358,6 +358,7 @@ with 501.
 | `--static-dir P=DIR` | none | serve URL prefix P from DIR; repeatable |
 | `--static-index` | off | answer a `--static-dir` directory with its `index.html` |
 | `--static-listing` | off | list a `--static-dir` directory that has no `index.html` |
+| `--static-listing-limit N` | 10000 | list at most N entries; 0 for no limit |
 | `--spa-fallback P=FILE` | none | answer a browser navigation under P that nothing else answers with FILE; repeatable |
 | `--compress-static` | off | serve `FILE.br`, `FILE.zst` or `FILE.gz` beside a static file when accepted |
 | `--compress` | off | compress handler responses with brotli, zstd or gzip, as the client accepts |
@@ -429,6 +430,12 @@ garuda --static-dir /files=/srv/files --static-listing
   first. Names beginning with `.` are left out, and so is anything that is
   neither a file nor a directory. It carries `Cache-Control: no-store`: it
   describes what is there now and has no validator to check that against.
+- A listing shows at most `--static-listing-limit` entries, 10,000 unless
+  set, and says when there are more. It is built on the worker, with a
+  `stat` for each entry, so a directory of a million files would otherwise
+  hold every other request on that worker while it was read. Which entries
+  make the page is the order the directory gives them in, not the page's
+  sorted order; 0 lifts the limit.
 - A symlinked directory is not listed, even one pointing inside the tree. A
   listing walks one segment at a time with `O_NOFOLLOW`, so the walk cannot
   leave the tree at all; deciding whether a link's target is still inside it

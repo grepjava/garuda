@@ -185,9 +185,16 @@ extension Worker {
     }
 
     /// The page for one directory. Takes the descriptor, and closes it.
+    ///
+    /// At most `staticListingLimit` entries looked at, and the directory is
+    /// read no further than that: which ones are the directory's own order, not the
+    /// page's, so past the limit the page says only that there are more.
     private func directoryPage(_ dir: Int32, path: [UInt8], count: Int) -> [UInt8] {
         var directories: [String] = []
         var files: [(name: String, size: Int64)] = []
+        let limit = config.staticListingLimit
+        var examined = 0
+        var more = false
         if let handle = fdopendir(dir) {
             while let entry = readdir(handle) {
                 let name = withUnsafePointer(to: entry.pointee.d_name) {
@@ -196,6 +203,13 @@ extension Worker {
                 // `.` and `..` are navigation rather than content, and a
                 // dotfile in a served directory is not something to announce.
                 if name.hasPrefix(".") { continue }
+                // Counted before the `stat`, whatever the entry turns out to
+                // be, since the `stat` is the cost being bounded.
+                if limit > 0 && examined >= limit {
+                    more = true
+                    break
+                }
+                examined += 1
                 var st = stat()
                 guard fstatat(dirfd(handle), name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
                 if st.st_mode & S_IFMT == S_IFDIR {
@@ -238,6 +252,9 @@ extension Worker {
                     + "<span>" + describeSize(file.size) + "</span></li>\n")
         }
         add("</ul>\n")
+        if more {
+            add("<p>More entries are not listed: the directory was read no further than \(limit) entries.</p>\n")
+        }
         return out
     }
 }

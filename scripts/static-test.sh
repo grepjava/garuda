@@ -272,7 +272,34 @@ is "a file is still served with listings on" "$(body $H/static/site.css)" "body 
 is "a missing directory still reaches the router" "$(code $H/static/nothing/)" "404"
 is "a listing over HTTP/2 is the same" \
    "$(curl -sS --http2-prior-knowledge --max-time 10 $H/static/listed/ | grep -c 'one.txt')" "1"
+is "a listing under its limit says nothing of more" \
+   "$(body $H/static/listed/ | grep -c 'More entries')" "0"
 
+server_stop
+
+# --- a listing's limit ---------------------------------------------------
+# A listing is read on the worker, a stat per entry, so it stops at
+# --static-listing-limit and says there is more; 0 lifts the limit.
+mkdir -p "$WORK/many/crowd"
+for i in $(seq 1 30); do echo "$i" > "$WORK/many/crowd/f$i.txt"; done
+
+server_require_port_free "$PORT" || exit 1
+server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
+    --static-dir "/many=$WORK/many" --static-listing --static-listing-limit 10 \
+    > "$WORK/limit.log" 2>&1
+wait_for_port "$PORT"
+H="http://127.0.0.1:$PORT"
+is "a listing stops at its limit" "$(body $H/many/crowd/ | grep -c '\.txt</a>')" "10"
+is "and says there is more" "$(body $H/many/crowd/ | grep -c 'More entries are not listed')" "1"
+server_stop
+
+server_require_port_free "$PORT" || exit 1
+server_start "$BIN" --port "$PORT" --workers 2 --log-level error \
+    --static-dir "/many=$WORK/many" --static-listing --static-listing-limit 0 \
+    > "$WORK/nolimit.log" 2>&1
+wait_for_port "$PORT"
+is "a limit of 0 lists everything" "$(body $H/many/crowd/ | grep -c '\.txt</a>')" "30"
+is "and says nothing of more" "$(body $H/many/crowd/ | grep -c 'More entries')" "0"
 server_stop
 
 # --- a route at the root -------------------------------------------------
