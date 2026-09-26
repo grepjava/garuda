@@ -328,6 +328,9 @@ public struct Connection {
     /// acquisition its handler is in (TimedWait.swift). Ending the request
     /// ends them, and nothing is looked for while this is zero.
     var ownedTimedWaits: Int32 = 0
+    /// Refills of a streaming body its handler's reads have made since the
+    /// loop last read the socket (`Worker.pumpStreamedBody`).
+    var readerFills: UInt8 = 0
     /// The body a streaming route is reading as it arrives, shared with its
     /// reader so what arrived survives the slot closing.
     var bodyStream: RequestBodyState? = nil

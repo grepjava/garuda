@@ -229,25 +229,40 @@ extension Worker {
     /// Reads what an HTTP/1.1 streaming body has waiting, as far as the
     /// buffer has room, and wakes its reader. Multiplexed streams are fed by
     /// their frames instead.
-    mutating func pumpStreamedBody(_ slot: Int) {
+    /// How many times in a row a handler's own reads may refill its body from
+    /// the socket before it waits for the loop to come round.
+    static let readerFillsPerTurn: UInt8 = 4
+
+    mutating func pumpStreamedBody(_ slot: Int, fromReader: Bool = false) {
         let c = table[slot]
         if c.pointee.isStream {
             c.pointee.bodyStream?.wake()
             return
         }
         let generation = c.pointee.generation
-        if c.pointee.bodyRemaining < 0 {
-            if c.pointee.body.readableBytes < config.bodyHighWaterMark {
-                if !fill(slot, .read, limit: config.bodyHighWaterMark) { return }
-                // Closes a connection that ended mid-body, and answers a body
-                // past its limit 413; both let the reader go.
-                _ = advanceChunkedBody(slot)
-            }
-        } else if c.pointee.bodyRemaining > 0 {
-            if !fill(slot, .body, limit: config.bodyHighWaterMark) { return }
-            if c.pointee.bodyRemaining > 0 && c.pointee.flags.contains(.peerClosed) {
-                closeConnection(slot)
-                return
+        // A handler taking bytes off its body refills it from the socket
+        // here, so it goes on without waiting for the loop -- which, while
+        // the client kept sending, was for the whole body: two clients
+        // uploading 256 MB each held a worker's other requests for most of a
+        // second at a time. So only a few refills in a row; after that the
+        // reader waits for the socket to be read in its turn, as every other
+        // connection's is. HTTP/2 holds a connection to a few frames a turn
+        // for the same reason.
+        c.pointee.readerFills = fromReader ? min(c.pointee.readerFills, 254) + 1 : 0
+        if c.pointee.readerFills <= Worker.readerFillsPerTurn {
+            if c.pointee.bodyRemaining < 0 {
+                if c.pointee.body.readableBytes < config.bodyHighWaterMark {
+                    if !fill(slot, .read, limit: config.bodyHighWaterMark) { return }
+                    // Closes a connection that ended mid-body, and answers a
+                    // body past its limit 413; both let the reader go.
+                    _ = advanceChunkedBody(slot)
+                }
+            } else if c.pointee.bodyRemaining > 0 {
+                if !fill(slot, .body, limit: config.bodyHighWaterMark) { return }
+                if c.pointee.bodyRemaining > 0 && c.pointee.flags.contains(.peerClosed) {
+                    closeConnection(slot)
+                    return
+                }
             }
         }
         guard c.pointee.state != .free, c.pointee.generation == generation else { return }
@@ -269,7 +284,7 @@ extension Worker {
             h2NoteConsumed(slot, h2Unannounced(slot))
             h2FlushWindowUpdates(slot)
         } else {
-            pumpStreamedBody(slot)
+            pumpStreamedBody(slot, fromReader: true)
         }
     }
 

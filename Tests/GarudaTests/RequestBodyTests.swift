@@ -85,6 +85,53 @@ struct RequestBodyTests {
         #expect(largestBuffered <= 64 * 1024 + 64 * 1024)
     }
 
+    @Test func aHandlerReadingItsBodyLetsTheLoopComeRound() throws {
+        // Each read refilled the body from the socket there and then, so a
+        // handler whose client kept sending read the lot without the loop
+        // turning once, and every other request on the worker waited. Now a
+        // turn gives it a few refills and no more.
+        bodyReceived = []
+        var config = ServerConfig()
+        config.bodyHighWaterMark = 16 * 1024
+        let app = Application()
+        let total = 1024 * 1024
+        app.onStreamingBody(.put, "/big") { _, response, body in
+            while let bytes = try await body.read(maxBytes: 16 * 1024) { bodyReceived += bytes }
+            response.send(status: .created)
+        }
+        let client = app.testClient(configuration: config)
+        let wire = try TestWire(client)
+        let body = pattern(total)
+        wire.send("PUT /big HTTP/1.1\r\nHost: test\r\nContent-Length: \(total)\r\n\r\n")
+        var sent = 0
+        func push(upTo end: Int) {
+            while sent < end {
+                let n = body.withUnsafeBufferPointer { av_write(wire.fd, $0.baseAddress! + sent, end - sent) }
+                if n <= 0 { break }
+                sent += n
+            }
+        }
+        push(upTo: 1024)
+        #expect(wire.turn(until: { bodyReceived.count == 1024 }))
+        // The rest, or as much as the socket holds, there before the loop
+        // turns again: all of it the handler's to read at once.
+        push(upTo: total)
+        let waiting = sent - bodyReceived.count
+        let allowed = (Int(Worker.readerFillsPerTurn) + 1) * config.bodyHighWaterMark
+        #expect(waiting > 2 * allowed, "the socket took only \(waiting) bytes")
+        let before = bodyReceived.count
+        client.turn()
+        #expect(bodyReceived.count - before <= allowed)
+        #expect(bodyReceived.count - before > 0)
+        // And it still gets the whole body, a few refills a turn.
+        for _ in 0..<10_000 where bodyReceived.count < total {
+            push(upTo: total)
+            client.turn()
+        }
+        #expect(bodyReceived == body)
+        #expect(wire.receive()?.hasPrefix("HTTP/1.1 201") == true)
+    }
+
     @Test func aBodyPastTheRoutesLimitIs413() throws {
         let app = Application()
         app.onStreamingBody(.post, "/small", maxBodySize: 10) { _, response, body in

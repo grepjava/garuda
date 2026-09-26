@@ -77,6 +77,22 @@ nothing relevant.
 
 ## Unreleased
 
+- A handler reading a streaming request body over HTTP/1.1 no longer holds up
+  every other request on its worker while the client keeps sending. Each
+  read refilled the body from the socket there and then, so the loop did not
+  turn until the client paused -- for a fast client, the whole body. Two
+  clients uploading 256 MB each to one worker held a cheap route on it for up
+  to 0.8 s at a time. A handler now gets a few refills (about 1 MiB) before
+  it waits for its socket's turn; upload throughput is unchanged.
+
+- Resumable uploads hash a finished upload on the blocking pool, not the
+  worker, when the client sent `Repr-Digest` or `Want-Repr-Digest`, and
+  `CompletedUpload.digestInBackground()` does the same for a handler.
+  `digest()` hashes on the worker, and says so now. On a CPU without SHA
+  instructions, two clients sending 15 MB files back to back took a worker
+  from 2,000 answers a second to 500, the rest waiting seconds; with both
+  changes it keeps 2,000 with p99 1.9 ms. The files example uses the new call.
+
 - A request waiting for an `SQLiteDatabase` connection gets the next one given
   back. The connection was marked free and the waiter only woken, so whoever
   asked before the waiter ran took it first -- often the handler that had

@@ -151,8 +151,20 @@ public struct CompletedUpload: Sendable {
     ///
     /// Worth storing beside whatever the bytes become: it is what lets a
     /// client be told later that what it sent is what is held.
+    ///
+    /// The file is read on the calling thread, which in a handler is the
+    /// worker's: every other request on it waits while the whole upload is
+    /// hashed, about 30 ms for each 15 MB on a CPU without SHA instructions.
+    /// In a handler, use `digestInBackground()`.
     public func digest() -> [UInt8]? {
         sha256 ?? Digest.sha256(contentsOfFile: path)
+    }
+
+    /// The same, with the file read and hashed on the blocking pool, so the
+    /// worker goes on serving other requests meanwhile.
+    public func digestInBackground() async -> [UInt8]? {
+        if let sha256 { return sha256 }
+        return await fileSHA256(path)
     }
 
     /// Removes the upload and its bytes, once they have been moved or used.
@@ -160,6 +172,19 @@ public struct CompletedUpload: Sendable {
 }
 
 public typealias UploadCompletion = (CompletedUpload) async throws -> any ResponseConvertible
+
+/// The SHA-256 of a whole file, read on the blocking pool. Hashing a large
+/// upload on the worker held every other request on it: two clients sending
+/// 15 MB files back to back took a worker from 2,000 answers a second to 500,
+/// with the rest waiting seconds. A pool too busy to take it has the file
+/// hashed here instead, which is slow for everyone but fails nobody.
+func fileSHA256(_ path: String) async -> [UInt8]? {
+    do {
+        return try await blocking { Digest.sha256(contentsOfFile: path) }
+    } catch {
+        return Digest.sha256(contentsOfFile: path)
+    }
+}
 
 /// What an application records on an upload as it is created, from the request
 /// that creates it:
@@ -656,7 +681,7 @@ final class UploadService: @unchecked Sendable {
         // the file, and only when somebody asked for it.
         var sha256: [UInt8]? = nil
         if let declared = (try? store.info(id))?.reprDigest.flatMap({ Digest.sha256(field: $0) }) {
-            guard let actual = Digest.sha256(contentsOfFile: store.dataPath(id)),
+            guard let actual = await fileSHA256(store.dataPath(id)),
                   Digest.equal(actual, declared) else {
                 // Whole and wrong: appending cannot mend it, so it goes, and
                 // the client starts again rather than holding a name for
@@ -668,7 +693,7 @@ final class UploadService: @unchecked Sendable {
             }
             sha256 = actual
         } else if wantsDigest {
-            sha256 = Digest.sha256(contentsOfFile: store.dataPath(id))
+            sha256 = await fileSHA256(store.dataPath(id))
         }
         try store.update(id, length: offset, complete: true)
         handle.release()

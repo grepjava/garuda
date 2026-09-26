@@ -833,6 +833,8 @@ struct ResumableUploadTests {
         let app = Application()
         app.resumableUploads("/files", store: store, progressInterval: 0) { upload in
             seen.digests.append(upload.digest())
+            // The same, hashed on the blocking pool rather than the worker.
+            seen.digests.append(await upload.digestInBackground())
             return Text("ok", status: .created)
         }
         // Computed for the check, and handed on rather than computed again.
@@ -840,12 +842,12 @@ struct ResumableUploadTests {
             ("Upload-Complete", "?1"),
             ("Repr-Digest", Digest.field(Digest.sha256(pattern(10)))),
         ]).status == 201)
-        #expect(seen.digests == [Digest.sha256(pattern(10))])
+        #expect(seen.digests == [Digest.sha256(pattern(10)), Digest.sha256(pattern(10))])
 
         // Nobody asked, so it is read from the file when the handler wants it.
         seen.digests = []
         #expect(try app.test.post("/files", body: pattern(6), headers: [("Upload-Complete", "?1")]).status == 201)
-        #expect(seen.digests == [Digest.sha256(pattern(6))])
+        #expect(seen.digests == [Digest.sha256(pattern(6)), Digest.sha256(pattern(6))])
     }
 
     @Test func aFinishedUploadIsAnsweredAgainToAClientThatAsks() throws {

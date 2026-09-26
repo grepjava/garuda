@@ -92,7 +92,9 @@ public func filesApp(_ configuration: FilesConfiguration) -> Application {
         // nothing. `safeName` is the whole of the trust placed in it.
         let asked = filename(fromContentDisposition: upload.info.contentDisposition)
         let name = safeName(asked) ?? upload.info.id
-        let digest = upload.digest() ?? []
+        // Hashed off the worker: a whole file takes long enough to hold up
+        // every other request on it.
+        let digest = await upload.digestInBackground() ?? []
 
         // Renamed rather than copied: the two directories are in the same
         // filesystem, so the file appears under its name whole or not at all.
