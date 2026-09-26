@@ -46,6 +46,7 @@
 import AvianCore
 import CAvian
 import GarudaRedis
+import Synchronization
 
 /// Where sessions are kept. The data is a map of strings; an ID is 43
 /// characters of base64url.
@@ -322,54 +323,71 @@ extension RouteBuilder {
 
 /// Sessions in the worker's memory. Each worker process has its own, so this
 /// is for --workers 1 and tests.
+///
+/// A worker runs its handlers on its one thread, but a store is a public,
+/// `Sendable` type, and user code can reach one from the blocking pool or a
+/// thread of its own; two threads in one `Dictionary` corrupt it. So the
+/// sessions are behind a lock, as `MemoryRefreshTokenStore`'s are.
 public final class MemorySessionStore: SessionStore, @unchecked Sendable {
-    // A worker runs its handlers on its one thread, so nothing here is shared
-    // between threads.
-    private var sessions: [String: (data: [String: String], expires: UInt64)] = [:]
-    private var savesSinceSweep = 0
-    /// Microseconds on a clock that only moves forward; tests set their own.
+    private struct State {
+        var sessions: [String: (data: [String: String], expires: UInt64)] = [:]
+        var savesSinceSweep = 0
+    }
+
+    private let state = Mutex(State())
+    /// Microseconds on a clock that only moves forward; tests set their own,
+    /// before the store is used. The one thing here not behind the lock.
     var clock: () -> UInt64 = { av_monotonic_us() }
 
     public init() {}
 
     /// How many sessions are held, expired ones not yet swept included.
-    public var count: Int { sessions.count }
+    public var count: Int { state.withLock { $0.sessions.count } }
 
     public func load(id: String, ttlMilliseconds: Int) async throws -> [String: String]? {
         let now = clock()
-        guard let entry = sessions[id] else { return nil }
-        guard entry.expires > now else {
-            sessions[id] = nil
-            return nil
+        return state.withLock { state in
+            guard let entry = state.sessions[id] else { return nil }
+            guard entry.expires > now else {
+                state.sessions[id] = nil
+                return nil
+            }
+            state.sessions[id] = (entry.data, now + UInt64(ttlMilliseconds) * 1000)
+            return entry.data
         }
-        sessions[id] = (entry.data, now + UInt64(ttlMilliseconds) * 1000)
-        return entry.data
     }
 
     public func save(id: String, data: [String: String], ttlMilliseconds: Int) async throws {
         let now = clock()
-        sessions[id] = (data, now + UInt64(ttlMilliseconds) * 1000)
-        savesSinceSweep += 1
-        if savesSinceSweep >= 1024 {
-            savesSinceSweep = 0
-            sessions = sessions.filter { $0.value.expires > now }
+        state.withLock { state in
+            state.sessions[id] = (data, now + UInt64(ttlMilliseconds) * 1000)
+            state.savesSinceSweep += 1
+            if state.savesSinceSweep >= 1024 {
+                state.savesSinceSweep = 0
+                state.sessions = state.sessions.filter { $0.value.expires > now }
+            }
         }
     }
 
     public func delete(id: String) async throws {
-        sessions[id] = nil
+        state.withLock { $0.sessions[id] = nil }
     }
 
     public func replace(id: String, data: [String: String], ttlMilliseconds: Int) async throws -> Bool {
         let now = clock()
-        guard let entry = sessions[id], entry.expires > now else { return false }
-        sessions[id] = (data, now + UInt64(ttlMilliseconds) * 1000)
-        return true
+        return state.withLock { state in
+            guard let entry = state.sessions[id], entry.expires > now else { return false }
+            state.sessions[id] = (data, now + UInt64(ttlMilliseconds) * 1000)
+            return true
+        }
     }
 
     public func remove(id: String) async throws -> Bool {
-        guard let entry = sessions.removeValue(forKey: id) else { return false }
-        return entry.expires > clock()
+        let now = clock()
+        return state.withLock { state in
+            guard let entry = state.sessions.removeValue(forKey: id) else { return false }
+            return entry.expires > now
+        }
     }
 }
 

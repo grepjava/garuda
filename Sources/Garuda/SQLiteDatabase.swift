@@ -298,12 +298,18 @@ public final class SQLiteDatabase: @unchecked Sendable {
             throw SQLiteClientError.cancelled
         }
         var id: Int32 = -1
-        let outcome = await Worker.waitTimed(worker, milliseconds: configuration.acquireTimeoutMilliseconds) {
+        let outcome = await Worker.waitTimed(worker, milliseconds: configuration.acquireTimeoutMilliseconds,
+                                             forRequest: true) {
             id = $0
             self[keyPath: queue].append($0)
         }
         switch outcome {
         case .woken:
+            // Woken just before its request ended: the wake is passed on.
+            if worker.pointee.currentRequestEnded {
+                wakeOne(queue)
+                throw SQLiteClientError.cancelled
+            }
             return
         case .timedOut:
             self[keyPath: queue].removeAll { $0 == id }

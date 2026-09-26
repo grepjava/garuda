@@ -276,6 +276,32 @@ struct RefreshTokenStoreTests {
         #expect(try await exerciseStore(MemoryRefreshTokenStore()) == storeExpectation)
     }
 
+    @Test func theMemoryStoreLetsEndedFamiliesGo() async throws {
+        // It kept every family and token it was ever given. Ended ones go now,
+        // by the issuer's own clock; a live family's spent token stays, since
+        // presenting it again is how theft is noticed.
+        let store = MemoryRefreshTokenStore()
+        let start: Int64 = 1_000_000
+        try await store.createFamily("old", subject: "ada", expiresAt: start + 60)
+        try await store.insert(RefreshTokenRecord(digest: "old-token", family: "old", subject: "ada",
+                                                  issuedAt: start, expiresAt: start + 60,
+                                                  familyExpiresAt: start + 60))
+        try await store.createFamily("live", subject: "ada", expiresAt: start + 100_000)
+        try await store.insert(RefreshTokenRecord(digest: "spent", family: "live", subject: "ada",
+                                                  issuedAt: start, expiresAt: start + 600,
+                                                  familyExpiresAt: start + 100_000))
+        #expect(try await store.markUsed(digest: "spent", at: start + 1))
+        for i in 0..<MemoryRefreshTokenStore.sweepEvery {
+            try await store.insert(RefreshTokenRecord(digest: "t\(i)", family: "live", subject: "ada",
+                                                      issuedAt: start + 120, expiresAt: start + 720,
+                                                      familyExpiresAt: start + 100_000))
+        }
+        #expect(store.count.families == 1)
+        #expect(store.count.tokens == MemoryRefreshTokenStore.sweepEvery + 1)
+        #expect(try await store.find(digest: "old-token") == nil)
+        #expect(try await store.find(digest: "spent")?.usedAt == start + 1)
+    }
+
     @Test(.enabled(if: gsq_available() != 0, "no libsqlite3"))
     func sqlite() throws {
         let path = "/tmp/garuda-refresh-\(av_getpid()).db"

@@ -67,6 +67,7 @@ extension Worker {
     /// wherever a request ends: the connection closed, the stream reset, the
     /// deadline passed, the next request taking the slot.
     mutating func wakeCancelWaiters(_ slot: Int) {
+        endOwnedTimedWaits(slot)
         let waiting = table[slot].pointee.cancelWaiters
         guard !waiting.isEmpty else { return }
         table[slot].pointee.cancelWaiters = []

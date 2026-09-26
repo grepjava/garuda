@@ -484,21 +484,54 @@ private struct JSONValueReader {
     var isNull: Bool { JSONValue.isNull(base, count, at: index) }
 }
 
+/// Where each member's value starts in an object whose keys were listed.
+final class JSONListedMembers {
+    /// Fewer members than this are walked: that is cheaper than hashing.
+    static let minimum = 16
+    var offsets: [String: Int]? = nil
+}
+
 private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol {
     let base: UnsafePointer<UInt8>
     let count: Int
     let objectIndex: Int
     let path: JSONPath
     var codingPath: [any CodingKey] { path.keys }
+    /// Room for `allKeys` to write down where the members are, for keys that
+    /// can hold any string -- a `Dictionary`'s -- and so are listed. Told
+    /// apart by size: such a key stores its string, and a type's own
+    /// `CodingKeys` is an enum of a byte or two. Asking the key type itself,
+    /// with `init(intValue:)`, cost a small struct 3% to decode; the
+    /// container of a type's own keys, the one nearly every object is read
+    /// through, makes nothing.
+    let listed: JSONListedMembers?
 
+    init(base: UnsafePointer<UInt8>, count: Int, objectIndex: Int, path: JSONPath) {
+        self.base = base
+        self.count = count
+        self.objectIndex = objectIndex
+        self.path = path
+        listed = MemoryLayout<Key>.size < MemoryLayout<String>.size ? nil : JSONListedMembers()
+    }
+
+    /// The keys, in the document's order. A big enough object also has where
+    /// each member's value starts written down, because whoever lists the keys
+    /// -- a `Dictionary`, most of all -- asks for every one of them next, and
+    /// finding each by walking the members before it was quadratic: seconds
+    /// for a few thousand keys, on the worker's thread.
     var allKeys: [Key] {
         var keys: [Key] = []
+        var offsets: [String: Int] = [:]
+        var members = 0
         try? forEachMember { keyStart, keyEnd, valueIndex in
             let name = try JSONValue.text(base, from: keyStart, to: keyEnd)
             if let key = Key(stringValue: name) { keys.append(key) }
-            _ = valueIndex
+            // The first of a repeated key, as the walk in `offset` finds.
+            if listed != nil, offsets[name] == nil { offsets[name] = valueIndex }
+            members += 1
             return true
         }
+        if members >= JSONListedMembers.minimum, let listed { listed.offsets = offsets }
         return keys
     }
 
@@ -532,6 +565,7 @@ private struct JSONKeyedDecoding<Key: CodingKey>: KeyedDecodingContainerProtocol
 
     /// Where the value for `key` starts, or nil.
     private func offset(of key: Key) throws -> Int? {
+        if let offsets = listed?.offsets { return offsets[key.stringValue] }
         var found: Int? = nil
         let wanted = key.stringValue
         try forEachMember { keyStart, keyEnd, valueIndex in

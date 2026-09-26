@@ -253,22 +253,54 @@ public final class TokenIssuer<Claims: Encodable & Sendable>: @unchecked Sendabl
 /// and what it holds decides whether a session is still valid -- so the state
 /// is behind a lock. A login or a refresh takes a handful of these calls, so
 /// the lock costs nothing that can be measured.
+///
+/// A family, and every token of it, is let go once the family has expired:
+/// until then a spent token is kept, because presenting it again is how a
+/// stolen one is noticed. Without that the store held every login and every
+/// refresh the worker had ever issued. There is no clock of its own: "now" is
+/// the latest time the issuer has written, so an issuer's own clock is the
+/// one that counts.
 public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
     private struct State {
         var tokens: [String: RefreshTokenRecord] = [:]
         var families: [String: (subject: String, expiresAt: Int64, revoked: Bool)] = [:]
+        /// The latest time written by the issuer, in seconds since the epoch.
+        var now: Int64 = .min
+        var writesSinceSweep = 0
+
+        mutating func wrote(at time: Int64) {
+            now = max(now, time)
+            writesSinceSweep += 1
+            // Every so many writes, so the cost of a sweep is spread over them.
+            guard writesSinceSweep >= MemoryRefreshTokenStore.sweepEvery else { return }
+            writesSinceSweep = 0
+            let now = self.now
+            families = families.filter { $0.value.expiresAt > now }
+            tokens = tokens.filter { $0.value.familyExpiresAt > now }
+        }
     }
+
+    static let sweepEvery = 1024
 
     private let state = Mutex(State())
 
     public init() {}
+
+    /// How many families and tokens are held, ended ones not yet swept
+    /// included.
+    public var count: (families: Int, tokens: Int) {
+        state.withLock { ($0.families.count, $0.tokens.count) }
+    }
 
     public func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
         state.withLock { $0.families[family] = (subject, expiresAt, false) }
     }
 
     public func insert(_ record: RefreshTokenRecord) async throws {
-        state.withLock { $0.tokens[record.digest] = record }
+        state.withLock { state in
+            state.tokens[record.digest] = record
+            state.wrote(at: record.issuedAt)
+        }
     }
 
     public func find(digest: String) async throws -> RefreshTokenRecord? {
@@ -284,6 +316,7 @@ public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
             guard var record = $0.tokens[digest], record.usedAt == nil else { return false }
             record.usedAt = at
             $0.tokens[digest] = record
+            $0.now = max($0.now, at)
             return true
         }
     }

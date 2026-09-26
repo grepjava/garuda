@@ -451,7 +451,8 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
                 }
             }
             var id: Int32 = -1
-            let outcome = await Worker.waitTimed(worker, milliseconds: acquireTimeoutMilliseconds) {
+            let outcome = await Worker.waitTimed(worker, milliseconds: acquireTimeoutMilliseconds,
+                                                 forRequest: true) {
                 id = $0
                 waiting.add($0)
             }
@@ -459,7 +460,15 @@ public final class RedisPool: RedisCommandSender, @unchecked Sendable {
             case .woken:
                 // Handed over by the release that woke this wait, so nobody
                 // who arrived since can have taken it first (PoolWaiters).
-                if let connection = waiting.take(id) { return connection }
+                if let connection = waiting.take(id) {
+                    guard worker.pointee.currentRequestEnded else { return connection }
+                    release(connection)
+                    throw .cancelled
+                }
+                if worker.pointee.currentRequestEnded {
+                    wakeOne()
+                    throw .cancelled
+                }
                 continue
             case .timedOut:
                 waiting.remove(id)

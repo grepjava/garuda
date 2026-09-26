@@ -317,7 +317,8 @@ app.post("/logout") { (body: Body<RefreshRequest>, issuer: State<TokenIssuer<Use
   `revokeAll(subject:)` ends every family of a user, after a password change
   for example.
 - A refused refresh is 400 `{"error":"invalid_grant"}` whatever the reason.
-- **Stores:** `MemoryRefreshTokenStore` for `--workers 1` and tests,
+- **Stores:** `MemoryRefreshTokenStore` for `--workers 1` and tests, which
+  lets expired families go by itself,
   `RedisRefreshTokenStore`, and `PostgresRefreshTokenStore` and
   `SQLiteRefreshTokenStore` (`createTables()` or `schema()`, and
   `deleteExpired()` now and then). Spending a token is atomic in each, so two

@@ -423,8 +423,9 @@ app.get("/user/:id") { (id: Path<Int>, db: State<PostgresPool>) async throws in
 - **Nothing made before `run()` is shared.** A dictionary built at start-up is
   copied into each worker by the fork and then goes its own way.
 - **Nothing here needs a lock.** A worker is one thread, so a class in
-  `app.state` is reached by one request at a time. (`MemorySessionStore` and
-  the other in-memory stores lean on exactly this.)
+  `app.state` is reached by one request at a time. (The in-memory session
+  and refresh-token stores lock anyway, because a store is `Sendable` and
+  may be handed to the blocking pool.)
 - **Pools multiply.** `maxConnections: 8` with `--workers 4` is 32
   connections. Size it against the database's limit, not against one number.
 - **A factory that throws stops that worker**, which the supervisor reports —

@@ -61,6 +61,15 @@ final class HandlerTaskPool: @unchecked Sendable {
         /// Set while the task waits on the engine. Resuming it says whether
         /// the wait completed (true) or its request was cancelled (false).
         var wake: UnsafeContinuation<Bool, Never>? = nil
+        /// The request the task is running, while it runs one.
+        var serving: Serving? = nil
+    }
+
+    /// A request, as a wait made for it names it (TimedWait.swift).
+    struct Serving {
+        var slot: Int32
+        var generation: UInt32
+        var requestId: UInt32
     }
 
     let worker: UnsafeMutablePointer<Worker>
@@ -75,6 +84,9 @@ final class HandlerTaskPool: @unchecked Sendable {
     /// Requests that found every task busy, oldest first. A cancelled one
     /// stays until it is reached, and is skipped then.
     private var waiting: ReadyQueue
+    /// Each task's number, by the task. Only a task of this pool is found
+    /// here, not one it started: that may be meant to outlive the request.
+    private var numbers: [UnsafeCurrentTask: Int32] = [:]
 
     init(worker: UnsafeMutablePointer<Worker>, limit: Int, slots: Int) {
         precondition(limit > 0)
@@ -161,6 +173,13 @@ final class HandlerTaskPool: @unchecked Sendable {
         records[index].wake.take()?.resume(returning: false)
     }
 
+    /// The request the calling task is running, when it is one of these.
+    func servingOnCurrentTask() -> Serving? {
+        guard !numbers.isEmpty,
+              let index = withUnsafeCurrentTask(body: { $0.flatMap { numbers[$0] } }) else { return nil }
+        return records[Int(index)].serving
+    }
+
     /// Parks the task running a request until the engine resumes it.
     func park(_ index: Int, _ wake: UnsafeContinuation<Bool, Never>) {
         records[index].wake = wake
@@ -182,6 +201,10 @@ final class HandlerTaskPool: @unchecked Sendable {
     private func spawn(_ index: Int, first: Work) {
         let pool = self
         Task(executorPreference: executor) {
+            // Kept for the task's life, and dropped before it ends, so that
+            // no later task at the same address is taken for this one.
+            withUnsafeCurrentTask { if let task = $0 { pool.numbers[task] = Int32(index) } }
+            defer { withUnsafeCurrentTask { if let task = $0 { pool.numbers[task] = nil } } }
             var next: Work? = first
             while let work = next {
                 await pool.run(index, work)
@@ -261,6 +284,9 @@ final class HandlerTaskPool: @unchecked Sendable {
         c.pointee.contTask = Int32(index)
         c.pointee.contState = .none
         c.pointee.contAsyncHandler = nil
+        records[index].serving = Serving(slot: Int32(work.slot), generation: work.generation,
+                                         requestId: work.requestId)
+        defer { records[index].serving = nil }
         let failure: (any Error)?
         // A task outlives the request it was handed, so the request's span is
         // bound for this one alone.

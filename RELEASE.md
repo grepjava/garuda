@@ -77,6 +77,39 @@ nothing relevant.
 
 ## Unreleased
 
+- A JSON object decoded into a `Dictionary` whose values are ordinary
+  `Decodable` types -- not `@JSON` ones -- is read in linear time. Each key was
+  found by walking every member before it, so a `Body<[String: Item]>` of
+  8,000 keys, 150 KB, took 1.4 seconds on the worker's thread, stalling every
+  other connection on it; 4,000 keys now take 5.5 ms rather than 480. Decoding
+  a struct costs what it did.
+
+- A pool acquisition ends when its request does. A handler waiting for a
+  PostgreSQL, Redis or SQLite connection whose client hung up, or whose
+  request passed its deadline, kept waiting until its own timeout, and then
+  took a connection and ran its queries for nobody. It now throws `cancelled`
+  as soon as the request ends, and a connection released to it just before
+  then goes to the next request in line.
+
+- A timed wait begun while the worker had no room left for another timer --
+  the op pool is sized to `--max-connections` and shared with every
+  deadline and sleep -- still ends on time. It waited with no timer at all, so
+  a pool acquisition could outlive its `acquireTimeoutMilliseconds`, and a
+  Redis Cluster or Sentinel retry's pause, or a scheduled job's sleep, had
+  nothing to end it. It gets a timer once there is room, and ends at its
+  deadline regardless.
+
+- `MemorySessionStore` is safe to share between threads, as its `Sendable`
+  conformance said. Its dictionary was unguarded, so a store reached from the
+  blocking pool or a thread of its own could crash the process; it is behind a
+  lock now, as `MemoryRefreshTokenStore`'s state already was.
+
+- `MemoryRefreshTokenStore` lets a family and its tokens go once the family
+  has expired. It kept every login and every refresh the worker had ever
+  issued. Spent tokens of a live family are still kept, since presenting one
+  again is how a stolen token is noticed. `count` says how many families and
+  tokens it holds.
+
 - An HTTP/2 or HTTP/3 request carrying a Host field beside `:authority` is
   served. Clients and proxies may send both, and RFC 9113 and RFC 9114 only
   ask that they match; the request was rebuilt as HTTP/1.1 text with a Host

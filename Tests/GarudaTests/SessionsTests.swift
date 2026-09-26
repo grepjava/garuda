@@ -244,6 +244,26 @@ struct SessionsTests {
         #expect(try await store.load(id: "a", ttlMilliseconds: 150) == nil)
         #expect(store.count == 0)
     }
+
+    @Test func theMemoryStoreTakesWritesFromManyThreadsAtOnce() async throws {
+        // It is Sendable, so nothing stops two threads sharing one. Before
+        // the lock this crashed in Dictionary within a few thousand saves.
+        let store = MemorySessionStore()
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for task in 0..<16 {
+                group.addTask {
+                    for i in 0..<500 {
+                        let id = "\(task)-\(i)"
+                        try await store.save(id: id, data: ["n": "\(i)"], ttlMilliseconds: 60_000)
+                        _ = try await store.load(id: id, ttlMilliseconds: 60_000)
+                        if i % 2 == 0 { try await store.delete(id: id) }
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+        #expect(store.count == 16 * 250)
+    }
 }
 
 // MARK: - SQLite

@@ -324,6 +324,10 @@ public struct Connection {
     /// Handlers waiting for this request to end so that they can give up on
     /// a wait the engine does not own (Cancellation.swift).
     var cancelWaiters: [CancelWaiter] = []
+    /// How many of the worker's timed waits are this request's: a pool
+    /// acquisition its handler is in (TimedWait.swift). Ending the request
+    /// ends them, and nothing is looked for while this is zero.
+    var ownedTimedWaits: Int32 = 0
     /// The body a streaming route is reading as it arrives, shared with its
     /// reader so what arrived survives the slot closing.
     var bodyStream: RequestBodyState? = nil

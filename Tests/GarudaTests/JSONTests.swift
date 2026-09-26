@@ -1,4 +1,5 @@
 import Testing
+import CAvian
 @testable import Garuda
 
 private func text(_ value: some Encodable) throws -> String {
@@ -337,5 +338,38 @@ struct JSONDecodingTests {
         let shallow = String(repeating: "[", count: 8) + String(repeating: "]", count: 8)
         #expect(throws: Never.self) { try JSONCoder.decode([[[[[[[[Int]]]]]]]].self,
                                                       from: Array(shallow.utf8)) }
+    }
+
+    @Test func aDictionaryOfOrdinaryValuesDecodesInLinearTime() throws {
+        // Each key used to be found by walking every member before it, so a
+        // dictionary whose values have no reader of their own took seconds
+        // for a few thousand keys. At 20,000 that was about a minute.
+        struct Plain: Decodable, Equatable { let v: Int }
+        let count = 20_000
+        let text = "{" + (0..<count).map { "\"k\($0)\":{\"v\":\($0)}" }.joined(separator: ",") + "}"
+        let start = av_monotonic_us()
+        let value = try decode([String: Plain].self, text)
+        let elapsed = av_monotonic_us() - start
+        #expect(value.count == count)
+        #expect(value["k0"] == Plain(v: 0) && value["k19999"] == Plain(v: 19_999))
+        #expect(elapsed < 5_000_000, "took \(elapsed) us")
+    }
+
+    @Test func aListedObjectReadsLikeAWalkedOne() throws {
+        // Big enough to have its members written down, and small: a repeated
+        // key is the first of it either way, a nested dictionary is its own,
+        // and a key with an escape in it is found by what it says.
+        struct Plain: Decodable, Equatable { let v: Int }
+        let members = (0..<20).map { "\"k\($0)\":{\"v\":\($0)}" }.joined(separator: ",")
+        let big = try decode([String: Plain].self, "{\"k0\":{\"v\":-1}," + members + "}")
+        #expect(big.count == 20 && big["k0"] == Plain(v: -1))
+        let small = try decode([String: Plain].self, "{\"a\":{\"v\":1},\"a\":{\"v\":2}}")
+        #expect(small == ["a": Plain(v: 1)])
+        let nested = try decode([String: [String: Plain]].self,
+                                "{\"outer\":{" + members + "},\"k1\":{\"k1\":{\"v\":7}}}")
+        #expect(nested["outer"]?.count == 20 && nested["outer"]?["k3"] == Plain(v: 3))
+        #expect(nested["k1"] == ["k1": Plain(v: 7)])
+        let escaped = try decode([String: Plain].self, "{\"\\u0041\":{\"v\":9}," + members + "}")
+        #expect(escaped["A"] == Plain(v: 9))
     }
 }

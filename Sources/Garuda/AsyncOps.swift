@@ -461,6 +461,7 @@ extension Worker {
         while let entry = timerHeap.popDue(nowUs: now, from: &asyncOps) {
             completeTimerOp(index: Int(entry.opIndex), generation: entry.opGeneration)
         }
+        if unarmedTimedWaits > 0 { armTimedWaits(nowUs: now) }
     }
 
     mutating func completeTimerOp(index: Int, generation: UInt32) {
