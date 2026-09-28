@@ -645,7 +645,8 @@ A worker is one thread, and staying on it is what removes the scheduling hop. A
 loop that never awaits holds the worker until it ends. A deadline bounds
 waiting, not computing. Run more workers than busy cores, and hand a call that
 blocks or computes for long to `try await blocking { … }`, which runs it on the
-worker's blocking pool while the worker serves other requests.
+worker's blocking pool while the worker serves other requests. Waiting on an
+external program is such a call.
 
 #### On macOS 15, `Task.yield()` leaves the worker
 

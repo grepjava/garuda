@@ -548,6 +548,33 @@ app.post("/login") { (body: Body<Credentials>) async throws -> HTTPStatus in
 computes for tens of milliseconds, or calls a blocking C library, belongs in
 `blocking { }` — `--blocking-threads` sizes the pool.
 
+Waiting on another program is blocking work too: `Process.waitUntilExit()`, or
+`waitpid` after `posix_spawn`, holds the worker's thread until the program
+exits, and every request on that worker waits with it. Launch and wait inside
+`blocking { }`, and do not put a lock of your own around it: the pool already
+bounds how many run at once, and a global lock makes three uploads that finish
+together queue behind one another.
+
+```swift
+app.resumableUploads("/photos", store: store) { upload in
+    // Decoded once, in this process, and both sizes made from that copy.
+    // Four programs per photo -- two resizes that each decode it again, then
+    // `identify` and `exiftool` -- took seconds on two vCPUs.
+    let path = upload.path
+    let (small, large) = try await blocking {
+        let photo = try Photo(decodingFileAt: path)
+        return (try photo.resized(to: 400), try photo.resized(to: 1600))
+    }
+    …
+}
+```
+
+Better still is not to launch anything. An image library linked into the
+server -- libvips, or libjpeg-turbo and libexif directly -- decodes the file
+once and reads its EXIF from the same bytes; a program started per request
+pays its own start-up (Perl's, for `exiftool`) and decodes the image again
+each time.
+
 ### Shutting down
 
 ```swift

@@ -287,6 +287,14 @@ the worker's other requests, so the compiler checks what it captures. Work
 cannot be interrupted, so a cancelled request learns of it only when its work
 returns.
 
+Garuda does not run external programs for a handler. Waiting on one is
+blocking work like any other, so it goes in `blocking { … }`, with no lock
+around it: the pool's bound is the limit on how many run at once. Where Garuda
+itself would otherwise block a handler, the blocking path is not the default:
+`CompletedUpload.digest()` hashes on the pool and must be awaited, and the
+overload that hashes on the calling thread is `noasync`, so a handler cannot
+choose it by accident.
+
 ### Outbound I/O on the worker's poller
 
 Outbound connections, the DNS resolver, TLS, the HTTP client, PostgreSQL and Redis all

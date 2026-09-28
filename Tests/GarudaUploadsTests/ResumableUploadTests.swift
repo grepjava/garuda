@@ -61,6 +61,10 @@ private final class DigestsSeen: @unchecked Sendable {
     var digests: [[UInt8]?] = []
 }
 
+private func digestOnThisThread(_ upload: CompletedUpload) -> [UInt8]? {
+    upload.digest()
+}
+
 /// Where the upload lives: in the final response while it is still open, and
 /// in the 104 for a client that completed it in one request.
 private func uploadURL(_ response: TestResponse) -> String? {
@@ -805,6 +809,21 @@ struct ResumableUploadTests {
         #expect(try listUploads(store).isEmpty)
     }
 
+    @Test func anUploadInOneRequestIsHashedAsItArrives() throws {
+        // Several reads' worth, so the hash is made a piece at a time and the
+        // pieces have to add up to what the file holds.
+        let whole = pattern(700 * 1024 + 13)
+        let store = try FileUploadStore(directory: temporaryDirectory())
+        let app = uploadApp(store)
+        let asked = try app.test.post("/files", body: whole, headers: [
+            ("Upload-Complete", "?1"), ("Want-Repr-Digest", "sha-256=1"),
+            ("Repr-Digest", Digest.field(Digest.sha256(whole))),
+        ])
+        #expect(asked.status == 201, "\(asked.status) \(asked.text)")
+        #expect(header(asked, "repr-digest") == Digest.field(Digest.sha256(whole)))
+        #expect(completed.first?.bytes == whole)
+    }
+
     @Test func aClientCanAskWhatTheUploadsDigestIs() throws {
         let store = try FileUploadStore(directory: temporaryDirectory())
         let app = uploadApp(store)
@@ -832,9 +851,10 @@ struct ResumableUploadTests {
         let store = try FileUploadStore(directory: temporaryDirectory())
         let app = Application()
         app.resumableUploads("/files", store: store, progressInterval: 0) { upload in
-            seen.digests.append(upload.digest())
-            // The same, hashed on the blocking pool rather than the worker.
-            seen.digests.append(await upload.digestInBackground())
+            seen.digests.append(await upload.digest())
+            // The same, hashed on the calling thread, from code that is not
+            // async -- the only place that overload can be called.
+            seen.digests.append(digestOnThisThread(upload))
             return Text("ok", status: .created)
         }
         // Computed for the check, and handed on rather than computed again.

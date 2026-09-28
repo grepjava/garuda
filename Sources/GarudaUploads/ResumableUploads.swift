@@ -152,19 +152,21 @@ public struct CompletedUpload: Sendable {
     /// Worth storing beside whatever the bytes become: it is what lets a
     /// client be told later that what it sent is what is held.
     ///
-    /// The file is read on the calling thread, which in a handler is the
-    /// worker's: every other request on it waits while the whole upload is
-    /// hashed, about 30 ms for each 15 MB on a CPU without SHA instructions.
-    /// In a handler, use `digestInBackground()`.
-    public func digest() -> [UInt8]? {
-        sha256 ?? Digest.sha256(contentsOfFile: path)
-    }
-
-    /// The same, with the file read and hashed on the blocking pool, so the
-    /// worker goes on serving other requests meanwhile.
-    public func digestInBackground() async -> [UInt8]? {
+    /// The file is read and hashed on the blocking pool, so the worker goes on
+    /// serving other requests meanwhile: hashed there, 15 MB takes about 30 ms
+    /// on a CPU without SHA instructions, and every request on the worker
+    /// would wait for it.
+    public func digest() async -> [UInt8]? {
         if let sha256 { return sha256 }
         return await fileSHA256(path)
+    }
+
+    /// The same, read on the calling thread, for code that is not a handler.
+    /// In a handler the `async` one is chosen, so this cannot block a worker
+    /// by accident.
+    @available(*, noasync, message: "hashes on the calling thread; use 'await digest()'")
+    public func digest() -> [UInt8]? {
+        sha256 ?? Digest.sha256(contentsOfFile: path)
     }
 
     /// Removes the upload and its bytes, once they have been moved or used.
@@ -602,9 +604,18 @@ final class UploadService: @unchecked Sendable {
         }
         var sinceProgress = 0
         let start = handle.offset
-        // Only when the client said what these bytes should be: hashing what
-        // nobody will check is a pass over every byte for nothing.
-        let running = contentDigest == nil ? nil : SHA256Digest()
+        // The Repr-Digest the upload was created with, checked once it has all
+        // come -- which it has only if this request says so.
+        let declared = complete
+            ? (try? store.info(id))?.reprDigest.flatMap({ Digest.sha256(field: $0) }) : nil
+        // A request that carries the whole upload -- most do, a photo sent in
+        // one go -- hashes it as it arrives, so the digest is ready when the
+        // last byte is, rather than the file being read back to make it.
+        let whole = start == 0 && complete
+        let wantsWhole = declared != nil || wantsDigest
+        // Otherwise only when the client said what these bytes should be:
+        // hashing what nobody will check is a pass over every byte for nothing.
+        let running = contentDigest != nil || (whole && wantsWhole) ? SHA256Digest() : nil
         do {
             while let bytes = try await body.read(maxBytes: 256 * 1024) {
                 if let length, handle.offset + bytes.count > length {
@@ -677,12 +688,19 @@ final class UploadService: @unchecked Sendable {
             response.addHeader("Upload-Offset", "\(offset)")
             return tooSmall(response, "the upload is shorter than min-size")
         }
-        // The whole upload, now that there is a whole upload: one pass over
-        // the file, and only when somebody asked for it.
+        // The whole upload, now that there is a whole upload, and only when
+        // somebody asked for it: hashed already if this request carried all
+        // of it, or one pass over the file if it took several.
         var sha256: [UInt8]? = nil
-        if let declared = (try? store.info(id))?.reprDigest.flatMap({ Digest.sha256(field: $0) }) {
-            guard let actual = await fileSHA256(store.dataPath(id)),
-                  Digest.equal(actual, declared) else {
+        if wantsWhole {
+            if whole, let running {
+                sha256 = running.digest()
+            } else {
+                sha256 = await fileSHA256(store.dataPath(id))
+            }
+        }
+        if let declared {
+            guard let actual = sha256, Digest.equal(actual, declared) else {
                 // Whole and wrong: appending cannot mend it, so it goes, and
                 // the client starts again rather than holding a name for
                 // bytes nobody will accept.
@@ -691,9 +709,6 @@ final class UploadService: @unchecked Sendable {
                 return problem(response, .badRequest, UploadProblem.mismatchingDigest,
                                "the upload is not what Repr-Digest says", [])
             }
-            sha256 = actual
-        } else if wantsDigest {
-            sha256 = await fileSHA256(store.dataPath(id))
         }
         try store.update(id, length: offset, complete: true)
         handle.release()

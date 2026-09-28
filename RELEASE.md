@@ -35,7 +35,7 @@ than one.
 ```bash
 swift build -c release
 swift test                             # 1093 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
-bash scripts/compile-fail-test.sh      # 11
+bash scripts/compile-fail-test.sh      # 18
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 105
 bash scripts/compress-test.sh          # 76, and garuda-conformance
@@ -94,11 +94,20 @@ nothing relevant.
 
 - Resumable uploads hash a finished upload on the blocking pool, not the
   worker, when the client sent `Repr-Digest` or `Want-Repr-Digest`, and
-  `CompletedUpload.digestInBackground()` does the same for a handler.
-  `digest()` hashes on the worker, and says so now. On a CPU without SHA
-  instructions, two clients sending 15 MB files back to back took a worker
-  from 2,000 answers a second to 500, the rest waiting seconds; with both
-  changes it keeps 2,000 with p99 1.9 ms. The files example uses the new call.
+  `CompletedUpload.digest()` in a handler does the same: it is now `async`
+  and has to be awaited. The overload that hashes on the calling thread is
+  still there for code that is not async, and marked `noasync`, so a handler
+  cannot pick it by accident. On a CPU without SHA instructions, two clients
+  sending 15 MB files back to back took a worker from 2,000 answers a second
+  to 500, the rest waiting seconds; with both changes it keeps 2,000 with p99
+  1.9 ms. An upload whose bytes all come in one request -- a photo, usually --
+  is hashed as they arrive when its digest is wanted, rather than read back
+  from the file afterwards.
+
+- EXAMPLES.md says that waiting on an external program in a handler is
+  blocking work, to be run in `blocking { }` with no lock of its own around
+  it, and that decoding an image once in-process beats launching tools per
+  request.
 
 - A request waiting for an `SQLiteDatabase` connection gets the next one given
   back. The connection was marked free and the waiter only woken, so whoever

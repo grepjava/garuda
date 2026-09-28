@@ -94,7 +94,7 @@ public func filesApp(_ configuration: FilesConfiguration) -> Application {
         let name = safeName(asked) ?? upload.info.id
         // Hashed off the worker: a whole file takes long enough to hold up
         // every other request on it.
-        let digest = await upload.digestInBackground() ?? []
+        let digest = await upload.digest() ?? []
 
         // Renamed rather than copied: the two directories are in the same
         // filesystem, so the file appears under its name whole or not at all.
