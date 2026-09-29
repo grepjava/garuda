@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/garuda.png" alt="Garuda, a Swift server framework" width="720">
+</p>
+
 # Garuda
 
 Garuda is a Swift web framework and the HTTP server underneath it. It is my attempt to create a spiritual successor to [Kitura](https://github.com/Kitura/Kitura): a server written in Swift, with its own HTTP engine, for the protocols and the application features a production service needs today.
