@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/garuda-stylized-lockup-tamil5.png" alt="Garuda" width="640">
-</p>
-
 # Architecture
 
 Garuda is one Swift executable: the `Garuda` library plus the routes an

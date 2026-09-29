@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/garuda-stylized-lockup-tamil5.png" alt="Garuda" width="640">
-</p>
-
 # Releases
 
 **1.0.0 is Garuda's first release.** The tags `v1.0.0` to `v1.1.5` that were

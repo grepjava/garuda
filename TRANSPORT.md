@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/garuda-stylized-lockup-tamil5.png" alt="Garuda" width="640">
-</p>
-
 # Transports
 
 What each protocol implementation does and enforces. The process model,

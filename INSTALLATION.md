@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/garuda-stylized-lockup-tamil5.png" alt="Garuda" width="640">
-</p>
-
 # Installing Garuda
 
 Garuda is built from source with SwiftPM. There are no prebuilt binaries. You

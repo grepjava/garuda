@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/garuda-stylized-lockup-tamil5.png" alt="Garuda" width="640">
-</p>
-
 # Configuring Garuda
 
 Garuda is configured on the command line. There is no configuration file. A

@@ -1,35 +1,44 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/garuda-stylized-lockup-tamil5.png" alt="Garuda" width="720">
-</p>
+# Garuda
 
-<p align="center">
-  <b>A Swift web framework with its own HTTP engine.</b><br>
-  HTTP/1.1, HTTP/2 and HTTP/3, TLS and ACME, typed handlers, PostgreSQL, Redis, SQLite, streaming, WebTransport.<br>
-  No Foundation, no SwiftNIO.
-</p>
+Garuda is a Swift web framework and the HTTP server underneath it. It is my attempt to create a spiritual successor to [Kitura](https://github.com/Kitura/Kitura): a server written in Swift, with its own HTTP engine, for the protocols and the application features a production service needs today.
+
+Handlers run on the worker thread that read the request, with no scheduling hop before a response that can be sent at once. Swift 6.2 or newer. No Foundation, no SwiftNIO.
+
+This project is an independent effort. It is not an IBM product, and it is not a continuation maintained by the Kitura project.
 
 <p align="center">
   <a href="https://github.com/grepjava/garuda/blob/main/LICENSE"><img src="https://img.shields.io/github/license/grepjava/garuda" alt="MIT license"></a>
 </p>
 
----
+**Released: 1.0.** The surface below is implemented and tested. [COMPATIBILITY.md](COMPATIBILITY.md) says what a release may change, and [Status](#status) below lists what is missing.
 
-Garuda is a web framework and the server under it, written together in Swift.
-The goal is a server that stands with the best in any language: correct and
-strict on every protocol it speaks, safe by construction, pleasant to build an
-API in, and fast. Handlers run on the worker thread that read the request, with
-no scheduling hop before a response that can be sent at once.
+## Features
 
-**Released: 1.0.** Routes, groups and middleware; synchronous and async
-handlers; typed extraction and answers; per-worker state; deadlines; an HTTP
-client; PostgreSQL, Redis and SQLite drivers; streamed responses and request
-bodies; server-sent events; WebSockets; resumable uploads; WebTransport. All
-tested. [COMPATIBILITY.md](COMPATIBILITY.md) says what a release may change,
-and [Status](#status) below lists what is missing.
+| Area | What Garuda provides |
+| --- | --- |
+| HTTP | HTTP/1.1 with a parser strict where that prevents request smuggling, HTTP/2 over TLS and in cleartext, and HTTP/3 over QUIC |
+| TLS and certificates | TLS 1.2 and 1.3, several certificates chosen by SNI, and ACME renewal with tls-alpn-01 on the port already served |
+| Handlers | Routes, groups, and middleware. A synchronous handler is a direct call on the worker thread. An async handler runs on a task reused from that worker's pool |
+| Typed API | Extractors for path, query, JSON body, form, and multipart. Answers as JSON, HTML, text, bytes, or a redirect. A type can validate its values; every broken rule is returned together as 422 |
+| OpenAPI | An OpenAPI 3.1 document generated from the routes, and Swagger UI |
+| Application middleware | Deadlines, CORS, bearer and basic authentication, authorization policies, CSRF protection, security headers, signed and encrypted cookies, and sessions in memory, Redis, or SQLite |
+| Identity | JWT (HS, RS, PS, ES, and EdDSA), JWKS verification, rotating refresh tokens, and PBKDF2-HMAC-SHA256 password hashing |
+| HTTP client | HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed bodies, and server-sent events |
+| Data | PostgreSQL and Redis on the worker's poller, including Redis Cluster and Sentinel, and SQLite through the system's libsqlite3 |
+| Streaming | Streamed responses and request bodies, server-sent events, broadcast across worker processes, and interim 1xx responses such as 103 Early Hints |
+| WebSockets | WebSockets over HTTP/1.1, HTTP/2, and HTTP/3. The engine joins fragments, checks UTF-8, answers pings, and supports permessage-deflate |
+| WebTransport | WebTransport over HTTP/3 on the same port and routes, with bidirectional and unidirectional streams and datagrams |
+| IETF Resumable Uploads | The IETF resumable upload protocol (draft-ietf-httpbis-resumable-upload, interop version 9). A client cut off mid-upload resumes on any worker and over any of the three HTTP protocols |
+| Files and compression | Static files with sendfile, ETag, and byte ranges, including precompressed copies. Response and request compression with brotli, zstd, and gzip |
+| Request limits | A body limit and a concurrency limit on a group of routes. Rate limiting counted across workers |
+| Edge policy | HTTPS redirect, HSTS, trusted proxy headers, allowed hosts, and client address allow and deny lists |
+| Operations | Prometheus metrics, health checks, request IDs, W3C trace context, an access log, a shared response cache, graceful shutdown, and reload on SIGHUP. Unix sockets and more than one worker |
+| Tracing | Spans through swift-distributed-tracing for the request, outbound HTTP, PostgreSQL, and Redis |
+| Tests | `app.test` runs the real engine in the test process, over a socket pair |
+| Process model | A supervisor accepts connections and forks one process per worker. In-memory state is per worker |
+| Platforms | Linux and macOS 15, on Swift 6.2 or newer |
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/features.png" alt="What Garuda has: HTTP/1.1, HTTP/2 and HTTP/3 over QUIC; TLS 1.2 and 1.3; ACME; WebSocket over HTTP/1.1, HTTP/2 and HTTP/3; WebTransport; server-sent events; cross-worker broadcast; resumable uploads; streamed bodies; static files with ranges; brotli, zstd and gzip; typed extraction; OpenAPI; PostgreSQL, Redis and SQLite; JWT and JWKS; metrics and health checks. Not built in: QUIC 0-RTT, kernel TLS, multipart/byteranges, Redis replica reads, Windows outside WSL 2." width="960">
-</p>
+Outside this release: QUIC 0-RTT and QUIC session resumption, kernel TLS, `multipart/byteranges`, reads from Redis replicas, and Windows other than through WSL 2.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/benchmark-256.png" alt="Requests per second at 256 connections: ntex 181,303, axum 176,794, Garuda 174,575, Elysia on Bun 167,754, Hummingbird 62,068, Vapor 48,359" width="900">
@@ -41,6 +50,8 @@ always measured last. **Garuda's range and axum's overlap, so these rounds do
 not separate them**; ntex is ahead of both, and Garuda is 2.8x Hummingbird and
 3.6x Vapor. [BENCHMARKS.md](BENCHMARKS.md) has the method, the rounds behind
 each bar, and the runs where Garuda is slower.
+
+External benchmark: [the-benchmarker](https://web-frameworks-benchmark.netlify.app/result?l=swift&f=garuda) measures Garuda on its own hardware and load command. The chart above is a separate run on our hardware.
 
 ## Quick start
 
@@ -87,10 +98,7 @@ on PostgreSQL.
 
 ### Routes and typed handlers
 
-Routes are registered with `get`, `head`, `post`, `put`, `delete`, `patch`,
-`options` or `on`. A path segment is a literal, a `:param` or a trailing
-`*rest`. HEAD falls back to GET, and a known path under the wrong method is 405
-with `Allow`.
+Routes are registered with `get`, `head`, `post`, `put`, `delete`, `patch`, `options`, or `on`. A path segment is a literal, a parameter (`:param`), or a trailing rest segment (`*rest`). HEAD falls back to GET, and a known path under the wrong method is 405 with `Allow`.
 
 A handler declares what it needs and returns what it means:
 
@@ -112,27 +120,21 @@ app.post("/login") { (form: Form<Credentials>) in Redirect(to: "/") }
 - **Errors:** a thrown `ResponseError` is the response.
   `throw HTTPError(.conflict, "the name is taken")` answers 409 with
   `{"error":"the name is taken"}`. Anything else thrown is a 500 and a log line.
-- **Rules:** a type saying what its values have to be, beyond their shape,
-  conforms to `Validated`, and whatever is decoded from a request is held to
-  them before the handler runs:
+- **Rules:** a type saying what its values have to be, beyond their shape, conforms to `Validated`, and whatever is decoded from a request is held to them before the handler runs.
 
-  ```swift
-  struct NewOrder: Decodable, Validated {
-      let quantity: Int
-      let email: String
+```swift
+struct NewOrder: Decodable, Validated {
+    let quantity: Int
+    let email: String
 
-      func validate(_ check: inout Validation) {
-          check.range("quantity", quantity, atLeast: 1, atMost: 100)
-          check.email("email", email)
-      }
-  }
-  ```
+    func validate(_ check: inout Validation) {
+        check.range("quantity", quantity, atLeast: 1, atMost: 100)
+        check.email("email", email)
+    }
+}
+```
 
-  Every broken rule is answered at once, as 422 with the fields named:
-  `{"error":"quantity must be at least 1","fields":[{"field":"quantity",
-  "message":"must be at least 1"}]}`. A decoding failure fills `fields` the
-  same way, from the path it already reports, so one answer tells a form where
-  each message goes whichever of the two refused the request.
+Every broken rule is answered at once, as 422 with the fields named: `{"error":"quantity must be at least 1","fields":[{"field":"quantity","message":"must be at least 1"}]}`. A decoding failure fills `fields` the same way, from the path it already reports, so one answer tells a form where each message goes whichever of the two refused the request.
 
 JSON goes through Garuda's own coder over `Encodable` and `Decodable`, which
 reads only the keys a type asks for, straight from the request bytes. `@JSON`
