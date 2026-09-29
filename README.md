@@ -21,7 +21,7 @@ let app = Router::new().route("/person/{id}", get(person));
 
 ```swift
 // Garuda
-app.get("/person/:id") { (id: Path<Int>) in
+app.get("/person/:id") { (id: Path<Int>) async in
     JSON(Person(id: id.value, name: "Ada"))
 }
 ```
@@ -108,7 +108,7 @@ import Garuda
 struct Person: Codable { let id: Int; let name: String }
 
 let app = Application()
-app.get("/person/:id") { (id: Path<Int>) in
+app.get("/person/:id") { (id: Path<Int>) async in
     JSON(Person(id: id.value, name: "Ada"))
 }
 exit(app.run())
@@ -133,9 +133,9 @@ Routes are registered with `get`, `head`, `post`, `put`, `delete`, `patch`, `opt
 A handler declares what it needs and returns what it means:
 
 ```swift
-app.get("/search") { (query: Query<Search>) in JSON(results(for: query.value)) }
-app.post("/people") { (body: Body<NewPerson>) in JSON(create(body.value), status: .created) }
-app.post("/login") { (form: Form<Credentials>) in Redirect(to: "/") }
+app.get("/search") { (query: Query<Search>) async in JSON(results(for: query.value)) }
+app.post("/people") { (body: Body<NewPerson>) async in JSON(create(body.value), status: .created) }
+app.post("/login") { (form: Form<Credentials>) async in Redirect(to: "/") }
 ```
 
 - **Extractors:** `Path<T>` (the next path parameter, percent-decoded),
@@ -195,7 +195,7 @@ Garuda that needs swift-syntax.
 Under the typed API, a handler can take the request and response directly:
 
 ```swift
-app.get("/user/:id") { request, response in
+app.onAsync(.get, "/user/:id") { request, response in
     request.withParameter(0) { response.send($0) }   // lent bytes, no copy
 }
 ```
@@ -259,7 +259,7 @@ app.state { _ in PostgresPool(PostgresConfiguration(host: "db", user: "app", pas
 app.group("/api") {
     app.cors(CORSPolicy(origins: ["https://app.example.com"], allowCredentials: true))
     app.authenticate(bearer: CurrentUser.self) { token in try await sessions.user(token) }
-    app.use { request, response in
+    app.use { request, response async throws -> (any ResponseConvertible)? in
         response.onSend { outgoing in outgoing.addHeader("cache-control", "no-store") }
         return nil
     }
@@ -477,7 +477,7 @@ app.webSocket("/chat/:room") { (ws: WebSocket, room: Path<String>) async throws 
 
 struct Said: Codable { var text: String }
 let lobby = Topic("lobby")
-app.post("/say") { (said: Body<Said>) in
+app.post("/say") { (said: Body<Said>) async in
     try lobby.publish(said.value.text, event: "said")   // heard by subscribers on every worker
     return HTTPStatus.noContent
 }
