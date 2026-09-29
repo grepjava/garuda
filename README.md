@@ -26,7 +26,13 @@ app.get("/person/:id") { (id: Path<Int>) in
 }
 ```
 
-Handlers run on the worker thread that read the request, with no scheduling hop before a response that can be sent at once. Swift 6.2 or newer. No Foundation, no SwiftNIO.
+The key difference is where the handler runs. axum makes every handler a future and runs it on Tokio, a work-stealing scheduler: an idle thread takes a waiting task from a busy one. SwiftNIO is that design in Swift. An event loop owns the socket, and the handler is a task the runtime resumes.
+
+Garuda does not use either. The worker thread that read the request runs the handler, and a response that can be sent at once is written on that thread. There is no hop onto a scheduler before those bytes go out, which is what SwiftNIO would insert between the read and the write. The engine parses HTTP/1.1, HTTP/2 and HTTP/3 itself.
+
+A worker is one process and one thread. Nothing is shared across workers, so nothing is locked, and a crash takes only that worker's connections. That boundary matters more in Swift than in Rust: a force-unwrapped `nil` ends the process, where Tokio catches a panic inside the task that raised it. Processes cannot steal tasks from each other. A worker that is ahead leaves new connections to the others, and can hand idle HTTP/1 keep-alive connections to a worker where they would not wait (`--balance`). [One process per worker](#one-process-per-worker) has the rest.
+
+Swift 6.2 or newer. No Foundation, no SwiftNIO.
 
 This project is an independent effort. It is not an IBM product, and it is not a continuation maintained by the Kitura project.
 
