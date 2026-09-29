@@ -6,6 +6,26 @@
 
 Garuda is a Swift web framework and the HTTP server underneath it. It is my attempt to create a spiritual successor to [Kitura](https://github.com/Kitura/Kitura): a server written in Swift, with its own HTTP engine, for the protocols and the application features a production service needs today.
 
+The application API is modelled after [axum](https://github.com/tokio-rs/axum). Routes, typed extractors, and the set of features a production framework is expected to offer follow axum's shape. [Garuda and axum](#garuda-and-axum) compares the two area by area. The HTTP engine is Garuda's own.
+
+The same route in each. axum names the parameter in braces; Garuda uses a colon. Both take it as a typed `Path` and answer JSON.
+
+```rust
+// axum
+async fn person(Path(id): Path<i32>) -> Json<Person> {
+    Json(Person { id, name: "Ada".into() })
+}
+
+let app = Router::new().route("/person/{id}", get(person));
+```
+
+```swift
+// Garuda
+app.get("/person/:id") { (id: Path<Int>) in
+    JSON(Person(id: id.value, name: "Ada"))
+}
+```
+
 Handlers run on the worker thread that read the request, with no scheduling hop before a response that can be sent at once. Swift 6.2 or newer. No Foundation, no SwiftNIO.
 
 This project is an independent effort. It is not an IBM product, and it is not a continuation maintained by the Kitura project.
@@ -555,9 +575,9 @@ port: parsing, routing, middleware, handlers, timers and the response path.
 
 ## Garuda and axum
 
-[axum](https://github.com/tokio-rs/axum) is a mature, widely used framework, so
-it is a useful reference for what a production web framework is expected to
-offer. This is where Garuda stands, area by area.
+The application API is modelled after [axum](https://github.com/tokio-rs/axum).
+axum is a mature, widely used framework, so this is where Garuda stands against
+it, area by area.
 
 | Area | axum (Tokio) | Garuda |
 |---|---|---|
