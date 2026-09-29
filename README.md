@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/garuda-hero.png" alt="Garuda, a Swift server framework" width="720">
+  <img src="assets/garuda-hero.png?v=2" alt="Garuda, a Swift server framework" width="720">
 </p>
 
 # Garuda
