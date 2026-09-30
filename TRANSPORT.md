@@ -27,7 +27,10 @@ request is. All three share one path.
   fields, so dispatch, handlers, timers and cancellation work on it unchanged.
 - **The head is rebuilt as HTTP/1.1 text** in the stream's `headStore` after
   validation, and parsed by the HTTP/1.1 parser: one copy and one parse per
-  request. `:authority` becomes `Host`.
+  request. `:authority` becomes the one `Host` line. A Host field sent
+  beside it must name the same authority, ignoring case, or the request is
+  malformed (RFC 9113 8.3.1, RFC 9114 4.3.1); an empty `:authority` beside a
+  Host included.
 - **The response is one call with three encodings**: header text on HTTP/1.1,
   HPACK in `respondH2`, QPACK in `respondH3`. A declared `Content-Length` is
   enforced on all three: a longer body is cut to it, a shorter one closes the
@@ -164,7 +167,8 @@ A WINDOW_UPDATE raises the connection window to match the stream window.
 - A header block cannot be interleaved with other frames. CONTINUATION
   assembly past twice the header list limit: `GOAWAY(ENHANCE_YOUR_CALM)`.
 - Pseudo-headers must come first, once each, from `:method`, `:path`,
-  `:scheme`, `:authority`; the first three are required. Field names and values
+  `:scheme`, `:authority`; the first three are required. A `Host` beside
+  `:authority` must match it. Field names and values
   are validated. Connection-specific fields other than `te: trailers`, and
   `Transfer-Encoding: chunked`, are malformed. A malformed request gets
   `RST_STREAM(PROTOCOL_ERROR)`; an HPACK failure `GOAWAY(COMPRESSION_ERROR)`.
@@ -313,7 +317,8 @@ streams.
   SETTINGS, or a second SETTINGS closes the connection. Losing the peer's
   control stream: `H3_CLOSED_CRITICAL_STREAM`.
 - Unknown unidirectional stream types get `STOP_SENDING`.
-- Malformed request: reset with `H3_MESSAGE_ERROR`. QPACK failure:
+- Malformed request, including a `Host` that differs from `:authority`:
+  reset with `H3_MESSAGE_ERROR`. QPACK failure:
   `QPACK_DECOMPRESSION_FAILED`. No free slot: `H3_REQUEST_REJECTED`.
 - A body that disagrees with its `Content-Length` is reset with
   `H3_MESSAGE_ERROR` (RFC 9114 4.1.2). Past `--max-body`: 413.

@@ -7,6 +7,13 @@ built after the fork, and none blocks a worker's thread. The network drivers
 are written in Swift and wrap no client library such as libpq or hiredis;
 SQLite is the system's own library, loaded at run time.
 
+The PostgreSQL, Redis and SQLite pools wait alike. A request waiting for a
+connection is given the next one released, oldest waiter first, so a handler
+running statements back to back cannot keep taking the connection it just
+gave back. A wait ends with its request: when the client hangs up or the
+request passes its deadline, the wait throws `cancelled` at once, rather than
+running into its own timeout and then running queries for nobody.
+
 This file covers what each connector supports, what it does not, and the work
 planned for each one. How to use them is in [README.md](README.md), and every
 change is in [RELEASE.md](RELEASE.md).
@@ -25,6 +32,12 @@ it. It resolves names on the poller, verifies TLS certificates, keeps
 connections for reuse, decodes compressed bodies and follows redirects when a
 policy allows them.
 
+Over HTTP/2 it holds the server to the same rules the server holds its
+clients to: a response head is limited to `maxHeadBytes` as it is assembled
+and as HPACK expands it, each stream keeps its own `maxBodyBytes`, a body
+that disagrees with its `Content-Length` is refused, and so are misplaced or
+repeated pseudo-fields and a 101. It sends `te: trailers`, which gRPC needs.
+
 ### Not supported
 
 - HTTP/3. The server speaks it, but the client does not.
@@ -34,8 +47,8 @@ policy allows them.
 
 - HTTP/3, when a server advertises it with Alt-Svc.
 - Proxies set in the configuration.
-- Streamed request and response bodies. Today the client holds a whole body in
-  memory, up to `maxBodyBytes`.
+- Streamed request bodies. A response can be read as it arrives, with
+  `client.stream`; a request body is still held whole in memory.
 
 ## PostgreSQL
 

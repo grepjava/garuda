@@ -1,6 +1,6 @@
 # Examples
 
-Two kinds of example: four runnable applications in [Examples/](Examples/),
+Two kinds of example: eight runnable applications in [Examples/](Examples/),
 and short recipes for common tasks below. Every recipe uses the public API and
 compiles as written. For flags, see [CONFIG.md](CONFIG.md); for middleware in
 depth, [MIDDLEWARE.md](MIDDLEWARE.md).
@@ -31,6 +31,9 @@ swift test                             # every example, through app.test
 | [Auth](Examples/Sources/AuthExample/AuthApp.swift) | Sign-up, login and logout: PBKDF2 password hashes on the blocking pool, random tokens stored as digests, `authenticate(bearer:state:)`, and `SignedInUser`, an async extractor | `curl -s localhost:8080/signup -d '{"username":"ada","password":"correct horse"}'` |
 | [Streaming](Examples/Sources/StreamingExample/StreamingApp.swift) | `EventStream`, a CSV export written as it is produced with backpressure, uploads written to disk as they arrive | `curl -N localhost:8080/countdown?from=5` |
 | [Chat](Examples/Sources/ChatExample/ChatApp.swift) | Rooms over WebSockets and server-sent events, heard across every worker through `Topic`, with replay for reconnecting clients | `swift run chat -- --workers 4`, then open two browser windows |
+| [Files](Examples/Sources/FilesExample/FilesApp.swift) | Uploads that survive a dropped connection and downloads that resume: the resumable upload protocol, size limits at both ends, digests, and `--static-dir` serving the store with byte ranges | `curl -X POST --data-binary @photo.jpg -H 'Upload-Complete: ?1' localhost:8080/files` |
+| [Uploads](Examples/Sources/UploadsExample/UploadsApp.swift) | Per-user photo uploads: `resumableUploads` inside `group("/users/:user")`, bearer tokens guarding the upload's own URL, `onCreate` recording the owner, types checked from the bytes, `await upload.digest()`, an answer replayed with its `Location` | `curl -X POST --data-binary @cat.png -H 'Authorization: Bearer ada-token' -H 'Content-Type: image/png' -H 'Upload-Complete: ?1' localhost:8080/users/ada/photos` |
+| [WebTransport](Examples/Sources/WebTransportExample/WebTransportApp.swift) | A network probe over HTTP/3: `app.webTransport` with an extractor that refuses before a session starts, datagram round trips, download and upload tests on streams with backpressure, a server-opened stream, and a browser page trusting a self-signed certificate by its hash | `swift run webtransport -- --port 8443 --tls-cert cert.pem --tls-key key.pem`, then open `https://localhost:8443` |
 | [Starter](Examples/STARTER.md) | A whole application: PostgreSQL, accounts with JWT access and refresh tokens, migrations, settings from the environment, a cleanup job, OpenAPI, health and readiness, a deployment recipe | `swift run starter serve -- --port 8080` |
 
 Each example is a library target with one function that builds the

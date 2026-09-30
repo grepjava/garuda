@@ -318,7 +318,9 @@ app.post("/logout") { (body: Body<RefreshRequest>, issuer: State<TokenIssuer<Use
   for example.
 - A refused refresh is 400 `{"error":"invalid_grant"}` whatever the reason.
 - **Stores:** `MemoryRefreshTokenStore` for `--workers 1` and tests, which
-  lets expired families go by itself,
+  lets expired families go by itself (spent tokens of a live family are kept,
+  since presenting one again is how theft is noticed; `count` says how many
+  families and tokens it holds),
   `RedisRefreshTokenStore`, and `PostgresRefreshTokenStore` and
   `SQLiteRefreshTokenStore` (`createTables()` or `schema()`, and
   `deleteExpired()` now and then). Spending a token is atomic in each, so two
@@ -342,6 +344,10 @@ app.get("/me") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
   made-up key IDs or a provider outage cannot turn into a flood of requests.
 - Requests that arrive during a fetch wait for it. If a fetch fails, the keys
   already in hand keep working; with none yet, the answer is 503.
+- A set that arrives holding no key the verifier can use is an answer, not
+  a failure: it is how a provider withdraws a compromised key. Keys older
+  than `maxAgeSeconds` are dropped then, and keys still within it are kept
+  until they reach it.
 - A synchronous route cannot wait. One that finds the keys still to be
   fetched, or due again, answers 503 and starts the fetch, and the requests
   after it are checked with the keys it brings. Take `JWT` in an async route

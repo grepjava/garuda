@@ -30,7 +30,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1093 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1126 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 18
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 105
@@ -46,8 +46,8 @@ bash scripts/trace-context-test.sh     # 17
 bash scripts/drain-test.sh             # 14
 bash scripts/reload-test.sh            # 7
 python3 scripts/feature-test.py        # 62
-python3 scripts/http2-test.py          # 54
-python3 scripts/http3-test.py          # 72
+python3 scripts/http2-test.py          # 58
+python3 scripts/http3-test.py          # 76
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 143, runs garuda-conformance
 python3 scripts/websocket-test.py      # 104, runs garuda-conformance
@@ -73,6 +73,29 @@ nothing relevant.
 
 ## Unreleased
 
+- Two new examples. `swift run uploads` is per-user photo uploads:
+  `resumableUploads` inside `group("/users/:user")`, bearer tokens that guard
+  the upload's own URL as well as the route that creates it, `onCreate`
+  recording whose upload it is, image types checked from the file's first
+  bytes rather than the client's `Content-Type`, and an answer replayed with
+  its `Location`. `swift run webtransport` is a network probe over HTTP/3:
+  datagram round trips, download and upload throughput on streams with
+  backpressure, a stream the server opens, an extractor that refuses a session
+  before it starts, and a browser page that trusts a self-signed certificate
+  through `serverCertificateHashes`. Nine tests cover them through `app.test`,
+  and the probe was driven over QUIC with aioquic.
+
+- The documentation catches up with this release. TRANSPORT.md says a Host
+  beside `:authority` must match it; MIDDLEWARE.md that a JWK Set with no usable
+  key withdraws aged keys, and what `MemoryRefreshTokenStore.count` reports;
+  CONNECTORS.md that a pool hands a connection to its oldest waiter and ends a
+  wait with its request, what the HTTP/2 client refuses, and that responses
+  can already be streamed with `client.stream` -- it had listed them as future
+  work. README.md says a send on an ended WebSocket throws
+  `WebSocketError.closed` and that a completed upload's answer is replayed
+  with its `Location`. EXAMPLES.md had left the files example out, and the test
+  counts in README.md and here are those of a verified run.
+
 - A `--static-listing` page shows at most 10,000 entries, and says when there
   are more; `--static-listing-limit N` sets the limit, and 0 lifts it. A
   listing is built on the worker with a `stat` for every entry, so a
@@ -88,10 +111,11 @@ nothing relevant.
   to 0.8 s at a time. A handler now gets a few refills (about 1 MiB) before
   it waits for its socket's turn; upload throughput is unchanged.
 
-- Resumable uploads hash a finished upload on the blocking pool, not the
-  worker, when the client sent `Repr-Digest` or `Want-Repr-Digest`, and
-  `CompletedUpload.digest()` in a handler does the same: it is now `async`
-  and has to be awaited. The overload that hashes on the calling thread is
+- **Breaking:** `CompletedUpload.digest()` is now `async`, and a completion
+  handler that calls it without `await` no longer compiles -- the error names
+  the fix, `await digest()`. Resumable uploads hash a finished upload on the
+  blocking pool, not the worker, when the client sent `Repr-Digest` or
+  `Want-Repr-Digest`, and `digest()` in a handler does the same. The overload that hashes on the calling thread is
   still there for code that is not async, and marked `noasync`, so a handler
   cannot pick it by accident. On a CPU without SHA instructions, two clients
   sending 15 MB files back to back took a worker from 2,000 answers a second

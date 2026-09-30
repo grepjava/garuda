@@ -121,8 +121,9 @@ system packages, certificates and running as a service.
 [Examples/](Examples/README.md) has complete applications to run and copy
 from: a CRUD API on SQLite, accounts with hashed passwords and sessions,
 streaming both ways, chat rooms over WebSockets across workers, a file service
-with resumable uploads and ranged downloads, and a whole starter application
-on PostgreSQL.
+with resumable uploads and ranged downloads, per-user photo uploads that are
+authenticated and resumable, a network probe over WebTransport, and a whole
+starter application on PostgreSQL.
 
 ## Writing handlers
 
@@ -496,11 +497,14 @@ stream rather than ending it cleanly. A WebSocket handler sees whole messages:
 the engine joins fragments, checks UTF-8, answers pings, sends keepalive pings,
 runs the close handshake and, with `--ws-compress`, permessage-deflate. Messages
 the handler has not read wait in a bounded queue, and past it the socket is not
-read, so a fast sender is slowed. The same route serves WebSockets over
+read, so a fast sender is slowed. A send on a socket whose connection has
+ended throws `WebSocketError.closed`, so a room holding sockets learns who has
+gone rather than writing to them. The same route serves WebSockets over
 HTTP/1.1, HTTP/2 and HTTP/3; on the last two, flow control slows just that
 stream. WebTransport runs over HTTP/3 on the same
 port and routes, with bidirectional and unidirectional streams, datagrams and
-close codes.
+close codes. The [webtransport example](Examples/Sources/WebTransportExample/WebTransportApp.swift)
+uses all of them, with a page that runs it from a browser.
 
 ### Streamed request bodies and resumable uploads
 
@@ -559,6 +563,15 @@ nothing behind to expire.
 them whole: inside `group("/api")` the uploads live at `/api/uploads/:id` and
 that is what the `Location` says, and inside `group("/users/:user")` each
 upload's URL sits under the user whose request created it.
+
+The answer to the request that completes an upload is kept, `Location`
+included, and a GET of the upload's URL gives it again until `maxAge`: a
+client whose connection died as the upload finished still learns what became
+of it. An answer whose body is streamed is not kept, since its bytes are
+written after it has gone; return one whole if it should survive. The
+[uploads example](Examples/Sources/UploadsExample/UploadsApp.swift) puts
+this together: per-user photos, owned through `onCreate`, checked before
+they are kept, and resumable under a group.
 
 A 104 is an interim response, and an intermediary is free to drop one: a CDN or
 a reverse proxy in front of the server may give the client only the final 201.
@@ -739,9 +752,9 @@ These work without any handler code, set by flags:
 ## Tests
 
 ```bash
-swift test                                   # 1069 unit tests, and the fuzz corpus
-(cd Examples && swift test)                  # 14  the examples, through app.test
-bash scripts/compile-fail-test.sh            # 11  handler code that must not compile
+swift test                                   # 1126 unit tests, and the fuzz corpus
+(cd Examples && swift test)                  # 41  the examples, through app.test
+bash scripts/compile-fail-test.sh            # 18  handler code that must not compile
 ```
 
 The end-to-end suites run against a release build. Each takes a binary path as
@@ -751,7 +764,7 @@ its first argument. Most use `.build/release/garuda`; `handler-test.py`,
 
 ```bash
 bash scripts/integration-test.sh             # 36  HTTP/1.1 framing and smuggling defences
-bash scripts/static-test.sh                  # 93  --static-dir
+bash scripts/static-test.sh                  # 105 --static-dir
 bash scripts/compress-test.sh                # 76  --compress, --compress-static
 bash scripts/cache-test.sh                   # 85  --cache-size
 bash scripts/ratelimit-test.sh               # 18  --rate-limit
@@ -764,8 +777,8 @@ bash scripts/trace-context-test.sh           # 17  --trace-context
 bash scripts/drain-test.sh                   # 14  --drain-delay
 bash scripts/reload-test.sh                  #  7  SIGHUP under load
 python3 scripts/feature-test.py              # 62  shutdown, supervision, unix sockets, slow clients
-python3 scripts/http2-test.py                # 54  against the h2 library
-python3 scripts/http3-test.py                # 72  against aioquic
+python3 scripts/http2-test.py                # 58  against the h2 library
+python3 scripts/http3-test.py                # 76  against aioquic
 python3 scripts/router-streams-test.py       # 41  routes over HTTP/2 and HTTP/3
 python3 scripts/handler-test.py              # 143 the handler API over all three protocols
 python3 scripts/websocket-test.py            # 104 handshake, framing violations, closing, pings, deflate
@@ -826,7 +839,7 @@ work and reports it on the health check instead.
 | [EXAMPLES.md](EXAMPLES.md) | The runnable applications, and recipes: the per-worker model, settings, common tasks |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine is built |
 | [TRANSPORT.md](TRANSPORT.md) | What each protocol implementation does |
-| [Examples/README.md](Examples/README.md) | Five runnable applications and how they are laid out |
+| [Examples/README.md](Examples/README.md) | Eight runnable applications and how they are laid out |
 | [Examples/STARTER.md](Examples/STARTER.md) | The starter application: layout, configuration, migrations, deployment |
 | [CONNECTORS.md](CONNECTORS.md) | The HTTP client and database drivers: limits and future work |
 | [BENCHMARKS.md](BENCHMARKS.md) | Benchmark method and results |
