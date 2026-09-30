@@ -96,7 +96,7 @@ depends on the `Garuda` library:
 
 ```swift
 // Package.swift
-dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "1.0.0")],
+dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "1.1.0")],
 targets: [.executableTarget(name: "app", dependencies: [.product(name: "Garuda", package: "garuda")])]
 ```
 
@@ -777,7 +777,7 @@ bash scripts/trace-context-test.sh           # 17  --trace-context
 bash scripts/drain-test.sh                   # 14  --drain-delay
 bash scripts/reload-test.sh                  #  7  SIGHUP under load
 python3 scripts/feature-test.py              # 62  shutdown, supervision, unix sockets, slow clients
-python3 scripts/http2-test.py                # 58  against the h2 library
+python3 scripts/http2-test.py                # 62  against the h2 library
 python3 scripts/http3-test.py                # 76  against aioquic
 python3 scripts/router-streams-test.py       # 41  routes over HTTP/2 and HTTP/3
 python3 scripts/handler-test.py              # 143 the handler API over all three protocols
@@ -803,9 +803,11 @@ on a pull request: they are slow and want a QUIC stack.
 
 ## Status
 
-Garuda is 1.0, so a breaking change to the public API needs a major version.
+Garuda is past 1.0, so a breaking change to the public API needs a major
+version. 1.1.0 made one exception, one word long: `CompletedUpload.digest()`
+must now be awaited, and [RELEASE.md](RELEASE.md#110--2026-09-30) says why.
 [COMPATIBILITY.md](COMPATIBILITY.md) says what that covers and how much notice
-a change gets. Pin with `from: "1.0.0"`.
+a change gets. Pin with `from: "1.1.0"`.
 
 ### Known limits
 

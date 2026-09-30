@@ -17,7 +17,7 @@ describes them:
 So `from:` is the pin to use:
 
 ```swift
-.package(url: "https://github.com/grepjava/garuda", from: "1.0.0")
+.package(url: "https://github.com/grepjava/garuda", from: "1.1.0")
 ```
 
 Every release's changes are in [RELEASE.md](RELEASE.md), and anything that

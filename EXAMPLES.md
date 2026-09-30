@@ -44,7 +44,7 @@ function, so they exercise exactly the routes the executable serves.
 ## A first server
 
 ```swift
-// Package.swift: .package(url: "https://github.com/grepjava/garuda", from: "1.0.0")
+// Package.swift: .package(url: "https://github.com/grepjava/garuda", from: "1.1.0")
 // Sources/hello/main.swift
 import Glibc   // Darwin on macOS
 import Garuda

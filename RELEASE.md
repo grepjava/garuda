@@ -46,7 +46,7 @@ bash scripts/trace-context-test.sh     # 17
 bash scripts/drain-test.sh             # 14
 bash scripts/reload-test.sh            # 7
 python3 scripts/feature-test.py        # 62
-python3 scripts/http2-test.py          # 58
+python3 scripts/http2-test.py          # 62
 python3 scripts/http3-test.py          # 76
 python3 scripts/router-streams-test.py # 41
 python3 scripts/handler-test.py        # 143, runs garuda-conformance
@@ -72,6 +72,22 @@ nothing relevant.
 ---
 
 ## Unreleased
+
+## 1.1.0 — 2026-09-30
+
+Mostly fixes, found by review and by measuring what one slow request costs
+the others on its worker. Beside them: two new examples, the documentation
+brought up to date, and a few additions -- `onCreate` and
+`CompletedUpload.metadata` for resumable uploads, `--static-listing-limit`,
+`MemoryRefreshTokenStore.count`, and `replace` and `remove` on `SessionStore`,
+which have defaults, so a store of your own still compiles.
+
+**One change breaks source**, which [COMPATIBILITY.md](COMPATIBILITY.md) keeps
+for a major version: `CompletedUpload.digest()` is now `async`. A completion
+handler that calls it must add `await`, and the compiler's error says exactly
+that. It is in a minor release because the call it replaces hashed a whole
+upload on the worker's thread, holding every other request there for as long
+as that took, and the fix is one word. Nothing else that is covered changes.
 
 - Two new examples. `swift run uploads` is per-user photo uploads:
   `resumableUploads` inside `group("/users/:user")`, bearer tokens that guard
