@@ -3,6 +3,12 @@ import CAvian
 import AvianCore
 @testable import Garuda
 
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
 // `onStreamingBody`: a request body read as it arrives. And `sendInterim`.
 
 nonisolated(unsafe) private var bodyEvents: [String] = []
@@ -101,6 +107,13 @@ struct RequestBodyTests {
         }
         let client = app.testClient(configuration: config)
         let wire = try TestWire(client)
+        // A socket pair holds 8 KB on macOS, against hundreds on Linux: too
+        // little to have more waiting than a turn may read.
+        var room: Int32 = 1024 * 1024
+        for fd in [wire.fd, client.worker.pointee.table[wire.slot].pointee.fd] {
+            _ = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &room, socklen_t(MemoryLayout<Int32>.size))
+            _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &room, socklen_t(MemoryLayout<Int32>.size))
+        }
         let body = pattern(total)
         wire.send("PUT /big HTTP/1.1\r\nHost: test\r\nContent-Length: \(total)\r\n\r\n")
         var sent = 0
