@@ -583,7 +583,9 @@ struct SQLiteDatabaseTests {
         let file = TemporaryDatabase("handover")
         let app = Application()
         let path = file.path
-        nonisolated(unsafe) var order: [String] = []
+        /// The transactions in the order they ran.
+        final class Order: @unchecked Sendable { var names: [String] = [] }
+        let order = Order()
         app.state { _ in
             let db = try SQLiteDatabase(SQLiteConfiguration(path: path))
             databaseForTests = db
@@ -592,25 +594,25 @@ struct SQLiteDatabaseTests {
         app.get("/greedy") { (db: State<SQLiteDatabase>) async throws -> String in
             for i in 0..<4 {
                 try await db.value.transaction { _ in
-                    order.append("greedy\(i)")
+                    order.names.append("greedy\(i)")
                     await pause(20)
                 }
             }
             return "greedy"
         }
         app.get("/other") { (db: State<SQLiteDatabase>) async throws -> String in
-            try await db.value.transaction { _ in order.append("other") }
+            try await db.value.transaction { _ in order.names.append("other") }
             return "other"
         }
         let client = app.test
         let greedy = try TestWire(client)
         greedy.send("GET /greedy HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(greedy.turn(until: { !order.isEmpty }, turns: 200_000))
+        #expect(greedy.turn(until: { !order.names.isEmpty }, turns: 200_000))
         let other = try TestWire(client)
         other.send("GET /other HTTP/1.1\r\nHost: test\r\n\r\n")
         #expect(other.receive(turns: 2_000_000)?.hasSuffix("other") == true)
         #expect(greedy.receive(turns: 2_000_000)?.hasSuffix("greedy") == true)
-        #expect(order == ["greedy0", "other", "greedy1", "greedy2", "greedy3"], "\(order)")
+        #expect(order.names == ["greedy0", "other", "greedy1", "greedy2", "greedy3"], "\(order.names)")
     }
 
     @Test func aWaitForTheWriterGivesUpAtItsDeadline() throws {

@@ -291,7 +291,10 @@ def open_streams(server, topic, count):
 
 def across_workers():
     print("across workers")
-    with Server("--workers", "4") as server:
+    # The kernel's hash spreads connections. The shared listener of the
+    # default balancing wakes whichever worker is idle, and an idle server
+    # can give it thirty publishes in a row.
+    with Server("--workers", "4", "--balance", "reuseport") as server:
         streams = open_streams(server, "room", 16)
         pids = {s.pid for s in streams}
         check("event streams landed on more than one worker", len(pids) > 1, pids)
@@ -371,7 +374,8 @@ def across_workers():
 
 def websockets():
     print("websockets")
-    with Server("--workers", "4") as server:
+    # Spread by the kernel's hash, as across_workers explains.
+    with Server("--workers", "4", "--balance", "reuseport") as server:
         clients = [WebSocketClient(server, "/broadcast/chat/ws") for _ in range(12)]
         check("every upgrade was accepted", all(c.status == 101 for c in clients))
         pids = {c.receive() for c in clients}
