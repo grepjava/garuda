@@ -240,4 +240,63 @@ struct DeadlineTests {
             #expect(client.worker.pointee.asyncOps.liveCount == 0)
         }
     }
+
+    /// Every op in the pool taken, as a worker under pressure might have them:
+    /// what is left is given back afterwards.
+    private func fillOpPool(_ client: TestClient) -> [Int] {
+        var ops: [Int] = []
+        while let op = client.worker.pointee.asyncOps.allocate(slot: 0, requestId: 0, kind: .timer,
+                                                               deadlineUs: 0) {
+            ops.append(op.index)
+        }
+        return ops
+    }
+
+    /// A request dispatched while the op pool is full still has its deadline:
+    /// it is given an op as soon as one is free. It used to be dropped, and
+    /// the request ran unbounded however long the pool took to recover.
+    @Test func aDeadlineArmedWithTheOpPoolFullIsArmedOnceThereIsRoom() throws {
+        parkedPastDeadline = nil
+        let client = deadlineApp().test
+        let ops = fillOpPool(client)
+        let wire = try Wire(client)
+        wire.send("GET /park HTTP/1.1\r\nHost: test\r\n\r\n")
+        for _ in 0..<500 where parkedPastDeadline == nil { client.turn() }
+        #expect(parkedPastDeadline != nil)
+        #expect(client.worker.pointee.unarmedDeadlines.count == 1)
+        for op in ops { client.worker.pointee.asyncOps.free(op) }
+        #expect(wire.receiveStatus() == 504)
+        #expect(client.worker.pointee.unarmedDeadlines.isEmpty)
+        client.onWorker { parkedPastDeadline.take()?.resume() }
+        client.turn()
+        #expect(wire.pending() == 0)
+    }
+
+    /// With the pool full for longer than the deadline, the worker answers
+    /// 504 itself when the time is up.
+    @Test func aDeadlineIsKeptWhileTheOpPoolStaysFull() throws {
+        parkedPastDeadline = nil
+        let client = deadlineApp().test
+        let ops = fillOpPool(client)
+        let wire = try Wire(client)
+        wire.send("GET /park HTTP/1.1\r\nHost: test\r\n\r\n")
+        #expect(wire.receiveStatus() == 504)
+        #expect(client.worker.pointee.unarmedDeadlines.isEmpty)
+        for op in ops { client.worker.pointee.asyncOps.free(op) }
+        client.onWorker { parkedPastDeadline.take()?.resume() }
+        client.turn()
+        #expect(wire.pending() == 0)
+    }
+
+    /// A request that ends before its deadline leaves nothing behind for the
+    /// next one on its slot.
+    @Test func aDeadlineWithoutAnOpEndsWithItsRequest() throws {
+        let client = deadlineApp().test
+        let ops = fillOpPool(client)
+        let wire = try Wire(client)
+        wire.send("GET /quick HTTP/1.1\r\nHost: test\r\n\r\n")
+        #expect(wire.receiveStatus() == 200)
+        #expect(client.worker.pointee.unarmedDeadlines.isEmpty)
+        for op in ops { client.worker.pointee.asyncOps.free(op) }
+    }
 }

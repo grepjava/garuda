@@ -297,6 +297,9 @@ public final class PostgresPool: @unchecked Sendable {
                 waiting.remove(id)
                 throw .poolTimedOut
             case .cancelled:
+                // The same: a request that ended is not waiting any more, and
+                // while every connection stays held nothing would take it out.
+                waiting.remove(id)
                 throw .cancelled
             }
         }

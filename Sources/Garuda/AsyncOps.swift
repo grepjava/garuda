@@ -60,6 +60,14 @@ public struct AsyncOp {
     @inlinable public init() {}
 }
 
+/// A route deadline armed while the op pool was full (`Worker.armDeadline`).
+struct UnarmedDeadline {
+    var slot: Int32
+    var generation: UInt32
+    var requestId: UInt32
+    var deadlineUs: UInt64
+}
+
 /// Bounded free-list slab of async operations, one per worker.
 public struct AsyncOpPool {
     @usableFromInline var slots: UnsafeMutablePointer<AsyncOp>
@@ -420,9 +428,13 @@ extension Worker {
     /// request's continuation: the handler may be running, or parked on a
     /// timer of its own, and the deadline has to outlast either.
     ///
-    /// A full op pool arms nothing and says nothing. A deadline is a safety
-    /// net, and refusing to serve a request because the net could not be hung
-    /// would be a worse failure than the one it guards against.
+    /// A full op pool still serves the request: a deadline is a safety net,
+    /// and refusing a request because the net could not be hung would be a
+    /// worse failure than the one it guards against. The deadline is kept
+    /// on `unarmedDeadlines` instead, and `fireDueTimers` gives it an op
+    /// once there is room, or answers 504 itself when its time is up first.
+    /// Dropped, it was gone for good, and exactly when the worker was under
+    /// the most pressure.
     mutating func armDeadline(_ slot: Int, ms: UInt64) {
         disarmDeadline(slot)
         let c = table[slot]
@@ -430,6 +442,9 @@ extension Worker {
         guard let (index, generation) = asyncOps.allocate(
             slot: slot, requestId: c.pointee.requestId, kind: .deadline,
             deadlineUs: deadline) else {
+            unarmedDeadlines.append(UnarmedDeadline(
+                slot: Int32(slot), generation: c.pointee.generation,
+                requestId: c.pointee.requestId, deadlineUs: deadline))
             return
         }
         timerHeap.push(
@@ -444,6 +459,7 @@ extension Worker {
     /// request boundary: a deadline belongs to one request, and an op left
     /// armed would fire into whatever took the slot next.
     mutating func disarmDeadline(_ slot: Int) {
+        if !unarmedDeadlines.isEmpty { unarmedDeadlines.removeAll { Int($0.slot) == slot } }
         let c = table[slot]
         let index = Int(c.pointee.deadlineOp)
         let generation = c.pointee.deadlineOpGeneration
@@ -461,7 +477,48 @@ extension Worker {
         while let entry = timerHeap.popDue(nowUs: now, from: &asyncOps) {
             completeTimerOp(index: Int(entry.opIndex), generation: entry.opGeneration)
         }
+        // Deadlines first: they bound a request, where a timed wait without
+        // a timer still ends at the next loop turn after its time.
+        if !unarmedDeadlines.isEmpty { armDeadlines(nowUs: now) }
         if unarmedTimedWaits > 0 { armTimedWaits(nowUs: now) }
+    }
+
+    /// Gives each deadline armed without an op one, now that the pool may
+    /// have room, and answers those whose time is up. One whose request has
+    /// ended is dropped: `deadlineFired` would find it gone anyway.
+    mutating func armDeadlines(nowUs now: UInt64) {
+        var kept: [UnarmedDeadline] = []
+        let pending = unarmedDeadlines
+        unarmedDeadlines.removeAll(keepingCapacity: true)
+        for entry in pending {
+            let slot = Int(entry.slot)
+            let c = table[slot]
+            guard c.pointee.state != .free, c.pointee.generation == entry.generation,
+                  c.pointee.requestId == entry.requestId else { continue }
+            if now >= entry.deadlineUs {
+                deadlineFired(slot, generation: entry.generation, requestId: entry.requestId)
+                continue
+            }
+            guard let (index, generation) = asyncOps.allocate(
+                slot: slot, requestId: entry.requestId, kind: .deadline,
+                deadlineUs: entry.deadlineUs) else {
+                kept.append(entry)
+                continue
+            }
+            timerHeap.push(
+                TimerHeap.Entry(deadlineUs: entry.deadlineUs, opIndex: Int32(index),
+                                opGeneration: generation),
+                into: &asyncOps)
+            c.pointee.deadlineOp = Int32(index)
+            c.pointee.deadlineOpGeneration = generation
+        }
+        // Anything added while answering went on the emptied list.
+        unarmedDeadlines.append(contentsOf: kept)
+    }
+
+    /// When the earliest deadline without an op is due, for the poll timeout.
+    var earliestUnarmedDeadlineUs: UInt64? {
+        unarmedDeadlines.lazy.map(\.deadlineUs).min()
     }
 
     mutating func completeTimerOp(index: Int, generation: UInt32) {

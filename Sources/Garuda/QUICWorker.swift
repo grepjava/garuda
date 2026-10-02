@@ -37,7 +37,9 @@ extension Worker {
                 if q < UInt64(wait) { wait = Int32(q) }
             }
         }
-        if let at = timerHeap.nextDeadlineUs {
+        // A deadline the op pool had no room for wakes the loop as well.
+        let at = min(timerHeap.nextDeadlineUs ?? .max, earliestUnarmedDeadlineUs ?? .max)
+        if at != .max {
             let now = av_monotonic_us()
             if at <= now { return 0 }
             // Rounded up: waking before the deadline would only spin the loop.

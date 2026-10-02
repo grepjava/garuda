@@ -30,7 +30,7 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1126 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+swift test                             # 1130 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
 bash scripts/compile-fail-test.sh      # 18
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 105
@@ -72,6 +72,19 @@ nothing relevant.
 ---
 
 ## Unreleased
+
+- A route's deadline is kept when the worker's timer pool is full. It used
+  to be dropped without a word, and a request dispatched then ran unbounded
+  for good, exactly when the worker was under the most pressure. It is now
+  armed as soon as there is room, or answered 504 when its time comes first.
+- A request that ends while waiting for a pooled PostgreSQL or Redis
+  connection leaves the pool's queue at once. It used to stay until a
+  release reached it, so while every connection was held -- a long
+  transaction, a parked session -- each client that hung up grew the queue.
+- Redis Cluster pipelines and the upload store's expiry no longer do work
+  quadratic in their size: a pipeline of thousands of keys to one node, and
+  an upload directory with thousands of remembered answers, each scanned an
+  array once per entry.
 
 ## 1.1.0 — 2026-09-30
 

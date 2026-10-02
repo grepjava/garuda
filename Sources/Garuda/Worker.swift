@@ -197,6 +197,8 @@ public struct Worker: ~Copyable {
     var timedWaits: [Int32: TimedWaiter] = [:]
     /// How many of those have no timer yet, the op pool having been full.
     var unarmedTimedWaits = 0
+    /// Route deadlines with no op yet, for the same reason (AsyncOps.swift).
+    var unarmedDeadlines: [UnarmedDeadline] = []
     var nextTimedWait: Int32 = 0
     /// How many connections this worker actually opened, as against handed
     /// back from the pool. A test cannot otherwise tell reuse from a new one.

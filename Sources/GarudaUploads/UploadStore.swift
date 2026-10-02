@@ -326,7 +326,10 @@ public final class FileUploadStore: @unchecked Sendable {
             guard let info = try? info(id), info.createdAt < cutoff else { continue }
             if (try? forget(id)) != nil { removed += 1 }
         }
-        for id in answers where !ids.contains(id) {
+        // A set: an array asked once per answer made this quadratic, and it
+        // runs on the worker, from the request that creates an upload.
+        let live = Set(ids)
+        for id in answers where !live.contains(id) {
             guard let answer = try? answer(id), answer.createdAt < cutoff else { continue }
             _ = unlink(donePath(id))
         }

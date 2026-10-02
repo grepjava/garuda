@@ -288,7 +288,7 @@ public final class RedisCluster: RedisCommandSender, @unchecked Sendable {
                     if aim.asking { sending.append(RedisCommand("ASKING")) }
                     for index in pending[i].indices { sending.append(commands[index]) }
                 }
-                let kept = pending.indices.filter { !going.contains($0) }.map { pending[$0] }
+                let kept = pending.filter { $0.aim != aim }
                 let units = going.map { pending[$0] }
                 var again: [Unit] = []
                 do throws(RedisClientError) {
