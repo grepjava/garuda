@@ -107,8 +107,9 @@ final class HandlerTaskPool: @unchecked Sendable {
     }
 
     /// Hands `work` to an idle task, or to a new one while the pool is under
-    /// its limit, and runs it until it answers or waits. False when every
-    /// task is busy: the caller queues the request with `enqueue`.
+    /// its limit, and runs it until it answers or waits, or until the run's
+    /// budget is spent and the loop picks it up on its next turn. False when
+    /// every task is busy: the caller queues the request with `enqueue`.
     func start(_ work: Work) -> Bool {
         if idleCount > 0 {
             idleCount -= 1
@@ -127,15 +128,21 @@ final class HandlerTaskPool: @unchecked Sendable {
         return true
     }
 
-    /// Runs every job that is ready, then sends what they wrote. A streamed
-    /// body's writes are held while tasks run (`Worker.streamBody`), so
-    /// every place that runs tasks comes through here: a write left held
-    /// would sit until some unrelated event ended a batch. Only the
-    /// outermost run flushes, when every task in it has waited.
-    func runReady() {
+    /// Runs the jobs that are ready, up to `budget` of them, then sends what
+    /// they wrote. A streamed body's writes are held while tasks run
+    /// (`Worker.streamBody`), so every place that runs tasks comes through
+    /// here: a write left held would sit until some unrelated event ended a
+    /// batch. Only the outermost run flushes, when every task in it has
+    /// waited or the budget has run out.
+    ///
+    /// The budget is what keeps a task that never waits -- one calling
+    /// `Task.yield()` in a loop -- from holding the worker: the jobs left
+    /// over make `quicPollTimeout` zero, and the loop's next turn runs them
+    /// after it has seen to its sockets and timers.
+    func runReady(budget: Int = Worker.taskDrainBudget) {
         let outer = !worker.pointee.runningHandlerTasks
         worker.pointee.runningHandlerTasks = true
-        executor.drain()
+        executor.drain(budget: budget)
         guard outer else { return }
         worker.pointee.runningHandlerTasks = false
         if worker.pointee.deferredFlushCount > 0 { worker.pointee.runDeferredFlushes() }
@@ -190,12 +197,13 @@ final class HandlerTaskPool: @unchecked Sendable {
     /// than the engine is left to finish on its own.
     func shutdown() {
         while waiting.pop() != nil {}
-        runReady()
+        // Unbudgeted: there is no next turn of the loop to leave work for.
+        runReady(budget: .max)
         while idleCount > 0 {
             idleCount -= 1
             records[Int(idle[idleCount])].inbox.take()?.resume(returning: nil)
         }
-        runReady()
+        runReady(budget: .max)
     }
 
     private func spawn(_ index: Int, first: Work) {

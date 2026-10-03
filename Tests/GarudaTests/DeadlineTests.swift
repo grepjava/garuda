@@ -9,6 +9,11 @@ nonisolated(unsafe) private var parkedPastDeadline: UnsafeContinuation<Void, Nev
 nonisolated(unsafe) private var sawCancelled: Bool? = nil
 /// Whether `/park` ran on past its dropped `send`, rather than trapping.
 nonisolated(unsafe) private var ranPastLateSend = false
+/// How many times `/spin` yielded, and whether it saw its request cancelled.
+nonisolated(unsafe) private var spins = 0
+nonisolated(unsafe) private var spinSawCancelled: Bool? = nil
+/// What keeps `/spin-free` yielding, until a test lets it stop.
+nonisolated(unsafe) private var keepSpinning = false
 
 private func deadlineApp() -> Application {
     let app = Application()
@@ -43,6 +48,25 @@ private func deadlineApp() -> Application {
                 response.send("inner")
             }
         }
+    }
+    app.deadline(milliseconds: 5) {
+        // Never waits on the engine, only yields. Bounded, so that a worker
+        // that cannot get its turn back fails the test rather than hangs it.
+        app.onAsync(.get, "/spin") { _, response in
+            spins = 0
+            while !response.isCancelled && spins < 2_000_000 {
+                spins += 1
+                await Task.yield()
+            }
+            spinSawCancelled = response.isCancelled
+            response.send("spun")
+        }
+    }
+    // Outside every deadline block.
+    app.onAsync(.get, "/spin-free") { _, response in
+        let until = av_monotonic_ms() &+ 10_000
+        while keepSpinning && av_monotonic_ms() < until { await Task.yield() }
+        response.send("stopped")
     }
     // Outside every deadline block.
     app.onAsync(.get, "/unbounded") { _, response in
@@ -226,6 +250,39 @@ struct DeadlineTests {
         #expect(ranPastLateSend)
         // Nothing more went out on the wire.
         #expect(wire.pending() == 0)
+    }
+
+    /// A handler that only ever yields never waits on the engine, and used
+    /// to keep the worker running it until it stopped: its deadline did not
+    /// get a turn. Runs of the handler tasks are budgeted now, so the timer
+    /// fires, the client has its 504 and the handler sees the cancellation.
+    @Test func aHandlerThatOnlyYieldsStillMeetsItsDeadline() throws {
+        spinSawCancelled = nil
+        let client = deadlineApp().test
+        let wire = try Wire(client)
+        wire.send("GET /spin HTTP/1.1\r\nHost: test\r\n\r\n")
+        #expect(wire.receiveStatus() == 504)
+        for _ in 0..<5_000 where spinSawCancelled == nil { client.turn() }
+        #expect(spinSawCancelled == true)
+        #expect(spins < 2_000_000)
+        #expect(wire.pending() == 0)
+    }
+
+    /// Nor does a yielding handler keep the worker from other connections.
+    @Test func anotherConnectionIsAnsweredWhileAHandlerKeepsYielding() throws {
+        keepSpinning = true
+        defer { keepSpinning = false }
+        let client = deadlineApp().test
+        let spinning = try Wire(client)
+        spinning.send("GET /spin-free HTTP/1.1\r\nHost: test\r\n\r\n")
+        for _ in 0..<10 { client.turn() }
+        let other = try Wire(client)
+        other.send("GET /quick HTTP/1.1\r\nHost: test\r\n\r\n")
+        #expect(other.receiveStatus() == 200)
+        #expect(keepSpinning)
+        #expect(spinning.pending() == 0)
+        keepSpinning = false
+        #expect(spinning.receiveStatus() == 200)
     }
 
     /// A deadline is one op per request, and the request boundary is what

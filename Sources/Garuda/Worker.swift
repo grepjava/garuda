@@ -136,6 +136,11 @@ public struct Worker: ~Copyable {
     /// second iovec, and far less than the second write on TLS.
     static let heldBodyMinimum = 64 * 1024
     static let readyDrainBudget = 64
+    /// How many handler-task jobs one run of them may take before the loop
+    /// gets its turn back: a task that keeps yielding would otherwise keep
+    /// timers, deadlines and every other connection waiting for as long as
+    /// it did. What is left over makes the next poll not block.
+    static let taskDrainBudget = 64
     /// The tasks async handlers run on (HandlerTasks.swift), made on the first
     /// async request, and how many there may be.
     var handlerTasks: HandlerTaskPool? = nil

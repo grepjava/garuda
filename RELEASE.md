@@ -73,6 +73,13 @@ nothing relevant.
 
 ## Unreleased
 
+- A handler that never waits -- one calling `Task.yield()` in a loop -- no
+  longer holds its worker. The worker ran ready handler tasks until none was
+  left, which such a handler never allowed, so the route's deadline did not
+  fire and every other connection on the worker waited until the handler
+  stopped. A run now takes at most 64 task steps before the worker sees to
+  its sockets and timers, and comes back for the rest without sleeping.
+  This needs aviancore 0.7.2.
 - A route's deadline is kept when the worker's timer pool is full. It used
   to be dropped without a word, and a request dispatched then ran unbounded
   for good, exactly when the worker was under the most pressure. It is now

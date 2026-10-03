@@ -41,7 +41,7 @@ let package = Package(
         // release there may change something as large as which library TLS is
         // built against -- 0.7.0 did exactly that. `from:` would take such a
         // release without anyone looking at it.
-        .package(url: "https://github.com/grepjava/aviancore", .upToNextMinor(from: "0.7.1")),
+        .package(url: "https://github.com/grepjava/aviancore", .upToNextMinor(from: "0.7.2")),
         // The tracing API the Swift server ecosystem shares: Garuda starts
         // spans, and whichever tracer the application bootstraps records
         // them. No Foundation, no threads of its own.

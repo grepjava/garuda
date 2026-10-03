@@ -1287,7 +1287,7 @@ enum GarudaRuntime {
             let allowed = application?.pointee.prepareTimeoutMilliseconds ?? 30_000
             let ready = runPreparation(workerPtr, index: index, prepare: prepare,
                                        timeoutMilliseconds: allowed) {
-                let n = workerPtr.pointee.poller.wait(timeoutMillis: 10)
+                let n = workerPtr.pointee.poller.wait(timeoutMillis: workerPtr.pointee.quicPollTimeout(10))
                 if n > 0 { workerPtr.pointee.processEvents(n) }
                 workerPtr.pointee.fireDueTimers()
                 workerPtr.pointee.drainReadyQueue()
@@ -1319,7 +1319,7 @@ enum GarudaRuntime {
         workerPtr.pointee.leaveBalancing()
         // Before the state they use is torn down.
         stopScheduledJobs(workerPtr) {
-            let n = workerPtr.pointee.poller.wait(timeoutMillis: 10)
+            let n = workerPtr.pointee.poller.wait(timeoutMillis: workerPtr.pointee.quicPollTimeout(10))
             if n > 0 { workerPtr.pointee.processEvents(n) }
             workerPtr.pointee.fireDueTimers()
             workerPtr.pointee.drainReadyQueue()

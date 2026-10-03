@@ -102,7 +102,7 @@ final class OneOffWorker {
     /// One turn of the loop: what the work is waiting on is the only thing
     /// this worker has.
     private func turn() {
-        let n = worker.pointee.poller.wait(timeoutMillis: 10)
+        let n = worker.pointee.poller.wait(timeoutMillis: worker.pointee.quicPollTimeout(10))
         if n > 0 { worker.pointee.processEvents(n) }
         worker.pointee.fireDueTimers()
         worker.pointee.drainReadyQueue()

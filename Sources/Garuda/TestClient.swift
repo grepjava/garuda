@@ -339,7 +339,7 @@ public final class TestClient {
     /// a short wait so that a request waiting on a timer does not spin.
     func turn() {
         onWorker {
-            let n = worker.pointee.poller.wait(timeoutMillis: 1)
+            let n = worker.pointee.poller.wait(timeoutMillis: worker.pointee.quicPollTimeout(1))
             if n > 0 { worker.pointee.processEvents(n) }
             worker.pointee.fireDueTimers()
             worker.pointee.drainReadyQueue()

@@ -25,9 +25,11 @@ extension Worker {
 
     /// How long the loop may block. QUIC timers and async op deadlines both
     /// need to wake the worker before the default idle interval, and ready
-    /// continuations left over from a budgeted drain must not wait at all.
+    /// continuations and handler-task jobs left over from a budgeted drain
+    /// must not wait at all.
     public func quicPollTimeout(_ base: Int32) -> Int32 {
         if !readyQueue.isEmpty { return 0 }
+        if let pool = handlerTasks, pool.executor.hasWork { return 0 }
         var wait = base
         if let quic {
             let now = av_monotonic_ms()
