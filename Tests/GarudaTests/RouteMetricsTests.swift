@@ -72,9 +72,10 @@ struct RouteMetricsTests {
         while av_monotonic_us() < until {}
     }
 
-    /// An async handler that computes past --slow-handler-ms without waiting
-    /// is counted against its route, before its first wait and after one; a
-    /// quick handler and a sync one are not.
+    /// A handler that computes past --slow-handler-ms without waiting is
+    /// counted against its route: an async one before its first wait and
+    /// after one, each run once, and a synchronous one from the time to its
+    /// answer. A quick handler is not.
     @Test func aHandlerThatHoldsItsWorkerIsCountedAgainstItsRoute() throws {
         #expect(av_metrics_init(2) == 0)
         let app = Application()
@@ -88,6 +89,7 @@ struct RouteMetricsTests {
             response.send("crunched")
         }
         app.onAsync(.get, "/quick") { _, response in response.send("quick") }
+        app.get("/sync-quick") { "sync" }
         app.get("/sync") { () -> String in
             RouteMetricsTests.spin(milliseconds: 30)
             return "sync"
@@ -105,12 +107,14 @@ struct RouteMetricsTests {
         #expect(try client.get("/nap-then-crunch").text == "crunched")
         #expect(try client.get("/quick").text == "quick")
         #expect(try client.get("/sync").text == "sync")
+        #expect(try client.get("/sync-quick").text == "sync")
 
         let text = rendered()
         #expect(text.contains(#"garuda_route_slow_runs_total{method="GET",route="/crunch"} 2"#))
         #expect(text.contains(#"garuda_route_slow_runs_total{method="GET",route="/nap-then-crunch"} 1"#))
         #expect(!text.contains(#"garuda_route_slow_runs_total{method="GET",route="/quick"}"#))
-        #expect(!text.contains(#"garuda_route_slow_runs_total{method="GET",route="/sync"}"#))
+        #expect(text.contains(#"garuda_route_slow_runs_total{method="GET",route="/sync"} 1"#))
+        #expect(!text.contains(#"garuda_route_slow_runs_total{method="GET",route="/sync-quick"}"#))
         #expect(text.contains("# TYPE garuda_route_slow_run_seconds_total counter"))
         #expect(text.contains(#"garuda_route_slow_run_seconds_total{method="GET",route="/crunch"} 0.0"#))
     }

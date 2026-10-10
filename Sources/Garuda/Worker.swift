@@ -147,6 +147,13 @@ public struct Worker: ~Copyable {
     /// The jobs `app.every` asked for, running in this worker.
     var scheduled: ScheduledJobs? = nil
     var handlerTaskLimit = 1024
+    /// The slot whose synchronous handler is running, or -1: a response
+    /// written meanwhile was written by it, inline (SlowHandlers.swift).
+    var inlineHandlerSlot: Int32 = -1
+    /// When a slow handler was last warned about (`av_monotonic_ms`), and
+    /// how many slow runs have gone unmentioned since.
+    var slowWarnedAt: UInt64 = 0
+    var slowUnwarned = 0
     /// Bodies still running whose request has ended (Cancellation.swift).
     var abandonedWaitCount = 0
     /// The threads `blocking` runs work on (BlockingPool.swift), started the
@@ -1384,6 +1391,13 @@ public struct Worker: ~Copyable {
             let micros = started == 0 ? -1 : Int(av_monotonic_us() &- started)
             Metrics.requestFinished(status: status, micros: micros)
             RouteMetrics.record(application, slot: busSlot, route: Int(c.pointee.routeIndex), status: status, micros: micros)
+            // A synchronous handler answering inline: the time since dispatch
+            // is the time it has held the worker. One the executor runs is
+            // timed there instead.
+            if inlineHandlerSlot == Int32(slot), micros >= 0, config.slowHandlerMs > 0,
+               micros >= config.slowHandlerMs &* 1000, c.pointee.contKind != .task {
+                handlerHeldTheWorker(route: c.pointee.routeIndex, micros: UInt64(micros))
+            }
         }
         if tracer != nil { requestSpanAnswered(slot, status: status, bodyToCome: bodyToCome) }
         if let observe = application?.pointee.onResponse { reportResponse(slot, status: status, observe) }

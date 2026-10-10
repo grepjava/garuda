@@ -27,8 +27,7 @@
 // That is also why a handler that computes for long without waiting holds up
 // every other request on its worker. With --slow-handler-ms set, the executor
 // times each job, and one that ran past it is traced back by the task's
-// address to the route its task was serving: warned about, and counted on the
-// metrics page.
+// address to the route its task was serving (SlowHandlers.swift).
 //===----------------------------------------------------------------------===//
 
 import CAvian
@@ -99,12 +98,6 @@ final class HandlerTaskPool: @unchecked Sendable {
     /// this pool is found here, not one it started: that may be meant to
     /// outlive the request.
     private var numbers: [UnsafeRawPointer: Int32] = [:]
-    /// When the last slow job was warned about (`av_monotonic_ms`), and how
-    /// many have gone unmentioned since.
-    private var warnedAt: UInt64 = 0
-    private var unwarned = 0
-    /// At most one warning this often, however many jobs run long.
-    static let warningIntervalMs: UInt64 = 10_000
 
     init(worker: UnsafeMutablePointer<Worker>, limit: Int, slots: Int) {
         precondition(limit > 0)
@@ -251,43 +244,12 @@ final class HandlerTaskPool: @unchecked Sendable {
     }
 
     /// A job ran `micros` without waiting, and the worker did nothing else
-    /// meanwhile. Counted against the route its task was serving, and warned
-    /// about at most every `warningIntervalMs`.
+    /// meanwhile: reported against the route its task was serving.
     private func heldTheWorker(_ address: UnsafeRawPointer, _ micros: UInt64) {
-        let worker = self.worker
         // Nil for a job that is not a handler task's: a task a handler
         // started, say.
         let route = numbers[address].map { records[Int($0)].route }
-        if let route {
-            RouteMetrics.slowRun(worker.pointee.application, slot: worker.pointee.busSlot,
-                                 route: Int(route), micros: micros)
-        }
-        let now = av_monotonic_ms()
-        guard warnedAt == 0 || now &- warnedAt >= HandlerTaskPool.warningIntervalMs else {
-            unwarned += 1
-            return
-        }
-        warnedAt = now
-        let more = unwarned
-        unwarned = 0
-        let label = route.flatMap { worker.pointee.application?.pointee.routeLabel(Int($0)) }
-        Log.warn { line in
-            line.str(label == nil ? "a task" : "a handler")
-            line.str(" held its worker for ")
-            line.int(Int(micros / 1000))
-            line.str(" ms without waiting")
-            if var label {
-                line.str(" (")
-                label.withUTF8 { line.bytes($0.baseAddress!, $0.count) }
-                line.str(")")
-            }
-            line.str("; every other request on the worker waited. Move CPU-heavy work into blocking { }, or raise --slow-handler-ms")
-            if more > 0 {
-                line.str(" [")
-                line.int(more)
-                line.str(" more since the last warning]")
-            }
-        }
+        worker.pointee.handlerHeldTheWorker(route: route, micros: micros)
     }
 
     private func parkIdle(_ index: Int, _ inbox: UnsafeContinuation<Work?, Never>) {
@@ -506,15 +468,5 @@ extension Response {
             worker.pointee.handlerTasks!.park(index, $0)
         }
         if !completed { throw .cancelled }
-    }
-}
-
-extension CompiledApplication {
-    /// How a log line names route `route`: its method and pattern, or nil
-    /// for none.
-    func routeLabel(_ route: Int) -> String? {
-        guard route >= 0, route < routePatterns.count else { return nil }
-        let method = route < routeMethods.count ? routeMethods[route]?.token.map { "\($0)" } : nil
-        return "\(method ?? "*") \(routePatterns[route] ?? "fallback")"
     }
 }

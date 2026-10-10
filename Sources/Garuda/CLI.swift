@@ -186,9 +186,9 @@ public enum GarudaCLI {
               --metrics-port PORT      serve Prometheus metrics on this port
               --metrics-host HOST      what the metrics port binds (default --host)
               --log-level LEVEL        debug, info, warning, error, silent
-              --slow-handler-ms MS     warn when an async handler runs MS without
-                                       waiting, holding up its worker (default 100;
-                                       0 = off)
+              --slow-handler-ms MS     warn when a handler runs MS without waiting,
+                                       holding up its worker (default 100; 0 = off;
+                                       sync handlers only with --metrics-port)
               --version                print the version and exit
               -h, --help               print this message
 

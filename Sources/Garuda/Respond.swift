@@ -184,6 +184,9 @@ extension Worker {
         let c = table[slot]
         let generation = c.pointee.generation
         let requestId = c.pointee.requestId
+        let outer = inlineHandlerSlot
+        inlineHandlerSlot = Int32(slot)
+        defer { inlineHandlerSlot = outer }
         withUnsafeMutablePointer(to: &self) { worker in
             let request = Request(worker: worker, slot: slot)
             var response = Response(worker: worker, slot: slot,

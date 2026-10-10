@@ -73,14 +73,15 @@ nothing relevant.
 
 ## Unreleased
 
-- **An async handler that holds its worker is reported.** Every other request
-  on a worker waits while one of its handlers computes without awaiting, and
+- **A handler that holds its worker is reported.** Every other request on a
+  worker waits while one of its handlers computes without awaiting, and
   until now nothing said so. A handler that runs 100 ms without waiting is
   now warned about, with its route and how long it ran, at most once every
   ten seconds; with `--metrics-port`, `garuda_route_slow_runs_total` and
   `garuda_route_slow_run_seconds_total` count such runs by route.
-  `--slow-handler-ms` sets the threshold, and 0 turns the timing off.
-  Synchronous handlers are not timed yet. This needs aviancore's
+  `--slow-handler-ms` sets the threshold, and 0 turns the timing off. Async
+  handlers are always timed; synchronous ones only with `--metrics-port`,
+  where the time is already taken. This needs aviancore's
   `LoopExecutor.slowJobMicros`.
 - A handler that never waits -- one calling `Task.yield()` in a loop -- no
   longer holds its worker. The worker ran ready handler tasks until none was

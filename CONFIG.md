@@ -618,15 +618,15 @@ request headers.
 | `--access-log-format F` | `text` | `text` or `json`; implies `--access-log` |
 | `--log-format F` | `text` | `text` or `json` for `request.log` and `AppLog`, and the access log unless `--access-log-format` is given |
 | `--log-level LEVEL` | `info` | `debug`, `info`, `warning`, `error` or `silent` |
-| `--slow-handler-ms MS` | `100` | warn when an async handler runs MS without waiting; `0` turns it off |
+| `--slow-handler-ms MS` | `100` | warn when a handler runs MS without waiting; `0` turns it off |
 | `--health-check-path P` | none | answer GET and HEAD for P with 200 |
 | `--metrics-port PORT` | none | serve Prometheus metrics on a separate port |
 | `--metrics-host HOST` | `--host` | interface the metrics port binds |
 
 ### Slow handlers
 
-A worker is one thread, so while an async handler computes without awaiting,
-every other request on that worker waits. A handler that runs
+A worker is one thread, so while a handler computes without awaiting, every
+other request on that worker waits. A handler that runs
 `--slow-handler-ms` (100 by default) without waiting is warned about:
 
 ```
@@ -636,8 +636,14 @@ every other request on that worker waits. A handler that runs
 At most one line is written every ten seconds, with a count of the runs left
 unmentioned since. Every run is counted on the metrics page by route. Time
 spent waiting -- on the database, a timer, `blocking { }` -- does not count:
-only the stretches the handler spends on the worker's thread. Synchronous
-handlers are not timed yet. `--slow-handler-ms 0` turns the timing off.
+only the stretches the handler spends on the worker's thread.
+
+Async handlers are always timed. Synchronous handlers are timed only with
+`--metrics-port`, which already reads the clock at dispatch and at the
+response: for a handler that answers inline, the time between is the time it
+held the worker. Without it, timing them would cost two clock reads on the
+fastest path. A synchronous handler that keeps computing after it has
+answered is not seen. `--slow-handler-ms 0` turns the timing off.
 
 ### Access log
 
