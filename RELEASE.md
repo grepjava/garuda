@@ -81,8 +81,7 @@ nothing relevant.
   `garuda_route_slow_run_seconds_total` count such runs by route.
   `--slow-handler-ms` sets the threshold, and 0 turns the timing off. Async
   handlers are always timed; synchronous ones only with `--metrics-port`,
-  where the time is already taken. This needs aviancore's
-  `LoopExecutor.slowJobMicros`.
+  where the time is already taken. This needs aviancore 0.7.3.
 - A handler that never waits -- one calling `Task.yield()` in a loop -- no
   longer holds its worker. The worker ran ready handler tasks until none was
   left, which such a handler never allowed, so the route's deadline did not
