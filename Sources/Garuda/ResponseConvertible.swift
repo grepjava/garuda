@@ -32,7 +32,7 @@ public struct JSON<Value: Encodable>: ResponseConvertible {
 
 /// Markup sent as `text/html`. Whatever escaping the page needs is the
 /// caller's: this does not touch the bytes.
-public struct HTML: ResponseConvertible {
+public struct HTML: ResponseConvertible, Sendable {
     public var markup: String
     public var status: HTTPStatus?
 
@@ -48,7 +48,7 @@ public struct HTML: ResponseConvertible {
 
 /// Text sent as `text/plain`, when the status is not the default. A plain
 /// `String` returned from a handler is the same thing with a 200.
-public struct Text: ResponseConvertible {
+public struct Text: ResponseConvertible, Sendable {
     public var text: String
     public var status: HTTPStatus?
 
@@ -63,7 +63,7 @@ public struct Text: ResponseConvertible {
 }
 
 /// Bytes, and what they are.
-public struct Bytes: ResponseConvertible {
+public struct Bytes: ResponseConvertible, Sendable {
     public var bytes: [UInt8]
     public var contentType: StaticString
     public var status: HTTPStatus?
@@ -82,7 +82,7 @@ public struct Bytes: ResponseConvertible {
 
 /// A redirect. 302 unless another is asked for, since 301 and 308 are
 /// remembered by clients and proxies.
-public struct Redirect: ResponseConvertible {
+public struct Redirect: ResponseConvertible, Sendable {
     public var location: String
     public var status: HTTPStatus
 
@@ -114,3 +114,5 @@ extension Optional: ResponseConvertible where Wrapped: ResponseConvertible {
         try self.write(to: response)
     }
 }
+
+extension JSON: Sendable where Value: Sendable {}

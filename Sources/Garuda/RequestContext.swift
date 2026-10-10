@@ -91,3 +91,5 @@ public struct Context<Key: RequestContextKey>: RequestExtractor {
         return Context(value)
     }
 }
+
+extension Context: Sendable where Key.Value: Sendable {}

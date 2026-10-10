@@ -626,7 +626,7 @@ it, area by area.
 | PostgreSQL | sqlx, tokio-postgres | Native driver on the poller |
 | Redis | redis-rs, fred | Native driver on the poller: RESP3 and RESP2, TLS, ACL, pipelines, transactions, pub/sub |
 | SQLite | sqlx, rusqlite | The system's libsqlite3 on the blocking pool: a writer and readers per worker, WAL, migrations |
-| Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker |
+| Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker, or a whole route with `app.offload` |
 | Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine |
 
 Every row is implemented and tested.
@@ -691,7 +691,9 @@ loop that never awaits holds the worker until it ends. A deadline bounds
 waiting, not computing. Run more workers than busy cores, and hand a call that
 blocks or computes for long to `try await blocking { … }`, which runs it on the
 worker's blocking pool while the worker serves other requests. Waiting on an
-external program is such a call. A handler that holds its worker for
+external program is such a call; a route whose handler only computes can be
+registered with `app.offload.get(…)` to run all of it there. A handler that
+holds its worker for
 `--slow-handler-ms` (100 by default) is warned about with its route, so such a
 loop shows up in the log rather than only in the latency of its neighbours:
 an async handler always, a synchronous one with `--metrics-port`.

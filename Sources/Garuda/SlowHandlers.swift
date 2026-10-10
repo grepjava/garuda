@@ -49,7 +49,7 @@ extension Worker {
                 label.withUTF8 { line.bytes($0.baseAddress!, $0.count) }
                 line.str(")")
             }
-            line.str("; every other request on the worker waited. Move CPU-heavy work into blocking { }, or raise --slow-handler-ms")
+            line.str("; every other request on the worker waited. Move CPU-heavy work into blocking { } or an app.offload route, or raise --slow-handler-ms")
             if more > 0 {
                 line.str(" [")
                 line.int(more)

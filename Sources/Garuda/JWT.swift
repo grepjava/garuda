@@ -975,3 +975,5 @@ extension RouteBuilder {
         }
     }
 }
+
+extension JWT: Sendable where Claims: Sendable {}
