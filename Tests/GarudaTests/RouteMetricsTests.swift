@@ -66,6 +66,74 @@ struct RouteMetricsTests {
         #expect(rendered().contains(#"route="/mine",status="2xx"} 1"#))
     }
 
+    /// Runs on the calling thread, without waiting, for `ms`.
+    private static func spin(milliseconds ms: UInt64) {
+        let until = av_monotonic_us() &+ ms &* 1000
+        while av_monotonic_us() < until {}
+    }
+
+    /// An async handler that computes past --slow-handler-ms without waiting
+    /// is counted against its route, before its first wait and after one; a
+    /// quick handler and a sync one are not.
+    @Test func aHandlerThatHoldsItsWorkerIsCountedAgainstItsRoute() throws {
+        #expect(av_metrics_init(2) == 0)
+        let app = Application()
+        app.onAsync(.get, "/crunch") { _, response in
+            RouteMetricsTests.spin(milliseconds: 30)
+            response.send("crunched")
+        }
+        app.onAsync(.get, "/nap-then-crunch") { _, response in
+            try await response.sleep(milliseconds: 1)
+            RouteMetricsTests.spin(milliseconds: 30)
+            response.send("crunched")
+        }
+        app.onAsync(.get, "/quick") { _, response in response.send("quick") }
+        app.get("/sync") { () -> String in
+            RouteMetricsTests.spin(milliseconds: 30)
+            return "sync"
+        }
+        var config = ServerConfig()
+        config.maxConnections = 16
+        config.slowHandlerMs = 10
+        let client = app.testClient(configuration: config)
+        RouteMetrics.reset()
+        defer { RouteMetrics.reset() }
+        #expect(RouteMetrics.initialize(app.compile(), slots: 2))
+
+        #expect(try client.get("/crunch").text == "crunched")
+        #expect(try client.get("/crunch").text == "crunched")
+        #expect(try client.get("/nap-then-crunch").text == "crunched")
+        #expect(try client.get("/quick").text == "quick")
+        #expect(try client.get("/sync").text == "sync")
+
+        let text = rendered()
+        #expect(text.contains(#"garuda_route_slow_runs_total{method="GET",route="/crunch"} 2"#))
+        #expect(text.contains(#"garuda_route_slow_runs_total{method="GET",route="/nap-then-crunch"} 1"#))
+        #expect(!text.contains(#"garuda_route_slow_runs_total{method="GET",route="/quick"}"#))
+        #expect(!text.contains(#"garuda_route_slow_runs_total{method="GET",route="/sync"}"#))
+        #expect(text.contains("# TYPE garuda_route_slow_run_seconds_total counter"))
+        #expect(text.contains(#"garuda_route_slow_run_seconds_total{method="GET",route="/crunch"} 0.0"#))
+    }
+
+    /// With the timing off, nothing is counted however long a handler runs.
+    @Test func noSlowRunsAreCountedWithTheTimingOff() throws {
+        #expect(av_metrics_init(2) == 0)
+        let app = Application()
+        app.onAsync(.get, "/crunch") { _, response in
+            RouteMetricsTests.spin(milliseconds: 20)
+            response.send("crunched")
+        }
+        var config = ServerConfig()
+        config.maxConnections = 16
+        config.slowHandlerMs = 0
+        let client = app.testClient(configuration: config)
+        RouteMetrics.reset()
+        defer { RouteMetrics.reset() }
+        #expect(RouteMetrics.initialize(app.compile(), slots: 2))
+        #expect(try client.get("/crunch").text == "crunched")
+        #expect(!rendered().contains("slow_run"))
+    }
+
     @Test func labelValuesAreEscaped() {
         #expect(RouteMetrics.escapeLabel("a\"b\\c\n") == "a\\\"b\\\\c\\n")
     }

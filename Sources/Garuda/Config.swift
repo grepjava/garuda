@@ -339,6 +339,11 @@ public struct ServerConfig {
     /// where not; `.on` warns.
     public var ktls: KernelTLS = .off
     public var logLevel: LogLevel = .info
+    /// --slow-handler-ms: an async handler that runs this long on its worker
+    /// without waiting is warned about, and counted against its route on the
+    /// metrics page. Every other request on the worker waits while it runs.
+    /// 0 turns the timing off.
+    public var slowHandlerMs = 100
     public var accessLog = false
     /// Emit the access log as one JSON object per line, for a collector that
     /// would otherwise be handed a regex.

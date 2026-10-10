@@ -618,9 +618,26 @@ request headers.
 | `--access-log-format F` | `text` | `text` or `json`; implies `--access-log` |
 | `--log-format F` | `text` | `text` or `json` for `request.log` and `AppLog`, and the access log unless `--access-log-format` is given |
 | `--log-level LEVEL` | `info` | `debug`, `info`, `warning`, `error` or `silent` |
+| `--slow-handler-ms MS` | `100` | warn when an async handler runs MS without waiting; `0` turns it off |
 | `--health-check-path P` | none | answer GET and HEAD for P with 200 |
 | `--metrics-port PORT` | none | serve Prometheus metrics on a separate port |
 | `--metrics-host HOST` | `--host` | interface the metrics port binds |
+
+### Slow handlers
+
+A worker is one thread, so while an async handler computes without awaiting,
+every other request on that worker waits. A handler that runs
+`--slow-handler-ms` (100 by default) without waiting is warned about:
+
+```
+[warn]  a handler held its worker for 230 ms without waiting (GET /report); every other request on the worker waited. Move CPU-heavy work into blocking { }, or raise --slow-handler-ms
+```
+
+At most one line is written every ten seconds, with a count of the runs left
+unmentioned since. Every run is counted on the metrics page by route. Time
+spent waiting -- on the database, a timer, `blocking { }` -- does not count:
+only the stretches the handler spends on the worker's thread. Synchronous
+handlers are not timed yet. `--slow-handler-ms 0` turns the timing off.
 
 ### Access log
 
@@ -692,6 +709,8 @@ all workers.
 | `garuda_workers` | gauge |
 | `garuda_route_requests_total{method, route, status}` | counter |
 | `garuda_route_request_duration_seconds{method, route}` | histogram |
+| `garuda_route_slow_runs_total{method, route}` | counter, with `--slow-handler-ms` |
+| `garuda_route_slow_run_seconds_total{method, route}` | counter, with `--slow-handler-ms` |
 
 The `route` label is the pattern a route was registered with, such as
 `/users/:id`, never the path a client sent, so there is one series per route

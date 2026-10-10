@@ -691,7 +691,9 @@ loop that never awaits holds the worker until it ends. A deadline bounds
 waiting, not computing. Run more workers than busy cores, and hand a call that
 blocks or computes for long to `try await blocking { … }`, which runs it on the
 worker's blocking pool while the worker serves other requests. Waiting on an
-external program is such a call.
+external program is such a call. An async handler that holds its worker for
+`--slow-handler-ms` (100 by default) is warned about with its route, so such a
+loop shows up in the log rather than only in the latency of its neighbours.
 
 #### On macOS 15, `Task.yield()` leaves the worker
 

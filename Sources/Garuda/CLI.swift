@@ -186,6 +186,9 @@ public enum GarudaCLI {
               --metrics-port PORT      serve Prometheus metrics on this port
               --metrics-host HOST      what the metrics port binds (default --host)
               --log-level LEVEL        debug, info, warning, error, silent
+              --slow-handler-ms MS     warn when an async handler runs MS without
+                                       waiting, holding up its worker (default 100;
+                                       0 = off)
               --version                print the version and exit
               -h, --help               print this message
 
@@ -562,6 +565,15 @@ public enum GarudaCLI {
                 config.healthPath = v
             } else if matches(arg, "--access-log") {
                 config.accessLog = true
+            } else if matches(arg, "--slow-handler-ms") {
+                guard let v = next("--slow-handler-ms needs a value") else { break }
+                let ms = parseInt(v)
+                if ms < 0 {
+                    Log.error("--slow-handler-ms must be 0 or more")
+                    failed = true
+                    break
+                }
+                config.slowHandlerMs = ms
             } else if matches(arg, "--metrics-port") {
                 guard let v = next("--metrics-port needs a value") else { break }
                 let p = parseInt(v)

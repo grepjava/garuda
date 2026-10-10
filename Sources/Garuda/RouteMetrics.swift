@@ -4,6 +4,7 @@
 //
 //     garuda_route_requests_total{method="GET",route="/users/:id",status="2xx"} 1523
 //     garuda_route_request_duration_seconds_bucket{method="GET",route="/users/:id",le="0.005"} 1490
+//     garuda_route_slow_runs_total{method="GET",route="/report"} 3
 //
 // The label is the pattern the route was registered with, never the path a
 // client sent, so the number of series is bounded by the number of routes:
@@ -29,11 +30,13 @@ import AvianHTTP
 
 enum RouteMetrics {
     /// Counters per route: five status classes, the duration count and sum,
-    /// and one per histogram bucket.
-    static let fieldsPerRoute = 7 + Int(AV_METRIC_BUCKETS)
+    /// the slow runs' count and time, and one per histogram bucket.
+    static let fieldsPerRoute = 9 + Int(AV_METRIC_BUCKETS)
     static let countField = 5
     static let sumField = 6
-    static let bucketField = 7
+    static let slowCountField = 7
+    static let slowSumField = 8
+    static let bucketField = 9
 
     nonisolated(unsafe) static var page: UnsafeMutablePointer<UInt64>? = nil
     nonisolated(unsafe) static var slots = 0
@@ -111,6 +114,16 @@ enum RouteMetrics {
         if bucket < Int(AV_METRIC_BUCKETS) { cell(slot, row, bucketField + bucket).pointee &+= 1 }
     }
 
+    /// A handler for route `route` held worker slot `slot` for `micros`
+    /// without waiting (--slow-handler-ms).
+    static func slowRun(_ application: UnsafeMutablePointer<CompiledApplication>?, slot: Int, route: Int,
+                        micros: UInt64) {
+        guard page != nil, application == owner, slot >= 0, slot < slots else { return }
+        let row = route >= 0 && route < rows - 1 ? route : rows - 1
+        cell(slot, row, slowCountField).pointee &+= 1
+        cell(slot, row, slowSumField).pointee &+= micros
+    }
+
     private static func sum(_ row: Int, _ field: Int) -> UInt64 {
         var total: UInt64 = 0
         for slot in 0..<slots { total &+= cell(slot, row, field).pointee }
@@ -164,6 +177,25 @@ enum RouteMetrics {
             writeSeconds(&out, sum(row, sumField))
             write(&out, "\ngaruda_route_request_duration_seconds_count{\(labels)} ")
             out.writeDecimal(Int(count))
+            out.write("\n")
+        }
+
+        let slow = used.filter { sum($0.row, slowCountField) > 0 }
+        guard !slow.isEmpty else { return }
+        out.write("# HELP garuda_route_slow_runs_total ")
+        out.write("Times a handler ran past --slow-handler-ms without waiting, holding up its worker.\n")
+        out.write("# TYPE garuda_route_slow_runs_total counter\n")
+        for (row, labels) in slow {
+            write(&out, "garuda_route_slow_runs_total{\(labels)} ")
+            out.writeDecimal(Int(sum(row, slowCountField)))
+            out.write("\n")
+        }
+        out.write("# HELP garuda_route_slow_run_seconds_total ")
+        out.write("Time handlers spent in those runs, by route pattern.\n")
+        out.write("# TYPE garuda_route_slow_run_seconds_total counter\n")
+        for (row, labels) in slow {
+            write(&out, "garuda_route_slow_run_seconds_total{\(labels)} ")
+            writeSeconds(&out, sum(row, slowSumField))
             out.write("\n")
         }
     }
