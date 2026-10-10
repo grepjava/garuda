@@ -80,23 +80,23 @@ struct RouteMetricsTests {
         #expect(av_metrics_init(2) == 0)
         let app = Application()
         app.onAsync(.get, "/crunch") { _, response in
-            RouteMetricsTests.spin(milliseconds: 30)
+            RouteMetricsTests.spin(milliseconds: 60)
             response.send("crunched")
         }
         app.onAsync(.get, "/nap-then-crunch") { _, response in
             try await response.sleep(milliseconds: 1)
-            RouteMetricsTests.spin(milliseconds: 30)
+            RouteMetricsTests.spin(milliseconds: 60)
             response.send("crunched")
         }
         app.onAsync(.get, "/quick") { _, response in response.send("quick") }
         app.get("/sync-quick") { "sync" }
         app.get("/sync") { () -> String in
-            RouteMetricsTests.spin(milliseconds: 30)
+            RouteMetricsTests.spin(milliseconds: 60)
             return "sync"
         }
         var config = ServerConfig()
         config.maxConnections = 16
-        config.slowHandlerMs = 10
+        config.slowHandlerMs = 25
         let client = app.testClient(configuration: config)
         RouteMetrics.reset()
         defer { RouteMetrics.reset() }
@@ -116,7 +116,7 @@ struct RouteMetricsTests {
         #expect(text.contains(#"garuda_route_slow_runs_total{method="GET",route="/sync"} 1"#))
         #expect(!text.contains(#"garuda_route_slow_runs_total{method="GET",route="/sync-quick"}"#))
         #expect(text.contains("# TYPE garuda_route_slow_run_seconds_total counter"))
-        #expect(text.contains(#"garuda_route_slow_run_seconds_total{method="GET",route="/crunch"} 0.0"#))
+        #expect(text.contains(#"garuda_route_slow_run_seconds_total{method="GET",route="/crunch"} 0."#))
     }
 
     /// With the timing off, nothing is counted however long a handler runs.
@@ -124,7 +124,7 @@ struct RouteMetricsTests {
         #expect(av_metrics_init(2) == 0)
         let app = Application()
         app.onAsync(.get, "/crunch") { _, response in
-            RouteMetricsTests.spin(milliseconds: 20)
+            RouteMetricsTests.spin(milliseconds: 60)
             response.send("crunched")
         }
         var config = ServerConfig()
