@@ -551,6 +551,23 @@ app.post("/login") { (body: Body<Credentials>) async throws -> HTTPStatus in
 computes for tens of milliseconds, or calls a blocking C library, belongs in
 `blocking { }` — `--blocking-threads` sizes the pool.
 
+A route whose whole handler is the computing can say so where it is declared
+instead:
+
+```swift
+app.offload.post("/thumbnail") { (image: Body<Upload>) -> Bytes in
+    Bytes(resize(image.value.bytes), contentType: "image/png")
+}
+```
+
+The extractors are taken on the worker, the handler runs on the blocking pool,
+and what it returns is written back on the worker, which serves other requests
+meanwhile. An offloaded handler is synchronous -- it cannot `await` the
+database, Redis or the HTTP client, which belong to their worker -- and what it
+takes and returns must be `Sendable`; `State` is not, so a worker's pools stay
+on their worker. A handler that computes *and* queries keeps the query in an
+ordinary async route and wraps only the computing in `blocking { }`.
+
 Waiting on another program is blocking work too: `Process.waitUntilExit()`, or
 `waitpid` after `posix_spawn`, holds the worker's thread until the program
 exits, and every request on that worker waits with it. Launch and wait inside

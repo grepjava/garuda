@@ -34,7 +34,7 @@ public struct MultipartPart: Equatable, Sendable {
 }
 
 /// A `multipart/form-data` body, in the order the client sent it.
-public struct Multipart: RequestExtractor {
+public struct Multipart: RequestExtractor, Sendable {
     /// How many parts one body may hold before it is refused.
     public static let partLimit = 1_000
 

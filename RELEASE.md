@@ -30,8 +30,8 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1130 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
-bash scripts/compile-fail-test.sh      # 18
+swift test                             # 1138 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+bash scripts/compile-fail-test.sh      # 21
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 105
 bash scripts/compress-test.sh          # 76, and garuda-conformance
@@ -73,6 +73,18 @@ nothing relevant.
 
 ## Unreleased
 
+- **`app.offload` runs a route's whole handler on the blocking pool.**
+  `app.offload.post("/thumbnail") { (image: Body<Upload>) -> Bytes in … }`
+  takes its extractors on the worker, runs the handler on the worker's
+  blocking pool, and writes what it returns back on the worker, which serves
+  other requests meanwhile. It is `try await blocking { … }` around the whole
+  handler, said where the route is declared. Only a handler that computes can
+  go: it is synchronous, so it cannot await the database, Redis or the HTTP
+  client, and what it takes and returns must be `Sendable`. `State` is not,
+  so a worker's pools stay on their worker; `Cancellation` and `Session` are
+  refused when the route is registered. `Form`, `Multipart`, `JWT`, `Context`,
+  `JSON`, `HTML`, `Text`, `Bytes` and `Redirect` are now `Sendable` when what
+  they hold is.
 - **A handler that holds its worker is reported.** Every other request on a
   worker waits while one of its handlers computes without awaiting, and
   until now nothing said so. A handler that runs 100 ms without waiting is

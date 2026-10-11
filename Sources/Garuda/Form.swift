@@ -74,3 +74,5 @@ extension Substring {
         return slice
     }
 }
+
+extension Form: Sendable where Value: Sendable {}

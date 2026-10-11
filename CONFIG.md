@@ -630,7 +630,7 @@ other request on that worker waits. A handler that runs
 `--slow-handler-ms` (100 by default) without waiting is warned about:
 
 ```
-[warn]  a handler held its worker for 230 ms without waiting (GET /report); every other request on the worker waited. Move CPU-heavy work into blocking { }, or raise --slow-handler-ms
+[warn]  a handler held its worker for 230 ms without waiting (GET /report); every other request on the worker waited. Move CPU-heavy work into blocking { } or an app.offload route, or raise --slow-handler-ms
 ```
 
 At most one line is written every ten seconds, with a count of the runs left
