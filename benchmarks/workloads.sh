@@ -330,7 +330,7 @@ for server in $SERVERS; do
             spin_json="$OUT/spin.json"
             rm -f "$spin_json"
             "${PIN_LOAD[@]}" "$OHA" -z "$(( ${WARMUP%s} + ${DURATION%s} + 1 ))s" -c "$SKEW_CONNS" \
-                --no-tui --output-format json -o "$spin_json" "$BASE/spin/$SPIN" > /dev/null 2>&1 &
+                --no-tui --insecure --output-format json -o "$spin_json" "$BASE/spin/$SPIN" > /dev/null 2>&1 &
             spinner=$!
             measure skew "$WARMUP" $((CONNS - SKEW_CONNS)) > /dev/null
             measure skew "$DURATION" $((CONNS - SKEW_CONNS)) | report skew "$server"
@@ -348,7 +348,7 @@ PY
             continue
         fi
         if [ "$workload" = spike ]; then
-            ( sleep 1; exec "${PIN_LOAD[@]}" "$OHA" -z 60s -c "$SKEW_CONNS" --no-tui \
+            ( sleep 1; exec "${PIN_LOAD[@]}" "$OHA" -z 60s -c "$SKEW_CONNS" --no-tui --insecure \
                   "$BASE/spin/$SPIN" > /dev/null 2>&1 ) &
             spinner=$!
             measure spike "$DURATION" $((CONNS - SKEW_CONNS)) | report spike "$server"
