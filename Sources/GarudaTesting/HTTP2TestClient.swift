@@ -55,6 +55,8 @@ public struct HTTP2TestResponse: Sendable {
     public var reset: UInt32?
     /// The stream ended with END_STREAM.
     public var ended = false
+    /// The informational (1xx) heads that came before the response, in order.
+    public var interim: [(status: HTTPStatus, headers: [(name: String, value: String)])] = []
 
     /// The body as text, with invalid UTF-8 repaired.
     public var text: String { String(decoding: body, as: UTF8.self) }
@@ -507,7 +509,10 @@ public final class HTTP2TestConnection: @unchecked Sendable {
             }
         }
         var response = streams[blockStream] ?? HTTP2TestResponse()
-        if response.status == nil, let status = fields.first(where: { $0.name == ":status" }).flatMap({ Int($0.value) }) {
+        if response.status == nil, let status = fields.first(where: { $0.name == ":status" }).flatMap({ Int($0.value) }),
+           status >= 100 && status < 200 {
+            response.interim.append((HTTPStatus(status), fields.filter { !$0.name.hasPrefix(":") }))
+        } else if response.status == nil, let status = fields.first(where: { $0.name == ":status" }).flatMap({ Int($0.value) }) {
             response.status = HTTPStatus(status)
             response.headers = fields.filter { !$0.name.hasPrefix(":") }
         } else {
