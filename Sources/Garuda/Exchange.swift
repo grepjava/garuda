@@ -194,6 +194,32 @@ struct Exchange: ~Copyable {
         return true
     }
 
+    /// Adds `content-type: value` for an answer that implies its type -- text,
+    /// JSON, HTML, bytes -- as `addHeader` would, without looking again at a
+    /// name known to be good: most answers carry one, and every byte of the
+    /// name was checked, lowered and copied one at a time.
+    @usableFromInline
+    mutating func addContentType(_ value: StaticString) -> Bool {
+        let count = value.utf8CodeUnitCount
+        guard !committed, count <= 0xFFFF else { return false }
+        let v = value.utf8Start
+        var i = 0
+        while i < count {
+            if !isFieldValueChar(v[i]) { return false }
+            i &+= 1
+        }
+        hasContentType = true
+        let name: StaticString = "content-type"
+        responseHeaders.reserve(16 &+ count)
+        responseHeaders.writeByte(12)
+        responseHeaders.writeByte(0)
+        responseHeaders.writeByte(UInt8(truncatingIfNeeded: count))
+        responseHeaders.writeByte(UInt8(truncatingIfNeeded: count >> 8))
+        responseHeaders.write(name.utf8Start, 12)
+        if count > 0 { responseHeaders.write(v, count) }
+        return true
+    }
+
     /// Answers: the status, and a copy of the body. Only the first answer
     /// counts.
     @usableFromInline

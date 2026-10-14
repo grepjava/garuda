@@ -27,7 +27,7 @@ extension Response {
         // cannot be written leaves no JSON content type on the error.
         try JSONCoder.encode(value, with: writer) { bytes, count in
             if !x.pointee.hasContentType {
-                _ = addHeader("content-type", "application/json")
+                _ = x.pointee.addContentType("application/json")
             }
             x.pointee.answer(code, bytes, count)
         }
@@ -69,7 +69,7 @@ extension Response {
     /// already said what it is sending.
     private func setContentTypeIfUnset(_ value: StaticString) {
         guard !exchange.pointee.hasContentType else { return }
-        addHeader("content-type", value)
+        _ = exchange.pointee.addContentType(value)
     }
 
     /// Answers a `ResponseError` with its status, and `{"error":"..."}` when
