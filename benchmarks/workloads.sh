@@ -322,13 +322,27 @@ for server in $SERVERS; do
             continue
         fi
         if [ "$workload" = skew ]; then
-            "${PIN_LOAD[@]}" "$OHA" -z 60s -c "$SKEW_CONNS" --no-tui "$BASE/spin/$SPIN" \
-                > /dev/null 2>&1 &
+            # The slow requests run for the whole measurement and a little
+            # past it, and how many were served is reported too: a server
+            # can buy quick-request throughput by starving them.
+            spin_json="$OUT/spin.json"
+            rm -f "$spin_json"
+            "${PIN_LOAD[@]}" "$OHA" -z "$(( ${WARMUP%s} + ${DURATION%s} + 1 ))s" -c "$SKEW_CONNS" \
+                --no-tui --output-format json -o "$spin_json" "$BASE/spin/$SPIN" > /dev/null 2>&1 &
             spinner=$!
             measure skew "$WARMUP" $((CONNS - SKEW_CONNS)) > /dev/null
             measure skew "$DURATION" $((CONNS - SKEW_CONNS)) | report skew "$server"
-            kill "$spinner" 2>/dev/null
             wait "$spinner" 2>/dev/null
+            python3 - "$spin_json" "$server" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    s, p = d["summary"], d["latencyPercentiles"]
+    print("%-9s %-16s %9d req/s   p50 %8.3f   p99 %9.3f ms" % ("skew-slow", sys.argv[2],
+          s["requestsPerSec"], p["p50"] * 1000, p["p99"] * 1000))
+except Exception as e:
+    print("skew-slow %-16s no result (%s)" % (sys.argv[2], e))
+PY
             continue
         fi
         if [ "$workload" = spike ]; then

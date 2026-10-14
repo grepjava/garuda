@@ -33,14 +33,17 @@ final class RouteCosts: @unchecked Sendable {
     private let average: UnsafeMutablePointer<Atomic<UInt64>>
     /// Registered through `app.heavy`.
     private let declared: [Bool]
+    /// "GET /report/:id", for the log.
+    private let names: [String]
     /// Past this a route is heavy. Set when serving starts.
     var thresholdNanos: UInt64 = 500_000
     /// The shard's heavy-lane permits; nil leaves every route unbounded.
     var lane: Vega.Semaphore?
 
-    init(declared: [Bool]) {
+    init(declared: [Bool], names: [String] = []) {
         count = declared.count
         self.declared = declared
+        self.names = names
         average = .allocate(capacity: max(1, count))
         for i in 0..<max(1, count) { (average + i).initialize(to: Atomic(0)) }
     }
@@ -84,7 +87,11 @@ final class RouteCosts: @unchecked Sendable {
         let sample = max(1, nanos)
         let old = average[index].load(ordering: .relaxed)
         let new = old == 0 ? sample : old - old / 8 + sample / 8
-        if new != old { average[index].store(new, ordering: .relaxed) }
+        guard new != old else { return }
+        average[index].store(new, ordering: .relaxed)
+        if (old > thresholdNanos) != (new > thresholdNanos), !declared[index] {
+            Log.debug("\(index < names.count ? names[index] : "route \(index)") \(new > thresholdNanos ? "enters" : "leaves") the heavy lane: \(new / 1000) us average, last run \(nanos / 1000) us")
+        }
     }
 }
 

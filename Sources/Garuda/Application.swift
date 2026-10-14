@@ -133,7 +133,7 @@ final class CompiledApplication: @unchecked Sendable {
     init(table: CompiledRoutes, routes: [RouteEntry]) {
         self.table = table
         routeCount = routes.count
-        costs = RouteCosts(declared: routes.map(\.heavy))
+        costs = RouteCosts(declared: routes.map(\.heavy), names: routes.map { "\($0.method) \($0.pattern)" })
         handlers = .allocate(capacity: max(1, routes.count))
         for (i, route) in routes.enumerated() { (handlers + i).initialize(to: route.handler) }
     }
