@@ -24,7 +24,7 @@ func vega(_ name: String) -> Target.Dependency {
 /// Garuda needs.
 let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0)
-} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.2.0"))
+} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.3.0"))
 
 let package = Package(
     name: "garuda",
