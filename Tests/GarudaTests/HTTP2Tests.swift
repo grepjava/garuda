@@ -258,6 +258,41 @@ struct HTTP2Tests {
         #expect(try h2.response(slow).status == .ok)
     }
 
+    /// Past its first runs a quick route is answered on the reader; the
+    /// answers are the same.
+    @Test func aQuickRouteAnsweredOnTheReaderAnswersTheSame() throws {
+        let h2 = try app().test.http2()
+        for i in 0..<40 {
+            let response = try h2.get("/user/\(i)")
+            #expect(response.text == "\(i)")
+            #expect(response.header("content-length") == "\("\(i)".utf8.count)")
+            #expect(response.header("server") == "garuda")
+        }
+        for n in 0..<24 { #expect(try h2.post("/user", body: [UInt8](repeating: 1, count: n)).text == "\(n)") }
+        #expect(try h2.get("/nope").status == .notFound)
+        #expect(try h2.get("/user/last").text == "last")
+    }
+
+    /// A route that suspends once it had been quick waits on the reader that
+    /// once, and goes to a task of its own from then on.
+    @Test func aRouteSeenToSuspendLeavesTheReader() throws {
+        let app = Application()
+        app.get("/maybe/:ms") { request, response in
+            let ms = Int(request.parameter(0)) ?? 0
+            if ms > 0 { try await Runtime.sleep(for: .milliseconds(ms)) }
+            response.send(status: .ok)
+        }
+        app.get("/user/:id") { request, response in response.send(request.parameter(0)) }
+        let h2 = try app.test.http2()
+        for _ in 0..<20 { #expect(try h2.get("/maybe/0").status == .ok) }
+        #expect(try h2.get("/maybe/50").status == .ok)
+        let slow = try h2.request("GET", "/maybe/400")
+        let fast = try h2.request("GET", "/user/7")
+        #expect(try h2.response(fast).text == "7")
+        #expect(h2.received(slow)?.status == nil)
+        #expect(try h2.response(slow).status == .ok)
+    }
+
     @Test func aResetStreamIsCancelledAndNeverAnswers() throws {
         let cancelled = Flag()
         let h2 = try app(cancelled).test.http2()

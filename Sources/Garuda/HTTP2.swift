@@ -24,8 +24,15 @@
 // dispatch, as HTTP/1 collects one, held to the same body limit, with the
 // window given back as it arrives. Then the stream runs `dispatch` in a task
 // from the shard's `TaskPool`, so a handler that waits holds up no other
-// stream, and hands the exchange to the writer, which frames the answer
-// within the stream's and the connection's send windows.
+// stream, and its answer is written within the stream's and the
+// connection's send windows.
+//
+// Except when nothing could be held up: the connection's only stream, going
+// to a route that has run many times without ever suspending and is not
+// heavy, is answered by the reader itself, as an HTTP/1 connection answers
+// its request. The frames that came after it wait in the buffer until it is
+// answered -- no longer than any other request takes. One run that does
+// suspend sends the route to the pool for good.
 //
 // A stream the client resets has its task cancelled -- Swift task
 // cancellation, so a handler waiting on I/O or a sleep stops waiting -- and
@@ -403,6 +410,9 @@ final class H2Connection: @unchecked Sendable {
     var blockStream: UInt32 = 0
     var blockEndsStream = false
     var expectingContinuation = false
+    /// A stream whose handler the reader runs itself, once the frame that
+    /// completed its request is handled.
+    var inlineStream: H2Stream?
     /// Scratch for rebuilding a head.
     var pseudo = ByteBuffer()
     var fields = ByteBuffer()
@@ -491,6 +501,17 @@ final class H2Connection: @unchecked Sendable {
                 failed = true
                 break
             }
+            // A stream to answer here, with the frames after its request
+            // still in the buffer: they are handled once it is answered.
+            while let s = inlineStream {
+                inlineStream = nil
+                await answerInline(s)
+                if !handleFrames() {
+                    failed = true
+                    break
+                }
+            }
+            if failed { break }
             // After GOAWAY either way, the writer ends the write side once
             // every stream is answered. The reader reads on until the peer
             // closes, or the keep-alive tick: closing under bytes the peer is
@@ -662,6 +683,7 @@ final class H2Connection: @unchecked Sendable {
                 break
             }
             start &+= H2FrameHeader.size &+ header.length
+            if inlineStream != nil { break }
         }
         if ok && start > 0 { parts.pointee.input.consume(start) }
         start = 0
@@ -1145,6 +1167,12 @@ final class H2Connection: @unchecked Sendable {
             x.pointee.body = UnsafePointer(s.body.readPointer)
             x.pointee.bodyCount = s.body.readableBytes
         }
+        if streams.count == 1 && runsInline(s) {
+            // Still counted as unstarted, so the writer does not take the
+            // connection for idle while it runs.
+            inlineStream = s
+            return
+        }
         lock.withLock { _ in
             s.holds &+= 1
             tasks &+= 1
@@ -1203,13 +1231,73 @@ final class H2Connection: @unchecked Sendable {
                 if s.reset { task?.cancel() } else { s.task = task }
             }
         }
+        await dispatchStream(s)
+        lock.withLock { _ in s.task = nil }
+    }
+
+    /// The stream's request through the application, noting whether its
+    /// route's run suspended.
+    @inline(__always)
+    func dispatchStream(_ s: H2Stream) async {
         let x = s.x
         // Before anything can answer, so every answer carries them.
         if limits.requestID { x.pointee.assignRequestID(trusting: limits.requestIDTrust) }
         if limits.traceContext { x.pointee.readTraceParent() }
         if observing { x.pointee.started = monotonicNanos() }
+        let stamp = Runtime.currentJobStamp
         await dispatch(x, app, matched: s.matched, observing: observing)
-        lock.withLock { _ in s.task = nil }
+        // A cancelled run may have been cut short before it could wait: it
+        // says nothing about the route.
+        let route = x.pointee.route
+        if route >= 0 && !Task.isCancelled { app.costs.noteRun(Int(route), startedIn: stamp) }
+    }
+
+    /// Whether `s`, the connection's only stream, is answered on the reader
+    /// rather than in a task of its own: its route has never been seen to
+    /// suspend, and is not heavy. It then holds the reader no longer than an
+    /// HTTP/1 request holds its connection, and saves two hand-offs. Matches
+    /// the route, for the dispatch to use.
+    func runsInline(_ s: H2Stream) -> Bool {
+        let x = s.x
+        if s.matched < 0 {
+            let path = x.pointee.head.path
+            s.matched = app.table.match(x.pointee.head.method, x.pointee.base + Int(path.offset), path.count,
+                                        into: &x.pointee.parameters)
+            if s.matched < 0 {
+                // The dispatch works a miss out again, from nothing.
+                x.pointee.parameters = RouteParameters()
+                return false
+            }
+        }
+        let route = Int(s.matched)
+        return app.costs.neverSuspends(route) && !app.costs.isHeavy(route)
+    }
+
+    /// The reader answers `s` itself: runs its handler, then writes the
+    /// answer when nobody else is writing, or hands it to the writer. A
+    /// reset cannot arrive meanwhile -- the reader is busy -- so there is no
+    /// task to cancel; a reset read afterwards is for an answered stream.
+    func answerInline(_ s: H2Stream) async {
+        await dispatchStream(s)
+        let data = prepareAnswer(s)
+        let direct = lock.withLock { _ -> Bool in
+            unstarted &-= 1
+            // The writer's hold, beside the table's.
+            s.holds &+= 1
+            if takeRole(for: s, data: data) { return true }
+            ready.append(s)
+            wake.notifyOne()
+            return false
+        }
+        guard direct else { return }
+        frameWhole(s)
+        let sent = await sendFramed()
+        lock.withLock { _ in
+            earned &+= 1
+            s.closed = true
+            release(s)
+            releaseRole(failed: !sent)
+        }
     }
 
     // MARK: Other frames

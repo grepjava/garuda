@@ -40,17 +40,52 @@ final class RouteCosts: @unchecked Sendable {
     /// The shard's heavy-lane permits; nil leaves every route unbounded.
     var lane: Vega.Semaphore?
 
+    /// Per route: how many runs in a row were seen to finish in the job they
+    /// started in, up to `steadyRuns`, or `suspends` once one did not.
+    private let quiet: UnsafeMutablePointer<Atomic<UInt8>>
+    private static let steadyRuns: UInt8 = 16
+    private static let suspends: UInt8 = 255
+
     init(declared: [Bool], names: [String] = []) {
         count = declared.count
         self.declared = declared
         self.names = names
         average = .allocate(capacity: max(1, count))
         for i in 0..<max(1, count) { (average + i).initialize(to: Atomic(0)) }
+        quiet = .allocate(capacity: max(1, count))
+        for i in 0..<max(1, count) { (quiet + i).initialize(to: Atomic(0)) }
     }
 
     deinit {
         average.deinitialize(count: max(1, count))
         average.deallocate()
+        quiet.deinitialize(count: max(1, count))
+        quiet.deallocate()
+    }
+
+    /// Whether route `index` has run often enough without ever suspending to
+    /// be run where its request arrived, on the task that read it -- an
+    /// HTTP/2 stream on its connection's reader (HTTP2.swift) -- rather than
+    /// handed to a task of its own.
+    @inline(__always)
+    func neverSuspends(_ index: Int) -> Bool {
+        let n = quiet[index].load(ordering: .relaxed)
+        return n >= RouteCosts.steadyRuns && n != RouteCosts.suspends
+    }
+
+    /// Notes whether a run of route `index`, middleware and all, suspended:
+    /// `stamp` is the job it started in. Off a Vega worker nothing can be
+    /// told, and nothing is noted. One run that suspends is enough for good.
+    @inline(__always)
+    func noteRun(_ index: Int, startedIn stamp: JobStamp) {
+        guard stamp != .none else { return }
+        let n = quiet[index].load(ordering: .relaxed)
+        if n == RouteCosts.suspends { return }
+        if Runtime.currentJobStamp != stamp {
+            quiet[index].store(RouteCosts.suspends, ordering: .relaxed)
+        } else if n < RouteCosts.steadyRuns {
+            quiet[index].store(n &+ 1, ordering: .relaxed)
+        }
     }
 
     /// Whether route `index` runs in the heavy lane.
