@@ -38,8 +38,8 @@
 // A stream the client resets has its task cancelled -- Swift task
 // cancellation, so a handler waiting on I/O or a sleep stops waiting -- and
 // whatever it answers is dropped. Pooled tasks are reused, and cancellation
-// cannot be undone, so the handler runs in a child task (an `async let`, made
-// from the pooled task's own allocator) and only the child is cancelled.
+// cannot be undone, so a task cancelled this way ends once its stream is done
+// and is not reused (HTTP2Pool.swift).
 //
 // Streams, their exchanges and their buffers are kept for the next stream on
 // the connection: a stream costs no allocation once the connection is warm.
@@ -92,14 +92,14 @@ final class HTTP2Service: @unchecked Sendable {
     /// Where streams run. A stream whose handler waits holds its pooled task
     /// meanwhile, and work past `maxTasks` queues, so the bound is generous:
     /// tasks are only made when work finds none idle.
-    let pool: TaskPool
+    let pool: H2StreamPool
     private let lock = Mutex<Void>(())
     private var first: H2Connection?
     private var stopping = false
 
     init(runtime: Runtime) {
         self.runtime = runtime
-        pool = TaskPool(runtime: runtime, maxTasks: max(1024, runtime.workerCount * 256))
+        pool = H2StreamPool(runtime: runtime, maxTasks: max(1024, runtime.workerCount * 256))
     }
 
     func register(_ connection: H2Connection) {
@@ -1232,21 +1232,24 @@ final class H2Connection: @unchecked Sendable {
             tasks &+= 1
             unstarted &-= 1
         }
-        service.pool.spawn { [s] in await s.connection.answer(s) }
+        service.pool.run(s)
     }
 
-    /// The stream's task: the handler, in a child task a reset can cancel,
-    /// then the answer to the writer.
+    /// The stream's task (HTTP2Pool.swift): the handler, which a reset
+    /// cancels by cancelling the task, then the answer, written from here
+    /// when nobody else is writing and the windows take it all, the
+    /// writer's otherwise.
     func answer(_ s: H2Stream) async {
-        // Unretained: the stream outlives its task, and the connection the
-        // stream (H2Connection.end).
-        let unretained = Unmanaged.passUnretained(s)
-        async let handled: Void = H2Connection.handle(unretained)
-        await handled
+        withUnsafeCurrentTask { task in
+            lock.withLock { _ in
+                if s.reset { task?.cancel() } else { s.task = task }
+            }
+        }
+        await dispatchStream(s)
         let data = prepareAnswer(s)
-        // Written from here when nobody else is writing and the windows
-        // take it all; the writer's otherwise.
         let direct = lock.withLock { _ -> Bool in
+            // No reset cancels the task once it may have moved on.
+            s.task = nil
             if s.reset {
                 release(s)
             } else if takeRole(for: s, data: data) {
@@ -1272,21 +1275,6 @@ final class H2Connection: @unchecked Sendable {
             tasks &-= 1
             if tasks == 0 { idle.notifyOne() }
         }
-    }
-
-    static func handle(_ unretained: Unmanaged<H2Stream>) async {
-        let s = unretained.takeUnretainedValue()
-        await s.connection.handle(s)
-    }
-
-    func handle(_ s: H2Stream) async {
-        withUnsafeCurrentTask { task in
-            lock.withLock { _ in
-                if s.reset { task?.cancel() } else { s.task = task }
-            }
-        }
-        await dispatchStream(s)
-        lock.withLock { _ in s.task = nil }
     }
 
     /// The stream's request through the application, noting whether its

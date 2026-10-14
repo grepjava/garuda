@@ -349,6 +349,34 @@ struct HTTP2Tests {
         #expect(h2.received(doomed)?.status == nil)
     }
 
+    /// A task a reset cancelled is not reused: streams after it are not
+    /// born cancelled.
+    @Test func streamsAfterAResetAreNotCancelled() throws {
+        let cancellations = Mutex(0)
+        let app = Application()
+        app.get("/delay/:ms") { request, response in
+            do {
+                try await Runtime.sleep(for: .milliseconds(Int(request.parameter(0)) ?? 1))
+            } catch {
+                cancellations.withLock { $0 += 1 }
+                throw error
+            }
+            response.send(status: .ok)
+        }
+        let h2 = try app.test.http2()
+        for _ in 0..<5 {
+            let doomed = try h2.request("GET", "/delay/1000")
+            nap(milliseconds: 50)
+            try h2.reset(doomed)
+        }
+        let deadline = ContinuousClock.now + .seconds(2)
+        while cancellations.withLock({ $0 }) < 5 && ContinuousClock.now < deadline { nap(milliseconds: 10) }
+        #expect(cancellations.withLock { $0 } == 5)
+        let ids = try (0..<40).map { _ in try h2.request("GET", "/delay/2") }
+        #expect(try h2.responses(ids).allSatisfy { $0.status == .ok })
+        #expect(cancellations.withLock { $0 } == 5)
+    }
+
     @Test func cancellingAmongCompletedRequestsIsNotPenalised() throws {
         let h2 = try app().test.http2()
         for _ in 0..<300 {
