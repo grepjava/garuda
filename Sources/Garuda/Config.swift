@@ -3,6 +3,8 @@
 // serve, and the limits every connection is held to.
 //===----------------------------------------------------------------------===//
 
+import GarudaWire
+
 public struct ServerConfig: Sendable {
     // --- listening ---
     public var host = "127.0.0.1"
@@ -57,6 +59,32 @@ public struct ServerConfig: Sendable {
     public var writeTimeout: Duration = .seconds(30)
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
+
+    // --- request IDs and logging (RequestID.swift, Logging.swift) ---
+    /// Peers whose forwarded headers are believed (--forwarded-allow-ips).
+    /// Empty means "trust nobody", which is the only safe default: a header
+    /// any client can set is not one anybody else can rely on.
+    public var trust = ForwardedTrust()
+    /// Give every request an `X-Request-ID`: hand it to the application, echo
+    /// it on the response and put it in the access log, so that a line in the
+    /// application's own log, a line in the access log and what the client
+    /// was told can be matched up. One a trusted proxy sent is kept; any other
+    /// is replaced, since a client can put anything it likes in a header.
+    public var requestID = false
+    /// Record the W3C `traceparent` a request carries -- the trace it belongs
+    /// to and the span that sent it -- in the logs and for response
+    /// observers. Never generated, and never changed on its way to the
+    /// application.
+    public var traceContext = false
+    /// One line per request, on standard error, at info.
+    public var accessLog = false
+    /// Write the access log as one JSON object per line, for a collector that
+    /// would otherwise be handed a regex.
+    public var accessLogJSON = false
+    /// Write the application log -- `request.log` and `AppLog` -- as one JSON
+    /// object per line. The command line has the access log follow it unless
+    /// --access-log-format says otherwise.
+    public var logJSON = false
 
     public init() {}
 

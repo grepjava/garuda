@@ -78,6 +78,8 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     /// What a path with a trailing slash no route has is answered with
     /// (TrailingSlash.swift).
     var trailingSlashPolicy = TrailingSlash.strict
+    /// `app.onResponse` registrations (ResponseObservers.swift).
+    var responseObservers: [ResponseObserver] = []
     /// The routes as connections read them, made the first time the
     /// application runs or is tested. Nothing can be added after that.
     var compiledApplication: CompiledApplication?
@@ -191,7 +193,8 @@ public final class Application: RouteBuilder, @unchecked Sendable {
         let compiled = CompiledApplication(table: table.compile(), routes: serving,
                                            stateFactories: stateFactories,
                                            startHooks: startHooks, stopHooks: stopHooks,
-                                           trailingSlash: trailingSlashPolicy)
+                                           trailingSlash: trailingSlashPolicy,
+                                           observers: responseObservers)
         compiledApplication = compiled
         return compiled
     }
@@ -243,13 +246,20 @@ final class CompiledApplication: @unchecked Sendable {
     let hasCORS: Bool
     /// What a path with a trailing slash no route has is answered with.
     let trailingSlash: TrailingSlash
+    /// What `app.onResponse` registered, and each route's pattern by index
+    /// for them to be told (ResponseObservers.swift).
+    let observers: [ResponseObserver]
+    let patterns: [String]
 
     init(table: CompiledRoutes, routes: [RouteEntry], stateFactories: [StateFactory] = [],
          startHooks: [@Sendable (ShardContext) async throws -> Void] = [],
          stopHooks: [@Sendable (ShardContext) async -> Void] = [],
-         trailingSlash: TrailingSlash = .strict) {
+         trailingSlash: TrailingSlash = .strict,
+         observers: [ResponseObserver] = []) {
         self.table = table
         self.trailingSlash = trailingSlash
+        self.observers = observers
+        patterns = routes.map(\.pattern)
         self.stateFactories = stateFactories
         self.startHooks = startHooks
         self.stopHooks = stopHooks

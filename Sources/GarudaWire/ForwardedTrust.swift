@@ -33,7 +33,7 @@ public struct TrustedNet: Sendable {
 }
 
 /// Which peers are believed when they claim to be forwarding.
-public struct ForwardedTrust {
+public struct ForwardedTrust: Sendable {
     /// `*`: trust every peer. Correct only when nothing but the proxy can open
     /// a connection to this server (a private network, or a unix socket).
     public var trustAll = false

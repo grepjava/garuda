@@ -61,6 +61,33 @@ struct Exchange: ~Copyable {
     /// Kept for the next JSON answer on this connection.
     var jsonWriter: JSONWriter?
 
+    /// `Response.onSend` hooks, run before the head is written. Empty, and
+    /// unallocated, for a request that registers none (ResponseHooks.swift).
+    @usableFromInline var sendHooks: [SendHook] = []
+
+    // MARK: What watches the request
+    //
+    // Each is left as it is -- empty, nil, -1, 0 -- by a request nothing is
+    // watching, and costs it no allocation.
+
+    /// The request's ID with --request-id, or empty (RequestID.swift).
+    @usableFromInline var requestID = ByteBuffer()
+    /// What this exchange's generated IDs are made from, kept from one
+    /// request to the next.
+    var requestIDKey: (UInt64, UInt64) = (0, 0)
+    var requestIDCount: UInt64 = 0
+    /// With --trace-context, the value of a valid traceparent the request
+    /// carries (RequestID.swift).
+    @usableFromInline var traceParent: UnsafePointer<UInt8>?
+    /// The route that matched, or -1.
+    @usableFromInline var route: Int32 = -1
+    /// When dispatch began, in monotonic nanoseconds, when something is timing
+    /// the request; 0 otherwise.
+    @usableFromInline var started: UInt64 = 0
+    /// Why the route answered 5xx on its own account, for the response
+    /// observers (ResponseObservers.swift).
+    @usableFromInline var failure: String?
+
     init(maxHeaders: Int, remote: SocketPeer) {
         self.maxHeaders = maxHeaders
         headers = .allocate(capacity: maxHeaders)
@@ -77,6 +104,8 @@ struct Exchange: ~Copyable {
         buffer = responseHeaders
         buffer.destroy()
         buffer = responseBody
+        buffer.destroy()
+        buffer = requestID
         buffer.destroy()
         jsonWriter?.destroy()
     }
@@ -98,6 +127,12 @@ struct Exchange: ~Copyable {
         answered = false
         committed = false
         if !context.isEmpty { context.clear() }
+        if !sendHooks.isEmpty { sendHooks = [] }
+        requestID.clear()
+        traceParent = nil
+        route = -1
+        started = 0
+        if failure != nil { failure = nil }
     }
 
     @inlinable

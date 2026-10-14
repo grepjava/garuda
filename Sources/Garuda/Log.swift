@@ -2,6 +2,9 @@
 // The server's own log: standard error, one line per write, held to
 // --log-level. A line is written with a single write so that shards sharing
 // one pipe never splice their lines into each other.
+//
+// The application log (`request.log`, `AppLog`) and the access log are
+// written through the same level and the same single write (Logging.swift).
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
@@ -68,14 +71,36 @@ enum Log {
             }
         }
         line += "\n"
-        var bytes = Array(line.utf8.prefix(4096))
+        var bytes = Array(line.utf8.prefix(lineCapacity))
         if bytes.last != 0x0A { bytes[bytes.count - 1] = 0x0A }
-        bytes.withUnsafeBytes { raw in
-            #if os(Windows)
-            _ = _write(2, raw.baseAddress, UInt32(raw.count))
-            #else
-            _ = write(2, raw.baseAddress, raw.count)
-            #endif
-        }
+        bytes.withUnsafeBytes { writeLine($0) }
+    }
+
+    /// The most a line may take, newline included: what one write to a pipe
+    /// delivers whole.
+    static let lineCapacity = 4096
+
+    /// Writes `line`, newline and all, to standard error in one write.
+    static func writeLine(_ line: UnsafeRawBufferPointer) {
+        guard let base = line.baseAddress, line.count > 0 else { return }
+        #if os(Windows)
+        _ = _write(2, base, UInt32(line.count))
+        #else
+        _ = write(2, base, line.count)
+        #endif
+    }
+
+    /// The process ID the application and access logs put on a JSON line,
+    /// so that shards sharing one output can be told apart; when set, this
+    /// instead, and 0 leaves it out (tests).
+    nonisolated(unsafe) static var fixedPID: Int32? = nil
+
+    static var pid: Int32 {
+        if let fixedPID { return fixedPID }
+        #if os(Windows)
+        return Int32(_getpid())
+        #else
+        return getpid()
+        #endif
     }
 }

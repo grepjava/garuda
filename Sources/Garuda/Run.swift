@@ -24,6 +24,7 @@ import ucrt
 #endif
 import Vega
 import VegaIO
+import GarudaWire
 
 extension Application {
     /// Serves with the configuration on the command line, and never returns:
@@ -46,6 +47,7 @@ extension Application {
             exit(2)
         }
         if let level = config.logLevel { Log.level = level }
+        AppLogOutput.json = config.logJSON
         #if !os(Windows)
         // Idle workers spin briefly before they sleep (Vega's default;
         // VEGA_SPIN_NS sets it, 0 to sleep at once). On cores of its own a
@@ -183,6 +185,20 @@ extension ServerConfig {
           --log-level LEVEL    debug, info, warning, error or silent
           --max-body BYTES     largest request body (default 16 MiB)
           --keep-alive SECS    idle keep-alive timeout (default 5)
+          --forwarded-allow-ips L
+                               proxies whose forwarded headers are trusted:
+                               addresses, CIDR blocks, unix, or *
+          --request-id         give every request an X-Request-ID, echoed on
+                               the response and logged; one a
+                               --forwarded-allow-ips proxy sent is kept
+          --trace-context      record a request's W3C traceparent, its trace
+                               and parent span, in the logs
+          --access-log         log one line per request
+          --access-log-format F
+                               text (default) or json; implies --access-log
+          --log-format F       text (default) or json, for request.log and
+                               AppLog; the access log follows it unless
+                               --access-log-format says otherwise
           --version            print the version
           -h, --help           print this
 
@@ -200,6 +216,7 @@ extension ServerConfig {
         if let port = environment("SERVER_PORT").flatMap({ Int($0) }) { config.port = port }
 
         var args = arguments.dropFirst()
+        var accessLogFormatGiven = false
         func fail(_ message: String) -> Parsed {
             Log.error(message)
             return .exit(2)
@@ -269,10 +286,34 @@ extension ServerConfig {
                     return fail("--keep-alive must be a number of seconds")
                 }
                 config.keepAliveTimeout = .seconds(n)
+            case "--forwarded-allow-ips":
+                guard let v = value() else { return fail("--forwarded-allow-ips needs a list") }
+                guard v.withCString({ config.trust.parse($0) }) else {
+                    return fail("--forwarded-allow-ips contains an address that is not valid")
+                }
+            case "--request-id":
+                config.requestID = true
+            case "--trace-context":
+                config.traceContext = true
+            case "--access-log":
+                config.accessLog = true
+            case "--access-log-format":
+                guard let v = value(), v == "text" || v == "json" else {
+                    return fail("--access-log-format must be text or json")
+                }
+                config.accessLog = true
+                config.accessLogJSON = v == "json"
+                accessLogFormatGiven = true
+            case "--log-format":
+                guard let v = value(), v == "text" || v == "json" else {
+                    return fail("--log-format must be text or json")
+                }
+                config.logJSON = v == "json"
             default:
                 return fail("unknown option \(arg) (garuda --help lists them)")
             }
         }
+        if !accessLogFormatGiven { config.accessLogJSON = config.logJSON }
         return .run(config)
     }
 }
