@@ -22,8 +22,10 @@
 #   spike     the same, but the slow requests start a second into the run, on
 #             workers that already hold quick connections
 #
-# SERVERS names what runs: garuda, axum, and garuda:MODE for Garuda under
-# --balance MODE (garuda:adaptive, garuda:accept, garuda:reuseport).
+# SERVERS names what runs: garuda, axum, and garuda:MODE for Garuda 1 under
+# --balance MODE (garuda:adaptive, garuda:accept, garuda:reuseport), and
+# garuda2:SxT for Garuda 2 (GARUDA2_APP, the garuda executable) with S shards
+# of T threads each (garuda2:1x8, garuda2:2x4).
 #
 # TLS=1 runs both over HTTPS with the same self-signed P-256 certificate:
 # Garuda with OpenSSL, axum with rustls through axum-server. The relay's
@@ -55,6 +57,7 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GARUDA_APP=${GARUDA_APP:-$ROOT/benchmarks/workloads/garuda-app/.build/release/workloads}
 AXUM_APP=${AXUM_APP:-$ROOT/benchmarks/workloads/axum/target/release/workloads}
+GARUDA2_APP=${GARUDA2_APP:-$ROOT/.build/release/garuda}
 CARGO=${CARGO:-$(command -v cargo || echo "$HOME/.cargo/bin/cargo")}
 OHA=${OHA:-oha}
 PSQL=${PSQL:-psql}
@@ -154,6 +157,9 @@ start() {
             server_start "${PIN_SERVER[@]}" "$GARUDA_APP" \
             --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${balance[@]}" \
             "${GARUDA_TLS[@]}" ${GARUDA_FLAGS:-} ;;
+    garuda2:*)
+        local layout=${1#garuda2:}
+        server_start "${PIN_SERVER[@]}" "$GARUDA2_APP"             --log-level error --host 127.0.0.1 --port "$PORT"             --shards "${layout%x*}" --threads "${layout#*x}" ${GARUDA2_FLAGS:-} ;;
     axum)
         if [ ! -x "$AXUM_APP" ]; then
             (cd "$ROOT/benchmarks/workloads/axum" && "$CARGO" build --release) > "$OUT/cargo.log" 2>&1 \
