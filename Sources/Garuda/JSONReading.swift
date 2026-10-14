@@ -18,7 +18,8 @@
 // Codable way for a type that does not.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
+import GarudaWire
+
 
 /// A key just read from an object, as the bytes it is: matching one costs a
 /// length and a comparison rather than a `String`.

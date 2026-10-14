@@ -15,8 +15,7 @@
 // the compiled table is flat memory that is only ever read.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
-import AvianHTTP
+import GarudaWire
 
 /// The parameters a match captured, as offsets into the matched path.
 public struct RouteParameters {

@@ -13,7 +13,8 @@
 // be as careful.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
+import GarudaWire
+
 
 /// The bytes of a document being written.
 public struct JSONOutput {

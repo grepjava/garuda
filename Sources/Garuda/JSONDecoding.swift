@@ -10,7 +10,8 @@
 // only thing standing between a hostile body and the stack.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
+import GarudaWire
+
 
 extension JSONCoder {
     /// Reads `type` out of a JSON document.

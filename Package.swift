@@ -2,7 +2,8 @@
 import CompilerPluginSupport
 import PackageDescription
 
-// Garuda — a pure-Swift web framework. No Foundation.
+// Garuda 2 -- a pure-Swift web framework on Vega's work-stealing runtime. No
+// Foundation.
 //
 // No target sets unsafe flags: SwiftPM refuses them in a package that is
 // depended on by version. Benchmarks build the way the-benchmarker builds
@@ -13,72 +14,47 @@ let sharedSwiftSettings: [SwiftSetting] = [
     .swiftLanguageMode(.v6),
 ]
 
-/// A module of aviancore, the protocol and systems layers Garuda is built on.
-func avian(_ name: String) -> Target.Dependency {
-    .product(name: name, package: "aviancore")
+/// A module of Vega.
+func vega(_ name: String) -> Target.Dependency {
+    .product(name: name, package: "vega")
 }
 
 let package = Package(
     name: "garuda",
-    // macOS 15: async handlers run on a `TaskExecutor`.
-    platforms: [.macOS(.v15)],
+    // Vega's floor: its executor needs macOS 26.4's custom-executor hooks.
+    platforms: [.macOS("26.4")],
     products: [
         .executable(name: "garuda", targets: ["garuda-server"]),
-        .executable(name: "garuda-conformance", targets: ["garuda-conformance"]),
         .library(name: "Garuda", targets: ["Garuda"]),
-        .library(name: "GarudaUploads", targets: ["GarudaUploads"]),
+        // `app.test`: requests through the real HTTP/1 connection over an
+        // in-memory stream.
+        .library(name: "GarudaTesting", targets: ["GarudaTesting"]),
         // `@JSON`. A separate product because it is the only thing in Garuda
         // that needs swift-syntax: an application that does not import it
         // never builds the macro plugin.
         .library(name: "GarudaJSON", targets: ["GarudaJSON"]),
-        // `@PostgresRow`, from the same plugin.
-        .library(name: "GarudaSQL", targets: ["GarudaSQL"]),
     ],
     dependencies: [
-        // The protocol and systems layers: syscalls, TLS, buffers, the poller,
-        // HTTP/1.1, HTTP/2, HTTP/3 and QUIC.
-        // upToNextMinor, not `from:`. aviancore is below 1.0, so a minor
-        // release there may change something as large as which library TLS is
-        // built against -- 0.7.0 did exactly that. `from:` would take such a
-        // release without anyone looking at it.
-        .package(url: "https://github.com/grepjava/aviancore", .upToNextMinor(from: "0.7.3")),
-        // The tracing API the Swift server ecosystem shares: Garuda starts
-        // spans, and whichever tracer the application bootstraps records
-        // them. No Foundation, no threads of its own.
-        .package(url: "https://github.com/apple/swift-distributed-tracing", from: "1.3.0"),
+        // The runtime: work-stealing scheduler, sharded processes, sockets,
+        // TLS. upToNextMinor, not `from:`: Vega is below 1.0, so a minor
+        // release may change its API.
+        .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.2.0")),
         // Only the `GarudaJSON` plugin builds against this. It is still
         // resolved by everyone who depends on Garuda, because SwiftPM resolves
         // a package's dependencies whether or not a product uses them.
         .package(url: "https://github.com/swiftlang/swift-syntax", from: "602.0.0"),
     ],
     targets: [
-        // Database protocols as byte-level state machines: no sockets, no
-        // poller, so each is tested against recorded exchanges.
-        .target(name: "GarudaPostgres", dependencies: [avian("CAvian"), avian("AvianCore")],
-                swiftSettings: sharedSwiftSettings),
-        .target(name: "GarudaRedis", dependencies: [avian("AvianCore")],
-                swiftSettings: sharedSwiftSettings),
-        // The system's libsqlite3, opened with dlopen: no headers to build.
-        .target(name: "CGarudaSQLite"),
-        // JSON Web Token signatures over the system's libcrypto, which the TLS
-        // layer already links: RSA, ECDSA, EdDSA and HMAC-SHA-512.
-        .target(name: "CGarudaJWT", linkerSettings: [.linkedLibrary("crypto")]),
-
-        // The engine and the handler API: `import Garuda`.
+        // HTTP on the wire as byte-level state machines: the HTTP/1.1 parser,
+        // HPACK, QPACK, frames. No sockets, no allocation on the hot path.
+        // Vendored from aviancore's AvianHTTP; see Sources/GarudaWire/VENDORED.md.
+        .target(name: "GarudaWire", exclude: ["VENDORED.md"], swiftSettings: sharedSwiftSettings),
         .target(name: "Garuda",
-                dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
-                               "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT",
-                               .product(name: "Tracing", package: "swift-distributed-tracing")],
+                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO")],
                 swiftSettings: sharedSwiftSettings),
-
-        // Resumable uploads (draft-ietf-httpbis-resumable-upload), built on the
-        // public handler API alone: `import GarudaUploads`.
-        .target(name: "GarudaUploads", dependencies: [avian("AvianHTTP"), "Garuda"],
+        .target(name: "GarudaTesting",
+                dependencies: ["Garuda", "GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaTest")],
                 swiftSettings: sharedSwiftSettings),
-
-        // `@JSON` reads the members off a declaration and writes the
-        // `JSONReadable` and `JSONWritable` conformances a hand is otherwise
-        // asked to write. It runs in the compiler, so it is its own plugin.
         .macro(name: "GarudaMacros",
                dependencies: [.product(name: "SwiftSyntax", package: "swift-syntax"),
                               .product(name: "SwiftSyntaxBuilder", package: "swift-syntax"),
@@ -86,52 +62,21 @@ let package = Package(
                               .product(name: "SwiftDiagnostics", package: "swift-syntax"),
                               .product(name: "SwiftCompilerPlugin", package: "swift-syntax")],
                swiftSettings: sharedSwiftSettings),
-
-        // The declaration of `@JSON`: `import GarudaJSON`.
         .target(name: "GarudaJSON", dependencies: ["Garuda", "GarudaMacros"],
                 swiftSettings: sharedSwiftSettings),
-
-        // The declaration of `@PostgresRow`: `import GarudaSQL`.
-        .target(name: "GarudaSQL", dependencies: ["Garuda", "GarudaMacros"],
-                swiftSettings: sharedSwiftSettings),
-
-        // The `garuda` executable. Its module is not named `garuda`, which a
-        // case-insensitive file system would take for the `Garuda` module.
-        .executableTarget(name: "garuda-server", dependencies: ["Garuda"],
+        // The benchmark server: the-benchmarker's routes plus the workloads.
+        .executableTarget(name: "garuda-server", dependencies: ["Garuda", "GarudaJSON", vega("Vega")],
                           path: "Sources/garuda-server",
                           swiftSettings: sharedSwiftSettings),
 
-        // The routes the end-to-end suites need a handler for.
-        .executableTarget(name: "garuda-conformance",
-                          dependencies: [avian("AvianCore"), avian("AvianHTTP"), "Garuda", "GarudaUploads"],
-                          path: "Sources/GarudaConformance",
-                          swiftSettings: sharedSwiftSettings),
-
-        .target(name: "GarudaFuzzTargets",
-                dependencies: [avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"), "Garuda"],
-                swiftSettings: sharedSwiftSettings),
-
-        .executableTarget(name: "pgfuzz",
-                          dependencies: [avian("CAvian"), "GarudaFuzzTargets"],
-                          swiftSettings: sharedSwiftSettings),
-
-        // Counts heap allocations in the test process, on glibc.
         .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),
-
+        .testTarget(name: "GarudaWireTests", dependencies: ["GarudaWire"],
+                    swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaTests",
-                    dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
-                                   "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT", "Garuda", "GarudaSQL",
-                                   "GarudaFuzzTargets",
-                                   "CAllocationCounter",
-                                   .product(name: "Tracing", package: "swift-distributed-tracing"),
-                                   .product(name: "InMemoryTracing", package: "swift-distributed-tracing")],
-                    swiftSettings: [.swiftLanguageMode(.v6)]),
-        .testTarget(name: "GarudaJSONTests",
-                    dependencies: ["Garuda", "GarudaJSON"],
-                    swiftSettings: [.swiftLanguageMode(.v6)]),
-        .testTarget(name: "GarudaUploadsTests",
-                    dependencies: [avian("CAvian"), avian("AvianHTTP"), "Garuda", "GarudaUploads"],
-                    swiftSettings: [.swiftLanguageMode(.v6)]),
-    ],
-    cLanguageStandard: .gnu11
+                    dependencies: ["Garuda", "GarudaWire", "GarudaTesting", "CAllocationCounter",
+                                   vega("Vega")],
+                    swiftSettings: sharedSwiftSettings),
+        .testTarget(name: "GarudaJSONTests", dependencies: ["Garuda", "GarudaJSON"],
+                    swiftSettings: sharedSwiftSettings),
+    ]
 )

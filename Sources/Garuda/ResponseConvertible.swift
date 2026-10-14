@@ -3,7 +3,7 @@
 //
 // A handler that takes extractors returns a value rather than writing a
 // response: `JSON(user)`, `HTML(page)`, a `String`, a status, a redirect. The
-// engine writes it through the same response sink as everything else, so the
+// connection writes it through the same response as everything else, so the
 // framing, the server's headers and the content length are unchanged.
 //
 // `nil` is a 404: a handler whose answer is optional is saying "if there is
@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 /// A value that can be the whole response.
-public protocol ResponseConvertible {
+public protocol ResponseConvertible: SendableMetatype {
     func write(to response: borrowing Response) throws
 }
 
