@@ -77,4 +77,23 @@ struct SecurityHeadersTests {
             "permissions-policy: camera=()",
         ])
     }
+
+    /// An error that is not an answer is a 500 that drops what the handler
+    /// half built -- but not the security or CORS headers, and not the
+    /// handler's error from the log.
+    @Test func anUnexpectedErrorKeepsTheScopesHeaders() throws {
+        struct Boom: Error {}
+        let app = Application()
+        app.cors(CORSPolicy(origins: ["https://app.example.com"]))
+        app.securityHeaders(SecurityHeaders())
+        app.get("/boom") { _, response in
+            response.addHeader("x-half-built", "yes")
+            throw Boom()
+        }
+        let response = try app.test.get("/boom", headers: [("origin", "https://app.example.com")])
+        #expect(response.status == 500)
+        #expect(sent(response) == defaults)
+        #expect(response.header("access-control-allow-origin") == "https://app.example.com")
+        #expect(response.header("x-half-built") == nil)
+    }
 }

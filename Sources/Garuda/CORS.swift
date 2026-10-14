@@ -122,14 +122,34 @@ struct CORSMiddleware: Middleware {
         let x = request.exchange
         guard request.headerBytes("origin") != nil else {
             if policy.variesByOrigin { response.addHeader("vary", "Origin") }
-            return try await next()
+            return try await runRest(x, next) {
+                if policy.variesByOrigin { Response(x).addHeader("vary", "Origin") }
+            }
         }
         if request.method == .options, request.headerBytes("access-control-request-method") != nil {
             addPreflightHeaders(x, policy, routed: routedMethods(x))
             return response.send(status: .noContent)
         }
         addCORSHeaders(x, policy)
-        try await next()
+        try await runRest(x, next) { addCORSHeaders(x, policy) }
+    }
+
+    /// Runs the rest of the chain. An error other than a `ResponseError` is a
+    /// 500 that drops every header: it is answered here and `again` adds this
+    /// policy's back, so a page on another origin can read even that. The
+    /// error goes on to the connection, which logs it.
+    @inline(__always)
+    private func runRest(_ x: UnsafeMutablePointer<Exchange>, _ next: () async throws -> Void,
+                         again: () -> Void) async throws {
+        do {
+            try await next()
+        } catch {
+            if !(error is any ResponseError) {
+                answerFailure(x)
+                again()
+            }
+            throw error
+        }
     }
 }
 

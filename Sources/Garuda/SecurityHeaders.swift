@@ -86,7 +86,11 @@ struct SecurityHeadersMiddleware: Middleware {
             try await next()
         } catch {
             // Thrown as an answer, a `ResponseError` keeps the headers the
-            // response has; add them before the connection answers it.
+            // response has; add them before the connection answers it. Any
+            // other error is a 500 that drops what the handler half built:
+            // answer it here, so these headers go out on it too. The
+            // connection still logs the error when it reaches it.
+            if !(error is any ResponseError) { answerFailure(response.exchange) }
             add(request, response)
             throw error
         }
