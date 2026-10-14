@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 import GarudaWire
+import Synchronization
 
 /// GET, POST and the rest, as routes are registered by them.
 public typealias HTTPMethod = GarudaWire.HTTPMethod
@@ -24,8 +25,9 @@ public protocol RouteBuilder: AnyObject {
     func on(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping Handler)
 
     /// Notes what a typed route's handler asks for, so `problems()` can find
-    /// a route that cannot work before anything is served.
-    func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int)
+    /// a route that cannot work before anything is served: how many path
+    /// parameters it takes, and the `app.state` types it needs.
+    func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type])
 
     /// Runs `middleware` around the handler of every route in the current
     /// scope (Middleware.swift).
@@ -48,7 +50,7 @@ public protocol RouteBuilder: AnyObject {
 }
 
 extension RouteBuilder {
-    public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int) {}
+    public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type]) {}
 
     public func get(_ pattern: String, _ handler: @escaping Handler) { on(.get, pattern, handler) }
     public func head(_ pattern: String, _ handler: @escaping Handler) { on(.head, pattern, handler) }
@@ -69,6 +71,10 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     var groups: [(prefix: String, middleware: [any Middleware])] = []
     /// The groups open right now, outermost first.
     var openGroups: [Int] = []
+    /// `app.state` registrations, and the shard hooks (State.swift).
+    var stateFactories: [StateFactory] = []
+    var startHooks: [@Sendable (ShardContext) async throws -> Void] = []
+    var stopHooks: [@Sendable (ShardContext) async -> Void] = []
     /// The routes as connections read them, made the first time the
     /// application runs or is tested. Nothing can be added after that.
     var compiledApplication: CompiledApplication?
@@ -95,10 +101,11 @@ public final class Application: RouteBuilder, @unchecked Sendable {
                                  parameters: parameters, handler: handler, groups: openGroups))
     }
 
-    public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int) {
+    public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type]) {
         guard let last = routes.indices.last, routes[last].registeredPattern == pattern,
               routes[last].method == method else { return }
         routes[last].pathExtractors = pathParameters
+        routes[last].states = states
     }
 
     // MARK: Scopes
@@ -142,13 +149,21 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     /// ```
     ///
     /// It finds a handler taking more `Path` extractors than its pattern has
-    /// parameters: those are taken by position, so the extra one has nothing
-    /// to take and every request to that route is a 500.
+    /// parameters -- those are taken by position, so the extra one has
+    /// nothing to take and every request to that route is a 500 -- and one
+    /// asking for `State` of a type no `app.state` builds.
     public func problems() -> [String] {
         var found: [String] = []
-        for route in routes where route.pathExtractors > route.parameters {
-            found.append("\(route.method.name) \(route.pattern) takes \(route.pathExtractors) Path "
-                         + "parameters, and its pattern has \(route.parameters)")
+        let built = Set(stateFactories.map(\.key))
+        for route in routes {
+            if route.pathExtractors > route.parameters {
+                found.append("\(route.method.name) \(route.pattern) takes \(route.pathExtractors) Path "
+                             + "parameters, and its pattern has \(route.parameters)")
+            }
+            for state in route.states where !built.contains(ObjectIdentifier(state)) {
+                found.append("\(route.method.name) \(route.pattern) asks for State<\(state)>, "
+                             + "and no app.state builds it")
+            }
         }
         return found
     }
@@ -167,7 +182,9 @@ public final class Application: RouteBuilder, @unchecked Sendable {
             let layers = middleware(of: serving[i])
             if !layers.isEmpty { serving[i].handler = compose(layers, around: serving[i].handler) }
         }
-        let compiled = CompiledApplication(table: table.compile(), routes: serving)
+        let compiled = CompiledApplication(table: table.compile(), routes: serving,
+                                           stateFactories: stateFactories,
+                                           startHooks: startHooks, stopHooks: stopHooks)
         compiledApplication = compiled
         return compiled
     }
@@ -189,6 +206,8 @@ struct RouteEntry {
     var pathExtractors = 0
     /// Registered through `app.heavy`.
     var heavy = false
+    /// The `app.state` types its handler asks for, when it is typed.
+    var states: [Any.Type] = []
 }
 
 /// The routes, laid out for serving: a flat route table and the handlers by
@@ -201,9 +220,22 @@ final class CompiledApplication: @unchecked Sendable {
     let costs: RouteCosts
     /// Spare connection memory, by worker thread.
     let connections = ConnectionCache()
+    /// This shard's state, and what builds it and stops it (State.swift).
+    let services: ServiceTable
+    /// How starting went, once a test client has started it.
+    let testStart = Mutex<Result<Void, any Error>?>(nil)
+    let stateFactories: [StateFactory]
+    let startHooks: [@Sendable (ShardContext) async throws -> Void]
+    let stopHooks: [@Sendable (ShardContext) async -> Void]
 
-    init(table: CompiledRoutes, routes: [RouteEntry]) {
+    init(table: CompiledRoutes, routes: [RouteEntry], stateFactories: [StateFactory] = [],
+         startHooks: [@Sendable (ShardContext) async throws -> Void] = [],
+         stopHooks: [@Sendable (ShardContext) async -> Void] = []) {
         self.table = table
+        self.stateFactories = stateFactories
+        self.startHooks = startHooks
+        self.stopHooks = stopHooks
+        services = ServiceTable(capacity: stateFactories.count)
         routeCount = routes.count
         costs = RouteCosts(declared: routes.map(\.heavy), names: routes.map { "\($0.method.name) \($0.pattern)" })
         handlers = .allocate(capacity: max(1, routes.count))

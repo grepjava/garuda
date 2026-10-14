@@ -60,8 +60,9 @@ let separateBodyThreshold = 16 * 1024
 func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     _ stream: borrowing S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer
 ) async {
-    var connection = HTTP1Connection(limits: limits, parts: app.connections.take(limits: limits, peer: peer),
-                                     cache: app.connections)
+    let parts = app.connections.take(limits: limits, peer: peer)
+    parts.pointee.exchange.pointee.application = Unmanaged.passUnretained(app)
+    var connection = HTTP1Connection(limits: limits, parts: parts, cache: app.connections)
     await connection.run(stream, app: app)
 }
 

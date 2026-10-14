@@ -119,7 +119,7 @@ func normalizedPrefix(_ prefix: String) -> String {
 public final class Router: RouteBuilder, @unchecked Sendable {
     enum Entry {
         case route(HTTPMethod, String, Handler)
-        case note(HTTPMethod, String, Int)
+        case note(HTTPMethod, String, Int, [Any.Type])
         case use(any Middleware)
         case group(String, [Entry])
     }
@@ -137,8 +137,8 @@ public final class Router: RouteBuilder, @unchecked Sendable {
         add(.route(method, pattern, handler))
     }
 
-    public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int) {
-        add(.note(method, pattern, pathParameters))
+    public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type]) {
+        add(.note(method, pattern, pathParameters, states))
     }
 
     public func use(_ middleware: some Middleware) {
@@ -162,7 +162,8 @@ public final class Router: RouteBuilder, @unchecked Sendable {
         for entry in entries {
             switch entry {
             case .route(let method, let pattern, let handler): builder.on(method, pattern, handler)
-            case .note(let method, let pattern, let count): builder.noteRoute(method, pattern, pathParameters: count)
+            case .note(let method, let pattern, let count, let states):
+                builder.noteRoute(method, pattern, pathParameters: count, states: states)
             case .use(let middleware): builder.use(middleware)
             case .group(let prefix, let inner): builder.group(prefix) { replay(inner, into: builder) }
             }

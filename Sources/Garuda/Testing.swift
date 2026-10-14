@@ -6,6 +6,8 @@
 // of a socket.
 //===----------------------------------------------------------------------===//
 
+import Synchronization
+import Vega
 import VegaIO
 
 extension Application {
@@ -15,6 +17,35 @@ extension Application {
     public func prepareForTesting(_ config: ServerConfig, threads: Int) {
         let app = compile()
         if app.costs.lane == nil { app.costs.configure(config, threads: threads) }
+    }
+
+    /// Builds the state and runs the start hooks, as shard 0 of 1, the first
+    /// time it is called for this application; later calls report how that
+    /// went. `prepareForTesting` must have been called.
+    @_spi(Testing)
+    public func startForTesting(on runtime: Runtime) throws {
+        guard let app = compiledApplication else { preconditionFailure("startForTesting before prepareForTesting") }
+        let outcome = app.testStart.withLock { outcome -> Result<Void, any Error> in
+            if let outcome { return outcome }
+            let shard = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
+            let result: Result<Void, any Error>
+            do {
+                try runtime.block { () async throws -> Void in try await app.startShard(shard) }
+                result = .success(())
+            } catch {
+                result = .failure(error)
+            }
+            outcome = result
+            return result
+        }
+        try outcome.get()
+    }
+
+    /// Runs the stop hooks and shuts the state down, as a shard stopping.
+    @_spi(Testing)
+    public func stopForTesting(on runtime: Runtime) {
+        guard let app = compiledApplication else { return }
+        runtime.block { () async -> Void in await app.stopShard(ShardInfo(index: 0, count: 1, threads: runtime.workerCount)) }
     }
 
     /// Route `pattern`'s smoothed thread-hold time, and whether it runs in

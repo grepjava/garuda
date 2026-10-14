@@ -65,13 +65,15 @@ extension Application {
         options.listeners = [.tcp(host: config.host, port: config.port, backlog: config.backlog)]
         options.name = "garuda-s"
         Runtime.sharded(options) { shard in
-            Application.serve(shard.runtime, app: app, limits: limits, config: config) {
+            let info = ShardInfo(index: shard.index, count: shard.count, threads: shard.runtime.workerCount)
+            Application.serve(shard.runtime, app: app, shard: info, limits: limits, config: config) {
                 () throws(IOError) -> TCPListener in try shard.listener()
             }
         }
         #else
         let runtime = Runtime(workers: config.threads)
-        Application.serve(runtime, app: app, limits: limits, config: config) {
+        let info = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
+        Application.serve(runtime, app: app, shard: info, limits: limits, config: config) {
             () throws(IOError) -> TCPListener in
             try TCPListener.bind(host: config.host, port: config.port, backlog: config.backlog)
         }
@@ -90,13 +92,20 @@ extension Application {
         #endif
     }
 
-    /// One shard's serving: accept until SIGTERM or SIGINT, then let the
-    /// requests in progress finish.
-    static func serve(_ runtime: Runtime, app: CompiledApplication, limits: ConnectionLimits,
+    /// One shard's serving: build its state and run its start hooks, accept
+    /// until SIGTERM or SIGINT, let the requests in progress finish, then run
+    /// its stop hooks and shut its state down.
+    static func serve(_ runtime: Runtime, app: CompiledApplication, shard: ShardInfo, limits: ConnectionLimits,
                       config: ServerConfig, listener: @escaping @Sendable () throws(IOError) -> TCPListener) {
         app.costs.configure(config, threads: runtime.workerCount)
         do {
             try runtime.block { () async throws(IOError) -> Void in
+                do {
+                    try await app.startShard(shard)
+                } catch {
+                    Log.error("shard \(shard.index) cannot start: \(error)")
+                    exit(1)
+                }
                 // Vega sets TCP_NODELAY on every accepted socket. One accept
                 // loop per thread: a connection then usually starts on the
                 // thread that accepted it, rather than one woken to steal it.
@@ -136,6 +145,7 @@ extension Application {
                 }
                 #endif
                 for server in all { await server.wait() }
+                await app.stopShard(shard)
             }
         } catch {
             Log.error("cannot serve on \(config.host):\(config.port): \(error)")

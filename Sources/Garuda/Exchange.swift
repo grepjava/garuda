@@ -38,6 +38,11 @@ struct Exchange: ~Copyable {
     @usableFromInline var decodedBody = ByteBuffer()
     /// The peer, as text, made when first asked for.
     @usableFromInline var remote: SocketPeer
+    /// What middleware stored for this request (Context.swift).
+    @usableFromInline var context = ContextSlots()
+    /// The application serving the connection, for its state. It outlives
+    /// every connection it serves.
+    var application: Unmanaged<CompiledApplication>?
 
     // MARK: The response
 
@@ -92,6 +97,7 @@ struct Exchange: ~Copyable {
         responseBody.clear()
         answered = false
         committed = false
+        if !context.isEmpty { context.clear() }
     }
 
     @inlinable

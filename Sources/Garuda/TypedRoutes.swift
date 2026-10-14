@@ -35,8 +35,10 @@ extension RouteBuilder {
             try answer.write(to: response)
         }
         var claims = 0
+        var states: [Any.Type] = []
         repeat claims += pathClaims((each E).self)
-        noteRoute(method, pattern, pathParameters: claims)
+        repeat states += requiredState((each E).self)
+        noteRoute(method, pattern, pathParameters: claims, states: states)
     }
 
     @inlinable

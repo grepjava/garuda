@@ -152,6 +152,35 @@ func percentDecoded(_ text: String) -> String {
 
 extension Path: PathClaiming {}
 
+/// An extractor that may refuse, made optional: nil where it would have
+/// refused, so the handler decides what a missing value means. A path
+/// parameter it would have claimed is left for the next `Path`.
+extension Optional: RequestExtractor where Wrapped: RequestExtractor {
+    public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Wrapped? {
+        let start = parameter
+        do {
+            return try await Wrapped.extract(from: request, parameter: &parameter)
+        } catch {
+            parameter = start
+            return nil
+        }
+    }
+}
+
+/// An extractor that may refuse, with why: the error it would have answered
+/// with, for the handler to look at.
+extension Result: RequestExtractor where Success: RequestExtractor, Failure == any Error {
+    public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Result {
+        let start = parameter
+        do {
+            return .success(try await Success.extract(from: request, parameter: &parameter))
+        } catch {
+            parameter = start
+            return .failure(error)
+        }
+    }
+}
+
 extension Path: Sendable where Value: Sendable {}
 extension Query: Sendable where Value: Sendable {}
 extension Body: Sendable where Value: Sendable {}

@@ -183,6 +183,9 @@ public final class TestClient: @unchecked Sendable {
         let address = remoteAddress, port = remotePort
         let limit = timeout
         let rt = TestClient.runtime
+        // The state and start hooks, once per application, as a shard
+        // builds them before it serves; what a factory threw, every time.
+        try app.startForTesting(on: rt)
         let received: [UInt8] = try rt.block { () async throws -> [UInt8] in
             let pair = duplex(capacity: 1 << 20)
             rt.spawn(with: pair.second) { stream in
