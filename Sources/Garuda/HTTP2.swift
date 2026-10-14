@@ -1076,9 +1076,10 @@ final class H2Connection: @unchecked Sendable {
                     return
                 }
                 sawRegular = true
-                if !HTTP2.validFieldName(span.name, span.nameLength)
-                    || !HTTP2.validFieldValue(span.value, span.valueLength)
-                    || !allFieldValueChars(span.value, span.valueLength) {
+                // HTTP/2's rules for a field (RFC 9113 section 8.2.1) and the
+                // parser's, in a pass over each of name and value.
+                guard let nameHash = validNameHash(span.name, span.nameLength),
+                      validRegularValue(span.value, span.valueLength) else {
                     malformed = true
                     return
                 }
@@ -1125,7 +1126,7 @@ final class H2Connection: @unchecked Sendable {
                 let name = s.head.append(span.name, span.nameLength)
                 let value = s.head.append(span.value, span.valueLength)
                 headers[count] = HTTPHeaderRef(name: HTTPSlice(name.0, name.1), value: HTTPSlice(value.0, value.1),
-                                               nameHash: fieldNameHash(span.name, span.nameLength))
+                                               nameHash: nameHash)
                 count &+= 1
                 textSize &+= span.nameLength &+ span.valueLength &+ 4
             }
@@ -1616,6 +1617,33 @@ func fieldNameHash(_ p: UnsafePointer<UInt8>, _ n: Int) -> UInt32 {
     var i = 0
     while i < n {
         hash = (hash ^ UInt32(asciiLower(p[i]))) &* 16777619
+        i &+= 1
+    }
+    return hash
+}
+
+/// A field value as HTTP/2 takes it -- not starting or ending in
+/// whitespace -- and as HTTPParser does: no control byte but HTAB, no DEL.
+/// That is stricter than HTTP/2's own rule, which only bars NUL, CR and LF.
+@inline(__always)
+func validRegularValue(_ p: UnsafePointer<UInt8>, _ n: Int) -> Bool {
+    if n == 0 { return true }
+    let first = p[0], last = p[n &- 1]
+    if first == cSP || first == cHT || last == cSP || last == cHT { return false }
+    return allFieldValueChars(p, n)
+}
+
+/// HTTPParser's hash of a field name HTTP/2 takes -- a token in lower case
+/// -- or nil for one it does not.
+@inline(__always)
+func validNameHash(_ p: UnsafePointer<UInt8>, _ n: Int) -> UInt32? {
+    if n == 0 { return nil }
+    var hash: UInt32 = 2166136261
+    var i = 0
+    while i < n {
+        let c = p[i]
+        if !isTokenChar(c) || (c >= 0x41 && c <= 0x5A) { return nil }
+        hash = (hash ^ UInt32(c)) &* 16777619
         i &+= 1
     }
     return hash
