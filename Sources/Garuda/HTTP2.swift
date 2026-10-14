@@ -8,13 +8,14 @@
 //
 // The connection's own task is the READER. It reads frames, owns the HPACK
 // decoder and the table of streams, keeps the receive windows, and enforces
-// every limit. A second task, the WRITER, owns the socket's write side and
-// the HPACK encoder: header blocks have to go out in the order they are
-// encoded, so one task does both. The two meet in `H2Connection`, under its
-// lock: control frames the reader wants sent (SETTINGS acks, PING answers,
-// WINDOW_UPDATEs, RST_STREAMs, GOAWAY), streams that have their answer, and
-// the send windows the peer grants. The reader wakes the writer with a
-// `Notify`; so does a stream when it is answered.
+// every limit. A second task, the WRITER, writes what nobody else does. The
+// two meet in `H2Connection`, under its lock: control frames the reader wants
+// sent (SETTINGS acks, PING answers, WINDOW_UPDATEs, RST_STREAMs, GOAWAY),
+// streams that have their answer, and the send windows the peer grants. The
+// reader wakes the writer with a `Notify`. A stream whose answer is ready
+// writes it itself when nobody else is writing and the windows take it
+// whole, holding the connection's write role meanwhile; otherwise it too
+// hands its answer to the writer (HTTP2Writer.swift).
 //
 // A stream's request head is rebuilt as HTTP/1.1 text in the stream's own
 // buffer and parsed by the ordinary parser into the stream's own `Exchange`,
@@ -242,12 +243,14 @@ func serveHTTP2<R: AsyncReader & ~Copyable, W: AsyncWriter & ~Copyable & Sendabl
     app: CompiledApplication, limits: ConnectionLimits, service: HTTP2Service, secure: Bool,
     closeWriter: @escaping @Sendable (borrowing W) async -> Void
 ) async {
-    let connection = H2Connection(app: app, limits: limits, parts: parts, service: service, secure: secure)
-    connection.begin()
     let reader = halves.reader
-    let writer = service.runtime.spawn(with: halves.writer) { stream in
-        await connection.runWriter(stream)
-        await closeWriter(stream)
+    let sink = H2WriteHalf(halves.writer)
+    let connection = H2Connection(app: app, limits: limits, parts: parts, service: service, secure: secure,
+                                  sink: sink)
+    connection.begin()
+    let writer = service.runtime.spawn {
+        await connection.runWriter()
+        await sink.close(closeWriter)
     }
     service.register(connection)
     await connection.runReader(reader)
@@ -364,6 +367,21 @@ final class H2Connection: @unchecked Sendable {
     /// The writer could not write.
     let writeFailed = Atomic<Bool>(false)
 
+    /// Someone holds the write role (HTTP2Writer.swift).
+    var writing = false
+    /// The writer is waiting for the role.
+    var writerWanted = false
+
+    // MARK: The write role's
+
+    /// The write half: kept alive by `serveHTTP2` and the writer, which
+    /// outlive every task that writes.
+    unowned(unsafe) let sink: any H2Sink
+    @exclusivity(unchecked) var wOut = ByteBuffer(capacity: 16 * 1024)
+    @exclusivity(unchecked) var wBlock = ByteBuffer(capacity: 1024)
+    @exclusivity(unchecked) var wDigits = ByteBuffer(capacity: 32)
+    var frameSizeForRole = H2FrameHeader.defaultMaxFrameSize
+
     // Links in the service's list, under its lock.
     unowned(unsafe) var previousConnection: H2Connection?
     unowned(unsafe) var nextConnection: H2Connection?
@@ -391,7 +409,8 @@ final class H2Connection: @unchecked Sendable {
     var cookies = ByteBuffer()
 
     init(app: CompiledApplication, limits: ConnectionLimits, parts: UnsafeMutablePointer<ConnectionParts>,
-         service: HTTP2Service, secure: Bool) {
+         service: HTTP2Service, secure: Bool, sink: any H2Sink) {
+        self.sink = sink
         self.app = app
         self.limits = limits
         settings = limits.http2
@@ -413,6 +432,9 @@ final class H2Connection: @unchecked Sendable {
         pseudo.destroy()
         fields.destroy()
         cookies.destroy()
+        wOut.destroy()
+        wBlock.destroy()
+        wDigits.destroy()
     }
 
     /// Takes the preface off the read buffer and queues our SETTINGS, which
@@ -1139,9 +1161,14 @@ final class H2Connection: @unchecked Sendable {
         let unretained = Unmanaged.passUnretained(s)
         async let handled: Void = H2Connection.handle(unretained)
         await handled
-        lock.withLock { _ in
+        let data = prepareAnswer(s)
+        // Written from here when nobody else is writing and the windows
+        // take it all; the writer's otherwise.
+        let direct = lock.withLock { _ -> Bool in
             if s.reset {
                 release(s)
+            } else if takeRole(for: s, data: data) {
+                return true
             } else {
                 ready.append(s)
                 wake.notifyOne()
@@ -1149,6 +1176,18 @@ final class H2Connection: @unchecked Sendable {
             tasks &-= 1
             // Signalled under the lock: once it is let go, the connection
             // may be gone.
+            if tasks == 0 { idle.notifyOne() }
+            return false
+        }
+        guard direct else { return }
+        frameWhole(s)
+        let sent = await sendFramed()
+        lock.withLock { _ in
+            if !s.reset { earned &+= 1 }
+            s.closed = true
+            release(s)
+            releaseRole(failed: !sent)
+            tasks &-= 1
             if tasks == 0 { idle.notifyOne() }
         }
     }
