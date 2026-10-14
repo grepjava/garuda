@@ -135,7 +135,9 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     /// The middleware around route `index`, outermost first: global, then
     /// its groups from the outside in, as they stand when this is asked.
     func middleware(of route: RouteEntry) -> [any Middleware] {
-        global + route.groups.flatMap { groups[$0].middleware }
+        // A CORS policy is not in the order of `use`: the innermost scope's
+        // runs in front of everything else (CORS.swift).
+        placingCORSFirst([global] + route.groups.map { groups[$0].middleware })
     }
 
     // MARK: Checks
@@ -181,6 +183,7 @@ public final class Application: RouteBuilder, @unchecked Sendable {
         for i in serving.indices {
             let layers = middleware(of: serving[i])
             if !layers.isEmpty { serving[i].handler = compose(layers, around: serving[i].handler) }
+            serving[i].cors = (layers.first as? CORSMiddleware)?.policy
         }
         let compiled = CompiledApplication(table: table.compile(), routes: serving,
                                            stateFactories: stateFactories,
@@ -208,6 +211,9 @@ struct RouteEntry {
     var heavy = false
     /// The `app.state` types its handler asks for, when it is typed.
     var states: [Any.Type] = []
+    /// The CORS policy in front of it, for a preflight to its path that no
+    /// OPTIONS route takes (CORS.swift).
+    var cors: CORSPolicy? = nil
 }
 
 /// The routes, laid out for serving: a flat route table and the handlers by
@@ -227,6 +233,10 @@ final class CompiledApplication: @unchecked Sendable {
     let stateFactories: [StateFactory]
     let startHooks: [@Sendable (ShardContext) async throws -> Void]
     let stopHooks: [@Sendable (ShardContext) async -> Void]
+    /// Each route's CORS policy, by route index, and whether any route has
+    /// one: a path with none never looks (CORS.swift).
+    let corsPolicies: [CORSPolicy?]
+    let hasCORS: Bool
 
     init(table: CompiledRoutes, routes: [RouteEntry], stateFactories: [StateFactory] = [],
          startHooks: [@Sendable (ShardContext) async throws -> Void] = [],
@@ -237,6 +247,8 @@ final class CompiledApplication: @unchecked Sendable {
         self.stopHooks = stopHooks
         services = ServiceTable(capacity: stateFactories.count)
         routeCount = routes.count
+        corsPolicies = routes.map(\.cors)
+        hasCORS = corsPolicies.contains { $0 != nil }
         costs = RouteCosts(declared: routes.map(\.heavy), names: routes.map { "\($0.method.name) \($0.pattern)" })
         handlers = .allocate(capacity: max(1, routes.count))
         for (i, route) in routes.enumerated() { (handlers + i).initialize(to: route.handler) }

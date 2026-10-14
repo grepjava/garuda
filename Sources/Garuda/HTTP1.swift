@@ -151,6 +151,12 @@ struct HTTP1Connection: ~Copyable {
             x.pointee.parameters = RouteParameters()
             if allowed.isEmpty {
                 x.pointee.answer(404, nil, 0)
+            } else if x.pointee.head.method == .options && app.hasCORS
+                        && answerPreflight(x, app, allowed: allowed, base, path.count) {
+                // A CORS preflight to a path routed only for other methods:
+                // the policy of a route there answers it rather than a 405
+                // (CORS.swift). Only an OPTIONS that matched nothing, in an
+                // application with a policy, gets this far.
             } else {
                 var list = ""
                 for method in allowed {
