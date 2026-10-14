@@ -98,15 +98,25 @@ extension Application {
         app.costs.configure(config, threads: runtime.workerCount)
         do {
             try runtime.block { () async throws(IOError) -> Void in
-                var options = TCPServer.Configuration()
-                options.connectionOptions[.noDelay] = 1
-                let server = try TCPServer.serve(try listener(), configuration: options) { stream in
-                    let peer = (try? stream.peerAddress).map {
-                        SocketPeer(address: $0.host, port: $0.port ?? 0)
-                    } ?? .none
-                    await serveHTTP1(stream, app: app, limits: limits, peer: peer)
+                // Vega sets TCP_NODELAY on every accepted socket. One accept
+                // loop per thread: a connection then usually starts on the
+                // thread that accepted it, rather than one woken to steal it.
+                let acceptors = max(1, config.acceptors ?? runtime.workerCount)
+                var servers: [TCPServer] = []
+                for _ in 0..<acceptors {
+                    servers.append(try TCPServer.serve(try listener()) { stream in
+                        #if os(Windows)
+                        let peer = (try? stream.peerAddress).map {
+                            SocketPeer(address: $0.host, port: $0.port ?? 0)
+                        } ?? .none
+                        #else
+                        let peer = SocketPeer(socket: stream.fileDescriptor)
+                        #endif
+                        await serveHTTP1(stream, app: app, limits: limits, peer: peer)
+                    })
                 }
-                Log.info("serving on \(config.host):\(server.port)")
+                Log.info("serving on \(config.host):\(servers[0].port)")
+                let all = servers
                 #if !os(Windows)
                 let grace = config.gracefulShutdown
                 runtime.spawn {
@@ -121,10 +131,12 @@ extension Application {
                         await group.next()
                         group.cancelAll()
                     }
-                    await server.shutdown(gracePeriod: grace)
+                    await withTaskGroup(of: Void.self) { group in
+                        for server in all { group.addTask { await server.shutdown(gracePeriod: grace) } }
+                    }
                 }
                 #endif
-                await server.wait()
+                for server in all { await server.wait() }
             }
         } catch {
             Log.error("cannot serve on \(config.host):\(config.port): \(error)")
@@ -158,6 +170,7 @@ extension ServerConfig {
           --heavy-threshold US a route holding a thread longer than this many
                                microseconds runs in the heavy lane (default 500)
           --no-heavy-lane      let every route use every thread
+          --acceptors N        accept loops per shard (default: one a thread)
           --log-level LEVEL    debug, info, warning, error or silent
           --max-body BYTES     largest request body (default 16 MiB)
           --keep-alive SECS    idle keep-alive timeout (default 5)
@@ -213,6 +226,11 @@ extension ServerConfig {
                     return fail("--threads must be a positive count")
                 }
                 config.threads = n
+            case "--acceptors":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--acceptors must be a positive count")
+                }
+                config.acceptors = n
             case "--no-pin":
                 config.pinThreads = false
             case "--io":
@@ -248,6 +266,44 @@ extension ServerConfig {
         }
         return .run(config)
     }
+}
+
+/// The address and port of the peer of socket `fd`, or nil.
+func peerName(of fd: Int32) -> (String, Int)? {
+    #if os(Windows)
+    return nil
+    #else
+    guard fd >= 0 else { return nil }
+    var storage = sockaddr_storage()
+    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let rc = withUnsafeMutablePointer(to: &storage) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fd, $0, &length) }
+    }
+    guard rc == 0 else { return nil }
+    var text = [CChar](repeating: 0, count: 64)
+    switch Int32(storage.ss_family) {
+    case AF_INET:
+        return withUnsafePointer(to: &storage) {
+            $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { a in
+                var addr = a.pointee.sin_addr
+                guard inet_ntop(AF_INET, &addr, &text, socklen_t(text.count)) != nil else { return nil }
+                return (String(cString: text), Int(UInt16(bigEndian: a.pointee.sin_port)))
+            }
+        }
+    case AF_INET6:
+        return withUnsafePointer(to: &storage) {
+            $0.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { a in
+                var addr = a.pointee.sin6_addr
+                guard inet_ntop(AF_INET6, &addr, &text, socklen_t(text.count)) != nil else { return nil }
+                return (String(cString: text), Int(UInt16(bigEndian: a.pointee.sin6_port)))
+            }
+        }
+    case AF_UNIX:
+        return ("unix", 0)
+    default:
+        return nil
+    }
+    #endif
 }
 
 func environment(_ name: String) -> String? {

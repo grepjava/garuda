@@ -165,18 +165,34 @@ struct Exchange: ~Copyable {
     }
 }
 
-/// The address of the peer of a connection, as the connection knows it.
+/// The address of the peer of a connection: given, or looked up from the
+/// socket the first time a handler asks. Most never do, and a lookup is a
+/// system call and a String for every connection.
 @usableFromInline
 struct SocketPeer: Sendable {
-    @usableFromInline var address: String
-    @usableFromInline var port: Int
+    private var fd: Int32 = -1
+    private var known: (address: String, port: Int)?
 
     @usableFromInline init(address: String, port: Int) {
-        self.address = address
-        self.port = port
+        known = (address, port)
+    }
+
+    /// The peer of socket `fd`, looked up when asked for.
+    init(socket fd: Int32) {
+        self.fd = fd
     }
 
     static let none = SocketPeer(address: "", port: 0)
+
+    @usableFromInline var address: String { mutating get { resolved().address } }
+    @usableFromInline var port: Int { mutating get { resolved().port } }
+
+    private mutating func resolved() -> (address: String, port: Int) {
+        if let known { return known }
+        let found = peerName(of: fd) ?? ("", 0)
+        known = found
+        return found
+    }
 }
 
 @inlinable

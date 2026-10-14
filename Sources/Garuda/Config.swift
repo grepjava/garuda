@@ -18,6 +18,8 @@ public struct ServerConfig: Sendable {
     public var shards: Int? = nil
     /// Worker threads per shard; nil divides the CPUs among the shards.
     public var threads: Int? = nil
+    /// Accept loops per shard; nil: one per thread.
+    public var acceptors: Int? = nil
     /// Pin each shard's threads to its CPUs.
     public var pinThreads = true
     /// The I/O driver: `uring` or `epoll`; nil for io_uring where the kernel
