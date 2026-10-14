@@ -74,6 +74,23 @@ public struct ServerConfig: Sendable {
     /// How long a client has to finish the TLS handshake.
     public var tlsHandshakeTimeout: Duration = .seconds(10)
 
+    // --- HTTP/2 (HTTP2.swift) ---
+    /// Serve HTTP/2: to a TLS client that asks for "h2" by ALPN, and to a
+    /// cleartext client that opens with the HTTP/2 preface (prior knowledge).
+    public var http2Enabled = true
+    /// Serve only HTTP/2 in cleartext (h2c), with no HTTP/1 fallback: what a
+    /// proxy that talks h2c upstream (Envoy, Caddy) and a gRPC client expect.
+    public var http2Only = false
+    /// Streams a client may have open at once on one connection.
+    public var h2MaxConcurrentStreams = 128
+    /// The largest frame payload a client may send.
+    public var h2MaxFrameSize = 16 * 1024
+    /// How much request body a client may send on a stream, and on the
+    /// connection, before the server gives the window back. The body is
+    /// held whole until dispatch, and the body limit bounds it, so a large
+    /// window costs nothing but lets an upload use the link.
+    public var h2InitialWindowSize = 256 * 1024
+
     // --- request IDs and logging (RequestID.swift, Logging.swift) ---
     /// Peers whose forwarded headers are believed (--forwarded-allow-ips).
     /// Empty means "trust nobody", which is the only safe default: a header

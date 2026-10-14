@@ -62,7 +62,8 @@ extension Application {
         // than by every shard as it starts.
         if !config.tlsCertificates.isEmpty {
             do {
-                _ = try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn, ticketKey: nil)
+                _ = try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn(for: config),
+                                         ticketKey: nil)
             } catch {
                 Log.error("TLS: \(error)")
                 exit(2)
@@ -115,7 +116,14 @@ extension Application {
     }
 
     /// The protocols offered by ALPN, most wanted first.
-    static let alpn = ["http/1.1"]
+    static let alpn = ["h2", "http/1.1"]
+
+    /// What `config` offers: no "h2" without HTTP/2, nothing else with
+    /// --http2-only.
+    static func alpn(for config: ServerConfig) -> [String] {
+        if config.http2Only { return ["h2"] }
+        return config.http2Enabled ? alpn : ["http/1.1"]
+    }
 
     /// Where a shard listens, and its session-ticket key under TLS.
     struct Listening: Sendable {
@@ -145,7 +153,8 @@ extension Application {
         var certificates: CertificateStore? = nil
         if !config.tlsCertificates.isEmpty {
             do {
-                certificates = try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn,
+                certificates = try CertificateStore(files: config.tlsCertificates,
+                                                    protocols: Application.alpn(for: config),
                                                     ticketKey: listening.ticketKey)
             } catch {
                 Log.error("TLS: \(error)")
@@ -154,6 +163,9 @@ extension Application {
         }
         let tls = certificates
         let handshakeTimeout = config.tlsHandshakeTimeout
+        // The pool HTTP/2 streams run in, and the connections shutdown
+        // sends GOAWAY to (HTTP2.swift).
+        let http2 = limits.http2.enabled ? HTTP2Service(runtime: runtime) : nil
         do {
             try runtime.block { () async throws(IOError) -> Void in
                 do {
@@ -169,13 +181,11 @@ extension Application {
                 var servers: [TCPServer] = []
                 for _ in 0..<acceptors {
                     servers.append(try TCPServer.serve(try listening.main()) { stream in
-                        let peer = socketPeer(stream)
                         guard let tls else {
-                            return await serveHTTP1(stream, app: app, limits: limits, peer: peer)
+                            return await serveTCP(stream, app: app, limits: limits, http2: http2)
                         }
-                        await serveTLS(stream, tls, handshakeTimeout: handshakeTimeout) { secured in
-                            await serveHTTP1(secured, app: app, limits: limits, peer: peer, secure: true)
-                        }
+                        await serveTLSConnection(stream, tls, handshakeTimeout: handshakeTimeout, app: app,
+                                                 limits: limits, http2: http2)
                     })
                 }
                 Log.info("serving \(tls == nil ? "http" : "https") on \(config.host):\(servers[0].port)")
@@ -205,6 +215,9 @@ extension Application {
                         await group.next()
                         group.cancelAll()
                     }
+                    // HTTP/2 connections are sent GOAWAY and finish the streams
+                    // they have, as HTTP/1 ones finish their request.
+                    http2?.shutdown()
                     await withTaskGroup(of: Void.self) { group in
                         for server in all { group.addTask { await server.shutdown(gracePeriod: grace) } }
                     }
@@ -260,6 +273,8 @@ extension ServerConfig {
           --forwarded-allow-ips L
                                proxies whose forwarded headers are trusted:
                                addresses, CIDR blocks, unix, or *
+          --no-http2           refuse HTTP/2 and answer HTTP/1.1 only
+          --http2-only         serve only HTTP/2 (h2c), with no HTTP/1 fallback
           --request-id         give every request an X-Request-ID, echoed on
                                the response and logged; one a
                                --forwarded-allow-ips proxy sent is kept
@@ -380,6 +395,12 @@ extension ServerConfig {
                 guard v.withCString({ config.trust.parse($0) }) else {
                     return fail("--forwarded-allow-ips contains an address that is not valid")
                 }
+            case "--no-http2":
+                config.http2Enabled = false
+                config.http2Only = false
+            case "--http2-only":
+                config.http2Only = true
+                config.http2Enabled = true
             case "--request-id":
                 config.requestID = true
             case "--trace-context":

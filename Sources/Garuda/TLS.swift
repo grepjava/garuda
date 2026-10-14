@@ -5,10 +5,11 @@
 //            --tls-cert api.pem --tls-key api.key --redirect-http 80
 //
 // A connection is accepted as TCP, handed to Vega's TLSStream for the
-// handshake (bounded by the head timeout), and then served by the same HTTP/1
-// task as plain text: TLSStream reads and writes like any stream. The
-// connection is marked secure, which is what Strict-Transport-Security and a
-// cookie's default `Secure` follow.
+// handshake (bounded by the head timeout), and then served as plain text is:
+// TLSStream reads and writes like any stream. A client that chose "h2" by
+// ALPN gets HTTP/2 (HTTP2.swift), any other the HTTP/1 task. The connection
+// is marked secure, which is what Strict-Transport-Security and a cookie's
+// default `Secure` follow.
 //
 // Several certificates: each covers the names in it (its subject alternative
 // names, wildcards one label deep). The client's SNI picks the first that
@@ -156,18 +157,48 @@ func socketPeer(_ stream: borrowing TCPStream) -> SocketPeer {
 /// goodbye with close_notify when it returns.
 func serveTLS(_ stream: consuming TCPStream, _ store: CertificateStore, handshakeTimeout: Duration,
               _ body: (borrowing TLSStream<TCPStream>) async -> Void) async {
+    guard let secured = await handshake(stream, store, handshakeTimeout: handshakeTimeout) else { return }
+    await body(secured)
+    _ = try? await secured.close()
+}
+
+/// Shakes hands on `stream`, giving up on a client that takes longer than
+/// `handshakeTimeout`. Nil for a client that went away, timed out, or spoke
+/// something else.
+func handshake(_ stream: consuming TCPStream, _ store: CertificateStore,
+               handshakeTimeout: Duration) async -> TLSStream<TCPStream>? {
     var pending: TCPStream? = consume stream
-    let secured: TLSStream<TCPStream>
     do {
-        secured = try await Runtime.withIODeadline(handshakeTimeout) { () async throws(IOError) -> TLSStream<TCPStream> in
+        return try await Runtime.withIODeadline(handshakeTimeout) { () async throws(IOError) -> TLSStream<TCPStream> in
             try await TLSStream.accept(pending.take()!, context: store.handshakeContext)
         }
     } catch {
-        // A client that went away, timed out, or spoke something else.
-        return
+        return nil
     }
-    await body(secured)
-    _ = try? await secured.close()
+}
+
+/// Serves an accepted TCP connection: HTTP/1, or HTTP/2 by prior knowledge
+/// (HTTP2.swift).
+func serveTCP(_ stream: consuming TCPStream, app: CompiledApplication, limits: ConnectionLimits,
+              http2: HTTP2Service?) async {
+    let peer = socketPeer(stream)
+    await serveConnection(stream, app: app, limits: limits, peer: peer, secure: false, http2: http2,
+                          halves: { $0.halves() }, close: { _ in }, closeWriter: { _ in })
+}
+
+/// Serves an accepted connection over TLS: HTTP/2 when the client chose
+/// "h2" by ALPN, otherwise as `serveTCP` does. Says goodbye with
+/// close_notify.
+func serveTLSConnection(_ stream: consuming TCPStream, _ store: CertificateStore, handshakeTimeout: Duration,
+                        app: CompiledApplication, limits: ConnectionLimits, http2: HTTP2Service?) async {
+    let peer = socketPeer(stream)
+    guard let secured = await handshake(stream, store, handshakeTimeout: handshakeTimeout) else { return }
+    let h2 = http2 != nil && secured.applicationProtocol == "h2"
+    await serveConnection(secured, app: app, limits: limits, peer: peer, secure: true, http2: http2,
+                          negotiatedH2: h2,
+                          halves: { $0.halves() },
+                          close: { secured in _ = try? await secured.close() },
+                          closeWriter: { writer in try? await writer.close() })
 }
 
 /// Looks at the certificate files every `interval`, and serves them again

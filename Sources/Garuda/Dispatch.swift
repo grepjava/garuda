@@ -86,6 +86,10 @@ func runHandler(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication,
         }
     } catch let error as any ResponseError {
         answerError(x, error)
+    } catch is CancellationError where Task.isCancelled {
+        // Cancelled because nobody wants the answer -- an HTTP/2 stream the
+        // client reset -- which is not the handler's failure to report.
+        answerFailure(x)
     } catch {
         Log.error("handler threw: \(error)")
         if observing { x.pointee.failure = "handler threw: \(error)" }

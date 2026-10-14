@@ -46,8 +46,11 @@ struct ConnectionLimits: Sendable {
     /// --access-log, as text or JSON (Logging.swift).
     var accessLog: Bool
     var accessLogJSON: Bool
+    /// HTTP/2's settings and limits (HTTP2.swift).
+    var http2: HTTP2Limits
 
     init(_ config: ServerConfig) {
+        http2 = HTTP2Limits(config)
         readBufferSize = max(1024, config.readBufferSize)
         maxHeadSize = config.maxHeadSize
         maxHeaders = max(1, config.maxHeaders)
@@ -78,7 +81,16 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     _ stream: borrowing S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer,
     secure: Bool = false
 ) async {
-    let parts = app.connections.take(limits: limits, peer: peer)
+    await serveHTTP1(stream, parts: app.connections.take(limits: limits, peer: peer), app: app, limits: limits,
+                     secure: secure)
+}
+
+/// The same, on parts already taken, whose input may hold the connection's
+/// first bytes: read while looking for the HTTP/2 preface (HTTP2.swift).
+func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
+    _ stream: borrowing S, parts: UnsafeMutablePointer<ConnectionParts>, app: CompiledApplication,
+    limits: ConnectionLimits, secure: Bool
+) async {
     let x = parts.pointee.exchange
     x.pointee.application = Unmanaged.passUnretained(app)
     // The exchange is reused from connection to connection: set both.
