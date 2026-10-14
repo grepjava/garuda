@@ -306,7 +306,7 @@ public enum HTTPParser {
     /// Method classification by length and first byte: one comparison chain,
     /// no hashing, and the common verbs land first.
     @inlinable
-    static func classifyMethod(_ p: UnsafePointer<UInt8>, _ n: Int) -> HTTPMethod {
+    public static func classifyMethod(_ p: UnsafePointer<UInt8>, _ n: Int) -> HTTPMethod {
         switch n {
         case 3:
             if equalsExact(p, 3, "GET") { return .get }

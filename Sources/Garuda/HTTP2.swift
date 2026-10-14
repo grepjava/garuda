@@ -17,10 +17,11 @@
 // whole, holding the connection's write role meanwhile; otherwise it too
 // hands its answer to the writer (HTTP2Writer.swift).
 //
-// A stream's request head is rebuilt as HTTP/1.1 text in the stream's own
-// buffer and parsed by the ordinary parser into the stream's own `Exchange`,
-// with its version set to 2: routing, middleware, extractors and the heavy
-// lane see a request like any other. Its body is collected whole before
+// A stream's request is decoded into the stream's own buffer and described in
+// the stream's own `Exchange` exactly as the HTTP/1 parser would describe the
+// HTTP/1.1 head it amounts to, with its version set to 2: routing,
+// middleware, extractors and the heavy lane see a request like any other.
+// Its body is collected whole before
 // dispatch, as HTTP/1 collects one, held to the same body limit, with the
 // window given back as it arrives. Then the stream runs `dispatch` in a task
 // from the shard's `TaskPool`, so a handler that waits holds up no other
@@ -418,9 +419,7 @@ final class H2Connection: @unchecked Sendable {
     /// A stream whose handler the reader runs itself, once the frame that
     /// completed its request is handled.
     @exclusivity(unchecked) var inlineStream: H2Stream?
-    /// Scratch for rebuilding a head.
-    @exclusivity(unchecked) var pseudo = ByteBuffer()
-    @exclusivity(unchecked) var fields = ByteBuffer()
+    /// Cookie crumbs being joined.
     @exclusivity(unchecked) var cookies = ByteBuffer()
 
     init(app: CompiledApplication, limits: ConnectionLimits, parts: UnsafeMutablePointer<ConnectionParts>,
@@ -444,8 +443,6 @@ final class H2Connection: @unchecked Sendable {
         control.destroy()
         outgoing.destroy()
         headerBlock.destroy()
-        pseudo.destroy()
-        fields.destroy()
         cookies.destroy()
         wOut.destroy()
         wBlock.destroy()
@@ -1011,20 +1008,38 @@ final class H2Connection: @unchecked Sendable {
 
     enum HeadOutcome { case ok, malformed, compression }
 
-    /// Rebuilds the request as HTTP/1.1 text in the stream's head buffer and
-    /// parses it into its exchange.
+    /// Fills the stream's exchange with the request: its bytes in the
+    /// stream's head buffer, and the head and header table describing them
+    /// as `HTTPParser` would describe the HTTP/1.1 head they amount to, so
+    /// nothing downstream can tell the difference.
     ///
-    /// A decoded field is only valid until the next one is decoded, so what
-    /// is kept is copied out as it arrives: pseudo-header values into
-    /// `pseudo`, regular fields straight into header text.
+    /// That head is `method SP path HTTP/1.1`, then `host` -- the
+    /// `:authority`, or the Host field when there is none -- then the other
+    /// fields in their order, then the cookie crumbs joined into one field
+    /// (RFC 9113 section 8.2.3). What the parser would refuse in it is
+    /// malformed here: a method that is not a token, a path with a space or
+    /// a control byte, a value with a control byte, no host at all, two
+    /// Content-Lengths that disagree, more fields than allowed.
+    ///
+    /// A decoded field is only valid until the next one is decoded, so each
+    /// is copied into the head buffer as it arrives; the slices are offsets,
+    /// which survive the buffer growing.
     func buildHead(_ s: H2Stream, _ p: UnsafePointer<UInt8>, _ n: Int) -> HeadOutcome {
-        pseudo.clear()
-        fields.clear()
         cookies.clear()
+        s.head.clear()
+        let x = s.x
+        let headers = x.pointee.headers
+        let maxHeaders = limits.maxHeaders
+        // Slot 0 is the host's, filled once the block is read.
+        var count = 1
         var method = (0, 0), path = (0, 0), authority = (0, 0), host = (0, 0)
         var sawMethod = false, sawPath = false, sawScheme = false, sawAuthority = false, sawHost = false
         var sawRegular = false
         var malformed = false
+        var contentLength = -1
+        var expectContinue = false
+        // The HTTP/1.1 head's size, for the parser's limit on it.
+        var textSize = 0
 
         do {
             try decoder.decode(p, n, sizeLimit: settings.maxHeaderListSize) { span in
@@ -1036,20 +1051,23 @@ final class H2Connection: @unchecked Sendable {
                         return
                     }
                     if equalsExact(span.name, span.nameLength, ":method") {
-                        if sawMethod { malformed = true; return }
+                        if sawMethod || !allTokenChars(span.value, span.valueLength) { malformed = true; return }
                         sawMethod = true
-                        method = stash(span)
+                        method = s.head.append(span.value, span.valueLength)
                     } else if equalsExact(span.name, span.nameLength, ":path") {
-                        if sawPath { malformed = true; return }
+                        if sawPath || !validTarget(span.value, span.valueLength) { malformed = true; return }
                         sawPath = true
-                        path = stash(span)
+                        path = s.head.append(span.value, span.valueLength)
                     } else if equalsExact(span.name, span.nameLength, ":scheme") {
                         if sawScheme { malformed = true; return }
                         sawScheme = true
                     } else if equalsExact(span.name, span.nameLength, ":authority") {
-                        if sawAuthority { malformed = true; return }
+                        if sawAuthority || !allFieldValueChars(span.value, span.valueLength) {
+                            malformed = true
+                            return
+                        }
                         sawAuthority = true
-                        authority = stash(span)
+                        authority = s.head.append(span.value, span.valueLength)
                     } else {
                         // Unknown, or :protocol, which is only for a peer we
                         // told it may (RFC 8441) and we do not.
@@ -1059,7 +1077,8 @@ final class H2Connection: @unchecked Sendable {
                 }
                 sawRegular = true
                 if !HTTP2.validFieldName(span.name, span.nameLength)
-                    || !HTTP2.validFieldValue(span.value, span.valueLength) {
+                    || !HTTP2.validFieldValue(span.value, span.valueLength)
+                    || !allFieldValueChars(span.value, span.valueLength) {
                     malformed = true
                     return
                 }
@@ -1072,23 +1091,43 @@ final class H2Connection: @unchecked Sendable {
                     }
                 }
                 if equalsExact(span.name, span.nameLength, "host") {
-                    // Written once below: the parser refuses a second Host.
+                    // One Host line: a second Host is refused.
                     if sawHost { malformed = true; return }
                     sawHost = true
-                    host = stash(span)
+                    host = s.head.append(span.value, span.valueLength)
                     return
                 }
                 if equalsExact(span.name, span.nameLength, "cookie") {
                     // RFC 9113 section 8.2.3: crumbs a client split are
-                    // joined into one field for HTTP/1.1.
+                    // joined into one field.
                     if cookies.readableBytes > 0 { cookies.write("; ") }
                     if span.valueLength > 0 { cookies.write(span.value, span.valueLength) }
                     return
                 }
-                fields.write(span.name, span.nameLength)
-                fields.write(": ")
-                if span.valueLength > 0 { fields.write(span.value, span.valueLength) }
-                fields.writeCRLF()
+                if count == maxHeaders {
+                    malformed = true
+                    return
+                }
+                switch span.nameLength {
+                case 14 where equalsExact(span.name, 14, "content-length"):
+                    // Repeated, every copy has to agree.
+                    let v = parseDecimal(span.value, span.valueLength)
+                    if v < 0 || (contentLength >= 0 && contentLength != v) {
+                        malformed = true
+                        return
+                    }
+                    contentLength = v
+                case 6 where equalsExact(span.name, 6, "expect"):
+                    if containsTokenLowercased(span.value, span.valueLength, "100-continue") { expectContinue = true }
+                default:
+                    break
+                }
+                let name = s.head.append(span.name, span.nameLength)
+                let value = s.head.append(span.value, span.valueLength)
+                headers[count] = HTTPHeaderRef(name: HTTPSlice(name.0, name.1), value: HTTPSlice(value.0, value.1),
+                                               nameHash: fieldNameHash(span.name, span.nameLength))
+                count &+= 1
+                textSize &+= span.nameLength &+ span.valueLength &+ 4
             }
         } catch {
             return .compression
@@ -1097,56 +1136,64 @@ final class H2Connection: @unchecked Sendable {
         // A plain CONNECT has no :scheme or :path, and an extended one needs
         // :protocol, which is not offered: neither is served.
         if !sawMethod || !sawScheme || !sawPath || method.1 == 0 || path.1 == 0 { return .malformed }
-        let values = UnsafePointer(pseudo.pointer(at: 0))
-        guard let hostAt = requestHost(values, sawAuthority ? authority : nil, sawHost ? host : nil) else {
+        // RFC 9113 section 8.3.1: an :authority and a Host that differ are
+        // malformed. Without either, there is no host, which HTTP/1.1 refuses.
+        guard let hostAt = requestHost(UnsafePointer(s.head.readPointer), sawAuthority ? authority : nil,
+                                       sawHost ? host : nil), hostAt.1 > 0 else {
             return .malformed
         }
-        if equalsExact(values + method.0, method.1, "CONNECT") { return .malformed }
+        if equalsExact(UnsafePointer(s.head.readPointer) + method.0, method.1, "CONNECT") { return .malformed }
 
-        s.head.reserve(method.1 + path.1 + hostAt.1 + fields.readableBytes + cookies.readableBytes + 40)
-        s.head.write(values + method.0, method.1)
-        s.head.writeByte(cSP)
-        s.head.write(values + path.0, path.1)
-        s.head.write(" HTTP/1.1\r\n")
-        if hostAt.1 > 0 {
-            s.head.write("host: ")
-            s.head.write(values + hostAt.0, hostAt.1)
-            s.head.writeCRLF()
-        }
-        if fields.readableBytes > 0 { s.head.write(fields.readPointer, fields.readableBytes) }
+        let hostName = s.head.append("host")
+        headers[0] = HTTPHeaderRef(name: HTTPSlice(hostName.0, 4), value: HTTPSlice(hostAt.0, hostAt.1),
+                                   nameHash: fieldNameHash(UnsafePointer(s.head.readPointer) + hostName.0, 4))
+        textSize &+= 4 &+ hostAt.1 &+ 4
         if cookies.readableBytes > 0 {
-            s.head.write("cookie: ")
-            s.head.write(cookies.readPointer, cookies.readableBytes)
-            s.head.writeCRLF()
+            if count == maxHeaders { return .malformed }
+            let name = s.head.append("cookie")
+            let value = s.head.append(UnsafePointer(cookies.readPointer), cookies.readableBytes)
+            headers[count] = HTTPHeaderRef(name: HTTPSlice(name.0, 6), value: HTTPSlice(value.0, value.1),
+                                           nameHash: fieldNameHash(UnsafePointer(s.head.readPointer) + name.0, 6))
+            count &+= 1
+            textSize &+= 6 &+ value.1 &+ 4
         }
-        s.head.writeCRLF()
+        // The request line and the empty line that ends the head.
+        textSize &+= method.1 &+ 1 &+ path.1 &+ 11 &+ 2
+        if textSize > limits.maxHeadSize { return .malformed }
 
-        let x = s.x
         let base = UnsafePointer(s.head.readPointer)
         x.pointee.base = base
-        guard case .complete = HTTPParser.parse(base, s.head.readableBytes, maxHeadSize: limits.maxHeadSize,
-                                                maxHeaders: limits.maxHeaders, headers: x.pointee.headers,
-                                                head: &x.pointee.head) else {
-            return .malformed
+        var head = HTTPRequestHead()
+        head.methodSlice = HTTPSlice(method.0, method.1)
+        head.method = HTTPParser.classifyMethod(base + method.0, method.1)
+        head.target = HTTPSlice(path.0, path.1)
+        let q = findByte(base + path.0, path.1, cQuestion)
+        if q >= 0 {
+            head.path = HTTPSlice(path.0, q)
+            head.query = HTTPSlice(path.0 &+ q &+ 1, path.1 &- q &- 1)
+        } else {
+            head.path = HTTPSlice(path.0, path.1)
+            head.query = HTTPSlice(path.0 &+ path.1, 0)
         }
-        x.pointee.head.httpMajor = 2
-        x.pointee.head.httpMinor = 0
-        // Chunked framing does not exist in HTTP/2, and a request that
-        // claims it is malformed rather than merely odd.
-        if x.pointee.head.flags.contains(.chunked) { return .malformed }
+        var flags: HTTPRequestFlags = [.keepAlive, .hasHost]
+        if hasPercent(base + Int(head.path.offset), Int(head.path.length)) { flags.insert(.escapedPath) }
+        if expectContinue { flags.insert(.expectContinue) }
+        if contentLength >= 0 {
+            flags.insert(.hasContentLength)
+            head.contentLength = contentLength
+        } else {
+            head.contentLength = 0
+        }
+        head.flags = flags
+        head.httpMajor = 2
+        head.httpMinor = 0
+        head.headerCount = count
+        head.headEnd = s.head.readableBytes
+        x.pointee.head = head
         return .ok
     }
 
-    /// Copies a decoded value into `pseudo`: its offset and length there.
-    func stash(_ span: HPACKSpan) -> (Int, Int) {
-        let at = pseudo.readableBytes
-        // Never empty, so `pseudo.pointer(at: 0)` is always good.
-        pseudo.reserve(span.valueLength + 1)
-        if span.valueLength > 0 { pseudo.write(span.value, span.valueLength) }
-        return (at, span.valueLength)
-    }
-
-    /// Which of `:authority` and a Host field the rebuilt head's one Host
+    /// Which of `:authority` and a Host field the head's one Host
     /// line is: whichever is there. Nil, a malformed request, when both are
     /// there and differ (RFC 9113 section 8.3.1) -- an empty `:authority`
     /// included, which is not the same as a Host that names something.
@@ -1511,3 +1558,65 @@ nonisolated(unsafe) let emptyBlock: UnsafePointer<UInt8> = {
     p[0] = 0
     return UnsafePointer(p)
 }()
+
+extension ByteBuffer {
+    /// Appends `n` bytes: where they start, and how many.
+    @inline(__always)
+    mutating func append(_ p: UnsafePointer<UInt8>, _ n: Int) -> (Int, Int) {
+        let at = readableBytes
+        if n > 0 { write(p, n) }
+        return (at, n)
+    }
+
+    @inline(__always)
+    mutating func append(_ s: StaticString) -> (Int, Int) {
+        append(s.utf8Start, s.utf8CodeUnitCount)
+    }
+}
+
+/// A method HTTPParser takes: one or more token characters.
+@inline(__always)
+func allTokenChars(_ p: UnsafePointer<UInt8>, _ n: Int) -> Bool {
+    if n == 0 { return false }
+    var i = 0
+    while i < n {
+        if !isTokenChar(p[i]) { return false }
+        i &+= 1
+    }
+    return true
+}
+
+/// A request target HTTPParser takes: no space, control byte or DEL.
+@inline(__always)
+func validTarget(_ p: UnsafePointer<UInt8>, _ n: Int) -> Bool {
+    if n == 0 { return false }
+    var i = 0
+    while i < n {
+        if p[i] <= cSP || p[i] == 0x7F { return false }
+        i &+= 1
+    }
+    return true
+}
+
+/// A field value HTTPParser takes: no control byte but HTAB, and no DEL.
+@inline(__always)
+func allFieldValueChars(_ p: UnsafePointer<UInt8>, _ n: Int) -> Bool {
+    var i = 0
+    while i < n {
+        if !isFieldValueChar(p[i]) { return false }
+        i &+= 1
+    }
+    return true
+}
+
+/// The hash HTTPParser keeps of a field name: FNV-1a over its lower case.
+@inline(__always)
+func fieldNameHash(_ p: UnsafePointer<UInt8>, _ n: Int) -> UInt32 {
+    var hash: UInt32 = 2166136261
+    var i = 0
+    while i < n {
+        hash = (hash ^ UInt32(asciiLower(p[i]))) &* 16777619
+        i &+= 1
+    }
+    return hash
+}

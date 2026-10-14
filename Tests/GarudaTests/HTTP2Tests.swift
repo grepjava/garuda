@@ -569,6 +569,63 @@ struct HTTP2Tests {
         #expect(try h2.get("/").status == .ok)
     }
 
+    /// A stream's request is what HTTP/1.1 would have parsed: Host first,
+    /// the fields in order, the cookie crumbs joined last; the target split
+    /// into path and query.
+    @Test func theRequestIsWhatHTTP1WouldHaveParsed() throws {
+        let app = Application()
+        app.get("/fields/:p") { request, response in
+            var lines: [String] = []
+            request.forEachHeader { name, value in lines.append("\(name.string)=\(value.string)") }
+            let v = request.version
+            response.send("\(request.method) \(request.path) [\(request.query)] \(request.parameter(0)) "
+                + "\(v.major).\(v.minor) \(request.header("content-length") ?? "-") | "
+                + lines.joined(separator: ","))
+        }
+        let h2 = try app.test.http2()
+        let text = try h2.get("/fields/x%20y?a=1&b=%20", headers: [
+            ("x-one", "1"), ("cookie", "a=1"), ("x-two", ""), ("cookie", "b=2"), ("accept", "*/*"),
+            ("content-length", "0"), ("content-length", "0"), ("x-tab", "a\tb"),
+        ]).text
+        #expect(text == "get /fields/x%20y [a=1&b=%20] x%20y 2.0 0 | host=test,x-one=1,x-two=,accept=*/*,"
+                + "content-length=0,content-length=0,x-tab=a\tb,cookie=a=1; b=2")
+        // Host from a Host field when there is no :authority.
+        let id = h2.nextStream
+        h2.nextStream += 2
+        try h2.sendHeaders(stream: id, [(":method", "GET"), (":scheme", "http"), (":path", "/fields/h"),
+                                        ("x-before", "b"), ("host", "example.test"), ("x-after", "a")])
+        #expect(try h2.response(id).text == "get /fields/h [] h 2.0 - | host=example.test,x-before=b,x-after=a")
+    }
+
+    /// What HTTP/1.1's parser would refuse is malformed on a stream too.
+    @Test func whatHTTP1WouldRefuseIsMalformed() throws {
+        let h2 = try app().test.http2()
+        func reset(_ fields: [(String, String)]) throws -> UInt32? {
+            let id = h2.nextStream
+            h2.nextStream += 2
+            try h2.sendHeaders(stream: id, fields)
+            return try h2.response(id).reset
+        }
+        let base = [(":method", "GET"), (":scheme", "http"), (":authority", "test"), (":path", "/")]
+        let malformed = H2Error.protocolError.rawValue
+        #expect(try reset(base + [("x-control", "a\u{01}b")]) == malformed)
+        #expect(try reset(base + [("x-del", "a\u{7F}b")]) == malformed)
+        #expect(try reset(base + [("cookie", "a=\u{01}")]) == malformed)
+        #expect(try reset([(":method", "G T"), (":scheme", "http"), (":authority", "test"), (":path", "/")])
+                == malformed)
+        #expect(try reset([(":method", "GET"), (":scheme", "http"), (":authority", "test"), (":path", "/a b")])
+                == malformed)
+        #expect(try reset([(":method", "GET"), (":scheme", "http"), (":authority", "te\u{7F}st"), (":path", "/")])
+                == malformed)
+        #expect(try reset([(":method", "GET"), (":scheme", "http"), (":path", "/")]) == malformed)
+        #expect(try reset([(":method", "GET"), (":scheme", "http"), (":authority", ""), (":path", "/")])
+                == malformed)
+        #expect(try reset(base + [("content-length", "1"), ("content-length", "2")]) == malformed)
+        #expect(try reset(base + [("content-length", "x")]) == malformed)
+        #expect(try reset(base + [("host", "test"), ("host", "test")]) == malformed)
+        #expect(try h2.get("/user/fine").text == "fine")
+    }
+
     @Test func dataAfterTheEndIsAStreamError() throws {
         let h2 = try app().test.http2()
         let id = try h2.request("GET", "/delay/300")
