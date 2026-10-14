@@ -275,41 +275,41 @@ final class H2Stream: @unchecked Sendable {
     let x: UnsafeMutablePointer<Exchange>
     /// The request head as HTTP/1.1 text; every slice in the exchange is
     /// relative to it.
-    var head = ByteBuffer()
-    var body = ByteBuffer()
-    var id: UInt32 = 0
+    @exclusivity(unchecked) var head = ByteBuffer()
+    @exclusivity(unchecked) var body = ByteBuffer()
+    @exclusivity(unchecked) var id: UInt32 = 0
 
     // The reader's.
     /// The request body is still arriving.
-    var receiving = false
+    @exclusivity(unchecked) var receiving = false
     /// Its task has started, or it has gone: no longer `unstarted`.
-    var started = false
-    var recvWindow = 0
+    @exclusivity(unchecked) var started = false
+    @exclusivity(unchecked) var recvWindow = 0
     /// Window consumed and not yet given back.
-    var pendingUpdate = 0
-    var received = 0
-    var bodyLimit = 0
+    @exclusivity(unchecked) var pendingUpdate = 0
+    @exclusivity(unchecked) var received = 0
+    @exclusivity(unchecked) var bodyLimit = 0
     /// The route matched for the body limit, or -1.
-    var matched: Int32 = -1
-    var lastActivity: UInt64 = 0
+    @exclusivity(unchecked) var matched: Int32 = -1
+    @exclusivity(unchecked) var lastActivity: UInt64 = 0
 
     // Shared, under the connection's lock.
-    var sendWindow = 0
+    @exclusivity(unchecked) var sendWindow = 0
     /// Reset by the client or by a stream error: its answer goes nowhere.
-    var reset = false
+    @exclusivity(unchecked) var reset = false
     /// The writer is done with it: ended, or dropped once reset.
-    var closed = false
+    @exclusivity(unchecked) var closed = false
     /// The table's hold and the task-and-writer's: kept for reuse at 0.
-    var holds = 0
+    @exclusivity(unchecked) var holds = 0
     /// The handler's task while it runs, for a reset to cancel.
-    var task: UnsafeCurrentTask?
+    @exclusivity(unchecked) var task: UnsafeCurrentTask?
 
     // The writer's.
     /// RST_STREAM to send after the answer: a 413 tells the client to stop.
-    var resetAfter: H2Error?
-    var sent = 0
-    var length = 0
-    var grant = 0
+    @exclusivity(unchecked) var resetAfter: H2Error?
+    @exclusivity(unchecked) var sent = 0
+    @exclusivity(unchecked) var length = 0
+    @exclusivity(unchecked) var grant = 0
 
     init(connection: H2Connection, maxHeaders: Int, peer: SocketPeer) {
         self.connection = connection
@@ -329,6 +329,11 @@ final class H2Stream: @unchecked Sendable {
 
 /// One HTTP/2 connection: what its reader and writer share, and the
 /// reader's own state.
+///
+/// Its stored properties, and a stream's, are `@exclusivity(unchecked)`:
+/// each is the reader's, the write role holder's, or kept under the lock, so
+/// two accesses never overlap, and the runtime's checks on every access to a
+/// class's stored property cost a request more than its locks do.
 final class H2Connection: @unchecked Sendable {
     let app: CompiledApplication
     let limits: ConnectionLimits
@@ -347,37 +352,37 @@ final class H2Connection: @unchecked Sendable {
     /// Wakes the reader at the end, waiting for the last stream task.
     let idle = Notify()
     /// Control frames for the writer to send.
-    var control = ByteBuffer()
+    @exclusivity(unchecked) var control = ByteBuffer()
     /// Streams answered, for the writer.
-    var ready: [H2Stream] = []
-    var spare: [H2Stream] = []
+    @exclusivity(unchecked) var ready: [H2Stream] = []
+    @exclusivity(unchecked) var spare: [H2Stream] = []
     /// Every stream made, so they live as long as the connection.
-    var made: [H2Stream] = []
-    var sendWindow = H2FrameHeader.defaultInitialWindowSize
-    var peerMaxFrameSize = H2FrameHeader.defaultMaxFrameSize
-    var peerInitialWindowSize = H2FrameHeader.defaultInitialWindowSize
+    @exclusivity(unchecked) var made: [H2Stream] = []
+    @exclusivity(unchecked) var sendWindow = H2FrameHeader.defaultInitialWindowSize
+    @exclusivity(unchecked) var peerMaxFrameSize = H2FrameHeader.defaultMaxFrameSize
+    @exclusivity(unchecked) var peerInitialWindowSize = H2FrameHeader.defaultInitialWindowSize
     /// Streams the writer has ended since the reader last looked: each
     /// buys back one cancellation.
-    var earned = 0
+    @exclusivity(unchecked) var earned = 0
     /// Stream tasks running.
-    var tasks = 0
+    @exclusivity(unchecked) var tasks = 0
     /// Streams taken whose task has not started: their request is still
     /// arriving, or being read.
-    var unstarted = 0
+    @exclusivity(unchecked) var unstarted = 0
     /// The peer sent GOAWAY.
-    var peerGoneAway = false
-    var lastPeerStream: UInt32 = 0
-    var goawaySent = false
+    @exclusivity(unchecked) var peerGoneAway = false
+    @exclusivity(unchecked) var lastPeerStream: UInt32 = 0
+    @exclusivity(unchecked) var goawaySent = false
     /// The writer is to stop as soon as it has sent the control frames.
-    var stopping = false
-    var readerDone = false
+    @exclusivity(unchecked) var stopping = false
+    @exclusivity(unchecked) var readerDone = false
     /// The writer could not write.
     let writeFailed = Atomic<Bool>(false)
 
     /// Someone holds the write role (HTTP2Writer.swift).
-    var writing = false
+    @exclusivity(unchecked) var writing = false
     /// The writer is waiting for the role.
-    var writerWanted = false
+    @exclusivity(unchecked) var writerWanted = false
 
     // MARK: The write role's
 
@@ -387,36 +392,36 @@ final class H2Connection: @unchecked Sendable {
     @exclusivity(unchecked) var wOut = ByteBuffer(capacity: 16 * 1024)
     @exclusivity(unchecked) var wBlock = ByteBuffer(capacity: 1024)
     @exclusivity(unchecked) var wDigits = ByteBuffer(capacity: 32)
-    var frameSizeForRole = H2FrameHeader.defaultMaxFrameSize
+    @exclusivity(unchecked) var frameSizeForRole = H2FrameHeader.defaultMaxFrameSize
 
     // Links in the service's list, under its lock.
-    unowned(unsafe) var previousConnection: H2Connection?
-    unowned(unsafe) var nextConnection: H2Connection?
+    @exclusivity(unchecked) unowned(unsafe) var previousConnection: H2Connection?
+    @exclusivity(unchecked) unowned(unsafe) var nextConnection: H2Connection?
 
     // MARK: The reader's
 
-    var decoder = HPACKDecoder(maxTableSize: 4096)
+    @exclusivity(unchecked) var decoder = HPACKDecoder(maxTableSize: 4096)
     /// The open streams, by the reader's account: few, so a list.
-    var streams: [H2Stream] = []
+    @exclusivity(unchecked) var streams: [H2Stream] = []
     /// Control frames made while reading, posted once per batch of frames.
-    var outgoing = ByteBuffer()
+    @exclusivity(unchecked) var outgoing = ByteBuffer()
     /// Where in the read buffer the next frame starts.
-    var start = 0
-    var recvWindow: Int
-    var pendingRecvUpdate = 0
-    var resetBudget: Int
+    @exclusivity(unchecked) var start = 0
+    @exclusivity(unchecked) var recvWindow: Int
+    @exclusivity(unchecked) var pendingRecvUpdate = 0
+    @exclusivity(unchecked) var resetBudget: Int
     /// A header block arriving in CONTINUATION frames.
-    var headerBlock = ByteBuffer()
-    var blockStream: UInt32 = 0
-    var blockEndsStream = false
-    var expectingContinuation = false
+    @exclusivity(unchecked) var headerBlock = ByteBuffer()
+    @exclusivity(unchecked) var blockStream: UInt32 = 0
+    @exclusivity(unchecked) var blockEndsStream = false
+    @exclusivity(unchecked) var expectingContinuation = false
     /// A stream whose handler the reader runs itself, once the frame that
     /// completed its request is handled.
-    var inlineStream: H2Stream?
+    @exclusivity(unchecked) var inlineStream: H2Stream?
     /// Scratch for rebuilding a head.
-    var pseudo = ByteBuffer()
-    var fields = ByteBuffer()
-    var cookies = ByteBuffer()
+    @exclusivity(unchecked) var pseudo = ByteBuffer()
+    @exclusivity(unchecked) var fields = ByteBuffer()
+    @exclusivity(unchecked) var cookies = ByteBuffer()
 
     init(app: CompiledApplication, limits: ConnectionLimits, parts: UnsafeMutablePointer<ConnectionParts>,
          service: HTTP2Service, secure: Bool, sink: any H2Sink) {
@@ -828,7 +833,7 @@ final class H2Connection: @unchecked Sendable {
     // MARK: HEADERS and CONTINUATION
 
     /// The highest stream the peer has opened, as the reader sees it.
-    var lastPeerStreamSeen: UInt32 = 0
+    @exclusivity(unchecked) var lastPeerStreamSeen: UInt32 = 0
 
     func handleHeaders(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         let id = header.streamID
