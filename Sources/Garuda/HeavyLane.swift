@@ -1,0 +1,140 @@
+//===----------------------------------------------------------------------===//
+// The heavy lane: slow handlers never hold more than half a shard's threads.
+//
+// Work stealing alone lets a burst of requests that each hold the CPU for
+// milliseconds take every thread, and then a quick request waits behind them
+// -- what the `skew` workload measures. So each route keeps an average of how
+// long its handler holds a thread, and a route whose average passes
+// `ServerConfig.heavyThreshold`, or one registered through `app.heavy`, is
+// heavy: its handler runs only once it holds one of the shard's heavy-lane
+// permits, of which there are half as many as threads, rounded up. The other
+// threads are left to everything else.
+//
+// "Holds a thread" is not wall time. A handler that awaits a database or a
+// timer gives its thread up while it waits, and is not heavy for waiting.
+// Vega's job stamp tells the two apart: a handler that finishes in the job it
+// started in never suspended, and only then is its time a sample. A handler
+// that computes between awaits is not seen this way; register it with
+// `app.heavy`.
+//===----------------------------------------------------------------------===//
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+import Synchronization
+import Vega
+
+/// What each route's handler costs, as the connections measure it.
+final class RouteCosts: @unchecked Sendable {
+    let count: Int
+    /// Smoothed thread-hold time, in nanoseconds.
+    private let average: UnsafeMutablePointer<Atomic<UInt64>>
+    /// Registered through `app.heavy`.
+    private let declared: [Bool]
+    /// Past this a route is heavy. Set when serving starts.
+    var thresholdNanos: UInt64 = 500_000
+    /// The shard's heavy-lane permits; nil leaves every route unbounded.
+    var lane: Vega.Semaphore?
+
+    init(declared: [Bool]) {
+        count = declared.count
+        self.declared = declared
+        average = .allocate(capacity: max(1, count))
+        for i in 0..<max(1, count) { (average + i).initialize(to: Atomic(0)) }
+    }
+
+    deinit {
+        average.deinitialize(count: max(1, count))
+        average.deallocate()
+    }
+
+    /// Whether route `index` runs in the heavy lane.
+    @inline(__always)
+    func isHeavy(_ index: Int) -> Bool {
+        declared[index] || average[index].load(ordering: .relaxed) > thresholdNanos
+    }
+
+    /// Readies the lane for a shard of `threads` threads.
+    func configure(_ config: ServerConfig, threads: Int) {
+        let (seconds, attos) = config.heavyThreshold.components
+        thresholdNanos = UInt64(max(0, seconds)) &* 1_000_000_000 &+ UInt64(max(0, attos) / 1_000_000_000)
+        lane = config.heavyLane ? Vega.Semaphore(permits: max(1, (threads + 1) / 2)) : nil
+    }
+
+    /// The smoothed thread-hold time of route `index`.
+    func averageNanos(_ index: Int) -> UInt64 {
+        average[index].load(ordering: .relaxed)
+    }
+
+    /// Whether to time this run of route `index`. Heavy routes are timed
+    /// every run, so one that turns quick again leaves the lane promptly;
+    /// light ones one run in sixteen, so a route every thread serves is not
+    /// a cache line every thread writes.
+    @inline(__always)
+    func shouldSample(_ index: Int, heavy: Bool, now: UInt64) -> Bool {
+        heavy || now & 15 == 0 || average[index].load(ordering: .relaxed) == 0
+    }
+
+    /// Folds one run's thread-hold time into route `index`'s average, an
+    /// eighth at a time. Concurrent updates may lose one another: the average
+    /// is a hint, and a lost sample changes nothing that matters.
+    func record(_ index: Int, nanos: UInt64) {
+        let sample = max(1, nanos)
+        let old = average[index].load(ordering: .relaxed)
+        let new = old == 0 ? sample : old - old / 8 + sample / 8
+        if new != old { average[index].store(new, ordering: .relaxed) }
+    }
+}
+
+/// Now, in nanoseconds, from the monotonic clock: what the lane times with.
+@inline(__always)
+func monotonicNanos() -> UInt64 {
+    #if canImport(Glibc) || canImport(Darwin)
+    var ts = timespec()
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    return UInt64(ts.tv_sec) &* 1_000_000_000 &+ UInt64(ts.tv_nsec)
+    #else
+    let (seconds, attos) = clockOrigin.duration(to: .now).components
+    return UInt64(seconds) &* 1_000_000_000 &+ UInt64(attos / 1_000_000_000)
+    #endif
+}
+
+#if !(canImport(Glibc) || canImport(Darwin))
+/// Where `monotonicNanos` counts from without clock_gettime.
+let clockOrigin = ContinuousClock.now
+#endif
+
+// MARK: - Declaring heavy routes
+
+extension Application {
+    /// Routes registered through this run in the heavy lane from the first
+    /// request, whatever they are measured to cost:
+    ///
+    /// ```
+    /// app.heavy.get("/report/:id") { (id: Path<Int>) in JSON(try render(id.value)) }
+    /// ```
+    ///
+    /// For a handler that computes between awaits, which measuring cannot
+    /// see; one that computes without awaiting is found by itself.
+    public var heavy: some RouteBuilder { HeavyRoutes(self) }
+}
+
+/// The routes `app.heavy` registers.
+final class HeavyRoutes: RouteBuilder {
+    let application: Application
+
+    init(_ application: Application) {
+        self.application = application
+    }
+
+    func on(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping Handler) {
+        application.on(method, pattern, handler)
+        application.routes[application.routes.count - 1].heavy = true
+    }
+
+    func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int) {
+        application.noteRoute(method, pattern, pathParameters: pathParameters)
+    }
+}

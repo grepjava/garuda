@@ -163,7 +163,16 @@ struct HTTP1Connection: ~Copyable {
             }
             return
         }
-        let handler = app.handlers[Int(route)]
+        let index = Int(route)
+        let handler = app.handlers[index]
+        let costs = app.costs
+        let heavy = costs.isHeavy(index)
+        let lane = heavy ? costs.lane : nil
+        // Only fails once the lane is closed, at shutdown: run regardless.
+        if let lane { try? await lane.acquireIgnoringCancellation() }
+        let start = monotonicNanos()
+        let sampled = costs.shouldSample(index, heavy: heavy, now: start)
+        let stamp = sampled ? Runtime.currentJobStamp : .none
         do {
             try await handler(Request(x), Response(x))
             if !x.pointee.answered {
@@ -176,6 +185,11 @@ struct HTTP1Connection: ~Copyable {
             Log.error("handler threw: \(error)")
             answerFailure(x)
         }
+        // A handler that suspended gave its thread up; its time says nothing.
+        if sampled && Runtime.currentJobStamp == stamp {
+            costs.record(index, nanos: monotonicNanos() &- start)
+        }
+        lane?.release()
     }
 
     // MARK: Reading

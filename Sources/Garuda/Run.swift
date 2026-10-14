@@ -89,6 +89,7 @@ extension Application {
     /// requests in progress finish.
     static func serve(_ runtime: Runtime, app: CompiledApplication, limits: ConnectionLimits,
                       config: ServerConfig, listener: @escaping @Sendable () throws(IOError) -> TCPListener) {
+        app.costs.configure(config, threads: runtime.workerCount)
         do {
             try runtime.block { () async throws(IOError) -> Void in
                 var options = TCPServer.Configuration()
@@ -148,6 +149,9 @@ extension ServerConfig {
           --no-pin             do not pin shard threads to their CPUs
           --io uring|epoll     the I/O driver (default: io_uring where the
                                kernel has it)
+          --heavy-threshold US a route holding a thread longer than this many
+                               microseconds runs in the heavy lane (default 500)
+          --no-heavy-lane      let every route use every thread
           --log-level LEVEL    debug, info, warning, error or silent
           --max-body BYTES     largest request body (default 16 MiB)
           --keep-alive SECS    idle keep-alive timeout (default 5)
@@ -210,6 +214,13 @@ extension ServerConfig {
                     return fail("--io must be uring or epoll")
                 }
                 config.io = v
+            case "--heavy-threshold":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--heavy-threshold must be a number of microseconds")
+                }
+                config.heavyThreshold = .microseconds(n)
+            case "--no-heavy-lane":
+                config.heavyLane = false
             case "--log-level":
                 guard let level = value().flatMap({ LogLevel(name: $0) }) else {
                     return fail("--log-level must be debug, info, warning, error or silent")

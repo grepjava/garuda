@@ -115,6 +115,8 @@ struct RouteEntry {
     var handler: Handler
     /// How many `Path` extractors the handler takes, when it is typed.
     var pathExtractors = 0
+    /// Registered through `app.heavy`.
+    var heavy = false
 }
 
 /// The routes, laid out for serving: a flat route table and the handlers by
@@ -123,10 +125,13 @@ final class CompiledApplication: @unchecked Sendable {
     let table: CompiledRoutes
     let handlers: UnsafeMutablePointer<Handler>
     let routeCount: Int
+    /// What each route's handler costs, and the heavy lane.
+    let costs: RouteCosts
 
     init(table: CompiledRoutes, routes: [RouteEntry]) {
         self.table = table
         routeCount = routes.count
+        costs = RouteCosts(declared: routes.map(\.heavy))
         handlers = .allocate(capacity: max(1, routes.count))
         for (i, route) in routes.enumerated() { (handlers + i).initialize(to: route.handler) }
     }

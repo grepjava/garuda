@@ -19,6 +19,13 @@ func vega(_ name: String) -> Target.Dependency {
     .product(name: name, package: "vega")
 }
 
+/// Vega, by version; or, with GARUDA_VEGA_PATH set, a local checkout -- for
+/// working on Garuda and Vega together before a Vega release has what
+/// Garuda needs.
+let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
+    .package(path: $0)
+} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.2.0"))
+
 let package = Package(
     name: "garuda",
     // Vega's floor: its executor needs macOS 26.4's custom-executor hooks.
@@ -38,7 +45,7 @@ let package = Package(
         // The runtime: work-stealing scheduler, sharded processes, sockets,
         // TLS. upToNextMinor, not `from:`: Vega is below 1.0, so a minor
         // release may change its API.
-        .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.2.0")),
+        vegaPackage,
         // Only the `GarudaJSON` plugin builds against this. It is still
         // resolved by everyone who depends on Garuda, because SwiftPM resolves
         // a package's dependencies whether or not a product uses them.

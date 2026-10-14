@@ -26,6 +26,13 @@ public struct ServerConfig: Sendable {
     /// The lowest level the server logs; nil keeps info.
     public var logLevel: LogLevel? = nil
 
+    /// A route whose handler holds a thread longer than this, on average,
+    /// runs in the heavy lane: no more than half of a shard's threads at
+    /// once (HeavyLane.swift).
+    public var heavyThreshold: Duration = .microseconds(500)
+    /// Turns the heavy lane off: every route runs on every thread.
+    public var heavyLane = true
+
     // --- limits ---
     public var readBufferSize = 16 * 1024
     public var maxHeadSize = 32 * 1024

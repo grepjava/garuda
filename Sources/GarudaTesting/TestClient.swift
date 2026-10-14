@@ -84,7 +84,7 @@ public final class TestClient: @unchecked Sendable {
     init(application: Application, configuration: ServerConfig) {
         self.application = application
         self.configuration = configuration
-        application.prepareForTesting()
+        application.prepareForTesting(configuration, threads: TestClient.runtime.workerCount)
     }
 
     // MARK: Requests
