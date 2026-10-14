@@ -12,6 +12,7 @@
 
 import GarudaWire
 import Synchronization
+import Vega
 
 /// GET, POST and the rest, as routes are registered by them.
 public typealias HTTPMethod = GarudaWire.HTTPMethod
@@ -298,6 +299,9 @@ final class CompiledApplication: @unchecked Sendable {
     let costs: RouteCosts
     /// Spare connection memory, by worker thread.
     let connections = ConnectionCache()
+    /// The runtime serving it, for the work a request leaves running beside
+    /// its handler: an event stream's keep-alive. Set before it serves.
+    var runtime: Runtime?
     /// This shard's state, and what builds it and stops it (State.swift).
     let services: ServiceTable
     /// How starting went, once a test client has started it.

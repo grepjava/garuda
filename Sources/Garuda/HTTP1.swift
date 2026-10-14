@@ -39,6 +39,7 @@ struct ConnectionLimits: Sendable {
     var writeTimeout: Duration
     var writeHighWaterMark: Int
     var writeLowWaterMark: Int
+    var eventKeepAlive: Duration
     /// --request-id, and the proxies whose ID is kept: nil when there are
     /// none, so a connection copies no list it would not read (RequestID.swift).
     var requestID: Bool
@@ -67,6 +68,7 @@ struct ConnectionLimits: Sendable {
         writeTimeout = config.writeTimeout
         writeHighWaterMark = max(1, config.writeHighWaterMark)
         writeLowWaterMark = min(max(0, config.writeLowWaterMark), writeHighWaterMark)
+        eventKeepAlive = config.eventKeepAlive
         requestID = config.requestID
         requestIDTrust = config.requestID && !config.trust.isEmpty ? config.trust : nil
         trust = config.trust.isEmpty ? nil : config.trust
@@ -197,7 +199,7 @@ struct HTTP1Connection: ~Copyable {
         if let channel = x.pointee.channel {
             // Streamed: the head and most of the body have gone; the rest
             // and the end of it go with the next flush (StreamingResponse.swift).
-            if !channel.close(into: &parts.pointee.output, failed: channel.handlerFailed) { keepAlive = false }
+            if await !channel.close(into: parts, failed: channel.handlerFailed) { keepAlive = false }
             if !x.pointee.keepAlive { keepAlive = false }
             if observing { report(status: x.pointee.status) }
         } else {

@@ -150,6 +150,7 @@ extension Application {
     static func serve(_ runtime: Runtime, app: CompiledApplication, shard: ShardInfo, limits: ConnectionLimits,
                       config: ServerConfig, listening: Listening) {
         app.costs.configure(config, threads: runtime.workerCount)
+        app.runtime = runtime
         var certificates: CertificateStore? = nil
         if !config.tlsCertificates.isEmpty {
             do {
@@ -375,6 +376,11 @@ extension ServerConfig {
                     return fail("--keep-alive must be a number of seconds")
                 }
                 config.keepAliveTimeout = .seconds(n)
+            case "--sse-keep-alive":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--sse-keep-alive must be a number of seconds")
+                }
+                config.eventKeepAlive = .seconds(n)
             case "--tls-cert":
                 guard let v = value() else { return fail("--tls-cert needs a path") }
                 certificates.append(v)

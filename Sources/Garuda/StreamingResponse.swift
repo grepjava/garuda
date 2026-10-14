@@ -97,6 +97,11 @@ public struct ResponseBodyWriter: Sendable {
         try await channel.settle(channel.isOpen ? .sent : .refused, flushing: true)
     }
 
+    /// Waits `milliseconds` between writes.
+    public func sleep(milliseconds: UInt64) async throws(HandlerWaitError) {
+        try await sleep(for: .milliseconds(Int64(clamping: milliseconds)))
+    }
+
     /// Waits `duration` between writes. Throws `cancelled` if the request
     /// ends first.
     public func sleep(for duration: Duration) async throws(HandlerWaitError) {
@@ -234,6 +239,7 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
         x.pointee.committed = true
         channel = BodyChannel(dropping: ())
     }
+    channel.runtime = x.pointee.application?.takeUnretainedValue().runtime
     x.pointee.channel = channel
     x.pointee.touchedStream = true
     return channel
@@ -308,6 +314,14 @@ final class BodyChannel: @unchecked Sendable {
     private let high: Int
     private let low: Int
 
+    // Keep-alive comments, under the lock (EventStream.swift).
+    /// The default quiet before one, and where its task runs.
+    let keepAliveDefault: Duration
+    var runtime: Runtime?
+    private var keepAliveTask: Task<Void, Never>?
+    /// When bytes were last queued, in monotonic nanoseconds.
+    private var lastWrite: UInt64 = 0
+
     // HTTP/2.
     private let h2: H2Stream?
 
@@ -317,7 +331,7 @@ final class BodyChannel: @unchecked Sendable {
         state = .failed
         remaining = -1
         held = nil; chunked = false; h2 = nil
-        timeout = .seconds(0); high = 0; low = 0
+        timeout = .seconds(0); high = 0; low = 0; keepAliveDefault = .zero
     }
 
     /// One whose writes go nowhere.
@@ -325,7 +339,7 @@ final class BodyChannel: @unchecked Sendable {
         bodyless = true
         remaining = -1
         held = nil; chunked = false; h2 = nil
-        timeout = .seconds(0); high = 0; low = 0
+        timeout = .seconds(0); high = 0; low = 0; keepAliveDefault = .zero
     }
 
     init(http1 held: HeldStream, parts: UnsafeMutablePointer<ConnectionParts>, limits: StreamLimits,
@@ -338,6 +352,7 @@ final class BodyChannel: @unchecked Sendable {
         timeout = limits.writeTimeout
         high = limits.high
         low = limits.low
+        keepAliveDefault = limits.eventKeepAlive
         // The head, behind whatever pipelined answers were still to go.
         let output = parts.pointee.output
         if output.readableBytes > 0 {
@@ -354,6 +369,7 @@ final class BodyChannel: @unchecked Sendable {
         timeout = .seconds(0)
         high = s.connection.limits.writeHighWaterMark
         low = s.connection.limits.writeLowWaterMark
+        keepAliveDefault = s.connection.limits.eventKeepAlive
     }
 
     deinit {
@@ -398,6 +414,7 @@ final class BodyChannel: @unchecked Sendable {
                 remaining &-= take
             }
             if take > 0 {
+                if keepAliveTask != nil { lastWrite = monotonicNanos() }
                 if let s = h2 {
                     s.staged.write(base, take)
                     s.backlog &+= take
@@ -535,6 +552,7 @@ final class BodyChannel: @unchecked Sendable {
     /// last chunk -- goes with the queue; over HTTP/2 the writer sends
     /// END_STREAM once the stream's bytes are out.
     private func endLocked() {
+        stopKeepAliveLocked()
         guard state == .open else { return }
         state = .finished
         if bodyless { return }
@@ -549,9 +567,10 @@ final class BodyChannel: @unchecked Sendable {
     /// The handler has returned: over HTTP/1, moves what is still queued
     /// into the connection's output, ahead of the next answer. False when
     /// the connection cannot be kept: the body was cut short or failed.
-    func close(into output: inout ByteBuffer, failed: Bool) -> Bool {
+    func close(into parts: UnsafeMutablePointer<ConnectionParts>, failed: Bool) async -> Bool {
         var keep = true
         lock.withLock { _ in
+            stopKeepAliveLocked()
             if failed || state == .failed {
                 // Half a body cannot be ended honestly: what was written
                 // goes, and then the close.
@@ -566,8 +585,24 @@ final class BodyChannel: @unchecked Sendable {
                 // A body delimited by the close has no other end.
                 if !bodyless && !chunked && remaining < 0 { keep = false }
             }
+        }
+        // A writer the handler left behind -- a keep-alive comment, a task
+        // not its child -- may still be taking the queue out: the
+        // connection writes nothing until it is done.
+        while true {
+            let waited = await withUnsafeContinuation { (c: UnsafeContinuation<Bool, Never>) in
+                let parked = lock.withLock { _ -> Bool in
+                    guard flushing else { return false }
+                    waiters.append(c)
+                    return true
+                }
+                if !parked { c.resume(returning: false) }
+            }
+            if !waited { break }
+        }
+        lock.withLock { _ in
             if pending.readableBytes > 0 {
-                output.write(pending.readPointer, pending.readableBytes)
+                parts.pointee.output.write(pending.readPointer, pending.readableBytes)
                 pending.clear()
             }
         }
@@ -578,6 +613,7 @@ final class BodyChannel: @unchecked Sendable {
     /// Over HTTP/2, when the handler has returned: ended, or failed and the
     /// stream to be reset. Under the connection's lock.
     func closeH2Locked(_ s: H2Stream, failed: Bool) {
+        stopKeepAliveLocked()
         if bodyless {
             state = .finished
             return
@@ -592,6 +628,56 @@ final class BodyChannel: @unchecked Sendable {
         } else {
             endLocked()
         }
+    }
+
+    // MARK: Keep-alive
+
+    /// Sends `comment` whenever the body has been quiet for `interval`, until
+    /// it ends. Comments are written whole, between whole writes.
+    func keepAlive(every interval: Duration, comment: [UInt8]) {
+        guard interval > .zero, !bodyless, let runtime else { return }
+        let nanos = UInt64(clamping: interval.components.seconds) &* 1_000_000_000
+            &+ UInt64(clamping: interval.components.attoseconds / 1_000_000_000)
+        locked {
+            guard state == .open, keepAliveTask == nil else { return }
+            lastWrite = monotonicNanos()
+            keepAliveTask = runtime.spawn { [self] in
+                var wait = interval
+                while true {
+                    do {
+                        try await Runtime.sleep(for: wait)
+                    } catch {
+                        return
+                    }
+                    let quiet = locked { () -> UInt64? in
+                        guard state == .open, keepAliveTask != nil else { return nil }
+                        return monotonicNanos() &- lastWrite
+                    }
+                    guard let quiet else { return }
+                    if quiet < nanos {
+                        wait = .nanoseconds(Int64(nanos &- quiet))
+                        continue
+                    }
+                    wait = interval
+                    // A client already behind needs no reminder that the
+                    // stream is there; the write timeout deals with it.
+                    if backlog > 0 { continue }
+                    let queued = comment.withUnsafeBufferPointer { queue(UnsafeRawBufferPointer($0)) }
+                    do {
+                        try await settle(queued)
+                    } catch {
+                        return
+                    }
+                }
+            }
+        }
+    }
+
+    /// Under the state's lock.
+    private func stopKeepAliveLocked() {
+        guard let task = keepAliveTask else { return }
+        keepAliveTask = nil
+        task.cancel()
     }
 
     // MARK: HTTP/2
@@ -626,10 +712,13 @@ struct StreamLimits {
     var high: Int
     var low: Int
 
+    var eventKeepAlive: Duration
+
     init(_ limits: ConnectionLimits) {
         writeTimeout = limits.writeTimeout
         high = limits.writeHighWaterMark
         low = limits.writeLowWaterMark
+        eventKeepAlive = limits.eventKeepAlive
     }
 }
 

@@ -63,6 +63,10 @@ public struct ServerConfig: Sendable {
     public var writeHighWaterMark = 512 * 1024
     /// ...until it is down to this much.
     public var writeLowWaterMark = 128 * 1024
+    /// An event stream quiet this long is sent a comment, so a proxy that
+    /// closes idle connections sees traffic and a client that has gone is
+    /// noticed (EventStream.swift). Zero sends none.
+    public var eventKeepAlive: Duration = .seconds(15)
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
 

@@ -25,6 +25,7 @@ extension Application {
     @_spi(Testing)
     public func startForTesting(on runtime: Runtime) throws {
         guard let app = compiledApplication else { preconditionFailure("startForTesting before prepareForTesting") }
+        if app.runtime == nil { app.runtime = runtime }
         let outcome = app.testStart.withLock { outcome -> Result<Void, any Error> in
             if let outcome { return outcome }
             let shard = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
