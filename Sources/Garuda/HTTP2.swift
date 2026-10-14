@@ -361,8 +361,6 @@ final class H2Connection: @unchecked Sendable {
     /// The writer is to stop as soon as it has sent the control frames.
     var stopping = false
     var readerDone = false
-    /// Shutdown has begun, for the reader to see without the lock.
-    let goingAway = Atomic<Bool>(false)
     /// The writer could not write.
     let writeFailed = Atomic<Bool>(false)
 
@@ -459,7 +457,6 @@ final class H2Connection: @unchecked Sendable {
             HTTP2.writeUInt32(H2Error.noError.rawValue, into: &control)
             wake.notifyOne()
         }
-        goingAway.store(true, ordering: .relaxed)
     }
 
     // MARK: - Reading
@@ -472,7 +469,10 @@ final class H2Connection: @unchecked Sendable {
                 failed = true
                 break
             }
-            if (peerGoneAway || goingAway.load(ordering: .relaxed)) && isIdle() { break }
+            // After GOAWAY either way, the writer ends the write side once
+            // every stream is answered. The reader reads on until the peer
+            // closes, or the keep-alive tick: closing under bytes the peer is
+            // still sending would turn an orderly end into a reset.
             if writeFailed.load(ordering: .relaxed) {
                 failed = true
                 break

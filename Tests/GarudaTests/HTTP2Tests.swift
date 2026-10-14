@@ -1,8 +1,3 @@
-#if canImport(Glibc)
-import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 import Synchronization
 import Testing
 @testable import Garuda
@@ -535,6 +530,26 @@ struct HTTP2Tests {
         #expect(h2.waitForClose())
     }
 
+    @Test func shutdownSendsGoawayAndFinishesTheStreamsInProgress() throws {
+        // A runtime of its own: shutdown is for every connection on it.
+        let runtime = Runtime(workers: 2)
+        let h2 = try app().test.http2(on: runtime)
+        let slow = try h2.request("GET", "/delay/300")
+        #expect(try h2.get("/").status == .ok)
+        // What SIGTERM does to a shard's HTTP/2.
+        HTTP2Service.forTesting(runtime).shutdown()
+        let goaway = try #require(try h2.goaway())
+        #expect(goaway.code == H2Error.noError.rawValue)
+        #expect(goaway.lastStream == slow + 2)
+        // Nothing new is taken; what was taken is finished.
+        #expect(try h2.response(try h2.request("GET", "/")).reset == H2Error.refusedStream.rawValue)
+        #expect(try h2.response(slow).status == .ok)
+        #expect(h2.waitForClose())
+        // A connection opened after shutdown began is told at once.
+        let late = try app().test.http2(on: runtime)
+        #expect(try late.goaway()?.code == H2Error.noError.rawValue)
+    }
+
     // MARK: Opening
 
     @Test func aBadPrefaceIsRefused() throws {
@@ -587,10 +602,10 @@ struct HTTP2Tests {
     }
 }
 
-/// Sleeps the test's thread.
+/// Waits on the test's thread, which is not one of the runtime's.
 private func nap(milliseconds: Int) {
-    var spec = timespec(tv_sec: milliseconds / 1000, tv_nsec: (milliseconds % 1000) * 1_000_000)
-    nanosleep(&spec, nil)
+    let until = ContinuousClock.now + .milliseconds(milliseconds)
+    while ContinuousClock.now < until {}
 }
 
 // MARK: - Over TLS

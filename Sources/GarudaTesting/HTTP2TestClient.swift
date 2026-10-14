@@ -84,7 +84,15 @@ extension TestClient {
     /// default) the preface and SETTINGS -- `settings` among them -- are
     /// sent and the server's SETTINGS read before this returns.
     public func http2(settings: [(H2Setting, UInt32)] = [], handshake: Bool = true) throws -> HTTP2TestConnection {
-        let connection = try HTTP2TestConnection(client: self)
+        try http2(on: TestClient.runtime, settings: settings, handshake: handshake)
+    }
+
+    /// The same, served on `runtime` rather than the one test clients
+    /// share: for a test that shuts that runtime's HTTP/2 down.
+    @_spi(Testing)
+    public func http2(on runtime: Runtime, settings: [(H2Setting, UInt32)] = [],
+                      handshake: Bool = true) throws -> HTTP2TestConnection {
+        let connection = try HTTP2TestConnection(client: self, runtime: runtime)
         if handshake { try connection.handshake(settings: settings) }
         return connection
     }
@@ -106,7 +114,7 @@ public final class HTTP2TestConnection: @unchecked Sendable {
     /// The identifier the next `request` uses.
     public var nextStream: UInt32 = 1
 
-    let runtime = TestClient.runtime
+    let runtime: Runtime
     let box: DuplexBox
     var pending: [UInt8] = []
     var decoder = HPACKDecoder()
@@ -121,7 +129,8 @@ public final class HTTP2TestConnection: @unchecked Sendable {
     var initialWindow = 65535
     var maxFrameSize = 16384
 
-    init(client: TestClient) throws {
+    init(client: TestClient, runtime: Runtime) throws {
+        self.runtime = runtime
         timeout = client.timeout
         let app = client.application, config = client.configuration
         let address = client.remoteAddress, port = client.remotePort
