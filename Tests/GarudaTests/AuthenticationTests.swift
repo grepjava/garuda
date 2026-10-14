@@ -156,6 +156,24 @@ struct AuthenticationTests {
         #expect(try client.get("/open").text == "open")
     }
 
+    /// A 401 still carries the CORS headers, so a page on another origin can
+    /// read why it was refused; and a preflight for the Authorization header
+    /// is answered before authentication runs.
+    @Test func aRefusalReachesACrossOriginPage() throws {
+        let app = Application()
+        app.cors(CORSPolicy(origins: ["https://app.example.com"]))
+        app.authenticate(bearer: SignedIn.self) { tokens[$0] }
+        app.get("/me") { (user: Context<SignedIn>) in user.value }
+        let client = app.test
+        let refused = try client.get("/me", headers: [("origin", "https://app.example.com")])
+        #expect(refused.status == 401)
+        #expect(refused.header("access-control-allow-origin") == "https://app.example.com")
+        #expect(try client.request("OPTIONS", "/me",
+                                   headers: [("origin", "https://app.example.com"),
+                                             ("access-control-request-method", "GET"),
+                                             ("access-control-request-headers", "authorization")]).status == 204)
+    }
+
     @Test func constantTimeEqualsComparesBytes() {
         #expect(constantTimeEquals("secret", "secret"))
         #expect(!constantTimeEquals("secreT", "secret"))

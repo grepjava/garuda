@@ -119,7 +119,7 @@ public enum Tokens {
         // The generator does not fail short of a broken system, and stops
         // the program if it does: a token of zeros would be one anyone can
         // guess.
-        return tokenBase64URLEncode(SecureRandom.bytes(bytes))
+        return base64URLEncode(SecureRandom.bytes(bytes))
     }
 
     /// The SHA-256 of `token` in lowercase hex: what to store and look up in

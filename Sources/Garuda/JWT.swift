@@ -216,7 +216,7 @@ public final class JWTKey: Sendable {
             throw .invalidKey("the JWK is for \(named), not \(algorithm)")
         }
         func bytes(_ member: String?, _ name: String) throws(JWTError) -> [UInt8] {
-            guard let member, let decoded = tokenBase64Decode(member), !decoded.isEmpty else {
+            guard let member, let decoded = base64Decode(member), !decoded.isEmpty else {
                 throw .invalidKey("the JWK has no valid \(name)")
             }
             return decoded
@@ -284,17 +284,17 @@ public final class JWTKey: Sendable {
         switch publicKey.components {
         case let .rsa(n, e):
             jwk.kty = "RSA"
-            jwk.n = tokenBase64URLEncode(n)
-            jwk.e = tokenBase64URLEncode(e)
+            jwk.n = base64URLEncode(n)
+            jwk.e = base64URLEncode(e)
         case let .ec(curve, x, y):
             jwk.kty = "EC"
             jwk.crv = curve.curveName
-            jwk.x = tokenBase64URLEncode(x)
-            jwk.y = tokenBase64URLEncode(y)
+            jwk.x = base64URLEncode(x)
+            jwk.y = base64URLEncode(y)
         case let .ed25519(x):
             jwk.kty = "OKP"
             jwk.crv = "Ed25519"
-            jwk.x = tokenBase64URLEncode(x)
+            jwk.x = base64URLEncode(x)
         }
         return jwk
     }
@@ -553,9 +553,9 @@ public final class JWTKeys: @unchecked Sendable {
 
     static func sign<Claims: Encodable>(_ claims: Claims, with key: JWTKey) throws -> String {
         let header = JWTHeader(alg: key.algorithm.rawValue, typ: "JWT", kid: key.keyID, crit: nil)
-        let input = tokenBase64URLEncode(try JSONCoder.encode(header)) + "." + tokenBase64URLEncode(try JSONCoder.encode(claims))
+        let input = base64URLEncode(try JSONCoder.encode(header)) + "." + base64URLEncode(try JSONCoder.encode(claims))
         let signature = try key.sign(Array(input.utf8))
-        return input + "." + tokenBase64URLEncode(signature)
+        return input + "." + base64URLEncode(signature)
     }
 
     /// The claims of `token` when it is signed by one of these keys and its
@@ -586,13 +586,13 @@ public final class JWTKeys: @unchecked Sendable {
             let payloadPart = UnsafeBufferPointer(rebasing: all[(first + 1)..<second])
             let signaturePart = UnsafeBufferPointer(rebasing: all[(second + 1)...])
             let verified = withUnsafeTemporaryAllocation(of: UInt8.self, capacity: signaturePart.count) { signature in
-                guard let length = tokenBase64URLDecode(signaturePart, into: signature) else { return false }
+                guard let length = base64Decode(signaturePart, into: signature) else { return false }
                 return key.verify(UnsafeBufferPointer(rebasing: all[0..<second]),
                                   signature: UnsafeBufferPointer(rebasing: signature[0..<length]))
             }
             guard verified else { throw JWTError.badSignature }
             return try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: payloadPart.count) { scratch in
-                guard let length = tokenBase64URLDecode(payloadPart, into: scratch) else { throw JWTError.malformed }
+                guard let length = base64Decode(payloadPart, into: scratch) else { throw JWTError.malformed }
                 return try ParsedToken.validClaims(type, UnsafeBufferPointer(rebasing: scratch[0..<length]),
                                                    validation: validation, now: clock())
             }
@@ -628,8 +628,8 @@ struct ParsedToken {
             do throws(JWTError) {
                 let (first, second) = try ParsedToken.dots(all)
                 let header = try ParsedToken.header(UnsafeBufferPointer(rebasing: all[0..<first]))
-                guard let payload = tokenBase64URLDecode(UnsafeBufferPointer(rebasing: all[(first + 1)..<second])),
-                      let signature = tokenBase64URLDecode(UnsafeBufferPointer(rebasing: all[(second + 1)...])) else {
+                guard let payload = base64Decode(UnsafeBufferPointer(rebasing: all[(first + 1)..<second])),
+                      let signature = base64Decode(UnsafeBufferPointer(rebasing: all[(second + 1)...])) else {
                     return .failure(.malformed)
                 }
                 return .success((header, Array(all[0..<second]), payload, signature))
@@ -661,7 +661,7 @@ struct ParsedToken {
     /// The header part decoded and checked: an algorithm this knows, and no
     /// `crit`.
     static func header(_ part: UnsafeBufferPointer<UInt8>) throws(JWTError) -> JWTHeader {
-        guard let bytes = tokenBase64URLDecode(part),
+        guard let bytes = base64Decode(part),
               let decoded = try? JSONCoder.decode(JWTHeader.self, from: bytes) else { throw .malformed }
         if decoded.crit != nil { throw .unsupported("crit") }
         guard JWTAlgorithm(rawValue: decoded.alg) != nil else { throw .unsupported(decoded.alg) }

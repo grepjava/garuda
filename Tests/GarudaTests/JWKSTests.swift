@@ -162,7 +162,7 @@ struct JWKSTests {
         var encryption = ec.publicJWK!
         encryption.use = "enc"
         var secret = JWK(kty: "oct", kid: "hs", alg: "HS256")
-        secret.k = tokenBase64URLEncode([UInt8](repeating: 1, count: 32))
+        secret.k = base64URLEncode([UInt8](repeating: 1, count: 32))
         let body = try JSONCoder.encode(JWKSet(keys: [rsaWithoutAlg, encryption, secret]))
         let (verifier, _, _) = verifier { body }
 

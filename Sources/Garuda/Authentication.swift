@@ -286,7 +286,7 @@ func parseBasic(_ bytes: UnsafeBufferPointer<UInt8>) -> BasicCredentials? {
     // The standard alphabet only, as StandardBase64.decode has it.
     let encoded = UnsafeBufferPointer(rebasing: bytes[i...])
     for byte in encoded where byte == UInt8(ascii: "-") || byte == UInt8(ascii: "_") { return nil }
-    guard let decoded = tokenBase64URLDecode(encoded),
+    guard let decoded = base64Decode(encoded),
           let colon = decoded.firstIndex(of: UInt8(ascii: ":")),
           let username = String(validating: decoded[..<colon], as: UTF8.self),
           let password = String(validating: decoded[(colon + 1)...], as: UTF8.self) else { return nil }

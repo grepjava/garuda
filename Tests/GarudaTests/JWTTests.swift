@@ -134,7 +134,7 @@ struct JWTTests {
             let key = try JWTKey.hmac(secret, algorithm: algorithm, keyID: "shared")
             let parts = vector.split(separator: ".").map(String.init)
             let signature = try key.sign(Array((parts[0] + "." + parts[1]).utf8))
-            #expect(tokenBase64URLEncode(signature) == parts[2], "\(algorithm)")
+            #expect(base64URLEncode(signature) == parts[2], "\(algorithm)")
         }
     }
 
@@ -142,32 +142,32 @@ struct JWTTests {
         let rsa = try JWTKey.pem(PyJWTVectors.rsaPublic, algorithm: .RS256)
         let set = try keys([rsa])
         func token(_ header: String, _ payload: String, _ signature: [UInt8]) -> String {
-            tokenBase64URLEncode(Array(header.utf8)) + "." + tokenBase64URLEncode(Array(payload.utf8)) + "."
-                + tokenBase64URLEncode(signature)
+            base64URLEncode(Array(header.utf8)) + "." + base64URLEncode(Array(payload.utf8)) + "."
+                + base64URLEncode(signature)
         }
         let payload = #"{"sub":"root","exp":4102444800}"#
 
         // alg none, with or without a signature.
-        let none = tokenBase64URLEncode(Array(#"{"alg":"none"}"#.utf8)) + "." + tokenBase64URLEncode(Array(payload.utf8)) + "."
+        let none = base64URLEncode(Array(#"{"alg":"none"}"#.utf8)) + "." + base64URLEncode(Array(payload.utf8)) + "."
         #expect(throws: JWTError.self) { try set.verify(none, as: UserClaims.self) }
         #expect(throws: JWTError.unsupported("none")) { try set.verify(token(#"{"alg":"none"}"#, payload, [1]), as: UserClaims.self) }
 
         // HS256 with the RSA public key's PEM as the secret.
-        let input = tokenBase64URLEncode(Array(#"{"alg":"HS256","typ":"JWT"}"#.utf8)) + "." + tokenBase64URLEncode(Array(payload.utf8))
+        let input = base64URLEncode(Array(#"{"alg":"HS256","typ":"JWT"}"#.utf8)) + "." + base64URLEncode(Array(payload.utf8))
         let forged = try JWTKey.hmac(Array(PyJWTVectors.rsaPublic.utf8), algorithm: .HS256)
-        let confused = input + "." + tokenBase64URLEncode(try forged.sign(Array(input.utf8)))
+        let confused = input + "." + base64URLEncode(try forged.sign(Array(input.utf8)))
         #expect(throws: JWTError.unknownKey) { try set.verify(confused, as: UserClaims.self) }
         // The same, naming the RSA key by its kid.
         let named = try keys([try JWTKey.pem(PyJWTVectors.rsaPublic, algorithm: .RS256, keyID: "rsa")])
-        let namedInput = tokenBase64URLEncode(Array(#"{"alg":"HS256","kid":"rsa"}"#.utf8)) + "." + tokenBase64URLEncode(Array(payload.utf8))
-        let namedForgery = namedInput + "." + tokenBase64URLEncode(try forged.sign(Array(namedInput.utf8)))
+        let namedInput = base64URLEncode(Array(#"{"alg":"HS256","kid":"rsa"}"#.utf8)) + "." + base64URLEncode(Array(payload.utf8))
+        let namedForgery = namedInput + "." + base64URLEncode(try forged.sign(Array(namedInput.utf8)))
         #expect(throws: JWTError.unknownKey) { try named.verify(namedForgery, as: UserClaims.self) }
 
         // An HMAC signature cut short, or empty.
         let hmacSet = try keys([try JWTKey.hmac([UInt8](repeating: 3, count: 32))])
         let real = try hmacSet.sign(UserClaims(sub: "a", exp: Int(now) + 60))
         let realParts = real.split(separator: ".").map(String.init)
-        let cut = realParts[0] + "." + realParts[1] + "." + tokenBase64URLEncode(Array(tokenBase64Decode(realParts[2])!.prefix(16)))
+        let cut = realParts[0] + "." + realParts[1] + "." + base64URLEncode(Array(base64Decode(realParts[2])!.prefix(16)))
         #expect(throws: JWTError.badSignature) { try hmacSet.verify(cut, as: UserClaims.self) }
         #expect(throws: JWTError.self) { try hmacSet.verify(realParts[0] + "." + realParts[1] + ".", as: UserClaims.self) }
 
@@ -203,9 +203,9 @@ struct JWTTests {
         #expect(try set.verify(good, as: UserClaims.self).sub == "a")
 
         // A header refused once is refused again: only usable headers are kept.
-        let payload = tokenBase64URLEncode(Array(#"{"sub":"a","exp":4102444800,"role":"user"}"#.utf8))
-        let crit = tokenBase64URLEncode(Array(#"{"alg":"HS256","crit":["b64"]}"#.utf8)) + "." + payload + ".AAAA"
-        let unknown = tokenBase64URLEncode(Array(#"{"alg":"HS999"}"#.utf8)) + "." + payload + ".AAAA"
+        let payload = base64URLEncode(Array(#"{"sub":"a","exp":4102444800,"role":"user"}"#.utf8))
+        let crit = base64URLEncode(Array(#"{"alg":"HS256","crit":["b64"]}"#.utf8)) + "." + payload + ".AAAA"
+        let unknown = base64URLEncode(Array(#"{"alg":"HS999"}"#.utf8)) + "." + payload + ".AAAA"
         for _ in 0..<2 {
             #expect(throws: JWTError.unsupported("crit")) { try set.verify(crit, as: UserClaims.self) }
             #expect(throws: JWTError.unsupported("HS999")) { try set.verify(unknown, as: UserClaims.self) }
@@ -214,9 +214,9 @@ struct JWTTests {
         // More headers than the cache keeps: each still verifies, whether it
         // was kept or decoded again.
         for n in 0..<(JWTHeaderCache.capacity + 4) {
-            let header = tokenBase64URLEncode(Array(#"{"alg":"HS256","typ":"JWT\#(n)"}"#.utf8))
+            let header = base64URLEncode(Array(#"{"alg":"HS256","typ":"JWT\#(n)"}"#.utf8))
             let input = header + "." + payload
-            let token = input + "." + tokenBase64URLEncode(try key.sign(Array(input.utf8)))
+            let token = input + "." + base64URLEncode(try key.sign(Array(input.utf8)))
             for _ in 0..<2 { #expect(try set.verify(token, as: UserClaims.self).sub == "a") }
         }
     }
@@ -226,11 +226,11 @@ struct JWTTests {
         // between them: each header is kept once, and every token verifies.
         let key = try JWTKey.hmac([UInt8](repeating: 5, count: 32))
         let set = try keys([key])
-        let payload = tokenBase64URLEncode(Array(#"{"sub":"a","exp":4102444800,"role":"user"}"#.utf8))
+        let payload = base64URLEncode(Array(#"{"sub":"a","exp":4102444800,"role":"user"}"#.utf8))
         var tokens: [String] = []
         for n in 0..<(JWTHeaderCache.capacity * 2) {
-            let input = tokenBase64URLEncode(Array(#"{"alg":"HS256","typ":"T\#(n)"}"#.utf8)) + "." + payload
-            tokens.append(input + "." + tokenBase64URLEncode(try key.sign(Array(input.utf8))))
+            let input = base64URLEncode(Array(#"{"alg":"HS256","typ":"T\#(n)"}"#.utf8)) + "." + payload
+            tokens.append(input + "." + base64URLEncode(try key.sign(Array(input.utf8))))
         }
         let signed = tokens
         let verified = await withTaskGroup(of: Int.self) { group in
@@ -257,19 +257,19 @@ struct JWTTests {
                 seed = seed &* 6364136223846793005 &+ 1442695040888963407
                 bytes.append(UInt8(truncatingIfNeeded: seed >> 33))
             }
-            let encoded = tokenBase64URLEncode(bytes)
-            let decoded = Array(encoded.utf8).withUnsafeBufferPointer { tokenBase64URLDecode($0) }
+            let encoded = base64URLEncode(bytes)
+            let decoded = Array(encoded.utf8).withUnsafeBufferPointer { base64Decode($0) }
             #expect(decoded == bytes)
-            #expect(decoded == tokenBase64Decode(encoded))
+            #expect(decoded == base64Decode(encoded))
             // And the standard alphabet, padded, both ways.
             #expect(StandardBase64.decode(StandardBase64.encode(bytes)) == bytes)
         }
         for bad in ["A", "AB!C", "AB C", "ABCDE"] {
-            #expect(Array(bad.utf8).withUnsafeBufferPointer { tokenBase64URLDecode($0) } == nil)
+            #expect(Array(bad.utf8).withUnsafeBufferPointer { base64Decode($0) } == nil)
         }
         // Padding, and the standard alphabet, are let through.
-        #expect(Array("-_8=".utf8).withUnsafeBufferPointer { tokenBase64URLDecode($0) }
-                == Array("+/8=".utf8).withUnsafeBufferPointer { tokenBase64URLDecode($0) })
+        #expect(Array("-_8=".utf8).withUnsafeBufferPointer { base64Decode($0) }
+                == Array("+/8=".utf8).withUnsafeBufferPointer { base64Decode($0) })
         // RFC 4648's vectors.
         for (text, encoded) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="),
                                 ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
@@ -316,8 +316,8 @@ struct JWTTests {
         let key = try JWTKey.hmac([UInt8](repeating: 9, count: 32))
         let set = try keys([key])
         func token(_ claims: String) throws -> String {
-            let input = tokenBase64URLEncode(Array(#"{"alg":"HS256"}"#.utf8)) + "." + tokenBase64URLEncode(Array(claims.utf8))
-            return input + "." + tokenBase64URLEncode(try key.sign(Array(input.utf8)))
+            let input = base64URLEncode(Array(#"{"alg":"HS256"}"#.utf8)) + "." + base64URLEncode(Array(claims.utf8))
+            return input + "." + base64URLEncode(try key.sign(Array(input.utf8)))
         }
         struct Subject: Decodable { let sub: String }
         func subject(_ claims: String, _ keys: JWTKeys? = nil) throws -> String {
