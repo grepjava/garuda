@@ -418,6 +418,12 @@ struct HTTP1Connection: ~Copyable {
 /// A `ResponseError` as the answer.
 func answerError(_ x: UnsafeMutablePointer<Exchange>, _ error: any ResponseError) {
     guard !x.pointee.answered else { return }
+    // A refused credential carries its WWW-Authenticate challenge, added only
+    // now that it is the answer: an optional extractor that swallowed it
+    // leaves no challenge on a response that went on (Authentication.swift).
+    if let refused = error as? Unauthenticated {
+        Response(x).addHeader("www-authenticate", refused.challenge)
+    }
     Response(x).sendError(status: error.status, reason: error.reason, fields: error.fields)
 }
 
