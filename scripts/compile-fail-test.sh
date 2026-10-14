@@ -7,6 +7,10 @@
 #
 #   swift build && bash scripts/compile-fail-test.sh
 #
+# BUILD names the build directory when it is not .build/debug (a
+# --scratch-path build), and VEGA the Vega checkout when it is not SwiftPM's
+# (GARUDA_VEGA_PATH, when that is set, is the one the build used).
+#
 # Tests/CompileFail/control holds code that must compile, so that a harness
 # that cannot find the Garuda module does not pass everything by failing it.
 # The `@JSON` cases need the macro plugin, which `swift build` leaves beside
@@ -16,22 +20,25 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=${BUILD:-$ROOT/.build/debug}
 SWIFTC=${SWIFTC:-swiftc}
-# aviancore's C headers: SwiftPM's checkout, or a local copy beside this one.
-AVIAN=${AVIAN:-$ROOT/.build/checkouts/aviancore}
-[ -d "$AVIAN" ] || AVIAN=$ROOT/../aviancore
+VEGA=${VEGA:-${GARUDA_VEGA_PATH:-$ROOT/.build/checkouts/vega}}
 
-# Every C target Garuda's module was built against, not aviancore's alone:
-# a swiftmodule names the clang modules it needs, and swiftc refuses to
-# load Garuda at all unless it can find every one of them.
+# Every C target Garuda's module was built against, Vega's included: a
+# swiftmodule names the clang modules it needs, and swiftc refuses to load
+# Garuda at all unless it can find every one of them. SwiftPM writes a module
+# map for each C target that has none of its own; the rest ship theirs in
+# their include directory.
+CMODULES=()
+for map in "$BUILD"/*.build/module.modulemap; do
+    [ -f "$map" ] && CMODULES+=(-Xcc -fmodule-map-file="$map")
+done
+for include in "$VEGA"/Sources/*/include "$ROOT"/Sources/*/include; do
+    [ -d "$include" ] && CMODULES+=(-Xcc -I"$include")
+done
+
 compile() {
     "$SWIFTC" -parse-as-library -swift-version 6 -emit-sil -o /dev/null \
         -I "$BUILD/Modules" \
-        -Xcc -fmodule-map-file="$BUILD/CAvian.build/module.modulemap" \
-        -Xcc -fmodule-map-file="$BUILD/CGarudaJWT.build/module.modulemap" \
-        -Xcc -fmodule-map-file="$BUILD/CGarudaSQLite.build/module.modulemap" \
-        -Xcc -I"$AVIAN/Sources/CAvian/include" \
-        -Xcc -I"$ROOT/Sources/CGarudaJWT/include" \
-        -Xcc -I"$ROOT/Sources/CGarudaSQLite/include" \
+        "${CMODULES[@]}" \
         -load-plugin-executable "$BUILD/GarudaMacros-tool#GarudaMacros" \
         "$1" 2>&1
 }
@@ -61,7 +68,11 @@ for file in "$ROOT"/Tests/CompileFail/*.swift; do
     fi
     output=$(compile "$file")
     status=$?
-    if [ "$status" -ne 0 ] && printf '%s' "$output" | grep -qF -- "$expected"; then
+    # Only the diagnostics themselves: the source excerpts swiftc prints
+    # beside them quote the file's own "expect-error:" line, which would
+    # match whatever the error really was.
+    if [ "$status" -ne 0 ] && printf '%s\n' "$output" | grep -E '^[^ |]+: error: ' \
+            | grep -qF -- "$expected"; then
         echo "  ok   $name is refused: $expected"
         passed=$((passed + 1))
     else

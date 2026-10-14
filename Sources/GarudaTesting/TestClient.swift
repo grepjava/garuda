@@ -125,23 +125,29 @@ public final class TestClient: @unchecked Sendable {
         try request("DELETE", path, headers: headers)
     }
 
-    /// Sends `value` encoded as JSON, with its Content-Type.
+    /// Sends `value` encoded as JSON, with its Content-Type unless `headers`
+    /// names one: a test sending the wrong type on purpose still can.
     public func post(_ path: String, json value: some Encodable,
                      headers: [(String, String)] = []) throws -> TestResponse {
-        try request("POST", path, headers: [("Content-Type", "application/json")] + headers,
-                    body: try JSONCoder.encode(value))
+        try request("POST", path, json: value, headers: headers)
     }
 
     public func put(_ path: String, json value: some Encodable,
                     headers: [(String, String)] = []) throws -> TestResponse {
-        try request("PUT", path, headers: [("Content-Type", "application/json")] + headers,
-                    body: try JSONCoder.encode(value))
+        try request("PUT", path, json: value, headers: headers)
     }
 
     public func patch(_ path: String, json value: some Encodable,
                       headers: [(String, String)] = []) throws -> TestResponse {
-        try request("PATCH", path, headers: [("Content-Type", "application/json")] + headers,
-                    body: try JSONCoder.encode(value))
+        try request("PATCH", path, json: value, headers: headers)
+    }
+
+    /// Any method, with `value` encoded as JSON for the body.
+    public func request(_ method: String, _ path: String, json value: some Encodable,
+                        headers: [(String, String)] = []) throws -> TestResponse {
+        let typed = headers.contains { $0.0.lowercased() == "content-type" }
+        return try request(method, path, headers: typed ? headers : [("Content-Type", "application/json")] + headers,
+                           body: try JSONCoder.encode(value))
     }
 
     /// Any method. A Host header is added unless `headers` has one, and a
