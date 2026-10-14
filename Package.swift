@@ -56,8 +56,10 @@ let package = Package(
         // HPACK, QPACK, frames. No sockets, no allocation on the hot path.
         // Vendored from aviancore's AvianHTTP; see Sources/GarudaWire/VENDORED.md.
         .target(name: "GarudaWire", exclude: ["VENDORED.md"], swiftSettings: sharedSwiftSettings),
+        // VegaCrypto: HMAC, HKDF, AES-GCM and secure random bytes for signed
+        // and encrypted cookies (Cookies.swift).
         .target(name: "Garuda",
-                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO")],
+                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaCrypto")],
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaTesting",
                 dependencies: ["Garuda", "GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaTest")],
