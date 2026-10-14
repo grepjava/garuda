@@ -1249,7 +1249,7 @@ final class H2Connection: @unchecked Sendable {
         if limits.traceContext { x.pointee.readTraceParent() }
         if observing { x.pointee.started = monotonicNanos() }
         let stamp = Runtime.currentJobStamp
-        await dispatch(x, app, matched: s.matched, observing: observing)
+        await dispatchInline(x, app, matched: s.matched, observing: observing)
         // A cancelled run may have been cut short before it could wait: it
         // says nothing about the route.
         let route = x.pointee.route
@@ -1281,6 +1281,11 @@ final class H2Connection: @unchecked Sendable {
     /// answer when nobody else is writing, or hands it to the writer. A
     /// reset cannot arrive meanwhile -- the reader is busy -- so there is no
     /// task to cancel; a reset read afterwards is for an answered stream.
+    ///
+    /// Inlined into the reader, with the dispatch: every async call made
+    /// is a hop in and a hop out, and with a task executor preference each
+    /// hop takes the task's status-record lock to look the preference up.
+    @inline(__always)
     func answerInline(_ s: H2Stream) async {
         await dispatchStream(s)
         let data = prepareAnswer(s)

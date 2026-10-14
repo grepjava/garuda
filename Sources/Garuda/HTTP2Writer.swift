@@ -344,6 +344,7 @@ extension H2Connection {
 
     /// With the write role: sends what is framed. False when the write
     /// failed, and the connection with it.
+    @inline(__always)
     func sendFramed() async -> Bool {
         defer { wOut.clear() }
         guard wOut.readableBytes > 0 else { return true }

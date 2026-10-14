@@ -17,6 +17,15 @@ import Vega
 /// matched already, with its parameters in the exchange, or -1.
 func dispatch(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, matched: Int32 = -1,
               observing: Bool) async {
+    await dispatchInline(x, app, matched: matched, observing: observing)
+}
+
+/// `dispatch`, for a caller that saves the hops into and out of it -- an
+/// executor check each, under a lock while the task prefers an executor -- by
+/// having it inlined: HTTP/2 streams.
+@inline(__always)
+func dispatchInline(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, matched: Int32 = -1,
+                    observing: Bool) async {
     let path = x.pointee.head.path
     let base = x.pointee.base + Int(path.offset)
     var count = path.count
