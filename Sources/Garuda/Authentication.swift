@@ -26,9 +26,9 @@
 // a handler that checks credentials itself. `constantTimeEquals` compares a
 // secret without telling a caller, by how long it took, how much was right.
 //
-// (Garuda 1 also described each guarded scope's security scheme and 401 in
-// the OpenAPI document, from here: `describeBearerScope` and
-// `describeBasicScope`. That belongs to the documentation phase.)
+// Each `authenticate` also writes its security scheme and its 401 into the
+// OpenAPI entry of every route in its scope (`describeBearerScope`,
+// `describeBasicScope`), when the document is built: nothing per request.
 //===----------------------------------------------------------------------===//
 
 import GarudaWire
@@ -148,6 +148,7 @@ extension RouteBuilder {
         bearer key: Key.Type, _ verify: @escaping @Sendable (_ token: String) async throws -> Key.Value?
     ) {
         use(BearerAuthentication<Key> { token, _ in try await verify(token) })
+        describeBearerScope()
     }
 
     /// Requires `Authorization: Basic` credentials of every request in the
@@ -161,6 +162,7 @@ extension RouteBuilder {
         use(BasicAuthentication<Key>(challenge: basicChallenge(realm)) { username, password, _ in
             try await verify(username, password)
         })
+        describeBasicScope()
     }
 
     /// `authenticate(bearer:)` with what `app.state` built for `Service` in
@@ -180,6 +182,7 @@ extension RouteBuilder {
         use(BearerAuthentication<Key> { token, request in
             try await verify(token, try request.state(Service.self))
         })
+        describeBearerScope()
     }
 
     /// `authenticate(basic:)` with what `app.state` built for `Service` in
@@ -191,6 +194,25 @@ extension RouteBuilder {
         use(BasicAuthentication<Key>(challenge: basicChallenge(realm)) { username, password, request in
             try await verify(username, password, try request.state(Service.self))
         })
+        describeBasicScope()
+    }
+
+    /// What every route of this scope takes and can answer, once an
+    /// `authenticate` guards it. The same words the `BearerToken` and
+    /// `BasicCredentials` extractors use, so a route guarded either way reads
+    /// the same in the document.
+    func describeBearerScope(format: String? = nil) {
+        describeRoutes { operation in
+            operation.security(.bearer(format: format))
+            operation.scopeResponse(.unauthorized, "No valid bearer token")
+        }
+    }
+
+    func describeBasicScope() {
+        describeRoutes { operation in
+            operation.security(.basic)
+            operation.scopeResponse(.unauthorized, "No valid credentials")
+        }
     }
 }
 

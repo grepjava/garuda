@@ -36,8 +36,8 @@
 // Each `authorize` is one middleware: it reads the context the authentication
 // in front of it filled, and either calls `next` or throws.
 //
-// (Garuda 1 also wrote each guarded scope's 403 into the OpenAPI document,
-// from here: `describeForbidden`. That belongs to the documentation phase.)
+// Each `authorize` also writes its 403, saying what would have been enough,
+// into the OpenAPI entry of every route in its scope (`describeForbidden`).
 //===----------------------------------------------------------------------===//
 
 /// A named rule about who may reach a route.
@@ -132,6 +132,7 @@ extension RouteBuilder {
     public func authorize<Key: RequestContextKey>(_ key: Key.Type, _ policy: Policy<Key.Value>) {
         let allows = policy.allows
         use(ContextAuthorization<Key>(needs: policy.needs) { allows($0) })
+        describeForbidden(policy.needs)
     }
 
     /// `authorize` with the rule written where it is used rather than named:
@@ -148,6 +149,7 @@ extension RouteBuilder {
         _ allows: @escaping @Sendable (Key.Value) async throws -> Bool
     ) {
         use(ContextAuthorization<Key>(needs: needs, allows: allows))
+        describeForbidden(needs)
     }
 
     /// Requires `policy` of the claims of the token `authenticate(jwt:)`
@@ -158,6 +160,7 @@ extension RouteBuilder {
     public func authorize<Claims: Decodable>(jwt claims: Claims.Type, _ policy: Policy<Claims>) {
         let allows = policy.allows
         use(ContextAuthorization<JWTContextKey<Claims>>(needs: policy.needs) { allows($0.claims) })
+        describeForbidden(policy.needs)
     }
 
     /// `authorize(jwt:)` with the rule written where it is used.
@@ -165,6 +168,14 @@ extension RouteBuilder {
         jwt claims: Claims.Type, needs: String? = nil, _ allows: @escaping @Sendable (Claims) -> Bool
     ) {
         use(ContextAuthorization<JWTContextKey<Claims>>(needs: needs) { allows($0.claims) })
+        describeForbidden(needs)
+    }
+
+    /// The 403 every route in this scope can now answer, in the OpenAPI
+    /// document, saying what would have been enough.
+    func describeForbidden(_ needs: String?) {
+        let description = needs.map { "Needs " + $0 } ?? "Not allowed"
+        describeRoutes { $0.scopeResponse(.forbidden, description) }
     }
 }
 

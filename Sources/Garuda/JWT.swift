@@ -869,11 +869,13 @@ extension RouteBuilder {
     /// the challenge RFC 6750 describes.
     public func authenticate<Claims: Decodable>(jwt claims: Claims.Type) {
         use(JWTAuthentication<Claims>(verifier: nil))
+        describeBearerScope(format: "JWT")
     }
 
     /// `authenticate(jwt:)` with the verifier given here.
     public func authenticate<Claims: Decodable>(jwt claims: Claims.Type, verifier: any JWTVerifying) {
         use(JWTAuthentication<Claims>(verifier: verifier))
+        describeBearerScope(format: "JWT")
     }
 }
 

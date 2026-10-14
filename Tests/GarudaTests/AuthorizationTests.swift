@@ -161,6 +161,114 @@ struct AuthorizationTests {
     }
 }
 
+@Suite("What a scope's rules say in the OpenAPI document")
+struct ScopeDocumentationTests {
+    private func documented() -> Application {
+        let app = Application()
+        app.get("/open") { () in "open" }
+        app.group("/admin") {
+            // A route registered before the rules, to show that a scope's
+            // rules reach every route in it and not only those after them.
+            app.get("/first") { () in "first" }
+            app.authenticate(bearer: CurrentPerson.self) { people[$0] }
+            app.authorize(CurrentPerson.self, .admin)
+            app.get("/stats") { () in "stats" }
+            app.get("/quiet") { () in "quiet" }
+                .response(.forbidden, "Only the owner may see this")
+        }
+        let router = Router()
+        router.authenticate(basic: CurrentPerson.self, realm: "reports") { user, _ in people[user] }
+        router.authorize(CurrentPerson.self, needs: "the reporting role") { $0.roles.contains("reports") }
+        router.get("/daily") { () in "daily" }
+        app.nest("/reports", router)
+        return app
+    }
+
+    @Test func aGuardedScopeSaysWhatItCanAnswer() throws {
+        let document = documented().openAPIDocument(OpenAPIInfo(title: "Rules", version: "1"))
+        let paths = document["paths"]
+
+        for route in ["/admin/first", "/admin/stats"] {
+            let responses = paths?[route]?["get"]?["responses"]
+            #expect(responses?["401"] == ["description": "No valid bearer token"], "\(route)")
+            #expect(responses?["403"] == ["description": "Needs an administrator"], "\(route)")
+            #expect(paths?[route]?["get"]?["security"] == [["bearerAuth": []]], "\(route)")
+        }
+
+        // What the route said about that status itself is left alone.
+        #expect(paths?["/admin/quiet"]?["get"]?["responses"]?["403"]
+                    == ["description": "Only the owner may see this"])
+
+        // A rule of a router travels with it, under the prefix it is nested
+        // at, and says which scheme guards it.
+        let daily = paths?["/reports/daily"]?["get"]
+        #expect(daily?["responses"]?["401"] == ["description": "No valid credentials"])
+        #expect(daily?["responses"]?["403"] == ["description": "Needs the reporting role"])
+        #expect(daily?["security"] == [["basicAuth": []]])
+
+        // A route in no guarded scope says none of it.
+        #expect(paths?["/open"]?["get"]?["responses"]?["401"] == nil)
+        #expect(paths?["/open"]?["get"]?["responses"]?["403"] == nil)
+        #expect(paths?["/open"]?["get"]?["security"] == nil)
+
+        // And the schemes are defined, not only referred to.
+        #expect(document["components"]?["securitySchemes"]?["bearerAuth"]?["scheme"] == "bearer")
+        #expect(document["components"]?["securitySchemes"]?["basicAuth"]?["scheme"] == "basic")
+    }
+
+    @Test func writingTheDocumentTwiceWritesTheSameDocument() throws {
+        // The notes are applied as the document is written, so they have to
+        // say nothing more the second time.
+        let app = documented()
+        let info = OpenAPIInfo(title: "Rules", version: "1")
+        #expect(app.openAPIJSON(info) == app.openAPIJSON(info))
+    }
+
+    @Test func aRouterMountedTwiceIsGuardedOnlyWhereItIs() throws {
+        // A router's routes share their entries between the places it is
+        // mounted; what one scope says must not reach the other.
+        let router = Router()
+        router.get("/daily") { () in "daily" }
+        let app = Application()
+        app.group("/guarded") {
+            app.authenticate(bearer: CurrentPerson.self) { people[$0] }
+            app.merge(router)
+        }
+        app.nest("/public", router)
+        let paths = app.openAPIDocument(OpenAPIInfo(title: "Twice", version: "1"))["paths"]
+        #expect(paths?["/guarded/daily"]?["get"]?["security"] == [["bearerAuth": []]])
+        #expect(paths?["/public/daily"]?["get"]?["security"] == nil)
+        #expect(paths?["/public/daily"]?["get"]?["responses"]?["401"] == nil)
+    }
+
+    @Test func aJWTScopeIsDocumentedAsAJWT() throws {
+        let set = try JWTKeys([try JWTKey.generate(.ES256, keyID: "k")])
+        let app = Application()
+        app.jwtVerifier { _ in set }
+        app.group("/orders") {
+            app.authenticate(jwt: ScopedToken.self, verifier: set)
+            app.authorize(jwt: ScopedToken.self, .scope("orders:write"))
+            app.post("/") { () in "made" }
+        }
+        let document = app.openAPIDocument(OpenAPIInfo(title: "Orders", version: "1"))
+        let post = document["paths"]?["/orders"]?["post"]
+        #expect(post?["responses"]?["403"] == ["description": "Needs the scope orders:write"])
+        #expect(post?["responses"]?["401"] == ["description": "No valid bearer token"])
+        #expect(document["components"]?["securitySchemes"]?["bearerAuth"]?["bearerFormat"] == "JWT")
+    }
+
+    @Test func aJWTExtractorIsDocumentedAsABearerJWT() throws {
+        let app = Application()
+        app.get("/me") { (jwt: JWT<ScopedToken>) in jwt.claims.sub }
+        let document = app.openAPIDocument(OpenAPIInfo(title: "Me", version: "1"))
+        let me = document["paths"]?["/me"]?["get"]
+        #expect(me?["security"] == [["bearerAuth": []]])
+        #expect(me?["responses"]?["401"] == ["description": "No valid bearer token"])
+        #expect(document["components"]?["securitySchemes"]?["bearerAuth"]
+                    == ["type": "http", "scheme": "bearer", "bearerFormat": "JWT"])
+    }
+}
+
 @Suite("Authorization by scope", .serialized)
 struct ScopeAuthorizationTests {
     @Test func whatAScopeClaimCarries() throws {
