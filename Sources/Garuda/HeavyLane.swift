@@ -145,6 +145,14 @@ final class HeavyRoutes: RouteBuilder {
         application.noteRoute(method, pattern, pathParameters: pathParameters, states: states)
     }
 
+    func document(_ operation: OpenAPIOperation) {
+        application.document(operation)
+    }
+
+    func describeRoutes(_ note: @escaping OperationNote) {
+        application.describeRoutes(note)
+    }
+
     func use(_ middleware: some Middleware) {
         application.use(middleware)
     }

@@ -122,6 +122,11 @@ public final class Router: RouteBuilder, @unchecked Sendable {
         case note(HTTPMethod, String, Int, [Any.Type])
         case use(any Middleware)
         case group(String, [Entry])
+        /// A route's OpenAPI entry, and a scope's note for the entries of its
+        /// routes (OpenAPI.swift), kept so a merged router's routes are
+        /// documented as they were here.
+        case document(OpenAPIOperation)
+        case describe(OperationNote)
     }
 
     /// What has been registered, innermost open group last.
@@ -145,6 +150,14 @@ public final class Router: RouteBuilder, @unchecked Sendable {
         add(.use(middleware))
     }
 
+    public func document(_ operation: OpenAPIOperation) {
+        add(.document(operation))
+    }
+
+    public func describeRoutes(_ note: @escaping OperationNote) {
+        add(.describe(note))
+    }
+
     public func group(_ prefix: String, _ register: () -> Void) {
         _ = normalizedPrefix(prefix)
         open.append([])
@@ -166,6 +179,8 @@ public final class Router: RouteBuilder, @unchecked Sendable {
                 builder.noteRoute(method, pattern, pathParameters: count, states: states)
             case .use(let middleware): builder.use(middleware)
             case .group(let prefix, let inner): builder.group(prefix) { replay(inner, into: builder) }
+            case .document(let operation): builder.document(operation)
+            case .describe(let note): builder.describeRoutes(note)
             }
         }
     }

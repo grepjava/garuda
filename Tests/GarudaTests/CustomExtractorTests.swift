@@ -91,4 +91,12 @@ struct CustomExtractorTests {
         #expect(try client.get("/result", headers: [("x-tenant", "acme")]).text == "tenant acme")
         #expect(try client.get("/result").text.hasPrefix("refused: "))
     }
+
+    @Test func theOpenAPIDocumentSeesThroughOptionalAndResult() {
+        let app = Application()
+        app.get("/items/:id") { (id: Path<Int>?, filter: Result<Query<[String: String]>, any Error>) in "x" }
+        let document = app.openAPIDocument(OpenAPIInfo(title: "t", version: "1"))
+        #expect(document["paths"]?["/items/{id}"]?["get"]?["parameters"]
+            == [["name": "id", "in": "path", "required": true, "schema": ["type": "integer", "format": "int64"]]])
+    }
 }

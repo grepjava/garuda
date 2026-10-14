@@ -29,6 +29,16 @@ public protocol RouteBuilder: AnyObject {
     /// parameters it takes, and the `app.state` types it needs.
     func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type])
 
+    /// Gives the route registered last its entry in the OpenAPI document
+    /// (OpenAPI.swift). The route methods call it, and return the entry.
+    func document(_ operation: OpenAPIOperation)
+
+    /// Adds what `note` says to the OpenAPI entry of every route in the
+    /// current scope, wherever in it the call is, as `use` applies to them
+    /// all. `authenticate` and `authorize` use it to say what they can
+    /// answer. A note leaves alone what a route has said about itself.
+    func describeRoutes(_ note: @escaping OperationNote)
+
     /// Runs `middleware` around the handler of every route in the current
     /// scope (Middleware.swift).
     func use(_ middleware: some Middleware)
@@ -51,14 +61,39 @@ public protocol RouteBuilder: AnyObject {
 
 extension RouteBuilder {
     public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type]) {}
+    public func document(_ operation: OpenAPIOperation) {}
+    public func describeRoutes(_ note: @escaping OperationNote) {}
 
-    public func get(_ pattern: String, _ handler: @escaping Handler) { on(.get, pattern, handler) }
-    public func head(_ pattern: String, _ handler: @escaping Handler) { on(.head, pattern, handler) }
-    public func post(_ pattern: String, _ handler: @escaping Handler) { on(.post, pattern, handler) }
-    public func put(_ pattern: String, _ handler: @escaping Handler) { on(.put, pattern, handler) }
-    public func delete(_ pattern: String, _ handler: @escaping Handler) { on(.delete, pattern, handler) }
-    public func patch(_ pattern: String, _ handler: @escaping Handler) { on(.patch, pattern, handler) }
-    public func options(_ pattern: String, _ handler: @escaping Handler) { on(.options, pattern, handler) }
+    // Each returns the route's OpenAPI entry, for `.summary(...)` and the
+    // rest (OpenAPI.swift).
+    @discardableResult
+    public func get(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.get, pattern, handler)
+    }
+    @discardableResult
+    public func head(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.head, pattern, handler)
+    }
+    @discardableResult
+    public func post(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.post, pattern, handler)
+    }
+    @discardableResult
+    public func put(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.put, pattern, handler)
+    }
+    @discardableResult
+    public func delete(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.delete, pattern, handler)
+    }
+    @discardableResult
+    public func patch(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.patch, pattern, handler)
+    }
+    @discardableResult
+    public func options(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.options, pattern, handler)
+    }
 }
 
 public final class Application: RouteBuilder, @unchecked Sendable {
@@ -80,6 +115,9 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     var trailingSlashPolicy = TrailingSlash.strict
     /// `app.onResponse` registrations (ResponseObservers.swift).
     var responseObservers: [ResponseObserver] = []
+    /// Each route's OpenAPI entry, what scopes add to them, and the
+    /// documents `openAPI` serves (OpenAPI.swift).
+    var documentation = APIDocumentation()
     /// The routes as connections read them, made the first time the
     /// application runs or is tested. Nothing can be added after that.
     var compiledApplication: CompiledApplication?
@@ -180,6 +218,8 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     /// The routes as every connection reads them. Made once.
     func compile() -> CompiledApplication {
         if let compiledApplication { return compiledApplication }
+        // The documents `openAPI` serves, written once from every route.
+        writeServedDocuments()
         // Each route's middleware is put in front of it now, once: gathered
         // from its scopes as they stand at the end, so a `use` after the
         // routes it covers applies to them too. A route with none keeps its
