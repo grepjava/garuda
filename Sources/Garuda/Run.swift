@@ -58,6 +58,16 @@ extension Application {
         #endif
         let app = compile()
         let limits = ConnectionLimits(config)
+        // A certificate that cannot be served is found here, once, rather
+        // than by every shard as it starts.
+        if !config.tlsCertificates.isEmpty {
+            do {
+                _ = try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn, ticketKey: nil)
+            } catch {
+                Log.error("TLS: \(error)")
+                exit(2)
+            }
+        }
 
         #if os(Linux) || os(macOS)
         var options = ShardOptions(shards: config.shards ?? Application.defaultShards,
@@ -65,22 +75,54 @@ extension Application {
         options.pinThreads = config.pinThreads
         options.shutdownGracePeriod = config.gracefulShutdown + .seconds(5)
         options.listeners = [.tcp(host: config.host, port: config.port, backlog: config.backlog)]
+        if let redirect = config.redirectHTTPPort {
+            options.listeners.append(.tcp(host: config.host, port: redirect, backlog: config.backlog))
+        }
+        // The session-ticket key every shard shares (TLS.swift).
+        if !config.tlsCertificates.isEmpty { options.sharedRegions = [TicketKey.regionSize] }
         options.name = "garuda-s"
         Runtime.sharded(options) { shard in
             let info = ShardInfo(index: shard.index, count: shard.count, threads: shard.runtime.workerCount)
-            Application.serve(shard.runtime, app: app, shard: info, limits: limits, config: config) {
-                () throws(IOError) -> TCPListener in try shard.listener()
+            let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
+                try shard.listener()
             }
+            var redirect: (@Sendable () throws(IOError) -> TCPListener)? = nil
+            if config.redirectHTTPPort != nil {
+                redirect = { () throws(IOError) -> TCPListener in try shard.listener(1) }
+            }
+            var ticketKey: [UInt8]? = nil
+            if !config.tlsCertificates.isEmpty { ticketKey = TicketKey.shared(in: shard.sharedRegion(0)) }
+            let listening = Listening(main: main, redirect: redirect, ticketKey: ticketKey)
+            Application.serve(shard.runtime, app: app, shard: info, limits: limits, config: config, listening: listening)
         }
         #else
         let runtime = Runtime(workers: config.threads)
         let info = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
-        Application.serve(runtime, app: app, shard: info, limits: limits, config: config) {
-            () throws(IOError) -> TCPListener in
+        let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
             try TCPListener.bind(host: config.host, port: config.port, backlog: config.backlog)
         }
+        var redirect: (@Sendable () throws(IOError) -> TCPListener)? = nil
+        if let port = config.redirectHTTPPort {
+            redirect = { () throws(IOError) -> TCPListener in
+                try TCPListener.bind(host: config.host, port: port, backlog: config.backlog)
+            }
+        }
+        let listening = Listening(main: main, redirect: redirect,
+                                  ticketKey: config.tlsCertificates.isEmpty ? nil : TicketKey.ownKey())
+        Application.serve(runtime, app: app, shard: info, limits: limits, config: config, listening: listening)
         exit(0)
         #endif
+    }
+
+    /// The protocols offered by ALPN, most wanted first.
+    static let alpn = ["http/1.1"]
+
+    /// Where a shard listens, and its session-ticket key under TLS.
+    struct Listening: Sendable {
+        let main: @Sendable () throws(IOError) -> TCPListener
+        /// The --redirect-http port's.
+        let redirect: (@Sendable () throws(IOError) -> TCPListener)?
+        let ticketKey: [UInt8]?
     }
 
     /// Shards when `--shards` is not given: Vega's choice from the machine's
@@ -98,8 +140,20 @@ extension Application {
     /// until SIGTERM or SIGINT, let the requests in progress finish, then run
     /// its stop hooks and shut its state down.
     static func serve(_ runtime: Runtime, app: CompiledApplication, shard: ShardInfo, limits: ConnectionLimits,
-                      config: ServerConfig, listener: @escaping @Sendable () throws(IOError) -> TCPListener) {
+                      config: ServerConfig, listening: Listening) {
         app.costs.configure(config, threads: runtime.workerCount)
+        var certificates: CertificateStore? = nil
+        if !config.tlsCertificates.isEmpty {
+            do {
+                certificates = try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn,
+                                                    ticketKey: listening.ticketKey)
+            } catch {
+                Log.error("TLS: \(error)")
+                exit(2)
+            }
+        }
+        let tls = certificates
+        let handshakeTimeout = config.tlsHandshakeTimeout
         do {
             try runtime.block { () async throws(IOError) -> Void in
                 do {
@@ -114,18 +168,28 @@ extension Application {
                 let acceptors = max(1, config.acceptors ?? runtime.workerCount)
                 var servers: [TCPServer] = []
                 for _ in 0..<acceptors {
-                    servers.append(try TCPServer.serve(try listener()) { stream in
-                        #if os(Windows)
-                        let peer = (try? stream.peerAddress).map {
-                            SocketPeer(address: $0.host, port: $0.port ?? 0)
-                        } ?? .none
-                        #else
-                        let peer = SocketPeer(socket: stream.fileDescriptor)
-                        #endif
-                        await serveHTTP1(stream, app: app, limits: limits, peer: peer)
+                    servers.append(try TCPServer.serve(try listening.main()) { stream in
+                        let peer = socketPeer(stream)
+                        guard let tls else {
+                            return await serveHTTP1(stream, app: app, limits: limits, peer: peer)
+                        }
+                        await serveTLS(stream, tls, handshakeTimeout: handshakeTimeout) { secured in
+                            await serveHTTP1(secured, app: app, limits: limits, peer: peer, secure: true)
+                        }
                     })
                 }
-                Log.info("serving on \(config.host):\(servers[0].port)")
+                Log.info("serving \(tls == nil ? "http" : "https") on \(config.host):\(servers[0].port)")
+                if let redirect = listening.redirect, let httpsPort = servers.first?.port {
+                    let redirector = httpsRedirectApplication(httpsPort: httpsPort).compile()
+                    let server = try TCPServer.serve(try redirect()) { stream in
+                        await serveHTTP1(stream, app: redirector, limits: limits, peer: socketPeer(stream))
+                    }
+                    Log.info("redirecting http on \(config.host):\(server.port) to https")
+                    servers.append(server)
+                }
+                if let tls, let interval = config.tlsReloadInterval {
+                    runtime.spawn { await watchCertificates(tls, every: interval) }
+                }
                 let all = servers
                 #if !os(Windows)
                 let grace = config.gracefulShutdown
@@ -185,6 +249,14 @@ extension ServerConfig {
           --log-level LEVEL    debug, info, warning, error or silent
           --max-body BYTES     largest request body (default 16 MiB)
           --keep-alive SECS    idle keep-alive timeout (default 5)
+          --tls-cert PATH      a PEM certificate chain to serve HTTPS with;
+                               give one --tls-key for each, in order. With
+                               several, SNI picks the one covering the name
+          --tls-key PATH       the PEM private key of the --tls-cert before it
+          --tls-reload SECS    look at the certificate files every SECS and
+                               serve them again when they change
+          --redirect-http PORT also listen for plain HTTP on PORT and redirect
+                               every request to https
           --forwarded-allow-ips L
                                proxies whose forwarded headers are trusted:
                                addresses, CIDR blocks, unix, or *
@@ -217,6 +289,7 @@ extension ServerConfig {
 
         var args = arguments.dropFirst()
         var accessLogFormatGiven = false
+        var certificates: [String] = [], keys: [String] = []
         func fail(_ message: String) -> Parsed {
             Log.error(message)
             return .exit(2)
@@ -286,6 +359,22 @@ extension ServerConfig {
                     return fail("--keep-alive must be a number of seconds")
                 }
                 config.keepAliveTimeout = .seconds(n)
+            case "--tls-cert":
+                guard let v = value() else { return fail("--tls-cert needs a path") }
+                certificates.append(v)
+            case "--tls-key":
+                guard let v = value() else { return fail("--tls-key needs a path") }
+                keys.append(v)
+            case "--tls-reload":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--tls-reload must be a number of seconds")
+                }
+                config.tlsReloadInterval = .seconds(n)
+            case "--redirect-http":
+                guard let v = value().flatMap({ Int($0) }), (1...65535).contains(v) else {
+                    return fail("--redirect-http must be a port between 1 and 65535")
+                }
+                config.redirectHTTPPort = v
             case "--forwarded-allow-ips":
                 guard let v = value() else { return fail("--forwarded-allow-ips needs a list") }
                 guard v.withCString({ config.trust.parse($0) }) else {
@@ -314,6 +403,21 @@ extension ServerConfig {
             }
         }
         if !accessLogFormatGiven { config.accessLogJSON = config.logJSON }
+        guard certificates.count == keys.count else {
+            return fail("--tls-cert and --tls-key go together, one key for each certificate")
+        }
+        config.tlsCertificates = zip(certificates, keys).map { TLSCertificateFiles(chain: $0, key: $1) }
+        if let redirect = config.redirectHTTPPort {
+            guard !config.tlsCertificates.isEmpty else {
+                return fail("--redirect-http sends clients to https; it needs --tls-cert")
+            }
+            guard redirect != config.port else {
+                return fail("--redirect-http needs a port of its own, not the TLS port")
+            }
+        }
+        if config.tlsReloadInterval != nil && config.tlsCertificates.isEmpty {
+            return fail("--tls-reload has no certificates to watch; it needs --tls-cert")
+        }
         return .run(config)
     }
 }

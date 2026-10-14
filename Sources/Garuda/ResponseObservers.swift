@@ -100,7 +100,8 @@ extension HTTP1Connection {
             status: status,
             microseconds: micros,
             protocolName: headParsed && head.httpMinor == 0 ? "HTTP/1.0" : "HTTP/1.1",
-            remoteAddress: x.pointee.remote.address,
+            // The client a trusted proxy names, once the head is there to say.
+            remoteAddress: headParsed ? Request(x).remoteAddress : x.pointee.remote.address,
             requestID: x.pointee.requestIDBytes?.string,
             traceID: trace?.trace.string,
             parentID: trace?.parent.string,

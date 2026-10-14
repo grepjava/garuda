@@ -60,6 +60,20 @@ public struct ServerConfig: Sendable {
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
 
+    // --- TLS (TLS.swift) ---
+    /// The certificates served, each with its key; none serves plain HTTP.
+    /// The client's SNI picks the first that covers the name it asks for,
+    /// and the first answers a client that names none.
+    public var tlsCertificates: [TLSCertificateFiles] = []
+    /// A plain-HTTP port that answers everything with a redirect to the same
+    /// URL on https, or nil for none.
+    public var redirectHTTPPort: Int? = nil
+    /// How often to look at the certificate files and serve them again when
+    /// they have changed; nil never looks.
+    public var tlsReloadInterval: Duration? = nil
+    /// How long a client has to finish the TLS handshake.
+    public var tlsHandshakeTimeout: Duration = .seconds(10)
+
     // --- request IDs and logging (RequestID.swift, Logging.swift) ---
     /// Peers whose forwarded headers are believed (--forwarded-allow-ips).
     /// Empty means "trust nobody", which is the only safe default: a header

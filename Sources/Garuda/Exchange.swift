@@ -40,6 +40,13 @@ struct Exchange: ~Copyable {
     @usableFromInline var remote: SocketPeer
     /// What middleware stored for this request (Context.swift).
     @usableFromInline var context = ContextSlots()
+    /// The connection is TLS (TLS.swift).
+    @usableFromInline var secure = false
+    /// The proxies whose forwarded headers are believed, or nil for none:
+    /// set per connection, and only when there is a list (Forwarded.swift).
+    @usableFromInline var trust: ForwardedTrust?
+    /// What those headers said for this request, read when first asked for.
+    @usableFromInline var forwardedState = ForwardedState.unknown
     /// The application serving the connection, for its state. It outlives
     /// every connection it serves.
     var application: Unmanaged<CompiledApplication>?
@@ -133,6 +140,7 @@ struct Exchange: ~Copyable {
         route = -1
         started = 0
         if failure != nil { failure = nil }
+        if case .unknown = forwardedState {} else { forwardedState = .unknown }
     }
 
     @inlinable
@@ -275,8 +283,6 @@ public struct Request: ~Copyable {
     /// How many parameters the matched route's pattern names.
     public var parameterCount: Int { exchange.pointee.parameters.count }
 
-    /// The client's port.
-    public var remotePort: Int { exchange.pointee.remote.port }
 
     // MARK: Lent bytes
 
@@ -346,7 +352,6 @@ public struct Request: ~Copyable {
         let bytes = bodyBytes
         return Array(UnsafeBufferPointer(start: bytes.base, count: bytes.count))
     }
-    public var remoteAddress: String { exchange.pointee.remote.address }
 
     // MARK: The bytes themselves
 

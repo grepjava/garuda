@@ -56,11 +56,12 @@ let package = Package(
         // HPACK, QPACK, frames. No sockets, no allocation on the hot path.
         // Vendored from aviancore's AvianHTTP; see Sources/GarudaWire/VENDORED.md.
         .target(name: "GarudaWire", exclude: ["VENDORED.md"], swiftSettings: sharedSwiftSettings),
-        // VegaCrypto: Garuda has no cryptography of its own. Signed and
+        // VegaTLS serves HTTPS (TLS.swift). VegaCrypto: Garuda has no
+        // cryptography of its own. Signed and
         // encrypted cookies (HMAC, HKDF, AES-GCM), JWT signing and verifying,
         // password hashes and tokens all use it.
         .target(name: "Garuda",
-                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaCrypto")],
+                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS")],
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaTesting",
                 dependencies: ["Garuda", "GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaTest")],

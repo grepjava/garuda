@@ -39,6 +39,9 @@ struct ConnectionLimits: Sendable {
     /// none, so a connection copies no list it would not read (RequestID.swift).
     var requestID: Bool
     var requestIDTrust: ForwardedTrust?
+    /// The proxies whose forwarded headers are believed, nil when there are
+    /// none (Forwarded.swift).
+    var trust: ForwardedTrust?
     var traceContext: Bool
     /// --access-log, as text or JSON (Logging.swift).
     var accessLog: Bool
@@ -56,6 +59,7 @@ struct ConnectionLimits: Sendable {
         bodyTimeout = config.bodyTimeout
         requestID = config.requestID
         requestIDTrust = config.requestID && !config.trust.isEmpty ? config.trust : nil
+        trust = config.trust.isEmpty ? nil : config.trust
         traceContext = config.traceContext
         accessLog = config.accessLog
         accessLogJSON = config.accessLogJSON
@@ -69,12 +73,17 @@ let outputFlushThreshold = 64 * 1024
 let separateBodyThreshold = 16 * 1024
 
 /// Serves HTTP/1.1 on `stream` until the client closes it, a request asks
-/// for the connection to close, or it idles out.
+/// for the connection to close, or it idles out. `secure`: the stream is TLS.
 func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
-    _ stream: borrowing S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer
+    _ stream: borrowing S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer,
+    secure: Bool = false
 ) async {
     let parts = app.connections.take(limits: limits, peer: peer)
-    parts.pointee.exchange.pointee.application = Unmanaged.passUnretained(app)
+    let x = parts.pointee.exchange
+    x.pointee.application = Unmanaged.passUnretained(app)
+    // The exchange is reused from connection to connection: set both.
+    x.pointee.secure = secure
+    if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
     var connection = HTTP1Connection(limits: limits, parts: parts, cache: app.connections,
                                      observing: limits.accessLog || !app.observers.isEmpty)
     await connection.run(stream, app: app)

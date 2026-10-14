@@ -108,17 +108,6 @@ struct SecurityHeadersMiddleware: Middleware {
     }
 }
 
-extension Request {
-    /// Whether the request came over HTTPS, directly or through a trusted
-    /// proxy that said so: what Strict-Transport-Security and a cookie's
-    /// default `Secure` follow.
-    ///
-    /// Always false for now: Garuda 2 serves plain HTTP/1 and takes no
-    /// proxy's word for the scheme yet. TLS serving and trusted proxies
-    /// answer it when they come, and these two follow without changing.
-    var arrivedOverHTTPS: Bool { false }
-}
-
 extension Exchange {
     /// Whether the response has a header named `name`, which is lowercase:
     /// the records keep their names lowercased.
