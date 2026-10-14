@@ -278,6 +278,12 @@ struct HTTP1Connection: ~Copyable {
             at &+= consumed
             switch outcome {
             case .finished:
+                // A body that arrived whole in one read never reached the
+                // check below.
+                if decoder.decodedBytes > limits.maxBodySize {
+                    try await failAndClose(stream, status: 413)
+                    return false
+                }
                 rebase()
                 x.pointee.body = x.pointee.decodedBody.readableBytes > 0
                     ? UnsafePointer(x.pointee.decodedBody.readPointer) : nil
