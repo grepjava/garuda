@@ -18,6 +18,11 @@ func avian(_ name: String) -> Target.Dependency {
     .product(name: name, package: "aviancore")
 }
 
+/// A module of Vega or vega-db, built only with the `VegaEngine` trait.
+func vega(_ name: String, _ package: String = "vega") -> Target.Dependency {
+    .product(name: name, package: package, condition: .when(traits: ["VegaEngine"]))
+}
+
 let package = Package(
     name: "garuda",
     // macOS 15: async handlers run on a `TaskExecutor`.
@@ -33,6 +38,14 @@ let package = Package(
         .library(name: "GarudaJSON", targets: ["GarudaJSON"]),
         // `@PostgresRow`, from the same plugin.
         .library(name: "GarudaSQL", targets: ["GarudaSQL"]),
+    ],
+    traits: [
+        // The engine under construction: requests served by Vega's
+        // work-stealing runtime instead of one event loop per process. Off by
+        // default; `swift build --traits VegaEngine`.
+        .trait(name: "VegaEngine",
+               description: "Serve on Vega (github.com/grepjava/vega), with the database clients from vega-db."),
+        .default(enabledTraits: []),
     ],
     dependencies: [
         // The protocol and systems layers: syscalls, TLS, buffers, the poller,
@@ -50,6 +63,10 @@ let package = Package(
         // resolved by everyone who depends on Garuda, because SwiftPM resolves
         // a package's dependencies whether or not a product uses them.
         .package(url: "https://github.com/swiftlang/swift-syntax", from: "602.0.0"),
+        // The work-stealing runtime and its database clients, for the
+        // `VegaEngine` trait. upToNextMinor for the same reason as aviancore.
+        .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.2.0")),
+        .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.1.0")),
     ],
     targets: [
         // Database protocols as byte-level state machines: no sockets, no
@@ -68,7 +85,10 @@ let package = Package(
         .target(name: "Garuda",
                 dependencies: [avian("CAvian"), avian("AvianCore"), avian("AvianHTTP"), avian("AvianQUIC"),
                                "GarudaPostgres", "GarudaRedis", "CGarudaSQLite", "CGarudaJWT",
-                               .product(name: "Tracing", package: "swift-distributed-tracing")],
+                               .product(name: "Tracing", package: "swift-distributed-tracing"),
+                               vega("Vega"), vega("VegaIO"), vega("VegaTLS"),
+                               vega("VegaPostgres", "vega-db"), vega("VegaRedis", "vega-db"),
+                               vega("VegaSQLite", "vega-db")],
                 swiftSettings: sharedSwiftSettings),
 
         // Resumable uploads (draft-ietf-httpbis-resumable-upload), built on the
