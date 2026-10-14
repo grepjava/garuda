@@ -61,6 +61,10 @@ struct Exchange: ~Copyable {
     /// Kept for the next JSON answer on this connection.
     var jsonWriter: JSONWriter?
 
+    /// `Response.onSend` hooks, run before the head is written. Empty, and
+    /// unallocated, for a request that registers none (ResponseHooks.swift).
+    @usableFromInline var sendHooks: [SendHook] = []
+
     init(maxHeaders: Int, remote: SocketPeer) {
         self.maxHeaders = maxHeaders
         headers = .allocate(capacity: maxHeaders)
@@ -98,6 +102,7 @@ struct Exchange: ~Copyable {
         answered = false
         committed = false
         if !context.isEmpty { context.clear() }
+        if !sendHooks.isEmpty { sendHooks = [] }
     }
 
     @inlinable

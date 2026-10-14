@@ -348,6 +348,9 @@ struct HTTP1Connection: ~Copyable {
 
     /// Writes the exchange's response into `output`.
     mutating func writeResponse(keepAlive: Bool, omitBody: Bool) {
+        // `Response.onSend` hooks see the answer once it is final, while it
+        // can still change (ResponseHooks.swift).
+        if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
         x.pointee.committed = true
         parts.pointee.dates.refresh()
         let status = x.pointee.status
