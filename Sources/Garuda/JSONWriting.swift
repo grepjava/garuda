@@ -111,8 +111,43 @@ public struct JSONOutput {
     }
 
     /// A whole number, written straight into the buffer rather than through
-    /// a `String`.
+    /// a `String`. Inlinable down to a non-generic writer, so `@JSON` code in
+    /// another module does not run it generically.
+    @inlinable
     public mutating func write<T: FixedWidthInteger>(_ value: T) {
+        if T.bitWidth <= 64 {
+            writeInteger(UInt64(truncatingIfNeeded: value.magnitude), negative: value < 0)
+        } else {
+            writeWide(value)
+        }
+    }
+
+    @usableFromInline
+    mutating func writeInteger(_ magnitude: UInt64, negative: Bool) {
+        if magnitude == 0 {
+            bytes.append(0x30)
+            return
+        }
+        if negative { bytes.append(0x2D) }
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 24) { digits in
+            var written = 0
+            var rest = magnitude
+            while rest > 0 {
+                digits[written] = 0x30 + UInt8(truncatingIfNeeded: rest % 10)
+                rest /= 10
+                written += 1
+            }
+            var i = written - 1
+            while i >= 0 {
+                bytes.append(digits[i])
+                i -= 1
+            }
+        }
+    }
+
+    /// A whole number wider than 64 bits.
+    @usableFromInline
+    mutating func writeWide<T: FixedWidthInteger>(_ value: T) {
         if value == 0 {
             bytes.append(0x30)
             return
@@ -120,7 +155,7 @@ public struct JSONOutput {
         if value < 0 { bytes.append(0x2D) }
         // On the stack: a number is written for nearly every answer, and an
         // array here was an allocation for each one.
-        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 24) { digits in
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 48) { digits in
             var written = 0
             var magnitude = value.magnitude
             while magnitude > 0 {
