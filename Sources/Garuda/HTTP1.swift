@@ -60,17 +60,19 @@ let separateBodyThreshold = 16 * 1024
 func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     _ stream: borrowing S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer
 ) async {
-    var connection = HTTP1Connection(limits: limits, peer: peer)
+    var connection = HTTP1Connection(limits: limits, parts: app.connections.take(limits: limits, peer: peer),
+                                     cache: app.connections)
     await connection.run(stream, app: app)
 }
 
 struct HTTP1Connection: ~Copyable {
     let limits: ConnectionLimits
-    var input: IOBuffer
+    /// The buffers and the exchange, borrowed from the cache for the
+    /// connection's life (ConnectionCache.swift).
+    let parts: UnsafeMutablePointer<ConnectionParts>
+    let cache: ConnectionCache
     /// Where the next request starts in `input`.
     var start = 0
-    var output = ByteBuffer()
-    var dates = DateCache()
     /// The exchange, where it stays for the connection's life: handlers are
     /// lent pointers to it.
     let x: UnsafeMutablePointer<Exchange>
@@ -78,19 +80,15 @@ struct HTTP1Connection: ~Copyable {
     var batched = 0
     var served = 0
 
-    init(limits: ConnectionLimits, peer: SocketPeer) {
+    init(limits: ConnectionLimits, parts: UnsafeMutablePointer<ConnectionParts>, cache: ConnectionCache) {
         self.limits = limits
-        input = IOBuffer(capacity: limits.readBufferSize)
-        x = .allocate(capacity: 1)
-        x.initialize(to: Exchange(maxHeaders: limits.maxHeaders, remote: peer))
-        output.reserve(4096)
+        self.parts = parts
+        self.cache = cache
+        x = parts.pointee.exchange
     }
 
     deinit {
-        var output = output
-        output.destroy()
-        x.deinitialize(count: 1)
-        x.deallocate()
+        cache.give(parts, limits: limits)
     }
 
     mutating func run<S: AsyncReader & AsyncWriter & ~Copyable>(
@@ -135,7 +133,7 @@ struct HTTP1Connection: ~Copyable {
             try await flush(stream)
             return false
         }
-        if batched >= limits.pipelineDepth || output.readableBytes >= outputFlushThreshold {
+        if batched >= limits.pipelineDepth || parts.pointee.output.readableBytes >= outputFlushThreshold {
             try await flush(stream)
         }
         return true
@@ -199,13 +197,13 @@ struct HTTP1Connection: ~Copyable {
     /// requests or must be closed on.
     mutating func readHead<S: AsyncReader & AsyncWriter & ~Copyable>(_ stream: borrowing S) async throws -> Bool {
         while true {
-            if start > 0 && start == input.count {
-                input.clear()
+            if start > 0 && start == parts.pointee.input.count {
+                parts.pointee.input.clear()
                 start = 0
             }
-            let available = input.count &- start
+            let available = parts.pointee.input.count &- start
             if available > 0 {
-                let base = input.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) } + start
+                let base = parts.pointee.input.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) } + start
                 x.pointee.base = base
                 switch HTTPParser.parse(base, available, maxHeadSize: limits.maxHeadSize,
                                         maxHeaders: limits.maxHeaders, headers: x.pointee.headers,
@@ -228,7 +226,7 @@ struct HTTP1Connection: ~Copyable {
             makeRoom(for: limits.maxHeadSize)
             let timeout = available == 0 ? limits.keepAliveTimeout : limits.requestHeadTimeout
             let n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
-                try await stream.read(into: &input)
+                try await stream.read(into: &parts.pointee.input)
             }
             if n == 0 { return false }
         }
@@ -247,13 +245,13 @@ struct HTTP1Connection: ~Copyable {
             return false
         }
         let need = head.headEnd &+ length
-        if input.count &- start < need {
+        if parts.pointee.input.count &- start < need {
             try await sendContinueIfAsked(stream)
             compact()
-            input.reserveCapacity(need)
-            while input.count < need {
+            parts.pointee.input.reserveCapacity(need)
+            while parts.pointee.input.count < need {
                 let n = try await Runtime.withIODeadline(limits.bodyTimeout) { () async throws(IOError) -> Int in
-                    try await stream.read(into: &input)
+                    try await stream.read(into: &parts.pointee.input)
                 }
                 if n == 0 { return false }
             }
@@ -270,9 +268,9 @@ struct HTTP1Connection: ~Copyable {
         var at = x.pointee.head.headEnd
         var asked = false
         while true {
-            let base = input.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) } + start
+            let base = parts.pointee.input.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) } + start
             var consumed = 0
-            let outcome = decoder.decode(base + at, input.count &- start &- at, consumed: &consumed) { p, n in
+            let outcome = decoder.decode(base + at, parts.pointee.input.count &- start &- at, consumed: &consumed) { p, n in
                 x.pointee.decodedBody.write(p, n)
             }
             at &+= consumed
@@ -305,9 +303,9 @@ struct HTTP1Connection: ~Copyable {
                 // The raw chunks read so far are decoded; only what is still
                 // undecoded needs to stay, but the head ahead of it does too.
                 compact()
-                if input.spareCapacity < 4096 { input.reserveCapacity(input.capacity * 2) }
+                if parts.pointee.input.spareCapacity < 4096 { parts.pointee.input.reserveCapacity(parts.pointee.input.capacity * 2) }
                 let n = try await Runtime.withIODeadline(limits.bodyTimeout) { () async throws(IOError) -> Int in
-                    try await stream.read(into: &input)
+                    try await stream.read(into: &parts.pointee.input)
                 }
                 if n == 0 { return false }
             }
@@ -317,82 +315,82 @@ struct HTTP1Connection: ~Copyable {
     /// `Expect: 100-continue`: the client is waiting to be told to send.
     mutating func sendContinueIfAsked<S: AsyncReader & AsyncWriter & ~Copyable>(_ stream: borrowing S) async throws {
         guard x.pointee.head.flags.contains(.expectContinue) else { return }
-        output.write("HTTP/1.1 100 Continue\r\n\r\n")
+        parts.pointee.output.write("HTTP/1.1 100 Continue\r\n\r\n")
         try await flush(stream)
     }
 
     /// Moves the request at `start` to the front of `input`.
     mutating func compact() {
         guard start > 0 else { return }
-        input.consume(start)
+        parts.pointee.input.consume(start)
         start = 0
         rebase()
     }
 
     /// Room in `input` for a head of up to `limit` bytes.
     mutating func makeRoom(for limit: Int) {
-        if input.spareCapacity > 0 { return }
+        if parts.pointee.input.spareCapacity > 0 { return }
         if start > 0 {
             compact()
-            if input.spareCapacity > 0 { return }
+            if parts.pointee.input.spareCapacity > 0 { return }
         }
-        input.reserveCapacity(min(max(input.capacity * 2, 1024), limit + 1024))
+        parts.pointee.input.reserveCapacity(min(max(parts.pointee.input.capacity * 2, 1024), limit + 1024))
         rebase()
     }
 
     /// Points the exchange at `input` again, after it may have moved.
     mutating func rebase() {
-        x.pointee.base = input.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) } + start
+        x.pointee.base = parts.pointee.input.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) } + start
     }
 
     // MARK: Writing
 
     /// Writes the exchange's response into `output`.
     mutating func writeResponse(keepAlive: Bool, omitBody: Bool) {
-        dates.refresh()
+        parts.pointee.dates.refresh()
         let status = x.pointee.status
         let forbids = HTTPResponseWriter.statusForbidsBody(status)
         let count = forbids ? 0 : x.pointee.responseBody.readableBytes
-        output.reserve(256 &+ x.pointee.responseHeaders.readableBytes)
-        HTTPResponseWriter.writeStatusLine(&output, status: status)
+        parts.pointee.output.reserve(256 &+ x.pointee.responseHeaders.readableBytes)
+        HTTPResponseWriter.writeStatusLine(&parts.pointee.output, status: status)
         let kinds = x.pointee.headerKinds
-        if !kinds.contains(.date) { HTTPResponseWriter.writeDate(&output, dates) }
-        if !kinds.contains(.server) { output.write("Server: garuda\r\n") }
+        if !kinds.contains(.date) { HTTPResponseWriter.writeDate(&parts.pointee.output, parts.pointee.dates) }
+        if !kinds.contains(.server) { parts.pointee.output.write("Server: garuda\r\n") }
         x.pointee.forEachResponseHeader { name, value in
             let kind = HTTPResponseWriter.classify(name)
             // The server frames the message and manages the connection.
             if kind == .contentLength || kind == .transferEncoding || kind == .connection { return }
-            _ = HTTPResponseWriter.writeHeader(&output, name: name, value: value)
+            _ = HTTPResponseWriter.writeHeader(&parts.pointee.output, name: name, value: value)
         }
-        if !forbids { HTTPResponseWriter.writeContentLength(&output, count) }
+        if !forbids { HTTPResponseWriter.writeContentLength(&parts.pointee.output, count) }
         if !keepAlive {
-            output.write("Connection: close\r\n")
+            parts.pointee.output.write("Connection: close\r\n")
         } else if x.pointee.head.httpMinor == 0 {
-            output.write("Connection: keep-alive\r\n")
+            parts.pointee.output.write("Connection: keep-alive\r\n")
         }
-        HTTPResponseWriter.endHead(&output)
+        HTTPResponseWriter.endHead(&parts.pointee.output)
         if count > 0 && !omitBody {
-            output.write(x.pointee.responseBody.readPointer, count)
+            parts.pointee.output.write(x.pointee.responseBody.readPointer, count)
         }
     }
 
     /// Writes whatever `output` holds.
     mutating func flush<S: AsyncReader & AsyncWriter & ~Copyable>(_ stream: borrowing S) async throws {
         batched = 0
-        let pending = output.readableBytes
+        let pending = parts.pointee.output.readableBytes
         guard pending > 0 else { return }
-        let bytes = UnsafeRawBufferPointer(start: output.readPointer, count: pending)
+        let bytes = UnsafeRawBufferPointer(start: parts.pointee.output.readPointer, count: pending)
         try await stream.write(bytes)
-        output.clear()
+        parts.pointee.output.clear()
     }
 
     /// Answers `status` to a request that cannot be read, and closes.
     mutating func failAndClose<S: AsyncReader & AsyncWriter & ~Copyable>(
         _ stream: borrowing S, status: Int
     ) async throws {
-        dates.refresh()
-        HTTPResponseWriter.writeError(&output, status: status, closeConnection: true,
-                                      dateCache: dates, serverName: "garuda")
+        parts.pointee.dates.refresh()
+        HTTPResponseWriter.writeError(&parts.pointee.output, status: status, closeConnection: true,
+                                      dateCache: parts.pointee.dates, serverName: "garuda")
         try await flush(stream)
     }
 }

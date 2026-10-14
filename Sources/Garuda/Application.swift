@@ -127,6 +127,8 @@ final class CompiledApplication: @unchecked Sendable {
     let routeCount: Int
     /// What each route's handler costs, and the heavy lane.
     let costs: RouteCosts
+    /// Spare connection memory, by worker thread.
+    let connections = ConnectionCache()
 
     init(table: CompiledRoutes, routes: [RouteEntry]) {
         self.table = table
