@@ -75,6 +75,9 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     var stateFactories: [StateFactory] = []
     var startHooks: [@Sendable (ShardContext) async throws -> Void] = []
     var stopHooks: [@Sendable (ShardContext) async -> Void] = []
+    /// What a path with a trailing slash no route has is answered with
+    /// (TrailingSlash.swift).
+    var trailingSlashPolicy = TrailingSlash.strict
     /// The routes as connections read them, made the first time the
     /// application runs or is tested. Nothing can be added after that.
     var compiledApplication: CompiledApplication?
@@ -187,7 +190,8 @@ public final class Application: RouteBuilder, @unchecked Sendable {
         }
         let compiled = CompiledApplication(table: table.compile(), routes: serving,
                                            stateFactories: stateFactories,
-                                           startHooks: startHooks, stopHooks: stopHooks)
+                                           startHooks: startHooks, stopHooks: stopHooks,
+                                           trailingSlash: trailingSlashPolicy)
         compiledApplication = compiled
         return compiled
     }
@@ -237,11 +241,15 @@ final class CompiledApplication: @unchecked Sendable {
     /// one: a path with none never looks (CORS.swift).
     let corsPolicies: [CORSPolicy?]
     let hasCORS: Bool
+    /// What a path with a trailing slash no route has is answered with.
+    let trailingSlash: TrailingSlash
 
     init(table: CompiledRoutes, routes: [RouteEntry], stateFactories: [StateFactory] = [],
          startHooks: [@Sendable (ShardContext) async throws -> Void] = [],
-         stopHooks: [@Sendable (ShardContext) async -> Void] = []) {
+         stopHooks: [@Sendable (ShardContext) async -> Void] = [],
+         trailingSlash: TrailingSlash = .strict) {
         self.table = table
+        self.trailingSlash = trailingSlash
         self.stateFactories = stateFactories
         self.startHooks = startHooks
         self.stopHooks = stopHooks

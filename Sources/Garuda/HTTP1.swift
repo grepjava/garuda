@@ -145,14 +145,26 @@ struct HTTP1Connection: ~Copyable {
     mutating func dispatch(_ app: CompiledApplication) async {
         let path = x.pointee.head.path
         let base = x.pointee.base + Int(path.offset)
-        let route = app.table.match(x.pointee.head.method, base, path.count, into: &x.pointee.parameters)
+        var count = path.count
+        var route = app.table.match(x.pointee.head.method, base, count, into: &x.pointee.parameters)
+        // A trailing slash no route has, under `app.trailingSlash`: redirected,
+        // or matched again without it (TrailingSlash.swift). Only a miss looks.
+        if route < 0 && app.trailingSlash != .strict,
+           let trimmed = pathWithoutTrailingSlash(app, base, count, &x.pointee.parameters) {
+            if app.trailingSlash == .redirect {
+                if redirectWithoutTrailingSlash(x) { return }
+            } else {
+                count = trimmed
+                route = app.table.match(x.pointee.head.method, base, count, into: &x.pointee.parameters)
+            }
+        }
         guard route >= 0 else {
-            let allowed = app.table.allowedMethods(base, path.count, into: &x.pointee.parameters)
+            let allowed = app.table.allowedMethods(base, count, into: &x.pointee.parameters)
             x.pointee.parameters = RouteParameters()
             if allowed.isEmpty {
                 x.pointee.answer(404, nil, 0)
             } else if x.pointee.head.method == .options && app.hasCORS
-                        && answerPreflight(x, app, allowed: allowed, base, path.count) {
+                        && answerPreflight(x, app, allowed: allowed, base, count) {
                 // A CORS preflight to a path routed only for other methods:
                 // the policy of a route there answers it rather than a 405
                 // (CORS.swift). Only an OPTIONS that matched nothing, in an
