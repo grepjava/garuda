@@ -57,7 +57,9 @@ let package = Package(
         // Vendored from aviancore's AvianHTTP; see Sources/GarudaWire/VENDORED.md.
         .target(name: "GarudaWire", exclude: ["VENDORED.md"], swiftSettings: sharedSwiftSettings),
         .target(name: "Garuda",
-                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO")],
+                // VegaCrypto: JWT signing and verifying, password hashes and
+                // tokens. Garuda has no cryptography of its own.
+                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaCrypto")],
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaTesting",
                 dependencies: ["Garuda", "GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaTest")],
