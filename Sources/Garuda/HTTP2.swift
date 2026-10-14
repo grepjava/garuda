@@ -261,7 +261,7 @@ func serveHTTP2<R: AsyncReader & ~Copyable, W: AsyncWriter & ~Copyable & Sendabl
         await sink.close(closeWriter)
     }
     service.register(connection)
-    await connection.runReader(reader)
+    await connection.runReader(reader, writer: sink)
     await connection.end(writer: writer)
     service.unregister(connection)
     app.connections.give(parts, limits: limits)
@@ -495,7 +495,9 @@ final class H2Connection: @unchecked Sendable {
     // MARK: - Reading
 
     /// Reads and handles frames until the connection is done.
-    func runReader<R: AsyncReader & ~Copyable>(_ reader: borrowing R) async {
+    func runReader<R: AsyncReader & ~Copyable, W: AsyncWriter & ~Copyable & Sendable>(
+        _ reader: borrowing R, writer half: H2WriteHalf<W>
+    ) async {
         var failed = false
         while true {
             if !handleFrames() {
@@ -506,7 +508,7 @@ final class H2Connection: @unchecked Sendable {
             // still in the buffer: they are handled once it is answered.
             while let s = inlineStream {
                 inlineStream = nil
-                await answerInline(s)
+                await answerInline(s, half)
                 if !handleFrames() {
                     failed = true
                     break
@@ -1334,7 +1336,7 @@ final class H2Connection: @unchecked Sendable {
     /// is a hop in and a hop out, and with a task executor preference each
     /// hop takes the task's status-record lock to look the preference up.
     @inline(__always)
-    func answerInline(_ s: H2Stream) async {
+    func answerInline<W: AsyncWriter & ~Copyable & Sendable>(_ s: H2Stream, _ half: H2WriteHalf<W>) async {
         await dispatchStream(s)
         let data = prepareAnswer(s)
         let direct = lock.withLock { _ -> Bool in
@@ -1348,7 +1350,7 @@ final class H2Connection: @unchecked Sendable {
         }
         guard direct else { return }
         frameWhole(s)
-        let sent = await sendFramed()
+        let sent = await sendFramed(to: half)
         lock.withLock { _ in
             earned &+= 1
             s.closed = true

@@ -357,6 +357,23 @@ extension H2Connection {
         }
     }
 
+    /// `sendFramed`, writing to `half` directly: for the reader, which knows
+    /// the write half's type, without the two async calls the type-erased
+    /// sink costs -- each a hop in and a hop out.
+    @inline(__always)
+    func sendFramed<W: AsyncWriter & ~Copyable & Sendable>(to half: H2WriteHalf<W>) async -> Bool {
+        defer { wOut.clear() }
+        guard wOut.readableBytes > 0 else { return true }
+        do {
+            try await half.half.pointee.write(UnsafeRawBufferPointer(start: wOut.readPointer,
+                                                                     count: wOut.readableBytes))
+            return true
+        } catch {
+            writeFailed.store(true, ordering: .relaxed)
+            return false
+        }
+    }
+
     /// Under the lock: lets the write role go, waking the writer when it is
     /// waiting for the role or has anything to do.
     func releaseRole(failed: Bool) {
