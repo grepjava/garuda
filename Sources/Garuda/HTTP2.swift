@@ -177,14 +177,14 @@ func serveConnection<S: AsyncReader & AsyncWriter & ~Copyable, R: AsyncReader & 
     closeWriter: @escaping @Sendable (borrowing W) async -> Void
 ) async {
     guard let http2, limits.http2.enabled else {
-        await serveHTTP1(stream, app: app, limits: limits, peer: peer, secure: secure)
+        let stream = await serveHTTP1(stream, app: app, limits: limits, peer: peer, secure: secure)
         await close(stream)
         return
     }
     let parts = app.connections.take(limits: limits, peer: peer)
     switch await opening(stream, parts, limits, strict: negotiatedH2 || limits.http2.only) {
     case .http1:
-        await serveHTTP1(stream, parts: parts, app: app, limits: limits, secure: secure)
+        let stream = await serveHTTP1(stream, parts: parts, app: app, limits: limits, secure: secure)
         await close(stream)
     case .http2:
         await serveHTTP2(halves(stream), parts: parts, app: app, limits: limits, service: http2, secure: secure,
@@ -312,15 +312,44 @@ final class H2Stream: @unchecked Sendable {
     @exclusivity(unchecked) var length = 0
     @exclusivity(unchecked) var grant = 0
 
+    // A streamed body (StreamingResponse.swift). Under the connection's
+    // lock, but for `ending`, which is the writer's.
+    /// The answer's body is written as it is produced.
+    @exclusivity(unchecked) var streamed = false
+    /// The Content-Length the handler declared for it, or -1.
+    @exclusivity(unchecked) var declared = -1
+    /// Written by the handler, not yet taken by the writer.
+    @exclusivity(unchecked) var staged = ByteBuffer()
+    /// Written and not yet given window: what the handler's writes wait on.
+    @exclusivity(unchecked) var backlog = 0
+    @exclusivity(unchecked) var bodyEnded = false
+    /// Cut off part-way: reset rather than ended.
+    @exclusivity(unchecked) var bodyFailed = false
+    @exclusivity(unchecked) var waiters: [UnsafeContinuation<Bool, Never>] = []
+    /// The reader is answering it itself: its writes cannot wait.
+    @exclusivity(unchecked) var runsInline = false
+    /// The writer has seen the end and sends END_STREAM with the last bytes.
+    @exclusivity(unchecked) var ending = false
+
     init(connection: H2Connection, maxHeaders: Int, peer: SocketPeer) {
         self.connection = connection
         x = .allocate(capacity: 1)
         x.initialize(to: Exchange(maxHeaders: maxHeaders, remote: peer))
+        x.pointee.link = .http2(Unmanaged.passUnretained(self))
+    }
+
+    /// Under the lock: resumes the writers waiting on the backlog.
+    func resumeWaiters(_ drained: Bool) {
+        guard !waiters.isEmpty else { return }
+        let waiting = waiters
+        waiters = []
+        for c in waiting { c.resume(returning: drained) }
     }
 
     deinit {
         head.destroy()
         body.destroy()
+        staged.destroy()
         x.deinitialize(count: 1)
         x.deallocate()
     }
@@ -570,6 +599,7 @@ final class H2Connection: @unchecked Sendable {
     func cancel(_ s: H2Stream) {
         s.reset = true
         s.task?.cancel()
+        s.resumeWaiters(false)
     }
 
     /// No stream open, by the reader's account, and none running.
@@ -996,6 +1026,15 @@ final class H2Connection: @unchecked Sendable {
         s.resetAfter = nil
         s.sent = 0
         s.length = 0
+        if s.streamed {
+            s.streamed = false
+            s.declared = -1
+            s.staged.clear()
+            s.backlog = 0
+            s.bodyEnded = false
+            s.bodyFailed = false
+            s.ending = false
+        }
         s.receiving = false
         s.recvWindow = settings.initialWindowSize
         s.pendingUpdate = 0
@@ -1225,6 +1264,7 @@ final class H2Connection: @unchecked Sendable {
             // Still counted as unstarted, so the writer does not take the
             // connection for idle while it runs.
             inlineStream = s
+            s.runsInline = true
             return
         }
         lock.withLock { _ in
@@ -1246,6 +1286,18 @@ final class H2Connection: @unchecked Sendable {
             }
         }
         await dispatchStream(s)
+        if let channel = s.x.pointee.channel {
+            // Streamed: the head is the writer's already, and the body's end
+            // is now (StreamingResponse.swift).
+            lock.withLock { _ in
+                s.task = nil
+                channel.closeH2Locked(s, failed: channel.handlerFailed)
+                release(s)
+                tasks &-= 1
+                if tasks == 0 { idle.notifyOne() }
+            }
+            return
+        }
         let data = prepareAnswer(s)
         let direct = lock.withLock { _ -> Bool in
             // No reset cancels the task once it may have moved on.
@@ -1326,6 +1378,15 @@ final class H2Connection: @unchecked Sendable {
     @inline(__always)
     func answerInline<W: AsyncWriter & ~Copyable & Sendable>(_ s: H2Stream, _ half: H2WriteHalf<W>) async {
         await dispatchStream(s)
+        s.runsInline = false
+        if let channel = s.x.pointee.channel {
+            // Streamed after all: the writer has it, and its own hold.
+            lock.withLock { _ in
+                unstarted &-= 1
+                channel.closeH2Locked(s, failed: channel.handlerFailed)
+            }
+            return
+        }
         let data = prepareAnswer(s)
         let direct = lock.withLock { _ -> Bool in
             unstarted &-= 1
@@ -1345,6 +1406,28 @@ final class H2Connection: @unchecked Sendable {
             release(s)
             releaseRole(failed: !sent)
         }
+    }
+
+    /// The head of `s`'s streamed answer is made: the writer frames it now,
+    /// and the body as it is written. The writer takes a hold of its own.
+    func startStreamedAnswer(_ s: H2Stream, channel: BodyChannel, declared: Int) {
+        // Its route waits on its client from now on: never again answered on
+        // the reader, which is the one to read the window it would wait for.
+        let route = s.x.pointee.route
+        if route >= 0 { app.costs.markSuspends(Int(route)) }
+        lock.withLock { _ in
+            s.streamed = true
+            s.declared = declared
+            s.holds &+= 1
+            ready.append(s)
+            wake.notifyOne()
+        }
+    }
+
+    /// Under the lock: the writer has something to do.
+    @inline(__always)
+    func wakeWriter() {
+        wake.notifyOne()
     }
 
     // MARK: Other frames

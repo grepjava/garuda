@@ -192,7 +192,8 @@ extension Application {
                 if let redirect = listening.redirect, let httpsPort = servers.first?.port {
                     let redirector = httpsRedirectApplication(httpsPort: httpsPort).compile()
                     let server = try TCPServer.serve(try redirect()) { stream in
-                        await serveHTTP1(stream, app: redirector, limits: limits, peer: socketPeer(stream))
+                        let peer = socketPeer(stream)
+                        await serveHTTP1(stream, app: redirector, limits: limits, peer: peer)
                     }
                     Log.info("redirecting http on \(config.host):\(server.port) to https")
                     servers.append(server)

@@ -68,6 +68,31 @@ struct Exchange: ~Copyable {
     /// Kept for the next JSON answer on this connection.
     var jsonWriter: JSONWriter?
 
+    // MARK: A streamed body (StreamingResponse.swift)
+
+    /// Where a streamed body goes, set by the connection.
+    var link = BodyLink.none
+    /// The body being streamed, once the head is made.
+    var channel: BodyChannel?
+    /// A returned `StreamingBody`'s producer, run once the handler returns.
+    var producer: StreamProducer?
+    /// HTTP/1: the connection may serve another request after this one.
+    var keepAlive = true
+    /// An `onSend` hook gave the response a body of its own.
+    var bodyReplaced = false
+    /// The hooks are running over a streamed head.
+    var streamStarting = false
+    /// Something above was set, for `reset` to undo.
+    @usableFromInline var touchedStream = false
+
+    @usableFromInline
+    mutating func resetStream() {
+        touchedStream = false
+        channel = nil
+        producer = nil
+        bodyReplaced = false
+    }
+
     /// `Response.onSend` hooks, run before the head is written. Empty, and
     /// unallocated, for a request that registers none (ResponseHooks.swift).
     @usableFromInline var sendHooks: [SendHook] = []
@@ -135,6 +160,7 @@ struct Exchange: ~Copyable {
         committed = false
         if !context.isEmpty { context.clear() }
         if !sendHooks.isEmpty { sendHooks = [] }
+        if touchedStream { resetStream() }
         requestID.clear()
         traceParent = nil
         route = -1

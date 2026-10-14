@@ -397,6 +397,7 @@ extension H2Connection {
         let status = x.pointee.status
         let forbids = HTTPResponseWriter.statusForbidsBody(status)
         let count = forbids ? 0 : x.pointee.responseBody.readableBytes
+        let streamed = s.streamed
         block.clear()
         encoder.encodeStatus(status, into: &block)
         let kinds = x.pointee.headerKinds
@@ -426,14 +427,19 @@ extension H2Connection {
             fieldCache.encode(encoder, name.base, name.count, value.count > 0 ? value.base : emptyBlock, value.count,
                               into: &block)
         }
-        if !forbids { encodeContentLength(count, into: &block) }
+        if streamed {
+            // Its length is known only when the handler said it.
+            if !forbids && s.declared >= 0 { encodeContentLength(s.declared, into: &block) }
+        } else if !forbids {
+            encodeContentLength(count, into: &block)
+        }
         // A HEAD answer carries the GET's headers and none of its body.
-        let hasData = count > 0 && x.pointee.head.method != .head
+        let hasData = (streamed ? !forbids : count > 0) && x.pointee.head.method != .head
         writeHeaderBlock(&block, stream: s.id, endStream: !hasData, frameSize: frameSize, into: &out)
         if observing { reportAnswer(x, limits: limits, status: status) }
         if hasData {
             s.sent = 0
-            s.length = count
+            s.length = streamed ? 0 : count
             return true
         }
         ended(s, into: &out)
@@ -476,6 +482,7 @@ extension H2Connection {
                     s.grant = -1
                     continue
                 }
+                if s.streamed { takeStaged(s) }
                 let grant = min(s.length - s.sent, s.sendWindow, sendWindow, room)
                 if grant <= 0 {
                     s.grant = 0
@@ -485,6 +492,11 @@ extension H2Connection {
                 sendWindow -= grant
                 room -= grant
                 s.grant = grant
+                if s.streamed {
+                    s.backlog &-= grant
+                    // Fallen to the low-water mark: its writers may go on.
+                    if s.backlog <= limits.writeLowWaterMark { s.resumeWaiters(true) }
+                }
             }
         }
         var i = 0
@@ -498,17 +510,32 @@ extension H2Connection {
             }
             var grant = s.grant
             s.grant = 0
+            // A streamed body ends where the handler ended it.
+            let last = !s.streamed || s.ending
+            if s.streamed && s.bodyFailed {
+                // Cut off part-way: half a body cannot be ended honestly.
+                frame(&out, 4, .rstStream, [], s.id)
+                HTTP2.writeUInt32(H2Error.internalError.rawValue, into: &out)
+                finished.append(s)
+                sending.remove(at: i)
+                continue
+            }
+            var endedNow = false
             if grant > 0 {
                 let body = UnsafePointer(s.x.pointee.responseBody.readPointer)
                 while grant > 0 {
                     let n = min(grant, frameSize)
-                    frame(&out, n, .data, s.sent + n == s.length ? .endStream : [], s.id)
+                    let end = last && s.sent + n == s.length
+                    frame(&out, n, .data, end ? .endStream : [], s.id)
                     out.write(body + s.sent, n)
                     s.sent += n
                     grant -= n
+                    endedNow = end
                 }
             }
-            if s.sent == s.length {
+            if s.sent == s.length && last {
+                // A streamed body whose end came after its last bytes.
+                if !endedNow && s.streamed { frame(&out, 0, .data, .endStream, s.id) }
                 ended(s, into: &out)
                 finished.append(s)
                 sending.remove(at: i)
@@ -518,6 +545,25 @@ extension H2Connection {
         }
         // The first in line does not always go first.
         if sending.count > 1 { sending.append(sending.removeFirst()) }
+    }
+
+    /// Under the lock: moves what the handler has written of a streamed body
+    /// behind what the writer still has of it, and notes whether the end
+    /// has come.
+    func takeStaged(_ s: H2Stream) {
+        let staged = s.staged.readableBytes
+        if staged > 0 {
+            let body = s.x
+            if s.sent > 0 {
+                body.pointee.responseBody.consume(s.sent)
+                s.length &-= s.sent
+                s.sent = 0
+            }
+            body.pointee.responseBody.write(s.staged.readPointer, staged)
+            s.length &+= staged
+            s.staged.clear()
+        }
+        s.ending = s.bodyEnded
     }
 
     /// After a stream's END_STREAM: the reset a 413 asks for.

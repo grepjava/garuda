@@ -110,6 +110,8 @@ public struct OutgoingResponse: ~Copyable {
     /// content type when one is given. A Content-Length the handler set is
     /// dropped: the server states the new body's length.
     public mutating func replaceBody(_ bytes: [UInt8], contentType: String? = nil) {
+        exchange.pointee.bodyReplaced = true
+        exchange.pointee.touchedStream = true
         exchange.pointee.responseBody.clear()
         bytes.withUnsafeBufferPointer { b in
             if let base = b.baseAddress, b.count > 0 { exchange.pointee.responseBody.write(base, b.count) }

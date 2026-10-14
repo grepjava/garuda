@@ -88,25 +88,56 @@ func runHandler(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication,
     let stamp = sampled ? Runtime.currentJobStamp : .none
     do {
         try await handler(Request(x), Response(x))
-        if !x.pointee.answered {
+        if let produce = x.pointee.producer {
+            // A returned `StreamingBody`, now that the middleware on its way
+            // out has had its say (StreamingResponse.swift).
+            try await runProducer(x, produce)
+        } else if !x.pointee.answered {
             Log.error("a handler returned without answering; answering 500")
             if observing { x.pointee.failure = "the handler returned without answering" }
             x.pointee.answer(500, nil, 0)
         }
     } catch let error as any ResponseError {
-        answerError(x, error)
+        if !cutStream(x, error, observing: observing) { answerError(x, error) }
     } catch is CancellationError where Task.isCancelled {
         // Cancelled because nobody wants the answer -- an HTTP/2 stream the
         // client reset -- which is not the handler's failure to report.
-        answerFailure(x)
+        if !cutStream(x, nil, observing: false) { answerFailure(x) }
+    } catch is HandlerWaitError {
+        // A streamed body's client went away: nothing to answer, and nobody
+        // to answer it to.
+        if !cutStream(x, nil, observing: false) { answerFailure(x) }
     } catch {
-        Log.error("handler threw: \(error)")
-        if observing { x.pointee.failure = "handler threw: \(error)" }
-        answerFailure(x)
+        if !cutStream(x, error, observing: observing) {
+            Log.error("handler threw: \(error)")
+            if observing { x.pointee.failure = "handler threw: \(error)" }
+            answerFailure(x)
+        }
     }
     // A handler that suspended gave its thread up; its time says nothing.
     if sampled && Runtime.currentJobStamp == stamp {
         costs.record(index, nanos: monotonicNanos() &- start)
     }
     lane?.release()
+}
+
+/// A handler threw: when its answer was a streamed body, cuts the body off
+/// rather than answering, and says so. False when there is no streamed body,
+/// for the error to be answered as any other.
+func cutStream(_ x: UnsafeMutablePointer<Exchange>, _ error: (any Error)?, observing: Bool) -> Bool {
+    guard let channel = x.pointee.channel else {
+        // A `StreamingBody` returned, and then a layer on its way out threw:
+        // the body never started, and the error is the answer.
+        if x.pointee.producer != nil {
+            x.pointee.producer = nil
+            x.pointee.answered = false
+        }
+        return false
+    }
+    channel.handlerFailed = true
+    if let error {
+        Log.error("handler threw part-way through a streamed response: \(error)")
+        if observing { x.pointee.failure = "handler threw part-way through a streamed response: \(error)" }
+    }
+    return true
 }

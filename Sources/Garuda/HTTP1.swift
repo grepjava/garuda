@@ -35,6 +35,10 @@ struct ConnectionLimits: Sendable {
     var keepAliveTimeout: Duration
     var requestHeadTimeout: Duration
     var bodyTimeout: Duration
+    /// What a streamed body is held to (StreamingResponse.swift).
+    var writeTimeout: Duration
+    var writeHighWaterMark: Int
+    var writeLowWaterMark: Int
     /// --request-id, and the proxies whose ID is kept: nil when there are
     /// none, so a connection copies no list it would not read (RequestID.swift).
     var requestID: Bool
@@ -60,6 +64,9 @@ struct ConnectionLimits: Sendable {
         keepAliveTimeout = config.keepAliveTimeout
         requestHeadTimeout = config.requestHeadTimeout
         bodyTimeout = config.bodyTimeout
+        writeTimeout = config.writeTimeout
+        writeHighWaterMark = max(1, config.writeHighWaterMark)
+        writeLowWaterMark = min(max(0, config.writeLowWaterMark), writeHighWaterMark)
         requestID = config.requestID
         requestIDTrust = config.requestID && !config.trust.isEmpty ? config.trust : nil
         trust = config.trust.isEmpty ? nil : config.trust
@@ -77,28 +84,41 @@ let separateBodyThreshold = 16 * 1024
 
 /// Serves HTTP/1.1 on `stream` until the client closes it, a request asks
 /// for the connection to close, or it idles out. `secure`: the stream is TLS.
+/// Gives the stream back, for the caller to close.
+@discardableResult
 func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
-    _ stream: borrowing S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer,
+    _ stream: consuming S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer,
     secure: Bool = false
-) async {
+) async -> S {
     await serveHTTP1(stream, parts: app.connections.take(limits: limits, peer: peer), app: app, limits: limits,
                      secure: secure)
 }
 
 /// The same, on parts already taken, whose input may hold the connection's
 /// first bytes: read while looking for the HTTP/2 preface (HTTP2.swift).
+@discardableResult
 func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
-    _ stream: borrowing S, parts: UnsafeMutablePointer<ConnectionParts>, app: CompiledApplication,
+    _ stream: consuming S, parts: UnsafeMutablePointer<ConnectionParts>, app: CompiledApplication,
     limits: ConnectionLimits, secure: Bool
-) async {
+) async -> S {
     let x = parts.pointee.exchange
     x.pointee.application = Unmanaged.passUnretained(app)
     // The exchange is reused from connection to connection: set both.
     x.pointee.secure = secure
     if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
+    // Held where a streamed body's writes can reach it while the handler
+    // writing it runs (StreamingResponse.swift).
+    let held = UnsafeMutablePointer<S>.allocate(capacity: 1)
+    held.initialize(to: stream)
+    x.pointee.link = .http1(HeldStream(pointer: UnsafeMutableRawPointer(held), writer: HeldWriter<S>.self),
+                            parts, StreamLimits(limits))
     var connection = HTTP1Connection(limits: limits, parts: parts, cache: app.connections,
                                      observing: limits.accessLog || !app.observers.isEmpty)
-    await connection.run(stream, app: app)
+    await connection.run(held.pointee, app: app)
+    x.pointee.link = .none
+    let back = held.move()
+    held.deallocate()
+    return back
 }
 
 struct HTTP1Connection: ~Copyable {
@@ -165,6 +185,7 @@ struct HTTP1Connection: ~Copyable {
         var keepAlive = head.isKeepAlive
         served &+= 1
         if limits.maxRequests > 0 && served >= limits.maxRequests { keepAlive = false }
+        x.pointee.keepAlive = keepAlive
 
         // Before anything can answer, so every answer carries them.
         if limits.requestID { x.pointee.assignRequestID(trusting: limits.requestIDTrust) }
@@ -173,10 +194,18 @@ struct HTTP1Connection: ~Copyable {
 
         await dispatch(app, matched: matched)
 
-        // A handler's body is only sent when there is room for it to be
-        // framed: never on HEAD, 1xx, 204 or 304.
-        writeResponse(keepAlive: keepAlive, omitBody: head.method == .head)
-        if observing { report(status: x.pointee.status) }
+        if let channel = x.pointee.channel {
+            // Streamed: the head and most of the body have gone; the rest
+            // and the end of it go with the next flush (StreamingResponse.swift).
+            if !channel.close(into: &parts.pointee.output, failed: channel.handlerFailed) { keepAlive = false }
+            if !x.pointee.keepAlive { keepAlive = false }
+            if observing { report(status: x.pointee.status) }
+        } else {
+            // A handler's body is only sent when there is room for it to be
+            // framed: never on HEAD, 1xx, 204 or 304.
+            writeResponse(keepAlive: keepAlive, omitBody: head.method == .head)
+            if observing { report(status: x.pointee.status) }
+        }
         start &+= head.headEnd &+ x.pointee.consumedBody
         batched &+= 1
 
@@ -356,35 +385,9 @@ struct HTTP1Connection: ~Copyable {
         // `Response.onSend` hooks see the answer once it is final, while it
         // can still change (ResponseHooks.swift).
         if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
-        x.pointee.committed = true
-        parts.pointee.dates.refresh()
-        let status = x.pointee.status
-        let forbids = HTTPResponseWriter.statusForbidsBody(status)
+        let forbids = HTTPResponseWriter.statusForbidsBody(x.pointee.status)
         let count = forbids ? 0 : x.pointee.responseBody.readableBytes
-        parts.pointee.output.reserve(256 &+ x.pointee.responseHeaders.readableBytes)
-        HTTPResponseWriter.writeStatusLine(&parts.pointee.output, status: status)
-        let kinds = x.pointee.headerKinds
-        if !kinds.contains(.date) { HTTPResponseWriter.writeDate(&parts.pointee.output, parts.pointee.dates) }
-        if !kinds.contains(.server) { parts.pointee.output.write("Server: garuda\r\n") }
-        // --request-id's, unless the handler set its own (RequestID.swift).
-        if x.pointee.requestID.readableBytes > 0 && !kinds.contains(.requestID) {
-            parts.pointee.output.write("X-Request-ID: ")
-            parts.pointee.output.write(x.pointee.requestID.readableSpan)
-            parts.pointee.output.writeCRLF()
-        }
-        x.pointee.forEachResponseHeader { name, value in
-            let kind = HTTPResponseWriter.classify(name)
-            // The server frames the message and manages the connection.
-            if kind == .contentLength || kind == .transferEncoding || kind == .connection { return }
-            _ = HTTPResponseWriter.writeHeader(&parts.pointee.output, name: name, value: value)
-        }
-        if !forbids { HTTPResponseWriter.writeContentLength(&parts.pointee.output, count) }
-        if !keepAlive {
-            parts.pointee.output.write("Connection: close\r\n")
-        } else if x.pointee.head.httpMinor == 0 {
-            parts.pointee.output.write("Connection: keep-alive\r\n")
-        }
-        HTTPResponseWriter.endHead(&parts.pointee.output)
+        writeHTTP1Head(x, parts, keepAlive: keepAlive, framing: forbids ? .none : .length(count))
         if count > 0 && !omitBody {
             parts.pointee.output.write(x.pointee.responseBody.readPointer, count)
         }
@@ -410,6 +413,42 @@ struct HTTP1Connection: ~Copyable {
                                       dateCache: parts.pointee.dates, serverName: "garuda")
         try await flush(stream)
     }
+}
+
+/// Writes the head of `x`'s response into the connection's output, the
+/// body delimited as `framing` says, and commits it.
+func writeHTTP1Head(_ x: UnsafeMutablePointer<Exchange>, _ parts: UnsafeMutablePointer<ConnectionParts>,
+                    keepAlive: Bool, framing: H1Framing) {
+    x.pointee.committed = true
+    parts.pointee.dates.refresh()
+    parts.pointee.output.reserve(256 &+ x.pointee.responseHeaders.readableBytes)
+    HTTPResponseWriter.writeStatusLine(&parts.pointee.output, status: x.pointee.status)
+    let kinds = x.pointee.headerKinds
+    if !kinds.contains(.date) { HTTPResponseWriter.writeDate(&parts.pointee.output, parts.pointee.dates) }
+    if !kinds.contains(.server) { parts.pointee.output.write("Server: garuda\r\n") }
+    // --request-id's, unless the handler set its own (RequestID.swift).
+    if x.pointee.requestID.readableBytes > 0 && !kinds.contains(.requestID) {
+        parts.pointee.output.write("X-Request-ID: ")
+        parts.pointee.output.write(x.pointee.requestID.readableSpan)
+        parts.pointee.output.writeCRLF()
+    }
+    x.pointee.forEachResponseHeader { name, value in
+        let kind = HTTPResponseWriter.classify(name)
+        // The server frames the message and manages the connection.
+        if kind == .contentLength || kind == .transferEncoding || kind == .connection { return }
+        _ = HTTPResponseWriter.writeHeader(&parts.pointee.output, name: name, value: value)
+    }
+    switch framing {
+    case .length(let count): HTTPResponseWriter.writeContentLength(&parts.pointee.output, count)
+    case .chunked: HTTPResponseWriter.writeChunkedEncoding(&parts.pointee.output)
+    case .none: break
+    }
+    if !keepAlive {
+        parts.pointee.output.write("Connection: close\r\n")
+    } else if x.pointee.head.httpMinor == 0 {
+        parts.pointee.output.write("Connection: keep-alive\r\n")
+    }
+    HTTPResponseWriter.endHead(&parts.pointee.output)
 }
 
 /// A `ResponseError` as the answer.

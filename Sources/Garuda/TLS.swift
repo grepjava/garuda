@@ -154,12 +154,12 @@ func socketPeer(_ stream: borrowing TCPStream) -> SocketPeer {
 
 /// Shakes hands on `stream` -- giving up on a client that takes longer than
 /// `handshakeTimeout` -- then hands the secured stream to `body`, and says
-/// goodbye with close_notify when it returns.
+/// goodbye with close_notify on the stream it gives back.
 func serveTLS(_ stream: consuming TCPStream, _ store: CertificateStore, handshakeTimeout: Duration,
-              _ body: (borrowing TLSStream<TCPStream>) async -> Void) async {
+              _ body: (consuming TLSStream<TCPStream>) async -> TLSStream<TCPStream>) async {
     guard let secured = await handshake(stream, store, handshakeTimeout: handshakeTimeout) else { return }
-    await body(secured)
-    _ = try? await secured.close()
+    let back = await body(secured)
+    _ = try? await back.close()
 }
 
 /// Shakes hands on `stream`, giving up on a client that takes longer than

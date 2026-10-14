@@ -55,8 +55,14 @@ public struct ServerConfig: Sendable {
     public var requestHeadTimeout: Duration = .seconds(30)
     /// How long a request body may take to arrive.
     public var bodyTimeout: Duration = .seconds(30)
-    /// How long a response may take to write.
+    /// How long one write of a streamed body may wait on a client that is
+    /// not reading: the connection is closed on it after that.
     public var writeTimeout: Duration = .seconds(30)
+    /// A streamed body's writes wait once this much of it is still on its
+    /// way to the client (StreamingResponse.swift)...
+    public var writeHighWaterMark = 512 * 1024
+    /// ...until it is down to this much.
+    public var writeLowWaterMark = 128 * 1024
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
 

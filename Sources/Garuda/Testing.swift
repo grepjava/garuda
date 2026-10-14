@@ -63,7 +63,7 @@ extension Application {
     /// have been called.
     @_spi(Testing)
     public func serveConnection<S: AsyncReader & AsyncWriter & ~Copyable>(
-        _ stream: borrowing S, config: ServerConfig, remoteAddress: String, remotePort: Int
+        _ stream: consuming S, config: ServerConfig, remoteAddress: String, remotePort: Int
     ) async {
         guard let app = compiledApplication else {
             preconditionFailure("serveConnection before prepareForTesting")

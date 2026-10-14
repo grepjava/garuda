@@ -88,6 +88,12 @@ final class RouteCosts: @unchecked Sendable {
         }
     }
 
+    /// Notes that route `index` waits, whatever its runs have shown: it
+    /// streams its answer.
+    func markSuspends(_ index: Int) {
+        quiet[index].store(RouteCosts.suspends, ordering: .relaxed)
+    }
+
     /// Whether route `index` runs in the heavy lane.
     @inline(__always)
     func isHeavy(_ index: Int) -> Bool {
