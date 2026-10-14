@@ -19,14 +19,15 @@ func vega(_ name: String) -> Target.Dependency {
     .product(name: name, package: "vega")
 }
 
-/// Vega, by version; or, with GARUDA_VEGA_PATH set, a local checkout -- for
-/// working on Garuda and Vega together before a Vega release has what
-/// Garuda needs.
 /// Garuda's TLS library traits pass straight through to Vega's.
 let vegaTraits: Set<Package.Dependency.Trait> = [
     .init(name: "OpenSSL", condition: .when(traits: ["OpenSSL"])),
     .init(name: "BoringSSL", condition: .when(traits: ["BoringSSL"])),
 ]
+
+/// Vega, by version; or, with GARUDA_VEGA_PATH set, a local checkout -- for
+/// working on Garuda and Vega together before a Vega release has what
+/// Garuda needs.
 let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: vegaTraits)
 } ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.3.0"), traits: vegaTraits)
@@ -46,12 +47,14 @@ let package = Package(
         // never builds the macro plugin.
         .library(name: "GarudaJSON", targets: ["GarudaJSON"]),
     ],
-    // The TLS library under Vega's TLS, as in Vega: `swift build --traits
-    // BoringSSL` for the vendored BoringSSL, which wins if OpenSSL is on too.
+    // The TLS library under Vega's TLS. BoringSSL, vendored in Vega, is the
+    // default: Garuda 1's library, cheaper a request than OpenSSL 3, and no
+    // system OpenSSL needed. `swift build --traits OpenSSL` (or a dependent's
+    // `traits: ["OpenSSL"]`) builds on the system's OpenSSL 3 instead.
     traits: [
-        .trait(name: "OpenSSL", description: "TLS on the system's OpenSSL 3 (the default)."),
-        .trait(name: "BoringSSL", description: "TLS on Vega's vendored BoringSSL."),
-        .default(enabledTraits: ["OpenSSL"]),
+        .trait(name: "BoringSSL", description: "TLS on Vega's vendored BoringSSL (the default)."),
+        .trait(name: "OpenSSL", description: "TLS on the system's OpenSSL 3. BoringSSL wins if both are on."),
+        .default(enabledTraits: ["BoringSSL"]),
     ],
     dependencies: [
         // The runtime: work-stealing scheduler, sharded processes, sockets,

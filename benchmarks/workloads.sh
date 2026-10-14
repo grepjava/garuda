@@ -29,8 +29,8 @@
 # of T threads each (garuda2:1x8, garuda2:2x4).
 #
 # TLS=1 runs both over HTTPS with the same self-signed P-256 certificate:
-# Garuda with OpenSSL, axum with rustls through axum-server. The relay's
-# origin stays in the clear.
+# Garuda 1 and Garuda 2 with BoringSSL (each one's default build), axum with
+# rustls through axum-server. The relay's origin stays in the clear.
 #
 # benchmarks/workloads/garuda-app is the Garuda side and
 # benchmarks/workloads/axum the axum side. Garuda runs WORKERS workers, one
