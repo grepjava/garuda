@@ -180,47 +180,118 @@ public enum HPACKHuffman {
         return true
     }
 
+    /// The decoder: an automaton with a state for each internal node of the
+    /// code's tree, fed four bits at a time -- nghttp2's construction. The
+    /// shortest code is five bits, so four bits complete at most one symbol.
+    /// Built once from the code itself, as the canonical tables are.
+    /// Written once, while it is made, and only read after.
+    struct Automaton: @unchecked Sendable {
+        /// `[state << 4 | nibble]`: the next state in bits 0-7, a symbol in
+        /// bits 8-15 when bit 16 is set, and bit 17 when the bits spell EOS,
+        /// which may never appear in a literal.
+        let steps: UnsafeMutablePointer<UInt32>
+        /// Whether a string may end in a state: at the root, or within
+        /// fewer than eight 1-bits of it -- padding that is a strict prefix
+        /// of EOS, and anything else is an error.
+        let accepting: UnsafeMutablePointer<Bool>
+    }
+
+    static let emits: UInt32 = 1 << 16
+    static let fails: UInt32 = 1 << 17
+
+    static let automaton: Automaton = {
+        let codes = HPACKTables.huffmanCodes
+        let lengths = HPACKTables.huffmanLengths
+        // Internal nodes 0...255, the root 0; a child below 0 is the leaf
+        // for symbol -child - 1, and 0 (never a child) is unset.
+        var children = [Int](repeating: 0, count: 256 * 2)
+        var depth = [Int](repeating: 0, count: 256)
+        var ones = [Bool](repeating: true, count: 256)
+        var made = 1
+        for symbol in 0..<lengths.count {
+            let code = codes[symbol]
+            let length = Int(lengths[symbol])
+            var node = 0
+            var bit = length - 1
+            while bit >= 0 {
+                let b = Int((code >> UInt32(bit)) & 1)
+                if bit == 0 {
+                    children[node * 2 + b] = -symbol - 1
+                } else {
+                    if children[node * 2 + b] == 0 {
+                        children[node * 2 + b] = made
+                        depth[made] = depth[node] + 1
+                        ones[made] = ones[node] && b == 1
+                        made += 1
+                    }
+                    node = children[node * 2 + b]
+                }
+                bit -= 1
+            }
+        }
+        precondition(made == 256, "the HPACK Huffman code's tree is not full")
+        let steps = UnsafeMutablePointer<UInt32>.allocate(capacity: 256 * 16)
+        let accepting = UnsafeMutablePointer<Bool>.allocate(capacity: 256)
+        for state in 0..<256 {
+            accepting[state] = state == 0 || (ones[state] && depth[state] <= 7)
+            for nibble in 0..<16 {
+                var node = state
+                var step: UInt32 = 0
+                var bit = 3
+                while bit >= 0 {
+                    let child = children[node * 2 + ((nibble >> bit) & 1)]
+                    if child < 0 {
+                        let symbol = -child - 1
+                        if symbol == 256 {
+                            step |= fails
+                            break
+                        }
+                        step |= emits | UInt32(symbol) << 8
+                        node = 0
+                    } else {
+                        node = child
+                    }
+                    bit -= 1
+                }
+                steps[state << 4 | nibble] = step | UInt32(node)
+            }
+        }
+        return Automaton(steps: steps, accepting: accepting)
+    }()
+
     /// Decodes `n` bytes into `out`. Returns the number of bytes produced.
     public static func decode(_ p: UnsafePointer<UInt8>, _ n: Int,
                               into out: inout ByteBuffer) throws -> Int {
-        let t = tables
+        let steps = automaton.steps
         // Worst case is one output byte per five input bits.
         out.reserve(n * 8 / 5 + 1)
+        let dst = out.storage.unsafelyUnwrapped + out.writerIndex
         var produced = 0
-        var code: UInt32 = 0
-        var len = 0
+        var state = 0
         var i = 0
         while i < n {
-            let byte = p[i]
-            i += 1
-            var bit = 7
-            while bit >= 0 {
-                code = (code << 1) | UInt32((byte >> UInt8(bit)) & 1)
-                len += 1
-                bit -= 1
-                if len > 30 { throw HPACKError.badHuffman }
-                if len < 5 { continue }
-                let c = t.count[len]
-                if c == 0 { continue }
-                let offset = code &- t.firstCode[len]
-                if offset >= UInt32(c) { continue }
-                let symbol = t.symbols[t.firstIndex[len] + Int(offset)]
-                // 256 is EOS, which may never appear in a literal.
-                if symbol > 255 { throw HPACKError.badHuffman }
-                out.writeByte(UInt8(truncatingIfNeeded: symbol))
-                produced += 1
-                code = 0
-                len = 0
+            let byte = Int(p[i])
+            i &+= 1
+            var step = steps[state << 4 | byte >> 4]
+            if step & (emits | fails) != 0 {
+                if step & fails != 0 { throw HPACKError.badHuffman }
+                dst[produced] = UInt8(truncatingIfNeeded: step >> 8)
+                produced &+= 1
             }
+            state = Int(step & 0xFF)
+            step = steps[state << 4 | byte & 0xF]
+            if step & (emits | fails) != 0 {
+                if step & fails != 0 { throw HPACKError.badHuffman }
+                dst[produced] = UInt8(truncatingIfNeeded: step >> 8)
+                produced &+= 1
+            }
+            state = Int(step & 0xFF)
         }
         // Whatever is left has to be a strict prefix of the all-ones EOS code.
         // Anything else is either a symbol the encoder could not fit or padding
         // chosen to smuggle bytes past a decoder that does not check.
-        if len >= 8 { throw HPACKError.badHuffman }
-        if len > 0 {
-            let ones = (UInt32(1) << UInt32(len)) &- 1
-            if code != ones { throw HPACKError.badHuffman }
-        }
+        if !automaton.accepting[state] { throw HPACKError.badHuffman }
+        out.writerIndex &+= produced
         return produced
     }
 
@@ -509,12 +580,8 @@ public struct HPACKDecoder {
             out.write(p + cursor, length)
             return length
         }
-        scratch.clear()
-        let produced = try HPACKHuffman.decode(p + cursor, length, into: &scratch)
-        if produced > 0 {
-            out.write(UnsafePointer(scratch.pointer(at: 0)), produced)
-        }
-        return produced
+        // Straight into `out`, rather than through `scratch` and a copy.
+        return try HPACKHuffman.decode(p + cursor, length, into: &out)
     }
 }
 

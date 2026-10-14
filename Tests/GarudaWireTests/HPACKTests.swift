@@ -331,6 +331,79 @@ struct HPACKTests {
         #expect(back == input)
     }
 
+    @Test("the Huffman automaton decodes exactly as the code's definition, bit by bit")
+    func huffmanMatchesTheDefinition() throws {
+        var lookup: [Int: Int] = [:]
+        for s in 0..<HPACKTables.huffmanLengths.count {
+            lookup[Int(HPACKTables.huffmanLengths[s]) << 32 | Int(HPACKTables.huffmanCodes[s])] = s
+        }
+        // RFC 7541 section 5.2, read literally: nil where a decoder must fail.
+        func reference(_ bytes: [UInt8]) -> [UInt8]? {
+            var out: [UInt8] = []
+            var code = 0
+            var length = 0
+            for byte in bytes {
+                for bit in (0..<8).reversed() {
+                    code = code << 1 | Int(byte >> UInt8(bit) & 1)
+                    length += 1
+                    if length > 30 { return nil }
+                    if let s = lookup[length << 32 | code] {
+                        if s == 256 { return nil }
+                        out.append(UInt8(s))
+                        code = 0
+                        length = 0
+                    }
+                }
+            }
+            if length >= 8 || (length > 0 && code != (1 << length) - 1) { return nil }
+            return out
+        }
+        func decoded(_ bytes: [UInt8]) -> [UInt8]? {
+            var out = ByteBuffer()
+            defer { out.destroy() }
+            out.write("prefix")
+            do {
+                let n = try bytes.withUnsafeBufferPointer { p in
+                    try HPACKHuffman.decode(p.baseAddress ?? UnsafePointer(out.readPointer), p.count, into: &out)
+                }
+                let all = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
+                #expect(Array(all.prefix(6)) == Array("prefix".utf8))
+                #expect(all.count == 6 + n)
+                return Array(all.dropFirst(6))
+            } catch {
+                return nil
+            }
+        }
+        var x: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func next() -> UInt8 {
+            x = x &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return UInt8(truncatingIfNeeded: x >> 56)
+        }
+        var valid = 0
+        for trial in 0..<20_000 {
+            // Random bytes: mostly symbols, ending well or badly.
+            var bytes = (0..<(trial % 13)).map { _ in next() }
+            if trial % 3 == 0 {
+                // A real encoding, sometimes cut short or with a byte changed.
+                let text = (0..<(trial % 17)).map { _ in next() }
+                var encoded = ByteBuffer()
+                text.withUnsafeBufferPointer { p in
+                    if p.count > 0 { HPACKHuffman.encode(p.baseAddress!, p.count, into: &encoded) }
+                }
+                bytes = encoded.readableBytes == 0 ? []
+                    : Array(UnsafeBufferPointer(start: encoded.readPointer, count: encoded.readableBytes))
+                encoded.destroy()
+                if trial % 2 == 0 { #expect(decoded(bytes) == text) }
+                if trial % 5 == 0 && !bytes.isEmpty { bytes.removeLast() }
+                if trial % 7 == 0 && !bytes.isEmpty { bytes[bytes.count / 2] ^= next() | 1 }
+            }
+            let expected = reference(bytes)
+            if expected != nil { valid += 1 }
+            #expect(decoded(bytes) == expected, "\(bytes)")
+        }
+        #expect(valid > 2000)
+    }
+
     @Test("malformed blocks are rejected rather than guessed at")
     func rejections() throws {
         func fails(_ bytes: [UInt8], _ expected: HPACKError) -> Bool {
