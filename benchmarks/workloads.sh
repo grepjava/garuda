@@ -19,6 +19,7 @@
 #   skew      GET  /user/12345   on 56 connections while 8 more ask for /spin, which
 #             holds the CPU for about 2 ms a request: what the quick requests
 #             pay for sharing a server with slow ones (cpu counts both)
+#   h2skew    skew with both the quick and the slow requests over HTTP/2
 #   spike     the same, but the slow requests start a second into the run, on
 #             workers that already hold quick connections
 #
@@ -205,7 +206,7 @@ request() {
     download) printf '%s\n' "$BASE/download" ;;
     relay) printf '%s\n' "$BASE/relay" ;;
     churn) printf '%s\n' --disable-keepalive "$BASE/user/12345" ;;
-    h2) printf '%s\n' --http2 "$BASE/user/12345" ;;
+    h2|h2skew) printf '%s\n' --http2 "$BASE/user/12345" ;;
     esac
 }
 
@@ -226,6 +227,7 @@ check() {
     download) body=$(curl -sk --max-time 5 "$BASE/download" | wc -c); [ "$body" -eq 1048576 ] ;;
     relay) body=$(curl -sk --max-time 5 "$BASE/relay" | wc -c); [ "$body" -eq 65536 ] ;;
     h2) body=$(curl -sk --max-time 2 "$H2_CURL" "$BASE/user/12345"); [ "$body" = 12345 ] ;;
+    h2skew) body=$(curl -sk --max-time 2 "$H2_CURL" "$BASE/spin/1000"); [ "$body" = 10097022301462541763 ] ;;
     esac || { echo "$body" | head -c 200; echo; return 1; }
 }
 
@@ -323,27 +325,30 @@ for server in $SERVERS; do
             measure user "$DURATION" "$CONNS" | report recovery "$server"
             continue
         fi
-        if [ "$workload" = skew ]; then
+        if [ "$workload" = skew ] || [ "$workload" = h2skew ]; then
             # The slow requests run for the whole measurement and a little
             # past it, and how many were served is reported too: a server
             # can buy quick-request throughput by starving them.
             spin_json="$OUT/spin.json"
+            spin_http2=()
+            [ "$workload" = h2skew ] && spin_http2=(--http2)
             rm -f "$spin_json"
             "${PIN_LOAD[@]}" "$OHA" -z "$(( ${WARMUP%s} + ${DURATION%s} + 1 ))s" -c "$SKEW_CONNS" \
-                --no-tui --insecure --output-format json -o "$spin_json" "$BASE/spin/$SPIN" > /dev/null 2>&1 &
+                --no-tui --insecure --output-format json -o "$spin_json" "${spin_http2[@]}" \
+                "$BASE/spin/$SPIN" > /dev/null 2>&1 &
             spinner=$!
-            measure skew "$WARMUP" $((CONNS - SKEW_CONNS)) > /dev/null
-            measure skew "$DURATION" $((CONNS - SKEW_CONNS)) | report skew "$server"
+            measure "$workload" "$WARMUP" $((CONNS - SKEW_CONNS)) > /dev/null
+            measure "$workload" "$DURATION" $((CONNS - SKEW_CONNS)) | report "$workload" "$server"
             wait "$spinner" 2>/dev/null
-            python3 - "$spin_json" "$server" <<'PY'
+            python3 - "$spin_json" "$server" "$workload-slow" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     s, p = d["summary"], d["latencyPercentiles"]
-    print("%-9s %-16s %9d req/s   p50 %8.3f   p99 %9.3f ms" % ("skew-slow", sys.argv[2],
+    print("%-9s %-16s %9d req/s   p50 %8.3f   p99 %9.3f ms" % (sys.argv[3], sys.argv[2],
           s["requestsPerSec"], p["p50"] * 1000, p["p99"] * 1000))
 except Exception as e:
-    print("skew-slow %-16s no result (%s)" % (sys.argv[2], e))
+    print("%-9s %-16s no result (%s)" % (sys.argv[3], sys.argv[2], e))
 PY
             continue
         fi
