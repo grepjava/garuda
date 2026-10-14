@@ -41,7 +41,11 @@ struct DeadlineMiddleware: Middleware {
             try await Runtime.withIODeadline(limit) { () async throws -> Void in try await next() }
         } catch let error as IOError where error == .timedOut {
             // A layer inside may have answered already, and caught nothing.
-            if !response.isFinished { response.send(status: .gatewayTimeout) }
+            if !response.isFinished {
+                // For the response observers (ResponseObservers.swift).
+                response.exchange.pointee.failure = "the handler passed its deadline"
+                response.send(status: .gatewayTimeout)
+            }
         }
     }
 }
