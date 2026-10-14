@@ -391,7 +391,7 @@ final class H2Connection: @unchecked Sendable {
     unowned(unsafe) let sink: any H2Sink
     @exclusivity(unchecked) var wOut = ByteBuffer(capacity: 16 * 1024)
     @exclusivity(unchecked) var wBlock = ByteBuffer(capacity: 1024)
-    @exclusivity(unchecked) var wDigits = ByteBuffer(capacity: 32)
+    @exclusivity(unchecked) var fieldCache = H2FieldCache()
     @exclusivity(unchecked) var frameSizeForRole = H2FrameHeader.defaultMaxFrameSize
 
     // Links in the service's list, under its lock.
@@ -449,7 +449,6 @@ final class H2Connection: @unchecked Sendable {
         cookies.destroy()
         wOut.destroy()
         wBlock.destroy()
-        wDigits.destroy()
     }
 
     /// Takes the preface off the read buffer and queues our SETTINGS, which

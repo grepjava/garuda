@@ -238,6 +238,47 @@ struct HTTP2Tests {
         #expect(h2.frames.contains { $0.kind == .continuation && $0.stream == id })
     }
 
+    /// The writer's shortcuts encode exactly what the encoder does.
+    @Test func cachedAndDirectFieldsEncodeAsTheEncoderDoes() {
+        func bytes(_ b: borrowing ByteBuffer) -> [UInt8] {
+            Array(UnsafeBufferPointer(start: b.readPointer, count: b.readableBytes))
+        }
+        func plain(_ name: String, _ value: String) -> [UInt8] {
+            var out = ByteBuffer()
+            defer { out.destroy() }
+            let n = Array(name.utf8), v = Array(value.utf8) + [0]
+            n.withUnsafeBufferPointer { np in
+                v.withUnsafeBufferPointer { vp in
+                    HPACKEncoder().encode(name: np.baseAddress!, nameLength: np.count, value: vp.baseAddress!,
+                                          valueLength: vp.count - 1, into: &out)
+                }
+            }
+            return bytes(out)
+        }
+        for n in [0, 1, 7, 9, 10, 33, 99, 100, 123, 999, 1000, 12345, 400_000, 1 << 40, Int.max] {
+            var out = ByteBuffer()
+            encodeContentLength(n, into: &out)
+            #expect(bytes(out) == plain("content-length", "\(n)"), "content-length \(n)")
+            out.destroy()
+        }
+        var cache = H2FieldCache()
+        let fields = (0..<20).map { ("x-field-\($0 % 11)", String(repeating: "v", count: $0 * 9)) }
+            + [("content-type", "text/plain; charset=utf-8"), ("server", "garuda"), ("x-empty", "")]
+        for round in 0..<3 {
+            for (name, value) in fields {
+                var out = ByteBuffer()
+                let n = Array(name.utf8), v = Array(value.utf8) + [0]
+                n.withUnsafeBufferPointer { np in
+                    v.withUnsafeBufferPointer { vp in
+                        cache.encode(HPACKEncoder(), np.baseAddress!, np.count, vp.baseAddress!, vp.count - 1, into: &out)
+                    }
+                }
+                #expect(bytes(out) == plain(name, value), "\(name) round \(round)")
+                out.destroy()
+            }
+        }
+    }
+
     // MARK: Multiplexing and cancellation
 
     @Test func streamsRunConcurrently() throws {

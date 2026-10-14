@@ -77,6 +77,112 @@ final class H2WriteHalf<W: AsyncWriter & ~Copyable & Sendable>: H2Sink, @uncheck
     }
 }
 
+/// Response fields as the encoder last encoded them, kept by the write role
+/// for the next answer on the connection: answers repeat their fields --
+/// `server`, `date` for a second, a handler's `content-type` -- and a field
+/// found here is one copy rather than a name lookup and a Huffman pass.
+/// The bytes are the encoder's own, so a block is what it would have been.
+/// A few slots, replaced in turn; a field too long for one is not kept.
+struct H2FieldCache: ~Copyable {
+    static let slots = 8
+    /// Name and value, then their encoding, in each slot.
+    static let slotSize = 384
+    static let maxKey = 128
+
+    struct Entry {
+        var nameLength = 0
+        var valueLength = -1
+        var encodedLength = 0
+    }
+
+    let storage: UnsafeMutablePointer<UInt8>
+    let entries: UnsafeMutablePointer<Entry>
+    var next = 0
+
+    init() {
+        storage = .allocate(capacity: H2FieldCache.slots * H2FieldCache.slotSize)
+        entries = .allocate(capacity: H2FieldCache.slots)
+        entries.initialize(repeating: Entry(), count: H2FieldCache.slots)
+    }
+
+    deinit {
+        storage.deallocate()
+        entries.deallocate()
+    }
+
+    /// Appends the encoding of `name: value` to `block`, from the cache or
+    /// from `encoder`, keeping the latter when it fits.
+    mutating func encode(_ encoder: HPACKEncoder, _ name: UnsafePointer<UInt8>, _ nameLength: Int,
+                         _ value: UnsafePointer<UInt8>, _ valueLength: Int, into block: inout ByteBuffer) {
+        var i = 0
+        while i < H2FieldCache.slots {
+            let e = entries[i]
+            if e.nameLength == nameLength && e.valueLength == valueLength {
+                let slot = storage + (i &* H2FieldCache.slotSize)
+                if memcmp(slot, name, nameLength) == 0
+                    && (valueLength == 0 || memcmp(slot + nameLength, value, valueLength) == 0) {
+                    block.write(slot + (nameLength &+ valueLength), e.encodedLength)
+                    return
+                }
+            }
+            i &+= 1
+        }
+        let at = block.readerOffset &+ block.readableBytes
+        encoder.encode(name: name, nameLength: nameLength, value: valueLength > 0 ? value : emptyBlock,
+                       valueLength: valueLength, into: &block)
+        let encoded = block.readerOffset &+ block.readableBytes &- at
+        let key = nameLength &+ valueLength
+        guard key <= H2FieldCache.maxKey, key &+ encoded <= H2FieldCache.slotSize else { return }
+        let n = next
+        next = (n &+ 1) & (H2FieldCache.slots &- 1)
+        let slot = storage + (n &* H2FieldCache.slotSize)
+        memcpy(slot, name, nameLength)
+        if valueLength > 0 { memcpy(slot + nameLength, value, valueLength) }
+        memcpy(slot + key, block.pointer(at: at), encoded)
+        entries[n] = Entry(nameLength: nameLength, valueLength: valueLength, encodedLength: encoded)
+    }
+}
+
+/// `content-length: n` as a literal without indexing under its static name
+/// (28), its digits Huffman-coded when that is shorter, as the encoder
+/// would: without a pass over the code table for a number.
+func encodeContentLength(_ n: Int, into block: inout ByteBuffer) {
+    block.reserve(32)
+    block.writeByte(0x0F)                    // 4-bit prefix full: 15 ...
+    block.writeByte(0x0D)                    // ... + 13 = 28
+    var digits: (UInt64, UInt64, UInt64) = (0, 0, 0)
+    withUnsafeMutableBytes(of: &digits) { raw in
+        let d = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+        let count = writeDecimal(n, d)
+        // '0'...'2' are 00000...00010; '3'...'9' are 011001...011111.
+        var bits = 0
+        for i in 0..<count { bits &+= d[i] < 0x33 ? 5 : 6 }
+        let coded = (bits &+ 7) >> 3
+        if coded >= count {
+            block.writeByte(UInt8(count))
+            block.write(UnsafePointer(d), count)
+            return
+        }
+        block.writeByte(0x80 | UInt8(coded))
+        var accumulator: UInt64 = 0
+        var held = 0
+        for i in 0..<count {
+            let digit = UInt64(d[i] &- 0x30)
+            let (code, length): (UInt64, Int) = digit < 3 ? (digit, 5) : (0x16 &+ digit, 6)
+            accumulator = (accumulator << UInt64(length)) | code
+            held &+= length
+            while held >= 8 {
+                held &-= 8
+                block.writeByte(UInt8(truncatingIfNeeded: accumulator >> UInt64(held)))
+            }
+        }
+        if held > 0 {
+            let pad = 8 &- held
+            block.writeByte(UInt8(truncatingIfNeeded: (accumulator << UInt64(pad)) | ((1 << UInt64(pad)) &- 1)))
+        }
+    }
+}
+
 extension H2Connection {
     /// Writes until the connection is done: the reader has finished and
     /// every stream task has, or the connection failed.
@@ -132,7 +238,7 @@ extension H2Connection {
                 break
             }
             for s in incoming {
-                if encodeHead(s, into: &wOut, block: &wBlock, digits: &wDigits, encoder: encoder,
+                if encodeHead(s, into: &wOut, block: &wBlock, encoder: encoder,
                               frameSize: frameSize) {
                     sending.append(s)
                 } else {
@@ -221,7 +327,7 @@ extension H2Connection {
     /// into `wOut`.
     func frameWhole(_ s: H2Stream) {
         let frameSize = frameSizeForRole
-        if encodeHead(s, into: &wOut, block: &wBlock, digits: &wDigits, encoder: HPACKEncoder(),
+        if encodeHead(s, into: &wOut, block: &wBlock, encoder: HPACKEncoder(),
                       frameSize: frameSize) {
             let body = UnsafePointer(s.x.pointee.responseBody.readPointer)
             var sent = 0
@@ -262,8 +368,8 @@ extension H2Connection {
     }
 
     /// Frames `s`'s head. True when it has body to send.
-    func encodeHead(_ s: H2Stream, into out: inout ByteBuffer, block: inout ByteBuffer, digits: inout ByteBuffer,
-                    encoder: HPACKEncoder, frameSize: Int) -> Bool {
+    func encodeHead(_ s: H2Stream, into out: inout ByteBuffer, block: inout ByteBuffer, encoder: HPACKEncoder,
+                    frameSize: Int) -> Bool {
         let x = s.x
         // `Response.onSend` hooks see the answer once it is final, while it
         // can still change (ResponseHooks.swift).
@@ -277,13 +383,18 @@ extension H2Connection {
         encoder.encodeStatus(status, into: &block)
         let kinds = x.pointee.headerKinds
         if !kinds.contains(.date) {
-            encode(encoder, "date", UnsafePointer(parts.pointee.dates.bytes), parts.pointee.dates.count, into: &block)
+            let name: StaticString = "date"
+            fieldCache.encode(encoder, name.utf8Start, name.utf8CodeUnitCount, UnsafePointer(parts.pointee.dates.bytes),
+                              parts.pointee.dates.count, into: &block)
         }
         if !kinds.contains(.server) {
+            let name: StaticString = "server"
             let server: StaticString = "garuda"
-            encode(encoder, "server", server.utf8Start, server.utf8CodeUnitCount, into: &block)
+            fieldCache.encode(encoder, name.utf8Start, name.utf8CodeUnitCount, server.utf8Start,
+                              server.utf8CodeUnitCount, into: &block)
         }
         // --request-id's, unless the handler set its own (RequestID.swift).
+        // Never the same twice, so never kept.
         if x.pointee.requestID.readableBytes > 0 && !kinds.contains(.requestID) {
             encode(encoder, "x-request-id", x.pointee.requestID.readPointer, x.pointee.requestID.readableBytes,
                    into: &block)
@@ -294,14 +405,10 @@ extension H2Connection {
             // management has no meaning on a stream.
             if kind == .contentLength || kind == .transferEncoding || kind == .connection { return }
             if HTTP2.isConnectionSpecific(name.base, name.count) { return }
-            encoder.encode(name: name.base, nameLength: name.count, value: value.count > 0 ? value.base : emptyBlock,
-                           valueLength: value.count, into: &block)
+            fieldCache.encode(encoder, name.base, name.count, value.count > 0 ? value.base : emptyBlock, value.count,
+                              into: &block)
         }
-        if !forbids {
-            digits.clear()
-            digits.writeDecimal(count)
-            encode(encoder, "content-length", digits.readPointer, digits.readableBytes, into: &block)
-        }
+        if !forbids { encodeContentLength(count, into: &block) }
         // A HEAD answer carries the GET's headers and none of its body.
         let hasData = count > 0 && x.pointee.head.method != .head
         writeHeaderBlock(&block, stream: s.id, endStream: !hasData, frameSize: frameSize, into: &out)
