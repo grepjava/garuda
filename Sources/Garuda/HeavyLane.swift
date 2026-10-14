@@ -141,6 +141,11 @@ final class HeavyRoutes: RouteBuilder {
         application.routes[application.routes.count - 1].heavy = true
     }
 
+    func fallback(_ handler: @escaping Handler) {
+        application.fallback(handler)
+        application.fallbacks[application.fallbacks.count - 1].heavy = true
+    }
+
     func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type]) {
         application.noteRoute(method, pattern, pathParameters: pathParameters, states: states)
     }

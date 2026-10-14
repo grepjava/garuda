@@ -15,6 +15,9 @@ struct TrailingSlashTests {
         app.get("/docs/") { () in "docs with slash" }
         app.get("/") { () in "root" }
         app.put("/only-put") { () in "put" }
+        app.group("/app") {
+            app.fallback { _, response in response.send(status: .notFound, "app fallback") }
+        }
         app.group("/app") { app.get("/page") { () in "page" } }
         return app
     }
@@ -25,7 +28,7 @@ struct TrailingSlashTests {
         #expect(try client.get("/users").text == "users")
         #expect(try client.get("/docs/").text == "docs with slash")
         #expect(try client.get("/docs").status == 404)
-        #expect(try client.get("/app/page/").status == 404)
+        #expect(try client.get("/app/page/").text == "app fallback")
     }
 
     @Test func redirectSendsThePathWithoutItsSlashes() throws {
@@ -46,6 +49,7 @@ struct TrailingSlashTests {
         #expect(try client.get("/users").text == "users")
         // Nothing routed without the slash: the usual answers.
         #expect(try client.get("/missing/").status == 404)
+        #expect(try client.get("/app/other/").text == "app fallback")
         // Never a Location another site could be read from.
         let doubled = try client.get("//users/")
         #expect(doubled.status == 404)
@@ -61,6 +65,8 @@ struct TrailingSlashTests {
         #expect(try client.get("/only-put/").header("allow") == "PUT")
         #expect(try client.get("/docs/").text == "docs with slash")
         #expect(try client.get("/missing/").status == 404)
+        #expect(try client.get("/app/page/").text == "page")
+        #expect(try client.get("/app/other/").text == "app fallback")
     }
 
     @Test func aRedirectNeverPointsAtAnotherHost() throws {

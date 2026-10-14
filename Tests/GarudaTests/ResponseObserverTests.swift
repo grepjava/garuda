@@ -139,6 +139,17 @@ struct ResponseObserverTests {
         #expect(seen.take().first?.traceID == nil)
     }
 
+    @Test func aFallbackAnswersWithNoRoute() throws {
+        let seen = Seen()
+        let app = Application()
+        app.onResponse { completed in seen.requests.withLock { $0.append(completed) } }
+        app.fallback { _, response in response.send(status: .notFound, "custom") }
+        let client = app.test
+        #expect(try client.get("/anything").text == "custom")
+        let completed = try #require(seen.take().first)
+        #expect(completed.status == 404 && completed.route == nil)
+    }
+
     @Test func anHTTP10RequestSaysSo() throws {
         let seen = Seen()
         let client = app(seen).test

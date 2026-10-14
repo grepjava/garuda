@@ -133,8 +133,12 @@ struct HTTP1Connection: ~Copyable {
         guard try await readHead(stream) else { return false }
 
         let head = x.pointee.head
+        // A route matched before its body was read, for its scope's body
+        // limit; -1 when the dispatch matches (RequestLimits.swift).
+        var matched: Int32 = -1
         if head.hasBody {
-            guard try await readBody(stream) else { return false }
+            let limit = app.hasBodyLimits ? bodyLimit(app, matched: &matched) : limits.maxBodySize
+            guard try await readBody(stream, limit: limit) else { return false }
         }
 
         var keepAlive = head.isKeepAlive
@@ -146,7 +150,7 @@ struct HTTP1Connection: ~Copyable {
         if limits.traceContext { x.pointee.readTraceParent() }
         if observing { x.pointee.started = monotonicNanos() }
 
-        await dispatch(app)
+        await dispatch(app, matched: matched)
 
         // A handler's body is only sent when there is room for it to be
         // framed: never on HEAD, 1xx, 204 or 304.
@@ -166,12 +170,14 @@ struct HTTP1Connection: ~Copyable {
     }
 
     /// Finds the route and runs its handler, answering for it when it throws
-    /// or returns without answering.
-    mutating func dispatch(_ app: CompiledApplication) async {
+    /// or returns without answering. `matched` is the route when it was
+    /// matched already, with its parameters in the exchange, or -1.
+    mutating func dispatch(_ app: CompiledApplication, matched: Int32 = -1) async {
         let path = x.pointee.head.path
         let base = x.pointee.base + Int(path.offset)
         var count = path.count
-        var route = app.table.match(x.pointee.head.method, base, count, into: &x.pointee.parameters)
+        var route = matched >= 0 ? matched
+            : app.table.match(x.pointee.head.method, base, count, into: &x.pointee.parameters)
         // A trailing slash no route has, under `app.trailingSlash`: redirected,
         // or matched again without it (TrailingSlash.swift). Only a miss looks.
         if route < 0 && app.trailingSlash != .strict,
@@ -187,6 +193,11 @@ struct HTTP1Connection: ~Copyable {
             let allowed = app.table.allowedMethods(base, count, into: &x.pointee.parameters)
             x.pointee.parameters = RouteParameters()
             if allowed.isEmpty {
+                // The fallback of the most specific scope the path is in,
+                // when there is one (Fallbacks.swift). It answers with no
+                // route: `x.pointee.route` stays -1.
+                let fallback = app.fallbacks.isEmpty ? -1 : app.fallbacks.match(base, count)
+                if fallback >= 0 { return await run(app, Int(fallback)) }
                 x.pointee.answer(404, nil, 0)
             } else if x.pointee.head.method == .options && app.hasCORS
                         && answerPreflight(x, app, allowed: allowed, base, count) {
@@ -206,7 +217,12 @@ struct HTTP1Connection: ~Copyable {
             return
         }
         x.pointee.route = route
-        let index = Int(route)
+        await run(app, Int(route))
+    }
+
+    /// Runs handler `index`: a route's, or a fallback's.
+    @inline(__always)
+    mutating func run(_ app: CompiledApplication, _ index: Int) async {
         let handler = app.handlers[index]
         let costs = app.costs
         let heavy = costs.isHeavy(index)
@@ -279,15 +295,16 @@ struct HTTP1Connection: ~Copyable {
         }
     }
 
-    /// Reads the request's body: in place for a Content-Length, decoded into
-    /// the exchange for chunked. False when the request cannot be served.
-    mutating func readBody<S: AsyncReader & AsyncWriter & ~Copyable>(_ stream: borrowing S) async throws -> Bool {
+    /// Reads the request's body, of at most `limit` bytes: in place for a
+    /// Content-Length, decoded into the exchange for chunked. False when the
+    /// request cannot be served.
+    mutating func readBody<S: AsyncReader & AsyncWriter & ~Copyable>(_ stream: borrowing S, limit: Int) async throws -> Bool {
         let head = x.pointee.head
         if head.isChunked {
-            return try await readChunkedBody(stream)
+            return try await readChunkedBody(stream, limit: limit)
         }
         let length = head.contentLength
-        guard length <= limits.maxBodySize else {
+        guard length <= limit else {
             try await failAndClose(stream, status: 413)
             return false
         }
@@ -310,7 +327,7 @@ struct HTTP1Connection: ~Copyable {
         return true
     }
 
-    mutating func readChunkedBody<S: AsyncReader & AsyncWriter & ~Copyable>(_ stream: borrowing S) async throws -> Bool {
+    mutating func readChunkedBody<S: AsyncReader & AsyncWriter & ~Copyable>(_ stream: borrowing S, limit: Int) async throws -> Bool {
         var decoder = ChunkedDecoder()
         var at = x.pointee.head.headEnd
         var asked = false
@@ -325,7 +342,7 @@ struct HTTP1Connection: ~Copyable {
             case .finished:
                 // A body that arrived whole in one read never reached the
                 // check below.
-                if decoder.decodedBytes > limits.maxBodySize {
+                if decoder.decodedBytes > limit {
                     try await failAndClose(stream, status: 413)
                     return false
                 }
@@ -339,7 +356,7 @@ struct HTTP1Connection: ~Copyable {
                 try await failAndClose(stream, status: error.status)
                 return false
             case .needMore:
-                if decoder.decodedBytes > limits.maxBodySize {
+                if decoder.decodedBytes > limit {
                     try await failAndClose(stream, status: 413)
                     return false
                 }

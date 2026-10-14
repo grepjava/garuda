@@ -57,6 +57,12 @@ public protocol RouteBuilder: AnyObject {
     /// }
     /// ```
     func group(_ prefix: String, _ register: () -> Void)
+
+    /// Answers a request no route matches under the current scope's prefix,
+    /// for any method, in place of 404; the most specific scope's answers.
+    /// The scope's middleware runs in front of it. A path some other method
+    /// has a route for is still 405 (Fallbacks.swift).
+    func fallback(_ handler: @escaping Handler)
 }
 
 extension RouteBuilder {
@@ -118,6 +124,10 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     /// Each route's OpenAPI entry, what scopes add to them, and the
     /// documents `openAPI` serves (OpenAPI.swift).
     var documentation = APIDocumentation()
+    /// Each scope's `fallback`, its pattern the scope's prefix
+    /// (Fallbacks.swift). Kept apart from `routes`: nothing in the route
+    /// table, the checks or the OpenAPI document is about them.
+    var fallbacks: [RouteEntry] = []
     /// The routes as connections read them, made the first time the
     /// application runs or is tested. Nothing can be added after that.
     var compiledApplication: CompiledApplication?
@@ -180,7 +190,11 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     func middleware(of route: RouteEntry) -> [any Middleware] {
         // A CORS policy is not in the order of `use`: the innermost scope's
         // runs in front of everything else (CORS.swift).
-        placingCORSFirst([global] + route.groups.map { groups[$0].middleware })
+        // The markers of `maxBodySize` and `concurrencyLimit` are read at
+        // compilation, not run (RequestLimits.swift).
+        placingCORSFirst([global] + route.groups.map { group in
+            groups[group].middleware.filter { !($0 is any ScopeLimitMarker) }
+        })
     }
 
     // MARK: Checks
@@ -224,8 +238,16 @@ public final class Application: RouteBuilder, @unchecked Sendable {
         // from its scopes as they stand at the end, so a `use` after the
         // routes it covers applies to them too. A route with none keeps its
         // own handler and pays nothing.
-        var serving = routes
+        // Fallbacks are served as routes after the real ones, which nothing
+        // in the table leads to (Fallbacks.swift). A scope's limits wrap the
+        // handler itself, inside every layer (RequestLimits.swift).
+        var serving = routes + fallbacks
+        var scopeLimits = ScopeLimits()
+        var bodyLimits: [Int] = []
         for i in serving.indices {
+            let (bodyLimit, permits) = scopeLimits.limits(of: serving[i].groups, in: groups)
+            bodyLimits.append(bodyLimit)
+            serving[i].handler = limited(serving[i].handler, permits)
             let layers = middleware(of: serving[i])
             if !layers.isEmpty { serving[i].handler = compose(layers, around: serving[i].handler) }
             serving[i].cors = (layers.first as? CORSMiddleware)?.policy
@@ -234,7 +256,10 @@ public final class Application: RouteBuilder, @unchecked Sendable {
                                            stateFactories: stateFactories,
                                            startHooks: startHooks, stopHooks: stopHooks,
                                            trailingSlash: trailingSlashPolicy,
-                                           observers: responseObservers)
+                                           observers: responseObservers,
+                                           fallbacks: CompiledFallbacks(fallbacks.map(\.pattern),
+                                                                        first: routes.count),
+                                           bodyLimits: bodyLimits)
         compiledApplication = compiled
         return compiled
     }
@@ -290,16 +315,31 @@ final class CompiledApplication: @unchecked Sendable {
     /// for them to be told (ResponseObservers.swift).
     let observers: [ResponseObserver]
     let patterns: [String]
+    /// Each scope's fallback, by prefix, its handlers after the routes'
+    /// (Fallbacks.swift).
+    let fallbacks: CompiledFallbacks
+    /// Each handler's body limit, -1 for `--max-body`, and whether any has
+    /// one: a connection matches a request to its route before reading its
+    /// body only then (RequestLimits.swift).
+    let bodyLimits: [Int]
+    let hasBodyLimits: Bool
 
     init(table: CompiledRoutes, routes: [RouteEntry], stateFactories: [StateFactory] = [],
          startHooks: [@Sendable (ShardContext) async throws -> Void] = [],
          stopHooks: [@Sendable (ShardContext) async -> Void] = [],
          trailingSlash: TrailingSlash = .strict,
-         observers: [ResponseObserver] = []) {
+         observers: [ResponseObserver] = [],
+         fallbacks: CompiledFallbacks = CompiledFallbacks(),
+         bodyLimits: [Int] = []) {
         self.table = table
         self.trailingSlash = trailingSlash
         self.observers = observers
-        patterns = routes.map(\.pattern)
+        self.fallbacks = fallbacks
+        self.bodyLimits = bodyLimits
+        hasBodyLimits = bodyLimits.contains { $0 >= 0 }
+        // A fallback is never reported as a route.
+        let routed = routes.count - fallbacks.routes.count
+        patterns = routes[..<routed].map(\.pattern)
         self.stateFactories = stateFactories
         self.startHooks = startHooks
         self.stopHooks = stopHooks
@@ -307,7 +347,10 @@ final class CompiledApplication: @unchecked Sendable {
         routeCount = routes.count
         corsPolicies = routes.map(\.cors)
         hasCORS = corsPolicies.contains { $0 != nil }
-        costs = RouteCosts(declared: routes.map(\.heavy), names: routes.map { "\($0.method.name) \($0.pattern)" })
+        costs = RouteCosts(declared: routes.map(\.heavy), names: routes.enumerated().map { i, route in
+            i < routed ? "\(route.method.name) \(route.pattern)"
+                       : "the fallback for \(route.pattern.isEmpty ? "/" : route.pattern)"
+        })
         handlers = .allocate(capacity: max(1, routes.count))
         for (i, route) in routes.enumerated() { (handlers + i).initialize(to: route.handler) }
     }

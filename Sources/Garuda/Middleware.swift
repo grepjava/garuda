@@ -127,6 +127,8 @@ public final class Router: RouteBuilder, @unchecked Sendable {
         /// documented as they were here.
         case document(OpenAPIOperation)
         case describe(OperationNote)
+        /// A scope's fallback (Fallbacks.swift).
+        case fallback(Handler)
     }
 
     /// What has been registered, innermost open group last.
@@ -158,6 +160,10 @@ public final class Router: RouteBuilder, @unchecked Sendable {
         add(.describe(note))
     }
 
+    public func fallback(_ handler: @escaping Handler) {
+        add(.fallback(handler))
+    }
+
     public func group(_ prefix: String, _ register: () -> Void) {
         _ = normalizedPrefix(prefix)
         open.append([])
@@ -181,6 +187,7 @@ public final class Router: RouteBuilder, @unchecked Sendable {
             case .group(let prefix, let inner): builder.group(prefix) { replay(inner, into: builder) }
             case .document(let operation): builder.document(operation)
             case .describe(let note): builder.describeRoutes(note)
+            case .fallback(let handler): builder.fallback(handler)
             }
         }
     }

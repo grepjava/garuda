@@ -22,7 +22,7 @@ import GarudaWire
 
 /// What a request whose path ends in a slash no route has is answered with.
 public enum TrailingSlash: Sendable {
-    /// Routes match exactly: a 404 or a 405, as for any path.
+    /// Routes match exactly: a 404, a 405 or the fallback, as for any path.
     case strict
     /// 308 to the path without its trailing slashes, when a route has it.
     case redirect

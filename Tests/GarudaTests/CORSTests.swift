@@ -148,6 +148,21 @@ struct CORSTests {
             .header("access-control-allow-origin") == partner)
     }
 
+    @Test func aFallbacksPreflightAllowsTheMethodAskedFor() throws {
+        let app = Application()
+        app.group("/proxy") {
+            app.cors(CORSPolicy(origins: [site]))
+            app.fallback { _, response in response.send("proxied") }
+        }
+        let client = app.test
+        let pre = try client.request("OPTIONS", "/proxy/anything", headers: preflight("PATCH"))
+        #expect(pre.status == 204)
+        #expect(pre.header("access-control-allow-methods") == "PATCH")
+        let get = try client.get("/proxy/anything", headers: [("origin", site)])
+        #expect(get.text == "proxied")
+        #expect(get.header("access-control-allow-origin") == site)
+    }
+
     @Test func aPathWithoutAPolicyIsStill405() throws {
         let app = Application()
         app.group("/api") {
