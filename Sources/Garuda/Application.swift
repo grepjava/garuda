@@ -26,6 +26,25 @@ public protocol RouteBuilder: AnyObject {
     /// Notes what a typed route's handler asks for, so `problems()` can find
     /// a route that cannot work before anything is served.
     func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int)
+
+    /// Runs `middleware` around the handler of every route in the current
+    /// scope (Middleware.swift).
+    func use(_ middleware: some Middleware)
+
+    /// Mounts every route registered inside `register` under `prefix`, with
+    /// the middleware `use` adds inside it running after the scope's own:
+    ///
+    /// ```
+    /// app.group("/api") {
+    ///     app.use(RequireToken())
+    ///     app.get("/users/:id") { … }        // GET /api/users/:id
+    ///     app.group("/admin") {
+    ///         app.use(RequireAdmin())
+    ///         app.delete("/users/:id") { … } // DELETE /api/admin/users/:id,
+    ///     }                                   // RequireToken, then RequireAdmin
+    /// }
+    /// ```
+    func group(_ prefix: String, _ register: () -> Void)
 }
 
 extension RouteBuilder {
@@ -43,6 +62,13 @@ extension RouteBuilder {
 public final class Application: RouteBuilder, @unchecked Sendable {
     var table = RouteTable()
     var routes: [RouteEntry] = []
+    /// Middleware for every route, from `use` outside any group.
+    var global: [any Middleware] = []
+    /// Every group opened so far: the prefix it adds and the middleware `use`
+    /// gave it.
+    var groups: [(prefix: String, middleware: [any Middleware])] = []
+    /// The groups open right now, outermost first.
+    var openGroups: [Int] = []
     /// The routes as connections read them, made the first time the
     /// application runs or is tested. Nothing can be added after that.
     var compiledApplication: CompiledApplication?
@@ -52,25 +78,57 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     // MARK: Routes
 
     /// Registers `handler` for `method` and `pattern`: literal segments,
-    /// `:param` segments and a trailing `*rest`. A pattern that cannot be
-    /// served, or a route added once the application has run or been tested,
-    /// is a mistake in the program and stops it.
+    /// `:param` segments and a trailing `*rest`, under the prefixes of the
+    /// groups open now. A pattern that cannot be served, or a route added
+    /// once the application has run or been tested, is a mistake in the
+    /// program and stops it.
     public func on(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping Handler) {
         precondition(compiledApplication == nil, "route \(pattern) added after the application was compiled")
+        let full = joinPattern(currentPrefix, pattern)
         let parameters: Int
         do {
-            parameters = try table.add(method, pattern, route: Int32(routes.count))
+            parameters = try table.add(method, full, route: Int32(routes.count))
         } catch {
-            preconditionFailure("route \(method) \(pattern): \(error)")
+            preconditionFailure("route \(method) \(full): \(error)")
         }
-        routes.append(RouteEntry(method: method, pattern: pattern, parameters: parameters,
-                                 handler: handler))
+        routes.append(RouteEntry(method: method, pattern: full, registeredPattern: pattern,
+                                 parameters: parameters, handler: handler, groups: openGroups))
     }
 
     public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int) {
-        guard let last = routes.indices.last, routes[last].pattern == pattern,
+        guard let last = routes.indices.last, routes[last].registeredPattern == pattern,
               routes[last].method == method else { return }
         routes[last].pathExtractors = pathParameters
+    }
+
+    // MARK: Scopes
+
+    public func use(_ middleware: some Middleware) {
+        precondition(compiledApplication == nil, "middleware added after the application was compiled")
+        if let group = openGroups.last {
+            groups[group].middleware.append(middleware)
+        } else {
+            global.append(middleware)
+        }
+    }
+
+    public func group(_ prefix: String, _ register: () -> Void) {
+        precondition(compiledApplication == nil, "group added after the application was compiled")
+        groups.append((prefix: normalizedPrefix(prefix), middleware: []))
+        openGroups.append(groups.count - 1)
+        defer { openGroups.removeLast() }
+        register()
+    }
+
+    /// The prefix routes registered now are mounted under.
+    var currentPrefix: String {
+        openGroups.map { groups[$0].prefix }.joined()
+    }
+
+    /// The middleware around route `index`, outermost first: global, then
+    /// its groups from the outside in, as they stand when this is asked.
+    func middleware(of route: RouteEntry) -> [any Middleware] {
+        global + route.groups.flatMap { groups[$0].middleware }
     }
 
     // MARK: Checks
@@ -89,7 +147,7 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     public func problems() -> [String] {
         var found: [String] = []
         for route in routes where route.pathExtractors > route.parameters {
-            found.append("\(route.method) \(route.pattern) takes \(route.pathExtractors) Path "
+            found.append("\(route.method.name) \(route.pattern) takes \(route.pathExtractors) Path "
                          + "parameters, and its pattern has \(route.parameters)")
         }
         return found
@@ -100,7 +158,16 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     /// The routes as every connection reads them. Made once.
     func compile() -> CompiledApplication {
         if let compiledApplication { return compiledApplication }
-        let compiled = CompiledApplication(table: table.compile(), routes: routes)
+        // Each route's middleware is put in front of it now, once: gathered
+        // from its scopes as they stand at the end, so a `use` after the
+        // routes it covers applies to them too. A route with none keeps its
+        // own handler and pays nothing.
+        var serving = routes
+        for i in serving.indices {
+            let layers = middleware(of: serving[i])
+            if !layers.isEmpty { serving[i].handler = compose(layers, around: serving[i].handler) }
+        }
+        let compiled = CompiledApplication(table: table.compile(), routes: serving)
         compiledApplication = compiled
         return compiled
     }
@@ -109,10 +176,15 @@ public final class Application: RouteBuilder, @unchecked Sendable {
 /// A route as it is registered.
 struct RouteEntry {
     var method: HTTPMethod
+    /// With its groups' prefixes.
     var pattern: String
+    /// As it was given to `on`, inside its groups.
+    var registeredPattern: String
     /// How many parameters the pattern captures.
     var parameters: Int
     var handler: Handler
+    /// The groups it was registered inside, outermost first.
+    var groups: [Int] = []
     /// How many `Path` extractors the handler takes, when it is typed.
     var pathExtractors = 0
     /// Registered through `app.heavy`.
@@ -133,7 +205,7 @@ final class CompiledApplication: @unchecked Sendable {
     init(table: CompiledRoutes, routes: [RouteEntry]) {
         self.table = table
         routeCount = routes.count
-        costs = RouteCosts(declared: routes.map(\.heavy), names: routes.map { "\($0.method) \($0.pattern)" })
+        costs = RouteCosts(declared: routes.map(\.heavy), names: routes.map { "\($0.method.name) \($0.pattern)" })
         handlers = .allocate(capacity: max(1, routes.count))
         for (i, route) in routes.enumerated() { (handlers + i).initialize(to: route.handler) }
     }

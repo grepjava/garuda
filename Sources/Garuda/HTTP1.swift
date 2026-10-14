@@ -347,6 +347,7 @@ struct HTTP1Connection: ~Copyable {
 
     /// Writes the exchange's response into `output`.
     mutating func writeResponse(keepAlive: Bool, omitBody: Bool) {
+        x.pointee.committed = true
         parts.pointee.dates.refresh()
         let status = x.pointee.status
         let forbids = HTTPResponseWriter.statusForbidsBody(status)

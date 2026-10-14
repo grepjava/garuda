@@ -49,6 +49,10 @@ struct Exchange: ~Copyable {
     @usableFromInline var hasContentType = false
     @usableFromInline var responseBody = ByteBuffer()
     @usableFromInline var answered = false
+    /// The head has gone to the connection: nothing in it can change. Until
+    /// then middleware may add headers and set the status after the handler
+    /// has answered.
+    @usableFromInline var committed = false
     /// Kept for the next JSON answer on this connection.
     var jsonWriter: JSONWriter?
 
@@ -87,6 +91,7 @@ struct Exchange: ~Copyable {
         hasContentType = false
         responseBody.clear()
         answered = false
+        committed = false
     }
 
     @inlinable
@@ -108,10 +113,10 @@ struct Exchange: ~Copyable {
 
     /// Adds a response header, refusing what could not be sent: a name that
     /// is not a token, a value with CR, LF or NUL, a Content-Length that is
-    /// not a number, or anything once the response has been answered.
+    /// not a number, or anything once the head has been written.
     @usableFromInline
     mutating func addHeader(_ name: ByteSpan, _ value: ByteSpan) -> Bool {
-        guard !answered, name.count > 0, name.count <= 0xFFFF, value.count <= 0xFFFF else { return false }
+        guard !committed, name.count > 0, name.count <= 0xFFFF, value.count <= 0xFFFF else { return false }
         var i = 0
         while i < name.count {
             if !isTokenChar(name.base[i]) { return false }

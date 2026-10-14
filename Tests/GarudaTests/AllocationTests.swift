@@ -92,4 +92,30 @@ struct AllocationTests {
         #expect(responses.allSatisfy { $0.status == 200 })
         expectNoAllocations(probe)
     }
+
+    /// Two layers of middleware, one a closure and one a struct, in a group:
+    /// `next` lives on the stack, so the chain adds nothing.
+    @Test func middlewareChainAllocatesNothing() throws {
+        struct Tag: Middleware {
+            func handle(_ request: borrowing Request, _ response: borrowing Response,
+                        next: () async throws -> Void) async throws {
+                try await next()
+                response.addHeader("x-tag", "1")
+            }
+        }
+        let probe = AllocationProbe()
+        let app = Application()
+        app.use { _, _, next in try await next() }
+        app.group("/api") {
+            app.use(Tag())
+            app.get("/user/:id") { (id: Path<Int>) -> HTTPStatus in
+                probe.take()
+                return id.value > 0 ? .ok : .notFound
+            }
+        }
+        let responses = try app.test.sendPipelined(raw: pipelined("GET /api/user/12345 HTTP/1.1\r\nHost: t\r\n\r\n", 200))
+        #expect(responses.count == 200)
+        #expect(responses.allSatisfy { $0.status == 200 && $0.header("x-tag") == "1" })
+        expectNoAllocations(probe)
+    }
 }

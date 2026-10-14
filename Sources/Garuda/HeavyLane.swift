@@ -144,4 +144,12 @@ final class HeavyRoutes: RouteBuilder {
     func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int) {
         application.noteRoute(method, pattern, pathParameters: pathParameters)
     }
+
+    func use(_ middleware: some Middleware) {
+        application.use(middleware)
+    }
+
+    func group(_ prefix: String, _ register: () -> Void) {
+        application.group(prefix, register)
+    }
 }
