@@ -46,7 +46,7 @@ public struct CompletedRequest: Sendable {
     public let status: Int
     /// From the request's dispatch to its response head being written.
     public let microseconds: Int
-    /// "HTTP/1.1" or "HTTP/1.0".
+    /// "HTTP/1.1", "HTTP/1.0" or "HTTP/2".
     public let protocolName: String
     /// The client's address.
     public let remoteAddress: String
@@ -76,35 +76,50 @@ extension HTTP1Connection {
     /// `headParsed`: false for a request refused before its head could be
     /// read, which has no method or path to report.
     mutating func report(status: Int, headParsed: Bool = true) {
-        let started = x.pointee.started
-        let micros = started == 0 ? 0 : Int((monotonicNanos() &- started) / 1000)
-        if let app = x.pointee.application {
-            app._withUnsafeGuaranteedRef { app in
-                guard !app.observers.isEmpty else { return }
-                let completed = completedRequest(app, status: status, micros: micros, headParsed: headParsed)
-                for observe in app.observers { observe(completed) }
-            }
-        }
-        if limits.accessLog { logAccess(status: status, micros: micros, headParsed: headParsed) }
+        reportAnswer(x, limits: limits, status: status, headParsed: headParsed)
     }
+}
 
-    func completedRequest(_ app: CompiledApplication, status: Int, micros: Int,
-                          headParsed: Bool) -> CompletedRequest {
-        let head = x.pointee.head
-        let index = Int(x.pointee.route)
-        let trace = x.pointee.traceIDs
-        return CompletedRequest(
-            method: headParsed ? x.pointee.slice(head.methodSlice).string : "",
-            path: headParsed ? x.pointee.slice(head.path).string : "",
-            route: index >= 0 && index < app.patterns.count ? app.patterns[index] : nil,
-            status: status,
-            microseconds: micros,
-            protocolName: headParsed && head.httpMinor == 0 ? "HTTP/1.0" : "HTTP/1.1",
-            // The client a trusted proxy names, once the head is there to say.
-            remoteAddress: headParsed ? Request(x).remoteAddress : x.pointee.remote.address,
-            requestID: x.pointee.requestIDBytes?.string,
-            traceID: trace?.trace.string,
-            parentID: trace?.parent.string,
-            failure: x.pointee.failure)
+/// Tells the observers and the access log how the request in `x` was
+/// answered: an HTTP/1 connection's, or an HTTP/2 stream's.
+func reportAnswer(_ x: UnsafeMutablePointer<Exchange>, limits: ConnectionLimits, status: Int,
+                  headParsed: Bool = true) {
+    let started = x.pointee.started
+    let micros = started == 0 ? 0 : Int((monotonicNanos() &- started) / 1000)
+    if let app = x.pointee.application {
+        app._withUnsafeGuaranteedRef { app in
+            guard !app.observers.isEmpty else { return }
+            let completed = completedRequest(x, app, status: status, micros: micros, headParsed: headParsed)
+            for observe in app.observers { observe(completed) }
+        }
     }
+    if limits.accessLog { logAccess(x, limits: limits, status: status, micros: micros, headParsed: headParsed) }
+}
+
+func completedRequest(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, status: Int, micros: Int,
+                      headParsed: Bool) -> CompletedRequest {
+    let head = x.pointee.head
+    let index = Int(x.pointee.route)
+    let trace = x.pointee.traceIDs
+    return CompletedRequest(
+        method: headParsed ? x.pointee.slice(head.methodSlice).string : "",
+        path: headParsed ? x.pointee.slice(head.path).string : "",
+        route: index >= 0 && index < app.patterns.count ? app.patterns[index] : nil,
+        status: status,
+        microseconds: micros,
+        protocolName: protocolName(head, headParsed: headParsed),
+        // The client a trusted proxy names, once the head is there to say.
+        remoteAddress: headParsed ? Request(x).remoteAddress : x.pointee.remote.address,
+        requestID: x.pointee.requestIDBytes?.string,
+        traceID: trace?.trace.string,
+        parentID: trace?.parent.string,
+        failure: x.pointee.failure)
+}
+
+/// "HTTP/2", "HTTP/1.0", or "HTTP/1.1" -- which a head that could not be
+/// read is taken to be.
+func protocolName(_ head: HTTPRequestHead, headParsed: Bool) -> String {
+    guard headParsed else { return "HTTP/1.1" }
+    if head.httpMajor == 2 { return "HTTP/2" }
+    return head.httpMinor == 0 ? "HTTP/1.0" : "HTTP/1.1"
 }

@@ -71,4 +71,23 @@ extension Application {
         await serveHTTP1(stream, app: app, limits: ConnectionLimits(config),
                          peer: SocketPeer(address: remoteAddress, port: remotePort))
     }
+
+    /// Serves `stream` as a shard serves a cleartext socket: HTTP/2 when it
+    /// opens with the preface, HTTP/1.1 otherwise. HTTP/2's streams run in
+    /// a pool on `runtime`. `prepareForTesting` must have been called.
+    @_spi(Testing)
+    public func serveConnection<S: AsyncReader & AsyncWriter & ~Copyable, R: AsyncReader & ~Copyable,
+                                W: AsyncWriter & ~Copyable & Sendable>(
+        _ stream: consuming S, halves: (consuming S) -> StreamHalves<R, W>, config: ServerConfig,
+        runtime: Runtime, remoteAddress: String, remotePort: Int
+    ) async {
+        guard let app = compiledApplication else {
+            preconditionFailure("serveConnection before prepareForTesting")
+        }
+        let limits = ConnectionLimits(config)
+        await Garuda.serveConnection(stream, app: app, limits: limits,
+                                     peer: SocketPeer(address: remoteAddress, port: remotePort), secure: false,
+                                     http2: limits.http2.enabled ? HTTP2Service.forTesting(runtime) : nil,
+                                     halves: halves, close: { _ in }, closeWriter: { _ in })
+    }
 }

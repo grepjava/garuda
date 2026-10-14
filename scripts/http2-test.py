@@ -10,18 +10,23 @@ multiplexing that actually overlaps, flow control on a real body in both
 directions, a body held to its declared length, body and request timeouts on
 a stream, header blocks split across frames, and the rapid-reset defence.
 
-Everything is served by the built-in router (GET /, GET /user/:id, POST /user
-and GET /delay/:ms) or by the server's own --static-dir, so no application is
+Everything is served by Garuda 2's `garuda` binary (Sources/garuda-server:
+GET /, GET /user/:id, POST /user and GET /delay/:ms), so no application is
 needed. Each check runs twice: cleartext with prior knowledge, then over TLS
 with ALPN. Routes, delays and cancelling a waiting delay are covered over TLS
 by scripts/router-streams-test.py and are not repeated here.
+
+Left out from Garuda 1's copy until Garuda 2 has what they need: the check of
+a response far larger than the window, which was served by --static-dir
+(phase P4) -- the unit tests (HTTP2Tests) cover it -- and the slow-stream
+check's --request-timeout, which Garuda 2 does not have: that check runs
+against the default body timeout instead.
 
 Needs `h2` in the interpreter running it, and openssl for the TLS pass:
 pip install h2
 """
 
 import os
-import shutil
 import socket
 import ssl
 import shlex
@@ -119,7 +124,7 @@ def free_port():
 class Server:
     def __init__(self, *args):
         self.port = free_port()
-        cmd = [BIN, "--port", str(self.port), "--log-level", "error"] + EXTRA + list(args)
+        cmd = [BIN, "--port", str(self.port), "--log-level", "error", "--shards", "0"] + EXTRA + list(args)
         if USE_TLS:
             cert, key = make_certs()
             cmd += ["--tls-cert", cert, "--tls-key", key]
@@ -370,30 +375,18 @@ def test_request_bodies():
 
 def test_flow_control():
     print("\nFlow control")
-    # The router has no large responses, so the large one comes from
-    # --static-dir, which refills a stream from the file as the window opens.
-    root = tempfile.mkdtemp(prefix="garuda-h2-static-")
-    large = os.urandom(400000)
-    with open(os.path.join(root, "big.bin"), "wb") as fh:
-        fh.write(large)
-    try:
-        with Server("--static-dir", "/static=" + root) as server:
-            flow_control_checks(server, large)
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+    # Garuda 1 served a response far larger than the window from --static-dir
+    # here. Garuda 2 has no static files yet (phase P4), and the binary's
+    # routes have no large response, so that check is in the unit tests.
+    with Server() as server:
+        flow_control_checks(server)
 
 
-def flow_control_checks(server, large):
-    # A deliberately small window, so the response cannot be sent in one go
-    # and the server has to wait for WINDOW_UPDATE frames.
+def flow_control_checks(server):
     c = Client(server, window=16384)
-    s = c.request(path="/static/big.bin")
-    status, _, body, _ = c.collect([s], deadline=30.0)
-    is_("a response far larger than the window arrives whole",
-        (status.get(s), body.get(s, b"") == large), (200, True))
 
-    # And the other direction: the server's own window has to be refreshed
-    # as the router reads, or an upload stalls at the initial window.
+    # The server's own window has to be refreshed as the body arrives, or an
+    # upload stalls at the initial window.
     payload = b"z" * (1024 * 1024)
     try:
         s2 = c.request(method="POST", path="/user", body=payload)
@@ -599,7 +592,9 @@ def test_slow_stream():
     stays reading until END_STREAM -- which is the state the sweep looks at.
     """
     print("\nSlow but steady streams")
-    with Server("--request-timeout", "2000") as server:
+    # Garuda 1 ran this with --request-timeout 2000. Garuda 2 has no such
+    # flag, and holds a stalled body to its 30-second body timeout.
+    with Server() as server:
         c = Client(server)
         body = b"abcdefghij"
         stream = c.request(method="POST", path="/user",

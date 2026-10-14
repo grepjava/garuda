@@ -385,97 +385,100 @@ extension String {
 
 // MARK: - The access log
 
-extension HTTP1Connection {
-    /// One line for the answer just written, with --access-log. `headParsed`:
-    /// false for a request refused before its head could be read, which has
-    /// no method or target to show.
-    mutating func logAccess(status: Int, micros: Int, headParsed: Bool) {
-        guard Log.enabled(.info) else { return }
-        let head = x.pointee.head
-        let id = x.pointee.requestIDBytes
-        let trace = x.pointee.traceIDs
-        var line = AccessLine()
+/// One line for the answer just written, with --access-log. `headParsed`:
+/// false for a request refused before its head could be read, which has
+/// no method or target to show.
+func logAccess(_ x: UnsafeMutablePointer<Exchange>, limits: ConnectionLimits, status: Int, micros: Int,
+               headParsed: Bool) {
+    guard Log.enabled(.info) else { return }
+    let head = x.pointee.head
+    let id = x.pointee.requestIDBytes
+    let trace = x.pointee.traceIDs
+    var line = AccessLine()
 
-        if !limits.accessLogJSON {
-            line.str("garuda info: ")
-            line.reserveTail()
-            if headParsed && head.methodSlice.count > 0 {
-                line.text(x.pointee.slice(head.methodSlice))
-            } else {
-                line.str("-")
-            }
-            line.str(" ")
-            if headParsed && head.target.count > 0 {
-                line.text(x.pointee.slice(head.target))
-            } else {
-                line.str("-")
-            }
-            line.releaseTail()
-            line.str(" ")
-            line.int(status)
-            line.str(" ")
-            line.int(micros)
-            line.str("us")
-            if let id {
-                line.str(" id=")
-                line.raw(id)
-            }
-            if let trace {
-                line.str(" trace=")
-                line.raw(trace.trace)
-                line.str(" span=")
-                line.raw(trace.parent)
-            }
-            if line.truncated { line.str(" truncated=true") }
+    if !limits.accessLogJSON {
+        line.str("garuda info: ")
+        line.reserveTail()
+        if headParsed && head.methodSlice.count > 0 {
+            line.text(x.pointee.slice(head.methodSlice))
         } else {
-            // Bare: the whole line is the object, so a collector can read it
-            // without being told where the JSON starts.
-            line.str("{\"level\":\"info\"")
-            let pid = Log.pid
-            if pid != 0 {
-                line.str(",\"pid\":")
-                line.int(Int(pid))
-            }
-            // The method and the target are both as long as the peer cares to
-            // make them, up to the head limit. Everything after them is short
-            // and bounded, so room for it is kept before either goes in: a
-            // long one is cut and says so, rather than eating the fields that
-            // close the object.
-            line.reserveTail()
-            line.str(",\"method\":")
-            if headParsed { line.json(x.pointee.slice(head.methodSlice)) } else { line.str("\"\"") }
-            line.str(",\"target\":")
-            if headParsed { line.json(x.pointee.slice(head.target)) } else { line.str("\"\"") }
-            line.releaseTail()
-            line.str(",\"status\":")
-            line.int(status)
-            line.str(",\"duration_us\":")
-            line.int(micros)
+            line.str("-")
+        }
+        line.str(" ")
+        if headParsed && head.target.count > 0 {
+            line.text(x.pointee.slice(head.target))
+        } else {
+            line.str("-")
+        }
+        line.releaseTail()
+        line.str(" ")
+        line.int(status)
+        line.str(" ")
+        line.int(micros)
+        line.str("us")
+        if let id {
+            line.str(" id=")
+            line.raw(id)
+        }
+        if let trace {
+            line.str(" trace=")
+            line.raw(trace.trace)
+            line.str(" span=")
+            line.raw(trace.parent)
+        }
+        if line.truncated { line.str(" truncated=true") }
+    } else {
+        // Bare: the whole line is the object, so a collector can read it
+        // without being told where the JSON starts.
+        line.str("{\"level\":\"info\"")
+        let pid = Log.pid
+        if pid != 0 {
+            line.str(",\"pid\":")
+            line.int(Int(pid))
+        }
+        // The method and the target are both as long as the peer cares to
+        // make them, up to the head limit. Everything after them is short
+        // and bounded, so room for it is kept before either goes in: a
+        // long one is cut and says so, rather than eating the fields that
+        // close the object.
+        line.reserveTail()
+        line.str(",\"method\":")
+        if headParsed { line.json(x.pointee.slice(head.methodSlice)) } else { line.str("\"\"") }
+        line.str(",\"target\":")
+        if headParsed { line.json(x.pointee.slice(head.target)) } else { line.str("\"\"") }
+        line.releaseTail()
+        line.str(",\"status\":")
+        line.int(status)
+        line.str(",\"duration_us\":")
+        line.int(micros)
+        if headParsed && head.httpMajor == 2 {
+            line.str(",\"proto\":\"HTTP/2\"")
+        } else {
             line.str(headParsed && head.httpMinor == 0 ? ",\"proto\":\"HTTP/1.0\"" : ",\"proto\":\"HTTP/1.1\"")
-            // An ID was checked when it was assigned, and a trace when it was
-            // read: neither holds anything a JSON string must escape.
-            if let id {
-                line.str(",\"request_id\":\"")
-                line.raw(id)
-                line.str("\"")
-            }
-            if let trace {
-                line.str(",\"trace_id\":\"")
-                line.raw(trace.trace)
-                line.str("\",\"parent_id\":\"")
-                line.raw(trace.parent)
-                line.str("\"")
-            }
-            if line.truncated { line.str(",\"truncated\":true") }
-            line.str("}")
         }
-        if let capture = AppLogOutput.capture {
-            capture(String(decoding: line.bytes, as: UTF8.self))
-            return
+        // An ID was checked when it was assigned, and a trace when it was
+        // read: neither holds anything a JSON string must escape.
+        if let id {
+            line.str(",\"request_id\":\"")
+            line.raw(id)
+            line.str("\"")
         }
-        line.bytes.append(cLF)
-        line.bytes.withUnsafeBytes { Log.writeLine($0) }
+        if let trace {
+            line.str(",\"trace_id\":\"")
+            line.raw(trace.trace)
+            line.str("\",\"parent_id\":\"")
+            line.raw(trace.parent)
+            line.str("\"")
+        }
+        if line.truncated { line.str(",\"truncated\":true") }
+        line.str("}")
     }
+    if let capture = AppLogOutput.capture {
+        capture(String(decoding: line.bytes, as: UTF8.self))
+        return
+    }
+    line.bytes.append(cLF)
+    line.bytes.withUnsafeBytes { Log.writeLine($0) }
 }
 
 /// An access log line, held to one write. Only the method and the target can

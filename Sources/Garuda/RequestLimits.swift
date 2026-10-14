@@ -141,34 +141,40 @@ func acquirePlaces(_ permits: [Vega.Semaphore]) -> Bool {
 // MARK: - The connection side
 
 extension HTTP1Connection {
-    /// The body limit of the route the request's head goes to, in an
-    /// application where some scope has one: matched now, before the body is
-    /// read. A route that matched as the path came is put in `matched`, with
-    /// its parameters in the exchange, for the dispatch to use rather than
-    /// match again; any other outcome -- a trailing slash, a fallback, a miss
-    /// -- the dispatch works out again, as it is rare and cheap next to a
-    /// body.
+    /// `bodyLimit(_:_:_:matched:)` for this connection's exchange.
     mutating func bodyLimit(_ app: CompiledApplication, matched: inout Int32) -> Int {
-        let path = x.pointee.head.path
-        let base = x.pointee.base + Int(path.offset)
-        let method = x.pointee.head.method
-        var route = app.table.match(method, base, path.count, into: &x.pointee.parameters)
-        if route >= 0 {
-            matched = route
-        } else {
-            x.pointee.parameters = RouteParameters()
-            var scratch = RouteParameters()
-            var count = path.count
-            if app.trailingSlash == .ignore,
-               let trimmed = pathWithoutTrailingSlash(app, base, count, &scratch) {
-                count = trimmed
-                route = app.table.match(method, base, count, into: &scratch)
-            }
-            if route < 0 && app.table.allowedMethods(base, count, into: &scratch).isEmpty {
-                route = app.fallbacks.match(base, count)
-            }
-        }
-        let limit = route >= 0 ? app.bodyLimits[Int(route)] : -1
-        return limit >= 0 ? limit : limits.maxBodySize
+        Garuda.bodyLimit(x, app, limits, matched: &matched)
     }
+}
+
+/// The body limit of the route the request's head goes to, in an
+/// application where some scope has one: matched now, before the body is
+/// read. A route that matched as the path came is put in `matched`, with
+/// its parameters in the exchange, for the dispatch to use rather than
+/// match again; any other outcome -- a trailing slash, a fallback, a miss
+/// -- the dispatch works out again, as it is rare and cheap next to a
+/// body. An HTTP/2 stream asks the same when its HEADERS arrive (HTTP2.swift).
+func bodyLimit(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, _ limits: ConnectionLimits,
+               matched: inout Int32) -> Int {
+    let path = x.pointee.head.path
+    let base = x.pointee.base + Int(path.offset)
+    let method = x.pointee.head.method
+    var route = app.table.match(method, base, path.count, into: &x.pointee.parameters)
+    if route >= 0 {
+        matched = route
+    } else {
+        x.pointee.parameters = RouteParameters()
+        var scratch = RouteParameters()
+        var count = path.count
+        if app.trailingSlash == .ignore,
+           let trimmed = pathWithoutTrailingSlash(app, base, count, &scratch) {
+            count = trimmed
+            route = app.table.match(method, base, count, into: &scratch)
+        }
+        if route < 0 && app.table.allowedMethods(base, count, into: &scratch).isEmpty {
+            route = app.fallbacks.match(base, count)
+        }
+    }
+    let limit = route >= 0 ? app.bodyLimits[Int(route)] : -1
+    return limit >= 0 ? limit : limits.maxBodySize
 }
