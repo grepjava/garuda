@@ -47,13 +47,12 @@ extension Application {
         }
         if let level = config.logLevel { Log.level = level }
         #if !os(Windows)
+        // Idle workers spin briefly before they sleep (Vega's default;
+        // VEGA_SPIN_NS sets it, 0 to sleep at once). On cores of its own a
+        // server gains from it: 35.7k against 30.3k new connections a second
+        // on the bench box. Where clients or another server share the cores,
+        // the spin takes their CPU and 0 is better.
         if let io = config.io { setenv("VEGA_DRIVER", io, 1) }
-        // Idle workers sleep at once rather than spin first. A spin saves a
-        // wake-up only when work arrives within it, and on a machine whose
-        // cores also run the clients, or another server, it takes their CPU:
-        // 117k against 143k requests a second on the bench box, 26 against
-        // 40 us of CPU each. VEGA_SPIN_NS still sets it.
-        setenv("VEGA_SPIN_NS", "0", 0)
         #endif
         let app = compile()
         let limits = ConnectionLimits(config)
