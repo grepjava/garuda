@@ -5,6 +5,11 @@ import GarudaTesting
 
 private struct HandlerFailure: Error {}
 
+/// What `/context/:n` keeps across its wait.
+private enum Remembered: RequestContextKey {
+    typealias Value = Int
+}
+
 /// The routes most tests here share.
 private func sample() -> Application {
     let app = Application()
@@ -32,6 +37,13 @@ private func sample() -> Application {
         let path = request.path
         let agent = request.header("user-agent") ?? "none"
         response.send("\(id) \(path) \(agent)")
+    }
+    app.get("/context/:n") { request, response in
+        let before = request[context: Remembered.self]
+        request[context: Remembered.self] = request.withParameter(0) { $0.integer }
+        try await Runtime.sleep(for: .milliseconds(1))
+        let after = request[context: Remembered.self]
+        response.send("before=\(before.map(String.init) ?? "none") after=\(after.map(String.init) ?? "none")")
     }
     return app
 }
@@ -132,6 +144,16 @@ struct ApplicationTests {
             let response = try client.get("/user/\(id)")
             #expect(response.text == "\(id)")
         }
+    }
+
+    @Test func contextCrossesAWaitButNotARequest() throws {
+        let client = sample().test
+        #expect(try client.get("/context/7").text == "before=none after=7")
+        let raw = "GET /context/8 HTTP/1.1\r\nHost: t\r\n\r\nGET /context/9 HTTP/1.1\r\nHost: t\r\n\r\n"
+        // The second request on the connection reuses the first's exchange;
+        // it starts empty.
+        #expect(try client.sendPipelined(raw: Array(raw.utf8)).map(\.text)
+                == ["before=none after=8", "before=none after=9"])
     }
 
     @Test func applicationsInOneProcessKeepTheirOwnRoutes() throws {
