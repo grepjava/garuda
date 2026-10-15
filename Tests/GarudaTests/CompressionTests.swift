@@ -27,7 +27,11 @@ private let text: [UInt8] = {
 
 private let gzipOnly = [("accept-encoding", "gzip")]
 
-@Suite("Response compression")
+/// Whether this process has gzip: Vega builds no codec on Windows, having no
+/// zlib there, so these suites are skipped.
+let gzipUsable = codingUsable(.gzip)
+
+@Suite("Response compression", .enabled(if: gzipUsable, "no gzip: Vega has no zlib on Windows"))
 struct ResponseCompressionTests {
     private func client(compress: Bool = true) -> TestClient {
         let app = Application()
@@ -105,7 +109,7 @@ private struct Event: Codable {
     var count: Int
 }
 
-@Suite("Request decompression")
+@Suite("Request decompression", .enabled(if: gzipUsable, "no gzip: Vega has no zlib on Windows"))
 struct RequestDecompressionTests {
     private func app() -> Application {
         let app = Application()

@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Synchronization
 import Testing
@@ -364,7 +366,8 @@ struct HTTPClientTests {
         #expect(unresolved == .connect(.unresolved))
     }
 
-    @Test func aCompressedBodyIsDecoded() throws {
+    @Test(.enabled(if: gzipUsable, "no gzip: Vega has no zlib on Windows"))
+    func aCompressedBodyIsDecoded() throws {
         let text = String(repeating: "decoded ", count: 400)
         let (answer, plain) = try onRuntime {
             let app = Application()
