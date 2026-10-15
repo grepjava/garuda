@@ -4,8 +4,8 @@
 // A client is handed `https://example.com:8443/a/b?c=d` and has to turn it
 // into three separate decisions: where to open a connection, what to put in
 // the Host field, and what to write as the request-target. Nothing in this
-// process did that before -- the server reads an authority that arrived, and
-// ACME hands its URLs to C without ever looking inside one.
+// process did that before -- the server only reads an authority that
+// arrived.
 //
 // This is where the untrusted bytes are. A URL is the part of an outbound
 // request most likely to have been built out of user input, and the three

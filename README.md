@@ -776,7 +776,6 @@ bash scripts/ratelimit-test.sh               # 18  --rate-limit
 bash scripts/redirect-test.sh                # 22  --redirect-http, --hsts
 bash scripts/sni-test.sh                     # 11  certificates by SNI
 bash scripts/resumption-test.sh              #  7  session tickets resume, TLS 1.3 and 1.2
-bash scripts/acme-test.sh                    # 12  --acme-domain, needs Pebble
 bash scripts/request-id-test.sh              # 12  --request-id
 bash scripts/trace-context-test.sh           # 17  --trace-context
 bash scripts/drain-test.sh                   # 14  --drain-delay

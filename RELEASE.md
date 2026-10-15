@@ -40,7 +40,6 @@ bash scripts/ratelimit-test.sh         # 18
 bash scripts/redirect-test.sh          # 22
 bash scripts/sni-test.sh               # 11
 bash scripts/resumption-test.sh        # 7
-bash scripts/acme-test.sh              # 12, needs Pebble (PEBBLE_DIR)
 bash scripts/request-id-test.sh        # 12
 bash scripts/trace-context-test.sh     # 17
 bash scripts/drain-test.sh             # 14

@@ -20,7 +20,7 @@ GROUPS = [
     ("Protocols", [
         "HTTP/1.1, HTTP/2, HTTP/3 over QUIC",
         "TLS 1.2 and 1.3, SNI, ALPN",
-        "ACME certificates, renewed in place",
+        "Certificates reloaded in place",
         "One worker per CPU, reload with no drops",
     ]),
     ("Real-time", [

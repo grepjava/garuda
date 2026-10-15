@@ -17,8 +17,10 @@
 // or something none covers.
 //
 // The certificates live in a store every handshake asks, so they can be
-// replaced while the server runs -- by --tls-reload when the files change,
-// and later by ACME -- without touching a connection already open.
+// replaced while the server runs -- by --tls-reload when the files change
+// -- without touching a connection already open. Garuda does not fetch
+// certificates itself: whatever issues them (certbot, a proxy, an operator)
+// writes the files, and the reload picks them up.
 //
 // Session tickets let a returning client skip the full handshake. A ticket
 // is sealed with a key, and every shard must hold the same one, or a client
