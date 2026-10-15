@@ -370,7 +370,10 @@ struct HTTP3Tests {
     // MARK: Requests
 
     @Test func aGetIsAnsweredAsHTTP1AndHTTP2Are() throws {
-        try withServer(h3App()) { client, _ in
+        let app = h3App()
+        let seen = Mutex<[CompletedRequest]>([])
+        app.onResponse { completed in seen.withLock { $0.append(completed) } }
+        try withServer(app) { client, _ in
             try await client.connect()
             // The control stream: its type, then SETTINGS first.
             let control = client.peer.streams[3] ?? []
@@ -390,6 +393,11 @@ struct HTTP3Tests {
             let missing = try await client.get(8, "/nowhere")
             #expect(missing.status == 404)
         }
+        // What observers and the access log are told.
+        let completed = seen.withLock { $0 }
+        #expect(completed.count == 3)
+        #expect(completed.allSatisfy { $0.protocolName == "HTTP/3" })
+        #expect(completed.first?.status == 200)
     }
 
     @Test func aRouteThatNeverWaitsIsAnsweredByTheEndpointAsWell() throws {

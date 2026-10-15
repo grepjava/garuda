@@ -129,6 +129,7 @@ func tracedDispatch(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplicat
         let request = Request(x)
         let version: String
         switch protocolName(head, headParsed: true) {
+        case "HTTP/3": version = "3"
         case "HTTP/2": version = "2"
         case "HTTP/1.0": version = "1.0"
         default: version = "1.1"

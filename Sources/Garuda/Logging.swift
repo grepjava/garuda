@@ -453,6 +453,8 @@ func logAccess(_ x: UnsafeMutablePointer<Exchange>, limits: ConnectionLimits, st
         line.int(micros)
         if headParsed && head.httpMajor == 2 {
             line.str(",\"proto\":\"HTTP/2\"")
+        } else if headParsed && head.httpMajor == 3 {
+            line.str(",\"proto\":\"HTTP/3\"")
         } else {
             line.str(headParsed && head.httpMinor == 0 ? ",\"proto\":\"HTTP/1.0\"" : ",\"proto\":\"HTTP/1.1\"")
         }

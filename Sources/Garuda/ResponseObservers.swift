@@ -46,7 +46,7 @@ public struct CompletedRequest: Sendable {
     public let status: Int
     /// From the request's dispatch to its response head being written.
     public let microseconds: Int
-    /// "HTTP/1.1", "HTTP/1.0" or "HTTP/2".
+    /// "HTTP/1.1", "HTTP/1.0", "HTTP/2" or "HTTP/3".
     public let protocolName: String
     /// The client's address.
     public let remoteAddress: String
@@ -118,10 +118,11 @@ func completedRequest(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplic
         failure: x.pointee.failure)
 }
 
-/// "HTTP/2", "HTTP/1.0", or "HTTP/1.1" -- which a head that could not be
-/// read is taken to be.
+/// "HTTP/3", "HTTP/2", "HTTP/1.0", or "HTTP/1.1" -- which a head that could
+/// not be read is taken to be.
 func protocolName(_ head: HTTPRequestHead, headParsed: Bool) -> String {
     guard headParsed else { return "HTTP/1.1" }
+    if head.httpMajor == 3 { return "HTTP/3" }
     if head.httpMajor == 2 { return "HTTP/2" }
     return head.httpMinor == 0 ? "HTTP/1.0" : "HTTP/1.1"
 }
