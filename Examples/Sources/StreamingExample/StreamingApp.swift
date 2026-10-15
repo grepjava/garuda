@@ -3,19 +3,25 @@
 //
 //   GET /countdown?from=10    server-sent events, one a second, then the end
 //   GET /export.csv?rows=N    a CSV of N rows, written as it is produced
-//   PUT /uploads/:name        the body written to disk as it arrives
+//   PUT /uploads/:name        the body written to disk
 //   GET /uploads/:name        how many bytes the upload holds
 //
 // What it shows:
 //
-// - `EventStream` for events, with keep-alive comments and the stream ending
-//   when the handler returns.
+// - `EventStream` for events, with keep-alive comments (`--sse-keep-alive`)
+//   and the stream ending when the handler returns.
 // - `StreamingBody` for a body too large to build in memory. A write waits
 //   while the client is behind, so a slow reader slows the producer, not the
 //   server's memory.
-// - `onStreamingBody` for an upload read as it arrives, with a size limit of
-//   its own. Unread bytes hold back the client, so the disk sets the pace.
-//   The file I/O runs on the blocking pool.
+// - An upload with a size limit of its own (`maxBodySize`), written to disk by
+//   an offloaded route (`app.offload`): the handler blocks on the file
+//   system, so it runs on Vega's blocking pool rather than on one of the
+//   shard's worker threads.
+//
+// Garuda 1 read an upload as it arrived (`onStreamingBody`), so the disk set
+// the pace and the body was never all in memory. Garuda 2 does not stream a
+// request body yet: the body is read whole, within its route's limit, before
+// the handler runs.
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
@@ -47,41 +53,70 @@ private func validName(_ name: String) -> Bool {
     }
 }
 
-/// A file descriptor, handed to the blocking pool and back.
-private struct Descriptor: Sendable {
-    let fd: Int32
-}
-
 /// Why a file operation failed, with the errno.
 struct FileError: Error {
     let operation: String
     let errno: Int32
 }
 
+/// The request body as it came, whatever its type: an upload is bytes, not
+/// JSON. An extractor of its own is a few lines.
+struct RawBody: RequestExtractor, Sendable {
+    let bytes: [UInt8]
+
+    static func extract(from request: borrowing Request, parameter: inout Int) async throws -> RawBody {
+        RawBody(bytes: request.body)
+    }
+}
+
+/// Writes `bytes` to `path` and makes them durable, or throws and leaves
+/// nothing behind. Blocks: call it from the blocking pool.
+private func writeFile(_ bytes: [UInt8], to path: String) throws {
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    guard fd >= 0 else { throw FileError(operation: "open", errno: errno) }
+    // Closed exactly once whatever happens: a second close could hit a file
+    // another thread has opened since under the same number.
+    defer { close(fd) }
+    do {
+        var offset = 0
+        while offset < bytes.count {
+            let n = bytes.withUnsafeBytes { write(fd, $0.baseAddress! + offset, $0.count - offset) }
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { throw FileError(operation: "write", errno: errno) }
+            offset += n
+        }
+        guard fsync(fd) == 0 else { throw FileError(operation: "fsync", errno: errno) }
+    } catch {
+        unlink(path)
+        throw error
+    }
+}
+
 /// The streaming examples, storing uploads in `uploadDirectory`, which must
-/// exist. `tickMilliseconds` is how far apart countdown events are.
-public func streamingApp(uploadDirectory: String, tickMilliseconds: UInt64 = 1000,
-                         maxUploadBytes: Int = 1 << 30) -> Application {
+/// exist. `tick` is how far apart countdown events are.
+public func streamingApp(uploadDirectory: String, tick: Duration = .seconds(1),
+                         maxUploadBytes: Int = 64 << 20) -> Application {
     let app = Application()
 
-    app.get("/countdown") { (query: Query<CountdownQuery>) async throws in
+    app.get("/countdown") { (query: Query<CountdownQuery>) in
         let from = min(max(query.value.from ?? 10, 0), 60)
-        return EventStream(keepAlive: 15_000) { events in
+        return EventStream { events in
             for n in stride(from: from, through: 1, by: -1) {
                 try await events.send(String(n), event: "tick", id: String(n))
-                try await events.sleep(milliseconds: tickMilliseconds)
+                // Throws when the client goes away, which ends the loop.
+                try await events.sleep(for: tick)
             }
             try await events.send("liftoff", event: "done")
             // Returning ends the stream.
         }
     }
 
-    app.get("/export.csv") { (query: Query<ExportQuery>) async throws in
+    app.get("/export.csv") { (query: Query<ExportQuery>) in
         let rows = min(max(query.value.rows ?? 1000, 0), 10_000_000)
         return StreamingBody(contentType: "text/csv") { body in
             try await body.write("id,square,label\n")
             // Rows are batched into writes of about 64 KiB, rather than one
-            // write per row.
+            // write per row. A write waits while the client is behind.
             var batch = ""
             batch.reserveCapacity(70_000)
             for id in 0..<rows {
@@ -95,69 +130,31 @@ public func streamingApp(uploadDirectory: String, tickMilliseconds: UInt64 = 100
         }
     }
 
-    app.onStreamingBody(.put, "/uploads/:name", maxBodySize: maxUploadBytes) { request, response, body in
-        let name = request.parameter(0)
-        guard validName(name) else {
-            // Answered without reading the body; the engine discards it, or
-            // closes an HTTP/1.1 connection with too much of it left.
-            response.send(status: .badRequest)
-            return
-        }
-        let final = uploadDirectory + "/" + name
-        let partial = final + ".partial"
-
-        // Written to a partial file and renamed when complete, so a reader
-        // never sees half an upload under its name.
-        let file = try await blocking { () throws -> Descriptor in
-            let fd = open(partial, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-            guard fd >= 0 else { throw FileError(operation: "open", errno: errno) }
-            return Descriptor(fd: fd)
-        }
-        var written = 0
-        var descriptorOpen = true
-        do {
-            while let chunk = try await body.read() {
-                try await blocking {
-                    var offset = 0
-                    while offset < chunk.count {
-                        let n = chunk.withUnsafeBytes { write(file.fd, $0.baseAddress! + offset, $0.count - offset) }
-                        if n < 0 && errno == EINTR { continue }
-                        guard n > 0 else { throw FileError(operation: "write", errno: errno) }
-                        offset += n
-                    }
-                }
-                written += chunk.count
-            }
-            // Closed in here whatever happens, so the descriptor is never
-            // closed twice -- a second close could hit a file opened since.
-            descriptorOpen = false
-            try await blocking {
-                let synced = fsync(file.fd) == 0 ? 0 : errno
-                close(file.fd)
-                guard synced == 0 else { throw FileError(operation: "fsync", errno: synced) }
-                guard rename(partial, final) == 0 else { throw FileError(operation: "rename", errno: errno) }
-            }
-        } catch {
-            // Cut off, too large, or the disk refused: nothing is kept.
-            let stillOpen = descriptorOpen
-            try? await blocking {
-                if stillOpen { close(file.fd) }
+    // A body past the limit is answered 413 before the handler runs, and
+    // before more of it than the limit is read.
+    app.maxBodySize(maxUploadBytes) {
+        app.offload.put("/uploads/:name") { (name: Path<String>, body: RawBody) throws -> JSON<UploadInfo> in
+            guard validName(name.value) else { throw HTTPError(.badRequest, "not an upload name") }
+            let final = uploadDirectory + "/" + name.value
+            let partial = final + ".partial"
+            // Written to a partial file and renamed when complete, so a reader
+            // never sees half an upload under its name.
+            try writeFile(body.bytes, to: partial)
+            guard rename(partial, final) == 0 else {
+                let failure = FileError(operation: "rename", errno: errno)
                 unlink(partial)
+                throw failure
             }
-            throw error
+            return JSON(UploadInfo(name: name.value, bytes: body.bytes.count), status: .created)
         }
-        try response.send(status: .created, json: UploadInfo(name: name, bytes: written))
     }
 
-    app.get("/uploads/:name") { (name: Path<String>) async throws -> JSON<UploadInfo>? in
+    // `stat` blocks on the disk too, so this one is offloaded as well.
+    app.offload.get("/uploads/:name") { (name: Path<String>) throws -> JSON<UploadInfo>? in
         guard validName(name.value) else { throw HTTPError(.badRequest, "not an upload name") }
-        let path = uploadDirectory + "/" + name.value
-        let size = try await blocking { () -> Int? in
-            var info = stat()
-            guard stat(path, &info) == 0 else { return nil }
-            return Int(info.st_size)
-        }
-        return size.map { JSON(UploadInfo(name: name.value, bytes: $0)) }
+        var info = stat()
+        guard stat(uploadDirectory + "/" + name.value, &info) == 0 else { return nil }
+        return JSON(UploadInfo(name: name.value, bytes: Int(info.st_size)))
     }
 
     return app

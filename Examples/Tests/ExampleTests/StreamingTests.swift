@@ -16,7 +16,7 @@ struct StreamingExampleTests {
     }
 
     @Test func aCountdownIsEventsAndThenTheEnd() throws {
-        let client = streamingApp(uploadDirectory: "/tmp", tickMilliseconds: 1).test
+        let client = streamingApp(uploadDirectory: "/tmp", tick: .milliseconds(1)).test
         let response = try client.get("/countdown?from=3")
         #expect(response.status == .ok)
         #expect(response.header("content-type")?.hasPrefix("text/event-stream") == true)
@@ -52,7 +52,9 @@ struct StreamingExampleTests {
     @Test func anUploadIsWrittenAndRenamed() throws {
         let dir = directory()
         defer { rmdir(dir) }
-        let client = streamingApp(uploadDirectory: dir, maxUploadBytes: 1 << 20).test
+        // Small, because the test client's connection buffers 1 MiB: a body
+        // past that is still being written when the 413 closes it.
+        let client = streamingApp(uploadDirectory: dir, maxUploadBytes: 400_000).test
         let bytes = (0..<300_000).map { UInt8($0 % 251) }
         let put = try client.put("/uploads/data.bin", body: bytes)
         #expect(put.status == .created)
@@ -79,7 +81,7 @@ struct StreamingExampleTests {
         let missing = Result { try client.get("/uploads/missing") }
         #expect((try? missing.get())?.status == .notFound, "\(missing)")
         // Over the limit: refused, and nothing left behind under either name.
-        let big = Result { try client.put("/uploads/big", body: [UInt8](repeating: 0, count: 2 << 20)) }
+        let big = Result { try client.put("/uploads/big", body: [UInt8](repeating: 0, count: 500_000)) }
         #expect((try? big.get())?.status == .contentTooLarge, "\(big)")
         #expect(access(dir + "/big", F_OK) != 0)
         #expect(access(dir + "/big.partial", F_OK) != 0)

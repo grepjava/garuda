@@ -47,11 +47,14 @@ let package = Package(
                 swiftSettings: swiftSettings),
         .executableTarget(name: "auth", dependencies: ["AuthExample"], swiftSettings: swiftSettings),
 
+        .target(name: "StreamingExample", dependencies: [garuda("Garuda")], swiftSettings: swiftSettings),
+        .executableTarget(name: "streaming", dependencies: ["StreamingExample"], swiftSettings: swiftSettings),
+
         .testTarget(name: "ExampleTests",
-                    dependencies: ["TodoExample", "AuthExample", garuda("Garuda"), garuda("GarudaSQLite"), garuda("GarudaTesting")],
+                    dependencies: ["TodoExample", "AuthExample", "StreamingExample", garuda("Garuda"), garuda("GarudaSQLite"), garuda("GarudaTesting")],
                     // Waiting for GarudaUploads.
                     exclude: ["FilesTests.swift", "UploadsTests.swift",
-                              "StreamingTests.swift", "ChatTests.swift", "StarterTests.swift", "WebTransportTests.swift"],
+                              "ChatTests.swift", "StarterTests.swift", "WebTransportTests.swift"],
                     swiftSettings: swiftSettings),
     ]
 )
