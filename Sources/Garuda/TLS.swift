@@ -20,7 +20,10 @@
 // replaced while the server runs -- by --tls-reload when the files change
 // -- without touching a connection already open. Garuda does not fetch
 // certificates itself: whatever issues them (certbot, a proxy, an operator)
-// writes the files, and the reload picks them up.
+// writes the files, and the reload picks them up. The one thing such a tool
+// needs from the server is its HTTP-01 challenges answered on port 80, which
+// is the --redirect-http port: --acme-webroot serves them from the directory
+// the tool writes them into (certbot's --webroot -w).
 //
 // Session tickets let a returning client skip the full handshake. A ticket
 // is sealed with a key, and every shard must hold the same one, or a client
@@ -39,6 +42,7 @@ import GarudaWire
 import Synchronization
 import Vega
 import VegaCrypto
+import VegaFS
 import VegaTLS
 
 /// A certificate chain and its private key, as PEM files.
@@ -262,9 +266,21 @@ enum TicketKey {
 
 /// What the --redirect-http port serves: every request answered with a
 /// redirect to the same URL on https, 301 for GET and HEAD and 308 for the
-/// rest, so a POST is not turned into a GET on the way.
-func httpsRedirectApplication(httpsPort: Int) -> Application {
+/// rest, so a POST is not turned into a GET on the way. With `acmeWebroot`,
+/// the HTTP-01 challenges an outside ACME client left there are answered
+/// instead: a certificate authority asks for them over plain HTTP and does
+/// not follow a redirect to a certificate that may not exist yet.
+func httpsRedirectApplication(httpsPort: Int, acmeWebroot: String? = nil) -> Application {
     let app = Application()
+    if let acmeWebroot {
+        app.get("/.well-known/acme-challenge/:token") { request, response in
+            let token = request.parameter(0)
+            guard let body = acmeChallenge(in: acmeWebroot, token: token) else {
+                return response.send(status: .notFound)
+            }
+            response.send(bytes: body, contentType: "text/plain")
+        }
+    }
     app.fallback { request, response in
         let x = request.exchange
         var location = ByteBuffer()
@@ -279,6 +295,37 @@ func httpsRedirectApplication(httpsPort: Int) -> Application {
         response.send(status: HTTPStatus(HTTPSRedirect.status(for: x.pointee.head.method)))
     }
     return app
+}
+
+/// The key authorization an ACME client wrote for `token`, or nil. A token
+/// is base64url (RFC 8555 8.1), so one with anything else -- a dot, a slash,
+/// an escape -- names nothing, and the file is opened beneath the webroot
+/// besides. A key authorization is a hundred bytes or so; a file far larger
+/// is not one.
+func acmeChallenge(in webroot: String, token: String) -> [UInt8]? {
+    let utf8 = token.utf8
+    guard (1...256).contains(utf8.count), utf8.allSatisfy({ base64URL($0) }) else { return nil }
+    guard let file = try? File.open(beneath: webroot, ".well-known/acme-challenge/" + token),
+          let size = try? file.metadataNow().size, size <= maxChallengeBytes else { return nil }
+    var body = [UInt8](repeating: 0, count: size)
+    var got = 0
+    while got < size {
+        let n = body.withUnsafeMutableBytes { bytes in
+            (try? file.readNow(into: UnsafeMutableRawBufferPointer(rebasing: bytes[got...]), at: got)) ?? 0
+        }
+        if n <= 0 { break }
+        got += n
+    }
+    guard got == size else { return nil }
+    // Clients write the key authorization alone; some add a newline.
+    while let last = body.last, last == 0x0A || last == 0x0D { body.removeLast() }
+    return body.isEmpty ? nil : body
+}
+
+private let maxChallengeBytes = 4096
+
+private func base64URL(_ c: UInt8) -> Bool {
+    (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || (c >= 0x30 && c <= 0x39) || c == 0x2D || c == 0x5F
 }
 
 private let hostName: StaticString = "host"

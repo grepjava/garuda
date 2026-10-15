@@ -139,6 +139,10 @@ public struct ServerConfig: Sendable {
     /// A plain-HTTP port that answers everything with a redirect to the same
     /// URL on https, or nil for none.
     public var redirectHTTPPort: Int? = nil
+    /// A directory an outside ACME client (certbot --webroot) writes its
+    /// HTTP-01 challenges under, served at /.well-known/acme-challenge/ on
+    /// the redirectHTTPPort, or nil for none.
+    public var acmeWebroot: String? = nil
     /// How often to look at the certificate files and serve them again when
     /// they have changed; nil never looks.
     public var tlsReloadInterval: Duration? = nil

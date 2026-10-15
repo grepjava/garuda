@@ -223,7 +223,8 @@ extension Application {
                 }
                 Log.info("serving \(tls == nil ? "http" : "https") on \(config.host):\(servers[0].port)")
                 if let redirect = listening.redirect, let httpsPort = servers.first?.port {
-                    let redirector = httpsRedirectApplication(httpsPort: httpsPort).compile()
+                    let redirector = httpsRedirectApplication(httpsPort: httpsPort,
+                                                              acmeWebroot: config.acmeWebroot).compile()
                     let server = try TCPServer.serve(try redirect()) { stream in
                         let peer = socketPeer(stream)
                         await serveHTTP1(stream, app: redirector, limits: limits, peer: peer)
@@ -350,6 +351,10 @@ extension ServerConfig {
                                serve them again when they change
           --redirect-http PORT also listen for plain HTTP on PORT and redirect
                                every request to https
+          --acme-webroot DIR   on the --redirect-http port, answer
+                               /.well-known/acme-challenge/ from DIR, the
+                               webroot an ACME client such as certbot writes
+                               its HTTP-01 challenges into
           --forwarded-allow-ips L
                                proxies whose forwarded headers are trusted:
                                addresses, CIDR blocks, unix, or *
@@ -569,6 +574,9 @@ extension ServerConfig {
                     return fail("--redirect-http must be a port between 1 and 65535")
                 }
                 config.redirectHTTPPort = v
+            case "--acme-webroot":
+                guard let v = value() else { return fail("--acme-webroot needs a directory") }
+                config.acmeWebroot = v
             case "--forwarded-allow-ips":
                 guard let v = value() else { return fail("--forwarded-allow-ips needs a list") }
                 guard v.withCString({ config.trust.parse($0) }) else {
@@ -614,6 +622,9 @@ extension ServerConfig {
             guard redirect != config.port else {
                 return fail("--redirect-http needs a port of its own, not the TLS port")
             }
+        }
+        if config.acmeWebroot != nil && config.redirectHTTPPort == nil {
+            return fail("--acme-webroot answers challenges on the --redirect-http port; it needs --redirect-http")
         }
         if config.tlsReloadInterval != nil && config.tlsCertificates.isEmpty {
             return fail("--tls-reload has no certificates to watch; it needs --tls-cert")

@@ -179,6 +179,44 @@ let closingGet = "GET /secure HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\
             .send(raw: Array("GET / HTTP/1.0\r\n\r\n".utf8))
         #expect(response.status == 400)
     }
+
+    @Test func acmeChallengesAreAnsweredNotRedirected() throws {
+        let site = Site()
+        site.directory("/.well-known")
+        site.directory("/.well-known/acme-challenge")
+        site.write("/.well-known/acme-challenge/tok-EN_1", "tok-EN_1.thumbprint\n")
+        site.write("/secret", "no")
+        let client = httpsRedirectApplication(httpsPort: 443, acmeWebroot: site.path).test
+        let host = [("host", "example.com")]
+
+        let found = try client.get("/.well-known/acme-challenge/tok-EN_1", headers: host)
+        #expect(found.status == 200)
+        #expect(found.text == "tok-EN_1.thumbprint")
+        #expect(found.header("content-type")?.hasPrefix("text/plain") == true)
+
+        #expect(try client.get("/.well-known/acme-challenge/missing", headers: host).status == 404)
+        #expect(try client.get("/.well-known/acme-challenge/..%2F..%2Fsecret", headers: host).status == 404)
+        #expect(try client.get("/.well-known/acme-challenge/a.b", headers: host).status == 404)
+
+        // Everything else is still sent to https.
+        let other = try client.get("/.well-known/other", headers: host)
+        #expect(other.status == 301)
+        #expect(other.header("location") == "https://example.com/.well-known/other")
+    }
+
+    @Test func withoutAWebrootChallengesAreRedirected() throws {
+        let response = try httpsRedirectApplication(httpsPort: 443).test
+            .get("/.well-known/acme-challenge/tok", headers: [("host", "example.com")])
+        #expect(response.status == 301)
+    }
+
+    @Test func oversizedChallengeFilesAreRefused() {
+        let site = Site()
+        site.directory("/.well-known")
+        site.directory("/.well-known/acme-challenge")
+        site.write("/.well-known/acme-challenge/big", [UInt8](repeating: 0x41, count: 5000))
+        #expect(acmeChallenge(in: site.path, token: "big") == nil)
+    }
 }
 
 @Suite struct ForwardedTests {

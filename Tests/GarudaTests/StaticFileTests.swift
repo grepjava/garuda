@@ -11,7 +11,7 @@ import GarudaWire
 // --static-dir, --static-index, --static-listing and --spa-fallback.
 
 /// A directory of files for one test, removed afterwards.
-private final class Site {
+final class Site {
     let path: String
 
     init() {
