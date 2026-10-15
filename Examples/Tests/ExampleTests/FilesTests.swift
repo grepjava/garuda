@@ -5,6 +5,8 @@ import Darwin
 #endif
 import Testing
 import Garuda
+import GarudaTesting
+import GarudaUploads
 @testable import FilesExample
 
 // The file service end to end: an upload that is cut off and resumed, what is
@@ -21,12 +23,10 @@ private func temporaryDirectory() -> String {
 /// the downloads are served here as they are when it is run.
 private func client(_ configuration: FilesConfiguration) -> TestClient {
     var config = ServerConfig()
-    config.maxConnections = 16
-    config.staticRoutes = [filesStaticRoute(configuration)]
+    config.staticDirectories = [configuration.staticDirectory]
     config.staticListing = true
-    config.staticIndex = true
     let client = filesApp(configuration).testClient(configuration: config)
-    client.timeoutMillis = 20_000
+    client.timeout = .seconds(20)
     return client
 }
 
@@ -60,7 +60,7 @@ struct FilesExampleTests {
         #expect(whole.header("accept-ranges") == "bytes")
 
         let part = try http.get("/files/photo.jpg", headers: [("Range", "bytes=1000-1099")])
-        #expect(part.status == 206)
+        #expect(part.status == .partialContent)
         #expect(part.body == Array(content[1000..<1100]))
         #expect(part.header("content-range") == "bytes 1000-1099/4000")
 
@@ -81,13 +81,17 @@ struct FilesExampleTests {
         let content = bytes(200_000)
 
         // The client speaks the protocol, so it is told where the upload
-        // lives before the body is read.
+        // lives before the body is read. It says what the whole file's digest
+        // is, which the server checks once the last byte is in, before the
+        // handler sees it.
         let begun = try http.post("/files", body: Array(content[0..<120_000]),
                                   headers: [("Upload-Complete", "?0"),
                                             ("Upload-Draft-Interop-Version", "9"),
+                                            ("Repr-Digest", Digest.field(Digest.sha256(content))),
                                             named("big.bin")])
         #expect(begun.status == .created, "\(begun.status) \(begun.text)")
         let location = try #require(begun.header("location"))
+        #expect(begun.interim.contains { $0.status == 104 })
 
         // Where it got to, as a client that lost its connection would ask.
         let head = try http.head(location)
@@ -95,8 +99,7 @@ struct FilesExampleTests {
         #expect(head.header("upload-offset") == "120000")
         #expect(head.header("upload-complete") == "?0")
 
-        // The rest of it, with the digest of the whole thing, which the
-        // server checks before the handler sees it.
+        // The rest of it, from where it got to.
         let finished = try http.request("PATCH", location, headers: [
             ("Content-Type", "application/partial-upload"),
             ("Upload-Offset", "120000"),
@@ -153,7 +156,7 @@ struct FilesExampleTests {
     }
 
     @Test func aNameTheClientSendsCannotBeAPath() throws {
-        // The one place a client's idea of a name reaches the filesystem.
+        // The one place a client's idea of a name reaches the file system.
         #expect(safeName("photo.jpg") == "photo.jpg")
         #expect(safeName("a-b_c.1.tar.gz") == "a-b_c.1.tar.gz")
         #expect(safeName(nil) == nil)

@@ -1,12 +1,10 @@
 # Examples
 
-> **Not yet ported to Garuda 2: `files` and `uploads`.** Both need
-> `GarudaUploads`, which Garuda 2 does not have yet. Their sources stay in
-> `Sources/FilesExample`, `Sources/UploadsExample`, `Sources/files`,
-> `Sources/uploads` and `Tests/ExampleTests/{Files,Uploads}Tests.swift`, outside
-> every target, until it does.
+> **Not yet ported to Garuda 2: `uploads`.** Its sources stay in
+> `Sources/UploadsExample`, `Sources/uploads` and
+> `Tests/ExampleTests/UploadsTests.swift`, outside every target, until it is.
 
-Six applications built on Garuda's public API. Five are small enough to read
+Seven applications built on Garuda's public API. Six are small enough to read
 in one sitting, each showing one thing; the starter shows the shape of a whole
 application and is the one to copy when beginning. They build against the
 Garuda checkout this directory sits in.
@@ -18,6 +16,7 @@ Garuda checkout this directory sits in.
 | [Streaming](Sources/StreamingExample/StreamingApp.swift) | `swift run streaming` | Server-sent events, a CSV export written as it is produced, and uploads written to disk by an offloaded route with a body limit of its own |
 | [Chat](Sources/ChatExample/ChatApp.swift) | `swift run chat` | Rooms over WebSockets and server-sent events, heard across every shard through `Topic` |
 | [WebTransport](Sources/WebTransportExample/WebTransportApp.swift) | `swift run webtransport -- --tls-cert cert.pem --tls-key key.pem` | A network probe over HTTP/3: datagram round trips, download and upload throughput on streams, a stream the server opens, an extractor that refuses a session before it starts, and a browser page that trusts a self-signed certificate by its hash |
+| [Files](Sources/FilesExample/FilesApp.swift) | `swift run files` | A file service: resumable uploads (`GarudaUploads`) with size limits and SHA-256 digests, the files served back by `--static-dir` with byte ranges, `ETag` and a listing |
 | [**Starter**](STARTER.md) | `swift run starter` | A whole application on PostgreSQL (`GarudaPostgres`): accounts with JWT access and refresh tokens, roles and admin-only routes, input rules answered as 422, migrations, configuration from the environment, OpenAPI, health and readiness, and a deployment recipe |
 
 ```bash
@@ -55,10 +54,11 @@ reads from its environment (a database path, a directory) is read in
 `main.swift` and passed in.
 
 The package depends on Garuda's products -- `Garuda`, and `GarudaSQLite`,
-`GarudaPostgres` and `GarudaTesting` where an example needs them -- and on
-Vega, the runtime Garuda is built on, for two things Garuda does not export:
-SHA-256 (`VegaCrypto`, in the webtransport example) and a runtime for work
-outside the server (`Vega`, in the starter's `withServices`).
+`GarudaPostgres`, `GarudaUploads` and `GarudaTesting` where an example needs
+them -- and on Vega, the runtime Garuda is built on, for what Garuda does not
+export: SHA-256 (`VegaCrypto`, in the webtransport example), a runtime for
+work outside the server (`Vega`, in the starter's `withServices`), and file
+system calls that run on the blocking pool (`VegaFS`, in the files example).
 
 ## Notes for copying
 
@@ -82,6 +82,12 @@ outside the server (`Vega`, in the starter's `withServices`).
   2 reads a request body whole before the handler runs, so the limit is also
   what an upload may hold in memory. Serve the directory with a separate
   route or `--static-dir` if they should be downloadable.
+- **Resumable uploads** in the files example are `app.resumableUploads`: the
+  body goes to disk as it arrives, a client that speaks the draft protocol can
+  ask how much arrived and send the rest after a dropped connection, and the
+  handler is called once, with the whole file on disk, to move it into place.
+  The files go back out through `--static-dir`, which `main.swift` adds to the
+  command line, so the application writes no download code at all.
 - **WebTransport needs HTTP/3**, and so TLS. A browser trusts a self-signed
   certificate over WebTransport only through `serverCertificateHashes`, and
   only an ECDSA one valid for at most 14 days; the webtransport example's
