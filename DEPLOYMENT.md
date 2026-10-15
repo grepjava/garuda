@@ -89,8 +89,8 @@ supervisor.
 3. sends each WebSocket a 1001 close, and each HTTP/2 connection a GOAWAY once
    its WebSockets have closed;
 4. lets HTTP/1.1 connections finish the request in hand, HTTP/2 and HTTP/3
-   connections finish their streams, all within `--graceful-timeout` seconds
-   (10 by default);
+   connections finish their streams, all within `--graceful-timeout`
+   milliseconds (10000 by default);
 5. stops its `app.every` jobs, runs its `onShardStop` hooks and shuts its
    state down, newest first.
 
@@ -107,7 +107,7 @@ process. **On Windows** no signal is handled.
 ## Draining behind a load balancer
 
 ```bash
-garuda --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30
+garuda --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30000
 ```
 
 A load balancer or Kubernetes Service keeps routing to a server for a few
@@ -120,8 +120,7 @@ that traffic. With `--drain-delay`, on `SIGTERM` the server:
 - closes each HTTP/1.1 connection after its response, so clients reconnect
   to a server that is staying;
 
-and only then starts draining. Note the units: `--drain-delay` is
-milliseconds, `--graceful-timeout` seconds.
+and only then starts draining. Both flags are milliseconds.
 
 - Make the delay longer than the readiness probe takes to fail: its period
   times its failure threshold.
@@ -157,7 +156,8 @@ shard has started again. A `SIGHUP` during a reload is ignored.
   `--tls-reload`.
 - **What it does not:** the command line, which the supervisor read once.
   The executable either: on Linux the replacement is forked from the
-  supervisor, so a new build needs a restart.
+  supervisor, so a new build needs a restart (or, in development,
+  `--reload`).
 - **The response cache** is emptied when a replacement starts.
 - **Capacity.** One shard is out of service at a time while it drains and
   restarts. The others keep accepting. With `--balance shared` they take
@@ -190,7 +190,7 @@ Wants=network-online.target
 ExecStart=/usr/local/bin/garuda --host 0.0.0.0 --port 443 \
     --tls-cert /etc/garuda/cert.pem --tls-key /etc/garuda/key.pem \
     --redirect-http 80 \
-    --health-check-path /healthz --drain-delay 5000 --graceful-timeout 10
+    --health-check-path /healthz --drain-delay 5000 --graceful-timeout 10000
 ExecReload=/bin/kill -HUP $MAINPID
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 Restart=on-failure
@@ -220,9 +220,10 @@ state on disk.
 
 ## Behind a reverse proxy
 
-Bind to loopback and trust the proxy's forwarded headers:
+Bind to loopback or a unix socket, and trust the proxy's forwarded headers:
 
 ```bash
+garuda --unix /run/garuda.sock --forwarded-allow-ips unix
 garuda --host 127.0.0.1 --port 8000 --forwarded-allow-ips 127.0.0.1
 ```
 
@@ -231,9 +232,10 @@ garuda --host 127.0.0.1 --port 8000 --forwarded-allow-ips 127.0.0.1
   address.
 - A proxy that talks h2c upstream, such as Envoy or Caddy, needs
   `--http2-only`.
-- Garuda 2 has no unix-socket listener and no `--root-path`. A proxy that
-  mounts the application under a prefix should strip it, or the routes should
-  be registered under it with `app.group`.
+- If the proxy mounts the application under a prefix and does not strip it,
+  use `--root-path`.
+- A proxy that terminates TLS and sends no forwarded headers needs
+  `--scheme https`.
 
 ---
 
