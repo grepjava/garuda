@@ -163,6 +163,15 @@ private func refused(_ flags: [String]) -> Bool {
         #expect(try traced.get("/trace", headers: [("traceparent", one), ("traceparent", other)]).text == "none")
     }
 
+    @Test func noWebSocketsRefusesAnUpgradeWhateverTheRoute() throws {
+        let upgrade = [("upgrade", "websocket"), ("connection", "Upgrade"),
+                       ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="), ("sec-websocket-version", "13")]
+        #expect(try client { $0.websocketsEnabled = false }.get("/", headers: upgrade).status.code == 501)
+        #expect(try client { _ in }.get("/", headers: upgrade).status.code == 200)
+        // An upgrade to something else is not a WebSocket's.
+        #expect(try client { $0.websocketsEnabled = false }.get("/", headers: [("upgrade", "h2c")]).status.code == 200)
+    }
+
     @Test func theHTTPSRedirectClosesTheConnection() throws {
         let response = try httpsRedirectApplication(httpsPort: 8443).testClient()
             .get("/a", headers: [("host", "example.com")])

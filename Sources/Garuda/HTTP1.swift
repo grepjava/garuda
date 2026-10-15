@@ -264,6 +264,13 @@ struct HTTP1Connection: ~Copyable {
         if let root = app.rootPath { stripRootPath(x, root) }
 
         let head = x.pointee.head
+        // --no-websockets: an upgrade to a WebSocket is refused whatever
+        // the route, as Garuda 1 refused it, rather than answered as the
+        // plain GET a route that knows nothing of WebSockets takes it for.
+        if head.flags.contains(.upgrade) && x.pointee.websocketsRefused && asksForWebSocket(x) {
+            try await failAndClose(stream, status: 501)
+            return false
+        }
         // A route matched before its body was read, for its scope's body
         // limit; -1 when the dispatch matches (RequestLimits.swift).
         var matched: Int32 = -1
@@ -593,6 +600,19 @@ func writeHTTP1Head(_ x: UnsafeMutablePointer<Exchange>, _ parts: UnsafeMutableP
         parts.pointee.output.write("Connection: keep-alive\r\n")
     }
     HTTPResponseWriter.endHead(&parts.pointee.output)
+}
+
+/// Whether the request's Upgrade names websocket.
+func asksForWebSocket(_ x: UnsafeMutablePointer<Exchange>) -> Bool {
+    let name: StaticString = "upgrade"
+    guard let value = x.pointee.header(name.utf8Start, name.utf8CodeUnitCount), value.count >= 9 else { return false }
+    let websocket: StaticString = "websocket"
+    var i = 0
+    while i &+ 9 <= value.count {
+        if equalsIgnoringCase(value.base + i, websocket.utf8Start, 9) { return true }
+        i &+= 1
+    }
+    return false
 }
 
 /// A `ResponseError` as the answer.
