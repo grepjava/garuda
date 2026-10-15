@@ -100,6 +100,9 @@ public final class QUICTestPeer {
     /// Streams the server asked to stop sending on, with the code.
     public var stopSending: [UInt64: UInt64] = [:]
     public private(set) var closeCode: UInt64?
+    /// The data of each PATH_CHALLENGE and PATH_RESPONSE the server sent.
+    public var pathChallenges: [[UInt8]] = []
+    public var pathResponses: [[UInt8]] = []
     /// The highest MAX_STREAMS (bidirectional) the server sent.
     public private(set) var maxStreamsBidi: UInt64 = 0
     /// The datagrams the server sent (RFC 9221), in order.
@@ -296,6 +299,10 @@ public final class QUICTestPeer {
                 _ = try need(r.varint(), "NEW_CONNECTION_ID")
                 let length = try need(r.byte(), "NEW_CONNECTION_ID")
                 try needTrue(r.skip(Int(length) + 16), "NEW_CONNECTION_ID")
+            case 0x1a:
+                pathChallenges.append(hsBytes(try need(r.take(8), "PATH_CHALLENGE"), 8))
+            case 0x1b:
+                pathResponses.append(hsBytes(try need(r.take(8), "PATH_RESPONSE"), 8))
             case 0x1c, 0x1d:
                 closeCode = try need(r.varint(), "CONNECTION_CLOSE")
                 return

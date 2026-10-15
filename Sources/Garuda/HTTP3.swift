@@ -500,15 +500,23 @@ final class QUICEndpoint: @unchecked Sendable {
             // connection ID, not the four-tuple, is what identifies it.
             //
             // But a connection ID is on the wire in clear, so anyone who sees
-            // one can put it in a UDP header of their own. Believing the
-            // source address before the packet has authenticated would let one
-            // forged datagram redirect everything the connection has yet to
-            // send. So the address moves only once a packet from it has
-            // decrypted and proved newer than anything before it.
-            connection.quic.receive(p, n, ecn: ecn, nowMs: now)
-            if connection.quic.acceptedNewPacket {
-                connection.peer = peer
-                connection.local = local
+            // one can put it in a UDP header of their own, or rewrite the
+            // source of a packet in flight. Believing the address of even an
+            // authenticated packet would let one such datagram redirect
+            // everything the connection has yet to send. So a datagram from
+            // elsewhere is handed over as from another path, and the
+            // connection moves there only once the transport has had a
+            // PATH_RESPONSE from it (QUICPath.swift).
+            let quic = connection.quic
+            if peer == connection.peer {
+                quic.receive(p, n, ecn: ecn, nowMs: now)
+                if quic.acceptedNewPacket { connection.local = local }
+            } else {
+                let (path, made) = connection.path(for: peer, local: local)
+                quic.receive(p, n, ecn: ecn, path: path, nowMs: now)
+                // A datagram that did not decrypt is not anybody's claim to
+                // the address, and takes no room.
+                if made && !quic.datagramAuthenticated { connection.forgetPath(path) }
             }
             touch(connection)
             return
@@ -600,7 +608,27 @@ final class QUICEndpoint: @unchecked Sendable {
         for connection in live where connection.quic.hasOutput {
             if await writeAll(connection, socket, nowMs: now) { more = true }
         }
+        for connection in live where connection.quic.hasProbes {
+            await sendProbes(connection, socket, nowMs: now)
+        }
         return more
+    }
+
+    /// Sends what a connection owes addresses other than its peer's: the
+    /// challenges that validate a move, and the answers to probes, which go
+    /// back the way they came. One datagram each: they are rare.
+    private func sendProbes(_ connection: H3Connection, _ socket: borrowing UDPSocket, nowMs now: UInt64) async {
+        for _ in 0..<QUICEndpoint.maxSegments {
+            let (n, path) = connection.quic.nextProbeDatagram(sendBuffer, QUICEndpoint.datagramSize, nowMs: now)
+            if n == 0 { break }
+            guard let to = connection.paths.first(where: { $0.id == path }) else { continue }
+            do {
+                _ = try await socket.send(segments: UnsafeRawBufferPointer(start: sendBuffer, count: n),
+                                          segmentSize: n, to: to.peer, from: to.local)
+            } catch {
+                Log.debug("quic: send failed: \(error)")
+            }
+        }
     }
 
     /// Builds a connection's datagrams straight into `sendBuffer`, back to

@@ -66,6 +66,11 @@ public struct QUICEvent {
         case streamWritable
         case datagram
         case closed
+        /// A path the peer moved to answered its challenge: `code` is the
+        /// caller's identifier for it (QUICPath.swift).
+        case pathValidated
+        /// It did not, in time.
+        case pathFailed
     }
     public var kind: Kind
     public var streamID: UInt64 = 0
@@ -197,6 +202,19 @@ public final class QUICConnection {
     var pingPending = false
     var pathResponsePending: [[UInt8]] = []
 
+    /// Addresses other than the one sent to (QUICPath.swift), and the
+    /// datagram being received: its path, its size, and whether a packet in
+    /// it has authenticated yet.
+    var paths: [QUICPathState] = []
+    var receivingPath = 0
+    var lastValidatedPath = 0
+    var receivingCount = 0
+    /// Whether a packet in the datagram just handed to `receive` decrypted:
+    /// until one does, its source address is nobody's claim.
+    public internal(set) var datagramAuthenticated = false
+    /// The packet being processed has carried probing frames alone so far.
+    var packetProbesOnly = true
+
     public internal(set) var events: [QUICEvent] = []
     /// Streams already announced as writable in the current batch.
     var writableAnnounced: Set<UInt64> = []
@@ -314,9 +332,14 @@ public final class QUICConnection {
     /// peer is now (RFC 9000 section 9.3).
     public private(set) var acceptedNewPacket = false
 
+    /// `path` is the caller's identifier for the address it came from: 0
+    /// for the one the connection sends to (QUICPath.swift).
     public func receive(_ datagram: UnsafeMutablePointer<UInt8>, _ count: Int,
-                        ecn: UInt8, nowMs: UInt64) {
+                        ecn: UInt8, path: Int = 0, nowMs: UInt64) {
         acceptedNewPacket = false
+        datagramAuthenticated = false
+        receivingPath = path
+        receivingCount = count
         if status == .drained { return }
         bytesReceived += count
 
@@ -362,6 +385,7 @@ public final class QUICConnection {
                                       header: keys[level.rawValue].receive.header)
         }
         guard let packet = opened else { return false }
+        pathAuthenticated()
 
         // Receiving a Handshake packet that decrypts proves the peer is at the
         // address it claims: only somebody who saw our Initial could have
@@ -388,6 +412,7 @@ public final class QUICConnection {
             spaces[space].largestReceived = Int64(packet.packetNumber)
             spaces[space].largestReceivedAtMs = nowMs
             acceptedNewPacket = true
+            if receivingPath != 0 && !packetProbesOnly { pathMoved(nowMs: nowMs) }
         }
         spaces[space].acks.add(packet.packetNumber)
         spaces[space].ackPending = true
@@ -463,12 +488,14 @@ public final class QUICConnection {
                                level: QUICLevel, nowMs: UInt64) -> Bool? {
         var r = QUICReader(p, n)
         var ackEliciting = false
+        packetProbesOnly = true
 
         while !r.isEmpty {
             guard let type = r.varint() else {
                 close(QUICError.frameEncodingError.rawValue)
                 return nil
             }
+            if !QUICFrameType.isProbing(type) { packetProbesOnly = false }
             if level != .application && !QUICFrameType.allowedDuringHandshake(type) {
                 close(QUICError.protocolViolation.rawValue)
                 return nil
@@ -574,12 +601,13 @@ public final class QUICConnection {
                 guard let data = r.take(8) else {
                     close(QUICError.frameEncodingError.rawValue); return nil
                 }
-                pathResponsePending.append([UInt8](UnsafeBufferPointer(start: data, count: 8)))
+                pathChallenged(data)
 
             case QUICFrameType.pathResponse:
-                guard r.skip(8) else {
+                guard let data = r.take(8) else {
                     close(QUICError.frameEncodingError.rawValue); return nil
                 }
+                pathResponded(data)
 
             case QUICFrameType.connectionCloseTransport,
                  QUICFrameType.connectionCloseApplication:

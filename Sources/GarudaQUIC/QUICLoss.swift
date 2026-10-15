@@ -176,6 +176,21 @@ public struct QUICRecovery {
         congestionWindow = initial
     }
 
+    /// RFC 9000 section 9.4: the peer has moved to a path whose round trip
+    /// and capacity are its own. What is in flight is still accounted for.
+    public mutating func resetForNewPath() {
+        let fresh = QUICRecovery()
+        latestRTTMs = fresh.latestRTTMs
+        smoothedRTTMs = fresh.smoothedRTTMs
+        rttVarianceMs = fresh.rttVarianceMs
+        minRTTMs = fresh.minRTTMs
+        haveRTTSample = fresh.haveRTTSample
+        congestionWindow = fresh.congestionWindow
+        slowStartThreshold = fresh.slowStartThreshold
+        recoveryStartMs = fresh.recoveryStartMs
+        ptoCount = 0
+    }
+
     @inlinable public var canSend: Bool { bytesInFlight < congestionWindow }
     @inlinable public var sendRoom: Int { max(0, congestionWindow - bytesInFlight) }
 
