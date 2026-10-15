@@ -295,7 +295,6 @@ extension Application {
                     runtime.spawn { await watchCertificates(tls, every: interval) }
                 }
                 let all = servers
-                #if !os(Windows)
                 let grace = config.gracefulShutdown
                 let delay = config.drainDelay
                 runtime.spawn {
@@ -303,7 +302,14 @@ extension Application {
                     // not. Under a supervisor, SIGQUIT arrives as SIGINT,
                     // and so does a rolling restart's stop.
                     let terms = try? Runtime.signals(SIGTERM)
+                    #if os(Windows)
+                    // Vega's console handler: Ctrl-C as SIGINT, Ctrl-Break
+                    // as SIGBREAK; closing the console, logging off or
+                    // shutting down as SIGTERM.
+                    let nows = [SIGINT, SIGBREAK].compactMap { try? Runtime.signals($0) }
+                    #else
                     let nows = [SIGINT, SIGQUIT].compactMap { try? Runtime.signals($0) }
+                    #endif
                     let first = await firstSignal(terms.map { [$0] + nows } ?? nows)
                     if first == SIGTERM && delay > .zero {
                         app.unready.store(true, ordering: .relaxed)
@@ -325,7 +331,6 @@ extension Application {
                         for server in all { group.addTask { await server.shutdown(gracePeriod: grace) } }
                     }
                 }
-                #endif
                 for server in all { await server.wait() }
                 await quic?.wait()
                 await app.stopShard(shard)
