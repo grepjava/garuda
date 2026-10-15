@@ -10,9 +10,15 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import StreamingExample
 
 let directory = getenv("UPLOAD_DIRECTORY").map { String(cString: $0) } ?? "uploads"
+#if os(Windows)
+_mkdir(directory)
+#else
 mkdir(directory, 0o755)
+#endif
 streamingApp(uploadDirectory: directory).run()

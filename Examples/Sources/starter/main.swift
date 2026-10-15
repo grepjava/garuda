@@ -20,6 +20,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Garuda
 import StarterExample
@@ -64,7 +66,11 @@ case "serve":
     // Either way every shard signs with the same key.
     let serving = configuration.withDevelopmentKey()
     if configuration.signingKeyPEM == nil, let pem = serving.signingKeyPEM {
+        #if os(Windows)
+        _putenv_s("JWT_PRIVATE_KEY", pem)
+        #else
         setenv("JWT_PRIVATE_KEY", pem, 1)
+        #endif
     }
     // Everything after `serve` is Garuda's own: --port, --shards, --tls-*,
     // --rate-limit, --access-log (CONFIG.md). A leading `--` is what
@@ -84,7 +90,11 @@ enum StandardError {
     static func put(_ text: String) {
         let bytes = Array(text.utf8)
         _ = bytes.withUnsafeBytes { raw in
+            #if os(Windows)
+            raw.baseAddress.map { Int(_write(2, $0, UInt32(raw.count))) } ?? 0
+            #else
             raw.baseAddress.map { write(2, $0, raw.count) } ?? 0
+            #endif
         }
     }
 }

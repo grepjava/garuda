@@ -38,7 +38,7 @@ let swiftSettings: [SwiftSetting] = [
 // Garuda's default has it.
 let vega: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: ["BoringSSL"])
-} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.4"), traits: ["BoringSSL"])
+} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.5"), traits: ["BoringSSL"])
 
 func garuda(_ product: String) -> Target.Dependency {
     .product(name: product, package: "garuda")

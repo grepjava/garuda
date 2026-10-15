@@ -18,10 +18,17 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import FilesExample
 
-let directory = getenv("FILES_DIR").map { String(cString: $0) } ?? "/tmp/garuda-files"
+#if os(Windows)
+let scratch = getenv("TEMP").map { String(cString: $0) } ?? "C:/Windows/Temp"
+#else
+let scratch = "/tmp"
+#endif
+let directory = getenv("FILES_DIR").map { String(cString: $0) } ?? scratch + "/garuda-files"
 let configuration = FilesConfiguration(directory: directory)
 let app = filesApp(configuration)
 
