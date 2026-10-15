@@ -388,10 +388,11 @@ extension ServerConfig {
                                shard accepts on; removed at exit
           --backlog N          listen backlog (default 2048)
           --shards N|auto      shard processes; 0 serves in this process
+                               (default: auto on Linux, 0 elsewhere)
           --balance MODE       how shards share the port: reuseport (a socket
                                each, hashed by the kernel), shared (one socket,
                                taken by whichever is waiting), or auto
-                               (default: auto on Linux, 0 elsewhere)
+                               (default auto)
           --threads N          worker threads per shard (default: its CPUs)
           --no-pin             do not pin shard threads to their CPUs
           --io uring|epoll     the I/O driver (default: io_uring where the

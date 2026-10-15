@@ -158,8 +158,10 @@ public struct RequestBody: Sendable {
     }
 
     /// Ends the request this body belongs to: an HTTP/1.1 connection is
-    /// closed, an HTTP/2 or HTTP/3 stream is reset as cancelled. What had
-    /// arrived is still read, and then the reader throws `incomplete`. For a
+    /// closed, an HTTP/2 or HTTP/3 stream is reset as cancelled. Over HTTP/2
+    /// and HTTP/3 what had arrived is still read, and then the reader throws
+    /// `incomplete`; over HTTP/1.1 the reader throws `incomplete` at once, and
+    /// bytes already buffered are dropped with the connection. For a
     /// request another has superseded, such as an upload resumed on a new
     /// connection while the old one is still open.
     public func cancel() {
