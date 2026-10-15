@@ -43,6 +43,13 @@ database pools, in-memory session and token stores -- belongs to one shard.
 An in-memory store under more than one shard is warned about at start-up;
 use a database or Redis for state every shard must see.
 
+**Nothing may start a thread before `app.run()`.** With shards, the
+supervisor forks, and a fork copies only the calling thread, so Vega stops the
+program if another thread exists by then: a Vega `Runtime` made in `main`, a
+tracer's exporter, a library that starts a background thread. Make such
+things in `app.state`, `onShardStart` or `app.tracing { shard in … }`, which run
+in each shard.
+
 The process names make the shards easy to find: shard *i*'s threads are named
 `garuda-s<i>`.
 
