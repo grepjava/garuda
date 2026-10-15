@@ -36,6 +36,9 @@ struct Exchange: ~Copyable {
     @usableFromInline var consumedBody = 0
     /// A chunked body, decoded.
     @usableFromInline var decodedBody = ByteBuffer()
+    /// The most the body may be, decoded as well (RequestDecompression.swift).
+    /// Set as the body is read.
+    var bodyLimit = Int.max
     /// The peer, as text, made when first asked for.
     @usableFromInline var remote: SocketPeer
     /// What middleware stored for this request (Context.swift).
@@ -49,6 +52,15 @@ struct Exchange: ~Copyable {
     @usableFromInline var forwardedState = ForwardedState.unknown
     /// --static-dir and --spa-fallback, set per connection (StaticFiles.swift).
     var site: StaticSite?
+    /// --compress, set per connection, and the coding this request's client
+    /// accepts (Compression.swift).
+    @usableFromInline var compress = false
+    var compressMinimum = 1024
+    @usableFromInline var acceptedCoding = ContentCoding.identity
+    /// The answer is not to be compressed here: a file, already as it should be.
+    @usableFromInline var noCompress = false
+    /// Where a body is compressed into, swapped with `responseBody`.
+    var compressed = ByteBuffer()
     /// The application serving the connection, for its state. It outlives
     /// every connection it serves.
     var application: Unmanaged<CompiledApplication>?
@@ -141,6 +153,8 @@ struct Exchange: ~Copyable {
         buffer.destroy()
         buffer = requestID
         buffer.destroy()
+        buffer = compressed
+        buffer.destroy()
         jsonWriter?.destroy()
     }
 
@@ -163,6 +177,10 @@ struct Exchange: ~Copyable {
         if !context.isEmpty { context.clear() }
         if !sendHooks.isEmpty { sendHooks = [] }
         if touchedStream { resetStream() }
+        if compress {
+            acceptedCoding = .identity
+            noCompress = false
+        }
         requestID.clear()
         traceParent = nil
         route = -1

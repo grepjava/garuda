@@ -38,6 +38,8 @@ let package = Package(
     platforms: [.macOS("26.4")],
     products: [
         .executable(name: "garuda", targets: ["garuda-server"]),
+        // The routes the end-to-end suites under scripts/ drive.
+        .executable(name: "garuda-conformance", targets: ["garuda-conformance"]),
         .library(name: "Garuda", targets: ["Garuda"]),
         // `app.test`: requests through the real HTTP/1 connection over an
         // in-memory stream.
@@ -77,7 +79,7 @@ let package = Package(
         // password hashes and tokens all use it.
         .target(name: "Garuda",
                 dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS"),
-                               vega("VegaFS")],
+                               vega("VegaFS"), vega("VegaExtras")],
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaTesting",
                 dependencies: ["Garuda", "GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaTest")],
@@ -94,6 +96,9 @@ let package = Package(
         // The benchmark server: the-benchmarker's routes plus the workloads.
         .executableTarget(name: "garuda-server", dependencies: ["Garuda", "GarudaJSON", vega("Vega")],
                           path: "Sources/garuda-server",
+                          swiftSettings: sharedSwiftSettings),
+        .executableTarget(name: "garuda-conformance", dependencies: ["Garuda", vega("VegaExtras")],
+                          path: "Sources/garuda-conformance",
                           swiftSettings: sharedSwiftSettings),
 
         .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),

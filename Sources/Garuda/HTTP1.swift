@@ -55,10 +55,15 @@ struct ConnectionLimits: Sendable {
     var http2: HTTP2Limits
     /// --static-dir and --spa-fallback, or nil for neither (StaticFiles.swift).
     var site: StaticSite?
+    /// --compress and --compress-min-size (Compression.swift).
+    var compress: Bool
+    var compressMinimum: Int
 
     init(_ config: ServerConfig) {
         http2 = HTTP2Limits(config)
         site = StaticSite(config)
+        compress = config.compress
+        compressMinimum = config.compressMinimumLength
         readBufferSize = max(1024, config.readBufferSize)
         maxHeadSize = config.maxHeadSize
         maxHeaders = max(1, config.maxHeaders)
@@ -112,6 +117,8 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     x.pointee.secure = secure
     if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
     if x.pointee.site != nil || limits.site != nil { x.pointee.site = limits.site }
+    x.pointee.compress = limits.compress
+    x.pointee.compressMinimum = limits.compressMinimum
     // Held where a streamed body's writes can reach it while the handler
     // writing it runs (StreamingResponse.swift).
     let held = UnsafeMutablePointer<S>.allocate(capacity: 1)
@@ -185,6 +192,7 @@ struct HTTP1Connection: ~Copyable {
         var matched: Int32 = -1
         if head.hasBody {
             let limit = app.hasBodyLimits ? bodyLimit(app, matched: &matched) : limits.maxBodySize
+            x.pointee.bodyLimit = limit
             guard try await readBody(stream, limit: limit) else { return false }
         }
 
@@ -391,6 +399,7 @@ struct HTTP1Connection: ~Copyable {
         // `Response.onSend` hooks see the answer once it is final, while it
         // can still change (ResponseHooks.swift).
         if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
+        if x.pointee.compress && !x.pointee.noCompress { x.pointee.compressAnswer(omitBody: omitBody) }
         let forbids = HTTPResponseWriter.statusForbidsBody(x.pointee.status)
         let count = forbids ? 0 : x.pointee.responseBody.readableBytes
         writeHTTP1Head(x, parts, keepAlive: keepAlive, framing: forbids ? .none : .length(count))

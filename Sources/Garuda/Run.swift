@@ -267,6 +267,12 @@ extension ServerConfig {
           --sse-keep-alive SECS
                                a comment to an event stream quiet this long
                                (default 15; 0 for none)
+          --compress           compress text responses for clients that accept
+                               it (see BREACH before turning this on)
+          --compress-static    serve file.br, file.zst or file.gz beside a
+                               --static-dir file to clients that accept them
+          --compress-min-size BYTES
+                               leave bodies smaller than this alone (default 1024)
           --static-dir PREFIX=DIR
                                answer GET and HEAD under PREFIX from the files
                                in DIR; a path naming no file falls through
@@ -376,6 +382,15 @@ extension ServerConfig {
                 let directory = slash.map { $0 == path.startIndex ? "/" : String(path[..<$0]) } ?? "."
                 let file = slash.map { String(path[$0...]) } ?? "/" + path
                 config.spaFallbacks.append((String(v[..<eq]), directory, file))
+            case "--compress":
+                config.compress = true
+            case "--compress-static":
+                config.compressStatic = true
+            case "--compress-min-size":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--compress-min-size must be a byte count")
+                }
+                config.compressMinimumLength = n
             case "--static-index":
                 config.staticIndex = true
             case "--static-listing":

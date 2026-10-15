@@ -70,6 +70,21 @@ public struct ServerConfig: Sendable {
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
 
+    // --- compression (Compression.swift) ---
+    /// Compress responses for clients that accept it: text and its kin, and
+    /// only those worth it. Off by default: a page that reflects a secret
+    /// and something an attacker controls leaks the secret a byte at a time
+    /// to anyone who can watch the compressed length (BREACH), and whether an
+    /// application has such a page is its own knowledge.
+    public var compress = false
+    /// Serve `file.br`, `file.zst` or `file.gz` next to a `--static-dir` file
+    /// to a client that accepts it. A static file reflects nothing, so this
+    /// is safe wherever the files themselves are.
+    public var compressStatic = false
+    /// A body declaring fewer bytes than this is sent as it is. Below about
+    /// a kilobyte the saving is smaller than the framing.
+    public var compressMinimumLength = 1024
+
     // --- static files (StaticFiles.swift) ---
     /// URL prefixes answered from directories, `--static-dir /static=/srv/www`:
     /// a GET or HEAD under a prefix is served the file it names, and one

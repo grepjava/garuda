@@ -220,6 +220,10 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
     let status = x.pointee.status
     let bodyless = HTTPResponseWriter.statusForbidsBody(status) || x.pointee.head.method == .head
     let declared = x.pointee.headerKinds.contains(.contentLength) ? declaredLength(x) : -1
+    // --compress: compressed as written, with no length to state, though the
+    // declared one still bounds what the handler writes.
+    let encoder = x.pointee.compress && !x.pointee.noCompress ? x.pointee.streamEncoder(bodyless: bodyless) : nil
+    let stated = encoder == nil ? declared : -1
     let channel: BodyChannel
     switch x.pointee.link {
     case .http1(let held, let parts, let limits):
@@ -227,7 +231,7 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
         if bodyless {
             // A HEAD says the GET's length, when it is known.
             framing = declared >= 0 && x.pointee.head.method == .head ? .length(declared) : .none
-        } else if declared >= 0 {
+        } else if stated >= 0 {
             framing = .length(declared)
         } else if x.pointee.head.httpMinor == 0 {
             // HTTP/1.0 has no chunks: the close is the only end it has.
@@ -238,14 +242,14 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
         }
         writeHTTP1Head(x, parts, keepAlive: x.pointee.keepAlive, framing: framing)
         channel = BodyChannel(http1: held, parts: parts, limits: limits, bodyless: bodyless,
-                              chunked: framing == .chunked, declared: bodyless ? -1 : declared)
+                              chunked: framing == .chunked, declared: bodyless ? -1 : declared, encoder: encoder)
     case .http2(let stream):
         let s = stream.takeUnretainedValue()
-        channel = BodyChannel(http2: s, bodyless: bodyless, declared: bodyless ? -1 : declared)
+        channel = BodyChannel(http2: s, bodyless: bodyless, declared: bodyless ? -1 : declared, encoder: encoder)
         x.pointee.committed = true
         // A HEAD says the GET's length, when it is known.
         let said = x.pointee.head.method == .head && !HTTPResponseWriter.statusForbidsBody(status) ? declared
-            : bodyless ? -1 : declared
+            : bodyless ? -1 : stated
         s.connection.startStreamedAnswer(s, channel: channel, declared: said)
     case .none:
         x.pointee.committed = true
@@ -373,12 +377,16 @@ final class BodyChannel: @unchecked Sendable {
     // HTTP/2.
     private let h2: H2Stream?
 
+    /// --compress: the body is compressed as it is written, each write
+    /// flushed through (Compression.swift). Under the state's lock.
+    private let encoder: ResponseEncoder?
+
     /// One whose writes throw: the request had been answered already.
     init(refusing: Void) {
         bodyless = false
         state = .failed
         remaining = -1
-        held = nil; chunked = false; h2 = nil
+        held = nil; chunked = false; h2 = nil; encoder = nil
         timeout = .seconds(0); high = 0; low = 0; keepAliveDefault = .zero
     }
 
@@ -386,13 +394,14 @@ final class BodyChannel: @unchecked Sendable {
     init(dropping: Void) {
         bodyless = true
         remaining = -1
-        held = nil; chunked = false; h2 = nil
+        held = nil; chunked = false; h2 = nil; encoder = nil
         timeout = .seconds(0); high = 0; low = 0; keepAliveDefault = .zero
     }
 
     init(http1 held: HeldStream, parts: UnsafeMutablePointer<ConnectionParts>, limits: StreamLimits,
-         bodyless: Bool, chunked: Bool, declared: Int) {
+         bodyless: Bool, chunked: Bool, declared: Int, encoder: ResponseEncoder? = nil) {
         self.held = held
+        self.encoder = encoder
         self.bodyless = bodyless
         self.chunked = chunked
         remaining = declared
@@ -409,8 +418,9 @@ final class BodyChannel: @unchecked Sendable {
         }
     }
 
-    init(http2 s: H2Stream, bodyless: Bool, declared: Int) {
+    init(http2 s: H2Stream, bodyless: Bool, declared: Int, encoder: ResponseEncoder? = nil) {
         h2 = s
+        self.encoder = encoder
         self.bodyless = bodyless
         remaining = declared
         held = nil; chunked = false
@@ -463,7 +473,15 @@ final class BodyChannel: @unchecked Sendable {
             }
             if take > 0 {
                 if keepAliveTask != nil { lastWrite = monotonicNanos() }
-                if let s = h2 {
+                if let encoder {
+                    // Flushed with each write, so what the handler sent is
+                    // what the client can read now.
+                    if !encode(encoder, base, take, finishing: false) {
+                        Log.error("compressing a streamed response failed; ending it")
+                        state = .failed
+                        return .refused
+                    }
+                } else if let s = h2 {
                     s.staged.write(base, take)
                     s.backlog &+= take
                     s.connection.wakeWriter()
@@ -604,12 +622,41 @@ final class BodyChannel: @unchecked Sendable {
         guard state == .open else { return }
         state = .finished
         if bodyless { return }
+        if let encoder, !encode(encoder, nil, 0, finishing: true) {
+            Log.error("compressing a streamed response failed; ending it")
+            state = .failed
+            if let s = h2 {
+                s.bodyFailed = true
+                s.bodyEnded = true
+                s.connection.wakeWriter()
+            }
+            return
+        }
         if let s = h2 {
             s.bodyEnded = true
             s.connection.wakeWriter()
         } else if chunked {
             HTTPResponseWriter.writeLastChunk(&pending)
         }
+    }
+
+    /// Under the state's lock: `n` bytes through the encoder onto the queue,
+    /// or its end.
+    private func encode(_ encoder: ResponseEncoder, _ p: UnsafePointer<UInt8>?, _ n: Int,
+                        finishing: Bool) -> Bool {
+        if let s = h2 {
+            let before = s.staged.readableBytes
+            let ok = finishing ? encoder.finish(into: &s.staged, chunked: false)
+                : encoder.encode(p, n, flush: true, into: &s.staged, chunked: false)
+            let added = s.staged.readableBytes - before
+            if added > 0 {
+                s.backlog &+= added
+                s.connection.wakeWriter()
+            }
+            return ok
+        }
+        return finishing ? encoder.finish(into: &pending, chunked: chunked)
+            : encoder.encode(p, n, flush: true, into: &pending, chunked: chunked)
     }
 
     /// The handler has returned: over HTTP/1, moves what is still queued

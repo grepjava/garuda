@@ -62,6 +62,8 @@ final class StaticSite: Sendable {
     let index: Bool
     let listing: Bool
     let listingLimit: Int
+    /// --compress-static.
+    let compress: Bool
 
     init?(_ config: ServerConfig) {
         guard !config.staticDirectories.isEmpty || !config.spaFallbacks.isEmpty else { return nil }
@@ -74,6 +76,7 @@ final class StaticSite: Sendable {
         index = config.staticIndex || config.staticListing
         listing = config.staticListing
         listingLimit = config.staticListingLimit
+        compress = config.compressStatic
     }
 
     /// Whether a `--static-dir` route may answer `path`, as the request has
@@ -137,6 +140,27 @@ func serveStatic(_ x: UnsafeMutablePointer<Exchange>) async -> Bool {
         let relative = String(decoding: decoded[start...], as: UTF8.self)
         do {
             let file = try File.open(beneath: route.directory, relative)
+            if site.compress {
+                // --compress-static: a copy compressed at build time, beside
+                // the file, in the order the client prefers. The original
+                // has to exist too -- a lone `app.js.br` is not a route to
+                // `app.js` -- because a client that accepts nothing still
+                // has to be served.
+                let type = contentType(decoded)
+                let compressible = CompressionEligibility.isCompressible(type.utf8Start, type.utf8CodeUnitCount)
+                for coding in x.pointee.acceptEncoding().ranked({ _ in true }) {
+                    let suffix = coding.fileSuffix
+                    let name = relative + String(decoding: UnsafeBufferPointer(start: suffix.utf8Start,
+                                                                               count: suffix.utf8CodeUnitCount),
+                                                 as: UTF8.self)
+                    if let copy = try? File.open(beneath: route.directory, name) {
+                        await sendStaticFile(x, copy, name: decoded, coding: coding, vary: true)
+                        return true
+                    }
+                }
+                await sendStaticFile(x, file, name: decoded, vary: compressible)
+                return true
+            }
             await sendStaticFile(x, file, name: decoded)
             return true
         } catch {
@@ -180,7 +204,11 @@ func serveSPAFallback(_ x: UnsafeMutablePointer<Exchange>) async -> Bool {
 /// Answers with `file`, whose request path was `name`: the head from what
 /// the filesystem says of it, the request's preconditions and range, then
 /// the bytes.
-func sendStaticFile(_ x: UnsafeMutablePointer<Exchange>, _ file: borrowing File, name: [UInt8]) async {
+func sendStaticFile(_ x: UnsafeMutablePointer<Exchange>, _ file: borrowing File, name: [UInt8],
+                    coding: ContentCoding = .identity, vary: Bool = false) async {
+    // Its bytes are as the directory has them: a compressed copy is chosen
+    // before this, not made by --compress.
+    x.pointee.noCompress = true
     let size: Int
     let mtime: Int64
     do {
@@ -200,7 +228,18 @@ func sendStaticFile(_ x: UnsafeMutablePointer<Exchange>, _ file: borrowing File,
     appendHex(UInt64(bitPattern: mtime), to: &etag)
     etag.append(UInt8(ascii: "-"))
     appendHex(UInt64(size), to: &etag)
+    if coding != .identity {
+        // A compressed copy is a different representation, and a strong
+        // validator says so even if its size and time matched the original's.
+        etag.append(UInt8(ascii: "-"))
+        let token = coding.token
+        etag.append(contentsOf: UnsafeBufferPointer(start: token.utf8Start, count: token.utf8CodeUnitCount))
+    }
     etag.append(UInt8(ascii: "\""))
+    // With pre-compressed copies being served, which bytes a URL gets
+    // depends on Accept-Encoding, and a cache has to be told so -- on the
+    // plain response as much as on a compressed one.
+    if vary { response.addHeader("vary", "Accept-Encoding") }
 
     // Preconditions in the order RFC 9110 section 13.2.2 gives them.
     if failsIfMatch(x, etag) {
@@ -234,6 +273,11 @@ func sendStaticFile(_ x: UnsafeMutablePointer<Exchange>, _ file: borrowing File,
     }
 
     _ = x.pointee.addContentType(contentType(name))
+    if coding != .identity {
+        let token = coding.token
+        response.addHeader("content-encoding", UnsafeBufferPointer(start: token.utf8Start,
+                                                                   count: token.utf8CodeUnitCount).span)
+    }
     response.addHeader("accept-ranges", "bytes")
     etag.withUnsafeBufferPointer { response.addHeader("etag", $0.span) }
     if status == 206 {

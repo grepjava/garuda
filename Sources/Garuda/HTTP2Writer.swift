@@ -299,6 +299,9 @@ extension H2Connection {
     func prepareAnswer(_ s: H2Stream) -> Int {
         let x = s.x
         if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
+        if x.pointee.compress && !x.pointee.noCompress {
+            x.pointee.compressAnswer(omitBody: x.pointee.head.method == .head)
+        }
         x.pointee.committed = true
         if HTTPResponseWriter.statusForbidsBody(x.pointee.status) || x.pointee.head.method == .head { return 0 }
         return x.pointee.responseBody.readableBytes

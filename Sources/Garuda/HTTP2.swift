@@ -1017,6 +1017,8 @@ final class H2Connection: @unchecked Sendable {
             s.x.pointee.secure = secure
             s.x.pointee.trust = limits.trust
             s.x.pointee.site = limits.site
+            s.x.pointee.compress = limits.compress
+            s.x.pointee.compressMinimum = limits.compressMinimum
             made.append(s)
         }
         s.id = id
@@ -1263,6 +1265,7 @@ final class H2Connection: @unchecked Sendable {
         if s.body.readableBytes > 0 {
             x.pointee.body = UnsafePointer(s.body.readPointer)
             x.pointee.bodyCount = s.body.readableBytes
+            x.pointee.bodyLimit = s.bodyLimit
         }
         if streams.count == 1 && runsInline(s) {
             // Still counted as unstarted, so the writer does not take the
