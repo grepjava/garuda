@@ -126,7 +126,7 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     x.pointee.link = .http1(HeldStream(pointer: UnsafeMutableRawPointer(held), writer: writer ?? HeldWriter<S>.self),
                             parts, StreamLimits(limits))
     var connection = HTTP1Connection(limits: limits, parts: parts, cache: app.connections,
-                                     observing: limits.accessLog || !app.observers.isEmpty)
+                                     observing: limits.accessLog || !app.observers.isEmpty || app.metrics != nil)
     await connection.run(held.pointee, app: app)
     x.pointee.link = .none
     let back = held.move()

@@ -80,15 +80,20 @@ final class ConnectionCache: @unchecked Sendable {
                 if p.pointee.exchange.pointee.maxHeaders == limits.maxHeaders
                     && p.pointee.input.capacity >= limits.readBufferSize {
                     p.pointee.exchange.pointee.remote = peer
+                    metrics?.add(.poolHits)
                     return p
                 }
                 free(p)
             }
         }
+        metrics?.add(.poolMisses)
         let p = UnsafeMutablePointer<ConnectionParts>.allocate(capacity: 1)
         p.initialize(to: ConnectionParts(limits: limits, peer: peer))
         return p
     }
+
+    /// --metrics-port's counters, set before the shard serves.
+    nonisolated(unsafe) var metrics: MetricsPage?
 
     /// Takes back parts a connection is done with.
     func give(_ p: UnsafeMutablePointer<ConnectionParts>, limits: ConnectionLimits) {

@@ -177,6 +177,8 @@ func serveConnection<S: AsyncReader & AsyncWriter & ~Copyable, R: AsyncReader & 
     closeWriter: @escaping @Sendable (borrowing W) async -> Void,
     heldWriter: (any HeldWriting.Type)? = nil
 ) async {
+    app.metrics?.add(.connectionsAccepted)
+    defer { app.metrics?.add(.connectionsClosed) }
     guard let http2, limits.http2.enabled else {
         let stream = await serveHTTP1(stream, app: app, limits: limits, peer: peer, secure: secure,
                                       writer: heldWriter)
@@ -463,7 +465,7 @@ final class H2Connection: @unchecked Sendable {
         self.parts = parts
         self.service = service
         self.secure = secure
-        observing = limits.accessLog || !app.observers.isEmpty
+        observing = limits.accessLog || !app.observers.isEmpty || app.metrics != nil
         recvWindow = H2FrameHeader.defaultInitialWindowSize
         resetBudget = settings.resetBudget
         ready.reserveCapacity(16)

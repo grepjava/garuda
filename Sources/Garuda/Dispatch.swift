@@ -28,6 +28,9 @@ func dispatchInline(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplicat
                     observing: Bool) async {
     // --static-dir comes before the routes; a path naming no file falls
     // through to them (StaticFiles.swift).
+    // --health-check-path, then --rate-limit: before anything that costs
+    // work, a static file included.
+    if app.screened && answeredBeforeRouting(x, app) { return }
     if x.pointee.compress { x.pointee.negotiateCoding() }
     if x.pointee.site != nil, await serveStatic(x) { return }
     let path = x.pointee.head.path

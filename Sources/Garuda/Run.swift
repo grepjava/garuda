@@ -79,8 +79,13 @@ extension Application {
         if let redirect = config.redirectHTTPPort {
             options.listeners.append(.tcp(host: config.host, port: redirect, backlog: config.backlog))
         }
-        // The session-ticket key every shard shares (TLS.swift).
-        if !config.tlsCertificates.isEmpty { options.sharedRegions = [TicketKey.regionSize] }
+        if let port = config.metricsPort {
+            options.listeners.append(.tcp(host: config.metricsHost ?? config.host, port: port, backlog: 128))
+        }
+        // The session-ticket key, the rate-limit table and the metrics
+        // every shard shares (SharedMemory.swift).
+        let layout = SharedLayout(config)
+        options.sharedRegions = layout.sizes
         options.name = "garuda-s"
         Runtime.sharded(options) { shard in
             let info = ShardInfo(index: shard.index, count: shard.count, threads: shard.runtime.workerCount)
@@ -91,9 +96,13 @@ extension Application {
             if config.redirectHTTPPort != nil {
                 redirect = { () throws(IOError) -> TCPListener in try shard.listener(1) }
             }
-            var ticketKey: [UInt8]? = nil
-            if !config.tlsCertificates.isEmpty { ticketKey = TicketKey.shared(in: shard.sharedRegion(0)) }
-            let listening = Listening(main: main, redirect: redirect, ticketKey: ticketKey)
+            var metrics: (@Sendable () throws(IOError) -> TCPListener)? = nil
+            if config.metricsPort != nil {
+                let index = config.redirectHTTPPort != nil ? 2 : 1
+                metrics = { () throws(IOError) -> TCPListener in try shard.listener(index) }
+            }
+            let shared = ServerShared(layout, config: config, shard: shard.index) { shard.sharedRegion($0) }
+            let listening = Listening(main: main, redirect: redirect, metrics: metrics, shared: shared)
             Application.serve(shard.runtime, app: app, shard: info, limits: limits, config: config, listening: listening)
         }
         #else
@@ -108,8 +117,14 @@ extension Application {
                 try TCPListener.bind(host: config.host, port: port, backlog: config.backlog)
             }
         }
-        let listening = Listening(main: main, redirect: redirect,
-                                  ticketKey: config.tlsCertificates.isEmpty ? nil : TicketKey.ownKey())
+        var metrics: (@Sendable () throws(IOError) -> TCPListener)? = nil
+        if let port = config.metricsPort {
+            metrics = { () throws(IOError) -> TCPListener in
+                try TCPListener.bind(host: config.metricsHost ?? config.host, port: port, backlog: 128)
+            }
+        }
+        let listening = Listening(main: main, redirect: redirect, metrics: metrics,
+                                  shared: ServerShared(SharedLayout(config), config: config))
         Application.serve(runtime, app: app, shard: info, limits: limits, config: config, listening: listening)
         exit(0)
         #endif
@@ -125,12 +140,15 @@ extension Application {
         return config.http2Enabled ? alpn : ["http/1.1"]
     }
 
-    /// Where a shard listens, and its session-ticket key under TLS.
+    /// Where a shard listens, and what it shares with the others.
     struct Listening: Sendable {
         let main: @Sendable () throws(IOError) -> TCPListener
         /// The --redirect-http port's.
         let redirect: (@Sendable () throws(IOError) -> TCPListener)?
-        let ticketKey: [UInt8]?
+        /// The --metrics-port's.
+        let metrics: (@Sendable () throws(IOError) -> TCPListener)?
+        let shared: ServerShared
+        var ticketKey: [UInt8]? { shared.ticketKey }
     }
 
     /// Shards when `--shards` is not given: Vega's choice from the machine's
@@ -151,6 +169,11 @@ extension Application {
                       config: ServerConfig, listening: Listening) {
         app.costs.configure(config, threads: runtime.workerCount)
         app.runtime = runtime
+        app.rateLimiter = listening.shared.rateLimiter
+        app.metrics = listening.shared.metrics
+        app.connections.metrics = listening.shared.metrics
+        app.healthPath = config.healthCheckPath.map { Array($0.utf8) }
+        app.screened = app.rateLimiter != nil || app.healthPath != nil
         var certificates: CertificateStore? = nil
         if !config.tlsCertificates.isEmpty {
             do {
@@ -197,6 +220,17 @@ extension Application {
                         await serveHTTP1(stream, app: redirector, limits: limits, peer: peer)
                     }
                     Log.info("redirecting http on \(config.host):\(server.port) to https")
+                    servers.append(server)
+                }
+                if let metrics = listening.metrics, let page = listening.shared.metrics {
+                    // A server of its own, never through the application.
+                    let workers = runtime.workerCount * max(1, config.shards ?? 1)
+                    let scraped = metricsApplication(page, workers: workers, cache: false).compile()
+                    let server = try TCPServer.serve(try metrics()) { stream in
+                        let peer = socketPeer(stream)
+                        await serveHTTP1(stream, app: scraped, limits: limits, peer: peer)
+                    }
+                    Log.info("metrics on \(config.metricsHost ?? config.host):\(server.port)/metrics")
                     servers.append(server)
                 }
                 if let tls, let interval = config.tlsReloadInterval {
@@ -267,6 +301,15 @@ extension ServerConfig {
           --sse-keep-alive SECS
                                a comment to an event stream quiet this long
                                (default 15; 0 for none)
+          --rate-limit N/s|m|h requests each client may make, counted across
+                               every shard; 429 past it
+          --rate-limit-burst N requests a client may make at once (default:
+                               the rate's count)
+          --health-check-path P
+                               answer GET P with 200 before routing and
+                               before --rate-limit
+          --metrics-port PORT  serve Prometheus metrics at /metrics on PORT
+          --metrics-host HOST  the interface for it (default: --host's)
           --compress           compress text responses for clients that accept
                                it (see BREACH before turning this on)
           --compress-static    serve file.br, file.zst or file.gz beside a
@@ -382,6 +425,41 @@ extension ServerConfig {
                 let directory = slash.map { $0 == path.startIndex ? "/" : String(path[..<$0]) } ?? "."
                 let file = slash.map { String(path[$0...]) } ?? "/" + path
                 config.spaFallbacks.append((String(v[..<eq]), directory, file))
+            case "--rate-limit":
+                guard let v = value(), let slash = v.firstIndex(of: "/"), let count = Int(v[..<slash]),
+                      count > 0, count <= 100_000_000 else {
+                    return fail("--rate-limit takes requests per second, minute or hour, as in 100/s or 600/m")
+                }
+                let period: UInt64
+                switch v[v.index(after: slash)...] {
+                case "s": period = 1000
+                case "m": period = 60_000
+                case "h": period = 3_600_000
+                default: return fail("--rate-limit takes requests per second, minute or hour, as in 100/s or 600/m")
+                }
+                guard period * 1000 / UInt64(count) > 0 else {
+                    return fail("--rate-limit is more than a request a microsecond")
+                }
+                config.rateLimitCount = count
+                config.rateLimitPeriodMs = period
+            case "--rate-limit-burst":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--rate-limit-burst must be a positive count")
+                }
+                config.rateLimitBurst = n
+            case "--health-check-path":
+                guard let v = value(), v.hasPrefix("/") else {
+                    return fail("--health-check-path must start with /")
+                }
+                config.healthCheckPath = v
+            case "--metrics-port":
+                guard let v = value().flatMap({ Int($0) }), (1...65535).contains(v) else {
+                    return fail("--metrics-port must be between 1 and 65535")
+                }
+                config.metricsPort = v
+            case "--metrics-host":
+                guard let v = value() else { return fail("--metrics-host needs a value") }
+                config.metricsHost = v
             case "--compress":
                 config.compress = true
             case "--compress-static":

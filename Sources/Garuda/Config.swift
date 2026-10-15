@@ -85,6 +85,22 @@ public struct ServerConfig: Sendable {
     /// a kilobyte the saving is smaller than the framing.
     public var compressMinimumLength = 1024
 
+    // --- before the application (RateLimit.swift, Metrics.swift) ---
+    /// Requests each client may make per `rateLimitPeriodMs`, or 0 for no
+    /// limit. Counted across every shard and thread, not per one.
+    public var rateLimitCount = 0
+    public var rateLimitPeriodMs: UInt64 = 1000
+    /// Requests a client may make at once before the rate applies. 0 means
+    /// one period's worth, the count itself.
+    public var rateLimitBurst = 0
+    /// A path answered 200 before routing and before --rate-limit, for a
+    /// load balancer's or an orchestrator's probe; nil for none.
+    public var healthCheckPath: String? = nil
+    /// The port the Prometheus page is served on, at /metrics; nil for none.
+    public var metricsPort: Int? = nil
+    /// The interface it listens on; nil for `host`'s.
+    public var metricsHost: String? = nil
+
     // --- static files (StaticFiles.swift) ---
     /// URL prefixes answered from directories, `--static-dir /static=/srv/www`:
     /// a GET or HEAD under a prefix is served the file it names, and one

@@ -88,6 +88,7 @@ func reportAnswer(_ x: UnsafeMutablePointer<Exchange>, limits: ConnectionLimits,
     let micros = started == 0 ? 0 : Int((monotonicNanos() &- started) / 1000)
     if let app = x.pointee.application {
         app._withUnsafeGuaranteedRef { app in
+            app.metrics?.requestFinished(status: status, micros: started == 0 ? nil : UInt64(micros))
             guard !app.observers.isEmpty else { return }
             let completed = completedRequest(x, app, status: status, micros: micros, headParsed: headParsed)
             for observe in app.observers { observe(completed) }

@@ -356,8 +356,8 @@ public enum Forwarded {
 /// A printable IPv4 or IPv6 address as 16 bytes (IPv4 in the first four),
 /// and its family, 4 or 6. A scope suffix (`fe80::1%eth0`) is not part of the
 /// address.
-func parseIP(_ s: UnsafeMutablePointer<CChar>, _ out16: UnsafeMutablePointer<UInt8>,
-             _ family: inout Int32) -> Bool {
+public func parseIP(_ s: UnsafeMutablePointer<CChar>, _ out16: UnsafeMutablePointer<UInt8>,
+                    _ family: inout Int32) -> Bool {
     for i in 0..<16 { out16[i] = 0 }
     if inet_pton(AF_INET, s, out16) == 1 {
         family = 4

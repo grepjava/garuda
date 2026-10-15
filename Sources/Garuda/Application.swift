@@ -302,6 +302,14 @@ final class CompiledApplication: @unchecked Sendable {
     /// The runtime serving it, for the work a request leaves running beside
     /// its handler: an event stream's keep-alive. Set before it serves.
     var runtime: Runtime?
+    /// What a shard shares with the others: --rate-limit's table and the
+    /// --metrics-port counters (SharedMemory.swift). Set before it serves.
+    var rateLimiter: RateLimiter?
+    var metrics: MetricsPage?
+    /// --health-check-path.
+    var healthPath: [UInt8]?
+    /// Any of the three is on: a request is looked at before routing.
+    var screened = false
     /// This shard's state, and what builds it and stops it (State.swift).
     let services: ServiceTable
     /// How starting went, once a test client has started it.
