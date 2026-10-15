@@ -163,9 +163,9 @@ no flag; set them on a `ServerConfig` and call `app.run(config:)`:
 | `maxHeaders` | `100` | most header fields in a request |
 | `maxRequestsPerConnection` | `0` | requests before a polite close; `0` is unlimited |
 | `pipelineDepth` | `16` | pipelined HTTP/1.1 responses written as one batch |
-| `requestHeadTimeout` | 30 s | time to send a whole head once it has started (the slowloris bound) |
-| `bodyTimeout` | 30 s | time a request body may take to arrive |
-| `writeTimeout` | 30 s | how long one write of a streamed body may wait on a client that is not reading |
+| `requestHeadTimeout` | 30 s | how long each read of a request head may wait once the head has started |
+| `bodyTimeout` | 30 s | how long each read of a request body may wait |
+| `writeTimeout` | 30 s | how long one write of a streamed body may wait on an HTTP/1.1 client that is not reading |
 | `writeHighWaterMark`, `writeLowWaterMark` | 512 KiB, 128 KiB | a streamed body's writes wait above the first until it is down to the second |
 | `tlsHandshakeTimeout` | 10 s | time to finish the TLS handshake |
 | `h2MaxConcurrentStreams` | `128` | HTTP/2 streams a client may have open at once |
