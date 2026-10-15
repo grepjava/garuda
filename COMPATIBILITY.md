@@ -24,10 +24,12 @@ resolves to 2.0.
 5. Replace `onWorkerStart`, `prepare` and `onWorkerShutdown` with
    `onShardStart` and `onShardStop`.
 6. Turn time values into `Duration`s: `app.deadline(.milliseconds(500))`,
-   `app.every(.hours(1))`, `HTTPClient.timeout`, database timeouts.
+   `app.every(.seconds(3600))`, `HTTPClient.timeout`, database timeouts.
 7. Check every command line: `--workers` is now `--shards`, and **`0` means
    one process**, not one per CPU. The ACME flags are gone. Flags keep
-   Garuda 1's names and units; a few are accepted but no longer do anything.
+   Garuda 1's names and units; a few are accepted but no longer do anything,
+   and `--max-connections`, `--blocking-threads` and `--blocking-queue` have
+   new defaults.
 
 ---
 
@@ -199,7 +201,7 @@ A custom extractor adds `async` to its `extract`.
 | `app.onWorkerStart { worker in … }`, `app.prepare(timeoutMilliseconds:) { … }` | `app.onShardStart { start in … }`, with no timeout |
 | `app.onWorkerShutdown { worker in … }` | `app.onShardStop { stop in … }`, run in reverse order |
 | `WorkerStartup` | `ShardContext`: `shard` (a `ShardInfo`: `index`, `count`, `threads`) and `state(_:)` |
-| `app.every(3600, onWorker: 0) { worker in … }`, seconds as `Double` | `app.every(.hours(1), onShard: 0) { shard in … }` |
+| `app.every(3600, onWorker: 0) { worker in … }`, seconds as `Double` | `app.every(.seconds(3600), onShard: 0) { shard in … }` |
 | `app.tracing { worker in … }` | `app.tracing { shard in … }` |
 | `app.jwtVerifier { worker in … }` | `app.jwtVerifier { start in … }`, `async` |
 | `app.listen(…, onWorker:, reconnectAfter: Double)` | `app.listen(…, onShard:, reconnectAfter: Duration)` |
@@ -272,9 +274,19 @@ The fields of removed features are gone with them (below).
 
 ## Command line
 
-Flags keep Garuda 1's names, units and defaults: `--keep-alive`,
+Flags keep Garuda 1's names and units: `--keep-alive`,
 `--request-timeout`, `--graceful-timeout`, `--drain-delay` and the
-`--ws-ping-*` flags are milliseconds as before. What changed:
+`--ws-ping-*` flags are milliseconds as before. Most keep their defaults
+too; three do not:
+
+| flag | Garuda 1's default | Garuda 2's default |
+|---|---|---|
+| `--max-connections` | 4096 per worker | no limit |
+| `--blocking-threads` | 16 per worker | Vega's, 512 per shard |
+| `--blocking-queue` | 1024 per worker | no limit |
+
+A deployment that relied on Garuda 1's bounds passes them. What else
+changed:
 
 | flag | Garuda 1 | Garuda 2 |
 |---|---|---|
