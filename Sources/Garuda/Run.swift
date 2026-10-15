@@ -97,6 +97,7 @@ extension Application {
         }
         Runtime.sharded(options) { shard in
             let info = ShardInfo(index: shard.index, count: shard.count, threads: shard.runtime.workerCount)
+            MemoryStores.warnIfSharded(info)
             let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
                 try shard.listener()
             }

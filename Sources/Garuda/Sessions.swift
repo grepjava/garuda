@@ -39,8 +39,9 @@
 //
 // Each shard is a process, so a `MemorySessionStore` holds the sessions of
 // one shard: with --shards above 1 a client's next request can reach a shard
-// that never saw its session (`problems()` says so). It is for one shard and
-// tests; GarudaRedis and GarudaSQLite have stores for the rest.
+// that never saw its session, which the server warns of as it starts. It is
+// for one shard and tests; GarudaRedis and GarudaSQLite have stores for the
+// rest.
 //===----------------------------------------------------------------------===//
 
 import GarudaWire
@@ -331,7 +332,9 @@ public final class MemorySessionStore: SessionStore, @unchecked Sendable {
     /// before the store is used. The one thing here not behind the lock.
     var clock: @Sendable () -> UInt64 = { monotonicNanos() / 1000 }
 
-    public init() {}
+    public init() {
+        MemoryStores.made("MemorySessionStore")
+    }
 
     /// How many sessions are held, expired ones not yet swept included.
     public var count: Int { state.withLock { $0.sessions.count } }
@@ -379,6 +382,29 @@ public final class MemorySessionStore: SessionStore, @unchecked Sendable {
         return state.withLock { state in
             guard let entry = state.sessions.removeValue(forKey: id) else { return false }
             return entry.expires > now
+        }
+    }
+}
+
+/// The stores that keep what they hold in one shard's memory, by name, as an
+/// application makes them: with more than one shard, the server says so as it
+/// starts (`problems()` would refuse to start, and one shard is a fine way to
+/// run them).
+enum MemoryStores {
+    private static let names = Mutex<Set<String>>([])
+
+    static func made(_ name: String) {
+        names.withLock { _ = $0.insert(name) }
+    }
+
+    /// Warns, once per server, about each store made, when there is more than
+    /// one shard to keep apart.
+    static func warnIfSharded(_ shard: ShardInfo) {
+        guard shard.count > 1, shard.index == 0 else { return }
+        for name in names.withLock({ $0 }).sorted() {
+            Log.warning("\(name) keeps what it holds in each shard's own memory: with \(shard.count) shards, "
+                        + "a client's next request may reach a shard that never saw it. Use a store in "
+                        + "Redis or SQLite, or --shards 1.")
         }
     }
 }

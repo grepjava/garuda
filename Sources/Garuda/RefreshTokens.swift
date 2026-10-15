@@ -291,7 +291,9 @@ public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
 
     private let state = Mutex(State())
 
-    public init() {}
+    public init() {
+        MemoryStores.made("MemoryRefreshTokenStore")
+    }
 
     /// How many families and tokens are held, ended ones not yet swept
     /// included.
