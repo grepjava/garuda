@@ -17,5 +17,7 @@ Changes from upstream:
   aviancore's `av_parse_ip` C shim.
 - `DateCache` is new: pure Swift, one per connection, instead of aviancore's
   C formatter.
+- `HTTPResponseParser` refuses a status below 100, which upstream read as a
+  final response (found by `pgfuzz`).
 
 The aim is to move this module into Vega once Garuda 2 has settled it.

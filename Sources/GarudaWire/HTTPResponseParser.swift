@@ -118,9 +118,11 @@ public enum HTTPResponseParser {
         i &+= 1
 
         // Exactly three digits. Not "at least three": a four-digit code would
-        // otherwise parse as a three-digit one with rubbish after it.
+        // otherwise parse as a three-digit one with rubbish after it. And not
+        // below 100 (RFC 9110 section 15): a code with no class is not a
+        // response a client can know how to read, interim or final.
         if i &+ 2 >= count { return .incomplete }
-        guard base[i] >= cZero, base[i] <= cNine,
+        guard base[i] > cZero, base[i] <= cNine,
               base[i &+ 1] >= cZero, base[i &+ 1] <= cNine,
               base[i &+ 2] >= cZero, base[i &+ 2] <= cNine else {
             return .failure(.badStatusLine)
