@@ -73,6 +73,9 @@ let package = Package(
         // `@PostgresRow`, apart from GarudaPostgres for the same reason
         // GarudaJSON is apart: only it needs swift-syntax.
         .library(name: "GarudaSQL", targets: ["GarudaSQL"]),
+        // Resumable uploads (draft-ietf-httpbis-resumable-upload): a file
+        // store and the draft's routes, over HTTP/1.1, HTTP/2 and HTTP/3.
+        .library(name: "GarudaUploads", targets: ["GarudaUploads"]),
     ],
     // The TLS library under Vega's TLS. BoringSSL, vendored in Vega, is the
     // default: Garuda 1's library, cheaper a request than OpenSSL 3, and no
@@ -144,6 +147,10 @@ let package = Package(
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaSQL", dependencies: ["GarudaPostgres", "GarudaMacros"],
                 swiftSettings: sharedSwiftSettings),
+        // The store is files, through VegaFS; the digests are VegaCrypto's.
+        .target(name: "GarudaUploads",
+                dependencies: ["Garuda", "GarudaWire", vega("Vega"), vega("VegaFS"), vega("VegaCrypto")],
+                swiftSettings: sharedSwiftSettings),
         // The benchmark server: the-benchmarker's routes plus the workloads.
         .executableTarget(name: "garuda-server",
                           dependencies: ["Garuda", "GarudaJSON", "GarudaPostgres", "GarudaSQL", vega("Vega")],
@@ -171,6 +178,10 @@ let package = Package(
                                    vegaDB("VegaDBTracing")],
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaJSONTests", dependencies: ["Garuda", "GarudaJSON"],
+                    swiftSettings: sharedSwiftSettings),
+        .testTarget(name: "GarudaUploadsTests",
+                    dependencies: ["Garuda", "GarudaUploads", "GarudaTesting", "GarudaWire", vega("Vega"),
+                                   vega("VegaFS")],
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaDatabaseTests",
                     dependencies: ["Garuda", "GarudaPostgres", "GarudaRedis", "GarudaSQLite", "GarudaSQL",
