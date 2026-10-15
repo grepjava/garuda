@@ -103,7 +103,7 @@ public struct OffloadedRoutes<Builder: RouteBuilder> {
 @inlinable
 func offloading<each E: Sendable, R: Sendable>(
     _ handler: @escaping @Sendable (repeat each E) throws -> R
-) -> @Sendable (repeat each E) async throws -> R {
+) -> @concurrent @Sendable (repeat each E) async throws -> R {
     { (values: repeat each E) async throws -> R in
         try await Runtime.blocking { try handler(repeat each values) }
     }

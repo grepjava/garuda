@@ -46,13 +46,12 @@ extension RouteBuilder {
     /// pattern, so it takes no `Path` parameters.
     @inlinable
     public func fallback<each E: RequestExtractor, R: ResponseConvertible>(
-        _ handler: @escaping @Sendable (repeat each E) async throws -> R
+        _ handler: @escaping @concurrent @Sendable (repeat each E) async throws -> R
     ) {
         fallback { request, response in
             var parameter = 0
-            let answer = try await handler(
-                repeat try await (each E).extract(from: request, parameter: &parameter))
-            try answer.write(to: response)
+            let values = HandOver((repeat try await (each E).extract(from: request, parameter: &parameter)))
+            try await callTyped(handler, values).value.write(to: response)
         }
     }
 }

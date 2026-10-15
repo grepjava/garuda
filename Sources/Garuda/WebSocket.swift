@@ -381,12 +381,12 @@ func sha1(_ message: [UInt8]) -> [UInt8] {
 /// A handler taking extracted values, in a struct: a function with a
 /// parameter pack cannot be held as a generic value on its own.
 struct VariadicWebSocketHandler<each E>: @unchecked Sendable {
-    let call: (WebSocket, repeat each E) async throws -> Void
+    let call: @concurrent (WebSocket, repeat each E) async throws -> Void
 }
 
 /// Carries what a handler was given onto the task that runs it.
 struct CarriedHandler: @unchecked Sendable {
-    let run: (WebSocket) async throws -> Void
+    let run: @concurrent (WebSocket) async throws -> Void
 }
 
 extension RouteBuilder {
@@ -408,7 +408,7 @@ extension RouteBuilder {
     public func webSocket<each E: RequestExtractor>(
         _ pattern: String,
         subprotocols: [String] = [],
-        _ handler: sending @escaping (WebSocket, repeat each E) async throws -> Void
+        _ handler: sending @escaping @concurrent (WebSocket, repeat each E) async throws -> Void
     ) -> OpenAPIOperation {
         let handler = VariadicWebSocketHandler<repeat each E>(call: handler)
         on(.get, pattern) { request, response in

@@ -779,7 +779,7 @@ func startWebSocketHandler(_ session: WebSocketSession, _ upgrade: WebSocketUpgr
                            offeredSubprotocols: upgrade.offered)
     app.webSockets.add(session)
     let run = upgrade.run
-    let body: @Sendable () async -> Void = {
+    let body: @concurrent @Sendable () async -> Void = {
         var failed = false
         do {
             try await run.run(socket)

@@ -10,8 +10,11 @@ import PackageDescription
 // every Swift entry, with the flag on the command line:
 //   swift build -c release -Xswiftc -enforce-exclusivity=unchecked
 
+// Nonsending by default, as Vega is: an async function runs on its caller's
+// executor, so returning from one is no hop, which on Vega costs a lock.
 let sharedSwiftSettings: [SwiftSetting] = [
     .swiftLanguageMode(.v6),
+    .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
 ]
 
 /// A module of Vega.
@@ -30,7 +33,7 @@ let vegaTraits: Set<Package.Dependency.Trait> = [
 /// Garuda needs.
 let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.3.5"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.0"), traits: vegaTraits)
 
 let package = Package(
     name: "garuda",
