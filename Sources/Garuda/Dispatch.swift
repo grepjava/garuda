@@ -26,6 +26,17 @@ func dispatch(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, m
 @inline(__always)
 func dispatchInline(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, matched: Int32 = -1,
                     observing: Bool) async {
+    // `app.tracing`: the same, inside the request's span (Tracing.swift).
+    if let tracer = app.tracer {
+        return await tracedDispatch(x, app, tracer, matched: matched, observing: observing)
+    }
+    await dispatchRouted(x, app, matched: matched, observing: observing)
+}
+
+/// `dispatchInline`, untraced, or inside the request's span.
+@inline(__always)
+func dispatchRouted(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, matched: Int32,
+                    observing: Bool) async {
     // --static-dir comes before the routes; a path naming no file falls
     // through to them (StaticFiles.swift).
     // --health-check-path, then --rate-limit: before anything that costs
@@ -122,6 +133,7 @@ func runHandler(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication,
         if !cutStream(x, nil, observing: false) { answerFailure(x) }
     } catch {
         if !cutStream(x, error, observing: observing) {
+            x.pointee.span?.recordError(error)
             Log.error("handler threw: \(error)")
             if observing { x.pointee.failure = "handler threw: \(error)" }
             answerFailure(x)
@@ -149,6 +161,7 @@ func cutStream(_ x: UnsafeMutablePointer<Exchange>, _ error: (any Error)?, obser
     }
     channel.handlerFailed = true
     if let error {
+        x.pointee.span?.recordError(error)
         Log.error("handler threw part-way through a streamed response: \(error)")
         if observing { x.pointee.failure = "handler threw part-way through a streamed response: \(error)" }
     }

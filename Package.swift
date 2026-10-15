@@ -40,7 +40,7 @@ let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].ma
 /// to the same checkout as GARUDA_VEGA_PATH.
 let vegaDBPackage: Package.Dependency = Context.environment["GARUDA_VEGA_DB_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.2.0"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.2.2"), traits: vegaTraits)
 
 /// A module of vega-db.
 func vegaDB(_ name: String) -> Target.Dependency {
@@ -91,6 +91,9 @@ let package = Package(
         // PostgreSQL, Redis and SQLite. Resolved by everyone, built only for
         // an application that imports one of the database products.
         vegaDBPackage,
+        // Traces: a request's span, and its outbound calls' under it
+        // (Tracing.swift). The API alone; the application picks a tracer.
+        .package(url: "https://github.com/apple/swift-distributed-tracing", from: "1.3.0"),
         // Only the `GarudaJSON` plugin builds against this. It is still
         // resolved by everyone who depends on Garuda, because SwiftPM resolves
         // a package's dependencies whether or not a product uses them.
@@ -110,7 +113,8 @@ let package = Package(
         .target(name: "CGarudaShared"),
         .target(name: "Garuda",
                 dependencies: ["GarudaWire", "CGarudaShared", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS"),
-                               vega("VegaFS"), vega("VegaExtras")],
+                               vega("VegaFS"), vega("VegaExtras"), vegaDB("VegaDBTracing"),
+                               .product(name: "Tracing", package: "swift-distributed-tracing")],
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaTesting",
                 dependencies: ["Garuda", "GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaTest")],
@@ -145,13 +149,17 @@ let package = Package(
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaTests",
                     dependencies: ["Garuda", "GarudaWire", "GarudaTesting", "CAllocationCounter",
-                                   vega("Vega")],
+                                   vega("Vega"),
+                                   .product(name: "Tracing", package: "swift-distributed-tracing"),
+                                   .product(name: "InMemoryTracing", package: "swift-distributed-tracing"),
+                                   vegaDB("VegaDBTracing")],
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaJSONTests", dependencies: ["Garuda", "GarudaJSON"],
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaDatabaseTests",
                     dependencies: ["Garuda", "GarudaPostgres", "GarudaRedis", "GarudaSQLite", "GarudaSQL",
-                                   "GarudaWire", "GarudaTesting", vega("Vega")],
+                                   "GarudaWire", "GarudaTesting", vega("Vega"),
+                                   .product(name: "InMemoryTracing", package: "swift-distributed-tracing")],
                     swiftSettings: sharedSwiftSettings),
     ]
 )

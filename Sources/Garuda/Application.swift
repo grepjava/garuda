@@ -12,6 +12,7 @@
 
 import GarudaWire
 import Synchronization
+import Tracing
 import Vega
 
 /// GET, POST and the rest, as routes are registered by them.
@@ -122,6 +123,8 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     var trailingSlashPolicy = TrailingSlash.strict
     /// `app.onResponse` registrations (ResponseObservers.swift).
     var responseObservers: [ResponseObserver] = []
+    /// What `tracing` makes each shard's tracer with (Tracing.swift).
+    var makeTracer: (@Sendable (Int) -> any Tracer)?
     /// Each route's OpenAPI entry, what scopes add to them, and the
     /// documents `openAPI` serves (OpenAPI.swift).
     var documentation = APIDocumentation()
@@ -260,7 +263,7 @@ public final class Application: RouteBuilder, @unchecked Sendable {
                                            observers: responseObservers,
                                            fallbacks: CompiledFallbacks(fallbacks.map(\.pattern),
                                                                         first: routes.count),
-                                           bodyLimits: bodyLimits)
+                                           bodyLimits: bodyLimits, makeTracer: makeTracer)
         compiledApplication = compiled
         return compiled
     }
@@ -312,6 +315,10 @@ final class CompiledApplication: @unchecked Sendable {
     var cache: ResponseCache?
     /// --health-check-path.
     var healthPath: [UInt8]?
+    /// What `app.tracing` makes each shard's tracer with, and the one this
+    /// shard made: set before it serves (Tracing.swift).
+    let makeTracer: (@Sendable (Int) -> any Tracer)?
+    var tracer: (any Tracer)?
     /// Any of the three is on: a request is looked at before routing.
     var screened = false
     /// This shard's state, and what builds it and stops it (State.swift).
@@ -346,8 +353,10 @@ final class CompiledApplication: @unchecked Sendable {
          trailingSlash: TrailingSlash = .strict,
          observers: [ResponseObserver] = [],
          fallbacks: CompiledFallbacks = CompiledFallbacks(),
-         bodyLimits: [Int] = []) {
+         bodyLimits: [Int] = [],
+         makeTracer: (@Sendable (Int) -> any Tracer)? = nil) {
         self.table = table
+        self.makeTracer = makeTracer
         self.trailingSlash = trailingSlash
         self.observers = observers
         self.fallbacks = fallbacks

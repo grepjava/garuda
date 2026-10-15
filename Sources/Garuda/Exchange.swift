@@ -159,6 +159,8 @@ struct Exchange: ~Copyable {
     /// Why the route answered 5xx on its own account, for the response
     /// observers (ResponseObservers.swift).
     @usableFromInline var failure: String?
+    /// The request's server span, while it is traced (Tracing.swift).
+    var span: RequestSpan?
 
     init(maxHeaders: Int, remote: SocketPeer) {
         self.maxHeaders = maxHeaders

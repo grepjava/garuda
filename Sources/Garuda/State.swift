@@ -153,6 +153,7 @@ extension CompiledApplication {
     /// a factory or hook throws.
     func startShard(_ shard: ShardInfo) async throws {
         let context = ShardContext(shard: shard, services: services)
+        startTracing()
         for factory in stateFactories {
             do {
                 services.add(factory.key, try await factory.make(context))
@@ -167,6 +168,7 @@ extension CompiledApplication {
                 throw ShardStartError(what: "onShardStart hook \(i + 1)", error: error)
             }
         }
+        makeShardTracer(shard)
     }
 
     /// Runs the stop hooks, then shuts the state down, newest first.

@@ -491,7 +491,7 @@ final class H2Connection: @unchecked Sendable {
         self.parts = parts
         self.service = service
         self.secure = secure
-        observing = limits.accessLog || !app.observers.isEmpty || app.metrics != nil
+        observing = limits.accessLog || !app.observers.isEmpty || app.metrics != nil || app.tracer != nil
         acceptsConnectProtocol = limits.websocket.overHTTP2
         recvWindow = H2FrameHeader.defaultInitialWindowSize
         resetBudget = settings.resetBudget

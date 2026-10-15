@@ -8,6 +8,8 @@ import Garuda
 import GarudaRedis
 @testable import GarudaSQLite
 import GarudaSQL
+import GarudaTesting
+import InMemoryTracing
 import Testing
 import Vega
 
@@ -186,6 +188,26 @@ struct PostgresTypeTests {
             return refused
         }
         #expect(refused == 4)
+    }
+
+    @Test func aStatementInATracedRequestIsASpanUnderIt() throws {
+        let tracer = InMemoryTracer()
+        let configuration = postgresTarget!
+        let app = Application()
+        app.tracing { _ in tracer }
+        // Made in the shard, once tracing is installed: traced without being told.
+        app.state { _ in PostgresPool(configuration, maxConnections: 1) }
+        app.get("/answer") { (db: State<PostgresPool>) in
+            String(try await db.value.first(Int.self, "select 41 + 1") ?? 0)
+        }
+        #expect(try app.test.get("/answer").text == "42")
+        let spans = tracer.finishedSpans
+        let request = try #require(spans.first { $0.operationName == "GET /answer" })
+        let select = try #require(spans.first { $0.operationName == "SELECT" })
+        #expect(select.parentSpanID == request.spanID)
+        #expect(select.attributes.get("db.system.name") == .string("postgresql"))
+        #expect(select.attributes.get("db.query.text") == .string("select 41 + 1"))
+        DatabaseTracing.installed = nil
     }
 
     @Test func thePostgresRowMacroReadsWhatCodableReads() throws {
