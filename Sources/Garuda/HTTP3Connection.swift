@@ -695,6 +695,7 @@ final class H3Connection {
         case .ok:
             break
         }
+        if let root = endpoint.app.rootPath { stripRootPath(s.x, root) }
         streams[id] = s
         s.inTable = true
         if Int64(id) > highestRequest { highestRequest = Int64(id) }
@@ -750,6 +751,8 @@ final class H3Connection {
         }
         s.id = id
         s.isSpare = false
+        // --request-start-header: the HEADERS frame is the request arriving.
+        if endpoint.limits.requestStart { s.x.pointee.requestStart = wallClockMicros() }
         s.inTable = false
         s.taskActive = false
         s.receiving = false
@@ -1013,7 +1016,9 @@ final class H3Connection {
                 quic.send(s.id, s.x.pointee.responseBody.readPointer + s.bodySent, n, fin: false)
                 s.bodySent &+= n
             }
-            if s.bodySent == length { endSend(s, resetCode: nil) }
+            // A body short of its declared length is reset, not ended: a FIN
+            // would tell the client the truncated body was all of it.
+            if s.bodySent == length { endSend(s, resetCode: s.short ? HTTP3Error.internalError : nil) }
         } else if streamed && ended {
             // A body cut off part-way cannot be ended honestly.
             endSend(s, resetCode: failed ? code : nil)

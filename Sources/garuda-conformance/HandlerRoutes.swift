@@ -178,8 +178,8 @@ func addHandlerRoutes(_ app: Application) {
         json.raw(",\"port\":\(request.remotePort)")
         json.raw(",\"requestID\":")
         json.optional(request.requestID)
-        // Garuda 2 has no --request-start-header.
-        json.raw(",\"requestStart\":null")
+        json.raw(",\"requestStart\":")
+        if let start = request.requestStart { json.raw("\(start)") } else { json.raw("null") }
         json.raw(",\"started\":\(startedShard)")
         json.raw(",\"pid\":\(getpid())")
         json.raw(",\"headers\":[")

@@ -7,7 +7,7 @@
 //                                every 64 KiB read, ?hold=1 waits 1.5 s before
 //                                reading anything
 //   POST /body-limited           /body-stream, held to 1 KiB
-//   POST /interim                a 103 with a Link, then 200
+//   POST /interim                a 103 with a Link, then 200 (HandlerRoutes.swift)
 //   POST /files                  resumable uploads, kept in $GARUDA_UPLOAD_DIR;
 //                                a finished one is answered 201 "<bytes>
 //                                <fnv-1a hex>" and removed
@@ -76,10 +76,7 @@ func addUploadRoutes(_ app: Application) {
         response.send(sum.text)
     }
 
-    app.post("/interim") { _, response in
-        await response.sendInterim(status: HTTPStatus(103), headers: [("Link", "</style.css>; rel=preload")])
-        response.send("final")
-    }
+    // POST /interim, which upload-test.py also drives, is HandlerRoutes'.
 
     guard let directory = getenv("GARUDA_UPLOAD_DIR").map({ String(cString: $0) }),
           let store = try? FileUploadStore(directory: directory) else { return }

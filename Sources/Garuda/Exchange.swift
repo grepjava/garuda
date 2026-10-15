@@ -45,6 +45,13 @@ struct Exchange: ~Copyable {
     @usableFromInline var context = ContextSlots()
     /// The connection is TLS (TLS.swift).
     @usableFromInline var secure = false
+    /// --scheme https: a request without TLS is taken as HTTPS all the same.
+    /// Set per connection.
+    @usableFromInline var assumeHTTPS = false
+    /// With --request-start-header, when the request arrived, in microseconds
+    /// since the epoch; 0 otherwise. Set by the connection as the request's
+    /// first bytes arrive.
+    @usableFromInline var requestStart: UInt64 = 0
     /// Alt-Svc and Strict-Transport-Security, as the connection's transport
     /// calls for them, or nil: set per connection (HTTP1.swift).
     var serverFields: ServerFields?
@@ -339,6 +346,60 @@ struct Exchange: ~Copyable {
     }
 }
 
+/// How a whole answer's body is framed, held to the Content-Length its
+/// handler declared. A longer body is cut to the declared length, and a
+/// shorter one is sent as it is but flagged, so the protocol can end the
+/// message the way a truncated one must -- the HTTP/1.1 connection closed,
+/// the stream reset -- and no client takes it for whole.
+struct WholeFraming {
+    /// The Content-Length the head states, or -1 for none.
+    var stated: Int
+    /// The body bytes that go out.
+    var sending: Int
+    /// The body falls short of the stated length, so the message cannot be
+    /// ended as if it were whole.
+    var short = false
+    /// The body disagrees with its declared length either way. On HTTP/1.1
+    /// nothing after it can be framed, so the connection carries no more.
+    var misframed = false
+}
+
+/// `x`'s whole answer framed against the Content-Length its handler set.
+/// `omitBody` is a HEAD's, which states the GET's length and sends none of
+/// the body.
+@inline(__always)
+func wholeFraming(_ x: UnsafeMutablePointer<Exchange>, omitBody: Bool) -> WholeFraming {
+    let forbids = HTTPResponseWriter.statusForbidsBody(x.pointee.status)
+    let count = forbids ? 0 : x.pointee.responseBody.readableBytes
+    // Most answers declare nothing, and are spared looking through their
+    // headers for a length.
+    if !x.pointee.headerKinds.contains(.contentLength) {
+        return WholeFraming(stated: forbids ? -1 : count, sending: omitBody ? 0 : count)
+    }
+    return declaredFraming(x, forbids: forbids, count: count, omitBody: omitBody)
+}
+
+/// `wholeFraming` for an answer whose handler set a Content-Length.
+@inline(never)
+func declaredFraming(_ x: UnsafeMutablePointer<Exchange>, forbids: Bool, count: Int,
+                     omitBody: Bool) -> WholeFraming {
+    let declared = declaredLength(x)
+    if forbids {
+        // RFC 9110 section 8.6: a 304 may state the length of the
+        // representation it stands for, while a 204 or a 1xx never states
+        // one.
+        return WholeFraming(stated: x.pointee.status == 304 ? declared : -1, sending: 0)
+    }
+    if declared < 0 { return WholeFraming(stated: count, sending: omitBody ? 0 : count) }
+    // A HEAD's length describes the body a GET would have had. Withholding
+    // that body is the point, so a HEAD is never short.
+    if omitBody || declared == count {
+        return WholeFraming(stated: declared, sending: omitBody ? 0 : count)
+    }
+    return WholeFraming(stated: declared, sending: min(count, declared), short: count < declared,
+                        misframed: true)
+}
+
 /// The address of the peer of a connection: given, or looked up from the
 /// socket the first time a handler asks. Most never do, and a lookup is a
 /// system call and a String for every connection.
@@ -403,6 +464,15 @@ public struct Request: ~Copyable {
     /// How many parameters the matched route's pattern names.
     public var parameterCount: Int { exchange.pointee.parameters.count }
 
+    /// With --request-start-header, when the request arrived, in microseconds
+    /// since the epoch; nil without it. For an APM agent that reports queue
+    /// time: everything that happened before the handler was called. A
+    /// proxy's own X-Request-Start is still among the headers, and is the
+    /// better time when there is one, the proxy having seen the request first.
+    public var requestStart: UInt64? {
+        let start = exchange.pointee.requestStart
+        return start == 0 ? nil : start
+    }
 
     // MARK: Lent bytes
 

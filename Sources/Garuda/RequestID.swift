@@ -113,9 +113,21 @@ extension Exchange {
         put(low, from: 48, count: 12)
     }
 
-    /// Notes where a valid traceparent lies in the request, if it has one.
+    /// Notes where a valid traceparent lies in the request, if it has one and
+    /// only one.
     mutating func readTraceParent() {
-        guard let value = header("traceparent", 11), TraceContext.valid(value.base, value.count) else { return }
+        let name: StaticString = "traceparent"
+        guard let first = headerIndex(name) else { return }
+        // Two say two different things, and neither can be believed over
+        // the other (W3C Trace Context, 3.2): the request has none.
+        var i = first &+ 1
+        while i < head.headerCount {
+            let h = headers[i]
+            if h.name.count == 11, equalsIgnoringCase(base + Int(h.name.offset), name.utf8Start, 11) { return }
+            i &+= 1
+        }
+        let value = slice(headers[first].value)
+        guard TraceContext.valid(value.base, value.count) else { return }
         traceParent = value.base
     }
 

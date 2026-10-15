@@ -48,6 +48,10 @@ struct ConnectionLimits: Sendable {
     /// none (Forwarded.swift).
     var trust: ForwardedTrust?
     var traceContext: Bool
+    /// --scheme https (Forwarded.swift).
+    var assumeHTTPS: Bool
+    /// --request-start-header: each request is stamped as it arrives.
+    var requestStart: Bool
     /// --access-log, as text or JSON (Logging.swift).
     var accessLog: Bool
     var accessLogJSON: Bool
@@ -104,6 +108,8 @@ struct ConnectionLimits: Sendable {
         requestIDTrust = config.requestID && !config.trust.isEmpty ? config.trust : nil
         trust = config.trust.isEmpty ? nil : config.trust
         traceContext = config.traceContext
+        assumeHTTPS = config.assumeHTTPS
+        requestStart = config.requestStartHeader
         accessLog = config.accessLog
         accessLogJSON = config.accessLogJSON
     }
@@ -172,6 +178,7 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     }
     // The exchange is reused from connection to connection: set both.
     x.pointee.secure = secure
+    x.pointee.assumeHTTPS = limits.assumeHTTPS
     x.pointee.serverFields = secure ? limits.secureFields : limits.plainFields
     if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
     if x.pointee.site != nil || limits.site != nil { x.pointee.site = limits.site }
@@ -250,9 +257,20 @@ struct HTTP1Connection: ~Copyable {
         _ stream: borrowing S, app: CompiledApplication
     ) async throws -> Bool {
         x.pointee.reset()
+        if limits.requestStart { x.pointee.requestStart = 0 }
         guard try await readHead(stream) else { return false }
+        // Pipelined: its bytes were here before it was looked at.
+        if limits.requestStart && x.pointee.requestStart == 0 { x.pointee.requestStart = wallClockMicros() }
+        if let root = app.rootPath { stripRootPath(x, root) }
 
         let head = x.pointee.head
+        // --no-websockets: an upgrade to a WebSocket is refused whatever
+        // the route, as Garuda 1 refused it, rather than answered as the
+        // plain GET a route that knows nothing of WebSockets takes it for.
+        if head.flags.contains(.upgrade) && x.pointee.websocketsRefused && asksForWebSocket(x) {
+            try await failAndClose(stream, status: 501)
+            return false
+        }
         // A route matched before its body was read, for its scope's body
         // limit; -1 when the dispatch matches (RequestLimits.swift).
         var matched: Int32 = -1
@@ -295,6 +313,8 @@ struct HTTP1Connection: ~Copyable {
                 x.pointee.keepAlive = false
             }
         }
+        // Something answered with the connection's end: the HTTPS redirect.
+        if !x.pointee.keepAlive { keepAlive = false }
 
         if let upgrade = x.pointee.upgrade {
             // The connection is the WebSocket's from here: the 101, and
@@ -318,7 +338,7 @@ struct HTTP1Connection: ~Copyable {
         } else {
             // A handler's body is only sent when there is room for it to be
             // framed: never on HEAD, 1xx, 204 or 304.
-            writeResponse(keepAlive: keepAlive, omitBody: head.method == .head)
+            writeResponse(keepAlive: &keepAlive, omitBody: head.method == .head)
             if observing { report(status: x.pointee.status) }
             if largeBody > 0 {
                 let count = largeBody
@@ -370,7 +390,10 @@ struct HTTP1Connection: ~Copyable {
                     try await failAndClose(stream, status: error.status, headParsed: false)
                     return false
                 case .incomplete:
-                    break
+                    // The parser starts from a fresh head, and parses all of
+                    // it again once more has arrived: what it noted of this
+                    // part -- a Host seen, a length -- would be noted twice.
+                    x.pointee.head = HTTPRequestHead()
                 }
             }
             // Waiting: whatever has been answered goes out first.
@@ -385,6 +408,8 @@ struct HTTP1Connection: ~Copyable {
                 try await stream.read(into: &parts.pointee.input)
             }
             if n == 0 { return false }
+            // The request's first bytes: when it arrived.
+            if available == 0 && limits.requestStart { x.pointee.requestStart = wallClockMicros() }
         }
     }
 
@@ -533,17 +558,28 @@ struct HTTP1Connection: ~Copyable {
 
     // MARK: Writing
 
-    /// Writes the exchange's response into `output`.
-    mutating func writeResponse(keepAlive: Bool, omitBody: Bool) {
+    /// Writes the exchange's response into `output`. `keepAlive` turns false
+    /// when a body that disagrees with its declared length leaves the
+    /// connection unable to frame another.
+    mutating func writeResponse(keepAlive: inout Bool, omitBody: Bool) {
         // `Response.onSend` hooks see the answer once it is final, while it
         // can still change (ResponseHooks.swift).
         if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
         if x.pointee.touchedStream { cacheAnswer(x) }
         if x.pointee.compress && !x.pointee.noCompress { x.pointee.compressAnswer(omitBody: omitBody) }
-        let forbids = HTTPResponseWriter.statusForbidsBody(x.pointee.status)
-        let count = forbids ? 0 : x.pointee.responseBody.readableBytes
-        writeHTTP1Head(x, parts, keepAlive: keepAlive, framing: forbids ? .none : .length(count))
-        if count > 0 && !omitBody {
+        let framing = wholeFraming(x, omitBody: omitBody)
+        if framing.misframed {
+            // Bytes past the declared length would be read as the next
+            // response, and a body short of it leaves the client waiting for
+            // the rest: either way this is the last response the connection
+            // carries, and its close is what tells the client it is cut short.
+            keepAlive = false
+            x.pointee.keepAlive = false
+        }
+        writeHTTP1Head(x, parts, keepAlive: keepAlive,
+                       framing: framing.stated >= 0 ? .length(framing.stated) : .none)
+        let count = framing.sending
+        if count > 0 {
             // A large body is sent from where it is, after the head, rather
             // than copied behind it: a copy of a megabyte costs more than
             // the extra write.
@@ -625,6 +661,19 @@ func writeHTTP1Head(_ x: UnsafeMutablePointer<Exchange>, _ parts: UnsafeMutableP
         parts.pointee.output.write("Connection: keep-alive\r\n")
     }
     HTTPResponseWriter.endHead(&parts.pointee.output)
+}
+
+/// Whether the request's Upgrade names websocket.
+func asksForWebSocket(_ x: UnsafeMutablePointer<Exchange>) -> Bool {
+    let name: StaticString = "upgrade"
+    guard let value = x.pointee.header(name.utf8Start, name.utf8CodeUnitCount), value.count >= 9 else { return false }
+    let websocket: StaticString = "websocket"
+    var i = 0
+    while i &+ 9 <= value.count {
+        if equalsIgnoringCase(value.base + i, websocket.utf8Start, 9) { return true }
+        i &+= 1
+    }
+    return false
 }
 
 /// A `ResponseError` as the answer.

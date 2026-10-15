@@ -71,18 +71,21 @@ final class CertificateStore: Sendable {
     let files: [TLSCertificateFiles]
     let protocols: [String]
     let ticketKey: [UInt8]?
+    /// --tls-ciphers, or nil for the library's.
+    let ciphers: String?
     private let entries: Mutex<[Entry]>
     /// The context every handshake starts in; its hook picks the real one.
     private(set) nonisolated(unsafe) var handshakeContext: TLSContext!
 
     /// Loads `files`, offering `protocols` by ALPN. Throws what is wrong with
     /// a file, a pair, or a key that does not match its certificate.
-    init(files: [TLSCertificateFiles], protocols: [String], ticketKey: [UInt8]?) throws {
+    init(files: [TLSCertificateFiles], protocols: [String], ticketKey: [UInt8]?, ciphers: String? = nil) throws {
         precondition(!files.isEmpty, "TLS with no certificate")
         self.files = files
         self.protocols = protocols
         self.ticketKey = ticketKey
-        entries = Mutex(try CertificateStore.load(files, protocols: protocols, ticketKey: ticketKey))
+        self.ciphers = ciphers
+        entries = Mutex(try CertificateStore.load(files, protocols: protocols, ticketKey: ticketKey, ciphers: ciphers))
         let first = entries.withLock { $0[0] }
         var configuration = first.context.configuration
         configuration.selectContext = { [unowned self] hello in self.context(for: hello.serverName) }
@@ -90,7 +93,7 @@ final class CertificateStore: Sendable {
     }
 
     private static func load(_ files: [TLSCertificateFiles], protocols: [String],
-                             ticketKey: [UInt8]?) throws -> [Entry] {
+                             ticketKey: [UInt8]?, ciphers: String?) throws -> [Entry] {
         try files.map { pair in
             let certificate: CertificateKey
             do {
@@ -101,7 +104,16 @@ final class CertificateStore: Sendable {
             var configuration = TLSConfiguration.server(identity: try TLSIdentity.files(chain: pair.chain, key: pair.key),
                                                         applicationProtocols: protocols)
             configuration.ticketKey = ticketKey
-            return Entry(certificate: certificate, context: try TLSContext(configuration))
+            configuration.cipherList = ciphers
+            let context: TLSContext
+            do {
+                context = try TLSContext(configuration)
+            } catch {
+                guard let ciphers else { throw error }
+                // Most likely the list: name it, as the library's error may not.
+                throw TLSSetupError("\(pair.chain): --tls-ciphers \(ciphers): \(error)")
+            }
+            return Entry(certificate: certificate, context: context)
         }
     }
 
@@ -122,11 +134,24 @@ final class CertificateStore: Sendable {
         entries.withLock { $0.map(\.certificate) }
     }
 
+    /// Logs the names each certificate covers, when there are several: a
+    /// name served by the wrong one shows up here at start-up rather than as
+    /// a browser's warning.
+    func logNames() {
+        let keys = certificateKeys()
+        guard keys.count > 1 else { return }
+        for (i, key) in keys.enumerated() {
+            for name in key.serverNames {
+                Log.info("tls: certificate \(i + 1)\(i == 0 ? " (default)" : "") serves \(name)")
+            }
+        }
+    }
+
     /// Reads the files again and serves what they hold from the next
     /// handshake on. Throws, and keeps serving the old ones, when they are
     /// not a usable set.
     func reload() throws {
-        let fresh = try CertificateStore.load(files, protocols: protocols, ticketKey: ticketKey)
+        let fresh = try CertificateStore.load(files, protocols: protocols, ticketKey: ticketKey, ciphers: ciphers)
         entries.withLock { $0 = fresh }
     }
 
@@ -299,6 +324,9 @@ func httpsRedirectApplication(httpsPort: Int, acmeWebroot: String? = nil) -> App
     }
     app.fallback { request, response in
         let x = request.exchange
+        // A client sent to https has no more use for this connection, and a
+        // plain-HTTP one kept open is only something to hold.
+        x.pointee.keepAlive = false
         var location = ByteBuffer()
         defer { location.destroy() }
         let host = x.pointee.header(hostName.utf8Start, hostName.utf8CodeUnitCount)

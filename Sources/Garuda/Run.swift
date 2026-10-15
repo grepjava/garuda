@@ -48,6 +48,7 @@ extension Application {
         }
         if let level = config.logLevel { Log.level = level }
         AppLogOutput.json = config.logJSON
+        for flag in config.ignoredFlags { Log.warning("\(flag) has no effect in Garuda 2") }
         #if !os(Windows)
         // Idle workers spin briefly before they sleep (Vega's default;
         // VEGA_SPIN_NS sets it, 0 to sleep at once). On cores of its own a
@@ -62,8 +63,8 @@ extension Application {
         // than by every shard as it starts.
         if !config.tlsCertificates.isEmpty {
             do {
-                _ = try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn(for: config),
-                                         ticketKey: nil)
+                try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn(for: config),
+                                     ticketKey: nil, ciphers: config.tlsCiphers).logNames()
             } catch {
                 Log.error("TLS: \(error)")
                 exit(2)
@@ -74,13 +75,16 @@ extension Application {
         var options = ShardOptions(shards: config.shards ?? Application.defaultShards,
                                    workersPerShard: config.threads)
         options.pinThreads = config.pinThreads
+        if let threads = config.blockingThreads { options.blockingThreads = threads }
         switch config.balance {
         case .reusePort?: options.listenerMode = .perShard
         case .shared?: options.listenerMode = .shared
         case nil: break
         }
         options.shutdownGracePeriod = config.drainDelay + config.gracefulShutdown + .seconds(5)
-        options.listeners = [.tcp(host: config.host, port: config.port, backlog: config.backlog)]
+        options.listeners = [config.unixPath.map { .unix(path: $0, backlog: config.backlog) }
+                             ?? .tcp(host: config.host, port: config.port, backlog: config.backlog)]
+        if let path = config.unixPath { UnixSocketRemoval.atExit(path) }
         if let redirect = config.redirectHTTPPort {
             options.listeners.append(.tcp(host: config.host, port: redirect, backlog: config.backlog))
         }
@@ -94,6 +98,7 @@ extension Application {
         options.name = "garuda-s"
         let reload = ReloadLog()
         options.onEvent = { event in reload.saw(event) }
+        if config.reload { ReloadWatcher.install(config, into: &options) }
         Runtime.sharded(options) { shard in
             let info = ShardInfo(index: shard.index, count: shard.count, threads: shard.runtime.workerCount)
             MemoryStores.warnIfSharded(info)
@@ -221,13 +226,16 @@ extension Application {
         }
         app.connections.metrics = listening.shared.metrics
         app.healthPath = config.healthCheckPath.map { Array($0.utf8) }
+        app.rootPath = config.rootPath.isEmpty ? nil : Array(config.rootPath.utf8)
+        // 512 is Vega's pool when --blocking-threads does not say.
+        OffloadAdmission.shared.configure(config, threads: config.blockingThreads ?? 512)
         app.screened = app.rateLimiter != nil || app.healthPath != nil
         var certificates: CertificateStore? = nil
         if !config.tlsCertificates.isEmpty {
             do {
                 certificates = try CertificateStore(files: config.tlsCertificates,
                                                     protocols: Application.alpn(for: config),
-                                                    ticketKey: listening.ticketKey)
+                                                    ticketKey: listening.ticketKey, ciphers: config.tlsCiphers)
             } catch {
                 Log.error("TLS: \(error)")
                 exit(2)
@@ -263,9 +271,10 @@ extension Application {
                 #else
                 let acceptors = max(1, config.acceptors ?? runtime.workerCount)
                 #endif
+                let accepting = config.serverConfiguration(acceptors: acceptors)
                 var servers: [TCPServer] = []
                 for _ in 0..<acceptors {
-                    servers.append(try TCPServer.serve(try listening.main()) { stream in
+                    servers.append(try TCPServer.serve(try listening.main(), configuration: accepting) { stream in
                         guard let tls else {
                             return await serveTCP(stream, app: app, limits: limits, http2: http2)
                         }
@@ -273,7 +282,7 @@ extension Application {
                                                  limits: limits, http2: http2)
                     })
                 }
-                Log.info("serving \(tls == nil ? "http" : "https") on \(config.host):\(servers[0].port)")
+                Log.info("serving \(tls == nil ? "http" : "https") on \(config.listeningName(port: servers[0].port))")
                 if let quic {
                     // A socket per thread, as there is an accept loop per
                     // thread: the kernel spreads clients across them.
@@ -298,8 +307,8 @@ extension Application {
                 }
                 if let metrics = listening.metrics, let page = listening.shared.metrics {
                     // A server of its own, never through the application.
-                    let workers = runtime.workerCount * max(1, config.shards ?? 1)
-                    let scraped = metricsApplication(page, workers: workers,
+                    // Shards, which are Garuda 1's worker processes.
+                    let scraped = metricsApplication(page, workers: shard.count,
                                                      cache: config.cacheSizeMiB > 0).compile()
                     let server = try TCPServer.serve(try metrics()) { stream in
                         let peer = socketPeer(stream)
@@ -375,6 +384,9 @@ extension ServerConfig {
 
           --host HOST          interface to bind (default 127.0.0.1)
           --port PORT          port to bind (default 8000)
+          --unix PATH          listen on a unix socket instead, which every
+                               shard accepts on; removed at exit
+          --backlog N          listen backlog (default 2048)
           --shards N|auto      shard processes; 0 serves in this process
           --balance MODE       how shards share the port: reuseport (a socket
                                each, hashed by the kernel), shared (one socket,
@@ -387,10 +399,21 @@ extension ServerConfig {
           --heavy-threshold US a route holding a thread longer than this many
                                microseconds runs in the heavy lane (default 500)
           --no-heavy-lane      let every route use every thread
+          --blocking-threads N threads per shard app.offload routes run on
+                               (default: Vega's, 512)
+          --blocking-queue N   offloaded work per shard that may wait for a
+                               thread, past which it is refused with 503
+                               (default: no limit)
           --acceptors N        accept loops per shard (default: one a thread)
           --log-level LEVEL    debug, info, warning, error or silent
           --max-body BYTES     largest request body (default 16 MiB)
-          --keep-alive SECS    idle keep-alive timeout (default 5)
+          --max-header-size BYTES
+                               largest request head (default 32 KiB)
+          --max-connections N  connections a shard has open at once; more
+                               wait in the backlog (default: no limit)
+          --keep-alive MS      idle keep-alive timeout (default 5000)
+          --request-timeout MS how long a request may stall mid-message,
+                               head or body (default 30000)
           --sse-keep-alive SECS
                                a comment to an event stream quiet this long
                                (default 15; 0 for none)
@@ -434,6 +457,8 @@ extension ServerConfig {
                                give one --tls-key for each, in order. With
                                several, SNI picks the one covering the name
           --tls-key PATH       the PEM private key of the --tls-cert before it
+          --tls-ciphers LIST   the TLS 1.2 cipher suites, as an OpenSSL cipher
+                               list (TLS 1.3's are fixed)
           --tls-reload SECS    look at the certificate files every SECS and
                                serve them again when they change
           --redirect-http PORT also listen for plain HTTP on PORT and redirect
@@ -445,10 +470,15 @@ extension ServerConfig {
           --forwarded-allow-ips L
                                proxies whose forwarded headers are trusted:
                                addresses, CIDR blocks, unix, or *
+          --root-path PATH     a mount prefix a proxy leaves on the path, taken
+                               off before routing
+          --scheme http|https  the scheme a request without TLS arrived by,
+                               behind a proxy that terminates TLS and does not
+                               say so (default http)
           --no-http2           refuse HTTP/2 and answer HTTP/1.1 only
-          --graceful-timeout SECS
+          --graceful-timeout MS
                                how long requests, streams and WebSockets in
-                               progress have to finish at shutdown (10)
+                               progress have to finish at shutdown (10000)
           --drain-delay MS     on SIGTERM, serve this long with the health
                                check failing before draining (0); SIGINT and
                                SIGQUIT do not wait
@@ -473,6 +503,15 @@ extension ServerConfig {
           --quic-port PORT     the UDP port for HTTP/3 (default: --port's)
           --hsts SECS          send Strict-Transport-Security: max-age=SECS
                                on every answer over TLS
+          --reload             restart on the executable when it is rebuilt,
+                               and replace the shards when a --tls-cert or
+                               --tls-key file changes; for development
+          --reload-interval MS how often --reload looks, where the kernel
+                               sends no notification (default 500)
+          --request-start-header
+                               give handlers request.requestStart, when the
+                               request arrived, for APM agents that report
+                               queue time
           --request-id         give every request an X-Request-ID, echoed on
                                the response and logged; one a
                                --forwarded-allow-ips proxy sent is kept
@@ -484,6 +523,9 @@ extension ServerConfig {
           --log-format F       text (default) or json, for request.log and
                                AppLog; the access log follows it unless
                                --access-log-format says otherwise
+          --ktls, --no-ktls, --sched-slice US, --slow-handler-ms MS
+                               Garuda 1's, accepted so its command lines
+                               start; they have no effect here
           --version            print the version
           -h, --help           print this
 
@@ -524,6 +566,91 @@ extension ServerConfig {
                     return fail("--port must be between 0 and 65535")
                 }
                 config.port = v
+            case "--unix":
+                guard let v = value(), !v.isEmpty else { return fail("--unix needs a path") }
+                config.unixPath = v
+            case "--backlog":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--backlog must be a positive count")
+                }
+                config.backlog = n
+            case "--max-connections":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--max-connections must be a positive count")
+                }
+                config.maxConnections = n
+            case "--max-header-size":
+                guard let n = value().flatMap({ Int($0) }), n >= 1024 else {
+                    return fail("--max-header-size must be a byte count of at least 1024")
+                }
+                config.maxHeadSize = n
+            case "--request-timeout":
+                // Garuda 1's: one bound on a client that stops part-way
+                // through a request, head or body.
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--request-timeout must be milliseconds")
+                }
+                config.requestHeadTimeout = .milliseconds(n)
+                config.bodyTimeout = .milliseconds(n)
+            case "--request-start-header":
+                config.requestStartHeader = true
+            case "--blocking-threads":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--blocking-threads must be a positive count")
+                }
+                config.blockingThreads = n
+            case "--blocking-queue":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--blocking-queue must be a count")
+                }
+                config.blockingQueue = n
+            case "--root-path":
+                guard var v = value(), v.isEmpty || v.hasPrefix("/") else {
+                    return fail("--root-path must start with /")
+                }
+                // "/app/" and "/app" are one mount.
+                while v.hasSuffix("/") { v.removeLast() }
+                config.rootPath = v
+            case "--scheme":
+                switch value() {
+                case "http": config.assumeHTTPS = false
+                case "https": config.assumeHTTPS = true
+                default: return fail("--scheme must be http or https")
+                }
+            case "--tls-ciphers":
+                guard let v = value(), !v.isEmpty else { return fail("--tls-ciphers needs an OpenSSL cipher list") }
+                config.tlsCiphers = v
+            case "--reload":
+                config.reload = true
+            case "--reload-interval":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--reload-interval must be milliseconds")
+                }
+                // Garuda 1's floor: looking more often only costs.
+                config.reloadInterval = .milliseconds(max(50, n))
+            case "--ktls":
+                // Garuda 1 could have the kernel encrypt; Vega's TLS is in
+                // the process, always.
+                config.ignoredFlags.append("--ktls")
+            case "--no-ktls":
+                // Encrypting in the process is what it asks for, and all
+                // there is here.
+                break
+            case "--sched-slice":
+                guard let n = value().flatMap({ Int($0) }), n == 0 || (100...100_000).contains(n) else {
+                    return fail("--sched-slice must be 0, or 100 to 100000 microseconds")
+                }
+                // Garuda 1 asked the kernel for a time slice per worker
+                // process; a work-stealing runtime has no such request.
+                config.ignoredFlags.append("--sched-slice")
+            case "--slow-handler-ms":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--slow-handler-ms must be 0 or more")
+                }
+                // Garuda 1 warned of a handler holding its worker. Here a
+                // route that holds a thread is moved to the heavy lane
+                // instead (--heavy-threshold), which is not a warning.
+                config.ignoredFlags.append("--slow-handler-ms")
             case "--shards":
                 guard let v = value() else { return fail("--shards needs a count or auto") }
                 if v == "auto" {
@@ -680,9 +807,9 @@ extension ServerConfig {
                 config.maxBodySize = n
             case "--keep-alive":
                 guard let n = value().flatMap({ Int($0) }), n > 0 else {
-                    return fail("--keep-alive must be a number of seconds")
+                    return fail("--keep-alive must be milliseconds")
                 }
-                config.keepAliveTimeout = .seconds(n)
+                config.keepAliveTimeout = .milliseconds(n)
             case "--sse-keep-alive":
                 guard let n = value().flatMap({ Int($0) }), n >= 0 else {
                     return fail("--sse-keep-alive must be a number of seconds")
@@ -719,9 +846,9 @@ extension ServerConfig {
                 config.drainDelay = .milliseconds(n)
             case "--graceful-timeout":
                 guard let n = value().flatMap({ Int($0) }), n >= 0 else {
-                    return fail("--graceful-timeout must be a number of seconds")
+                    return fail("--graceful-timeout must be milliseconds")
                 }
-                config.gracefulShutdown = .seconds(n)
+                config.gracefulShutdown = .milliseconds(n)
             case "--no-websockets":
                 config.websocketsEnabled = false
             case "--ws-max-message":
@@ -824,6 +951,19 @@ extension ServerConfig {
         }
         if config.hstsMaxAge != nil && config.tlsCertificates.isEmpty {
             return fail("--hsts is only ever sent over TLS; it needs --tls-cert")
+        }
+        if config.tlsCiphers != nil && config.tlsCertificates.isEmpty {
+            return fail("--tls-ciphers chooses among TLS's ciphers; it needs --tls-cert")
+        }
+        if config.unixPath != nil {
+            #if os(Windows)
+            return fail("--unix is not available on Windows")
+            #else
+            if config.http3Enabled { return fail("--http3 cannot be served over a unix socket") }
+            if config.redirectHTTPPort != nil {
+                return fail("--redirect-http has no https port to send clients to on a unix socket")
+            }
+            #endif
         }
         return .run(config)
     }
