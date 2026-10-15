@@ -63,8 +63,8 @@ extension Application {
         // than by every shard as it starts.
         if !config.tlsCertificates.isEmpty {
             do {
-                _ = try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn(for: config),
-                                         ticketKey: nil)
+                try CertificateStore(files: config.tlsCertificates, protocols: Application.alpn(for: config),
+                                     ticketKey: nil, ciphers: config.tlsCiphers).logNames()
             } catch {
                 Log.error("TLS: \(error)")
                 exit(2)
@@ -75,13 +75,16 @@ extension Application {
         var options = ShardOptions(shards: config.shards ?? Application.defaultShards,
                                    workersPerShard: config.threads)
         options.pinThreads = config.pinThreads
+        if let threads = config.blockingThreads { options.blockingThreads = threads }
         switch config.balance {
         case .reusePort?: options.listenerMode = .perShard
         case .shared?: options.listenerMode = .shared
         case nil: break
         }
         options.shutdownGracePeriod = config.drainDelay + config.gracefulShutdown + .seconds(5)
-        options.listeners = [.tcp(host: config.host, port: config.port, backlog: config.backlog)]
+        options.listeners = [config.unixPath.map { .unix(path: $0, backlog: config.backlog) }
+                             ?? .tcp(host: config.host, port: config.port, backlog: config.backlog)]
+        if let path = config.unixPath { UnixSocketRemoval.atExit(path) }
         if let redirect = config.redirectHTTPPort {
             options.listeners.append(.tcp(host: config.host, port: redirect, backlog: config.backlog))
         }
@@ -211,13 +214,16 @@ extension Application {
         }
         app.connections.metrics = listening.shared.metrics
         app.healthPath = config.healthCheckPath.map { Array($0.utf8) }
+        app.rootPath = config.rootPath.isEmpty ? nil : Array(config.rootPath.utf8)
+        // 512 is Vega's pool when --blocking-threads does not say.
+        OffloadAdmission.shared.configure(config, threads: config.blockingThreads ?? 512)
         app.screened = app.rateLimiter != nil || app.healthPath != nil
         var certificates: CertificateStore? = nil
         if !config.tlsCertificates.isEmpty {
             do {
                 certificates = try CertificateStore(files: config.tlsCertificates,
                                                     protocols: Application.alpn(for: config),
-                                                    ticketKey: listening.ticketKey)
+                                                    ticketKey: listening.ticketKey, ciphers: config.tlsCiphers)
             } catch {
                 Log.error("TLS: \(error)")
                 exit(2)
@@ -247,9 +253,10 @@ extension Application {
                 // loop per thread: a connection then usually starts on the
                 // thread that accepted it, rather than one woken to steal it.
                 let acceptors = max(1, config.acceptors ?? runtime.workerCount)
+                let accepting = config.serverConfiguration(acceptors: acceptors)
                 var servers: [TCPServer] = []
                 for _ in 0..<acceptors {
-                    servers.append(try TCPServer.serve(try listening.main()) { stream in
+                    servers.append(try TCPServer.serve(try listening.main(), configuration: accepting) { stream in
                         guard let tls else {
                             return await serveTCP(stream, app: app, limits: limits, http2: http2)
                         }
@@ -257,7 +264,7 @@ extension Application {
                                                  limits: limits, http2: http2)
                     })
                 }
-                Log.info("serving \(tls == nil ? "http" : "https") on \(config.host):\(servers[0].port)")
+                Log.info("serving \(tls == nil ? "http" : "https") on \(config.listeningName(port: servers[0].port))")
                 if let quic {
                     // A socket per thread, as there is an accept loop per
                     // thread: the kernel spreads clients across them.
@@ -282,8 +289,8 @@ extension Application {
                 }
                 if let metrics = listening.metrics, let page = listening.shared.metrics {
                     // A server of its own, never through the application.
-                    let workers = runtime.workerCount * max(1, config.shards ?? 1)
-                    let scraped = metricsApplication(page, workers: workers,
+                    // Shards, which are Garuda 1's worker processes.
+                    let scraped = metricsApplication(page, workers: shard.count,
                                                      cache: config.cacheSizeMiB > 0).compile()
                     let server = try TCPServer.serve(try metrics()) { stream in
                         let peer = socketPeer(stream)
