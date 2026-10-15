@@ -241,8 +241,9 @@ enforces every limit. A second task, the **writer**, writes control frames and
 answers that could not be written by their own stream. A stream's request is
 decoded into its own exchange, described exactly as an HTTP/1.1 head would be,
 so routing and middleware see a request like any other. Its body is collected
-whole, then the stream runs in a task from the shard's **stream pool**, so a
-handler that waits holds up no other stream. A stream whose answer is ready
+whole (or, for an `onStreamingBody` route, handed to the handler through a
+pipe as DATA arrives), then the stream runs in a task from the shard's
+**stream pool**, so a handler that waits holds up no other stream. A stream whose answer is ready
 writes it itself when nobody else is writing and the windows take it whole.
 
 **HTTP/3** (`HTTP3.swift`, `HTTP3Connection.swift`). Each shard binds one UDP
@@ -277,7 +278,10 @@ of streams cancelled to streams answered.
    read buffer and allocates nothing. HTTP/2 and HTTP/3 build the same
    description from HPACK or QPACK.
 2. **Body.** The whole body is collected before dispatch, on every protocol,
-   held to `--max-body` or the route's own `app.maxBodySize`.
+   held to `--max-body` or the route's own `app.maxBodySize`. An
+   `onStreamingBody` route is dispatched at the head instead, and its handler
+   reads the body as it arrives: on HTTP/1.1 from the connection, on HTTP/2
+   and HTTP/3 from a pipe whose stream window grows only as it is read.
 3. **Screening** (`Dispatch.swift`). The request ID and trace context are
    recorded; then `--health-check-path`, `--rate-limit`, `--static-dir` and
    the `--cache-size` lookup, each answering without the application when it
@@ -299,7 +303,9 @@ of streams cancelled to streams answered.
    unless the handler set them, the handler's headers, framing and body. A
    streamed body is written as it is produced, chunked on HTTP/1.1 and DATA
    frames on HTTP/2 and HTTP/3; a write waits while more than 512 KiB is
-   queued, until it is down to 128 KiB.
+   queued, until it is down to 128 KiB. A `Content-Length` the handler set is
+   held to: a longer body is cut, and a shorter one closes the HTTP/1.1
+   connection or resets the stream.
 
 A handler that throws gets 500, or the status of a `ResponseError`. One that
 returns without answering gets 500.
@@ -399,6 +405,11 @@ path.
   `http2-test.py` (`h2`), `http3-test.py` and `webtransport-test.py`
   (`aioquic`), `handler-test.py` against `garuda-conformance`, and shell
   scripts for static files, compression, the cache, rate limiting, redirects,
-  request IDs, draining and reload.
-
-Garuda 2 has no fuzz targets yet.
+  request IDs, draining and reload; `upload-test.py` for streamed request
+  bodies and resumable uploads.
+- `pgfuzz`: a mutation fuzzer over 14 targets (`GarudaFuzzTargets`), from the
+  HTTP/1.1, HPACK, QPACK, WebSocket, QUIC, JSON, Redis and PostgreSQL parsers
+  to whole HTTP/2, HTTP/3 and QUIC connections, each checking invariants
+  beyond not crashing. `swift test` replays the seeds and `fuzz/corpus`
+  (`GarudaFuzzTests`), and CI runs the fuzzer under AddressSanitizer.
+  [fuzz/README.md](fuzz/README.md) has the targets.
