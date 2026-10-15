@@ -389,9 +389,9 @@ final class H3Connection {
                     current.trailersSeen = true
                     stream.receive.ready.consume(header &+ length)
                 } else {
-                    guard let started = beginRequest(id, base + header, length, nowMs: now) else {
-                        // Refused, or the connection failed: either way the
-                        // rest of the stream is nobody's.
+                    guard let started = beginRequest(id, base + header, length, nowMs: now), started.inTable else {
+                        // Refused, answered at once (413), or the connection
+                        // failed: the rest of the stream is nobody's.
                         stream.receive.ready.clear()
                         return
                     }
@@ -468,10 +468,11 @@ final class H3Connection {
         }
         // Answered already: the bytes are counted and checked, and dropped.
         if s.refused || !s.receiving { return true }
-        // Cumulative: the limit is on the upload.
+        // Cumulative: the limit is on the upload. The 413 may have ended the
+        // stream already, and taken what was buffered on it.
         if s.received > s.bodyLimit {
             refuseBody(s)
-            return true
+            return s.inTable
         }
         if n > 0 { s.body.write(p, n) }
         return true

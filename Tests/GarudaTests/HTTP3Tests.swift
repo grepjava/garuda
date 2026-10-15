@@ -438,8 +438,13 @@ struct HTTP3Tests {
                                      body: [UInt8](repeating: 1, count: 100))
             let answer = try await client.answer(0)
             #expect(answer.status == 413)
+            // With no length declared, the body is counted as it comes, in
+            // DATA frames, and refused once past the limit.
+            try await client.request(4, [(":method", "POST"), (":scheme", "https"), (":authority", "localhost"),
+                                         (":path", "/echo")], body: [UInt8](repeating: 2, count: 100), chunk: 8)
+            #expect(try await client.answer(4).status == 413)
             // The connection goes on.
-            #expect(try await client.get(4, "/user/after").text == "after")
+            #expect(try await client.get(8, "/user/after").text == "after")
         }
     }
 
