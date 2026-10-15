@@ -7,7 +7,7 @@
 //                                every 64 KiB read, ?hold=1 waits 1.5 s before
 //                                reading anything
 //   POST /body-limited           /body-stream, held to 1 KiB
-//   POST /interim                a 103 with a Link, then 200
+//   POST /interim                a 103 with a Link, then 200 (HandlerRoutes.swift)
 //   POST /files                  resumable uploads, kept in $GARUDA_UPLOAD_DIR;
 //                                a finished one is answered 201 "<bytes>
 //                                <fnv-1a hex>" and removed
