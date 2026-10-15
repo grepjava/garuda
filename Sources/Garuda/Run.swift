@@ -98,6 +98,7 @@ extension Application {
         options.name = "garuda-s"
         let reload = ReloadLog()
         options.onEvent = { event in reload.saw(event) }
+        if config.reload { ReloadWatcher.install(config, into: &options) }
         Runtime.sharded(options) { shard in
             let info = ShardInfo(index: shard.index, count: shard.count, threads: shard.runtime.workerCount)
             MemoryStores.warnIfSharded(info)

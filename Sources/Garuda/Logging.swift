@@ -416,6 +416,13 @@ func logAccess(_ x: UnsafeMutablePointer<Exchange>, limits: ConnectionLimits, st
         line.str(" ")
         line.int(micros)
         line.str("us")
+        // Which shard answered, as on a JSON line: what tells shards
+        // sharing one output apart.
+        let pid = Log.pid
+        if pid != 0 {
+            line.str(" pid=")
+            line.int(Int(pid))
+        }
         if let id {
             line.str(" id=")
             line.raw(id)
