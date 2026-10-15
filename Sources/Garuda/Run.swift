@@ -245,7 +245,13 @@ extension Application {
                 // Vega sets TCP_NODELAY on every accepted socket. One accept
                 // loop per thread: a connection then usually starts on the
                 // thread that accepted it, rather than one woken to steal it.
+                #if os(Windows)
+                // No SO_REUSEPORT, and one process: a socket bound once,
+                // and one accept loop on it.
+                let acceptors = 1
+                #else
                 let acceptors = max(1, config.acceptors ?? runtime.workerCount)
+                #endif
                 var servers: [TCPServer] = []
                 for _ in 0..<acceptors {
                     servers.append(try TCPServer.serve(try listening.main()) { stream in
