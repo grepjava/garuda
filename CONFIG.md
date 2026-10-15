@@ -878,7 +878,7 @@ func settings() throws -> Settings {
 - **`summary()`** is what a `myapp env` command prints: every variable that was
   read, secrets held back, passwords taken out of URLs.
 - **Work on a timer** belongs to the application too:
-  `app.every(.hours(1)) { shard in … }` runs in each shard between start-up and
+  `app.every(.seconds(3600)) { shard in … }` runs in each shard between start-up and
   shutdown, and `onShard: 0` runs it in one shard only.
 - **Where to call it:** before the application is built, so nothing is served
   until the environment checks out.
