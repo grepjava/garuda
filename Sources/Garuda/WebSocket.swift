@@ -193,7 +193,7 @@ struct WebSocketOffer {
         case version
         /// An upgrade missing what it needs: 400.
         case malformed
-        /// Over HTTP/2, a request that is not an extended CONNECT.
+        /// Over HTTP/2 or HTTP/3, a request that is not an extended CONNECT.
         case multiplexed
         /// --no-websockets, or an extended CONNECT for another protocol:
         /// 501.
@@ -207,14 +207,23 @@ struct WebSocketOffer {
     /// The offer `request` makes, or what is wrong with it.
     static func read(_ request: borrowing Request) -> Result<WebSocketOffer, Problem> {
         let x = request.exchange
-        // Over HTTP/3 no extended CONNECT is offered yet (RFC 9220), so a
-        // request there is never one.
-        if case .http3 = x.pointee.link { return .failure(.multiplexed) }
-        if case .http2 = x.pointee.link {
+        // Over HTTP/2 and HTTP/3 a WebSocket is an extended CONNECT (RFC
+        // 8441, RFC 9220).
+        var multiplexed = false, overHTTP3 = false
+        switch x.pointee.link {
+        case .http2: multiplexed = true
+        case .http3: multiplexed = true; overHTTP3 = true
+        default: break
+        }
+        if multiplexed {
             switch x.pointee.connectProtocol {
-            case .none: return .failure(.multiplexed)
+            case .none, .webtransport: return .failure(.multiplexed)
             case .other: return .failure(.disabled)
-            case .websocket: return readExtendedConnect(request)
+            case .websocket:
+                // HTTP/3 offers extended CONNECT for WebTransport whatever
+                // --websocket-protocols says.
+                if overHTTP3 && !x.pointee.websocketLimits.overHTTP3 { return .failure(.disabled) }
+                return readExtendedConnect(request)
             }
         }
         guard x.pointee.canUpgrade else {
@@ -462,7 +471,7 @@ func refuseWebSocket(_ problem: WebSocketOffer.Problem, _ response: borrowing Re
     case .malformed:
         response.send(status: .badRequest, "the WebSocket handshake is incomplete\n")
     case .multiplexed:
-        response.send(status: .badRequest, "a WebSocket over HTTP/2 starts with an extended CONNECT\n")
+        response.send(status: .badRequest, "a WebSocket over HTTP/2 or HTTP/3 starts with an extended CONNECT\n")
     case .disabled:
         response.send(status: HTTPStatus(501), "WebSockets are turned off\n")
     }
@@ -470,7 +479,7 @@ func refuseWebSocket(_ problem: WebSocketOffer.Problem, _ response: borrowing Re
 
 /// Answers the upgrade: the 101 is written by the connection once the
 /// handler has returned, and the connection becomes the WebSocket's; over
-/// HTTP/2, the 200, and the stream becomes it.
+/// HTTP/2 and HTTP/3, the 200, and the stream becomes it.
 func acceptWebSocket(_ x: UnsafeMutablePointer<Exchange>, _ offer: WebSocketOffer, subprotocol: String?,
                      run: CarriedHandler) {
     let limits = x.pointee.websocketLimits
@@ -478,7 +487,10 @@ func acceptWebSocket(_ x: UnsafeMutablePointer<Exchange>, _ offer: WebSocketOffe
         ? offer.extensions.withSpans { WSDeflate.negotiate($0) } : nil
     let response = Response(x)
     let multiplexed: Bool
-    if case .http2 = x.pointee.link { multiplexed = true } else { multiplexed = false }
+    switch x.pointee.link {
+    case .http2, .http3: multiplexed = true
+    default: multiplexed = false
+    }
     if !multiplexed {
         response.addHeader("upgrade", "websocket")
         response.addHeader("sec-websocket-accept", offer.acceptValue())
@@ -490,8 +502,9 @@ func acceptWebSocket(_ x: UnsafeMutablePointer<Exchange>, _ offer: WebSocketOffe
         deflate.writeResponse(into: &value)
         response.addHeader("sec-websocket-extensions", value.readableSpan.string)
     }
-    // Over HTTP/2 a 200 opens the stream as the WebSocket's (RFC 8441),
-    // its body the frames, which are not to be compressed twice.
+    // Over HTTP/2 and HTTP/3 a 200 opens the stream as the WebSocket's (RFC
+    // 8441, RFC 9220), its body the frames, which are not to be compressed
+    // twice.
     x.pointee.status = multiplexed ? 200 : 101
     if multiplexed { x.pointee.noCompress = true }
     x.pointee.answered = true
@@ -577,4 +590,6 @@ extension WebSocketLimits {
     var overHTTP1: Bool { enabled && protocols.contains(.http1) }
     /// And over HTTP/2's extended CONNECT, which is then offered.
     var overHTTP2: Bool { enabled && protocols.contains(.http2) }
+    /// And over HTTP/3's (RFC 9220).
+    var overHTTP3: Bool { enabled && protocols.contains(.http3) }
 }

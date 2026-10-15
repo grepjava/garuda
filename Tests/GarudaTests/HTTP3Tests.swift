@@ -15,9 +15,9 @@ import VegaTLS
 // QUIC client (Tests/QUICTestPeer). Garuda 1 tested its HTTP/3 only from
 // outside, as scripts/http3-test.py still does against aioquic.
 
-private let h3Runtime = Runtime(workers: 2)
+let h3Runtime = Runtime(workers: 2)
 
-private func h3App() -> Application {
+func h3App() -> Application {
     let app = Application()
     app.get("/") { _, response in response.send(status: .ok) }
     app.get("/user/:id") { request, response in response.send(request.parameter(0)) }
@@ -37,12 +37,12 @@ private func h3App() -> Application {
     return app
 }
 
-private let certificate: CertificateKey = {
+let certificate: CertificateKey = {
     let identity = try! TLSIdentity.selfSigned(names: ["localhost"])
     return try! CertificateKey(chainPEM: identity.certificateChain, keyPEM: identity.privateKey)
 }()
 
-private func h3Config(_ change: (inout ServerConfig) -> Void = { _ in }) -> ServerConfig {
+func h3Config(_ change: (inout ServerConfig) -> Void = { _ in }) -> ServerConfig {
     var config = ServerConfig()
     config.http3Enabled = true
     change(&config)
@@ -84,12 +84,16 @@ private func longHeader(version: UInt32, dcid: [UInt8], scid: [UInt8], size: Int
 
 /// The tests' QUIC client on a UDP socket connected to the endpoint, with
 /// an HTTP/3 request's worth of framing.
-private final class H3Client: @unchecked Sendable {
+final class H3Client: @unchecked Sendable {
     let peer: QUICTestPeer
     let socket: UnsafeMutablePointer<UDPSocket>
+    /// How much has been sent on each stream.
+    var offsets: [UInt64: Int] = [:]
 
-    init(port: Int) throws {
+    /// `datagrams`: the largest DATAGRAM frame offered, or 0 for none.
+    init(port: Int, datagrams: UInt64 = 0) throws {
         peer = try QUICTestPeer()
+        peer.maxDatagramFrameSize = datagrams
         socket = .allocate(capacity: 1)
         socket.initialize(to: try UDPSocket.connect(to: SocketAddress(numericHost: "127.0.0.1", port: port)!))
     }
@@ -160,6 +164,27 @@ private final class H3Client: @unchecked Sendable {
                 + streamFrame(id, offset: at, Array(frames[at..<(at + n)]), fin: fin && last)))
             at += n
         } while at < frames.count
+        offsets[id] = frames.count
+    }
+
+    /// `bytes` on stream `id`, after whatever was sent on it before.
+    func write(_ id: UInt64, _ bytes: [UInt8], fin: Bool = false) async throws {
+        var at = 0
+        let base = offsets[id] ?? 0
+        repeat {
+            let n = min(1000, bytes.count - at)
+            let last = at + n == bytes.count
+            try await send(try peer.packet(.application, peer.ack(.application)
+                + streamFrame(id, offset: base + at, Array(bytes[at..<(at + n)]), fin: fin && last)))
+            at += n
+        } while at < bytes.count
+        offsets[id] = base + bytes.count
+    }
+
+    /// One DATAGRAM frame (RFC 9221).
+    func datagram(_ payload: [UInt8]) async throws {
+        try await send(try peer.packet(.application, peer.ack(.application)
+            + hsVarint(0x31) + hsVarint(UInt64(payload.count)) + payload))
     }
 
     func get(_ id: UInt64, _ path: String, headers: [(String, String)] = []) async throws -> H3Answer {
@@ -176,7 +201,7 @@ private final class H3Client: @unchecked Sendable {
 }
 
 /// One datagram from `socket`, or nil once `timeout` has passed.
-private func receiveDatagram(_ socket: borrowing UDPSocket, timeout: Duration) async throws(IOError) -> [UInt8]? {
+func receiveDatagram(_ socket: borrowing UDPSocket, timeout: Duration) async throws(IOError) -> [UInt8]? {
     var buffer = IOBuffer(capacity: 2048)
     do {
         _ = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
@@ -189,7 +214,7 @@ private func receiveDatagram(_ socket: borrowing UDPSocket, timeout: Duration) a
     return buffer.withUnsafeBytes { Array($0) }
 }
 
-private func headersFrame(_ fields: [(String, String)]) -> [UInt8] {
+func headersFrame(_ fields: [(String, String)]) -> [UInt8] {
     var block = ByteBuffer()
     defer { block.destroy() }
     let encoder = QPACKEncoder()
@@ -208,7 +233,7 @@ private func headersFrame(_ fields: [(String, String)]) -> [UInt8] {
 }
 
 /// An HTTP/3 response as it arrived on its stream.
-private struct H3Answer {
+struct H3Answer {
     var status = 0
     var headers: [(name: String, value: String)] = []
     var body: [UInt8] = []
@@ -238,7 +263,7 @@ private struct H3Answer {
 }
 
 /// A QPACK field section's fields.
-private func decodeFields(_ payload: [UInt8]) throws -> [(name: String, value: String)] {
+func decodeFields(_ payload: [UInt8]) throws -> [(name: String, value: String)] {
     final class Fields { var list: [(name: String, value: String)] = [] }
     let fields = Fields()
     var decoder = QPACKDecoder()
@@ -255,7 +280,7 @@ private func decodeFields(_ payload: [UInt8]) throws -> [(name: String, value: S
 }
 
 /// The frames in `bytes`: type and payload.
-private func h3Frames(_ bytes: [UInt8]) throws -> [(UInt64, [UInt8])] {
+func h3Frames(_ bytes: [UInt8]) throws -> [(UInt64, [UInt8])] {
     var out: [(UInt64, [UInt8])] = []
     try bytes.withUnsafeBufferPointer { b in
         guard let base = b.baseAddress else { return }
@@ -272,8 +297,8 @@ private func h3Frames(_ bytes: [UInt8]) throws -> [(UInt64, [UInt8])] {
 
 /// Serves `app` on a socket of its own on the test runtime, runs `body`
 /// with a client connected to it, and shuts the endpoint down.
-private func withServer(_ app: Application, _ config: ServerConfig = h3Config(),
-                        _ body: @escaping @Sendable (H3Client, HTTP3Service) async throws -> Void) throws {
+func withServer(_ app: Application, _ config: ServerConfig = h3Config(), datagrams: UInt64 = 0,
+                _ body: @escaping @Sendable (H3Client, HTTP3Service) async throws -> Void) throws {
     app.prepareForTesting(config, threads: h3Runtime.workerCount)
     try app.startForTesting(on: h3Runtime)
     let compiled = try #require(app.compiledApplication)
@@ -281,7 +306,7 @@ private func withServer(_ app: Application, _ config: ServerConfig = h3Config(),
                                certificates: { [certificate] })
     try h3Runtime.block { () async throws -> Void in
         let port = try service.start(host: "127.0.0.1", port: 0, count: 1)
-        let client = try H3Client(port: port)
+        let client = try H3Client(port: port, datagrams: datagrams)
         do {
             try await body(client, service)
         } catch {

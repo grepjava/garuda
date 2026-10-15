@@ -121,8 +121,9 @@ struct Exchange: ~Copyable {
     var websocketsRefused = false
     /// --ws-*, set per connection that can upgrade.
     var websocketLimits = WebSocketLimits()
-    /// HTTP/2: the `:protocol` of an extended CONNECT (RFC 8441), routed as
-    /// the GET it stands for. Set per stream.
+    /// HTTP/2 and HTTP/3: the `:protocol` of an extended CONNECT (RFC 8441,
+    /// RFC 9220), routed as the GET it stands for -- a WebTransport session
+    /// as the CONNECT it is. Set per stream.
     var connectProtocol = ConnectProtocol.none
 
     @usableFromInline
@@ -659,6 +660,10 @@ enum ConnectProtocol: UInt8 {
     /// An ordinary request.
     case none
     case websocket
-    /// A protocol nothing here speaks: 501 at a WebSocket route.
+    /// HTTP/3 only: a WebTransport session, routed as the CONNECT it is
+    /// (WebTransport.swift).
+    case webtransport
+    /// A protocol nothing here speaks: 501 at a WebSocket route, and at
+    /// once over HTTP/3.
     case other
 }

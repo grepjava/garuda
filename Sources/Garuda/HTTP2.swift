@@ -1589,7 +1589,7 @@ func buildRequestHead(_ x: UnsafeMutablePointer<Exchange>, into text: inout Byte
     var count = 1
     var method = (0, 0), path = (0, 0), authority = (0, 0), host = (0, 0)
     var sawMethod = false, sawPath = false, sawScheme = false, sawAuthority = false, sawHost = false
-    var sawProtocol = false, protocolIsWebSocket = false
+    var sawProtocol = false, protocolIsWebSocket = false, protocolIsWebTransport = false
     var sawRegular = false
     var malformed = false
     var contentLength = -1
@@ -1629,6 +1629,9 @@ func buildRequestHead(_ x: UnsafeMutablePointer<Exchange>, into text: inout Byte
                     if sawProtocol { malformed = true; return }
                     sawProtocol = true
                     protocolIsWebSocket = equalsExact(span.value, span.valueLength, "websocket")
+                    // WebTransport is served over HTTP/3 alone.
+                    protocolIsWebTransport = major == 3
+                        && equalsExact(span.value, span.valueLength, "webtransport")
                 } else {
                     // Unknown, or :protocol from a peer we did not tell it
                     // may (RFC 8441).
@@ -1705,10 +1708,15 @@ func buildRequestHead(_ x: UnsafeMutablePointer<Exchange>, into text: inout Byte
     let isConnect = equalsExact(UnsafePointer(text.readPointer) + method.0, method.1, "CONNECT")
     if sawProtocol {
         // An extended CONNECT names what it connects to, and stands for
-        // a GET of its path: that is how it is routed.
+        // a GET of its path: that is how it is routed. A WebTransport
+        // session stays the CONNECT it is, for the routes that serve one.
         if !isConnect || !sawAuthority { return .malformed }
-        method = text.append("GET")
-        x.pointee.connectProtocol = protocolIsWebSocket ? .websocket : .other
+        if protocolIsWebTransport {
+            x.pointee.connectProtocol = .webtransport
+        } else {
+            method = text.append("GET")
+            x.pointee.connectProtocol = protocolIsWebSocket ? .websocket : .other
+        }
     } else {
         // A plain CONNECT has no :scheme or :path, and is not served.
         if isConnect { return .malformed }

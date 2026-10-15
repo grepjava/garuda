@@ -79,6 +79,12 @@ final class H3Stream: @unchecked Sendable {
     /// the body of `bodyLength`.
     @exclusivity(unchecked) var headSent = false
     @exclusivity(unchecked) var bodySent = 0
+    /// An extended CONNECT: dispatched on its HEADERS, and what follows them
+    /// is the tunnel's (HTTP3WebSocket.swift, HTTP3WebTransport.swift).
+    @exclusivity(unchecked) var isTunnel = false
+    /// A WebSocket's: its DATA, handed to the task as it arrives. Set before
+    /// the task runs.
+    @exclusivity(unchecked) var inbound: H3Inbound?
 
     // MARK: Shared, under the endpoint's lock
 
@@ -102,6 +108,8 @@ final class H3Stream: @unchecked Sendable {
     /// A streamed body has ended, whole or cut off part-way.
     @exclusivity(unchecked) var bodyEnded = false
     @exclusivity(unchecked) var bodyFailed = false
+    /// What a failed body's stream is reset with.
+    @exclusivity(unchecked) var failCode = HTTP3Error.internalError
     /// Writers of a streamed body waiting for `staged` to drain.
     @exclusivity(unchecked) var waiters: [UnsafeContinuation<Bool, Never>] = []
     /// The endpoint is answering it itself: its writes cannot wait for the
@@ -225,6 +233,16 @@ extension QUICEndpoint {
             }
         }
         await dispatchStream(s)
+        if let inbound = s.inbound {
+            if let upgrade = s.x.pointee.upgrade {
+                s.x.pointee.upgrade = nil
+                await runWebSocket(s, inbound, upgrade)
+                return
+            }
+            // Answered as an ordinary request: the tunnel is refused, and
+            // the client told to stop sending once the answer has gone.
+            inbound.close()
+        }
         if let channel = s.x.pointee.channel {
             // Streamed: the head is staged already, and the body's end is
             // now (StreamingResponse.swift).

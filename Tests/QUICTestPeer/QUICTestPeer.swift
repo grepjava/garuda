@@ -102,6 +102,10 @@ public final class QUICTestPeer {
     public private(set) var closeCode: UInt64?
     /// The highest MAX_STREAMS (bidirectional) the server sent.
     public private(set) var maxStreamsBidi: UInt64 = 0
+    /// The datagrams the server sent (RFC 9221), in order.
+    public var datagrams: [[UInt8]] = []
+    /// The largest DATAGRAM frame offered to the server; 0 offers none.
+    public var maxDatagramFrameSize: UInt64 = 0
 
     /// `dcidLength`: how long the identifier the client invents for the
     /// server is, which RFC 9000 says must be at least eight bytes.
@@ -145,6 +149,7 @@ public final class QUICTestPeer {
         parameters.initialMaxStreamsUni = 100
         parameters.initialSourceCID = scid
         parameters.hasInitialSourceCID = true
+        parameters.maxDatagramFrameSize = maxDatagramFrameSize
         var encoded = ByteBuffer()
         defer { encoded.destroy() }
         parameters.encode(into: &encoded, isServer: false)
@@ -296,6 +301,9 @@ public final class QUICTestPeer {
                 return
             case 0x1e:
                 handshakeDone = true
+            case 0x30, 0x31:
+                let length = type == 0x31 ? try need(r.varintAsInt(), "DATAGRAM") : r.remaining
+                datagrams.append(hsBytes(try need(r.take(length), "DATAGRAM"), length))
             default:
                 throw QUICTestPeerError("unexpected frame type \(type) at level \(level)")
             }

@@ -11,8 +11,7 @@
 // The unidirectional streams are the awkward part, because a stream's type is
 // its first varint and a stream can be opened long before anything is sent on
 // it. A type nobody recognises is not an error -- it is how extensions arrive
-// (WebTransport's among them, when it is served) -- and the peer is told to
-// stop sending on it.
+// -- and the peer is told to stop sending on it.
 //
 // QPACK runs with a dynamic table of capacity zero, which is a promise as much
 // as a limit: no header block on the connection ever waits for another stream,
@@ -169,8 +168,9 @@ final class H3Connection {
         body.writeVarint(0)
         body.writeVarint(HTTP3Setting.maxFieldSectionSize)
         body.writeVarint(UInt64(settings.maxHeadSize))
-        // Extended CONNECT (RFC 9220) -- WebSockets and WebTransport over
-        // HTTP/3 -- is not offered: neither is served yet.
+        // Extended CONNECT (RFC 9220): what carries WebSockets over HTTP/3.
+        body.writeVarint(HTTP3Setting.enableConnectProtocol)
+        body.writeVarint(1)
         out.writeVarint(HTTP3StreamType.control)
         out.writeVarint(HTTP3FrameType.settings)
         out.writeVarint(UInt64(body.readableBytes))
@@ -376,7 +376,7 @@ final class H3Connection {
                     // A second HEADERS is the trailer section, and the last
                     // thing on the stream: nothing downstream wants it, but
                     // it still has to decode.
-                    if current.trailersSeen || !current.receiving && !current.refused {
+                    if current.trailersSeen || !current.receiving && !current.refused && !current.isTunnel {
                         return fail(HTTP3Error.frameUnexpected)
                     }
                     var decoded = true
@@ -431,6 +431,15 @@ final class H3Connection {
             return
         }
         guard current.inTable else { return }
+        if current.isTunnel {
+            // The client's FIN is its side of the tunnel ending.
+            if stream.receive.finished && stream.receive.ready.readableBytes == 0 {
+                if current.frameRemaining > 0 { return fail(HTTP3Error.frameError) }
+                current.inbound?.end()
+            }
+            if let inbound = current.inbound { extendTunnel(current, inbound) }
+            return
+        }
         if stream.receive.finished && stream.receive.ready.readableBytes == 0 && (current.receiving || current.refused) {
             if current.frameRemaining > 0 { return fail(HTTP3Error.frameError) }
             if current.refused {
@@ -460,6 +469,12 @@ final class H3Connection {
     /// Takes body bytes. False when the stream has been ended for them.
     private func appendBody(_ s: H3Stream, _ p: UnsafePointer<UInt8>, _ n: Int, nowMs now: UInt64) -> Bool {
         s.lastActivity = now
+        if s.isTunnel {
+            // A WebSocket's frames, for its task as they come; the exchange
+            // is the task's now.
+            s.inbound?.deliver(p, n)
+            return true
+        }
         s.received &+= n
         let head = s.x.pointee.head
         if head.flags.contains(.hasContentLength) && s.received > head.contentLength {
@@ -489,7 +504,7 @@ final class H3Connection {
         }
         let s = take(id)
         let outcome = buildRequestHead(s.x, into: &s.head, cookies: &cookies, limits: endpoint.limits,
-                                       acceptsConnectProtocol: false, major: 3) { field throws in
+                                       acceptsConnectProtocol: true, major: 3) { field throws in
             try decoder.decode(block, length, field)
         }
         switch outcome {
@@ -509,6 +524,20 @@ final class H3Connection {
         if Int64(id) > highestRequest { highestRequest = Int64(id) }
         s.receiving = true
         s.lastActivity = now
+        switch s.x.pointee.connectProtocol {
+        case .none:
+            break
+        case .other:
+            // An extended CONNECT for a protocol nothing here speaks.
+            answerNow(s, status: 501)
+            return s
+        case .websocket, .webtransport:
+            // The stream stays open as the tunnel it asks for, so waiting
+            // for the end of its body would wait for ever: it is dispatched
+            // now.
+            runTunnel(s)
+            return s
+        }
         let app = endpoint.app
         s.bodyLimit = app.hasBodyLimits ? bodyLimit(s.x, app, endpoint.limits, matched: &s.matched)
             : endpoint.limits.maxBodySize
@@ -552,6 +581,8 @@ final class H3Connection {
         s.sendEnded = false
         s.headSent = false
         s.bodySent = 0
+        s.isTunnel = false
+        s.inbound = nil
         endpoint.lock.withLock { _ in
             s.reset = false
             s.task = nil
@@ -562,6 +593,7 @@ final class H3Connection {
             s.staged.clear()
             s.bodyEnded = false
             s.bodyFailed = false
+            s.failCode = HTTP3Error.internalError
         }
         s.x.pointee.reset()
         s.head.clear()
@@ -573,12 +605,31 @@ final class H3Connection {
     /// A body past its limit: answered 413, as on HTTP/1.1, and the client
     /// then told to stop sending the rest (RFC 9114 section 4.1.2).
     private func refuseBody(_ s: H3Stream) {
-        s.receiving = false
         s.refused = true
-        s.x.pointee.answer(413, nil, 0)
+        answerNow(s, status: 413)
+    }
+
+    /// Answers `s` here with `status` and no body, before any task has it.
+    private func answerNow(_ s: H3Stream, status: Int) {
+        s.receiving = false
+        s.x.pointee.answer(status, nil, 0)
         endpoint.frameWhole(s)
         endpoint.lock.withLock { _ in s.answerReady = true }
         pump(s)
+    }
+
+    /// An extended CONNECT: its handler runs in a pooled task now -- never
+    /// the endpoint's own, since it lasts as long as the tunnel -- and what
+    /// follows the HEADERS is the tunnel's.
+    private func runTunnel(_ s: H3Stream) {
+        s.receiving = false
+        s.isTunnel = true
+        if s.x.pointee.connectProtocol == .websocket {
+            s.inbound = H3Inbound(stream: s, window: settings.streamWindow)
+        }
+        s.taskActive = true
+        tasks &+= 1
+        endpoint.pool.run(s)
     }
 
     /// The request is whole: its handler runs in a pooled task.
@@ -644,6 +695,7 @@ final class H3Connection {
             s.task?.cancel()
             s.resumeWaiters(false)
         }
+        s.inbound?.fail()
         if !s.sendEnded {
             s.sendEnded = true
             quic.resetStream(s.id, code: code)
@@ -696,6 +748,8 @@ final class H3Connection {
             tasks &-= 1
         }
         if s.inTable && !closed {
+            // A WebSocket's session took some of what arrived.
+            if let inbound = s.inbound { extendTunnel(s, inbound) }
             pump(s)
         } else if !s.inTable && !s.taskActive {
             recycle(s)
@@ -710,7 +764,8 @@ final class H3Connection {
         guard s.inTable, !s.sendEnded, let stream = quic.stream(s.id) else { return }
         var room = settings.sendBudget &- stream.send.data.readableBytes
         let low = settings.low
-        let (whole, streamed, ended, failed, clear) = endpoint.lock.withLock { _ -> (Bool, Bool, Bool, Bool, Bool) in
+        let (whole, streamed, ended, failed, clear, code) = endpoint.lock.withLock {
+            _ -> (Bool, Bool, Bool, Bool, Bool, UInt64) in
             let staged = s.staged.readableBytes
             if staged > 0 && room > 0 {
                 let n = min(room, staged)
@@ -720,7 +775,7 @@ final class H3Connection {
                 // Fallen to the low-water mark: its writers may go on.
                 if s.staged.readableBytes <= low { s.resumeWaiters(true) }
             }
-            return (s.answerReady, s.streamed, s.bodyEnded, s.bodyFailed, s.staged.readableBytes == 0)
+            return (s.answerReady, s.streamed, s.bodyEnded, s.bodyFailed, s.staged.readableBytes == 0, s.failCode)
         }
         guard clear else { return }
         if whole {
@@ -737,7 +792,7 @@ final class H3Connection {
             if s.bodySent == length { endSend(s, resetCode: nil) }
         } else if streamed && ended {
             // A body cut off part-way cannot be ended honestly.
-            endSend(s, resetCode: failed ? HTTP3Error.internalError : nil)
+            endSend(s, resetCode: failed ? code : nil)
         }
     }
 
@@ -827,6 +882,7 @@ final class H3Connection {
             }
         }
         for s in open {
+            s.inbound?.fail()
             s.inTable = false
             s.sendEnded = true
             if !s.taskActive { recycle(s) }
