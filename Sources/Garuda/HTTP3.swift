@@ -129,6 +129,10 @@ final class HTTP3Service: @unchecked Sendable {
     @discardableResult
     func start(host: String, port: Int, count: Int) throws(IOError) -> Int {
         var bound = port
+        #if os(Windows)
+        // No SO_REUSEPORT: a second socket on the port would fail to bind.
+        let count = 1
+        #endif
         for _ in 0..<max(1, count) {
             let socket = try UDPSocket.bind(host: host, port: bound, reusePort: true)
             if bound == 0 { bound = (try socket.localAddress).port ?? 0 }
