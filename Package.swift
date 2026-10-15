@@ -104,6 +104,13 @@ let package = Package(
         // HPACK, QPACK, frames. No sockets, no allocation on the hot path.
         // Vendored from aviancore's AvianHTTP; see Sources/GarudaWire/VENDORED.md.
         .target(name: "GarudaWire", exclude: ["VENDORED.md"], swiftSettings: sharedSwiftSettings),
+        // QUIC as a sans-I/O state machine: packets, packet protection, loss
+        // recovery, streams, and the server side of TLS 1.3 that QUIC runs
+        // its handshake on. Datagrams in, datagrams out; no sockets, no
+        // clock. Ported from aviancore's AvianQUIC, its cryptography on
+        // VegaCrypto. HTTP/3 (in Garuda) sits on it.
+        .target(name: "GarudaQUIC", dependencies: ["GarudaWire", vega("VegaCrypto")],
+                swiftSettings: sharedSwiftSettings),
         // VegaTLS serves HTTPS (TLS.swift). VegaCrypto: Garuda has no
         // cryptography of its own. Signed and
         // encrypted cookies (HMAC, HKDF, AES-GCM), JWT signing and verifying,
@@ -147,6 +154,10 @@ let package = Package(
 
         .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),
         .testTarget(name: "GarudaWireTests", dependencies: ["GarudaWire"],
+                    swiftSettings: sharedSwiftSettings),
+        // VegaTLS only for a self-signed certificate the handshake test serves.
+        .testTarget(name: "GarudaQUICTests",
+                    dependencies: ["GarudaQUIC", "GarudaWire", vega("VegaCrypto"), vega("VegaTLS")],
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaTests",
                     dependencies: ["Garuda", "GarudaWire", "GarudaTesting", "CAllocationCounter",
