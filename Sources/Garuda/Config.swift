@@ -182,6 +182,11 @@ public struct ServerConfig: Sendable {
     public var maxWebsocketQueueBytes = 4 * 1024 * 1024
     /// --ws-compress: permessage-deflate with clients that offer it.
     public var websocketCompress = false
+    /// --websocket-protocols: which protocols carry WebSockets. HTTP/1.1's
+    /// upgrade, HTTP/2's extended CONNECT (RFC 8441), and HTTP/3's (RFC
+    /// 9220); a WebSocket over one left out is refused with 501, and over
+    /// HTTP/2 extended CONNECT is not offered at all.
+    public var websocketProtocols: WebSocketProtocols = .all
     /// Streams a client may have open at once on one connection.
     public var h2MaxConcurrentStreams = 128
     /// The largest frame payload a client may send.
@@ -230,4 +235,29 @@ public enum ConnectionBalance: Sendable, Hashable {
     /// One socket every shard accepts on: a connection goes to a shard
     /// waiting in accept.
     case shared
+}
+
+/// The protocols WebSockets are served over (--websocket-protocols).
+public struct WebSocketProtocols: OptionSet, Sendable {
+    public let rawValue: UInt8
+    public init(rawValue: UInt8) { self.rawValue = rawValue }
+
+    public static let http1 = WebSocketProtocols(rawValue: 1)
+    public static let http2 = WebSocketProtocols(rawValue: 2)
+    public static let http3 = WebSocketProtocols(rawValue: 4)
+    public static let all: WebSocketProtocols = [.http1, .http2, .http3]
+
+    /// "http1,http2", as the flag takes it; nil for a name it does not know.
+    public init?(parsing list: String) {
+        var set: WebSocketProtocols = []
+        for name in list.split(separator: ",") {
+            switch String(name).trimmingSpaces {
+            case "http1", "http1.1", "h1": set.insert(.http1)
+            case "http2", "h2": set.insert(.http2)
+            case "http3", "h3": set.insert(.http3)
+            default: return nil
+            }
+        }
+        self = set
+    }
 }

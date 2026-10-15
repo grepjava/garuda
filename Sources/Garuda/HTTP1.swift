@@ -129,13 +129,13 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     let x = parts.pointee.exchange
     x.pointee.application = Unmanaged.passUnretained(app)
     // The exchange is reused from connection to connection: set every time.
-    let canUpgrade = upgradable && limits.websocket.enabled
+    let canUpgrade = upgradable && limits.websocket.overHTTP1
     if canUpgrade || x.pointee.canUpgrade {
         x.pointee.canUpgrade = canUpgrade
         if canUpgrade { x.pointee.websocketLimits = limits.websocket }
     }
-    if x.pointee.websocketsRefused != !limits.websocket.enabled {
-        x.pointee.websocketsRefused = !limits.websocket.enabled
+    if x.pointee.websocketsRefused != !limits.websocket.overHTTP1 {
+        x.pointee.websocketsRefused = !limits.websocket.overHTTP1
     }
     // The exchange is reused from connection to connection: set both.
     x.pointee.secure = secure

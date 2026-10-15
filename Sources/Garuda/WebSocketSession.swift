@@ -6,7 +6,9 @@
 // frames for as long as the WebSocket lasts, and what is sent -- the
 // handler's messages, and pongs and closes the reader answers with -- goes
 // through a `BodyChannel` over the writing half, as a streamed body does,
-// with its backpressure and write timeout.
+// with its backpressure and write timeout. Over HTTP/2 the WebSocket is one
+// stream's (HTTP2WebSocket.swift): its DATA is what is read, and its
+// streamed answer what is written.
 //
 // Frames are decoded as they arrive, whether or not the handler is reading:
 // a ping has to be answered and a pong seen on time, or a healthy peer the
@@ -57,9 +59,6 @@ final class WebSocketSession: @unchecked Sendable {
     /// A violation behind messages the handler has not read: acted on once
     /// they have been.
     private var pendingFailure: UInt16 = 0
-    /// The reader is to stop: a close went unanswered, or the server is
-    /// going away and the handler is done.
-    private var stopReading = false
 
     // The outbound side, under `sendLock`.
     private let sendLock = Mutex<Void>(())
@@ -313,8 +312,11 @@ final class WebSocketSession: @unchecked Sendable {
 
     /// Reads frames until the WebSocket ends: the closes have crossed, the
     /// peer went, broke the protocol, stopped answering pings, or never
-    /// answered a close.
-    func read<R: AsyncReader & ~Copyable>(_ reader: borrowing R, leftover: [UInt8]) async {
+    /// answered a close. True for those last two: the peer was given up on,
+    /// and its stream is better reset than ended.
+    @discardableResult
+    func read<R: AsyncReader & ~Copyable>(_ reader: borrowing R, leftover: [UInt8]) async -> Bool {
+        var abandoned = false
         var input = IOBuffer(capacity: max(16 * 1024, leftover.count))
         if !leftover.isEmpty { _ = leftover.withUnsafeBytes { input.append($0) } }
         lastHeard = monotonicNanos()
@@ -329,7 +331,7 @@ final class WebSocketSession: @unchecked Sendable {
                 break reading
             case .full:
                 await waitForRoom()
-                if lock.withLock({ _ in stopReading || gone }) { break reading }
+                if lock.withLock({ _ in gone }) { break reading }
                 if lock.withLock({ _ in pendingFailure != 0 && inboxHead >= inbox.count }) {
                     applyPendingFailure()
                     answered = false
@@ -340,7 +342,6 @@ final class WebSocketSession: @unchecked Sendable {
             case .more:
                 break
             }
-            if lock.withLock({ _ in stopReading }) { break reading }
             // One whole frame has to fit; a frame is bounded by the message
             // limit and its header.
             if input.spareCapacity < 4096 && input.capacity < limits.maxMessage + 4096 {
@@ -355,10 +356,14 @@ final class WebSocketSession: @unchecked Sendable {
                 lastHeard = monotonicNanos()
             } catch let error {
                 guard error == .timedOut else { break reading }
-                if !timersAllowReading() { break reading }
+                if !timersAllowReading() {
+                    abandoned = !lock.withLock { _ in gone }
+                    break reading
+                }
             }
         }
         readerEnded()
+        return abandoned
     }
 
     /// How long the next read may wait: until a keepalive ping is due, a
@@ -381,7 +386,7 @@ final class WebSocketSession: @unchecked Sendable {
     /// A read gave up on its deadline: what is due now. False when the
     /// WebSocket is over.
     private func timersAllowReading() -> Bool {
-        if lock.withLock({ _ in stopReading || gone }) { return false }
+        if lock.withLock({ _ in gone }) { return false }
         let now = monotonicNanos()
         let timeout = nanos(limits.pingTimeout)
         let closed = closeSentAt.load(ordering: .relaxed)
@@ -422,7 +427,7 @@ final class WebSocketSession: @unchecked Sendable {
             let now = lock.withLock { _ -> Bool in
                 let pending = inbox.count - inboxHead
                 let full = pending >= limits.maxQueue || (pending > 0 && inboxBytes >= limits.maxQueueBytes)
-                if (!full && pendingFailure == 0) || stopReading || gone { return true }
+                if (!full && pendingFailure == 0) || gone { return true }
                 if pendingFailure != 0 && pending == 0 { return true }
                 roomWaiter = c
                 return false
@@ -751,6 +756,25 @@ func serveWebSocket<R: AsyncReader & ~Copyable, W: AsyncWriter & ~Copyable & Sen
                               limits: StreamLimits(limits))
     let session = WebSocketSession(limits: upgrade.limits, channel: channel, deflate: upgrade.deflate,
                                    runtime: app.runtime)
+    let handler = startWebSocketHandler(session, upgrade, app: app)
+    await session.read(reader, leftover: upgrade.leftover)
+    // The connection is over. A handler with messages still to read reads
+    // them, and its receive then ends; one with none is told by being
+    // cancelled. Either way it is waited for before the stream it writes to
+    // is let go of.
+    if !session.hasUnread { handler.cancel() }
+    await handler.value
+    await session.drain()
+    app.webSockets.remove(session)
+    await closeWriter(held.pointee)
+    held.deinitialize(count: 1)
+    held.deallocate()
+}
+
+/// Registers `session` and runs `upgrade`'s handler on it in a task of its
+/// own, which closes the WebSocket when the handler returns or throws.
+func startWebSocketHandler(_ session: WebSocketSession, _ upgrade: WebSocketUpgrade,
+                           app: CompiledApplication) -> Task<Void, Never> {
     let socket = WebSocket(session: session, subprotocol: upgrade.subprotocol,
                            offeredSubprotocols: upgrade.offered)
     app.webSockets.add(session)
@@ -768,19 +792,7 @@ func serveWebSocket<R: AsyncReader & ~Copyable, W: AsyncWriter & ~Copyable & Sen
         }
         session.handlerFinished(failed: failed)
     }
-    let handler = app.runtime?.spawn(body) ?? Task(operation: body)
-    await session.read(reader, leftover: upgrade.leftover)
-    // The connection is over. A handler with messages still to read reads
-    // them, and its receive then ends; one with none is told by being
-    // cancelled. Either way it is waited for before the stream it writes to
-    // is let go of.
-    if !session.hasUnread { handler.cancel() }
-    await handler.value
-    await session.drain()
-    app.webSockets.remove(session)
-    await closeWriter(held.pointee)
-    held.deinitialize(count: 1)
-    held.deallocate()
+    return app.runtime?.spawn(body) ?? Task(operation: body)
 }
 
 /// The WebSockets a shard holds, to be closed with 1001 when it shuts down.

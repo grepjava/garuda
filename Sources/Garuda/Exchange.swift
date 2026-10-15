@@ -118,6 +118,9 @@ struct Exchange: ~Copyable {
     var websocketsRefused = false
     /// --ws-*, set per connection that can upgrade.
     var websocketLimits = WebSocketLimits()
+    /// HTTP/2: the `:protocol` of an extended CONNECT (RFC 8441), routed as
+    /// the GET it stands for. Set per stream.
+    var connectProtocol = ConnectProtocol.none
 
     @usableFromInline
     mutating func resetStream() {
@@ -644,4 +647,13 @@ extension ByteSpan {
     func equals(_ literal: StaticString) -> Bool {
         count == literal.utf8CodeUnitCount && equalsExact(base, count, literal)
     }
+}
+
+/// What an HTTP/2 extended CONNECT asked to become.
+enum ConnectProtocol: UInt8 {
+    /// An ordinary request.
+    case none
+    case websocket
+    /// A protocol nothing here speaks: 501 at a WebSocket route.
+    case other
 }

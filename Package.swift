@@ -30,7 +30,7 @@ let vegaTraits: Set<Package.Dependency.Trait> = [
 /// Garuda needs.
 let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.3.4"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.3.5"), traits: vegaTraits)
 
 let package = Package(
     name: "garuda",

@@ -345,6 +345,15 @@ final class H2Stream: @unchecked Sendable {
     @exclusivity(unchecked) var runsInline = false
     /// The writer has seen the end and sends END_STREAM with the last bytes.
     @exclusivity(unchecked) var ending = false
+    /// What a body cut off part-way is reset with.
+    @exclusivity(unchecked) var failCode = H2Error.internalError
+
+    // An extended CONNECT's (HTTP2WebSocket.swift).
+    /// Where its DATA goes, as it arrives, for the WebSocket to read.
+    @exclusivity(unchecked) var inbound: H2Inbound?
+    /// Ended from our side while the client's may still be open: kept in
+    /// the reader's table until it ends too. Under the lock.
+    @exclusivity(unchecked) var lingering = false
 
     init(connection: H2Connection, maxHeaders: Int, peer: SocketPeer) {
         self.connection = connection
@@ -388,6 +397,8 @@ final class H2Connection: @unchecked Sendable {
     let secure: Bool
     /// The access log or `app.onResponse` sees each answer.
     let observing: Bool
+    /// SETTINGS_ENABLE_CONNECT_PROTOCOL was sent: `:protocol` is allowed.
+    let acceptsConnectProtocol: Bool
 
     // MARK: Shared, under `lock`
 
@@ -418,6 +429,11 @@ final class H2Connection: @unchecked Sendable {
     @exclusivity(unchecked) var peerGoneAway = false
     @exclusivity(unchecked) var lastPeerStream: UInt32 = 0
     @exclusivity(unchecked) var goawaySent = false
+    /// WebSockets running on the connection's streams.
+    @exclusivity(unchecked) var webSocketStreams = 0
+    /// Shutdown has begun, and its GOAWAY waits for the WebSockets' close
+    /// handshakes: no new streams are taken meanwhile.
+    @exclusivity(unchecked) var goawayDeferred = false
     /// The writer is to stop as soon as it has sent the control frames.
     @exclusivity(unchecked) var stopping = false
     @exclusivity(unchecked) var readerDone = false
@@ -476,6 +492,7 @@ final class H2Connection: @unchecked Sendable {
         self.service = service
         self.secure = secure
         observing = limits.accessLog || !app.observers.isEmpty || app.metrics != nil
+        acceptsConnectProtocol = limits.websocket.overHTTP2
         recvWindow = H2FrameHeader.defaultInitialWindowSize
         resetBudget = settings.resetBudget
         ready.reserveCapacity(16)
@@ -504,7 +521,7 @@ final class H2Connection: @unchecked Sendable {
             // We never push, and saying so up front keeps a client from
             // reserving anything on our behalf.
             (.enablePush, 0),
-        ]
+        ] + (limits.websocket.overHTTP2 ? [(.enableConnectProtocol, 1)] : [])
         frame(&control, entries.count * 6, .settings, [], 0)
         for (setting, value) in entries {
             control.writeByte(UInt8(truncatingIfNeeded: setting.rawValue >> 8))
@@ -525,15 +542,27 @@ final class H2Connection: @unchecked Sendable {
     }
 
     /// Shutdown: GOAWAY naming the last stream taken, and no new ones.
+    /// With WebSockets open it waits for them: they are sent 1001, and a
+    /// client may take GOAWAY for the end of every stream -- Python's h2
+    /// does -- and never answer.
     func beginShutdown() {
         lock.withLock { _ in
             guard !goawaySent else { return }
-            goawaySent = true
-            frame(&control, 8, .goaway, [], 0)
-            HTTP2.writeUInt32(lastPeerStream, into: &control)
-            HTTP2.writeUInt32(H2Error.noError.rawValue, into: &control)
-            wake.notifyOne()
+            if webSocketStreams > 0 {
+                goawayDeferred = true
+                return
+            }
+            sendShutdownGoawayLocked()
         }
+    }
+
+    /// Under the lock: the shutdown's GOAWAY.
+    func sendShutdownGoawayLocked() {
+        goawaySent = true
+        frame(&control, 8, .goaway, [], 0)
+        HTTP2.writeUInt32(lastPeerStream, into: &control)
+        HTTP2.writeUInt32(H2Error.noError.rawValue, into: &control)
+        wake.notifyOne()
     }
 
     // MARK: - Reading
@@ -615,6 +644,7 @@ final class H2Connection: @unchecked Sendable {
         s.reset = true
         s.task?.cancel()
         s.resumeWaiters(false)
+        s.inbound?.fail()
     }
 
     /// No stream open, by the reader's account, and none running.
@@ -647,8 +677,16 @@ final class H2Connection: @unchecked Sendable {
         while i < streams.count {
             let s = streams[i]
             if s.receiving && now &- s.lastActivity > limit {
-                streamError(s.id, .cancel)
-                continue
+                if s.inbound == nil {
+                    streamError(s.id, .cancel)
+                    continue
+                }
+                // A WebSocket ended from our side whose client never ended
+                // its own: told to stop, without error.
+                if lock.withLock({ _ in s.closed }) {
+                    streamError(s.id, .noError)
+                    continue
+                }
             }
             i &+= 1
         }
@@ -656,11 +694,13 @@ final class H2Connection: @unchecked Sendable {
         return false
     }
 
-    /// Under the lock: drops the streams the writer has finished with.
+    /// Under the lock: drops the streams the writer has finished with, but
+    /// for a WebSocket's whose client has not yet ended its side.
     func sweep() {
         var i = 0
         while i < streams.count {
-            if streams[i].closed {
+            let s = streams[i]
+            if s.closed && !(s.lingering && s.receiving) {
                 release(streams[i])
                 streams.swapAt(i, streams.count - 1)
                 streams.removeLast()
@@ -796,6 +836,19 @@ final class H2Connection: @unchecked Sendable {
             return true
         }
         s.lastActivity = monotonicNanos()
+        if let inbound = s.inbound {
+            // A WebSocket's: the bytes are its to read as they come, and the
+            // stream's window is given back as they are read.
+            let end = header.flags.contains(.endStream)
+            if !inbound.deliver(payload + offset, length, spent: header.length, end: end) {
+                releaseConnectionWindow()
+                streamError(header.streamID, .flowControlError)
+                return true
+            }
+            if end { s.receiving = false }
+            releaseConnectionWindow()
+            return true
+        }
         s.recvWindow -= header.length
         if s.recvWindow < 0 {
             releaseConnectionWindow()
@@ -960,6 +1013,11 @@ final class H2Connection: @unchecked Sendable {
                 streamError(id, .streamClosed)
                 return true
             }
+            if let inbound = s.inbound {
+                s.receiving = false
+                inbound.end()
+                return true
+            }
             // A trailer section ends the body as surely as END_STREAM on a
             // DATA frame, and is held to the same declared length.
             let head = s.x.pointee.head
@@ -976,7 +1034,9 @@ final class H2Connection: @unchecked Sendable {
         let s: H2Stream? = lock.withLock { _ in
             lastPeerStream = id
             sweep()
-            if streams.count >= settings.maxConcurrentStreams || goawaySent || peerGoneAway { return nil }
+            if streams.count >= settings.maxConcurrentStreams || goawaySent || goawayDeferred || peerGoneAway {
+                return nil
+            }
             return take(id)
         }
         guard let s else {
@@ -995,6 +1055,17 @@ final class H2Connection: @unchecked Sendable {
             return true
         case .ok:
             break
+        }
+        if s.x.pointee.connectProtocol != .none {
+            // RFC 8441: the stream is the tunnel, and one ended at once has
+            // none.
+            if blockEndsStream {
+                remove(s)
+                rst(id, .protocolError)
+                return true
+            }
+            runTunnel(s)
+            return true
         }
         let head = s.x.pointee.head
         if blockEndsStream {
@@ -1031,6 +1102,7 @@ final class H2Connection: @unchecked Sendable {
             s.x.pointee.site = limits.site
             s.x.pointee.compress = limits.compress
             s.x.pointee.compressMinimum = limits.compressMinimum
+            s.x.pointee.websocketLimits = limits.websocket
             made.append(s)
         }
         s.id = id
@@ -1044,6 +1116,11 @@ final class H2Connection: @unchecked Sendable {
         s.resetAfter = nil
         s.sent = 0
         s.length = 0
+        if s.inbound != nil {
+            s.inbound = nil
+            s.lingering = false
+            s.failCode = .internalError
+        }
         if s.streamed {
             s.streamed = false
             s.declared = -1
@@ -1093,6 +1170,7 @@ final class H2Connection: @unchecked Sendable {
         var count = 1
         var method = (0, 0), path = (0, 0), authority = (0, 0), host = (0, 0)
         var sawMethod = false, sawPath = false, sawScheme = false, sawAuthority = false, sawHost = false
+        var sawProtocol = false, protocolIsWebSocket = false
         var sawRegular = false
         var malformed = false
         var contentLength = -1
@@ -1127,9 +1205,14 @@ final class H2Connection: @unchecked Sendable {
                         }
                         sawAuthority = true
                         authority = s.head.append(span.value, span.valueLength)
+                    } else if acceptsConnectProtocol && equalsExact(span.name, span.nameLength, ":protocol") {
+                        // RFC 8441: offered by SETTINGS_ENABLE_CONNECT_PROTOCOL.
+                        if sawProtocol { malformed = true; return }
+                        sawProtocol = true
+                        protocolIsWebSocket = equalsExact(span.value, span.valueLength, "websocket")
                     } else {
-                        // Unknown, or :protocol, which is only for a peer we
-                        // told it may (RFC 8441) and we do not.
+                        // Unknown, or :protocol from a peer we did not tell it
+                        // may (RFC 8441).
                         malformed = true
                     }
                     return
@@ -1193,8 +1276,6 @@ final class H2Connection: @unchecked Sendable {
             return .compression
         }
         if malformed { return .malformed }
-        // A plain CONNECT has no :scheme or :path, and an extended one needs
-        // :protocol, which is not offered: neither is served.
         if !sawMethod || !sawScheme || !sawPath || method.1 == 0 || path.1 == 0 { return .malformed }
         // RFC 9113 section 8.3.1: an :authority and a Host that differ are
         // malformed. Without either, there is no host, which HTTP/1.1 refuses.
@@ -1202,7 +1283,18 @@ final class H2Connection: @unchecked Sendable {
                                        sawHost ? host : nil), hostAt.1 > 0 else {
             return .malformed
         }
-        if equalsExact(UnsafePointer(s.head.readPointer) + method.0, method.1, "CONNECT") { return .malformed }
+        let isConnect = equalsExact(UnsafePointer(s.head.readPointer) + method.0, method.1, "CONNECT")
+        if sawProtocol {
+            // An extended CONNECT names what it connects to, and stands for
+            // a GET of its path: that is how it is routed.
+            if !isConnect || !sawAuthority { return .malformed }
+            method = s.head.append("GET")
+            x.pointee.connectProtocol = protocolIsWebSocket ? .websocket : .other
+        } else {
+            // A plain CONNECT has no :scheme or :path, and is not served.
+            if isConnect { return .malformed }
+            x.pointee.connectProtocol = .none
+        }
 
         let hostName = s.head.append("host")
         headers[0] = HTTPHeaderRef(name: HTTPSlice(hostName.0, 4), value: HTTPSlice(hostAt.0, hostAt.1),
@@ -1269,6 +1361,22 @@ final class H2Connection: @unchecked Sendable {
 
     // MARK: Running a stream
 
+    /// An extended CONNECT: its handler runs now, in a task of its own --
+    /// never on the reader, which feeds it -- with the stream still open
+    /// for the DATA it reads.
+    func runTunnel(_ s: H2Stream) {
+        s.receiving = true
+        s.started = true
+        s.lastActivity = monotonicNanos()
+        s.inbound = H2Inbound(stream: s, window: settings.initialWindowSize)
+        lock.withLock { _ in
+            s.holds &+= 1
+            tasks &+= 1
+            unstarted &-= 1
+        }
+        service.pool.run(s)
+    }
+
     /// The request is whole: its handler runs in a pooled task.
     func run(_ s: H2Stream) {
         s.receiving = false
@@ -1305,6 +1413,17 @@ final class H2Connection: @unchecked Sendable {
             }
         }
         await dispatchStream(s)
+        if let inbound = s.inbound {
+            if let upgrade = s.x.pointee.upgrade {
+                s.x.pointee.upgrade = nil
+                await runWebSocket(s, inbound, upgrade)
+                return
+            }
+            // Answered as an ordinary request: the tunnel is refused, and the
+            // client told to stop sending (RFC 9113 section 8.1).
+            inbound.close()
+            s.resetAfter = .noError
+        }
         if let channel = s.x.pointee.channel {
             // Streamed: the head is the writer's already, and the body's end
             // is now (StreamingResponse.swift).

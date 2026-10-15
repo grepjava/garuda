@@ -195,7 +195,8 @@ struct WebSocketOffer {
         case malformed
         /// Over HTTP/2, a request that is not an extended CONNECT.
         case multiplexed
-        /// --no-websockets: 501.
+        /// --no-websockets, or an extended CONNECT for another protocol:
+        /// 501.
         case disabled
     }
 
@@ -206,8 +207,14 @@ struct WebSocketOffer {
     /// The offer `request` makes, or what is wrong with it.
     static func read(_ request: borrowing Request) -> Result<WebSocketOffer, Problem> {
         let x = request.exchange
+        if case .http2 = x.pointee.link {
+            switch x.pointee.connectProtocol {
+            case .none: return .failure(.multiplexed)
+            case .other: return .failure(.disabled)
+            case .websocket: return readExtendedConnect(request)
+            }
+        }
         guard x.pointee.canUpgrade else {
-            if case .http2 = x.pointee.link { return .failure(.multiplexed) }
             return .failure(x.pointee.websocketsRefused ? .disabled : .notUpgrade)
         }
         var key: [UInt8]? = nil
@@ -242,6 +249,31 @@ struct WebSocketOffer {
         // A key is 16 random bytes in base64: 24 characters.
         guard let key, key.count == 24 else { return .failure(.malformed) }
         return .success(WebSocketOffer(key: key, subprotocols: subprotocols, extensions: extensions))
+    }
+
+    /// RFC 8441's handshake: the extended CONNECT itself stands for the
+    /// upgrade, and there is no key, so only the version, subprotocols and
+    /// extensions are read.
+    private static func readExtendedConnect(_ request: borrowing Request) -> Result<WebSocketOffer, Problem> {
+        var version = -1
+        var subprotocols: [String] = []
+        var extensions: [[UInt8]] = []
+        request.forEachHeader { name, value in
+            switch name.count {
+            case 21 where lowercasedEquals(name, "sec-websocket-version"):
+                version = value.withUnsafeBufferPointer { b in
+                    Int(String(decoding: b, as: UTF8.self).trimmingSpaces) ?? -1
+                }
+            case 22 where lowercasedEquals(name, "sec-websocket-protocol"):
+                forEachItem(value) { subprotocols.append(String(decoding: $0, as: UTF8.self)) }
+            case 24 where lowercasedEquals(name, "sec-websocket-extensions"):
+                extensions.append(value.withUnsafeBufferPointer { Array($0) })
+            default:
+                break
+            }
+        }
+        guard version == 13 else { return .failure(.version) }
+        return .success(WebSocketOffer(key: [], subprotocols: subprotocols, extensions: extensions))
     }
 
     /// The 28-character Sec-WebSocket-Accept value.
@@ -434,15 +466,20 @@ func refuseWebSocket(_ problem: WebSocketOffer.Problem, _ response: borrowing Re
 }
 
 /// Answers the upgrade: the 101 is written by the connection once the
-/// handler has returned, and the connection becomes the WebSocket's.
+/// handler has returned, and the connection becomes the WebSocket's; over
+/// HTTP/2, the 200, and the stream becomes it.
 func acceptWebSocket(_ x: UnsafeMutablePointer<Exchange>, _ offer: WebSocketOffer, subprotocol: String?,
                      run: CarriedHandler) {
     let limits = x.pointee.websocketLimits
     let deflate = limits.compress && !offer.extensions.isEmpty
         ? offer.extensions.withSpans { WSDeflate.negotiate($0) } : nil
     let response = Response(x)
-    response.addHeader("upgrade", "websocket")
-    response.addHeader("sec-websocket-accept", offer.acceptValue())
+    let multiplexed: Bool
+    if case .http2 = x.pointee.link { multiplexed = true } else { multiplexed = false }
+    if !multiplexed {
+        response.addHeader("upgrade", "websocket")
+        response.addHeader("sec-websocket-accept", offer.acceptValue())
+    }
     if let subprotocol { response.addHeader("sec-websocket-protocol", subprotocol) }
     if let deflate {
         var value = ByteBuffer()
@@ -450,7 +487,10 @@ func acceptWebSocket(_ x: UnsafeMutablePointer<Exchange>, _ offer: WebSocketOffe
         deflate.writeResponse(into: &value)
         response.addHeader("sec-websocket-extensions", value.readableSpan.string)
     }
-    x.pointee.status = 101
+    // Over HTTP/2 a 200 opens the stream as the WebSocket's (RFC 8441),
+    // its body the frames, which are not to be compressed twice.
+    x.pointee.status = multiplexed ? 200 : 101
+    if multiplexed { x.pointee.noCompress = true }
     x.pointee.answered = true
     x.pointee.touchedStream = true
     x.pointee.upgrade = WebSocketUpgrade(run: run, subprotocol: subprotocol,
@@ -496,6 +536,8 @@ final class WebSocketUpgrade: @unchecked Sendable {
 /// --ws-*: what every WebSocket is held to.
 struct WebSocketLimits: Sendable {
     var enabled: Bool
+    /// --websocket-protocols.
+    var protocols: WebSocketProtocols
     var maxMessage: Int
     var pingInterval: Duration
     var pingTimeout: Duration
@@ -506,6 +548,7 @@ struct WebSocketLimits: Sendable {
     /// ServerConfig's defaults.
     init() {
         enabled = true
+        protocols = .all
         maxMessage = 16 * 1024 * 1024
         pingInterval = .seconds(20)
         pingTimeout = .seconds(20)
@@ -516,6 +559,7 @@ struct WebSocketLimits: Sendable {
 
     init(_ config: ServerConfig) {
         enabled = config.websocketsEnabled
+        protocols = config.websocketProtocols
         maxMessage = max(125, config.maxWebsocketMessageSize)
         pingInterval = config.websocketPingInterval
         pingTimeout = config.websocketPingTimeout
@@ -523,4 +567,11 @@ struct WebSocketLimits: Sendable {
         maxQueueBytes = max(1, config.maxWebsocketQueueBytes)
         compress = config.websocketCompress
     }
+}
+
+extension WebSocketLimits {
+    /// WebSockets are served over HTTP/1.1's upgrade.
+    var overHTTP1: Bool { enabled && protocols.contains(.http1) }
+    /// And over HTTP/2's extended CONNECT, which is then offered.
+    var overHTTP2: Bool { enabled && protocols.contains(.http2) }
 }

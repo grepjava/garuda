@@ -10,6 +10,8 @@ so that the broken ones a library would never send can be sent too.
 
 Uses the routes in Sources/GarudaConformance under /ws and /broadcast.
 Needs:  pip install h2 aioquic
+
+PROTOCOLS=2 runs the HTTP/2 checks alone, against a server without --http3.
 """
 
 import asyncio
@@ -41,6 +43,7 @@ except ImportError:
     raise SystemExit(2)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROTOCOLS = tuple(int(p) for p in os.environ.get("PROTOCOLS", "2,3").split(","))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, ".build", "release", "garuda-conformance")
 
 ENABLE_CONNECT_PROTOCOL = 0x8
@@ -120,7 +123,7 @@ class Server:
     def __init__(self, *args):
         self.port = free_port()
         cert, key = make_certs()
-        cmd = [BIN, "--port", str(self.port), "--log-level", "error", "--http3",
+        cmd = [BIN, "--port", str(self.port), "--log-level", "error"] + (["--http3"] if 3 in PROTOCOLS else []) + [
                "--tls-cert", cert, "--tls-key", key] + list(args)
         self.log = tempfile.TemporaryFile()
         self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT)
@@ -786,7 +789,7 @@ async def run_section(section, server, protocol):
 def section(name, func, *args):
     print("\n" + name)
     with Server(*args) as server:
-        for protocol in (2, 3):
+        for protocol in PROTOCOLS:
             try:
                 asyncio.run(run_section(func, server, protocol))
             except Exception as exc:  # noqa: BLE001 -- one broken section must not hide the rest
@@ -796,7 +799,7 @@ def section(name, func, *args):
 def keepalive():
     print("\nPings")
     with Server("--ws-ping-interval", "300", "--ws-ping-timeout", "1000") as server:
-        for protocol in (2, 3):
+        for protocol in PROTOCOLS:
             async def run():
                 client = await (H2Client.open(server) if protocol == 2 else H3Client.open(server))
                 p = client.name
@@ -827,7 +830,7 @@ def keepalive():
 def compression():
     print("\nCompression")
     with Server("--ws-compress") as server:
-        for protocol in (2, 3):
+        for protocol in PROTOCOLS:
             async def run():
                 client = await (H2Client.open(server) if protocol == 2 else H3Client.open(server))
                 p = client.name
@@ -864,6 +867,8 @@ def protocols_flag():
                     ("reset", H2_PROTOCOL_ERROR))
             finally:
                 await client.close()
+            if 3 not in PROTOCOLS:
+                return
             client = await H3Client.open(server)
             try:
                 stream = client.open_stream("/ws/echo")
@@ -923,19 +928,24 @@ def draining():
     print("\nShutting down")
     with Server("--graceful-timeout", "5") as server:
         async def run():
+            h3 = 3 in PROTOCOLS
             h2c = await H2Client.open(server)
-            h3c = await H3Client.open(server)
+            h3c = await H3Client.open(server) if h3 else None
             s2, w2 = await websocket(h2c, "/ws/echo")
-            s3, w3 = await websocket(h3c, "/ws/echo")
+            if h3:
+                s3, w3 = await websocket(h3c, "/ws/echo")
             server.proc.send_signal(signal.SIGTERM)
             got2 = await w2.close_frame()
-            got3 = await w3.close_frame()
             is_("HTTP/2: an open WebSocket is closed with 1001", got2[0] if got2 else None, 1001)
-            is_("HTTP/3: and the same", got3[0] if got3 else None, 1001)
+            if h3:
+                got3 = await w3.close_frame()
+                is_("HTTP/3: and the same", got3[0] if got3 else None, 1001)
             await w2.close(1001)
-            await w3.close(1001)
+            if h3:
+                await w3.close(1001)
             await h2c.close()
-            await h3c.close()
+            if h3:
+                await h3c.close()
         asyncio.run(run())
         try:
             server.proc.wait(10)

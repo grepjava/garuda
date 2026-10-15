@@ -268,10 +268,12 @@ extension Application {
                         await group.next()
                         group.cancelAll()
                     }
-                    // HTTP/2 connections are sent GOAWAY and finish the streams
-                    // they have, as HTTP/1 ones finish their request.
-                    http2?.shutdown()
+                    // WebSockets are sent 1001. HTTP/2 connections are sent
+                    // GOAWAY -- once their WebSockets have closed -- and
+                    // finish the streams they have, as HTTP/1 ones finish
+                    // their request.
                     app.webSockets.shutdown()
+                    http2?.shutdown()
                     await withTaskGroup(of: Void.self) { group in
                         for server in all { group.addTask { await server.shutdown(gracePeriod: grace) } }
                     }
@@ -389,6 +391,9 @@ extension ServerConfig {
           --ws-max-queue-bytes BYTES
                                and bytes (4 MiB)
           --ws-compress        permessage-deflate with clients that offer it
+          --websocket-protocols LIST
+                               which of http1, http2 and http3 carry
+                               WebSockets (all three)
           --http2-only         serve only HTTP/2 (h2c), with no HTTP/1 fallback
           --request-id         give every request an X-Request-ID, echoed on
                                the response and logged; one a
@@ -663,6 +668,11 @@ extension ServerConfig {
                 config.maxWebsocketQueueBytes = n
             case "--ws-compress":
                 config.websocketCompress = true
+            case "--websocket-protocols":
+                guard let list = value().flatMap({ WebSocketProtocols(parsing: $0) }) else {
+                    return fail("--websocket-protocols takes a list of http1, http2 and http3")
+                }
+                config.websocketProtocols = list
             case "--no-http2":
                 config.http2Enabled = false
                 config.http2Only = false

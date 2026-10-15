@@ -519,7 +519,7 @@ extension H2Connection {
             if s.streamed && s.bodyFailed {
                 // Cut off part-way: half a body cannot be ended honestly.
                 frame(&out, 4, .rstStream, [], s.id)
-                HTTP2.writeUInt32(H2Error.internalError.rawValue, into: &out)
+                HTTP2.writeUInt32(s.failCode.rawValue, into: &out)
                 finished.append(s)
                 sending.remove(at: i)
                 continue
