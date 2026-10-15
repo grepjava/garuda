@@ -39,6 +39,7 @@ import Glibc
 import Darwin
 #elseif os(Windows)
 import ucrt
+import WinSDK
 #endif
 import GarudaWire
 import Synchronization
@@ -150,6 +151,13 @@ func modificationTime(_ path: String) -> Int {
     #else
     return Int(info.st_mtim.tv_sec) &* 1_000_000_000 &+ Int(info.st_mtim.tv_nsec)
     #endif
+    #elseif os(Windows)
+    // The last write, in the 100 ns ticks of a FILETIME.
+    var data = WIN32_FILE_ATTRIBUTE_DATA()
+    let found = path.withCString(encodedAs: UTF16.self) { GetFileAttributesExW($0, GetFileExInfoStandard, &data) }
+    guard found else { return -1 }
+    let ticks = UInt64(data.ftLastWriteTime.dwHighDateTime) << 32 | UInt64(data.ftLastWriteTime.dwLowDateTime)
+    return Int(truncatingIfNeeded: ticks) &* 100
     #else
     return -1
     #endif
