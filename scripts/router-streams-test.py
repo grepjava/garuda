@@ -12,8 +12,7 @@ server is Garuda 2's `garuda` binary (Sources/garuda-server), which serves GET
 /, GET /user/:id, POST /user and GET /delay/:ms.
 
 Garuda 1's copy also limited the server with --max-connections, which Garuda 2
-does not have, and sent extended CONNECTs over HTTP/3, which Garuda 2 does not
-offer yet (WebSockets and WebTransport over HTTP/3 come with them).
+does not have.
 
 Needs `h2` and `aioquic` in the interpreter running it:  pip install h2 aioquic
 """
@@ -502,6 +501,23 @@ async def h3_abandoned():
         check("the server is still running", server.alive())
 
 
+async def h3_extended_connect():
+    print("\nHTTP/3: extended CONNECT")
+    # WebTransport goes to the routes, and this binary has none for it; any
+    # other :protocol is refused. A CONNECT stream stays open by design, so an
+    # answer that waited for the end of the request would never be sent.
+    with Server() as server:
+        async with h3_connect(server) as client:
+            session = client.extended_connect("/wt", "webtransport")
+            unknown = client.extended_connect("/x", "unknown-protocol")
+            await client.collect([session, unknown], timeout=5.0)
+            is_("a WebTransport CONNECT to no route is 404", client.status.get(session), 404)
+            is_("so is an unknown :protocol", client.status.get(unknown), 501)
+            after = client.request("GET", "/user/5")
+            await client.collect([after])
+            is_("and the connection serves on", client.body.get(after), b"5")
+
+
 def run(coro):
     asyncio.run(asyncio.wait_for(coro, timeout=120))
 
@@ -517,6 +533,7 @@ def main():
     run(h3_delays())
     run(h3_cancellation())
     run(h3_abandoned())
+    run(h3_extended_connect())
     print("\n%d passed, %d failed" % (PASS, FAIL))
     raise SystemExit(1 if FAIL else 0)
 
