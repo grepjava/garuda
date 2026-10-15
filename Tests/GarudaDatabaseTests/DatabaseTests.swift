@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Garuda
 @testable import GarudaPostgres
@@ -65,7 +67,7 @@ struct Stamped: Codable, Equatable {
 @Suite("Garuda's types in SQLite")
 struct SQLiteTypeTests {
     @Test func uuidsAndTimestampsRoundTrip() throws {
-        let path = "/tmp/garuda-db-\(getpid())-types.sqlite"
+        let path = "\(temporaryDirectory)/garuda-db-\(getpid())-types.sqlite"
         defer { unlink(path); unlink(path + "-wal"); unlink(path + "-shm") }
         let id = UUID.random()
         let instants = [Timestamp(microsecondsSinceEpoch: 1_789_591_223_196_123),
@@ -291,7 +293,7 @@ private func written(_ data: [String: String]?) -> String {
 @Suite("Session stores")
 struct SessionStoreTests {
     @Test func theSQLiteStoreSavesLoadsExpiresAndReplacesOnlyLiveSessions() throws {
-        let path = "/tmp/garuda-db-\(getpid())-sessions.sqlite"
+        let path = "\(temporaryDirectory)/garuda-db-\(getpid())-sessions.sqlite"
         defer { unlink(path); unlink(path + "-wal"); unlink(path + "-shm") }
         let out = try DatabaseTestRuntime.shared.block { () async throws -> String in
             let db = try SQLiteDatabase(SQLiteConfiguration(path: path))
@@ -317,7 +319,7 @@ struct SessionStoreTests {
     }
 
     @Test func sessionsWorkOverTheSQLiteStore() throws {
-        let path = "/tmp/garuda-db-\(getpid())-web.sqlite"
+        let path = "\(temporaryDirectory)/garuda-db-\(getpid())-web.sqlite"
         defer { unlink(path); unlink(path + "-wal"); unlink(path + "-shm") }
         let app = visitingApp { request in SQLiteSessionStore(try request.state(SQLiteDatabase.self)) }
         app.state { _ in

@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 @testable import Garuda
 import GarudaTesting
@@ -18,7 +20,7 @@ struct TestCertificate {
 
     init(_ names: [String], tag: String) throws {
         identity = try TLSIdentity.selfSigned(names: names)
-        let stem = "/tmp/garuda-tls-\(getpid())-\(tag)"
+        let stem = "\(temporaryDirectory)/garuda-tls-\(getpid())-\(tag)"
         files = TLSCertificateFiles(chain: stem + ".crt", key: stem + ".key")
         try write(identity.certificateChain, to: files.chain)
         try write(identity.privateKey, to: files.key)
@@ -38,7 +40,7 @@ struct TestCertificate {
 struct WriteFailed: Error {}
 
 func write(_ text: String, to path: String) throws {
-    guard let file = fopen(path, "w") else { throw WriteFailed() }
+    guard let file = fopen(path, "wb") else { throw WriteFailed() }
     defer { fclose(file) }
     guard fputs(text, file) >= 0 else { throw WriteFailed() }
 }
