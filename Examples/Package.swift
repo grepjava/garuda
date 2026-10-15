@@ -15,13 +15,12 @@ import PackageDescription
 //                        trips, and throughput on streams
 //   swift run files      a file service: resumable uploads, and downloads
 //                        with byte ranges from the static route
+//   swift run uploads    photo uploads per user: resumable, behind bearer
+//                        tokens, checked for what the bytes are
 //
 // Each application is a library target with a function that builds it, so
 // `swift test` drives it through `app.test`, and a small executable that runs
 // it with the server's command-line flags.
-//
-// Sources/UploadsExample and its executable are not built yet: they wait to be
-// ported to Garuda 2.
 
 // Garuda's own settings: Swift 6, and async functions that run on their
 // caller's executor unless they say otherwise.
@@ -34,9 +33,9 @@ let swiftSettings: [SwiftSetting] = [
 // does not export: VegaCrypto's SHA-256 in the webtransport example, a
 // runtime for work outside the server in the starter's `withServices`, and
 // VegaFS's file system calls, which run on the blocking pool, in the files
-// example. The
-// same checkout Garuda builds on (GARUDA_VEGA_PATH), or the same release, and
-// BoringSSL under its TLS as Garuda's default has it.
+// and uploads examples. The same checkout Garuda builds on
+// (GARUDA_VEGA_PATH), or the same release, and BoringSSL under its TLS as
+// Garuda's default has it.
 let vega: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: ["BoringSSL"])
 } ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.4"), traits: ["BoringSSL"])
@@ -87,14 +86,21 @@ let package = Package(
         .executableTarget(name: "files", dependencies: ["FilesExample", garuda("Garuda")],
                           swiftSettings: swiftSettings),
 
+        .target(name: "UploadsExample",
+                dependencies: [garuda("Garuda"), garuda("GarudaUploads"),
+                               .product(name: "Vega", package: "vega"),
+                               .product(name: "VegaFS", package: "vega")],
+                swiftSettings: swiftSettings),
+        .executableTarget(name: "uploads", dependencies: ["UploadsExample", garuda("Garuda")],
+                          swiftSettings: swiftSettings),
+
         .testTarget(name: "ExampleTests",
                     dependencies: ["TodoExample", "AuthExample", "StreamingExample", "ChatExample",
                                    "WebTransportExample", "StarterExample", "FilesExample",
+                                   "UploadsExample",
                                    garuda("Garuda"), garuda("GarudaSQLite"), garuda("GarudaPostgres"),
                                    garuda("GarudaUploads"), garuda("GarudaTesting"),
                                    .product(name: "VegaCrypto", package: "vega")],
-                    // The uploads example's tests, kept until it is ported.
-                    exclude: ["UploadsTests.swift"],
                     swiftSettings: swiftSettings),
     ]
 )

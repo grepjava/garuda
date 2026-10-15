@@ -5,6 +5,8 @@ import Darwin
 #endif
 import Testing
 import Garuda
+import GarudaTesting
+import GarudaUploads
 @testable import UploadsExample
 
 // The photo service end to end: whose an upload is, what is refused before a
@@ -19,10 +21,8 @@ private func temporaryDirectory() -> String {
 }
 
 private func client(_ configuration: UploadsConfiguration) -> TestClient {
-    var config = ServerConfig()
-    config.maxConnections = 16
-    let client = uploadsApp(configuration).testClient(configuration: config)
-    client.timeoutMillis = 20_000
+    let client = uploadsApp(configuration).test
+    client.timeout = .seconds(20)
     return client
 }
 
@@ -174,7 +174,7 @@ private func listing(_ directory: String) -> [String] {
     var names: [String] = []
     while let entry = readdir(dir) {
         let name = withUnsafeBytes(of: entry.pointee.d_name) {
-            String(cString: $0.bindMemory(to: CChar.self).baseAddress!)
+            String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self)
         }
         if name != "." && name != ".." { names.append(name) }
     }

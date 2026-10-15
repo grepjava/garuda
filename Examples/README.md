@@ -1,10 +1,6 @@
 # Examples
 
-> **Not yet ported to Garuda 2: `uploads`.** Its sources stay in
-> `Sources/UploadsExample`, `Sources/uploads` and
-> `Tests/ExampleTests/UploadsTests.swift`, outside every target, until it is.
-
-Seven applications built on Garuda's public API. Six are small enough to read
+Eight applications built on Garuda's public API. Seven are small enough to read
 in one sitting, each showing one thing; the starter shows the shape of a whole
 application and is the one to copy when beginning. They build against the
 Garuda checkout this directory sits in.
@@ -17,6 +13,7 @@ Garuda checkout this directory sits in.
 | [Chat](Sources/ChatExample/ChatApp.swift) | `swift run chat` | Rooms over WebSockets and server-sent events, heard across every shard through `Topic` |
 | [WebTransport](Sources/WebTransportExample/WebTransportApp.swift) | `swift run webtransport -- --tls-cert cert.pem --tls-key key.pem` | A network probe over HTTP/3: datagram round trips, download and upload throughput on streams, a stream the server opens, an extractor that refuses a session before it starts, and a browser page that trusts a self-signed certificate by its hash |
 | [Files](Sources/FilesExample/FilesApp.swift) | `swift run files` | A file service: resumable uploads (`GarudaUploads`) with size limits and SHA-256 digests, the files served back by `--static-dir` with byte ranges, `ETag` and a listing |
+| [Uploads](Sources/UploadsExample/UploadsApp.swift) | `swift run uploads` | Photo uploads per user: resumable uploads inside `group("/users/:user")` behind bearer tokens, `onCreate` recording whose upload it is, the bytes checked for the image type they claim, and an answer with a `Location` replayed to a client that lost it |
 | [**Starter**](STARTER.md) | `swift run starter` | A whole application on PostgreSQL (`GarudaPostgres`): accounts with JWT access and refresh tokens, roles and admin-only routes, input rules answered as 422, migrations, configuration from the environment, OpenAPI, health and readiness, and a deployment recipe |
 
 ```bash
@@ -58,7 +55,8 @@ The package depends on Garuda's products -- `Garuda`, and `GarudaSQLite`,
 them -- and on Vega, the runtime Garuda is built on, for what Garuda does not
 export: SHA-256 (`VegaCrypto`, in the webtransport example), a runtime for
 work outside the server (`Vega`, in the starter's `withServices`), and file
-system calls that run on the blocking pool (`VegaFS`, in the files example).
+system calls that run on the blocking pool (`VegaFS`, in the files and uploads
+examples).
 
 ## Notes for copying
 
@@ -88,6 +86,13 @@ system calls that run on the blocking pool (`VegaFS`, in the files example).
   handler is called once, with the whole file on disk, to move it into place.
   The files go back out through `--static-dir`, which `main.swift` adds to the
   command line, so the application writes no download code at all.
+- **Whose upload it is** is decided once, on the request that creates it. The
+  request that completes an upload is a later one, perhaps on another
+  connection; the uploads example's `onCreate` records the owner from the
+  group's authentication, and the completion handler reads it from
+  `upload.metadata`, which no client can write. `Content-Type` and the file
+  name are the client's word, so the example checks the first bytes before it
+  keeps a photo.
 - **WebTransport needs HTTP/3**, and so TLS. A browser trusts a self-signed
   certificate over WebTransport only through `serverCertificateHashes`, and
   only an ECDSA one valid for at most 14 days; the webtransport example's
