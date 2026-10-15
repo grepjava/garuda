@@ -68,12 +68,17 @@ let package = Package(
         .executableTarget(name: "webtransport", dependencies: ["WebTransportExample", garuda("Garuda")],
                           swiftSettings: swiftSettings),
 
+        .target(name: "StarterExample",
+                dependencies: [garuda("Garuda"), garuda("GarudaPostgres"), .product(name: "Vega", package: "vega")],
+                swiftSettings: swiftSettings),
+        .executableTarget(name: "starter", dependencies: ["StarterExample", garuda("Garuda")],
+                          swiftSettings: swiftSettings),
+
         .testTarget(name: "ExampleTests",
-                    dependencies: ["TodoExample", "AuthExample", "StreamingExample", "ChatExample", "WebTransportExample",
-                                   garuda("Garuda"), garuda("GarudaSQLite"), garuda("GarudaTesting"), .product(name: "VegaCrypto", package: "vega")],
+                    dependencies: ["TodoExample", "AuthExample", "StreamingExample", "ChatExample", "WebTransportExample", "StarterExample",
+                                   garuda("Garuda"), garuda("GarudaSQLite"), garuda("GarudaPostgres"), garuda("GarudaTesting"), .product(name: "VegaCrypto", package: "vega")],
                     // Waiting for GarudaUploads.
-                    exclude: ["FilesTests.swift", "UploadsTests.swift",
-                              "StarterTests.swift", ],
+                    exclude: ["FilesTests.swift", "UploadsTests.swift"],
                     swiftSettings: swiftSettings),
     ]
 )

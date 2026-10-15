@@ -7,14 +7,15 @@
 //   records how many have been applied, and an edited one will not run again.
 // - One migration is the statements that belong together. They run in one
 //   transaction, so a migration either happened or did not.
-// - Times are stored as epoch seconds (bigint). PostgreSQL's timestamptz has
-//   no Swift type of its own yet (CONNECTORS.md), and a number decodes into
-//   `Int64` everywhere without a format to agree on.
+// - Times are stored as epoch seconds (bigint). GarudaPostgres reads a
+//   timestamptz as Garuda's `Timestamp`, but the OpenAPI document cannot yet
+//   say what a `Timestamp` looks like in JSON, and a number needs no format
+//   for a client to agree on.
 // - The refresh-token tables come from Garuda, so they are migrated with
 //   everything else rather than created on the side.
 //===----------------------------------------------------------------------===//
 
-import Garuda
+import GarudaPostgres
 
 public let starterMigrations: [[String]] = [
     // 1: accounts.

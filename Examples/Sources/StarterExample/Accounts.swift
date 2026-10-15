@@ -17,11 +17,11 @@
 //
 // - A login costs the same whether the email is unknown or the password is
 //   wrong, so timing does not say which emails have accounts.
-// - Passwords are hashed with 600,000 PBKDF2 iterations on the blocking pool,
-//   so the worker keeps serving while a login spends its CPU.
+// - Passwords are hashed with 600,000 PBKDF2 iterations on Vega's blocking
+//   pool, so the shard's threads keep serving while a login spends its CPU.
 //===----------------------------------------------------------------------===//
 
-import Garuda
+import GarudaPostgres
 
 /// What a login sends. No rules of its own on purpose: the rules below say
 /// what a *new* password has to be, and an account made before they changed
@@ -106,7 +106,7 @@ func addAccountRoutes(_ app: Application, _ configuration: StarterConfiguration)
                 LoginRow.self, "select id, password from users where email = $1", email)
             // The same work either way: an unknown email verifies against a
             // hash nobody has.
-            // A real hash, made once per worker at start-up, so an unknown
+            // A real hash, made once per shard at start-up, so an unknown
             // email costs what a known one does.
             let against = found?.password ?? services.value.absentPasswordHash
             let correct = try await Passwords.verify(body.value.password, against: against)

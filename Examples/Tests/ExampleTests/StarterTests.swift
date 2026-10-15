@@ -4,21 +4,42 @@ import Glibc
 import Darwin
 #endif
 import Testing
-import Garuda
+import GarudaPostgres
+import GarudaTesting
 @testable import StarterExample
 
 // The starter application end to end, through `app.test`: the real engine,
 // the real PostgreSQL, its own migrations.
 //
-// Opt-in, because it needs a database it may drop tables in:
+// Opt-in, against the server Garuda's own database tests use (vega-db's
+// scripts/postgres-test-server.sh starts it), as host:port:user:password:database:
 //
-//     STARTER_DATABASE_URL=postgres://garuda:garuda-secret@127.0.0.1:55432/postgres?sslmode=disable \
-//         swift test
+//     GARUDA_POSTGRES=127.0.0.1:46432:vega:vega-secret:vega swift test
+//
+// The tests drop and make tables, so they work in a database of their own,
+// `garuda_starter_example`, made on that server the first time.
 
+/// The database the tests use, made if it is not there yet.
 private let databaseURL: String? = {
-    guard let raw = getenv("STARTER_DATABASE_URL") else { return nil }
-    let url = String(cString: raw)
-    return url.isEmpty ? nil : url
+    guard let raw = getenv("GARUDA_POSTGRES") else { return nil }
+    let parts = String(cString: raw).split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+    guard parts.count == 5 else { return nil }
+    let server = "postgres://\(parts[2]):\(parts[3])@\(parts[0]):\(parts[1])"
+    var configuration = StarterConfiguration(mode: .development,
+                                             databaseURL: "\(server)/\(parts[4])?sslmode=disable")
+    configuration.databasePoolSize = 1
+    do {
+        try withServices(configuration) { services in
+            do {
+                try await services.pool.execute("create database garuda_starter_example")
+            } catch let error as PostgresClientError where error.sqlState == "42P04" {
+                // There already.
+            }
+        }
+    } catch {
+        return nil
+    }
+    return "\(server)/garuda_starter_example?sslmode=disable"
 }()
 
 /// A configuration for tests: quick tokens, no documentation routes.
@@ -34,9 +55,8 @@ private func testConfiguration() -> StarterConfiguration {
 /// An empty database: the migrations then build the schema from nothing, as
 /// they do on a new deployment.
 private func emptySchema() throws {
-    let app = starterApp(testConfiguration())
-    try app.runOnce { start in
-        let pool = try start.state(Services.self).pool
+    try withServices(testConfiguration()) { services in
+        let pool = services.pool
         for table in ["notes", "users", "garuda_refresh_tokens", "garuda_refresh_tokens_families",
                       "garuda_schema_version"] {
             try await pool.execute("drop table if exists \(table) cascade")
@@ -62,11 +82,11 @@ private func bearer(_ pair: TokenPair) -> [(String, String)] {
 
 @Suite("Starter example", .serialized)
 struct StarterExampleTests {
-    @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))
+    @Test(.enabled(if: databaseURL != nil, "set GARUDA_POSTGRES to run"))
     func accountsAndSessions() throws {
         try emptySchema()
         let client = starterApp(testConfiguration()).test
-        client.timeoutMillis = 30_000
+        client.timeout = .seconds(30)
 
         // Signing up, and what is refused.
         let created = try signUp(client, "Ada@Example.com ")
@@ -120,11 +140,11 @@ struct StarterExampleTests {
         }
     }
 
-    @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))
+    @Test(.enabled(if: databaseURL != nil, "set GARUDA_POSTGRES to run"))
     func notesBelongToTheirAccount() throws {
         try emptySchema()
         let client = starterApp(testConfiguration()).test
-        client.timeoutMillis = 30_000
+        client.timeout = .seconds(30)
         _ = try signUp(client, "ada@example.com")
         _ = try signUp(client, "grace@example.com")
         let ada = try logIn(client, "ada@example.com")
@@ -176,14 +196,14 @@ struct StarterExampleTests {
         #expect(try client.delete("/notes/\(note.id)", headers: bearer(ada)).status == .notFound)
     }
 
-    @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))
+    @Test(.enabled(if: databaseURL != nil, "set GARUDA_POSTGRES to run"))
     func onlyAnAdministratorReachesTheAdminRoutes() throws {
         try emptySchema()
 
         // The order a deployment does this in: the accounts exist, and then
         // the deployment names one an administrator and restarts.
         let plain = starterApp(testConfiguration()).test
-        plain.timeoutMillis = 30_000
+        plain.timeout = .seconds(30)
         let ada = try signUp(plain, "ada@example.com").json(Account.self)
         let grace = try signUp(plain, "grace@example.com").json(Account.self)
         #expect(ada.role == "member", "an account starts as a member")
@@ -191,7 +211,7 @@ struct StarterExampleTests {
         var configuration = testConfiguration()
         configuration.adminEmails = ["ada@example.com"]
         let client = starterApp(configuration).test
-        client.timeoutMillis = 30_000
+        client.timeout = .seconds(30)
 
         // The role is in the token, so it is in /auth/me without a lookup.
         let adaTokens = try logIn(client, "ada@example.com")
@@ -291,13 +311,13 @@ struct StarterExampleTests {
         #expect(document.isEmpty, "\(document)")
     }
 
-    @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))
+    @Test(.enabled(if: databaseURL != nil, "set GARUDA_POSTGRES to run"))
     func healthReadinessAndDocumentation() throws {
         try emptySchema()
         var configuration = testConfiguration()
         configuration.documentationPath = "/docs"
         let client = starterApp(configuration).test
-        client.timeoutMillis = 30_000
+        client.timeout = .seconds(30)
 
         #expect(try client.get("/health").text == "ok")
         #expect(try client.get("/ready").text == "ready")
@@ -310,21 +330,18 @@ struct StarterExampleTests {
         #expect(try client.get("/docs").text.contains("swagger-ui"))
     }
 
-    @Test(.enabled(if: databaseURL != nil, "set STARTER_DATABASE_URL to run"))
+    @Test(.enabled(if: databaseURL != nil, "set GARUDA_POSTGRES to run"))
     func migrationsRunOnceAndAreSafeToRepeat() throws {
         try emptySchema()
-        // A worker migrates as it starts, so the first request already has a
-        // schema; a second application over the same database finds nothing
-        // to do.
+        // A shard migrates as it starts, so the first request already has a
+        // schema; `starter migrate` over the same database finds nothing to
+        // do.
         let first = starterApp(testConfiguration()).test
         #expect(try first.get("/health").status == .ok)
-        let applied = starterApp(testConfiguration())
-        final class Count: @unchecked Sendable { var value = -1 }
-        let count = Count()
-        try applied.runOnce { start in
-            count.value = try await start.state(Services.self).pool.migrate(starterMigrations)
+        let applied = try withServices(testConfiguration()) { services in
+            try await services.pool.migrate(starterMigrations)
         }
-        #expect(count.value == 0)
+        #expect(applied == 0)
     }
 }
 

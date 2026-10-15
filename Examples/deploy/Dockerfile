@@ -9,9 +9,13 @@
 #       starter
 #
 # The schema: `docker run ... starter migrate` before rolling out, or let each
-# worker migrate as it starts. Both are safe; Examples/STARTER.md says why.
+# shard migrate as it starts. Both are safe; Examples/STARTER.md says why.
 
-FROM swift:6.1-noble AS build
+FROM swift:6.3-noble AS build
+
+# Garuda links the system's libssl, libcrypto and libz (INSTALLATION.md).
+RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
@@ -21,10 +25,11 @@ RUN swift build -c release --package-path Examples --product starter \
 
 FROM ubuntu:noble
 
-# What the binary needs beyond the Swift runtime: TLS, compression, C++ runtime,
-# and curl for the health check.
+# What the binary needs beyond the Swift runtime: OpenSSL's libraries, zlib,
+# the C++ runtime, time zones and CA certificates, and curl for the health
+# check.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 zlib1g libstdc++6 libcurl4 curl tzdata \
+        ca-certificates libssl3 zlib1g libstdc++6 curl tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # The Swift runtime libraries, from the build image.
@@ -37,12 +42,15 @@ RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin starter
 USER 10001:10001
 
 EXPOSE 8080
-# Liveness only: /health touches no database, so a database outage does not
-# restart the container.
+# Liveness only: --health-check-path answers before routing and touches no
+# database, so a database outage does not restart the container.
 HEALTHCHECK --interval=10s --timeout=2s --start-period=20s \
     CMD curl -fsS http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["starter"]
-# --workers 0 is one per CPU. Under a CPU limit, set it to that limit.
-CMD ["serve", "--", "--host", "0.0.0.0", "--port", "8080", "--workers", "0", \
-     "--access-log", "--request-id", "--drain-delay", "5000"]
+# --shards auto lets Vega choose the shard processes from the machine's CPUs,
+# each with threads of its own. Under a CPU limit, give --shards and --threads
+# that fit it. On SIGTERM (docker stop) the health check fails for
+# --drain-delay milliseconds before the shards drain.
+CMD ["serve", "--", "--host", "0.0.0.0", "--port", "8080", "--shards", "auto", \
+     "--access-log", "--request-id", "--health-check-path", "/health", "--drain-delay", "5000"]

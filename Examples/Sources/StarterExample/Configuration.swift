@@ -7,12 +7,12 @@
 // sense. Nothing is served until it all checks out, and every problem is
 // reported at once rather than one per restart.
 //
-// Garuda's own flags -- port, workers, TLS, rate limits -- stay on the command
+// Garuda's own flags -- port, shards, TLS, rate limits -- stay on the command
 // line (CONFIG.md). This is for what the *application* needs: where the
 // database is, what signs its tokens, whether sign-ups are open.
 //===----------------------------------------------------------------------===//
 
-import Garuda
+import GarudaPostgres
 
 public struct StarterConfiguration: Sendable {
     public var mode: AppEnvironment.Mode
@@ -37,6 +37,17 @@ public struct StarterConfiguration: Sendable {
     public var summary: String = ""
 
     public var isProduction: Bool { mode == .production }
+
+    /// This configuration with a signing key: the one it has, or, in
+    /// development with none given, one made up now. Tokens stop working
+    /// when the process restarts, which is what a key nobody wrote down
+    /// means. Production is refused a default by `fromEnvironment`.
+    public func withDevelopmentKey() -> StarterConfiguration {
+        guard signingKeyPEM == nil else { return self }
+        var configuration = self
+        configuration.signingKeyPEM = try? JWTKey.generate(.ES256, keyID: "access").privatePEM
+        return configuration
+    }
 
     public init(mode: AppEnvironment.Mode = .development,
                 databaseURL: String = "postgres://garuda:garuda-secret@127.0.0.1:5432/starter?sslmode=disable",
@@ -100,8 +111,8 @@ extension StarterConfiguration {
         }
 
         // In development, no key means one made up for the run, which
-        // `starterApp` does. In production that would sign out every user on
-        // each deployment, and no two workers would agree.
+        // `withDevelopmentKey` does. In production that would sign out every
+        // user on each deployment.
         let key = env.secretOrFile("JWT_PRIVATE_KEY", default: production ? nil : "")
         configuration.signingKeyPEM = key.isEmpty ? nil : key
         if let pem = configuration.signingKeyPEM {

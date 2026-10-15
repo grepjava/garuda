@@ -17,7 +17,7 @@
 // every later page. `id desc` with `before` reads one index range.
 //===----------------------------------------------------------------------===//
 
-import Garuda
+import GarudaPostgres
 
 public struct Note: Codable, Equatable, Sendable {
     public let id: Int64
