@@ -30,6 +30,7 @@ private func h3App() -> Application {
         let body = response.stream(contentType: "text/plain")
         for i in 1...3 { try await body.write("line \(i)\n") }
     }
+    app.get("/big") { _, response in response.send(String(repeating: "a", count: 30_000)) }
     app.get("/delay/:ms") { request, response in
         try await Runtime.sleep(for: .milliseconds(Int(request.parameter(0)) ?? 1))
         response.send(status: .ok)
@@ -542,6 +543,24 @@ struct HTTP3Tests {
             try await client.sendStream(8, hsVarint(0x21) + hsVarint(16_383), fin: false)
             #expect(try await client.answer(8).reset == HTTP3Error.excessiveLoad)
             #expect(try await client.get(12, "/user/after").text == "after")
+        }
+    }
+
+    @Test func aConnectionCutShortOfItsTurnGoesOnAtOnce() throws {
+        try withServer(h3App()) { client, service in
+            try await client.connect()
+            for endpoint in service.endpoints { endpoint.datagramsPerTurn = 1 }
+            try await client.request(0, [(":method", "GET"), (":scheme", "https"), (":authority", "localhost"),
+                                         (":path", "/big")])
+            // Nothing is acknowledged, so what arrives the server sent on
+            // its own: the rest of its congestion window, at once, not a
+            // datagram a probe timeout (25 ms of ack delay and more).
+            guard try await client.receiveOne(timeout: .seconds(2)) != nil else {
+                throw QUICTestPeerError("no answer")
+            }
+            var count = 1
+            while try await client.receiveOne(timeout: .milliseconds(10)) != nil { count += 1 }
+            #expect(count >= 4)
         }
     }
 

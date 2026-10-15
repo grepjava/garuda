@@ -151,6 +151,9 @@ final class HTTP3Service: @unchecked Sendable {
         for endpoint in lock.withLock({ $0.endpoints }) { endpoint.stop(grace: grace) }
     }
 
+    /// The endpoints, one a socket.
+    var endpoints: [QUICEndpoint] { lock.withLock { $0.endpoints } }
+
     /// Returns once every endpoint has ended.
     func wait() async {
         for task in lock.withLock({ $0.tasks }) { await task.value }
@@ -175,7 +178,8 @@ final class QUICEndpoint: @unchecked Sendable {
     /// The most datagrams one connection sends before the others get a turn.
     /// Congestion control is what normally stops a connection; this is so one
     /// that always believes it has something to send cannot hold the socket.
-    static let datagramsPerTurn = 4096
+    /// One cut short goes on at once, on the next pass.
+    @exclusivity(unchecked) var datagramsPerTurn = 4096
     /// The socket buffers asked for. A burst arriving faster than the
     /// endpoint takes it waits here rather than being dropped.
     static let socketBufferSize = 2 * 1024 * 1024
@@ -329,7 +333,7 @@ final class QUICEndpoint: @unchecked Sendable {
                 takePosts()
                 serviceTouched(nowMs: now)
             }
-            await flush(socket, nowMs: now)
+            if await flush(socket, nowMs: now) { busy = true }
             // After the flush: what was just sent set loss and probe timers.
             nextTimerMs = earliestTimer(nowMs: now)
             if stopping && (live.isEmpty || forced && closesSent) { break }
@@ -578,8 +582,9 @@ final class QUICEndpoint: @unchecked Sendable {
 
     // MARK: Datagrams out
 
-    /// Sends what every connection has to say.
-    func flush(_ socket: borrowing UDPSocket, nowMs now: UInt64) async {
+    /// Sends what every connection has to say. True when a connection was
+    /// cut short of its turn, and still has more.
+    func flush(_ socket: borrowing UDPSocket, nowMs now: UInt64) async -> Bool {
         if !replies.isEmpty {
             let sending = replies
             replies.removeAll(keepingCapacity: true)
@@ -591,9 +596,11 @@ final class QUICEndpoint: @unchecked Sendable {
                                            segmentSize: n, to: reply.to, from: reply.from)
             }
         }
+        var more = false
         for connection in live where connection.quic.hasOutput {
-            await writeAll(connection, socket, nowMs: now)
+            if await writeAll(connection, socket, nowMs: now) { more = true }
         }
+        return more
     }
 
     /// Builds a connection's datagrams straight into `sendBuffer`, back to
@@ -603,15 +610,20 @@ final class QUICEndpoint: @unchecked Sendable {
     /// lookup and a wake-up of the receiver apiece. A run ends at a datagram
     /// shorter than the ones before it (the kernel allows the last to be
     /// short), at one longer (it cannot join, so it starts the next run), or
-    /// at `maxSegments`.
-    func writeAll(_ connection: H3Connection, _ socket: borrowing UDPSocket, nowMs now: UInt64) async {
-        var remaining = QUICEndpoint.datagramsPerTurn
+    /// at `maxSegments`. True when the turn ran out before the connection
+    /// did.
+    @discardableResult
+    func writeAll(_ connection: H3Connection, _ socket: borrowing UDPSocket, nowMs now: UInt64) async -> Bool {
+        var remaining = datagramsPerTurn
         while remaining > 0 {
             remaining &-= 1
             // There is always room: a run is sent before it reaches the cap.
             let at = sendBuffer + pendingLength
             let n = connection.quic.nextDatagram(at, QUICEndpoint.datagramSize, nowMs: now)
-            if n == 0 { break }
+            if n == 0 {
+                remaining = -1
+                break
+            }
             if pendingLength == 0 {
                 pendingPeer = connection.peer
                 pendingLocal = connection.local
@@ -631,6 +643,7 @@ final class QUICEndpoint: @unchecked Sendable {
             }
         }
         await sendPending(socket, length: pendingLength)
+        return remaining == 0
     }
 
     /// Sends the run at the front of `sendBuffer`. A run the socket refuses
