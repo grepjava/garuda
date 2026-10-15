@@ -114,6 +114,9 @@ struct Exchange: ~Copyable {
     /// An accepted WebSocket upgrade, for the connection to carry out once
     /// the handler has returned (WebSocket.swift).
     var upgrade: WebSocketUpgrade?
+    /// An accepted WebTransport session, for the stream's task to run once
+    /// the handler has returned (WebTransport.swift).
+    var webTransport: WTAcceptance?
     /// The connection can become a WebSocket's: HTTP/1, served where its
     /// stream can be split. Set per connection.
     var canUpgrade = false
@@ -130,6 +133,7 @@ struct Exchange: ~Copyable {
     mutating func resetStream() {
         touchedStream = false
         upgrade = nil
+        webTransport = nil
         channel = nil
         producer = nil
         bodyReplaced = false

@@ -6,7 +6,10 @@
 // parser would describe the HTTP/1.1 head it amounts to, with its version set
 // to 3. Its body is collected whole before dispatch, held to the same body
 // limit. Then the stream runs `dispatch` in a task from the shard's stream
-// pool, and a stream the client cancels has its task cancelled.
+// pool, and a stream the client cancels has its task cancelled. An extended
+// CONNECT is dispatched on its HEADERS instead, and its stream is then a
+// tunnel: a WebSocket's (HTTP3WebSocket.swift), or a WebTransport session's
+// (HTTP3WebTransport.swift).
 //
 // The task never touches the QUIC connection. It frames its answer itself --
 // QPACK here never indexes, so encoding needs no state shared with anything
@@ -85,6 +88,8 @@ final class H3Stream: @unchecked Sendable {
     /// A WebSocket's: its DATA, handed to the task as it arrives. Set before
     /// the task runs.
     @exclusivity(unchecked) var inbound: H3Inbound?
+    /// A WebTransport session's, once the endpoint has its 200.
+    @exclusivity(unchecked) var liveSession: WTSession?
 
     // MARK: Shared, under the endpoint's lock
 
@@ -110,6 +115,9 @@ final class H3Stream: @unchecked Sendable {
     @exclusivity(unchecked) var bodyFailed = false
     /// What a failed body's stream is reset with.
     @exclusivity(unchecked) var failCode = HTTP3Error.internalError
+    /// The WebTransport session on the stream, once its task has staged the
+    /// 200 (HTTP3WebTransport.swift).
+    @exclusivity(unchecked) var wt: WTSession?
     /// Writers of a streamed body waiting for `staged` to drain.
     @exclusivity(unchecked) var waiters: [UnsafeContinuation<Bool, Never>] = []
     /// The endpoint is answering it itself: its writes cannot wait for the
@@ -242,6 +250,12 @@ extension QUICEndpoint {
             // Answered as an ordinary request: the tunnel is refused, and
             // the client told to stop sending once the answer has gone.
             inbound.close()
+        }
+        if let accepted = s.x.pointee.webTransport {
+            s.x.pointee.webTransport = nil
+            if await runWebTransport(s, accepted) { return }
+            // The connection has as many sessions as it may.
+            s.x.pointee.status = 503
         }
         if let channel = s.x.pointee.channel {
             // Streamed: the head is staged already, and the body's end is

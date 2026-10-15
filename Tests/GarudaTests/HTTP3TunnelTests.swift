@@ -7,8 +7,9 @@ import QUICTestPeer
 import Vega
 
 // Extended CONNECT over HTTP/3, over a real UDP socket in process, to the
-// tests' own QUIC client (HTTP3Tests.swift): WebSockets (RFC 9220).
-// scripts/websocket-streams-test.py checks the same against aioquic.
+// tests' own QUIC client (HTTP3Tests.swift): WebSockets (RFC 9220) and
+// WebTransport. scripts/websocket-streams-test.py and webtransport-test.py
+// check the same against aioquic.
 
 /// `fields` for an extended CONNECT for `protocol` to `path`.
 private func extendedConnect(_ path: String, _ proto: String, _ more: [(String, String)] = []) -> [(String, String)] {
@@ -133,6 +134,178 @@ struct HTTP3WebSocketTests {
             let answer = try await client.answer(0)
             #expect(answer.reset == HTTP3Error.requestCancelled)
             #expect(try serverFrames(client.peer.streams[0] ?? []).contains { $0.0 == 0x9 })
+        }
+    }
+}
+
+// MARK: - WebTransport
+
+/// How the last /wt-report session ended, as "<code> <reason>".
+private let lastSessionClose = Mutex("")
+
+/// Echoes every stream and datagram, as scripts/webtransport-test.py's /wt.
+private func echoSession(_ session: WebTransportSession) async throws {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        group.addTask {
+            while let datagram = try await session.receiveDatagram() {
+                session.sendDatagram(Array("echo:".utf8) + datagram)
+            }
+        }
+        while let stream = try await session.acceptStream() {
+            group.addTask {
+                let body = try await stream.readAll()
+                let out = stream.isBidirectional ? stream : try session.openStream(bidirectional: false)
+                try await out.write(Array("echo:".utf8) + body)
+                out.finish()
+            }
+        }
+        try await group.waitForAll()
+    }
+}
+
+private func webTransportApp() -> Application {
+    let app = h3App()
+    app.onWebTransport("/wt") { _, session in try await echoSession(session) }
+    app.onWebTransport("/wt-close") { _, session in session.close(code: 7, reason: "asked to") }
+    app.onWebTransport("/wt-report") { _, session in
+        while try await session.acceptStream() != nil {}
+        lastSessionClose.withLock { $0 = "\(session.closeCode) \(session.closeReason)" }
+    }
+    app.group("/wt-reject") {
+        app.use { _, response, _ in response.send(status: .forbidden) }
+        app.onWebTransport("/") { _, session in try await echoSession(session) }
+    }
+    app.webTransport("/wt-room/:name") { (session: WebTransportSession, name: Path<String>) async throws in
+        let out = try session.openStream(bidirectional: false)
+        try await out.write(Array("welcome to \(name.value)".utf8))
+        out.finish()
+        while try await session.acceptStream() != nil {}
+    }
+    return app
+}
+
+/// A CLOSE_WEBTRANSPORT_SESSION capsule.
+private func closeCapsule(_ code: UInt32, _ reason: String) -> [UInt8] {
+    let payload = [UInt8(code >> 24), UInt8(code >> 16 & 0xFF), UInt8(code >> 8 & 0xFF), UInt8(code & 0xFF)]
+        + Array(reason.utf8)
+    return hsVarint(0x2843) + hsVarint(UInt64(payload.count)) + payload
+}
+
+/// The length of the HEADERS frame at the start of `bytes`, or 0 while it
+/// has not all arrived.
+private func headLength(_ bytes: [UInt8]) -> Int {
+    bytes.withUnsafeBufferPointer { b -> Int in
+        guard let base = b.baseAddress else { return 0 }
+        var r = QUICReader(base, b.count)
+        guard r.varint() == 0x01, let length = r.varintAsInt(), r.skip(length) else { return 0 }
+        return r.offset
+    }
+}
+
+/// What follows the HEADERS frame on a session's CONNECT stream: capsules.
+private func afterHead(_ bytes: [UInt8]) -> [UInt8] {
+    Array(bytes[headLength(bytes)...])
+}
+
+extension H3Client {
+    /// Opens a WebTransport session on stream `id`, and waits for its answer.
+    func session(_ id: UInt64, _ path: String) async throws -> H3Answer {
+        try await request(id, extendedConnect(path, "webtransport"), fin: false)
+        try await pump { headLength(peer.streams[id] ?? []) > 0 || peer.resets[id] != nil }
+        let bytes = peer.streams[id] ?? []
+        return try H3Answer(Array(bytes.prefix(headLength(bytes))), reset: peer.resets[id])
+    }
+}
+
+@Suite("WebTransport over HTTP/3")
+struct HTTP3WebTransportTests {
+
+    @Test func aSessionEchoesItsStreamsAndDatagrams() throws {
+        try withServer(webTransportApp(), datagrams: 1200) { client, _ in
+            try await client.connect()
+            let settings = try serverSettings(client)
+            #expect(settings[0x08] == 1)
+            #expect(settings[0x33] == 1)
+            #expect(settings[0xC671_706A] == 16)
+            #expect(try await client.session(0, "/wt").status == 200)
+
+            // A bidirectional stream, answered on itself.
+            try await client.write(4, hsVarint(0x41) + hsVarint(0) + Array("hello".utf8), fin: true)
+            try await client.pump { client.peer.finished.contains(4) }
+            #expect(client.peer.streams[4] == Array("echo:hello".utf8))
+
+            // A unidirectional one, answered on one of ours: the first after
+            // the control and QPACK streams.
+            try await client.write(2, hsVarint(0x54) + hsVarint(0) + Array("uni".utf8), fin: true)
+            try await client.pump { client.peer.finished.contains(15) }
+            #expect(client.peer.streams[15] == hsVarint(0x54) + hsVarint(0) + Array("echo:uni".utf8))
+
+            // A datagram, by the session's quarter stream ID.
+            try await client.datagram([0] + Array("ping".utf8))
+            try await client.pump { !client.peer.datagrams.isEmpty }
+            #expect(client.peer.datagrams.first == [0] + Array("echo:ping".utf8))
+
+            // The connection still serves requests.
+            #expect(try await client.get(8, "/user/alongside").text == "alongside")
+        }
+    }
+
+    @Test func eitherSideMayClose() throws {
+        lastSessionClose.withLock { $0 = "" }
+        try withServer(webTransportApp(), datagrams: 1200) { client, _ in
+            try await client.connect()
+            // The handler closes: its code and reason, then FIN.
+            #expect(try await client.session(0, "/wt-close").status == 200)
+            try await client.pump { client.peer.finished.contains(0) }
+            #expect(afterHead(client.peer.streams[0] ?? []) == closeCapsule(7, "asked to"))
+
+            // The client closes: the handler's wait ends, and it sees why.
+            #expect(try await client.session(4, "/wt-report").status == 200)
+            try await client.write(4, closeCapsule(9, "bye now"), fin: true)
+            try await client.pump { client.peer.finished.contains(4) }
+            for _ in 0..<100 where lastSessionClose.withLock({ $0.isEmpty }) {
+                try await Runtime.sleep(for: .milliseconds(10))
+            }
+            #expect(lastSessionClose.withLock { $0 } == "9 bye now")
+        }
+    }
+
+    @Test func aSessionIsARouteUntilAccepted() throws {
+        try withServer(webTransportApp(), datagrams: 1200) { client, _ in
+            try await client.connect()
+            #expect(try await client.session(0, "/wt-reject").status == 403)
+            #expect(try await client.session(4, "/wt-nowhere").status == 404)
+            let get = try await client.get(8, "/wt")
+            #expect(get.status == 405)
+            #expect(get.header("allow") == "CONNECT")
+            // A typed route: the path parameter reaches the handler.
+            #expect(try await client.session(12, "/wt-room/lobby").status == 200)
+            try await client.pump { client.peer.finished.contains(15) }
+            #expect(client.peer.streams[15] == hsVarint(0x54) + hsVarint(12) + Array("welcome to lobby".utf8))
+        }
+    }
+
+    @Test func withoutDatagramsNoSessionsAreOffered() throws {
+        try withServer(webTransportApp()) { client, _ in
+            try await client.connect()
+            let settings = try serverSettings(client)
+            #expect(settings[0x08] == 1)
+            #expect(settings[0x33] == nil)
+            #expect(settings[0xC671_706A] == nil)
+        }
+    }
+
+    @Test func shutdownClosesSessionsCleanly() throws {
+        try withServer(webTransportApp(), datagrams: 1200) { client, service in
+            try await client.connect()
+            #expect(try await client.session(0, "/wt").status == 200)
+            service.shutdown(grace: .seconds(5))
+            // The session is closed with a capsule and FIN, and then the
+            // connection with H3_NO_ERROR, well inside the grace period.
+            try await client.pump(timeout: .seconds(3)) { client.peer.closeCode != nil }
+            #expect(client.peer.finished.contains(0))
+            #expect(afterHead(client.peer.streams[0] ?? []) == closeCapsule(0, ""))
+            #expect(client.peer.closeCode == HTTP3Error.noError)
         }
     }
 }

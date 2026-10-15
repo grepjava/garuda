@@ -79,6 +79,28 @@ final class H3Connection {
     /// GOAWAY was sent: requests on this stream or later are refused.
     var goawayID = UInt64.max
 
+    // MARK: WebTransport (HTTP3WebTransport.swift)
+
+    /// Live sessions, by the identifier of their CONNECT stream.
+    var sessions: [UInt64: WTSession] = [:]
+    /// The streams that belong to them, ours and the peer's.
+    var wtStreams: [UInt64: WTStream] = [:]
+    /// Streams that named a session not seen yet: their prefix is read,
+    /// what follows waits on the stream.
+    var orphans: [UInt64: (session: UInt64, bidirectional: Bool, prefix: UInt64)] = [:]
+    /// The largest datagram the peer takes, within what a packet carries;
+    /// 0 when it takes none. Set as the connection begins.
+    var datagramPayload = 0
+    /// Under the endpoint's lock: sessions whose handler is running, the
+    /// streams handlers have reserved and not yet had opened, the next index
+    /// of each kind to reserve, and the peer's limit on each.
+    @exclusivity(unchecked) var sessionCount = 0
+    @exclusivity(unchecked) var opening: [WTStream] = []
+    @exclusivity(unchecked) var nextLocalUni: UInt64 = 0
+    @exclusivity(unchecked) var nextLocalBidi: UInt64 = 0
+    @exclusivity(unchecked) var localLimitUni: UInt64 = 0
+    @exclusivity(unchecked) var localLimitBidi: UInt64 = 0
+
     init(endpoint: QUICEndpoint, quic: QUICConnection, peer: SocketAddress, local: SocketAddress?,
          localCID: QUICConnectionID, originalDCID: QUICConnectionID) {
         self.endpoint = endpoint
@@ -115,6 +137,8 @@ final class H3Connection {
             case .streamReadable, .streamFinished:
                 guard began, !closed else { return }
                 let id = event.streamID
+                // A WebTransport session's stream is bytes past its prefix.
+                if !wtStreams.isEmpty, let st = wtStreams[id] { return readWT(st) }
                 if QUICStreamKind.isServerInitiated(id) { return }
                 if QUICStreamKind.isUnidirectional(id) {
                     readUnidirectional(id)
@@ -123,18 +147,27 @@ final class H3Connection {
                 }
             case .streamReset, .stopSending:
                 guard began, !closed else { return }
-                aborted(event.streamID, code: event.code)
+                aborted(event.streamID, code: event.code, stop: event.kind == .stopSending)
             case .streamWritable:
-                if let s = streams[event.streamID] { pump(s) }
+                if let s = streams[event.streamID] {
+                    pump(s)
+                } else if !wtStreams.isEmpty, let st = wtStreams[event.streamID] {
+                    pumpWT(st)
+                }
             case .datagram:
-                // Not offered (QUICEndpoint.quicConfig); WebTransport's
-                // when it is.
-                quic.incomingDatagrams.removeAll(keepingCapacity: true)
+                // WebTransport's.
+                guard began, !closed else {
+                    quic.incomingDatagrams.removeAll(keepingCapacity: true)
+                    return
+                }
+                receiveDatagrams()
             case .closed:
                 closeHTTP()
             }
         }
         if !quic.events.isEmpty { endpoint.touch(self) }
+        // MAX_STREAMS may have raised what handlers can open.
+        if !sessions.isEmpty { refreshStreamLimits() }
     }
 
     // MARK: - Setting up
@@ -168,9 +201,21 @@ final class H3Connection {
         body.writeVarint(0)
         body.writeVarint(HTTP3Setting.maxFieldSectionSize)
         body.writeVarint(UInt64(settings.maxHeadSize))
-        // Extended CONNECT (RFC 9220): what carries WebSockets over HTTP/3.
+        // Extended CONNECT (RFC 9220): what carries WebSockets and
+        // WebTransport over HTTP/3.
         body.writeVarint(HTTP3Setting.enableConnectProtocol)
         body.writeVarint(1)
+        if quic.peerAllowsDatagrams {
+            body.writeVarint(HTTP3Setting.h3Datagram)
+            body.writeVarint(1)
+            // Offered only alongside datagrams. A WebTransport session whose
+            // datagrams cannot be carried is a session that works differently
+            // from the one the client asked for, and saying so up front is
+            // better than discovering it a message in.
+            body.writeVarint(HTTP3Setting.webTransportMaxSessions)
+            body.writeVarint(UInt64(wtMaxSessions))
+            datagramPayload = min(quic.maxDatagramPayload, wtDatagramCeiling)
+        }
         out.writeVarint(HTTP3StreamType.control)
         out.writeVarint(HTTP3FrameType.settings)
         out.writeVarint(UInt64(body.readableBytes))
@@ -187,6 +232,14 @@ final class H3Connection {
             decoderOut = id
             sendType(HTTP3StreamType.qpackDecoder, on: id)
         }
+        // What WebTransport handlers may open from here on.
+        let uni = quic.localStreamsOpened(unidirectional: true)
+        let bidi = quic.localStreamsOpened(unidirectional: false)
+        endpoint.lock.withLock { _ in
+            nextLocalUni = uni
+            nextLocalBidi = bidi
+        }
+        refreshStreamLimits()
         if endpoint.stopping { goaway() }
     }
 
@@ -201,6 +254,8 @@ final class H3Connection {
 
     func readUnidirectional(_ id: UInt64) {
         guard let stream = quic.stream(id) else { return }
+        // Held for a session not accepted yet.
+        if !orphans.isEmpty && orphans[id] != nil { return }
         if stream.released {
             // One we told to stop: whatever is still arriving is dropped.
             stream.receive.ready.clear()
@@ -217,6 +272,16 @@ final class H3Connection {
             }
             var r = QUICReader(UnsafePointer(stream.receive.ready.readPointer), available)
             guard let type = r.varint() else { return }
+            if type == HTTP3StreamType.webTransport {
+                // A WebTransport session's: its identifier follows the type,
+                // and the two together are the whole prefix.
+                guard let sessionID = r.varint() else {
+                    if available >= 16 { fail(HTTP3Error.generalProtocolError) }
+                    return
+                }
+                stream.receive.ready.consume(r.offset)
+                return adopt(id, sessionID: sessionID, bidirectional: false, prefix: r.offset)
+            }
             stream.receive.ready.consume(r.offset)
             switch type {
             case HTTP3StreamType.control:
@@ -232,8 +297,7 @@ final class H3Connection {
                 // Only a server pushes.
                 return fail(HTTP3Error.streamCreationError)
             default:
-                // An extension's stream -- WebTransport's (0x54) among them,
-                // until it is served -- or a reserved type: the peer is told
+                // An extension's stream, or a reserved type: the peer is told
                 // we are not interested rather than left waiting, and the
                 // stream is let go of, so its credit comes back.
                 stream.receive.ready.clear()
@@ -331,12 +395,31 @@ final class H3Connection {
     /// Reads what arrived on request stream `id`.
     func readRequest(_ id: UInt64, nowMs now: UInt64) {
         guard let stream = quic.stream(id) else { return }
+        if !orphans.isEmpty && orphans[id] != nil { return }
         if stream.released {
             // Answered, refused or cancelled: what still arrives is dropped.
             stream.receive.ready.clear()
             return
         }
         var s = streams[id]
+        if let current = s, current.isTunnel && current.inbound == nil {
+            // A WebTransport session's CONNECT stream: capsules.
+            return readSession(current, stream)
+        }
+        if s == nil && stream.receive.ready.readableBytes > 0 {
+            // A bidirectional stream that opens with WEBTRANSPORT_STREAM is
+            // not a request. Nothing is consumed until both varints are here.
+            let available = stream.receive.ready.readableBytes
+            var r = QUICReader(UnsafePointer(stream.receive.ready.readPointer), available)
+            if let type = r.varint(), type == HTTP3FrameType.webTransportStream {
+                guard let sessionID = r.varint() else {
+                    if available >= 16 { fail(HTTP3Error.frameError) }
+                    return
+                }
+                stream.receive.ready.consume(r.offset)
+                return adopt(id, sessionID: sessionID, bidirectional: true, prefix: r.offset)
+            }
+        }
         while true {
             let available = stream.receive.ready.readableBytes
             if available == 0 { break }
@@ -397,6 +480,8 @@ final class H3Connection {
                     }
                     stream.receive.ready.consume(header &+ length)
                     s = started
+                    // A WebTransport session's: what follows waits for it.
+                    if started.isTunnel && started.inbound == nil { return }
                 }
             case HTTP3FrameType.data:
                 guard let current = s else { return fail(HTTP3Error.frameUnexpected) }
@@ -583,6 +668,7 @@ final class H3Connection {
         s.bodySent = 0
         s.isTunnel = false
         s.inbound = nil
+        s.liveSession = nil
         endpoint.lock.withLock { _ in
             s.reset = false
             s.task = nil
@@ -594,6 +680,7 @@ final class H3Connection {
             s.bodyEnded = false
             s.bodyFailed = false
             s.failCode = HTTP3Error.internalError
+            s.wt = nil
         }
         s.x.pointee.reset()
         s.head.clear()
@@ -653,7 +740,13 @@ final class H3Connection {
     // MARK: - Cancellation
 
     /// The peer reset stream `id`, or asked us to stop sending on it.
-    func aborted(_ id: UInt64, code: UInt64) {
+    func aborted(_ id: UInt64, code: UInt64, stop: Bool) {
+        if !wtStreams.isEmpty, let st = wtStreams[id] { return abortedWT(st, stop: stop) }
+        if !orphans.isEmpty && orphans[id] != nil {
+            // Held for a session that never came: nobody will read it.
+            orphans[id] = nil
+            return refuse(id, code: HTTP3Error.webTransportSessionGone)
+        }
         if id == peerControl || id == peerEncoder || id == peerDecoder {
             // A critical stream: losing it loses the connection.
             return fail(HTTP3Error.closedCriticalStream)
@@ -669,6 +762,9 @@ final class H3Connection {
         guard let stream = quic.stream(id), !stream.released else { return }
         let s = streams[id]
         if let s, s.sendEnded { return }
+        // A WebTransport session's CONNECT stream: losing it loses the
+        // session, which is no rapid reset.
+        if let s, s.isTunnel && s.inbound == nil { return abort(s, code: HTTP3Error.requestCancelled) }
         // The same accounting HTTP/2 keeps, for the same attack. A request
         // costs a header decode and a task whatever happens to it afterwards,
         // and cancelling it hands the stream credit straight back, so a peer
@@ -724,6 +820,10 @@ final class H3Connection {
         guard s.inTable else { return }
         s.inTable = false
         streams[s.id] = nil
+        // A WebTransport session lasts as long as its CONNECT stream.
+        if s.isTunnel, let session = s.liveSession ?? endpoint.lock.withLock({ _ in s.wt }) {
+            endSession(session)
+        }
         quic.releaseStream(s.id)
         if !s.taskActive { recycle(s) }
     }
@@ -739,9 +839,9 @@ final class H3Connection {
 
     /// A task posted `s`: an answer, body bytes, an end, or its own end.
     func posted(_ s: H3Stream) {
-        let done = endpoint.lock.withLock { _ -> Bool in
+        let (done, session) = endpoint.lock.withLock { _ -> (Bool, WTSession?) in
             s.queued = false
-            return s.taskDone
+            return (s.taskDone, s.wt)
         }
         if done && s.taskActive {
             s.taskActive = false
@@ -750,6 +850,8 @@ final class H3Connection {
         if s.inTable && !closed {
             // A WebSocket's session took some of what arrived.
             if let inbound = s.inbound { extendTunnel(s, inbound) }
+            // A WebTransport session's streams, and what it sent.
+            if let session { serviceSession(session, on: s) }
             pump(s)
         } else if !s.inTable && !s.taskActive {
             recycle(s)
@@ -839,6 +941,9 @@ final class H3Connection {
         frame.writeVarint(UInt64(quicVarintLength(id)))
         frame.writeVarint(id)
         quic.send(controlOut, frame.readPointer, frame.readableBytes, fin: false)
+        // WebTransport sessions end now, cleanly: their handlers return, and
+        // the connection can close once they have.
+        closeSessions()
     }
 
     /// While shutting down: closes the connection once it has nothing left
@@ -879,8 +984,12 @@ final class H3Connection {
                 s.reset = true
                 s.task?.cancel()
                 s.resumeWaiters(false)
+                s.wt?.endLocked()
             }
         }
+        sessions.removeAll()
+        wtStreams.removeAll()
+        orphans.removeAll()
         for s in open {
             s.inbound?.fail()
             s.inTable = false

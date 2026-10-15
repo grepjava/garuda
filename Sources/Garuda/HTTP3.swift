@@ -278,9 +278,9 @@ final class QUICEndpoint: @unchecked Sendable {
         config.initialMaxStreamData = UInt64(settings.streamWindow)
         config.initialMaxData = UInt64(settings.streamWindow) &* 8
         config.initialMaxStreamsBidi = UInt64(settings.maxStreams)
-        // Datagrams are WebTransport's, which is not served yet: a peer that
-        // sends one has broken the protocol.
-        config.maxDatagramFrameSize = 0
+        // Datagrams are WebTransport's (RFC 9221, RFC 9297): as large as a
+        // packet of the smallest size a path must carry.
+        config.maxDatagramFrameSize = 1200
         return config
     }
 
