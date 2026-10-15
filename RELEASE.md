@@ -11,10 +11,11 @@ cut, that section is renamed to the version and its date, and a new empty
 Unreleased section goes above it.
 
 **What CI runs.** `.github/workflows/ci.yml` runs on every push to `main` and
-every pull request:
+`vega` and every pull request:
 
-- the release build and `swift test` on Ubuntu 24.04 and macOS 15, and the
+- the release build and `swift test` on Ubuntu 24.04 and macOS 26, and the
   handler code that must not compile;
+- the build and `swift test` with the OpenSSL trait, on the system OpenSSL;
 - `swift test` again against a real PostgreSQL and a real Redis, which is what
   turns the opt-in connector suites on, and the example applications with
   them;

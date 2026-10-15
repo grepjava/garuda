@@ -1,12 +1,13 @@
 # What every change is checked by.
 #
-# On every push to main and every pull request: the build and unit tests on
-# Linux and macOS, the handler code that must not compile, the connectors
-# against real PostgreSQL and Redis, the end-to-end suites that drive the
-# release binary over HTTP/1.1, the protocol suites -- HTTP/2, HTTP/3,
-# WebSocket, WebTransport, uploads -- against clients built from h2 and
-# aioquic, a minute of the fuzzer under AddressSanitizer, and a build against
-# the versioned dependency. A pull request is checked by everything main is.
+# On every push to main and vega and every pull request: the build and unit
+# tests on Linux and macOS, the handler code that must not compile, the
+# connectors against real PostgreSQL and Redis, the end-to-end suites that
+# drive the release binaries over a socket, the protocol suites -- HTTP/2,
+# HTTP/3, WebSocket, WebTransport, uploads -- against clients built from h2
+# and aioquic, a minute of the fuzzer under AddressSanitizer, and a build
+# against the versioned dependency. A pull request is checked by everything
+# main is.
 #
 # Nightly, and on demand: the same, with ten minutes of fuzzing rather than
 # one.
@@ -15,7 +16,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, vega]
   pull_request:
   schedule:
     # 03:17 UTC, off the hour so it does not queue behind everyone else's.
@@ -52,7 +53,7 @@ jobs:
 
   macos:
     name: macos · build and unit tests
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -62,19 +63,10 @@ jobs:
           if [ -n "$newest" ]; then sudo xcode-select -s "$newest"; fi
           swift --version
 
-      - name: Homebrew packages
-        run: brew install pkg-config openssl@3
-
-      - name: Environment
-        run: |
-          echo "OPENSSL_PREFIX=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
-
+      # BoringSSL, the default TLS library, is vendored in Vega: nothing to
+      # install.
       - name: Build
-        run: |
-          swift build -c release --product garuda \
-            -Xcc -I"$OPENSSL_PREFIX/include" \
-            -Xlinker -L"$OPENSSL_PREFIX/lib"
+        run: swift build -c release --product garuda
 
       - name: Unit tests and the fuzz corpus
         run: |
@@ -83,23 +75,22 @@ jobs:
           # A run that ever does fail for want of descriptors should say so
           # in its log rather than be quietly given more.
           echo "descriptors: $(ulimit -n)"
-          swift test \
-            -Xcc -I"$OPENSSL_PREFIX/include" \
-            -Xlinker -L"$OPENSSL_PREFIX/lib"
+          swift test
 
-      # Four tests fail here and nowhere else, and running them one at a
-      # time split them: three pass serially, so those three interfere with
-      # each other through something the suites share, and one --
-      # aClosedDatabaseRefusesStatements -- fails either way, so that one is
-      # macOS or this toolchain. Keeping both runs is what tells the two
-      # apart as either is worked on. This one does not fail the job.
-      - name: Unit tests again, one suite at a time
-        if: always()
-        continue-on-error: true
+  # The OpenSSL trait, so the second TLS library stays buildable.
+  openssl:
+    name: linux · the OpenSSL trait
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/swift-linux
+        with:
+          swift-version: ${{ env.SWIFT_VERSION }}
+
+      - name: Build and test on the system OpenSSL
         run: |
-          swift test --no-parallel \
-            -Xcc -I"$OPENSSL_PREFIX/include" \
-            -Xlinker -L"$OPENSSL_PREFIX/lib"
+          swift build --traits OpenSSL
+          swift test --traits OpenSSL
 
   # The connector tests are opt-in: without these environment variables they
   # skip themselves, which is how `swift test` stays runnable with nothing
@@ -186,6 +177,7 @@ jobs:
           bash scripts/ratelimit-test.sh
           bash scripts/redirect-test.sh
           bash scripts/sni-test.sh
+          bash scripts/resumption-test.sh
 
       - name: Request identity and the supervisor
         run: |
@@ -282,7 +274,7 @@ jobs:
           import PackageDescription
           let package = Package(
               name: "consumer",
-              platforms: [.macOS(.v15)],
+              platforms: [.macOS("26.4")],
               dependencies: [.package(url: "file://$GITHUB_WORKSPACE", exact: "999.0.0")],
               targets: [.executableTarget(name: "consumer",
                                           dependencies: [.product(name: "Garuda", package: "garuda")])]
@@ -296,7 +288,7 @@ jobs:
               response.send(status: 200)
           }
           if CommandLine.arguments.contains("--serve") {
-              _ = app.run()
+              app.run()
           }
           EOF
           cd /tmp/consumer && swift build -c release
