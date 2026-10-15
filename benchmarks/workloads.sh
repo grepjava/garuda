@@ -160,7 +160,9 @@ start() {
             "${GARUDA_TLS[@]}" ${GARUDA_FLAGS:-} ;;
     garuda2:*)
         local layout=${1#garuda2:}
-        server_start "${PIN_SERVER[@]}" "$GARUDA2_APP" \
+        DATABASE_URL=$DATABASE_URL POOL_SIZE=$((WORKERS * POOL_SIZE)) \
+            ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT/stream" \
+            server_start "${PIN_SERVER[@]}" "$GARUDA2_APP" \
             --log-level error --host 127.0.0.1 --port "$PORT" \
             --shards "${layout%x*}" --threads "${layout#*x}" "${GARUDA_TLS[@]}" ${GARUDA2_FLAGS:-} ;;
     axum)

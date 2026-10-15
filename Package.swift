@@ -137,7 +137,8 @@ let package = Package(
         .target(name: "GarudaSQL", dependencies: ["GarudaPostgres", "GarudaMacros"],
                 swiftSettings: sharedSwiftSettings),
         // The benchmark server: the-benchmarker's routes plus the workloads.
-        .executableTarget(name: "garuda-server", dependencies: ["Garuda", "GarudaJSON", vega("Vega")],
+        .executableTarget(name: "garuda-server",
+                          dependencies: ["Garuda", "GarudaJSON", "GarudaPostgres", "GarudaSQL", vega("Vega")],
                           path: "Sources/garuda-server",
                           swiftSettings: sharedSwiftSettings),
         .executableTarget(name: "garuda-conformance", dependencies: ["Garuda", vega("Vega"), vega("VegaExtras")],

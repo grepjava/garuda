@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
-// The garuda executable: the-benchmarker's contract and the workloads that
-// need no database, served through the handler API, so the benchmark
-// measures what an application gets.
+// The garuda executable: the-benchmarker's contract and the workloads,
+// served through the handler API, so the benchmark measures what an
+// application gets.
 //
 //   GET  /          200, empty body
 //   GET  /user/:id  200, the id as the body
@@ -12,12 +12,24 @@
 //   GET  /stream    64 KiB written as 16 chunks of 4 KiB
 //   POST /upload    a body read whole, and its length answered
 //   GET  /download  1 MiB answered from memory
+//   GET  /db/:id    one row from PostgreSQL by primary key, as JSON
+//   GET  /me        an HS256 bearer token verified, its subject answered
+//   GET  /relay     ORIGIN_URL fetched and streamed on as it arrives
 //
-// Anything else is 404.
+// Anything else is 404. DATABASE_URL names the database, and POOL_SIZE how
+// many connections it gets in all, shared out among the shards; the
+// benchmark script makes the table. Without a database, /db answers 500.
 //===----------------------------------------------------------------------===//
 
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 import Garuda
 import GarudaJSON
+import GarudaPostgres
+import GarudaSQL
 import Vega
 
 @JSON struct Order: Codable {
@@ -33,11 +45,43 @@ import Vega
     let count: Int
 }
 
+@JSON @PostgresRow struct Item: Codable {
+    let id: Int32
+    let name: String
+    let price: Int32
+}
+
+struct Claims: Codable, Sendable {
+    let sub: String
+    let exp: Int
+}
+
 // The same bytes Garuda 1's workloads app answers with.
 let chunk = [UInt8](repeating: UInt8(ascii: "x"), count: 4096)
 let blob = [UInt8](repeating: UInt8(ascii: "y"), count: 1 << 20)
 
+func environment(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
+
+let databaseURL = environment("DATABASE_URL")
+    ?? "postgres://garuda:garuda-secret@127.0.0.1:5432/bench?sslmode=disable"
+// For the whole server: Garuda 1's script gave each of its workers a share.
+let poolTotal = environment("POOL_SIZE").flatMap { Int($0) } ?? 32
+// What /relay fetches: another server's /stream.
+let originURL = environment("ORIGIN_URL") ?? "http://127.0.0.1:3001/stream"
+// The secret the script signs its token with. At least as long as the hash.
+let secret = "workloads-benchmark-secret-0123456789abcdef"
+
 let app = Application()
+
+// Made lazily: a pool connects on its first query, so a server without a
+// database starts, and only /db fails.
+app.state { shard in
+    PostgresPool(try PostgresConfiguration(url: databaseURL),
+                 maxConnections: max(1, (poolTotal + shard.shard.count - 1) / shard.shard.count))
+} shutdown: { $0.close() }
+
+let keys = try JWTKeys([.hmac(secret, algorithm: .HS256)])
+app.jwtVerifier { _ in keys }
 
 app.get("/") { () in HTTPStatus.ok }
 
@@ -78,6 +122,24 @@ app.post("/upload") { request, response in
 
 app.get("/download") { _, response in
     response.send(bytes: blob, contentType: "application/octet-stream")
+}
+
+app.get("/db/:id") { (id: Path<Int32>, pool: State<PostgresPool>) async throws -> JSON<Item>? in
+    try await pool.value.first(Item.self, "select id, name, price from bench_items where id = $1", id.value)
+        .map { JSON($0) }
+}
+
+app.get("/me") { (jwt: JWT<Claims>) in
+    "user \(jwt.claims.sub)"
+}
+
+app.get("/relay") { () async throws in
+    let upstream = try await HTTPClient().stream(.get, originURL)
+    return StreamingBody(contentType: "application/octet-stream") { body in
+        while let piece = try await upstream.next() {
+            try await body.write(piece)
+        }
+    }
 }
 
 app.run()
