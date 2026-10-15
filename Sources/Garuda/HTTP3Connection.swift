@@ -245,9 +245,14 @@ final class H3Connection {
         if id == peerControl {
             readControl(stream)
         } else if id == peerEncoder {
-            // With a table capacity of zero the peer has nothing legitimate
-            // to say here, and saying it anyway is an error, not noise.
-            if stream.receive.ready.readableBytes > 0 { return fail(HTTP3Error.qpackEncoderStreamError) }
+            // With a table capacity of zero the peer has only one thing it
+            // may say here: Set Dynamic Table Capacity to zero, 0x20 (RFC
+            // 9204 section 4.3.1). Anything else is an error, not noise.
+            let ready = stream.receive.ready
+            for i in 0..<ready.readableBytes where ready.readPointer[i] != 0x20 {
+                return fail(HTTP3Error.qpackEncoderStreamError)
+            }
+            stream.receive.ready.clear()
         } else if id == peerDecoder {
             // Acknowledgements for a table we never fill.
             stream.receive.ready.clear()

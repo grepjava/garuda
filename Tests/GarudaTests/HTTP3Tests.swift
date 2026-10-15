@@ -510,6 +510,21 @@ struct HTTP3Tests {
         }
     }
 
+    @Test func anEncoderStreamMaySetTheTableCapacityToZeroAndNothingElse() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            // The client's encoder stream: its type, then Set Dynamic Table
+            // Capacity to zero, twice.
+            try await client.sendStream(2, [0x02, 0x20, 0x20], fin: false)
+            #expect(try await client.get(0, "/user/fine").text == "fine")
+            #expect(client.peer.closeCode == nil)
+            // A capacity of one, past the zero the server allows.
+            try await client.sendStream(2, [0x21], offset: 3, fin: false)
+            try await client.pump { client.peer.closeCode != nil }
+            #expect(client.peer.closeCode == HTTP3Error.qpackEncoderStreamError)
+        }
+    }
+
     @Test func aStreamedAnswerEndsWithTheStream() throws {
         try withServer(h3App()) { client, _ in
             try await client.connect()
