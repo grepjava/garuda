@@ -380,11 +380,16 @@ final class H3Connection {
                         return fail(HTTP3Error.frameUnexpected)
                     }
                     var decoded = true
+                    var tooLarge = false
                     do {
                         try decoder.decode(base + header, length) { _ in }
+                    } catch QPACKError.tooLarge {
+                        tooLarge = true
                     } catch {
                         decoded = false
                     }
+                    // Too large is the request's failing, as its head's is.
+                    if tooLarge { return abort(current, code: HTTP3Error.excessiveLoad) }
                     if !decoded { return fail(HTTP3Error.qpackDecompressionFailed) }
                     current.trailersSeen = true
                     stream.receive.ready.consume(header &+ length)
@@ -488,11 +493,31 @@ final class H3Connection {
             return nil
         }
         let s = take(id)
+        var tooLarge = false
         let outcome = buildRequestHead(s.x, into: &s.head, cookies: &cookies, limits: endpoint.limits,
                                        acceptsConnectProtocol: false, major: 3) { field throws in
-            try decoder.decode(block, length, field)
+            do {
+                try decoder.decode(block, length, field)
+            } catch QPACKError.tooLarge {
+                tooLarge = true
+                throw QPACKError.tooLarge
+            }
         }
         switch outcome {
+        case .compression where tooLarge:
+            // Past the field section size. With no dynamic table there is no
+            // compressor state to lose, so it is this request's failing, not
+            // the connection's: answered 431, as on HTTP/1.1, and whatever
+            // follows on the stream dropped.
+            streams[id] = s
+            s.inTable = true
+            if Int64(id) > highestRequest { highestRequest = Int64(id) }
+            s.refused = true
+            s.x.pointee.answer(431, nil, 0)
+            endpoint.frameWhole(s, headParsed: false)
+            endpoint.lock.withLock { _ in s.answerReady = true }
+            pump(s)
+            return s
         case .compression:
             recycle(s)
             fail(HTTP3Error.qpackDecompressionFailed)

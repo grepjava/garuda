@@ -151,15 +151,20 @@ private final class H3Client: @unchecked Sendable {
                 at += n
             } while at < body.count
         }
-        // In packets that fit a datagram, as a client's must.
+        try await sendStream(id, frames, fin: fin)
+    }
+
+    /// `bytes` on stream `id` from `offset`, in packets that fit a
+    /// datagram, as a client's must.
+    func sendStream(_ id: UInt64, _ bytes: [UInt8], offset: Int = 0, fin: Bool) async throws {
         var at = 0
         repeat {
-            let n = min(1000, frames.count - at)
-            let last = at + n == frames.count
+            let n = min(1000, bytes.count - at)
+            let last = at + n == bytes.count
             try await send(try peer.packet(.application, peer.ack(.application)
-                + streamFrame(id, offset: at, Array(frames[at..<(at + n)]), fin: fin && last)))
+                + streamFrame(id, offset: offset + at, Array(bytes[at..<(at + n)]), fin: fin && last)))
             at += n
-        } while at < frames.count
+        } while at < bytes.count
     }
 
     func get(_ id: UInt64, _ path: String, headers: [(String, String)] = []) async throws -> H3Answer {
@@ -477,6 +482,31 @@ struct HTTP3Tests {
             let differs = try await client.get(4, "/", headers: [("host", "elsewhere")])
             #expect(differs.reset == HTTP3Error.messageError)
             #expect(try await client.get(8, "/user/still").text == "still")
+        }
+    }
+
+    @Test func aHeadTooLargeIsAnswered431AndTheConnectionGoesOn() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            // Past the 32 KiB field section size once decoded.
+            let answer = try await client.get(0, "/", headers: [("x-big", String(repeating: "a", count: 40_000))])
+            #expect(answer.status == 431)
+            #expect(client.peer.closeCode == nil)
+            #expect(try await client.get(4, "/user/after").text == "after")
+        }
+    }
+
+    @Test func trailersTooLargeResetTheirRequestAlone() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            let frames = headersFrame([(":method", "POST"), (":scheme", "https"), (":authority", "localhost"),
+                                       (":path", "/echo")])
+                + hsVarint(0) + hsVarint(3) + [1, 2, 3]
+                + headersFrame([("x-big", String(repeating: "a", count: 40_000))])
+            try await client.sendStream(0, frames, fin: true)
+            #expect(try await client.answer(0).reset == HTTP3Error.excessiveLoad)
+            #expect(client.peer.closeCode == nil)
+            #expect(try await client.get(4, "/user/after").text == "after")
         }
     }
 
