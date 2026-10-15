@@ -125,11 +125,13 @@ borrowed body is a `Span`, macOS 26.4 because Vega's executor needs that
 release's runtime. [INSTALLATION.md](INSTALLATION.md) lists the system
 packages, the TLS library traits and certificates.
 
-The databases and the test client are products of their own:
-`GarudaPostgres`, `GarudaRedis`, `GarudaSQLite` and `GarudaTesting`.
+The databases, resumable uploads and the test client are products of their
+own: `GarudaPostgres`, `GarudaRedis`, `GarudaSQLite`, `GarudaUploads` and
+`GarudaTesting`.
 
-[Examples/](Examples/README.md) has complete applications to run and copy
-from. They are being ported to Garuda 2.
+[Examples/](Examples/README.md) has eight complete applications to run and
+copy from, all on Garuda 2: a todo API, sign-in, streaming, chat,
+WebTransport, a file service, per-user uploads, and a starter.
 
 ## Writing handlers
 
