@@ -74,14 +74,21 @@ included. Cookie fields a client split are joined into one.
 to `--max-body` or the route's own limit (`app.maxBodySize`). On HTTP/2 and
 HTTP/3 a request is dispatched when its stream ends (END_STREAM, a trailer
 section, or FIN). An extended CONNECT (a WebSocket or a WebTransport session)
-is dispatched on its head, because its stream does not end.
+is dispatched on its head, because its stream does not end. So is a request
+to an `onStreamingBody` route, whose handler reads the body as it arrives;
+see [Streamed request bodies](#streamed-request-bodies).
 
 **The response is one answer with three encodings**: header text on
 HTTP/1.1, HPACK on HTTP/2, QPACK on HTTP/3. The server adds `date` and
 `server: garuda` unless the handler set them, and frames the body itself: a
-`Content-Length`, `Transfer-Encoding` or `Connection` field the handler set on
-a whole body is dropped and the real length sent. A streamed body is held to
-a `Content-Length` the handler declared; see
+`Transfer-Encoding` or `Connection` field the handler set is dropped. A
+`Content-Length` the handler set is the one sent, and the body is held to it,
+whole or streamed. A longer body is cut to it. A shorter one is never ended as
+if it were whole: HTTP/1.1 closes the connection (after either mismatch,
+since nothing after it could be framed), and HTTP/2 and HTTP/3 reset the
+stream with `INTERNAL_ERROR` / `H3_INTERNAL_ERROR` after its last bytes. A
+HEAD states the declared length, a 304 keeps it (RFC 9110 8.6), and a 204 or
+1xx states none. See also
 [Streaming responses](#streaming-responses-and-backpressure).
 
 ---
@@ -130,7 +137,9 @@ and after `ServerConfig.maxRequestsPerConnection` requests when that is set
 (it is 0, unlimited, by default).
 
 The body is read whole, and never past its declared end. Bytes after it are
-the next request, parsed once this one is answered. Answers to pipelined
+the next request, parsed once this one is answered. A streaming route's body
+the handler leaves unread is skipped when all of it has arrived; otherwise the
+connection is closed rather than read for a body nobody wants. Answers to pipelined
 requests are written together: when the connection is about to wait for
 input, after `ServerConfig.pipelineDepth` answers (16), or once 64 KiB is
 waiting. A body of 64 KiB or more is written from the response's own buffer
@@ -269,7 +278,10 @@ WINDOW_UPDATE and a settings change wake it.
 **Receiving.** DATA is charged to both windows before anything can reject
 it. Bytes count as consumed on arrival, since bodies are buffered before
 dispatch, and WINDOW_UPDATE goes out, for the stream and for the connection,
-once half the initial window has accumulated. DATA for a closed stream still
+once half the initial window has accumulated. A streaming route's body is the
+exception for the stream window: it is given back as the handler reads, so a
+handler that stops reading holds its client to one window. The connection
+window is given back on arrival as before. DATA for a closed stream still
 returns its bytes to the connection window, and is answered
 `RST_STREAM(STREAM_CLOSED)`.
 
@@ -290,7 +302,8 @@ its answer was sent spends one; a stream answered earns one back, up to the
 cap. At zero the connection gets `GOAWAY(ENHANCE_YOUR_CALM)`. A reset after
 the answer costs nothing. A reset cancels the stream's handler task, so a
 handler waiting on I/O or a sleep stops waiting, and whatever it answers is
-dropped.
+dropped. A streaming-body handler is not cancelled: its body throws
+`RequestBodyError.incomplete` once what arrived has been read.
 
 ### Timeouts
 
@@ -391,7 +404,8 @@ sends at most 4,096 datagrams before the others get a turn.
 | `active_connection_id_limit` | 4 |
 
 Windows extend as the application reads, once they have fallen by half. A
-request body counts as read when it arrives, since it is buffered whole.
+request body counts as read when it arrives, since it is buffered whole,
+except a streaming route's, which counts as read when the handler reads it.
 
 ### HTTP/3
 
@@ -442,6 +456,37 @@ connection with `QPACK_ENCODER_STREAM_ERROR`.
 **Alt-Svc.** With `--http3`, HTTP/1.1 and HTTP/2 answers carry
 `alt-svc: h3=":PORT"; ma=86400` (PORT is `--quic-port` or `--port`), unless
 the handler set its own. HTTP/3 answers do not.
+
+---
+
+## Streamed request bodies
+
+A route registered with `onStreamingBody` is dispatched at its request's head,
+and the handler reads the body through a `RequestBody`
+([HANDLER-API.md](HANDLER-API.md#request-bodies-read-as-they-arrive)). Taking
+bytes is what lets more in:
+
+- **HTTP/1.1**: the handler's read is the connection's read, into the read
+  buffer behind the head, of at most 256 KiB. Chunked bodies are decoded as
+  they are read. `Expect: 100-continue` is answered on the handler's first
+  read that has to wait for the client.
+- **HTTP/2**: DATA is held for the handler, and the stream's window is given
+  back as the handler reads, once half of it has been read.
+- **HTTP/3**: QUIC's stream window grows as the handler reads, the same way.
+
+The route's `maxBodySize` (`Int.max` unless given) takes the place of
+`--max-body`. A declared length past it is 413 before the handler runs; a
+body that grows past it makes the read throw `tooLarge`, answered 413 unless
+the handler answers first. A request that ends before its body did (the
+connection closed, the stream reset, the body timeout) hands the handler
+every byte that arrived, and then the read throws `incomplete`, answered 400.
+A reset does not cancel the handler's task, as it does any other handler's.
+
+`RequestBody.cancel()` ends the request from the server's side: the HTTP/1.1
+connection is closed, or the stream reset with `CANCEL` /
+`H3_REQUEST_CANCELLED`. On HTTP/2 and HTTP/3 what had arrived is still read
+before `incomplete`. On HTTP/1.1, cancelling ends the connection's task, and
+bytes in the read buffer the handler had not taken are dropped.
 
 ---
 
@@ -730,11 +775,16 @@ Each protocol is tested against implementations that share none of its code:
 HTTP/3), `scripts/handler-test.py` (handler framing on all three),
 `scripts/websocket-test.py` (WebSocket, with `websockets` for
 interoperability) and `scripts/websocket-streams-test.py` (WebSocket over
-HTTP/2 and HTTP/3). They run the `garuda` and `garuda-conformance` binaries.
+HTTP/2 and HTTP/3) and `scripts/upload-test.py` (streamed request bodies and
+resumable uploads on all three). They run the `garuda` and
+`garuda-conformance` binaries.
 
 `swift test` covers the HTTP/1.1 parser, HPACK, WebSocket framing and deflate
 (`GarudaWireTests`); QUIC packet protection, the handshake and streams
 (`GarudaQUICTests`); and each transport end to end (`GarudaTests`:
 `HTTP2Tests`, `HTTP3Tests`, `HTTP3TunnelTests`, `HTTP2WebSocketTests`,
 `WebSocketTests`, `TLSTests`, `StreamingResponseTests`, `EventStreamTests`,
-`InterimTests`, `RequestLimitsTests`, `LargeBodyTests`).
+`InterimTests`, `RequestLimitsTests`, `LargeBodyTests`, `RequestBodyTests`,
+`DeclaredLengthTests`). `GarudaFuzzTests` replays the fuzz corpus through the
+parsers and whole HTTP/2, HTTP/3 and QUIC connections
+([fuzz/README.md](fuzz/README.md)).
