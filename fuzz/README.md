@@ -99,13 +99,15 @@ swift build -c release --product pgfuzz -Xswiftc -sanitize=address
 .build/release/pgfuzz --seconds 60
 ```
 
-The `fuzz` job in `.github/workflows/ci.yml` runs exactly this, and uploads any
-`pgfuzz-*.bin` it finds. The workflow is started by hand.
+The `fuzz` job in `.github/workflows/ci.yml` runs exactly this: 60 seconds a
+target on every push to `main` and `vega`, every pull request and every run
+started by hand, and 600 seconds a target nightly. It uploads any
+`pgfuzz-*.bin` it finds.
 
 ## Corpus
 
 `fuzz/corpus/<target>/` holds inputs worth keeping, above all anything that
-once broke an invariant. `swift test` runs `FuzzCorpusTests`, which checks
+once broke an invariant. `swift test` runs `FuzzCorpusTests` (in `Tests/GarudaFuzzTests`), which checks
 every compiled-in seed, every corpus file, and an empty input against each
 target's invariants.
 
