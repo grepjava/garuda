@@ -1123,6 +1123,7 @@ final class H2Connection: @unchecked Sendable {
         case .ok:
             break
         }
+        if let root = app.rootPath { stripRootPath(s.x, root) }
         if s.x.pointee.connectProtocol != .none {
             // RFC 8441: the stream is the tunnel, and one ended at once has
             // none.
@@ -1171,6 +1172,7 @@ final class H2Connection: @unchecked Sendable {
             s = H2Stream(connection: self, maxHeaders: limits.maxHeaders, peer: parts.pointee.exchange.pointee.remote)
             s.x.pointee.application = Unmanaged.passUnretained(app)
             s.x.pointee.secure = secure
+            s.x.pointee.assumeHTTPS = limits.assumeHTTPS
             s.x.pointee.serverFields = secure ? limits.secureFields : limits.plainFields
             s.x.pointee.trust = limits.trust
             s.x.pointee.site = limits.site
@@ -1181,6 +1183,8 @@ final class H2Connection: @unchecked Sendable {
         }
         s.id = id
         s.holds = 1
+        // --request-start-header: the HEADERS frame is the request arriving.
+        if limits.requestStart { s.x.pointee.requestStart = wallClockMicros() }
         s.started = false
         unstarted &+= 1
         s.reset = false

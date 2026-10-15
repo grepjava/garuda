@@ -67,7 +67,7 @@ all_probes() {
 server_require_port_free "$PORT" || exit 1
 
 echo "SIGTERM to the supervisor, --drain-delay 2000"
-start "$WORK/term.log" --drain-delay 2000 --graceful-timeout 3
+start "$WORK/term.log" --drain-delay 2000 --graceful-timeout 3000
 is "the health check passes before" "$(code /healthz)" 200
 t0=$(ms)
 kill -TERM "$SERVER_PID"
@@ -87,7 +87,7 @@ fi
 server_stop
 
 echo "SIGTERM to the whole process group, as systemd sends it"
-start "$WORK/group.log" --drain-delay 2000 --graceful-timeout 3
+start "$WORK/group.log" --drain-delay 2000 --graceful-timeout 3000
 t0=$(ms)
 kill -TERM -- "-$SERVER_PID"
 sleep 0.6

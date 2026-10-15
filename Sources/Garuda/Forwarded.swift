@@ -65,12 +65,13 @@ extension Request {
         return exchange.pointee.remote.port
     }
 
-    /// Whether the request came over HTTPS: on this connection's own TLS, or
-    /// through a trusted proxy that says so. What Strict-Transport-Security
-    /// and a cookie's default `Secure` follow.
+    /// Whether the request came over HTTPS: on this connection's own TLS,
+    /// through a trusted proxy that says so, or, with `--scheme https`, from
+    /// a proxy that terminated TLS without saying. What
+    /// Strict-Transport-Security and a cookie's default `Secure` follow.
     public var arrivedOverHTTPS: Bool {
         if exchange.pointee.secure { return true }
         if case .said(_, _, let https?) = exchange.pointee.forwarded() { return https }
-        return false
+        return exchange.pointee.assumeHTTPS
     }
 }

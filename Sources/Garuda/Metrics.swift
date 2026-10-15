@@ -145,7 +145,7 @@ final class MetricsPage: @unchecked Sendable {
             simple("garuda_cache_stores_total", "counter", "Responses stored in the response cache.",
                    sum(.cacheStores))
         }
-        simple("garuda_workers", "gauge", "Worker threads sharing these counters.", UInt64(max(1, workers)))
+        simple("garuda_workers", "gauge", "Shard processes sharing these counters.", UInt64(max(1, workers)))
 
         // Prometheus histograms are cumulative; the rows keep each bucket
         // apart, so a request touches one counter rather than fourteen.
@@ -170,10 +170,16 @@ final class MetricsPage: @unchecked Sendable {
     }
 }
 
-/// The application the metrics port serves: GET /metrics, and nothing else.
+/// The application the metrics port serves: the page, at /metrics and at
+/// any other path, so a scraper set up with another path is answered all the
+/// same. The port is never a way to the application's routes.
 func metricsApplication(_ page: MetricsPage, workers: Int, cache: Bool) -> Application {
     let app = Application()
     app.get("/metrics") { _, response in
+        response.addHeader("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        response.send(page.render(workers: workers, cache: cache))
+    }
+    app.fallback { _, response in
         response.addHeader("content-type", "text/plain; version=0.0.4; charset=utf-8")
         response.send(page.render(workers: workers, cache: cache))
     }

@@ -10,6 +10,10 @@ public struct ServerConfig: Sendable {
     public var host = "127.0.0.1"
     public var port = 8000
     public var backlog = 2048
+    /// A Unix socket to listen on in place of `host` and `port`, for a proxy
+    /// on the same machine; nil listens on TCP. Every shard accepts on the
+    /// one socket, and it is removed when the server exits.
+    public var unixPath: String? = nil
 
     // --- processes and threads ---
     /// Shard processes. Each is a whole runtime with its own threads and its
@@ -40,6 +44,12 @@ public struct ServerConfig: Sendable {
     public var heavyThreshold: Duration = .microseconds(500)
     /// Turns the heavy lane off: every route runs on every thread.
     public var heavyLane = true
+    /// Threads per shard that `app.offload` routes run on; nil for Vega's
+    /// default. A thread is started when work arrives and none is free.
+    public var blockingThreads: Int? = nil
+    /// Offloaded work per shard that may wait for one of those threads
+    /// before more is refused with 503; nil waits for as long as it takes.
+    public var blockingQueue: Int? = nil
 
     // --- limits ---
     public var readBufferSize = 16 * 1024
@@ -50,6 +60,9 @@ public struct ServerConfig: Sendable {
     public var maxRequestsPerConnection = 0
     /// Responses written as one batch when a client pipelines requests.
     public var pipelineDepth = 16
+    /// Connections a shard has open at once; past it, new ones wait in the
+    /// listen backlog until one closes. Nil for no limit.
+    public var maxConnections: Int? = nil
 
     // --- timeouts ---
     /// How long an idle keep-alive connection is kept.
@@ -79,6 +92,13 @@ public struct ServerConfig: Sendable {
     public var broadcastQueue = 1024
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
+    /// --reload: restart on the executable when it is rebuilt, and replace
+    /// the shards when a --tls-cert or --tls-key file changes. A development
+    /// convenience; the supervisor watches, and no shard does any work for it.
+    public var reload = false
+    /// How often --reload looks at the files, where the kernel sends no
+    /// notification of a change.
+    public var reloadInterval: Duration = .milliseconds(500)
     /// How long SIGTERM leaves the server serving, with only the health
     /// check failing, before it stops accepting and drains.
     ///
@@ -169,6 +189,9 @@ public struct ServerConfig: Sendable {
     public var tlsReloadInterval: Duration? = nil
     /// How long a client has to finish the TLS handshake.
     public var tlsHandshakeTimeout: Duration = .seconds(10)
+    /// The TLS 1.2 cipher suites, as an OpenSSL cipher list; nil for the
+    /// library's. TLS 1.3's suites are fixed.
+    public var tlsCiphers: String? = nil
 
     // --- HTTP/2 (HTTP2.swift) ---
     /// Serve HTTP/2: to a TLS client that asks for "h2" by ALPN, and to a
@@ -235,6 +258,20 @@ public struct ServerConfig: Sendable {
     /// was told can be matched up. One a trusted proxy sent is kept; any other
     /// is replaced, since a client can put anything it likes in a header.
     public var requestID = false
+    /// A mount prefix a proxy in front leaves on the path: taken off before
+    /// routing, so `/app/users` reaches the `/users` route under
+    /// `--root-path /app`. A path outside it is routed as it came, as from a
+    /// proxy that took the prefix off itself. Empty for none.
+    public var rootPath = ""
+    /// Take every request that arrived without TLS, and without a trusted
+    /// proxy saying otherwise, as HTTPS (`--scheme https`): for a proxy that
+    /// terminates TLS and says nothing about it. `Request.arrivedOverHTTPS`,
+    /// and what follows it, then say so.
+    public var assumeHTTPS = false
+    /// Give handlers `Request.requestStart`: when the request arrived, in
+    /// microseconds since the epoch, for an APM agent that reports the time
+    /// a request waited before the application saw it.
+    public var requestStartHeader = false
     /// Record the W3C `traceparent` a request carries -- the trace it belongs
     /// to and the span that sent it -- in the logs and for response
     /// observers. Never generated, and never changed on its way to the
@@ -249,6 +286,10 @@ public struct ServerConfig: Sendable {
     /// object per line. The command line has the access log follow it unless
     /// --access-log-format says otherwise.
     public var logJSON = false
+
+    /// Garuda 1 flags that mean nothing here, given on the command line:
+    /// warned about once at start-up, so an old command line still starts.
+    var ignoredFlags: [String] = []
 
     public init() {}
 

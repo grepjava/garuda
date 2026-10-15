@@ -48,6 +48,10 @@ struct ConnectionLimits: Sendable {
     /// none (Forwarded.swift).
     var trust: ForwardedTrust?
     var traceContext: Bool
+    /// --scheme https (Forwarded.swift).
+    var assumeHTTPS: Bool
+    /// --request-start-header: each request is stamped as it arrives.
+    var requestStart: Bool
     /// --access-log, as text or JSON (Logging.swift).
     var accessLog: Bool
     var accessLogJSON: Bool
@@ -104,6 +108,8 @@ struct ConnectionLimits: Sendable {
         requestIDTrust = config.requestID && !config.trust.isEmpty ? config.trust : nil
         trust = config.trust.isEmpty ? nil : config.trust
         traceContext = config.traceContext
+        assumeHTTPS = config.assumeHTTPS
+        requestStart = config.requestStartHeader
         accessLog = config.accessLog
         accessLogJSON = config.accessLogJSON
     }
@@ -172,6 +178,7 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     }
     // The exchange is reused from connection to connection: set both.
     x.pointee.secure = secure
+    x.pointee.assumeHTTPS = limits.assumeHTTPS
     x.pointee.serverFields = secure ? limits.secureFields : limits.plainFields
     if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
     if x.pointee.site != nil || limits.site != nil { x.pointee.site = limits.site }
@@ -250,9 +257,20 @@ struct HTTP1Connection: ~Copyable {
         _ stream: borrowing S, app: CompiledApplication
     ) async throws -> Bool {
         x.pointee.reset()
+        if limits.requestStart { x.pointee.requestStart = 0 }
         guard try await readHead(stream) else { return false }
+        // Pipelined: its bytes were here before it was looked at.
+        if limits.requestStart && x.pointee.requestStart == 0 { x.pointee.requestStart = wallClockMicros() }
+        if let root = app.rootPath { stripRootPath(x, root) }
 
         let head = x.pointee.head
+        // --no-websockets: an upgrade to a WebSocket is refused whatever
+        // the route, as Garuda 1 refused it, rather than answered as the
+        // plain GET a route that knows nothing of WebSockets takes it for.
+        if head.flags.contains(.upgrade) && x.pointee.websocketsRefused && asksForWebSocket(x) {
+            try await failAndClose(stream, status: 501)
+            return false
+        }
         // A route matched before its body was read, for its scope's body
         // limit; -1 when the dispatch matches (RequestLimits.swift).
         var matched: Int32 = -1
@@ -295,6 +313,8 @@ struct HTTP1Connection: ~Copyable {
                 x.pointee.keepAlive = false
             }
         }
+        // Something answered with the connection's end: the HTTPS redirect.
+        if !x.pointee.keepAlive { keepAlive = false }
 
         if let upgrade = x.pointee.upgrade {
             // The connection is the WebSocket's from here: the 101, and
@@ -370,7 +390,10 @@ struct HTTP1Connection: ~Copyable {
                     try await failAndClose(stream, status: error.status, headParsed: false)
                     return false
                 case .incomplete:
-                    break
+                    // The parser starts from a fresh head, and parses all of
+                    // it again once more has arrived: what it noted of this
+                    // part -- a Host seen, a length -- would be noted twice.
+                    x.pointee.head = HTTPRequestHead()
                 }
             }
             // Waiting: whatever has been answered goes out first.
@@ -385,6 +408,8 @@ struct HTTP1Connection: ~Copyable {
                 try await stream.read(into: &parts.pointee.input)
             }
             if n == 0 { return false }
+            // The request's first bytes: when it arrived.
+            if available == 0 && limits.requestStart { x.pointee.requestStart = wallClockMicros() }
         }
     }
 
@@ -636,6 +661,19 @@ func writeHTTP1Head(_ x: UnsafeMutablePointer<Exchange>, _ parts: UnsafeMutableP
         parts.pointee.output.write("Connection: keep-alive\r\n")
     }
     HTTPResponseWriter.endHead(&parts.pointee.output)
+}
+
+/// Whether the request's Upgrade names websocket.
+func asksForWebSocket(_ x: UnsafeMutablePointer<Exchange>) -> Bool {
+    let name: StaticString = "upgrade"
+    guard let value = x.pointee.header(name.utf8Start, name.utf8CodeUnitCount), value.count >= 9 else { return false }
+    let websocket: StaticString = "websocket"
+    var i = 0
+    while i &+ 9 <= value.count {
+        if equalsIgnoringCase(value.base + i, websocket.utf8Start, 9) { return true }
+        i &+= 1
+    }
+    return false
 }
 
 /// A `ResponseError` as the answer.
