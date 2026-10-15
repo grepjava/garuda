@@ -9,9 +9,9 @@
 //
 // What it shows:
 //
-// - Passwords stored as PBKDF2 hashes (`Passwords`), hashed on the blocking
-//   pool so a worker keeps serving while a login spends its few hundred
-//   milliseconds of CPU.
+// - Passwords stored as PBKDF2 hashes (`Passwords`), hashed on Vega's
+//   blocking pool so the shard's worker threads keep serving while a login
+//   spends its few hundred milliseconds of CPU.
 // - Session tokens that are random (`Tokens.random`), with only their digest
 //   in the database: a copy of the table holds no token that works.
 // - A login that takes as long for an unknown username as for a wrong
@@ -25,7 +25,7 @@
 // thread of CPU.
 //===----------------------------------------------------------------------===//
 
-import Garuda
+import GarudaSQLite
 
 public struct User: Codable, Equatable, Sendable {
     public let id: Int
@@ -62,13 +62,12 @@ let migrations = [
 ]
 
 /// The user a request's bearer token belongs to, looked up in the database
-/// while the request is extracted. A handler that takes it must be async.
-struct SignedInUser: AsyncRequestExtractor {
+/// while the request is extracted: an extractor may await, like a handler.
+struct SignedInUser: RequestExtractor {
     let user: User
 
     static func extract(from request: borrowing Request, parameter: inout Int) async throws -> SignedInUser {
-        // Everything read from the request is read before the first await.
-        guard let token = try? BearerToken.extract(from: request, parameter: &parameter) else {
+        guard let token = try? await BearerToken.extract(from: request, parameter: &parameter) else {
             throw HTTPError.unauthorized
         }
         let db = try request.state(SQLiteDatabase.self)
@@ -105,9 +104,10 @@ private func validPassword(_ password: String) -> Bool {
 }
 
 /// What an unknown username's login is checked against, so it costs what a
-/// known one does. Made once per worker, on first use.
-private final class DecoyHash: @unchecked Sendable {
-    var value: String? = nil
+/// known one does. Made once per shard, as it starts: a shard serves on many
+/// threads at once, and a value made before the first request needs no lock.
+struct DecoyHash: Sendable {
+    let value: String
 }
 
 /// The accounts API over the database at `path`. `iterations` is for tests,
@@ -117,10 +117,13 @@ public func authApp(databasePath path: String, iterations: Int = Passwords.defau
 
     app.state { _ in
         let db = try SQLiteDatabase(SQLiteConfiguration(path: path))
-        try db.migrate(migrations)
+        try await db.migrate(migrations)
         return db
+    } shutdown: { db in
+        db.close()
     }
-    app.state { _ in DecoyHash() }
+    // A hash of a password nobody knows, with the iterations a real one has.
+    app.state { _ in DecoyHash(value: try await Passwords.hash(Tokens.random(), iterations: iterations)) }
 
     app.post("/signup") { (body: Body<Credentials>, db: State<SQLiteDatabase>) async throws -> JSON<User> in
         let username = body.value.username.lowercased()
@@ -158,10 +161,7 @@ public func authApp(databasePath path: String, iterations: Int = Passwords.defau
             Account.self, "select id, password_hash as passwordHash from users where username = ?", username)
         guard let account else {
             // The same work as a real check, then the same answer.
-            if decoy.value.value == nil {
-                decoy.value.value = try await Passwords.hash(Tokens.random(), iterations: iterations)
-            }
-            _ = try await Passwords.verify(body.value.password, against: decoy.value.value!)
+            _ = try await Passwords.verify(body.value.password, against: decoy.value.value)
             throw refused
         }
         guard try await Passwords.verify(body.value.password, against: account.passwordHash) else {

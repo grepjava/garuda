@@ -1,5 +1,7 @@
 import Testing
 import Garuda
+import GarudaTesting
+import VegaCrypto
 @testable import WebTransportExample
 
 // What of the probe can be reached without QUIC: the page, the certificate
@@ -10,14 +12,14 @@ import Garuda
 @Suite("WebTransport example")
 struct WebTransportExampleTests {
     @Test func thePageAndTheCertificateHash() throws {
-        let http = webTransportApp(certificateHash: Digest.sha256(Array("cert".utf8))).test
+        let http = webTransportApp(certificateHash: Hash.sha256(Array("cert".utf8))).test
         let page = try http.get("/")
         #expect(page.status == .ok)
         #expect(page.text.contains("new WebTransport("))
 
         let hash = try http.get("/certificate-hash")
         #expect(hash.status == .ok)
-        #expect(try hash.json([String: String].self)["sha256"] == hex(Digest.sha256(Array("cert".utf8))))
+        #expect(try hash.json([String: String].self)["sha256"] == hex(Hash.sha256(Array("cert".utf8))))
 
         // With no certificate to describe, there is nothing to publish.
         #expect(try webTransportApp().test.get("/certificate-hash").status == .notFound)
@@ -59,7 +61,7 @@ struct WebTransportExampleTests {
             MAMCAQU=
             -----END CERTIFICATE-----
             """
-        #expect(certificateHash(pem: pem) == Digest.sha256(der))
+        #expect(certificateHash(pem: pem) == Hash.sha256(der))
         #expect(certificateHash(pem: "-----BEGIN PRIVATE KEY-----\nMAMCAQU=\n-----END PRIVATE KEY-----") == nil)
         #expect(certificateHash(pem: "") == nil)
     }

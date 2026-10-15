@@ -26,7 +26,7 @@
 // demotion leaves any is a question for the database, and the answer is 409.
 //===----------------------------------------------------------------------===//
 
-import Garuda
+import GarudaPostgres
 
 extension Policy where Value == AccessClaims {
     /// An administrator, as the token says. Named once, used by the group
@@ -52,7 +52,7 @@ public struct AccountPage: Codable, Sendable {
 }
 
 /// Every route an administrator has, as a value. It needs nothing but the
-/// worker's `Services` and the verifier `app.jwtVerifier` registered, so it is
+/// shard's `Services` and the verifier `app.jwtVerifier` registered, so it is
 /// a `Router`: `app.nest("/admin", adminRoutes())`.
 func adminRoutes() -> Router {
     let app = Router()

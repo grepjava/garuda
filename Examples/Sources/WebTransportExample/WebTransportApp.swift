@@ -31,21 +31,24 @@
 //   other until it is accepted: `Query<Hello>` runs first, and a CONNECT
 //   without `name` is answered 400 and never becomes a session.
 // - One task group per session: datagrams in one child, and a child per
-//   stream, so a slow download does not hold up a round-trip sample. The
-//   children run on the worker's thread, as a session requires; an
-//   unstructured `Task { }` would not.
+//   stream, so a slow download does not hold up a round-trip sample. A
+//   session and its streams may be used from any task; the group is what
+//   ends every child when the session ends.
 // - Backpressure both ways. `write` waits while too much is queued on the
 //   stream, so a download to a slow client costs memory for what is in
 //   flight, not for all N bytes. `read` gives the client more room only as
 //   the handler reads, so an upload to a slow handler slows the client.
 //
-// A session lives on one worker, and everything here is per session, so any
-// number of workers serves it. Sessions that must hear each other -- a game
-// room, say -- need that to happen outside the worker, as the chat example
+// A session lives on one shard, and everything here is per session, so any
+// number of shards serves it. Sessions that must hear each other -- a game
+// room, say -- need that to happen outside the shard, as the chat example
 // does for WebSockets with `Topic`.
 //===----------------------------------------------------------------------===//
 
 import Garuda
+// SHA-256, which Garuda uses but does not export: Vega's, which Garuda is
+// built on.
+import VegaCrypto
 
 /// What a client says when it opens a session.
 public struct Hello: Decodable, Sendable {
@@ -206,7 +209,7 @@ public func certificateHash(pem: String) -> [UInt8]? {
           let stop = find(end, in: text, from: start + begin.count),
           let der = decodeBase64(String(decoding: text[(start + begin.count)..<stop], as: UTF8.self)),
           !der.isEmpty else { return nil }
-    return Digest.sha256(der)
+    return Hash.sha256(der)
 }
 
 /// Where `needle` first occurs in `haystack` at or after `from`.

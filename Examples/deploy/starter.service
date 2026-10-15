@@ -5,8 +5,11 @@
 #   install -m 640 -o root -g starter Examples/deploy/env.example /etc/starter/env
 #   systemctl daemon-reload && systemctl enable --now starter
 #
-# A new binary goes out with `systemctl reload starter`: the workers are
-# replaced one at a time and no connection is dropped.
+# A new binary goes out with `systemctl restart starter`: the health check
+# fails for --drain-delay, then the shards finish what they are serving. The
+# shards are forks of the running process, so `systemctl reload` (SIGHUP)
+# replaces them one at a time without dropping a connection, but on the code
+# already running.
 
 [Unit]
 Description=starter
@@ -20,21 +23,25 @@ User=starter
 Group=starter
 EnvironmentFile=/etc/starter/env
 
-# Migrate before any worker serves. Workers would migrate for themselves; doing
+# Migrate before any shard serves. Shards would migrate for themselves; doing
 # it here means a failed migration fails the unit instead of the first request.
 ExecStartPre=/usr/local/bin/starter migrate
 
 # Everything after -- is Garuda's own (CONFIG.md). Loopback because a proxy
 # terminates TLS; --forwarded-allow-ips is what makes the proxy's headers
-# trusted. For TLS here instead: --tls-cert, --tls-key or --acme-domain.
+# trusted. For TLS here instead: --tls-cert and --tls-key, with --tls-reload
+# to serve a renewed certificate. --shards auto lets Vega choose the shard
+# processes from the machine's CPUs. --health-check-path answers before
+# routing, and fails during --drain-delay so a load balancer stops sending
+# before the shards drain.
 ExecStart=/usr/local/bin/starter serve -- \
-    --host 127.0.0.1 --port 8080 --workers 0 \
+    --host 127.0.0.1 --port 8080 --shards auto \
     --access-log --request-id \
     --forwarded-allow-ips 127.0.0.1 \
     --drain-delay 5000 --health-check-path /health \
     --metrics-port 9090 --metrics-host 127.0.0.1
 
-# SIGHUP replaces the workers without dropping a connection.
+# SIGHUP restarts the shards one at a time without dropping a connection.
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure
@@ -56,8 +63,6 @@ RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
-# With --acme-domain, the cache directory must be writable:
-# ReadWritePaths=/var/lib/starter
 
 [Install]
 WantedBy=multi-user.target
