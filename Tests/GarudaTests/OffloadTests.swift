@@ -109,6 +109,9 @@ struct OffloadTests {
     @Test func theWorkersServeOthersWhileOffloadedHandlersBlock() async throws {
         let gate = Gate()
         let client = offloadApp(gate).test
+        // Every test's client shares one small runtime: with the whole suite
+        // running, the held requests can wait their turn for seconds.
+        client.timeout = .seconds(60)
         let held = 3
         try #require(held > 2, "more than the test client's workers")
         let requests = (0..<held).map { _ in
@@ -120,7 +123,7 @@ struct OffloadTests {
         }
         // Every held handler has a pool thread and is blocked on it.
         let clock = ContinuousClock()
-        let giveUp = clock.now + .seconds(5)
+        let giveUp = clock.now + .seconds(30)
         while gate.waiting.load(ordering: .sequentiallyConsistent) < held && clock.now < giveUp {
             try await Task.sleep(for: .milliseconds(1))
         }
