@@ -268,6 +268,25 @@ public final class QUICConnection {
         return out
     }
 
+    /// Hands each event to `body` in order, those `body` itself causes
+    /// included, then clears them: `takeEvents` without the copy, which costs
+    /// the list a new buffer every time. At most `limit` are handed over; any
+    /// past it stay for the next call.
+    public func drainEvents(limit: Int = 4096, _ body: (QUICEvent) -> Void) {
+        var i = 0
+        while i < events.count && i < limit {
+            let event = events[i]
+            i &+= 1
+            body(event)
+        }
+        if i == events.count {
+            events.removeAll(keepingCapacity: true)
+        } else {
+            events.removeFirst(i)
+        }
+        writableAnnounced.removeAll(keepingCapacity: true)
+    }
+
     /// Says that a stream can take more, once per batch of events.
     ///
     /// A large transfer is acknowledged a packet at a time, and the layer

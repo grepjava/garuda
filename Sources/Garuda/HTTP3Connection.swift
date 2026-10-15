@@ -109,34 +109,30 @@ final class H3Connection {
 
     /// Handles what the transport reported since the last look.
     func handleEvents(nowMs now: UInt64) {
-        var rounds = 0
-        while !quic.events.isEmpty && rounds < 8 {
-            rounds &+= 1
-            for event in quic.takeEvents() {
-                switch event.kind {
-                case .handshakeComplete:
-                    begin()
-                case .streamReadable, .streamFinished:
-                    guard began, !closed else { continue }
-                    let id = event.streamID
-                    if QUICStreamKind.isServerInitiated(id) { continue }
-                    if QUICStreamKind.isUnidirectional(id) {
-                        readUnidirectional(id)
-                    } else {
-                        readRequest(id, nowMs: now)
-                    }
-                case .streamReset, .stopSending:
-                    guard began, !closed else { continue }
-                    aborted(event.streamID, code: event.code)
-                case .streamWritable:
-                    if let s = streams[event.streamID] { pump(s) }
-                case .datagram:
-                    // Not offered (QUICEndpoint.quicConfig); WebTransport's
-                    // when it is.
-                    quic.incomingDatagrams.removeAll(keepingCapacity: true)
-                case .closed:
-                    closeHTTP()
+        quic.drainEvents { event in
+            switch event.kind {
+            case .handshakeComplete:
+                begin()
+            case .streamReadable, .streamFinished:
+                guard began, !closed else { return }
+                let id = event.streamID
+                if QUICStreamKind.isServerInitiated(id) { return }
+                if QUICStreamKind.isUnidirectional(id) {
+                    readUnidirectional(id)
+                } else {
+                    readRequest(id, nowMs: now)
                 }
+            case .streamReset, .stopSending:
+                guard began, !closed else { return }
+                aborted(event.streamID, code: event.code)
+            case .streamWritable:
+                if let s = streams[event.streamID] { pump(s) }
+            case .datagram:
+                // Not offered (QUICEndpoint.quicConfig); WebTransport's
+                // when it is.
+                quic.incomingDatagrams.removeAll(keepingCapacity: true)
+            case .closed:
+                closeHTTP()
             }
         }
         if !quic.events.isEmpty { endpoint.touch(self) }

@@ -211,8 +211,10 @@ final class QUICEndpoint: @unchecked Sendable {
     @exclusivity(unchecked) var connections: [QUICConnectionID: H3Connection] = [:]
     /// Every connection, once each, until it is closed and its tasks done.
     @exclusivity(unchecked) var live: [H3Connection] = []
-    /// Connections with something to look at since the last pass.
+    /// Connections with something to look at since the last pass, and the
+    /// list they are taken into.
     @exclusivity(unchecked) var touched: [H3Connection] = []
+    @exclusivity(unchecked) var servicing: [H3Connection] = []
     @exclusivity(unchecked) var draining: [Unmanaged<H3Stream>] = []
     /// Requests the endpoint answers itself, once the datagrams in hand are
     /// handled.
@@ -390,12 +392,12 @@ final class QUICEndpoint: @unchecked Sendable {
         var rounds = 0
         while !touched.isEmpty && rounds < 4 {
             rounds &+= 1
-            let list = touched
-            touched.removeAll(keepingCapacity: true)
-            for connection in list {
+            swap(&touched, &servicing)
+            for connection in servicing {
                 connection.touched = false
                 connection.handleEvents(nowMs: now)
             }
+            servicing.removeAll(keepingCapacity: true)
         }
     }
 
