@@ -138,9 +138,10 @@ rather than copied behind the head.
 
 ### Timeouts
 
-- An idle connection is closed after `--keep-alive` seconds (5).
+- An idle connection is closed after `--keep-alive` milliseconds (5000).
 - Once a head has begun, each read of the rest of it may wait
-  `ServerConfig.requestHeadTimeout` (30 s).
+  `--request-timeout` milliseconds (`ServerConfig.requestHeadTimeout`,
+  30 s).
 - Each read of a body may wait `ServerConfig.bodyTimeout` (30 s).
 
 ---
@@ -156,8 +157,9 @@ other, and the connection is served as a cleartext one is.
 
 - The handshake must finish within `ServerConfig.tlsHandshakeTimeout`
   (10 s). A TLS connection ends with `close_notify`.
-- TLS 1.2 minimum, compression and renegotiation off. There is no flag for
-  cipher suites or versions; the library's defaults apply.
+- TLS 1.2 minimum, compression and renegotiation off. `--tls-ciphers LIST`
+  sets the TLS 1.2 cipher list; TLS 1.3 suites and the versions are the
+  library's.
 - **ALPN**: `h2` then `http/1.1`; `http/1.1` alone with `--no-http2`; `h2`
   alone with `--http2-only`. A connection that negotiated `h2` must send the
   HTTP/2 preface.
@@ -185,7 +187,8 @@ other, and the connection is served as a cleartext one is.
 - `--hsts SECS` adds `Strict-Transport-Security: max-age=SECS` to every
   answer over TLS and HTTP/3 that does not set its own. It needs `--tls-cert`.
 
-**Not available**: kernel TLS (`--ktls` and `--no-ktls` are not accepted),
+**Not available**: kernel TLS (`--ktls` and `--no-ktls` are accepted, with a
+warning that they have no effect),
 `sendfile` over TLS (a `--static-dir` file goes out by `sendfile` over
 cleartext HTTP/1.1 only, and is read and encrypted otherwise), and the
 `tls-alpn-01` ACME challenge.
@@ -683,7 +686,7 @@ Then:
   be served, take no new connections or requests, close their WebTransport
   sessions, and close with `H3_NO_ERROR` once their requests are answered.
 
-Whatever is still running after `--graceful-timeout` seconds (10) is cut
+Whatever is still running after `--graceful-timeout` milliseconds (10000) is cut
 off. On Windows the server does not handle these signals; it stops when the
 process ends.
 
@@ -693,13 +696,13 @@ process ends.
 
 | `ServerConfig` field | Flag | Default | Applies to |
 | --- | --- | --- | --- |
-| `maxHeadSize` | none | 32 KiB | HTTP/1.1 head (431), HTTP/2 header list, HTTP/3 field section |
+| `maxHeadSize` | `--max-header-size BYTES` | 32 KiB | HTTP/1.1 head (431), HTTP/2 header list, HTTP/3 field section |
 | `maxHeaders` | none | 100 | fields in a request head |
 | `maxBodySize` | `--max-body BYTES` | 16 MiB | request bodies; `app.maxBodySize` sets a route's own |
 | `maxRequestsPerConnection` | none | 0 (unlimited) | HTTP/1.1 requests before `Connection: close` |
 | `pipelineDepth` | none | 16 | HTTP/1.1 answers written as one batch |
-| `keepAliveTimeout` | `--keep-alive SECS` | 5 s | idle HTTP/1.1 and HTTP/2 connections, QUIC idle timeout |
-| `requestHeadTimeout` | none | 30 s | each read of an HTTP/1.1 head once it has begun |
+| `keepAliveTimeout` | `--keep-alive MS` | 5 s | idle HTTP/1.1 and HTTP/2 connections, QUIC idle timeout |
+| `requestHeadTimeout` | `--request-timeout MS` | 30 s | each read of an HTTP/1.1 head once it has begun |
 | `bodyTimeout` | none | 30 s | a request body that stops arriving, on all three |
 | `tlsHandshakeTimeout` | none | 10 s | the TLS handshake over TCP |
 | `writeTimeout` | none | 30 s | a streamed body's or WebSocket's write over HTTP/1.1 |
@@ -709,7 +712,7 @@ process ends.
 | `h2MaxFrameSize` | none | 16 KiB | HTTP/2 frames a client may send |
 | `h2InitialWindowSize` | none | 256 KiB | HTTP/2 and HTTP/3 receive windows |
 | `maxQUICConnections` | none | 4,096 | QUIC connections per UDP socket |
-| `gracefulShutdown` | `--graceful-timeout SECS` | 10 s | shutdown |
+| `gracefulShutdown` | `--graceful-timeout MS` | 10 s | shutdown |
 | `drainDelay` | `--drain-delay MS` | 0 | SIGTERM's wait before draining |
 
 A route can also be given a deadline on its I/O waits (`app.deadline`,
