@@ -257,3 +257,31 @@ struct JWKSTests {
         #expect(verifier.fetches == 1)
     }
 }
+
+@Suite("JWKS over HTTP")
+struct JWKSOverHTTPTests {
+    @Test func theSetIsFetchedWithTheHTTPClientAndARefusalIsNoKeys() throws {
+        let key = try JWTKey.generate(.ES256, keyID: "k")
+        let body = try set([key])
+        let signed = try token(key)
+        let (subject, refused) = try onRuntime {
+            let provider = Application()
+            provider.get("/jwks") { _, response in response.send(bytes: body, contentType: "application/json") }
+            let server = try LoopbackServer.start(provider)
+            defer { Task { await server.stop() } }
+            let verifier = JWKSVerifier(url: server.url + "/jwks")
+            let subject = try await verifier.verify(signed, as: Claims.self).sub
+            let missing = JWKSVerifier(url: server.url + "/nowhere")
+            let refused: JWTError?
+            do {
+                _ = try await missing.verify(signed, as: Claims.self)
+                refused = nil
+            } catch let error as JWTError {
+                refused = error
+            }
+            return (subject, refused)
+        }
+        #expect(subject == "ada")
+        #expect(refused == .keySetUnavailable)
+    }
+}

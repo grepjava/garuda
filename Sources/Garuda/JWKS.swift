@@ -4,8 +4,7 @@
 //
 //     app.jwtVerifier { _ in
 //         JWKSVerifier(url: "https://auth.example.com/.well-known/jwks.json",
-//                      validation: JWTValidation(issuer: "https://auth.example.com/", audience: "shop"),
-//                      fetch: { url in try await fetchBody(url) })
+//                      validation: JWTValidation(issuer: "https://auth.example.com/", audience: "shop"))
 //     }
 //     app.get("/me") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
 //
@@ -36,9 +35,9 @@
 // were fetched, who waits -- is behind a lock held for a few loads and stores,
 // never across the fetch or a signature check.
 //
-// The fetch itself is the `fetch` closure: the bytes at a URL. Garuda's HTTP
-// client comes in a later phase, and with it a fetch that goes over the
-// network by default; until then an application hands in its own.
+// The fetch goes out on Garuda's HTTP client, with the trust store and the
+// timeout given, and takes a 200 of at most a megabyte. A `fetch` of the
+// application's own -- the bytes at a URL -- replaces it.
 //===----------------------------------------------------------------------===//
 
 import Synchronization
@@ -82,14 +81,30 @@ public final class JWKSVerifier: JWTVerifying, @unchecked Sendable {
     public init(url: String, validation: JWTValidation = JWTValidation(),
                 algorithms: [JWTAlgorithm] = JWTAlgorithm.allCases.filter { !$0.isHMAC },
                 maxAgeSeconds: Int64 = 3600, minimumRefetchSeconds: Int64 = 60,
-                fetch: @escaping JWKSFetch) {
+                caFile: String = "", timeout: Duration = .seconds(10),
+                fetch: JWKSFetch? = nil) {
         precondition(!algorithms.contains(where: \.isHMAC), "a key set never holds an HMAC secret worth trusting")
         self.url = url
         self.validation = validation
         self.algorithms = Set(algorithms)
         self.maxAgeSeconds = maxAgeSeconds
         self.minimumRefetchSeconds = minimumRefetchSeconds
-        self.fetch = fetch
+        self.fetch = fetch ?? JWKSVerifier.overHTTP(caFile: caFile, timeout: timeout)
+    }
+
+    /// Fetches with the HTTP client: a 200 of at most a megabyte, over the
+    /// trust store in `caFile` (the system's when empty).
+    static func overHTTP(caFile: String, timeout: Duration) -> JWKSFetch {
+        { url in
+            var client = HTTPClient()
+            client.caFile = caFile
+            client.timeout = timeout
+            client.totalTimeout = timeout
+            client.maxBodyBytes = 1024 * 1024
+            let response = try await client.get(url, headers: [("Accept", "application/json")])
+            guard response.status == 200 else { throw JWTError.keySetUnavailable }
+            return response.body
+        }
     }
 
     public func verify<Claims: Decodable>(_ token: String, as type: Claims.Type) async throws -> Claims {

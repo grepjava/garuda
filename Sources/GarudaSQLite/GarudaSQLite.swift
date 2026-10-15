@@ -156,3 +156,98 @@ public struct SQLiteSessionStore: SessionStore {
         Timestamp.now.microsecondsSinceEpoch / 1000
     }
 }
+
+// MARK: - Refresh tokens
+
+/// Refresh tokens in two SQLite tables: families, and tokens by digest. Make
+/// them with `createTables`, or with `schema` in a migration, and clear ended
+/// families now and then with `deleteExpired`.
+public struct SQLiteRefreshTokenStore: RefreshTokenStore {
+    public let database: SQLiteDatabase
+    public let table: String
+
+    public init(_ database: SQLiteDatabase, table: String = "garuda_refresh_tokens") {
+        precondition(!table.isEmpty && table.utf8.allSatisfy { c in
+            (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F
+        } && !(table.utf8.first! >= 0x30 && table.utf8.first! <= 0x39),
+                     "a refresh token table's name is letters, digits and underscores: \(table)")
+        self.database = database
+        self.table = table
+    }
+
+    /// The statements that make the tables.
+    public static func schema(table: String = "garuda_refresh_tokens") -> [String] {
+        [
+            "CREATE TABLE IF NOT EXISTS \(table)_families (family TEXT PRIMARY KEY NOT NULL, subject TEXT NOT NULL, "
+                + "expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID",
+            "CREATE INDEX IF NOT EXISTS \(table)_families_subject ON \(table)_families (subject)",
+            "CREATE TABLE IF NOT EXISTS \(table) (digest TEXT PRIMARY KEY NOT NULL, family TEXT NOT NULL, "
+                + "subject TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, "
+                + "family_expires_at INTEGER NOT NULL, used_at INTEGER) WITHOUT ROWID",
+            "CREATE INDEX IF NOT EXISTS \(table)_family ON \(table) (family)",
+        ]
+    }
+
+    public func createTables() async throws {
+        for statement in Self.schema(table: table) { try await database.execute(statement) }
+    }
+
+    /// Deletes families that have ended, and their tokens. Returns how many
+    /// tokens went.
+    @discardableResult
+    public func deleteExpired() async throws -> Int {
+        let now = Timestamp.now.secondsSinceEpoch
+        let tokens = try await database.execute("DELETE FROM \(table) WHERE family_expires_at <= ?", now)
+        try await database.execute("DELETE FROM \(table)_families WHERE expires_at <= ?", now)
+        return tokens
+    }
+
+    public func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
+        try await database.execute("INSERT INTO \(table)_families (family, subject, expires_at) VALUES (?, ?, ?)",
+                                   family, subject, expiresAt)
+    }
+
+    public func insert(_ record: RefreshTokenRecord) async throws {
+        try await database.execute(
+            "INSERT INTO \(table) (digest, family, subject, issued_at, expires_at, family_expires_at, used_at) "
+                + "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            record.digest, record.family, record.subject, record.issuedAt, record.expiresAt, record.familyExpiresAt)
+    }
+
+    private struct Row: Decodable {
+        var digest: String
+        var family: String
+        var subject: String
+        var issuedAt: Int64
+        var expiresAt: Int64
+        var familyExpiresAt: Int64
+        var usedAt: Int64?
+        var revoked: Int64?
+    }
+
+    public func find(digest: String) async throws -> RefreshTokenRecord? {
+        guard let row = try await database.first(
+            Row.self,
+            "SELECT t.digest, t.family, t.subject, t.issued_at AS issuedAt, t.expires_at AS expiresAt, "
+                + "t.family_expires_at AS familyExpiresAt, t.used_at AS usedAt, f.revoked "
+                + "FROM \(table) t LEFT JOIN \(table)_families f ON f.family = t.family WHERE t.digest = ?",
+            digest) else { return nil }
+        return RefreshTokenRecord(digest: row.digest, family: row.family, subject: row.subject,
+                                  issuedAt: row.issuedAt, expiresAt: row.expiresAt,
+                                  familyExpiresAt: row.familyExpiresAt, usedAt: row.usedAt,
+                                  revoked: (row.revoked ?? 1) != 0)
+    }
+
+    public func markUsed(digest: String, at: Int64) async throws -> Bool {
+        try await database.execute("UPDATE \(table) SET used_at = ? WHERE digest = ? AND used_at IS NULL",
+                                   at, digest) == 1
+    }
+
+    public func revokeFamily(_ family: String) async throws {
+        try await database.execute("UPDATE \(table)_families SET revoked = 1 WHERE family = ?", family)
+    }
+
+    public func revokeSubject(_ subject: String) async throws {
+        try await database.execute("UPDATE \(table)_families SET revoked = 1 WHERE subject = ?", subject)
+    }
+}
