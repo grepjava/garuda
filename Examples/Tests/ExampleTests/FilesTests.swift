@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Testing
 import Garuda
@@ -13,10 +15,7 @@ import GarudaUploads
 // refused, and the downloads the static route serves.
 
 private func temporaryDirectory() -> String {
-    var template = Array("/tmp/garuda-files-XXXXXX".utf8CString)
-    let made = template.withUnsafeMutableBufferPointer { mkdtemp($0.baseAddress!) }
-    precondition(made != nil)
-    return String(cString: template)
+    makeScratchDirectory("garuda-files")
 }
 
 /// A client for the service, with the static route its `main.swift` adds, so

@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Testing
 import Garuda
@@ -14,10 +16,7 @@ import GarudaUploads
 // replayed with its Location.
 
 private func temporaryDirectory() -> String {
-    var template = Array("/tmp/garuda-uploads-XXXXXX".utf8CString)
-    let made = template.withUnsafeMutableBufferPointer { mkdtemp($0.baseAddress!) }
-    precondition(made != nil)
-    return String(cString: template)
+    makeScratchDirectory("garuda-uploads")
 }
 
 private func client(_ configuration: UploadsConfiguration) -> TestClient {
@@ -60,7 +59,7 @@ struct UploadsExampleTests {
         #expect(photo.url == "/users/ada/photos/\(photo.id)")
 
         // Filed in ada's directory, and served back with the checked type.
-        #expect(access(configuration.photoDirectory + "/ada/" + photo.id, F_OK) == 0)
+        #expect(fileExists(configuration.photoDirectory + "/ada/" + photo.id))
         let fetched = try http.get(photo.url, headers: [ada])
         #expect(fetched.status == .ok)
         #expect(fetched.body == content)
@@ -169,14 +168,5 @@ struct UploadsExampleTests {
 }
 
 private func listing(_ directory: String) -> [String] {
-    guard let dir = opendir(directory) else { return [] }
-    defer { closedir(dir) }
-    var names: [String] = []
-    while let entry = readdir(dir) {
-        let name = withUnsafeBytes(of: entry.pointee.d_name) {
-            String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self)
-        }
-        if name != "." && name != ".." { names.append(name) }
-    }
-    return names
+    directoryListing(directory)
 }
