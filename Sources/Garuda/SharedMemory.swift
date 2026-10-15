@@ -20,12 +20,14 @@ struct SharedLayout: Sendable {
     private(set) var rateLimit: Int?
     private(set) var metrics: Int?
     private(set) var cache: Int?
+    private(set) var bus: Int?
 
     init(_ config: ServerConfig) {
         if !config.tlsCertificates.isEmpty { ticketKey = add(TicketKey.regionSize) }
         if config.rateLimitCount > 0 { rateLimit = add(RateLimiter.regionSize) }
         if config.metricsPort != nil { metrics = add(MetricsPage.regionSize) }
         if let size = ResponseCache.regionSize(config) { cache = add(size) }
+        if let size = TopicBus.regionSize(config) { bus = add(size) }
     }
 
     private mutating func add(_ size: Int) -> Int {
@@ -40,6 +42,8 @@ final class ServerShared: Sendable {
     let rateLimiter: RateLimiter?
     let metrics: MetricsPage?
     let cache: ResponseCache?
+    /// --broadcast-size: the ring topics cross shards in (Broadcast.swift).
+    let bus: TopicBus?
 
     /// `region(i)` is region `i` of `layout`; `shard` is this shard's index.
     init(_ layout: SharedLayout, config: ServerConfig, shard: Int,
@@ -48,6 +52,7 @@ final class ServerShared: Sendable {
         rateLimiter = layout.rateLimit.map { RateLimiter(region: region($0), config: config) }
         metrics = layout.metrics.map { MetricsPage(region: region($0), shard: shard) }
         cache = layout.cache.flatMap { ResponseCache(region: region($0), config: config) }
+        bus = layout.bus.flatMap { TopicBus(region: region($0), config: config) }
     }
 
     /// This shard has started, one of `shards`: a replacement's start retires

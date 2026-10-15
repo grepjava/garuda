@@ -8,6 +8,7 @@
 //   GET  /                       200, empty
 //   GET  /compress/...           scripts/compress-test.sh (CompressionRoutes.swift)
 //   /cache/...                   scripts/cache-test.sh (CacheRoutes.swift)
+//   /broadcast/...               scripts/broadcast-test.py (BroadcastRoutes.swift)
 //===----------------------------------------------------------------------===//
 
 import Garuda
@@ -20,5 +21,6 @@ app.get("/") { _, response in
 
 addCompressionRoutes(app)
 addCacheRoutes(app)
+addBroadcastRoutes(app)
 
 app.run()

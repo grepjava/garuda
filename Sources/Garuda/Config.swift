@@ -18,6 +18,10 @@ public struct ServerConfig: Sendable {
     /// machine's cache domains. 0 serves in this process, with no supervisor
     /// -- what tests and development want.
     public var shards: Int? = nil
+    /// How shards share the listening port: each its own SO_REUSEPORT
+    /// socket, hashed by the kernel, or one socket all of them accept on.
+    /// Nil for Vega's choice: the first on Linux, the second elsewhere.
+    public var balance: ConnectionBalance? = nil
     /// Worker threads per shard; nil divides the CPUs among the shards.
     public var threads: Int? = nil
     /// Accept loops per shard; nil: one per thread.
@@ -67,6 +71,12 @@ public struct ServerConfig: Sendable {
     /// closes idle connections sees traffic and a client that has gone is
     /// noticed (EventStream.swift). Zero sends none.
     public var eventKeepAlive: Duration = .seconds(15)
+    /// The ring, in MiB, that messages a `Topic` publishes cross shards in
+    /// (Broadcast.swift); 0 turns topics off. A message may be a quarter of it.
+    public var broadcastSizeMiB = 4
+    /// Messages a subscriber may fall behind by before it is handed
+    /// `.missed` in place of the rest.
+    public var broadcastQueue = 1024
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
 
@@ -194,4 +204,14 @@ public struct ServerConfig: Sendable {
 
     public init() {}
 
+}
+
+/// How shards share the listening port (`--balance`).
+public enum ConnectionBalance: Sendable, Hashable {
+    /// Each shard binds its own SO_REUSEPORT socket and the kernel hashes
+    /// connections across them.
+    case reusePort
+    /// One socket every shard accepts on: a connection goes to a shard
+    /// waiting in accept.
+    case shared
 }

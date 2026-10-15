@@ -74,6 +74,11 @@ extension Application {
         var options = ShardOptions(shards: config.shards ?? Application.defaultShards,
                                    workersPerShard: config.threads)
         options.pinThreads = config.pinThreads
+        switch config.balance {
+        case .reusePort?: options.listenerMode = .perShard
+        case .shared?: options.listenerMode = .shared
+        case nil: break
+        }
         options.shutdownGracePeriod = config.gracefulShutdown + .seconds(5)
         options.listeners = [.tcp(host: config.host, port: config.port, backlog: config.backlog)]
         if let redirect = config.redirectHTTPPort {
@@ -176,6 +181,7 @@ extension Application {
         app.rateLimiter = listening.shared.rateLimiter
         app.metrics = listening.shared.metrics
         app.cache = listening.shared.cache
+        TopicBus.install(listening.shared.bus)
         if config.cacheSizeMiB > 0 && app.cache == nil {
             Log.error("--cache-size \(config.cacheSizeMiB) is too little for a response of --cache-max-object")
             exit(2)
@@ -297,6 +303,9 @@ extension ServerConfig {
           --host HOST          interface to bind (default 127.0.0.1)
           --port PORT          port to bind (default 8000)
           --shards N|auto      shard processes; 0 serves in this process
+          --balance MODE       how shards share the port: reuseport (a socket
+                               each, hashed by the kernel), shared (one socket,
+                               taken by whichever is waiting), or auto
                                (default: auto on Linux, 0 elsewhere)
           --threads N          worker threads per shard (default: its CPUs)
           --no-pin             do not pin shard threads to their CPUs
@@ -326,6 +335,11 @@ extension ServerConfig {
           --cache-max-object KIB
                                the largest body kept (default 1024)
           --cache-ttl-max SECS the longest a response is kept (default 300)
+          --broadcast-size MIB the ring a Topic's messages cross shards in, and
+                               how far back a reconnecting client can catch up
+                               (default 4; 0 turns topics off)
+          --broadcast-queue N  messages a subscriber may fall behind by before
+                               the rest are replaced by one .missed (default 1024)
           --compress           compress text responses for clients that accept
                                it (see BREACH before turning this on)
           --compress-static    serve file.br, file.zst or file.gz beside a
@@ -420,6 +434,13 @@ extension ServerConfig {
                 } else {
                     return fail("--shards must be a count or auto")
                 }
+            case "--balance":
+                switch value() {
+                case "reuseport": config.balance = .reusePort
+                case "accept", "shared": config.balance = .shared
+                case "adaptive", "auto": config.balance = nil
+                default: return fail("--balance must be reuseport, shared or auto")
+                }
             case "--workers":
                 // Garuda 1's name for its processes, which are shards here.
                 guard let n = value().flatMap({ Int($0) }), n >= 0 else {
@@ -490,6 +511,16 @@ extension ServerConfig {
                     return fail("--cache-max-object must be a number of kibibytes, at most 65536")
                 }
                 config.cacheMaxObject = n * 1024
+            case "--broadcast-size":
+                guard let n = value().flatMap({ Int($0) }), n >= 0, n <= 1 << 20 else {
+                    return fail("--broadcast-size must be a number of MiB")
+                }
+                config.broadcastSizeMiB = n
+            case "--broadcast-queue":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--broadcast-queue must be a count above 0")
+                }
+                config.broadcastQueue = n
             case "--cache-ttl-max":
                 guard let n = value().flatMap({ Int($0) }), n > 0 else {
                     return fail("--cache-ttl-max must be a number of seconds")
