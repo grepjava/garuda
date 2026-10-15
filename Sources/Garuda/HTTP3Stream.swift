@@ -114,6 +114,9 @@ final class H3Stream: @unchecked Sendable {
     /// the exchange.
     @exclusivity(unchecked) var answerReady = false
     @exclusivity(unchecked) var bodyLength = 0
+    /// The whole answer falls short of its declared length: reset after its
+    /// last bytes rather than ended. Set with `bodyLength`.
+    @exclusivity(unchecked) var short = false
     /// The answer is streamed: everything is in `staged`.
     @exclusivity(unchecked) var streamed = false
     /// Frames for the endpoint to send, ahead of a whole answer's head.
@@ -316,10 +319,12 @@ extension QUICEndpoint {
     /// header in `outHead`, the body left in the exchange. `headParsed`:
     /// false for an answer to a request whose head could not be read.
     func frameWhole(_ s: H3Stream, headParsed: Bool = true) {
-        let count = prepareAnswer(s.x)
+        let framing = prepareAnswer(s.x)
+        let count = framing.sending
         s.bodyLength = count
+        s.short = framing.short
         s.outHead.clear()
-        encodeHead(s, streamed: false, declared: -1, headParsed: headParsed, into: &s.outHead)
+        encodeHead(s, length: framing.stated, headParsed: headParsed, into: &s.outHead)
         if count > 0 {
             s.outHead.writeVarint(HTTP3FrameType.data)
             s.outHead.writeVarint(UInt64(count))
@@ -334,7 +339,7 @@ extension QUICEndpoint {
         let route = s.x.pointee.route
         if route >= 0 { app.costs.markSuspends(Int(route)) }
         s.outHead.clear()
-        encodeHead(s, streamed: true, declared: declared, into: &s.outHead)
+        encodeHead(s, length: declared, into: &s.outHead)
         lock.withLock { _ in
             s.streamed = true
             s.staged.write(s.outHead.readPointer, s.outHead.readableBytes)
@@ -381,10 +386,10 @@ extension QUICEndpoint {
     /// Frames `s`'s head as a HEADERS frame into `out`: `:status` and the
     /// response headers, as `writeHTTP1Head` writes them -- date, server and
     /// content-length added, the headers that frame an HTTP/1 message or
-    /// manage its connection dropped. A streamed answer's length is the one
-    /// its handler declared, if it did.
-    func encodeHead(_ s: H3Stream, streamed: Bool, declared: Int, headParsed: Bool = true,
-                    into out: inout ByteBuffer) {
+    /// manage its connection dropped. `length` is the content-length to
+    /// state, or -1 for none: a whole answer's as `wholeFraming` settles it,
+    /// a streamed one's as `startStream` does.
+    func encodeHead(_ s: H3Stream, length: Int, headParsed: Bool = true, into out: inout ByteBuffer) {
         let x = s.x
         // `Response.onSend` hooks see the answer once it is final, while it
         // can still change (ResponseHooks.swift).
@@ -392,7 +397,6 @@ extension QUICEndpoint {
         x.pointee.committed = true
         s.dates.refresh()
         let status = x.pointee.status
-        let forbids = HTTPResponseWriter.statusForbidsBody(status)
         let encoder = QPACKEncoder()
         s.block.clear()
         encoder.begin(into: &s.block)
@@ -419,7 +423,6 @@ extension QUICEndpoint {
             encoder.encode(name: name.base, nameLength: name.count, value: value.count > 0 ? value.base : emptyBlock,
                            valueLength: value.count, into: &s.block)
         }
-        let length = forbids ? -1 : streamed ? declared : x.pointee.responseBody.readableBytes
         if length >= 0 {
             withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 24) { digits in
                 let n = writeDecimal(length, digits.baseAddress!)

@@ -269,7 +269,7 @@ extension QUICEndpoint {
         x.pointee.capture = nil
         x.pointee.cacheInvalidates = 0
         s.outHead.clear()
-        encodeHead(s, streamed: true, declared: -1, into: &s.outHead)
+        encodeHead(s, length: -1, into: &s.outHead)
         lock.withLock { _ in
             s.streamed = true
             s.staged.write(s.outHead.readPointer, s.outHead.readableBytes)
