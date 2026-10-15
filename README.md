@@ -67,7 +67,8 @@ lists what Garuda 2 does not have yet.
 | Identity | JWT (HS, RS, PS, ES, and EdDSA), JWKS verification, rotating refresh tokens, and PBKDF2-HMAC-SHA256 password hashing |
 | HTTP client | HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed response bodies, and server-sent events |
 | Data | PostgreSQL, Redis (including Redis Cluster and Sentinel) and SQLite, from [vega-db](https://github.com/grepjava/vega-db) through `GarudaPostgres`, `GarudaRedis` and `GarudaSQLite` |
-| Streaming | Streamed responses, server-sent events, broadcast across shards, and interim 1xx responses such as 103 Early Hints |
+| Streaming | Streamed responses, request bodies read as they arrive, server-sent events, broadcast across shards, and interim 1xx responses such as 103 Early Hints |
+| Uploads | Resumable uploads (draft-ietf-httpbis-resumable-upload) through `GarudaUploads`: the body goes to disk as it arrives, and a client whose connection drops asks how much arrived and sends the rest |
 | WebSockets | WebSockets over HTTP/1.1, HTTP/2, and HTTP/3. The engine joins fragments, checks UTF-8, answers pings, and supports permessage-deflate |
 | WebTransport | WebTransport over HTTP/3 on the same port and routes, with bidirectional and unidirectional streams and datagrams |
 | Files and compression | Static files with ETag and byte ranges, including precompressed copies. Response and request compression with brotli, zstd, and gzip |
@@ -75,13 +76,12 @@ lists what Garuda 2 does not have yet.
 | Edge policy | HTTPS redirect, HSTS, trusted proxy headers, allowed hosts, and client address allow and deny lists |
 | Operations | Prometheus metrics, health checks, request IDs, W3C trace context, an access log, a response cache shared by the shards, graceful shutdown with a drain delay, and a rolling restart on SIGHUP. Unix sockets and more than one shard |
 | Tracing | Spans through swift-distributed-tracing for the request, outbound HTTP, PostgreSQL, and Redis |
-| Tests | `app.test`, from `GarudaTesting`, runs requests through the real HTTP/1 connection over an in-memory stream, and has an HTTP/2 client too |
+| Tests | `app.test`, from `GarudaTesting`, runs requests through the real HTTP/1 connection over an in-memory stream, and has an HTTP/2 client too. The parsers that read the network are fuzzed (`pgfuzz`) |
 | Process model | A supervisor starts shard processes, each a work-stealing runtime over several threads. In-memory state is per shard |
 | Platforms | Linux, and macOS 26.4 or newer, on Swift 6.2 or newer. Windows is experimental, and serves in one process only |
 
-Not in Garuda 2 yet: resumable uploads and streamed request bodies (both
-coming), a built-in ACME client, QUIC 0-RTT and session resumption, kernel
-TLS, `multipart/byteranges`, and reads from Redis replicas.
+Not in Garuda 2: a built-in ACME client, QUIC 0-RTT and session resumption,
+kernel TLS, `multipart/byteranges`, and reads from Redis replicas.
 [What Garuda 2 does not have](COMPATIBILITY.md#what-garuda-2-does-not-have)
 lists what Garuda 1 had.
 
@@ -553,9 +553,72 @@ A `Topic`'s messages cross shards through a ring in shared memory
 (`--broadcast-size`), which also keeps recent messages for `Last-Event-ID`.
 `response.sendInterim` sends 1xx responses such as 103 Early Hints.
 
-Request bodies are collected whole before the handler runs, held to
-`--max-body` or the scope's `maxBodySize`. Streamed request bodies
-(`onStreamingBody`) and resumable uploads (`GarudaUploads`) are coming.
+A route's request body is collected whole before the handler runs, held to
+`--max-body` or the scope's `maxBodySize`, unless the route reads it as it
+arrives:
+
+```swift
+app.onStreamingBody(.put, "/uploads/:name", maxBodySize: 10 << 30) { request, response, body in
+    var buffer = IOBuffer(capacity: 256 * 1024)   // Vega's
+    while try await body.read(into: &buffer) > 0 {
+        try await file.write(buffer)              // a VegaFS File
+        buffer.clear()
+    }
+    response.send(status: .created)
+}
+```
+
+This works over HTTP/1.1, HTTP/2 and HTTP/3. Reading is what lets more in: the
+HTTP/2 or HTTP/3 window is given back as the handler reads, so a slow disk
+slows its own upload and nothing else. `body.read(maxBytes:)` and
+`body.readAll(maxBytes:)` hand over `[UInt8]`; `bytesRead`, `expectedLength`
+and `cancel()` are there too. A body that passes `maxBodySize` throws
+`RequestBodyError.tooLarge`, answered 413. A request that ends before its body
+did hands over every byte that arrived and then throws `.incomplete`, answered
+400; a reset HTTP/2 or HTTP/3 stream ends a streaming handler this way rather
+than cancelling it. [HANDLER-API.md](HANDLER-API.md#request-bodies-read-as-they-arrive)
+has the details.
+
+### Resumable uploads
+
+```swift
+import GarudaUploads
+
+let store = try FileUploadStore(directory: "/var/lib/app/uploads")
+app.resumableUploads("/files", store: store,
+                     limits: UploadLimits(maxSize: 10 << 30)) { upload in
+    try await FileSystem.rename(upload.path, to: "/srv/files/\(upload.info.id)")   // VegaFS
+    return JSON(["size": upload.length], status: .created)
+}
+```
+
+`GarudaUploads` implements the IETF's resumable uploads
+(draft-ietf-httpbis-resumable-upload, interop version 9) over HTTP/1.1,
+HTTP/2 and HTTP/3. A client that speaks it learns where its upload lives (in
+a 104 before a byte of the body is read, when it sends interop version 9),
+and if the connection drops, it asks that URL how much arrived (`HEAD`) and
+sends the rest (`PATCH`) as many times as it takes. A client that does not
+speak it sends an ordinary `POST`. Either way the handler is called once,
+with the whole file on disk, and its answer is the response to the request
+that finished the upload. A `GET` of the upload's URL
+replays that answer to a client that lost it.
+
+`UploadLimits` sets the largest and smallest upload and append, and how long
+an upload is kept. `onCreate` records what the application knows on the
+request that creates an upload, such as whose it is, for the completion
+handler to read as `upload.metadata`. A client's `Repr-Digest` is checked
+before the handler runs, and `await upload.digest()` gives the SHA-256.
+
+A client that comes back while its old request is still appending supersedes
+it: on the same shard the old request is ended and what it received kept; on
+another shard the new request waits a moment, then is answered 409 with
+`Retry-After`. Over HTTP/1.1, ending the old request closes its connection,
+and bytes it had read from the socket but not yet stored are dropped. The
+client resumes from the offset that was stored, so nothing is lost but those
+bytes' transfer.
+
+The [files and uploads examples](Examples/README.md) are whole applications
+built on it.
 
 ### Testing
 
@@ -599,8 +662,8 @@ it, area by area.
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure |
 | Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` |
 | Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across shard processes, to event streams, WebSockets and long polls, with replay |
-| Streaming request bodies | `Body::into_data_stream` | Coming; bodies are collected whole today |
-| Resumable uploads | None built in; tus through other crates | Coming (`GarudaUploads`) |
+| Streaming request bodies | `Body::into_data_stream` | `app.onStreamingBody`, read with flow control over HTTP/1.1, HTTP/2 and HTTP/3 |
+| Resumable uploads | None built in; tus through other crates | `app.resumableUploads` (`GarudaUploads`), the IETF draft over every protocol |
 | Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints |
 | WebSockets | `WebSocketUpgrade` | `app.webSocket`, whole messages, pings and permessage-deflate by the engine (over HTTP/1.1, HTTP/2 and HTTP/3) |
 | WebTransport | None in hyper | `app.webTransport` |
@@ -611,7 +674,7 @@ it, area by area.
 | Blocking work | `spawn_blocking` | a whole route with `app.offload`, or `Runtime.blocking { … }` from Vega |
 | Testing | `tower::ServiceExt::oneshot` | `app.test`, the real HTTP/1 connection; `app.test.http2()` |
 
-Every row but the two marked coming is implemented and tested.
+Every row is implemented and tested.
 
 [BENCHMARKS.md](BENCHMARKS.md) has the benchmark method, including
 hello-world comparisons with axum that measure what the server adds to a
@@ -727,7 +790,7 @@ bash scripts/compile-fail-test.sh            # handler code that must not compil
 The database tests skip themselves unless a database is reachable. The
 end-to-end suites run against a release build. Each takes a binary path as
 its first argument. Most use `.build/release/garuda`; the handler, WebSocket,
-WebTransport and broadcast suites use `.build/release/garuda-conformance`,
+WebTransport, broadcast and upload suites use `.build/release/garuda-conformance`,
 whose routes exist only for the tests.
 
 ```bash
@@ -752,11 +815,24 @@ python3 scripts/websocket-test.py            # handshake, framing violations, cl
 python3 scripts/websocket-streams-test.py    # WebSocket over HTTP/2 and HTTP/3
 python3 scripts/webtransport-test.py         # sessions, streams, datagrams
 python3 scripts/broadcast-test.py            # topics across shards, Last-Event-ID, keep-alive
+python3 scripts/upload-test.py               # streamed request bodies, resumable uploads
 ```
 
 The shell suites need `curl` and `openssl`. The Python suites are clients only,
-using `h2` and `aioquic`, which share no code with the server. Garuda 1's fuzz
-targets (`pgfuzz`) are not ported yet.
+using `h2` and `aioquic`, which share no code with the server.
+
+The parsers that read bytes from the network, and whole HTTP/2, HTTP/3 and
+QUIC connections, are fuzzed with `pgfuzz`, a mutation fuzzer in the package,
+against 14 targets (`GarudaFuzzTargets`). `swift test` replays every seed and
+everything in `fuzz/corpus` through them (`GarudaFuzzTests`).
+
+```bash
+swift run -c release pgfuzz                  # every target, 5 seconds each
+swift run -c release pgfuzz h2 --seconds 300
+```
+
+[fuzz/README.md](fuzz/README.md) lists the targets, the invariants each
+checks, and how to run them under AddressSanitizer.
 
 ## Status
 
@@ -768,9 +844,6 @@ covers.
 
 ### Not supported yet
 
-- Resumable uploads (`GarudaUploads`) and streamed request bodies
-  (`onStreamingBody`): coming.
-- Fuzz targets (`GarudaFuzzTargets`, `pgfuzz`): coming.
 - A built-in ACME client. Use certbot or another client with
   `--acme-webroot`.
 - Kernel TLS: `--ktls` is accepted and has no effect.
@@ -796,7 +869,7 @@ covers.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How Garuda 2 is built: shards, the work-stealing runtime, the protocols, the heavy lane, shared memory |
 | [TRANSPORT.md](TRANSPORT.md) | What each protocol implementation does |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | Moving from Garuda 1 to Garuda 2, and what a release may change |
-| [EXAMPLES.md](EXAMPLES.md) | The runnable applications and recipes (being ported to Garuda 2) |
+| [EXAMPLES.md](EXAMPLES.md) | The eight runnable applications, and recipes (still being ported from Garuda 1) |
 | [Examples/README.md](Examples/README.md) | The example applications and how they are laid out |
 | [BENCHMARKS.md](BENCHMARKS.md) | Benchmark method and results |
 | [RELEASE.md](RELEASE.md) | Changes |
