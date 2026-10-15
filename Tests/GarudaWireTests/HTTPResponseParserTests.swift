@@ -97,6 +97,14 @@ struct HTTPResponseParserTests {
         #expect(failure("HTTP/1.1 2000 OK\r\n\r\n") == .badStatusLine)
     }
 
+    /// Found by pgfuzz: "001 Switching Protocols" was a status of 1, which
+    /// is neither interim nor final, and was read as a final response.
+    @Test func aStatusBelow100IsRefused() {
+        #expect(failure("HTTP/1.1 001 Switching Protocols\r\n\r\n") == .badStatusLine)
+        #expect(failure("HTTP/1.1 099 OK\r\n\r\n") == .badStatusLine)
+        #expect(failure("HTTP/1.1 000\r\n\r\n") == .badStatusLine)
+    }
+
     @Test func aNonNumericStatusIsRefused() {
         #expect(failure("HTTP/1.1 2x0 OK\r\n\r\n") == .badStatusLine)
     }

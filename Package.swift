@@ -161,6 +161,16 @@ let package = Package(
                                          vega("VegaFS")],
                           path: "Sources/garuda-conformance",
                           swiftSettings: sharedSwiftSettings),
+        // The parsers that read untrusted bytes, and the connections around
+        // them, as fuzz targets; `pgfuzz` mutates inputs against them and
+        // GarudaFuzzTests replays fuzz/corpus through them (fuzz/README.md).
+        .target(name: "GarudaFuzzTargets",
+                dependencies: ["Garuda", "GarudaWire", "GarudaQUIC", "GarudaTesting", "QUICTestPeer",
+                               vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS"),
+                               vegaDB("VegaPostgres"), vegaDB("VegaRedis")],
+                swiftSettings: sharedSwiftSettings),
+        .executableTarget(name: "pgfuzz", dependencies: ["GarudaFuzzTargets"],
+                          swiftSettings: sharedSwiftSettings),
 
         .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),
         .testTarget(name: "GarudaWireTests", dependencies: ["GarudaWire"],
@@ -184,6 +194,8 @@ let package = Package(
         .testTarget(name: "GarudaUploadsTests",
                     dependencies: ["Garuda", "GarudaUploads", "GarudaTesting", "GarudaWire", vega("Vega"),
                                    vega("VegaFS")],
+                    swiftSettings: sharedSwiftSettings),
+        .testTarget(name: "GarudaFuzzTests", dependencies: ["GarudaFuzzTargets"],
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaDatabaseTests",
                     dependencies: ["Garuda", "GarudaPostgres", "GarudaRedis", "GarudaSQLite", "GarudaSQL",

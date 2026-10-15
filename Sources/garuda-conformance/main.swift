@@ -3,9 +3,9 @@
 //
 // Not a benchmark and not an example to copy: each route exists to make one
 // server behaviour observable from outside, for the scripts under scripts/.
-// Garuda 1's had more; the rest come with the features they exercise.
 //
 //   GET  /                       200, empty
+//   /echo, /headers, /status ... scripts/handler-test.py (HandlerRoutes.swift)
 //   GET  /compress/...           scripts/compress-test.sh (CompressionRoutes.swift)
 //   /cache/...                   scripts/cache-test.sh (CacheRoutes.swift)
 //   /broadcast/...               scripts/broadcast-test.py (BroadcastRoutes.swift)
@@ -25,6 +25,7 @@ app.get("/") { _, response in
     response.send(status: .ok)
 }
 
+addHandlerRoutes(app)
 addCompressionRoutes(app)
 addCacheRoutes(app)
 addBroadcastRoutes(app)
