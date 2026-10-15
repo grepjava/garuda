@@ -206,6 +206,13 @@ extension Application {
         // The pool HTTP/2 streams run in, and the connections shutdown
         // sends GOAWAY to (HTTP2.swift).
         let http2 = limits.http2.enabled ? HTTP2Service(runtime: runtime) : nil
+        // HTTP/3's endpoints and the pool their requests run in (HTTP3.swift).
+        var http3: HTTP3Service? = nil
+        if let tls, limits.http3.enabled {
+            http3 = HTTP3Service(runtime: runtime, app: app, limits: limits,
+                                 certificates: { tls.certificateKeys() })
+        }
+        let quic = http3
         do {
             try runtime.block { () async throws(IOError) -> Void in
                 do {
@@ -229,6 +236,18 @@ extension Application {
                     })
                 }
                 Log.info("serving \(tls == nil ? "http" : "https") on \(config.host):\(servers[0].port)")
+                if let quic {
+                    // A socket per thread, as there is an accept loop per
+                    // thread: the kernel spreads clients across them.
+                    let port = config.quicPort ?? servers[0].port
+                    do {
+                        try quic.start(host: config.host, port: port, count: runtime.workerCount)
+                    } catch {
+                        Log.error("cannot serve HTTP/3 on udp \(config.host):\(port): \(error)")
+                        exit(1)
+                    }
+                    Log.info("serving h3 on udp \(config.host):\(port)")
+                }
                 if let redirect = listening.redirect, let httpsPort = servers.first?.port {
                     let redirector = httpsRedirectApplication(httpsPort: httpsPort,
                                                               acmeWebroot: config.acmeWebroot).compile()
@@ -275,12 +294,14 @@ extension Application {
                     // their request.
                     app.webSockets.shutdown()
                     http2?.shutdown()
+                    quic?.shutdown(grace: grace)
                     await withTaskGroup(of: Void.self) { group in
                         for server in all { group.addTask { await server.shutdown(gracePeriod: grace) } }
                     }
                 }
                 #endif
                 for server in all { await server.wait() }
+                await quic?.wait()
                 await app.stopShard(shard)
             }
         } catch {
@@ -396,6 +417,11 @@ extension ServerConfig {
                                which of http1, http2 and http3 carry
                                WebSockets (all three)
           --http2-only         serve only HTTP/2 (h2c), with no HTTP/1 fallback
+          --http3              also serve HTTP/3 over QUIC (needs --tls-cert),
+                               advertised to TCP clients by Alt-Svc
+          --quic-port PORT     the UDP port for HTTP/3 (default: --port's)
+          --hsts SECS          send Strict-Transport-Security: max-age=SECS
+                               on every answer over TLS
           --request-id         give every request an X-Request-ID, echoed on
                                the response and logged; one a
                                --forwarded-allow-ips proxy sent is kept
@@ -680,6 +706,18 @@ extension ServerConfig {
             case "--http2-only":
                 config.http2Only = true
                 config.http2Enabled = true
+            case "--http3":
+                config.http3Enabled = true
+            case "--quic-port":
+                guard let v = value().flatMap({ Int($0) }), (1...65535).contains(v) else {
+                    return fail("--quic-port must be between 1 and 65535")
+                }
+                config.quicPort = v
+            case "--hsts":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--hsts must be a number of seconds")
+                }
+                config.hstsMaxAge = n
             case "--request-id":
                 config.requestID = true
             case "--trace-context":
@@ -720,6 +758,16 @@ extension ServerConfig {
         }
         if config.tlsReloadInterval != nil && config.tlsCertificates.isEmpty {
             return fail("--tls-reload has no certificates to watch; it needs --tls-cert")
+        }
+        // QUIC has no cleartext form.
+        if config.http3Enabled && config.tlsCertificates.isEmpty {
+            return fail("--http3 needs --tls-cert and --tls-key")
+        }
+        if config.quicPort != nil && !config.http3Enabled {
+            return fail("--quic-port is the port of HTTP/3; it needs --http3")
+        }
+        if config.hstsMaxAge != nil && config.tlsCertificates.isEmpty {
+            return fail("--hsts is only ever sent over TLS; it needs --tls-cert")
         }
         return .run(config)
     }

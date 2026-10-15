@@ -113,6 +113,12 @@ final class CertificateStore: Sendable {
         }
     }
 
+    /// The certificates as they are now, the default first: what a QUIC
+    /// handshake chooses among by SNI, as a TLS one does by `context(for:)`.
+    func certificateKeys() -> [CertificateKey] {
+        entries.withLock { $0.map(\.certificate) }
+    }
+
     /// Reads the files again and serves what they hold from the next
     /// handshake on. Throws, and keeps serving the old ones, when they are
     /// not a usable set.

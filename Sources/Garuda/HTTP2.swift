@@ -92,14 +92,14 @@ final class HTTP2Service: @unchecked Sendable {
     /// Where streams run. A stream whose handler waits holds its pooled task
     /// meanwhile, and work past `maxTasks` queues, so the bound is generous:
     /// tasks are only made when work finds none idle.
-    let pool: H2StreamPool
+    let pool: StreamPool
     private let lock = Mutex<Void>(())
     private var first: H2Connection?
     private var stopping = false
 
     init(runtime: Runtime) {
         self.runtime = runtime
-        pool = H2StreamPool(runtime: runtime, maxTasks: max(1024, runtime.workerCount * 256))
+        pool = StreamPool(runtime: runtime, maxTasks: max(1024, runtime.workerCount * 256))
     }
 
     func register(_ connection: H2Connection) {
@@ -1098,6 +1098,7 @@ final class H2Connection: @unchecked Sendable {
             s = H2Stream(connection: self, maxHeaders: limits.maxHeaders, peer: parts.pointee.exchange.pointee.remote)
             s.x.pointee.application = Unmanaged.passUnretained(app)
             s.x.pointee.secure = secure
+            s.x.pointee.serverFields = secure ? limits.secureFields : limits.plainFields
             s.x.pointee.trust = limits.trust
             s.x.pointee.site = limits.site
             s.x.pointee.compress = limits.compress
@@ -1142,8 +1143,6 @@ final class H2Connection: @unchecked Sendable {
         return s
     }
 
-    enum HeadOutcome { case ok, malformed, compression }
-
     /// Fills the stream's exchange with the request: its bytes in the
     /// stream's head buffer, and the head and header table describing them
     /// as `HTTPParser` would describe the HTTP/1.1 head they amount to, so
@@ -1160,203 +1159,12 @@ final class H2Connection: @unchecked Sendable {
     /// A decoded field is only valid until the next one is decoded, so each
     /// is copied into the head buffer as it arrives; the slices are offsets,
     /// which survive the buffer growing.
-    func buildHead(_ s: H2Stream, _ p: UnsafePointer<UInt8>, _ n: Int) -> HeadOutcome {
-        cookies.clear()
-        s.head.clear()
-        let x = s.x
-        let headers = x.pointee.headers
-        let maxHeaders = limits.maxHeaders
-        // Slot 0 is the host's, filled once the block is read.
-        var count = 1
-        var method = (0, 0), path = (0, 0), authority = (0, 0), host = (0, 0)
-        var sawMethod = false, sawPath = false, sawScheme = false, sawAuthority = false, sawHost = false
-        var sawProtocol = false, protocolIsWebSocket = false
-        var sawRegular = false
-        var malformed = false
-        var contentLength = -1
-        var expectContinue = false
-        // The HTTP/1.1 head's size, for the parser's limit on it.
-        var textSize = 0
-
-        do {
-            try decoder.decode(p, n, sizeLimit: settings.maxHeaderListSize) { span in
-                if malformed { return }
-                if span.nameLength > 0 && span.name[0] == 0x3A {      // ':'
-                    // Pseudo-headers come first, once each, and only these.
-                    if sawRegular || !HTTP2.validFieldValue(span.value, span.valueLength) {
-                        malformed = true
-                        return
-                    }
-                    if equalsExact(span.name, span.nameLength, ":method") {
-                        if sawMethod || !allTokenChars(span.value, span.valueLength) { malformed = true; return }
-                        sawMethod = true
-                        method = s.head.append(span.value, span.valueLength)
-                    } else if equalsExact(span.name, span.nameLength, ":path") {
-                        if sawPath || !validTarget(span.value, span.valueLength) { malformed = true; return }
-                        sawPath = true
-                        path = s.head.append(span.value, span.valueLength)
-                    } else if equalsExact(span.name, span.nameLength, ":scheme") {
-                        if sawScheme { malformed = true; return }
-                        sawScheme = true
-                    } else if equalsExact(span.name, span.nameLength, ":authority") {
-                        if sawAuthority || !allFieldValueChars(span.value, span.valueLength) {
-                            malformed = true
-                            return
-                        }
-                        sawAuthority = true
-                        authority = s.head.append(span.value, span.valueLength)
-                    } else if acceptsConnectProtocol && equalsExact(span.name, span.nameLength, ":protocol") {
-                        // RFC 8441: offered by SETTINGS_ENABLE_CONNECT_PROTOCOL.
-                        if sawProtocol { malformed = true; return }
-                        sawProtocol = true
-                        protocolIsWebSocket = equalsExact(span.value, span.valueLength, "websocket")
-                    } else {
-                        // Unknown, or :protocol from a peer we did not tell it
-                        // may (RFC 8441).
-                        malformed = true
-                    }
-                    return
-                }
-                sawRegular = true
-                // HTTP/2's rules for a field (RFC 9113 section 8.2.1) and the
-                // parser's, in a pass over each of name and value.
-                guard let nameHash = validNameHash(span.name, span.nameLength),
-                      validRegularValue(span.value, span.valueLength) else {
-                    malformed = true
-                    return
-                }
-                if HTTP2.isConnectionSpecific(span.name, span.nameLength) {
-                    // "te: trailers" is the one connection-specific field
-                    // HTTP/2 still allows.
-                    if !(span.nameLength == 2 && equalsLowercased(span.value, span.valueLength, "trailers")) {
-                        malformed = true
-                        return
-                    }
-                }
-                if equalsExact(span.name, span.nameLength, "host") {
-                    // One Host line: a second Host is refused.
-                    if sawHost { malformed = true; return }
-                    sawHost = true
-                    host = s.head.append(span.value, span.valueLength)
-                    return
-                }
-                if equalsExact(span.name, span.nameLength, "cookie") {
-                    // RFC 9113 section 8.2.3: crumbs a client split are
-                    // joined into one field.
-                    if cookies.readableBytes > 0 { cookies.write("; ") }
-                    if span.valueLength > 0 { cookies.write(span.value, span.valueLength) }
-                    return
-                }
-                if count == maxHeaders {
-                    malformed = true
-                    return
-                }
-                switch span.nameLength {
-                case 14 where equalsExact(span.name, 14, "content-length"):
-                    // Repeated, every copy has to agree.
-                    let v = parseDecimal(span.value, span.valueLength)
-                    if v < 0 || (contentLength >= 0 && contentLength != v) {
-                        malformed = true
-                        return
-                    }
-                    contentLength = v
-                case 6 where equalsExact(span.name, 6, "expect"):
-                    if containsTokenLowercased(span.value, span.valueLength, "100-continue") { expectContinue = true }
-                default:
-                    break
-                }
-                let name = s.head.append(span.name, span.nameLength)
-                let value = s.head.append(span.value, span.valueLength)
-                headers[count] = HTTPHeaderRef(name: HTTPSlice(name.0, name.1), value: HTTPSlice(value.0, value.1),
-                                               nameHash: nameHash)
-                count &+= 1
-                textSize &+= span.nameLength &+ span.valueLength &+ 4
-            }
-        } catch {
-            return .compression
+    func buildHead(_ s: H2Stream, _ p: UnsafePointer<UInt8>, _ n: Int) -> RequestHeadOutcome {
+        let sizeLimit = settings.maxHeaderListSize
+        return buildRequestHead(s.x, into: &s.head, cookies: &cookies, limits: limits,
+                                acceptsConnectProtocol: acceptsConnectProtocol, major: 2) { field throws in
+            try decoder.decode(p, n, sizeLimit: sizeLimit, emit: field)
         }
-        if malformed { return .malformed }
-        if !sawMethod || !sawScheme || !sawPath || method.1 == 0 || path.1 == 0 { return .malformed }
-        // RFC 9113 section 8.3.1: an :authority and a Host that differ are
-        // malformed. Without either, there is no host, which HTTP/1.1 refuses.
-        guard let hostAt = requestHost(UnsafePointer(s.head.readPointer), sawAuthority ? authority : nil,
-                                       sawHost ? host : nil), hostAt.1 > 0 else {
-            return .malformed
-        }
-        let isConnect = equalsExact(UnsafePointer(s.head.readPointer) + method.0, method.1, "CONNECT")
-        if sawProtocol {
-            // An extended CONNECT names what it connects to, and stands for
-            // a GET of its path: that is how it is routed.
-            if !isConnect || !sawAuthority { return .malformed }
-            method = s.head.append("GET")
-            x.pointee.connectProtocol = protocolIsWebSocket ? .websocket : .other
-        } else {
-            // A plain CONNECT has no :scheme or :path, and is not served.
-            if isConnect { return .malformed }
-            x.pointee.connectProtocol = .none
-        }
-
-        let hostName = s.head.append("host")
-        headers[0] = HTTPHeaderRef(name: HTTPSlice(hostName.0, 4), value: HTTPSlice(hostAt.0, hostAt.1),
-                                   nameHash: fieldNameHash(UnsafePointer(s.head.readPointer) + hostName.0, 4))
-        textSize &+= 4 &+ hostAt.1 &+ 4
-        if cookies.readableBytes > 0 {
-            if count == maxHeaders { return .malformed }
-            let name = s.head.append("cookie")
-            let value = s.head.append(UnsafePointer(cookies.readPointer), cookies.readableBytes)
-            headers[count] = HTTPHeaderRef(name: HTTPSlice(name.0, 6), value: HTTPSlice(value.0, value.1),
-                                           nameHash: fieldNameHash(UnsafePointer(s.head.readPointer) + name.0, 6))
-            count &+= 1
-            textSize &+= 6 &+ value.1 &+ 4
-        }
-        // The request line and the empty line that ends the head.
-        textSize &+= method.1 &+ 1 &+ path.1 &+ 11 &+ 2
-        if textSize > limits.maxHeadSize { return .malformed }
-
-        let base = UnsafePointer(s.head.readPointer)
-        x.pointee.base = base
-        var head = HTTPRequestHead()
-        head.methodSlice = HTTPSlice(method.0, method.1)
-        head.method = HTTPParser.classifyMethod(base + method.0, method.1)
-        head.target = HTTPSlice(path.0, path.1)
-        let q = findByte(base + path.0, path.1, cQuestion)
-        if q >= 0 {
-            head.path = HTTPSlice(path.0, q)
-            head.query = HTTPSlice(path.0 &+ q &+ 1, path.1 &- q &- 1)
-        } else {
-            head.path = HTTPSlice(path.0, path.1)
-            head.query = HTTPSlice(path.0 &+ path.1, 0)
-        }
-        var flags: HTTPRequestFlags = [.keepAlive, .hasHost]
-        if hasPercent(base + Int(head.path.offset), Int(head.path.length)) { flags.insert(.escapedPath) }
-        if expectContinue { flags.insert(.expectContinue) }
-        if contentLength >= 0 {
-            flags.insert(.hasContentLength)
-            head.contentLength = contentLength
-        } else {
-            head.contentLength = 0
-        }
-        head.flags = flags
-        head.httpMajor = 2
-        head.httpMinor = 0
-        head.headerCount = count
-        head.headEnd = s.head.readableBytes
-        x.pointee.head = head
-        return .ok
-    }
-
-    /// Which of `:authority` and a Host field the head's one Host
-    /// line is: whichever is there. Nil, a malformed request, when both are
-    /// there and differ (RFC 9113 section 8.3.1) -- an empty `:authority`
-    /// included, which is not the same as a Host that names something.
-    func requestHost(_ base: UnsafePointer<UInt8>, _ authority: (Int, Int)?, _ host: (Int, Int)?) -> (Int, Int)? {
-        guard let authority else { return host ?? (0, 0) }
-        guard let host else { return authority }
-        guard host.1 == authority.1 else { return nil }
-        for i in 0..<host.1 where asciiLower(base[host.0 + i]) != asciiLower(base[authority.0 + i]) {
-            return nil
-        }
-        return authority
     }
 
     // MARK: Running a stream
@@ -1758,6 +1566,216 @@ final class H2Connection: @unchecked Sendable {
         frame(&outgoing, 4, .rstStream, [], id)
         HTTP2.writeUInt32(code.rawValue, into: &outgoing)
     }
+}
+
+/// What a request's header block made: a request, a malformed one (a
+/// stream error), or a block that could not be decoded (a connection error).
+enum RequestHeadOutcome { case ok, malformed, compression }
+
+/// Fills `x` with the request a header block describes -- HTTP/2's or
+/// HTTP/3's, the two having the same rules for one -- its bytes in `text`
+/// and the head and header table describing them as `HTTPParser` would the
+/// HTTP/1.1 head they amount to. `decode` runs the block's decoder, which
+/// calls `field` with each field in order. `cookies` is scratch. See
+/// `H2Connection.buildHead`.
+func buildRequestHead(_ x: UnsafeMutablePointer<Exchange>, into text: inout ByteBuffer, cookies: inout ByteBuffer,
+                      limits: ConnectionLimits, acceptsConnectProtocol: Bool, major: UInt8,
+                      decode: (_ field: (HPACKSpan) -> Void) throws -> Void) -> RequestHeadOutcome {
+    cookies.clear()
+    text.clear()
+    let headers = x.pointee.headers
+    let maxHeaders = limits.maxHeaders
+    // Slot 0 is the host's, filled once the block is read.
+    var count = 1
+    var method = (0, 0), path = (0, 0), authority = (0, 0), host = (0, 0)
+    var sawMethod = false, sawPath = false, sawScheme = false, sawAuthority = false, sawHost = false
+    var sawProtocol = false, protocolIsWebSocket = false
+    var sawRegular = false
+    var malformed = false
+    var contentLength = -1
+    var expectContinue = false
+    // The HTTP/1.1 head's size, for the parser's limit on it.
+    var textSize = 0
+
+    do {
+        try decode { span in
+            if malformed { return }
+            if span.nameLength > 0 && span.name[0] == 0x3A {      // ':'
+                // Pseudo-headers come first, once each, and only these.
+                if sawRegular || !HTTP2.validFieldValue(span.value, span.valueLength) {
+                    malformed = true
+                    return
+                }
+                if equalsExact(span.name, span.nameLength, ":method") {
+                    if sawMethod || !allTokenChars(span.value, span.valueLength) { malformed = true; return }
+                    sawMethod = true
+                    method = text.append(span.value, span.valueLength)
+                } else if equalsExact(span.name, span.nameLength, ":path") {
+                    if sawPath || !validTarget(span.value, span.valueLength) { malformed = true; return }
+                    sawPath = true
+                    path = text.append(span.value, span.valueLength)
+                } else if equalsExact(span.name, span.nameLength, ":scheme") {
+                    if sawScheme { malformed = true; return }
+                    sawScheme = true
+                } else if equalsExact(span.name, span.nameLength, ":authority") {
+                    if sawAuthority || !allFieldValueChars(span.value, span.valueLength) {
+                        malformed = true
+                        return
+                    }
+                    sawAuthority = true
+                    authority = text.append(span.value, span.valueLength)
+                } else if acceptsConnectProtocol && equalsExact(span.name, span.nameLength, ":protocol") {
+                    // RFC 8441: offered by SETTINGS_ENABLE_CONNECT_PROTOCOL.
+                    if sawProtocol { malformed = true; return }
+                    sawProtocol = true
+                    protocolIsWebSocket = equalsExact(span.value, span.valueLength, "websocket")
+                } else {
+                    // Unknown, or :protocol from a peer we did not tell it
+                    // may (RFC 8441).
+                    malformed = true
+                }
+                return
+            }
+            sawRegular = true
+            // HTTP/2's rules for a field (RFC 9113 section 8.2.1) and the
+            // parser's, in a pass over each of name and value.
+            guard let nameHash = validNameHash(span.name, span.nameLength),
+                  validRegularValue(span.value, span.valueLength) else {
+                malformed = true
+                return
+            }
+            if HTTP2.isConnectionSpecific(span.name, span.nameLength) {
+                // "te: trailers" is the one connection-specific field
+                // HTTP/2 still allows.
+                if !(span.nameLength == 2 && equalsLowercased(span.value, span.valueLength, "trailers")) {
+                    malformed = true
+                    return
+                }
+            }
+            if equalsExact(span.name, span.nameLength, "host") {
+                // One Host line: a second Host is refused.
+                if sawHost { malformed = true; return }
+                sawHost = true
+                host = text.append(span.value, span.valueLength)
+                return
+            }
+            if equalsExact(span.name, span.nameLength, "cookie") {
+                // RFC 9113 section 8.2.3: crumbs a client split are
+                // joined into one field.
+                if cookies.readableBytes > 0 { cookies.write("; ") }
+                if span.valueLength > 0 { cookies.write(span.value, span.valueLength) }
+                return
+            }
+            if count == maxHeaders {
+                malformed = true
+                return
+            }
+            switch span.nameLength {
+            case 14 where equalsExact(span.name, 14, "content-length"):
+                // Repeated, every copy has to agree.
+                let v = parseDecimal(span.value, span.valueLength)
+                if v < 0 || (contentLength >= 0 && contentLength != v) {
+                    malformed = true
+                    return
+                }
+                contentLength = v
+            case 6 where equalsExact(span.name, 6, "expect"):
+                if containsTokenLowercased(span.value, span.valueLength, "100-continue") { expectContinue = true }
+            default:
+                break
+            }
+            let name = text.append(span.name, span.nameLength)
+            let value = text.append(span.value, span.valueLength)
+            headers[count] = HTTPHeaderRef(name: HTTPSlice(name.0, name.1), value: HTTPSlice(value.0, value.1),
+                                           nameHash: nameHash)
+            count &+= 1
+            textSize &+= span.nameLength &+ span.valueLength &+ 4
+        }
+    } catch {
+        return .compression
+    }
+    if malformed { return .malformed }
+    if !sawMethod || !sawScheme || !sawPath || method.1 == 0 || path.1 == 0 { return .malformed }
+    // RFC 9113 section 8.3.1: an :authority and a Host that differ are
+    // malformed. Without either, there is no host, which HTTP/1.1 refuses.
+    guard let hostAt = requestHost(UnsafePointer(text.readPointer), sawAuthority ? authority : nil,
+                                   sawHost ? host : nil), hostAt.1 > 0 else {
+        return .malformed
+    }
+    let isConnect = equalsExact(UnsafePointer(text.readPointer) + method.0, method.1, "CONNECT")
+    if sawProtocol {
+        // An extended CONNECT names what it connects to, and stands for
+        // a GET of its path: that is how it is routed.
+        if !isConnect || !sawAuthority { return .malformed }
+        method = text.append("GET")
+        x.pointee.connectProtocol = protocolIsWebSocket ? .websocket : .other
+    } else {
+        // A plain CONNECT has no :scheme or :path, and is not served.
+        if isConnect { return .malformed }
+        x.pointee.connectProtocol = .none
+    }
+
+    let hostName = text.append("host")
+    headers[0] = HTTPHeaderRef(name: HTTPSlice(hostName.0, 4), value: HTTPSlice(hostAt.0, hostAt.1),
+                               nameHash: fieldNameHash(UnsafePointer(text.readPointer) + hostName.0, 4))
+    textSize &+= 4 &+ hostAt.1 &+ 4
+    if cookies.readableBytes > 0 {
+        if count == maxHeaders { return .malformed }
+        let name = text.append("cookie")
+        let value = text.append(UnsafePointer(cookies.readPointer), cookies.readableBytes)
+        headers[count] = HTTPHeaderRef(name: HTTPSlice(name.0, 6), value: HTTPSlice(value.0, value.1),
+                                       nameHash: fieldNameHash(UnsafePointer(text.readPointer) + name.0, 6))
+        count &+= 1
+        textSize &+= 6 &+ value.1 &+ 4
+    }
+    // The request line and the empty line that ends the head.
+    textSize &+= method.1 &+ 1 &+ path.1 &+ 11 &+ 2
+    if textSize > limits.maxHeadSize { return .malformed }
+
+    let base = UnsafePointer(text.readPointer)
+    x.pointee.base = base
+    var head = HTTPRequestHead()
+    head.methodSlice = HTTPSlice(method.0, method.1)
+    head.method = HTTPParser.classifyMethod(base + method.0, method.1)
+    head.target = HTTPSlice(path.0, path.1)
+    let q = findByte(base + path.0, path.1, cQuestion)
+    if q >= 0 {
+        head.path = HTTPSlice(path.0, q)
+        head.query = HTTPSlice(path.0 &+ q &+ 1, path.1 &- q &- 1)
+    } else {
+        head.path = HTTPSlice(path.0, path.1)
+        head.query = HTTPSlice(path.0 &+ path.1, 0)
+    }
+    var flags: HTTPRequestFlags = [.keepAlive, .hasHost]
+    if hasPercent(base + Int(head.path.offset), Int(head.path.length)) { flags.insert(.escapedPath) }
+    if expectContinue { flags.insert(.expectContinue) }
+    if contentLength >= 0 {
+        flags.insert(.hasContentLength)
+        head.contentLength = contentLength
+    } else {
+        head.contentLength = 0
+    }
+    head.flags = flags
+    head.httpMajor = major
+    head.httpMinor = 0
+    head.headerCount = count
+    head.headEnd = text.readableBytes
+    x.pointee.head = head
+    return .ok
+}
+
+/// Which of `:authority` and a Host field the head's one Host
+/// line is: whichever is there. Nil, a malformed request, when both are
+/// there and differ (RFC 9113 section 8.3.1) -- an empty `:authority`
+/// included, which is not the same as a Host that names something.
+func requestHost(_ base: UnsafePointer<UInt8>, _ authority: (Int, Int)?, _ host: (Int, Int)?) -> (Int, Int)? {
+    guard let authority else { return host ?? (0, 0) }
+    guard let host else { return authority }
+    guard host.1 == authority.1 else { return nil }
+    for i in 0..<host.1 where asciiLower(base[host.0 + i]) != asciiLower(base[authority.0 + i]) {
+        return nil
+    }
+    return authority
 }
 
 /// Writes a frame header into `out`.

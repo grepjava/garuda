@@ -119,7 +119,8 @@ let package = Package(
         // response cache's table (garuda_cache.c).
         .target(name: "CGarudaShared"),
         .target(name: "Garuda",
-                dependencies: ["GarudaWire", "CGarudaShared", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS"),
+                dependencies: ["GarudaWire", "GarudaQUIC", "CGarudaShared", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"),
+                               vega("VegaTLS"),
                                vega("VegaFS"), vega("VegaExtras"), vegaDB("VegaDBTracing"),
                                .product(name: "Tracing", package: "swift-distributed-tracing")],
                 swiftSettings: sharedSwiftSettings),

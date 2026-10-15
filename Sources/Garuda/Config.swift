@@ -197,6 +197,22 @@ public struct ServerConfig: Sendable {
     /// window costs nothing but lets an upload use the link.
     public var h2InitialWindowSize = 256 * 1024
 
+    // --- HTTP/3 (HTTP3.swift) ---
+    /// Serve HTTP/3 over QUIC as well, on UDP. It needs a certificate: QUIC
+    /// has no cleartext form. Clients learn of it from the Alt-Svc header
+    /// every TCP response then carries.
+    public var http3Enabled = false
+    /// The UDP port HTTP/3 is served on; nil for the TCP port.
+    public var quicPort: Int? = nil
+    /// QUIC connections one UDP socket serves at once; a new one past this
+    /// is not answered. A shard has a socket per thread.
+    public var maxQUICConnections = 4096
+
+    // --- Strict-Transport-Security ---
+    /// --hsts: `strict-transport-security: max-age=N` on every answer over
+    /// TLS that does not set its own; nil for none.
+    public var hstsMaxAge: Int? = nil
+
     // --- request IDs and logging (RequestID.swift, Logging.swift) ---
     /// Peers whose forwarded headers are believed (--forwarded-allow-ips).
     /// Empty means "trust nobody", which is the only safe default: a header

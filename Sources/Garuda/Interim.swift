@@ -66,6 +66,9 @@ extension Response {
         case .http2(let stream):
             let s = stream.takeUnretainedValue()
             return s.connection.sendInterim(s, status: code, fields: fields)
+        case .http3(let stream):
+            let s = stream.takeUnretainedValue()
+            return s.endpoint.sendInterim(s, status: code, fields: fields)
         case .none:
             return false
         }

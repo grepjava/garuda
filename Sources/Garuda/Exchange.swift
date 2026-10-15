@@ -45,6 +45,9 @@ struct Exchange: ~Copyable {
     @usableFromInline var context = ContextSlots()
     /// The connection is TLS (TLS.swift).
     @usableFromInline var secure = false
+    /// Alt-Svc and Strict-Transport-Security, as the connection's transport
+    /// calls for them, or nil: set per connection (HTTP1.swift).
+    var serverFields: ServerFields?
     /// The proxies whose forwarded headers are believed, or nil for none:
     /// set per connection, and only when there is a list (Forwarded.swift).
     @usableFromInline var trust: ForwardedTrust?
@@ -651,7 +654,7 @@ extension ByteSpan {
     }
 }
 
-/// What an HTTP/2 extended CONNECT asked to become.
+/// What an HTTP/2 or HTTP/3 extended CONNECT asked to become.
 enum ConnectProtocol: UInt8 {
     /// An ordinary request.
     case none

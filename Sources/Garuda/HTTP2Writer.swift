@@ -297,15 +297,7 @@ extension H2Connection {
     /// The DATA bytes `s`'s answer sends, once its `onSend` hooks have had
     /// their say: none for a HEAD or a status that forbids a body.
     func prepareAnswer(_ s: H2Stream) -> Int {
-        let x = s.x
-        if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
-        if x.pointee.touchedStream { cacheAnswer(x) }
-        if x.pointee.compress && !x.pointee.noCompress {
-            x.pointee.compressAnswer(omitBody: x.pointee.head.method == .head)
-        }
-        x.pointee.committed = true
-        if HTTPResponseWriter.statusForbidsBody(x.pointee.status) || x.pointee.head.method == .head { return 0 }
-        return x.pointee.responseBody.readableBytes
+        Garuda.prepareAnswer(s.x)
     }
 
     /// Under the lock: takes the write role for `s`'s answer of `data`
@@ -415,6 +407,22 @@ extension H2Connection {
             let server: StaticString = "garuda"
             fieldCache.encode(encoder, name.utf8Start, name.utf8CodeUnitCount, server.utf8Start,
                               server.utf8CodeUnitCount, into: &block)
+        }
+        if let fields = x.pointee.serverFields {
+            if let altSvc = fields.altSvc, !kinds.contains(.altSvc) {
+                let name: StaticString = "alt-svc"
+                altSvc.withUnsafeBufferPointer {
+                    fieldCache.encode(encoder, name.utf8Start, name.utf8CodeUnitCount, $0.baseAddress!, $0.count,
+                                      into: &block)
+                }
+            }
+            if let hsts = fields.hsts, !kinds.contains(.hsts) {
+                let name: StaticString = "strict-transport-security"
+                hsts.withUnsafeBufferPointer {
+                    fieldCache.encode(encoder, name.utf8Start, name.utf8CodeUnitCount, $0.baseAddress!, $0.count,
+                                      into: &block)
+                }
+            }
         }
         // --request-id's, unless the handler set its own (RequestID.swift).
         // Never the same twice, so never kept.
@@ -576,4 +584,18 @@ extension H2Connection {
         frame(&out, 4, .rstStream, [], s.id)
         HTTP2.writeUInt32(code.rawValue, into: &out)
     }
+}
+
+/// The body bytes `x`'s whole answer sends, once its `onSend` hooks have
+/// had their say, the response cache its copy, and --compress its turn:
+/// none for a HEAD or a status that forbids a body. HTTP/2's and HTTP/3's.
+func prepareAnswer(_ x: UnsafeMutablePointer<Exchange>) -> Int {
+    if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
+    if x.pointee.touchedStream { cacheAnswer(x) }
+    if x.pointee.compress && !x.pointee.noCompress {
+        x.pointee.compressAnswer(omitBody: x.pointee.head.method == .head)
+    }
+    x.pointee.committed = true
+    if HTTPResponseWriter.statusForbidsBody(x.pointee.status) || x.pointee.head.method == .head { return 0 }
+    return x.pointee.responseBody.readableBytes
 }

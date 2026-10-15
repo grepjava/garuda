@@ -207,6 +207,9 @@ struct WebSocketOffer {
     /// The offer `request` makes, or what is wrong with it.
     static func read(_ request: borrowing Request) -> Result<WebSocketOffer, Problem> {
         let x = request.exchange
+        // Over HTTP/3 no extended CONNECT is offered yet (RFC 9220), so a
+        // request there is never one.
+        if case .http3 = x.pointee.link { return .failure(.multiplexed) }
         if case .http2 = x.pointee.link {
             switch x.pointee.connectProtocol {
             case .none: return .failure(.multiplexed)

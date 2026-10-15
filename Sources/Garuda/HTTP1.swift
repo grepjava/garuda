@@ -60,10 +60,30 @@ struct ConnectionLimits: Sendable {
     var compressMinimum: Int
     /// --ws-* (WebSocket.swift).
     var websocket: WebSocketLimits
+    /// HTTP/3's settings and limits (HTTP3.swift).
+    var http3: HTTP3Limits
+    /// What the server adds to every answer that does not set its own:
+    /// Alt-Svc over TCP when HTTP/3 is served, Strict-Transport-Security over
+    /// TLS with --hsts. Nil where there is nothing to add.
+    var plainFields: ServerFields?
+    var secureFields: ServerFields?
+    var quicFields: ServerFields?
 
     init(_ config: ServerConfig) {
         websocket = WebSocketLimits(config)
         http2 = HTTP2Limits(config)
+        http3 = HTTP3Limits(config)
+        // A client cannot discover HTTP/3 by trying: there is no upgrade and
+        // no well-known port. It is told on a connection it already has
+        // (RFC 7838), for a day: long enough to be worth remembering, short
+        // enough that turning HTTP/3 off is not a decision clients keep
+        // honouring.
+        let altSvc = config.http3Enabled ? Array("h3=\":\(config.quicPort ?? config.port)\"; ma=86400".utf8) : nil
+        let hsts = config.hstsMaxAge.map { Array("max-age=\($0)".utf8) }
+        plainFields = altSvc.map { ServerFields(altSvc: $0, hsts: nil) }
+        secureFields = altSvc != nil || hsts != nil ? ServerFields(altSvc: altSvc, hsts: hsts) : nil
+        // Over HTTP/3 itself an Alt-Svc would advertise what is in use.
+        quicFields = hsts.map { ServerFields(altSvc: nil, hsts: $0) }
         site = StaticSite(config)
         compress = config.compress
         compressMinimum = config.compressMinimumLength
@@ -86,6 +106,19 @@ struct ConnectionLimits: Sendable {
         traceContext = config.traceContext
         accessLog = config.accessLog
         accessLogJSON = config.accessLogJSON
+    }
+}
+
+/// Header fields the server adds to an answer, worked out once.
+final class ServerFields: Sendable {
+    /// `h3=":443"; ma=86400`, or nil.
+    let altSvc: [UInt8]?
+    /// `max-age=N`, or nil.
+    let hsts: [UInt8]?
+
+    init(altSvc: [UInt8]?, hsts: [UInt8]?) {
+        self.altSvc = altSvc
+        self.hsts = hsts
     }
 }
 
@@ -139,6 +172,7 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     }
     // The exchange is reused from connection to connection: set both.
     x.pointee.secure = secure
+    x.pointee.serverFields = secure ? limits.secureFields : limits.plainFields
     if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
     if x.pointee.site != nil || limits.site != nil { x.pointee.site = limits.site }
     x.pointee.compress = limits.compress
@@ -501,6 +535,18 @@ func writeHTTP1Head(_ x: UnsafeMutablePointer<Exchange>, _ parts: UnsafeMutableP
     let kinds = x.pointee.headerKinds
     if !kinds.contains(.date) { HTTPResponseWriter.writeDate(&parts.pointee.output, parts.pointee.dates) }
     if !kinds.contains(.server) { parts.pointee.output.write("Server: garuda\r\n") }
+    if let fields = x.pointee.serverFields {
+        if let altSvc = fields.altSvc, !kinds.contains(.altSvc) {
+            parts.pointee.output.write("Alt-Svc: ")
+            altSvc.withUnsafeBufferPointer { parts.pointee.output.write($0.baseAddress!, $0.count) }
+            parts.pointee.output.writeCRLF()
+        }
+        if let hsts = fields.hsts, !kinds.contains(.hsts) {
+            parts.pointee.output.write("Strict-Transport-Security: ")
+            hsts.withUnsafeBufferPointer { parts.pointee.output.write($0.baseAddress!, $0.count) }
+            parts.pointee.output.writeCRLF()
+        }
+    }
     // --request-id's, unless the handler set its own (RequestID.swift).
     if x.pointee.requestID.readableBytes > 0 && !kinds.contains(.requestID) {
         parts.pointee.output.write("X-Request-ID: ")

@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// The tasks HTTP/2 streams run in.
+// The tasks HTTP/2 and HTTP/3 streams run in.
 //
 // A stream whose handler may wait runs in a task of its own, so it holds up
 // no other stream; a reset cancels that task. Making a task per stream is
@@ -13,6 +13,9 @@
 //
 // Vega's `TaskPool` reuses its tasks whatever happens to them, and takes
 // closures, a heap allocation each; this takes the stream itself.
+//
+// A shard has one for its HTTP/2 connections and one for its HTTP/3
+// endpoints (HTTP3.swift).
 //===----------------------------------------------------------------------===//
 
 import Synchronization
@@ -67,11 +70,18 @@ struct H2Ring<Element>: ~Copyable {
     }
 }
 
-/// The tasks a shard's HTTP/2 streams run in.
-final class H2StreamPool: @unchecked Sendable {
+/// A stream to answer, held unretained: it outlives its task, and its
+/// connection outlives it.
+enum PooledStream {
+    case h2(Unmanaged<H2Stream>)
+    case h3(Unmanaged<H3Stream>)
+}
+
+/// The tasks a shard's HTTP/2 or HTTP/3 streams run in.
+final class StreamPool: @unchecked Sendable {
     private struct State: ~Copyable {
-        var pending = H2Ring<Unmanaged<H2Stream>>(capacity: 64)
-        var idle = H2Ring<UnsafeContinuation<Unmanaged<H2Stream>, Never>>(capacity: 64)
+        var pending = H2Ring<PooledStream>(capacity: 64)
+        var idle = H2Ring<UnsafeContinuation<PooledStream, Never>>(capacity: 64)
         var live = 0
     }
 
@@ -91,8 +101,17 @@ final class H2StreamPool: @unchecked Sendable {
     /// held unretained: it outlives its task, and its connection outlives
     /// it (H2Connection.end).
     func run(_ s: H2Stream) {
-        let stream = Unmanaged.passUnretained(s)
-        let (idle, grow) = state.withLock { state -> (UnsafeContinuation<Unmanaged<H2Stream>, Never>?, Bool) in
+        run(.h2(Unmanaged.passUnretained(s)))
+    }
+
+    /// Answers `s` in a pooled task: `QUICEndpoint.answer`. Its endpoint
+    /// keeps it, and its connection, until the task has posted its end.
+    func run(_ s: H3Stream) {
+        run(.h3(Unmanaged.passUnretained(s)))
+    }
+
+    private func run(_ stream: PooledStream) {
+        let (idle, grow) = state.withLock { state -> (UnsafeContinuation<PooledStream, Never>?, Bool) in
             if let c = state.idle.pop() { return (c, false) }
             state.pending.push(stream)
             // Nobody idle: every task is answering or waiting in a handler.
@@ -123,9 +142,9 @@ final class H2StreamPool: @unchecked Sendable {
     /// continuation stored under a lock and inlined into a loop that awaits
     /// is a pattern Swift 6.3's optimiser has miscompiled.
     @inline(never)
-    private func next() async -> Unmanaged<H2Stream> {
-        await withUnsafeContinuation { (c: UnsafeContinuation<Unmanaged<H2Stream>, Never>) in
-            let ready = state.withLock { state -> Unmanaged<H2Stream>? in
+    private func next() async -> PooledStream {
+        await withUnsafeContinuation { (c: UnsafeContinuation<PooledStream, Never>) in
+            let ready = state.withLock { state -> PooledStream? in
                 if let stream = state.pending.pop() { return stream }
                 state.idle.push(c)
                 return nil
@@ -137,9 +156,15 @@ final class H2StreamPool: @unchecked Sendable {
     /// Answers one stream. True when this task was cancelled meanwhile, by a
     /// reset, and has ended: no later stream may see a cancelled task.
     @inline(__always)
-    private func answer(_ stream: Unmanaged<H2Stream>) async -> Bool {
-        let s = stream.takeUnretainedValue()
-        await s.connection.answer(s)
+    private func answer(_ stream: PooledStream) async -> Bool {
+        switch stream {
+        case .h2(let s):
+            let s = s.takeUnretainedValue()
+            await s.connection.answer(s)
+        case .h3(let s):
+            let s = s.takeUnretainedValue()
+            await s.endpoint.answer(s)
+        }
         guard Task.isCancelled else { return false }
         // Whatever is queued still needs a task.
         let replace = state.withLock { state -> Bool in

@@ -256,6 +256,13 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
         let said = x.pointee.head.method == .head && !HTTPResponseWriter.statusForbidsBody(status) ? declared
             : bodyless ? -1 : stated
         s.connection.startStreamedAnswer(s, channel: channel, declared: said)
+    case .http3(let stream):
+        let s = stream.takeUnretainedValue()
+        channel = BodyChannel(http3: s, bodyless: bodyless, declared: bodyless ? -1 : declared, encoder: encoder)
+        x.pointee.committed = true
+        let said = x.pointee.head.method == .head && !HTTPResponseWriter.statusForbidsBody(status) ? declared
+            : bodyless ? -1 : stated
+        s.endpoint.startStreamedAnswer(s, declared: said)
     case .none:
         x.pointee.committed = true
         channel = BodyChannel(dropping: ())
@@ -387,6 +394,8 @@ final class BodyChannel: @unchecked Sendable {
 
     // HTTP/2.
     private let h2: H2Stream?
+    // HTTP/3: the stream's staged frames, under its endpoint's lock.
+    private let h3: H3Stream?
 
     /// --compress: the body is compressed as it is written, each write
     /// flushed through (Compression.swift). Under the state's lock.
@@ -400,7 +409,7 @@ final class BodyChannel: @unchecked Sendable {
         bodyless = false
         state = .failed
         remaining = -1
-        held = nil; chunked = false; h2 = nil; encoder = nil
+        held = nil; chunked = false; h2 = nil; h3 = nil; encoder = nil
         timeout = .seconds(0); high = 0; low = 0; keepAliveDefault = .zero
     }
 
@@ -412,6 +421,7 @@ final class BodyChannel: @unchecked Sendable {
         chunked = false
         remaining = -1
         h2 = nil
+        h3 = nil
         encoder = nil
         timeout = limits.writeTimeout
         high = limits.high
@@ -423,7 +433,7 @@ final class BodyChannel: @unchecked Sendable {
     init(dropping: Void) {
         bodyless = true
         remaining = -1
-        held = nil; chunked = false; h2 = nil; encoder = nil
+        held = nil; chunked = false; h2 = nil; h3 = nil; encoder = nil
         timeout = .seconds(0); high = 0; low = 0; keepAliveDefault = .zero
     }
 
@@ -435,6 +445,7 @@ final class BodyChannel: @unchecked Sendable {
         self.chunked = chunked
         remaining = declared
         h2 = nil
+        h3 = nil
         timeout = limits.writeTimeout
         high = limits.high
         low = limits.low
@@ -448,6 +459,7 @@ final class BodyChannel: @unchecked Sendable {
 
     init(http2 s: H2Stream, bodyless: Bool, declared: Int, encoder: ResponseEncoder? = nil) {
         h2 = s
+        h3 = nil
         self.encoder = encoder
         self.bodyless = bodyless
         remaining = declared
@@ -456,6 +468,19 @@ final class BodyChannel: @unchecked Sendable {
         high = s.connection.limits.writeHighWaterMark
         low = s.connection.limits.writeLowWaterMark
         keepAliveDefault = s.connection.limits.eventKeepAlive
+    }
+
+    init(http3 s: H3Stream, bodyless: Bool, declared: Int, encoder: ResponseEncoder? = nil) {
+        h2 = nil
+        h3 = s
+        self.encoder = encoder
+        self.bodyless = bodyless
+        remaining = declared
+        held = nil; chunked = false
+        timeout = .seconds(0)
+        high = s.endpoint.settings.high
+        low = s.endpoint.settings.low
+        keepAliveDefault = s.endpoint.limits.eventKeepAlive
     }
 
     deinit {
@@ -467,15 +492,16 @@ final class BodyChannel: @unchecked Sendable {
     @inline(__always)
     private func locked<R>(_ body: () -> R) -> R {
         if let h2 { return h2.connection.lock.withLock { _ in body() } }
+        if let h3 { return h3.endpoint.lock.withLock { _ in body() } }
         return lock.withLock { _ in body() }
     }
 
     var isOpen: Bool {
-        locked { state == .open && h2?.reset != true }
+        locked { state == .open && h2?.reset != true && h3?.reset != true }
     }
 
     var backlog: Int {
-        locked { h2?.backlog ?? (pending.readableBytes &+ inFlight) }
+        locked { h2?.backlog ?? h3?.staged.readableBytes ?? (pending.readableBytes &+ inFlight) }
     }
 
     // MARK: Writing
@@ -484,7 +510,7 @@ final class BodyChannel: @unchecked Sendable {
     func queue(_ bytes: UnsafeRawBufferPointer) -> Queued {
         locked {
             if bodyless { return state == .failed ? .refused : .dropped }
-            guard state == .open, h2?.reset != true else { return .refused }
+            guard state == .open, h2?.reset != true, h3?.reset != true else { return .refused }
             guard let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self), bytes.count > 0 else {
                 return .dropped
             }
@@ -514,6 +540,11 @@ final class BodyChannel: @unchecked Sendable {
                     s.staged.write(base, take)
                     s.backlog &+= take
                     s.connection.wakeWriter()
+                } else if let s = h3 {
+                    s.staged.writeVarint(HTTP3FrameType.data)
+                    s.staged.writeVarint(UInt64(take))
+                    s.staged.write(base, take)
+                    s.endpoint.post(s)
                 } else if chunked {
                     HTTPResponseWriter.writeChunk(&pending, base, take)
                 } else {
@@ -542,6 +573,7 @@ final class BodyChannel: @unchecked Sendable {
         case .sent: break
         }
         if let h2 { return try await settleH2(h2, force: force) }
+        if let h3 { return try await settleH3(h3, force: force) }
         if !force, let runtime, deferFlush(runtime) { return }
         while true {
             switch await drain() {
@@ -683,12 +715,19 @@ final class BodyChannel: @unchecked Sendable {
                 s.bodyFailed = true
                 s.bodyEnded = true
                 s.connection.wakeWriter()
+            } else if let s = h3 {
+                s.bodyFailed = true
+                s.bodyEnded = true
+                s.endpoint.post(s)
             }
             return
         }
         if let s = h2 {
             s.bodyEnded = true
             s.connection.wakeWriter()
+        } else if let s = h3 {
+            s.bodyEnded = true
+            s.endpoint.post(s)
         } else if chunked {
             HTTPResponseWriter.writeLastChunk(&pending)
         }
@@ -706,6 +745,20 @@ final class BodyChannel: @unchecked Sendable {
             if added > 0 {
                 s.backlog &+= added
                 s.connection.wakeWriter()
+            }
+            return ok
+        }
+        if let s = h3 {
+            // Compressed out of the way, then framed as DATA.
+            s.scratch.clear()
+            let ok = finishing ? encoder.finish(into: &s.scratch, chunked: false)
+                : encoder.encode(p, n, flush: true, into: &s.scratch, chunked: false)
+            let added = s.scratch.readableBytes
+            if added > 0 {
+                s.staged.writeVarint(HTTP3FrameType.data)
+                s.staged.writeVarint(UInt64(added))
+                s.staged.write(s.scratch.readPointer, added)
+                s.endpoint.post(s)
             }
             return ok
         }
@@ -785,6 +838,32 @@ final class BodyChannel: @unchecked Sendable {
             s.resumeWaiters(false)
         } else {
             endLocked()
+            if let capture, state == .finished { _ = capture.store() }
+        }
+        capture = nil
+    }
+
+    /// Over HTTP/3, when the handler has returned: ended, or failed and the
+    /// stream to be reset. Under the endpoint's lock. The endpoint ends the
+    /// stream once what is staged has gone.
+    func closeH3Locked(_ s: H3Stream, failed: Bool) {
+        stopKeepAliveLocked()
+        if bodyless {
+            state = .finished
+            s.bodyEnded = true
+            return
+        }
+        if failed || remaining > 0 {
+            if !failed { Log.error("a streamed response ended short of its Content-Length") }
+            state = .failed
+            s.bodyFailed = true
+            s.bodyEnded = true
+            s.resumeWaiters(false)
+        } else {
+            endLocked()
+            // Ended already by the handler, or now; either way the endpoint
+            // ends the stream once what is staged has gone.
+            if state != .failed { s.bodyEnded = true }
             if let capture, state == .finished { _ = capture.store() }
         }
         capture = nil
@@ -926,6 +1005,28 @@ final class BodyChannel: @unchecked Sendable {
         task.cancel()
     }
 
+    // MARK: HTTP/3
+
+    private func settleH3(_ s: H3Stream, force: Bool) async throws(HandlerWaitError) {
+        let endpoint = s.endpoint
+        while true {
+            let drained = await withUnsafeContinuation { (c: UnsafeContinuation<Bool, Never>) in
+                let resume = endpoint.lock.withLock { _ -> Bool? in
+                    if s.reset || state == .failed { return false }
+                    if s.staged.readableBytes <= (force ? 0 : high) { return true }
+                    s.waiters.append(c)
+                    return nil
+                }
+                if let resume { c.resume(returning: resume) }
+            }
+            if !drained { throw .cancelled }
+            let more = endpoint.lock.withLock { _ in
+                s.staged.readableBytes > (force ? 0 : high) && !s.reset && state != .failed
+            }
+            if !more { return }
+        }
+    }
+
     // MARK: HTTP/2
 
     private func settleH2(_ s: H2Stream, force: Bool) async throws(HandlerWaitError) {
@@ -973,6 +1074,7 @@ enum BodyLink {
     case none
     case http1(HeldStream, UnsafeMutablePointer<ConnectionParts>, StreamLimits)
     case http2(Unmanaged<H2Stream>)
+    case http3(Unmanaged<H3Stream>)
 }
 
 /// How an HTTP/1 response's body is delimited.
