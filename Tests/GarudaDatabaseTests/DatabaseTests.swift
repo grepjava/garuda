@@ -204,7 +204,11 @@ struct PostgresTypeTests {
         #expect(try app.test.get("/answer").text == "42")
         let spans = tracer.finishedSpans
         let request = try #require(spans.first { $0.operationName == "GET /answer" })
-        let select = try #require(spans.first { $0.operationName == "SELECT" })
+        // Tests running alongside are traced too while tracing is installed:
+        // find this one's statement by its text.
+        let select = try #require(spans.first {
+            $0.operationName == "SELECT" && $0.attributes.get("db.query.text") == .string("select 41 + 1")
+        })
         #expect(select.parentSpanID == request.spanID)
         #expect(select.attributes.get("db.system.name") == .string("postgresql"))
         #expect(select.attributes.get("db.query.text") == .string("select 41 + 1"))
