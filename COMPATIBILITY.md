@@ -47,7 +47,7 @@ resolves to 2.0.
 | `GarudaSQL` | `@PostgresRow`; re-exports `Garuda` | `@PostgresRow`; re-exports `GarudaPostgres` |
 | `GarudaJSON` | `@JSON` | unchanged |
 | `GarudaTesting` | -- (`app.test` was in `Garuda`) | new: `app.test` and the test clients |
-| `GarudaUploads` | resumable uploads | **coming** |
+| `GarudaUploads` | resumable uploads | the same API, `app.resumableUploads`; bodies are read as they arrive over HTTP/1.1, HTTP/2 and HTTP/3 |
 
 - **Imports.** A file that uses PostgreSQL imports `GarudaPostgres` (which
   brings `Garuda` with it), and so on for Redis and SQLite. Tests import
@@ -96,7 +96,9 @@ What this means for application code:
 - **Cancellation is Swift's.** A reset HTTP/2 or HTTP/3 stream cancels its
   handler's task; `Task.isCancelled` and `try Task.checkCancellation()` work.
   On HTTP/1.1 nothing interrupts a handler, but a streamed write to a client
-  that went away throws `HandlerWaitError.cancelled`.
+  that went away throws `HandlerWaitError.cancelled`. A streaming-body route
+  is the exception: a reset does not cancel its task, and its body throws
+  `RequestBodyError.incomplete` instead, once what arrived has been read.
 
 ---
 
@@ -135,9 +137,21 @@ What this means for application code:
 
 ### Streaming request bodies
 
-`app.onStreamingBody`, `RequestBodyStream` and `RequestBodyError` are not in
-Garuda 2 yet; they are coming with resumable uploads. Every request body is
-collected whole before dispatch, held to `--max-body` or `app.maxBodySize`.
+`app.onStreamingBody` is back, over HTTP/1.1, HTTP/2 and HTTP/3. What
+changed:
+
+| Garuda 1 | Garuda 2 |
+|---|---|
+| `(borrowing Request, inout Response, RequestBodyStream) async throws -> Void` | `@Sendable (borrowing Request, borrowing Response, RequestBody) async throws -> Void` |
+| `RequestBodyStream`, a class | `RequestBody`, a `Sendable` struct |
+| `read(maxBytes:)`, `readAll(maxBytes:)`, `cancel()`, `bytesRead`, `expectedLength` | the same, and `read(into: &buffer)`, which reads into an `IOBuffer` without a new array per read |
+| `onStreamingBody` returns nothing | it returns the route's `OpenAPIOperation`, as other routes do |
+| `RequestBodyError.concurrentRead` | gone; read one piece at a time |
+
+`RequestBodyError.incomplete` still answers 400 and `.tooLarge` 413. Every
+other route's body is collected whole before dispatch, held to `--max-body`
+or `app.maxBodySize`. [HANDLER-API.md](HANDLER-API.md#request-bodies-read-as-they-arrive)
+describes the API.
 
 ### Middleware
 
@@ -268,7 +282,7 @@ Flags keep Garuda 1's names, units and defaults: `--keep-alive`,
 | `--balance` | `adaptive` (default), `accept`, `reuseport` | `auto` (default), `shared`, `reuseport`; `adaptive` and `accept` are taken as `auto` and `shared` |
 | `--max-connections`, `--blocking-threads`, `--blocking-queue` | per worker | per shard |
 | `--port` | 1 to 65535 | 0 to 65535; 0 picks a free port |
-| `--ktls`, `--no-ktls`, `--sched-slice`, `--slow-handler-ms` | in effect, or accepted and ignored | accepted, with a warning that they have no effect |
+| `--ktls`, `--no-ktls`, `--sched-slice`, `--slow-handler-ms` | in effect, or accepted and ignored | accepted; all but `--no-ktls` warn that they have no effect |
 
 `--shards 4` is four processes of several threads each, where `--workers 4`
 was four single-threaded ones: a machine that ran `--workers 0` (one per CPU)
@@ -312,8 +326,15 @@ with an outside ACME client, answer its HTTP-01 challenges with
   follows it.
 - **TLS** has a 10-second handshake timeout, and session tickets resume across
   shards.
-- **Request bodies** are always collected whole before the handler runs, on
-  every protocol.
+- **Request bodies** are collected whole before the handler runs, on every
+  protocol, except on an `onStreamingBody` route, which reads its body as it
+  arrives.
+- **Content-Length.** A `Content-Length` the handler sets is enforced, as in
+  Garuda 1, on whole and streamed bodies alike. A longer body is cut to it,
+  and a shorter one is never ended as if it were whole: HTTP/1.1 closes the
+  connection after either mismatch, and HTTP/2 and HTTP/3 reset the stream of
+  a short one. A HEAD states the declared length, a 304 keeps it, and a 204
+  states none.
 
 ---
 
@@ -321,9 +342,6 @@ with an outside ACME client, answer its HTTP-01 challenges with
 
 | Garuda 1 feature | status in Garuda 2 |
 |---|---|
-| Resumable uploads (`GarudaUploads`) | coming |
-| Streamed request bodies (`onStreamingBody`) | coming |
-| Fuzz targets (`GarudaFuzzTargets`, `pgfuzz`) | coming |
 | Built-in ACME client (tls-alpn-01) | dropped: use certbot or another client with `--acme-webroot` |
 | Kernel TLS (`--ktls`) | no; the flag is accepted and has no effect |
 | Scheduler slice (`--sched-slice`) and slow-handler warnings (`--slow-handler-ms`) | no; the flags are accepted and have no effect. The heavy lane does the work of both |
