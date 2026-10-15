@@ -4,6 +4,9 @@ import Synchronization
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
+import WinSDK
 #endif
 import Garuda
 import GarudaTesting
@@ -41,6 +44,52 @@ private func pattern(_ count: Int, from start: Int = 0) -> [UInt8] {
     (0..<count).map { UInt8(truncatingIfNeeded: ($0 + start) &* 197 &+ 3) }
 }
 
+#if os(Windows)
+private func temporaryDirectory() -> String {
+    var base = getenv("TEMP").map { String(cString: $0) } ?? "C:/Windows/Temp"
+    base = String(base.map { $0 == "\\" ? "/" : $0 })
+    while base.hasSuffix("/") { base.removeLast() }
+    let path = "\(base)/garuda-uploads-\(_getpid())-\(UInt64.random(in: 0...UInt64.max))"
+    precondition(_mkdir(path) == 0)
+    return path
+}
+
+private func contents(_ path: String) -> [UInt8] {
+    guard let file = fopen(path, "rb") else { return [] }
+    defer { _ = fclose(file) }
+    var out: [UInt8] = []
+    var chunk = [UInt8](repeating: 0, count: 65536)
+    while true {
+        let n = chunk.withUnsafeMutableBufferPointer { fread($0.baseAddress!, 1, $0.count, file) }
+        if n == 0 { break }
+        out += chunk[0..<n]
+    }
+    return out
+}
+
+private func writeBytes(_ bytes: [UInt8], to path: String) {
+    let file = fopen(path, "wb")
+    precondition(file != nil)
+    defer { _ = fclose(file) }
+    _ = bytes.withUnsafeBufferPointer { fwrite($0.baseAddress!, 1, $0.count, file) }
+}
+
+/// The names in `directory` that end in `suffix`, without it.
+private func names(in directory: String, endingIn suffix: String) -> [String] {
+    var data = WIN32_FIND_DATAW()
+    let find = (directory + "/*").withCString(encodedAs: UTF16.self) { FindFirstFileW($0, &data) }
+    guard let find, find != INVALID_HANDLE_VALUE else { return [] }
+    defer { FindClose(find) }
+    var found: [String] = []
+    repeat {
+        let name = withUnsafeBytes(of: data.cFileName) {
+            String(decoding: $0.bindMemory(to: UInt16.self).prefix { $0 != 0 }, as: UTF16.self)
+        }
+        if name.hasSuffix(suffix) { found.append(String(name.dropLast(suffix.count))) }
+    } while FindNextFileW(find, &data)
+    return found
+}
+#else
 private func temporaryDirectory() -> String {
     var template = Array("/tmp/garuda-uploads-XXXXXX".utf8CString)
     let made = template.withUnsafeMutableBufferPointer { mkdtemp($0.baseAddress!) }
@@ -82,6 +131,7 @@ private func names(in directory: String, endingIn suffix: String) -> [String] {
     }
     return found
 }
+#endif
 
 private func listUploads(_ store: FileUploadStore) -> [String] {
     names(in: store.directory, endingIn: ".info")
