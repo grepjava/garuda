@@ -667,6 +667,7 @@ final class H3Connection {
         case .ok:
             break
         }
+        if let root = endpoint.app.rootPath { stripRootPath(s.x, root) }
         streams[id] = s
         s.inTable = true
         if Int64(id) > highestRequest { highestRequest = Int64(id) }
@@ -717,6 +718,8 @@ final class H3Connection {
         }
         s.id = id
         s.isSpare = false
+        // --request-start-header: the HEADERS frame is the request arriving.
+        if endpoint.limits.requestStart { s.x.pointee.requestStart = wallClockMicros() }
         s.inTable = false
         s.taskActive = false
         s.receiving = false

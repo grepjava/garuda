@@ -48,6 +48,10 @@ struct ConnectionLimits: Sendable {
     /// none (Forwarded.swift).
     var trust: ForwardedTrust?
     var traceContext: Bool
+    /// --scheme https (Forwarded.swift).
+    var assumeHTTPS: Bool
+    /// --request-start-header: each request is stamped as it arrives.
+    var requestStart: Bool
     /// --access-log, as text or JSON (Logging.swift).
     var accessLog: Bool
     var accessLogJSON: Bool
@@ -104,6 +108,8 @@ struct ConnectionLimits: Sendable {
         requestIDTrust = config.requestID && !config.trust.isEmpty ? config.trust : nil
         trust = config.trust.isEmpty ? nil : config.trust
         traceContext = config.traceContext
+        assumeHTTPS = config.assumeHTTPS
+        requestStart = config.requestStartHeader
         accessLog = config.accessLog
         accessLogJSON = config.accessLogJSON
     }
@@ -172,6 +178,7 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     }
     // The exchange is reused from connection to connection: set both.
     x.pointee.secure = secure
+    x.pointee.assumeHTTPS = limits.assumeHTTPS
     x.pointee.serverFields = secure ? limits.secureFields : limits.plainFields
     if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
     if x.pointee.site != nil || limits.site != nil { x.pointee.site = limits.site }
@@ -250,7 +257,11 @@ struct HTTP1Connection: ~Copyable {
         _ stream: borrowing S, app: CompiledApplication
     ) async throws -> Bool {
         x.pointee.reset()
+        if limits.requestStart { x.pointee.requestStart = 0 }
         guard try await readHead(stream) else { return false }
+        // Pipelined: its bytes were here before it was looked at.
+        if limits.requestStart && x.pointee.requestStart == 0 { x.pointee.requestStart = wallClockMicros() }
+        if let root = app.rootPath { stripRootPath(x, root) }
 
         let head = x.pointee.head
         // A route matched before its body was read, for its scope's body
@@ -276,6 +287,8 @@ struct HTTP1Connection: ~Copyable {
         if observing { x.pointee.started = monotonicNanos() }
 
         await dispatch(app, matched: matched)
+        // Something answered with the connection's end: the HTTPS redirect.
+        if !x.pointee.keepAlive { keepAlive = false }
 
         if let upgrade = x.pointee.upgrade {
             // The connection is the WebSocket's from here: the 101, and
@@ -366,6 +379,8 @@ struct HTTP1Connection: ~Copyable {
                 try await stream.read(into: &parts.pointee.input)
             }
             if n == 0 { return false }
+            // The request's first bytes: when it arrived.
+            if available == 0 && limits.requestStart { x.pointee.requestStart = wallClockMicros() }
         }
     }
 

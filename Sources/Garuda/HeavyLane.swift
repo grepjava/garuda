@@ -22,6 +22,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Synchronization
 import Vega
@@ -153,6 +155,19 @@ func monotonicNanos() -> UInt64 {
 /// Where `monotonicNanos` counts from without clock_gettime.
 let clockOrigin = ContinuousClock.now
 #endif
+
+/// Now, in microseconds since the epoch, from the wall clock: what
+/// --request-start-header stamps a request with, for an agent to set against
+/// its own clock.
+func wallClockMicros() -> UInt64 {
+    var ts = timespec()
+    #if canImport(Glibc) || canImport(Darwin)
+    clock_gettime(CLOCK_REALTIME, &ts)
+    #else
+    timespec_get(&ts, TIME_UTC)
+    #endif
+    return UInt64(ts.tv_sec) &* 1_000_000 &+ UInt64(ts.tv_nsec) / 1000
+}
 
 // MARK: - Declaring heavy routes
 

@@ -45,6 +45,13 @@ struct Exchange: ~Copyable {
     @usableFromInline var context = ContextSlots()
     /// The connection is TLS (TLS.swift).
     @usableFromInline var secure = false
+    /// --scheme https: a request without TLS is taken as HTTPS all the same.
+    /// Set per connection.
+    @usableFromInline var assumeHTTPS = false
+    /// With --request-start-header, when the request arrived, in microseconds
+    /// since the epoch; 0 otherwise. Set by the connection as the request's
+    /// first bytes arrive.
+    @usableFromInline var requestStart: UInt64 = 0
     /// Alt-Svc and Strict-Transport-Security, as the connection's transport
     /// calls for them, or nil: set per connection (HTTP1.swift).
     var serverFields: ServerFields?
@@ -393,6 +400,15 @@ public struct Request: ~Copyable {
     /// How many parameters the matched route's pattern names.
     public var parameterCount: Int { exchange.pointee.parameters.count }
 
+    /// With --request-start-header, when the request arrived, in microseconds
+    /// since the epoch; nil without it. For an APM agent that reports queue
+    /// time: everything that happened before the handler was called. A
+    /// proxy's own X-Request-Start is still among the headers, and is the
+    /// better time when there is one, the proxy having seen the request first.
+    public var requestStart: UInt64? {
+        let start = exchange.pointee.requestStart
+        return start == 0 ? nil : start
+    }
 
     // MARK: Lent bytes
 

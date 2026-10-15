@@ -17,6 +17,7 @@ extension Application {
     public func prepareForTesting(_ config: ServerConfig, threads: Int) {
         let app = compile()
         if app.costs.lane == nil { app.costs.configure(config, threads: threads) }
+        app.rootPath = config.rootPath.isEmpty ? nil : Array(config.rootPath.utf8)
     }
 
     /// Builds the state and runs the start hooks, as shard 0 of 1, the first

@@ -1,5 +1,6 @@
 import Testing
 @testable import Garuda
+import GarudaTesting
 
 // The command line: Garuda 1's flags, and its units, on Garuda 2.
 
@@ -105,5 +106,80 @@ private func refused(_ flags: [String]) -> Bool {
         for bad in [["--sched-slice", "50"], ["--slow-handler-ms", "-1"]] {
             #expect(refused(bad), "\(bad) parsed")
         }
+    }
+}
+
+// What those flags do to a request.
+@Suite struct GarudaOneFlagTests {
+    private func app() -> Application {
+        let app = Application()
+        app.get("/users") { request, response in response.send("users \(request.path)") }
+        app.get("/") { request, response in response.send("root \(request.path)") }
+        app.get("/scheme") { request, response in response.send(request.arrivedOverHTTPS ? "https" : "http") }
+        app.get("/start") { request, response in
+            response.send(request.requestStart.map { "\($0)" } ?? "none")
+        }
+        app.get("/trace") { request, response in response.send(request.traceContext?.parentID ?? "none") }
+        return app
+    }
+
+    private func client(_ change: (inout ServerConfig) -> Void) -> TestClient {
+        var config = ServerConfig()
+        change(&config)
+        return app().testClient(configuration: config)
+    }
+
+    @Test func theRootPathIsTakenOffBeforeRouting() throws {
+        let mounted = client { $0.rootPath = "/app" }
+        #expect(try mounted.get("/app/users").text == "users /users")
+        #expect(try mounted.get("/app").text == "root /")
+        #expect(try mounted.get("/app/").text == "root /")
+        // Outside the mount, as from a proxy that took the prefix off.
+        #expect(try mounted.get("/users").text == "users /users")
+        #expect(try mounted.get("/apple").status == .notFound)
+        #expect(try client { _ in }.get("/app/users").status == .notFound)
+    }
+
+    @Test func schemeHTTPSIsWhatARequestWithoutTLSArrivedBy() throws {
+        #expect(try client { $0.assumeHTTPS = true }.get("/scheme").text == "https")
+        #expect(try client { _ in }.get("/scheme").text == "http")
+    }
+
+    @Test func requestStartIsTheWallClockWhenAskedFor() throws {
+        let before = wallClockMicros()
+        let text = try client { $0.requestStartHeader = true }.get("/start").text
+        let start = UInt64(text) ?? 0
+        #expect(start >= before && start <= wallClockMicros())
+        #expect(try client { _ in }.get("/start").text == "none")
+    }
+
+    @Test func twoTraceparentsAreIgnored() throws {
+        let traced = client { $0.traceContext = true }
+        let one = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        let other = "00-0af7651916cd43dd8448eb211c80319c-1111111111111111-01"
+        #expect(try traced.get("/trace", headers: [("traceparent", one)]).text == "b7ad6b7169203331")
+        #expect(try traced.get("/trace", headers: [("traceparent", one), ("traceparent", other)]).text == "none")
+    }
+
+    @Test func theHTTPSRedirectClosesTheConnection() throws {
+        let response = try httpsRedirectApplication(httpsPort: 8443).testClient()
+            .get("/a", headers: [("host", "example.com")])
+        #expect(response.status.code == 301)
+        #expect(response.header("connection") == "close")
+    }
+
+    @Test func blockingQueueRefusesPastThreadsAndQueue() {
+        let admission = OffloadAdmission()
+        #expect(admission.enter() && admission.enter())
+        admission.leave()
+        admission.leave()
+        var config = ServerConfig()
+        config.blockingQueue = 1
+        admission.configure(config, threads: 1)
+        #expect(admission.enter())
+        #expect(admission.enter())
+        #expect(!admission.enter())
+        admission.leave()
+        #expect(admission.enter())
     }
 }

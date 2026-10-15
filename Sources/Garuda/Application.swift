@@ -318,6 +318,8 @@ final class CompiledApplication: @unchecked Sendable {
     var cache: ResponseCache?
     /// --health-check-path.
     var healthPath: [UInt8]?
+    /// --root-path, or nil for none (RootPath.swift).
+    var rootPath: [UInt8]?
     /// SIGTERM has arrived: the health check answers 503 and HTTP/1
     /// connections close after their response, through --drain-delay.
     let unready = Atomic<Bool>(false)
