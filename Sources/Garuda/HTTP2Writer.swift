@@ -299,6 +299,7 @@ extension H2Connection {
     func prepareAnswer(_ s: H2Stream) -> Int {
         let x = s.x
         if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
+        if x.pointee.touchedStream { cacheAnswer(x) }
         if x.pointee.compress && !x.pointee.noCompress {
             x.pointee.compressAnswer(omitBody: x.pointee.head.method == .head)
         }

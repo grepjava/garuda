@@ -61,6 +61,16 @@ struct Exchange: ~Copyable {
     @usableFromInline var noCompress = false
     /// Where a body is compressed into, swapped with `responseBody`.
     var compressed = ByteBuffer()
+
+    // MARK: The response cache (ResponseCache.swift)
+
+    /// The copy of this answer being made for the cache.
+    var capture: ResponseCapture?
+    /// The target's mark, when this request changes what it names; 0 when
+    /// it does not.
+    var cacheInvalidates: UInt64 = 0
+    /// Where a lookup copies a stored response.
+    var cacheScratch = ByteBuffer()
     /// The application serving the connection, for its state. It outlives
     /// every connection it serves.
     var application: Unmanaged<CompiledApplication>?
@@ -105,6 +115,8 @@ struct Exchange: ~Copyable {
         channel = nil
         producer = nil
         bodyReplaced = false
+        if capture != nil { capture = nil }
+        cacheInvalidates = 0
     }
 
     /// `Response.onSend` hooks, run before the head is written. Empty, and
@@ -154,6 +166,8 @@ struct Exchange: ~Copyable {
         buffer = requestID
         buffer.destroy()
         buffer = compressed
+        buffer.destroy()
+        buffer = cacheScratch
         buffer.destroy()
         jsonWriter?.destroy()
     }

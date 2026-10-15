@@ -214,7 +214,7 @@ fetch /cache/etag --http1.1 -H 'If-None-Match: "v1"'
 is "a 304 for a client that takes the body plain says Vary too" "$(header vary)" "Accept-Encoding"
 is "with the strong ETag" "$(header etag)" '"v1"'
 fetch /cache/etag --http2 -H 'Accept-Encoding: gzip' -H 'If-None-Match: W/"v1"'
-is "and so does a 304 over HTTP/2" "$(status):$(header vary):$(header etag)" '304:accept-encoding:W/"v1"'
+is "and so does a 304 over HTTP/2" "$(status):$(header vary | tr 'A-Z' 'a-z'):$(header etag)" '304:accept-encoding:W/"v1"'
 is "all without calling the handler" "$(calls GET /cache/etag)" "4"
 
 echo "requests that keep out of the cache"

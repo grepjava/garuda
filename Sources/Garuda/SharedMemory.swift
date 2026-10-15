@@ -10,6 +10,7 @@
 // from memory of its own.
 //===----------------------------------------------------------------------===//
 
+import CGarudaShared
 import Vega
 
 /// Which shared region holds what, from the config.
@@ -18,11 +19,13 @@ struct SharedLayout: Sendable {
     private(set) var ticketKey: Int?
     private(set) var rateLimit: Int?
     private(set) var metrics: Int?
+    private(set) var cache: Int?
 
     init(_ config: ServerConfig) {
         if !config.tlsCertificates.isEmpty { ticketKey = add(TicketKey.regionSize) }
         if config.rateLimitCount > 0 { rateLimit = add(RateLimiter.regionSize) }
         if config.metricsPort != nil { metrics = add(MetricsPage.regionSize) }
+        if let size = ResponseCache.regionSize(config) { cache = add(size) }
     }
 
     private mutating func add(_ size: Int) -> Int {
@@ -36,6 +39,7 @@ final class ServerShared: Sendable {
     let ticketKey: [UInt8]?
     let rateLimiter: RateLimiter?
     let metrics: MetricsPage?
+    let cache: ResponseCache?
 
     /// `region(i)` is region `i` of `layout`; `shard` is this shard's index.
     init(_ layout: SharedLayout, config: ServerConfig, shard: Int,
@@ -43,6 +47,13 @@ final class ServerShared: Sendable {
         ticketKey = layout.ticketKey.map { TicketKey.shared(in: region($0)) }
         rateLimiter = layout.rateLimit.map { RateLimiter(region: region($0), config: config) }
         metrics = layout.metrics.map { MetricsPage(region: region($0), shard: shard) }
+        cache = layout.cache.flatMap { ResponseCache(region: region($0), config: config) }
+    }
+
+    /// This shard has started, one of `shards`: a replacement's start retires
+    /// what the cache holds.
+    func shardStarted(of shards: Int) {
+        if let cache { gc_cache_shard_started(cache.handle, Int32(shards)) }
     }
 
     /// For a server in one process: the regions are its own memory.

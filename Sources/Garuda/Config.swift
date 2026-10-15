@@ -101,6 +101,15 @@ public struct ServerConfig: Sendable {
     /// The interface it listens on; nil for `host`'s.
     public var metricsHost: String? = nil
 
+    // --- the response cache (ResponseCache.swift) ---
+    /// Mebibytes of memory, shared by every shard, for responses the
+    /// application marks fresh; 0 for no cache.
+    public var cacheSizeMiB = 0
+    /// The largest response body the cache keeps, in bytes.
+    public var cacheMaxObject = 1024 * 1024
+    /// The longest a response is kept, whatever it says, in seconds.
+    public var cacheTTLMaxSeconds = 300
+
     // --- static files (StaticFiles.swift) ---
     /// URL prefixes answered from directories, `--static-dir /static=/srv/www`:
     /// a GET or HEAD under a prefix is served the file it names, and one

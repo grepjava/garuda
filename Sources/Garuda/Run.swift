@@ -87,6 +87,9 @@ extension Application {
         let layout = SharedLayout(config)
         options.sharedRegions = layout.sizes
         options.name = "garuda-s"
+        options.onEvent = { event in
+            if case .reloading = event { Log.info("reloading workers") }
+        }
         Runtime.sharded(options) { shard in
             let info = ShardInfo(index: shard.index, count: shard.count, threads: shard.runtime.workerCount)
             let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
@@ -102,6 +105,7 @@ extension Application {
                 metrics = { () throws(IOError) -> TCPListener in try shard.listener(index) }
             }
             let shared = ServerShared(layout, config: config, shard: shard.index) { shard.sharedRegion($0) }
+            shared.shardStarted(of: shard.count)
             let listening = Listening(main: main, redirect: redirect, metrics: metrics, shared: shared)
             Application.serve(shard.runtime, app: app, shard: info, limits: limits, config: config, listening: listening)
         }
@@ -171,6 +175,11 @@ extension Application {
         app.runtime = runtime
         app.rateLimiter = listening.shared.rateLimiter
         app.metrics = listening.shared.metrics
+        app.cache = listening.shared.cache
+        if config.cacheSizeMiB > 0 && app.cache == nil {
+            Log.error("--cache-size \(config.cacheSizeMiB) is too little for a response of --cache-max-object")
+            exit(2)
+        }
         app.connections.metrics = listening.shared.metrics
         app.healthPath = config.healthCheckPath.map { Array($0.utf8) }
         app.screened = app.rateLimiter != nil || app.healthPath != nil
@@ -225,7 +234,8 @@ extension Application {
                 if let metrics = listening.metrics, let page = listening.shared.metrics {
                     // A server of its own, never through the application.
                     let workers = runtime.workerCount * max(1, config.shards ?? 1)
-                    let scraped = metricsApplication(page, workers: workers, cache: false).compile()
+                    let scraped = metricsApplication(page, workers: workers,
+                                                     cache: config.cacheSizeMiB > 0).compile()
                     let server = try TCPServer.serve(try metrics()) { stream in
                         let peer = socketPeer(stream)
                         await serveHTTP1(stream, app: scraped, limits: limits, peer: peer)
@@ -310,6 +320,11 @@ extension ServerConfig {
                                before --rate-limit
           --metrics-port PORT  serve Prometheus metrics at /metrics on PORT
           --metrics-host HOST  the interface for it (default: --host's)
+          --cache-size MIB     keep responses the application marks fresh in
+                               MIB of memory every shard shares
+          --cache-max-object KIB
+                               the largest body kept (default 1024)
+          --cache-ttl-max SECS the longest a response is kept (default 300)
           --compress           compress text responses for clients that accept
                                it (see BREACH before turning this on)
           --compress-static    serve file.br, file.zst or file.gz beside a
@@ -460,6 +475,21 @@ extension ServerConfig {
             case "--metrics-host":
                 guard let v = value() else { return fail("--metrics-host needs a value") }
                 config.metricsHost = v
+            case "--cache-size":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--cache-size must be a number of mebibytes")
+                }
+                config.cacheSizeMiB = n
+            case "--cache-max-object":
+                guard let n = value().flatMap({ Int($0) }), n > 0, n <= 64 * 1024 else {
+                    return fail("--cache-max-object must be a number of kibibytes, at most 65536")
+                }
+                config.cacheMaxObject = n * 1024
+            case "--cache-ttl-max":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--cache-ttl-max must be a number of seconds")
+                }
+                config.cacheTTLMaxSeconds = n
             case "--compress":
                 config.compress = true
             case "--compress-static":

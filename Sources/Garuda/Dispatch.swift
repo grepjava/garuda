@@ -33,6 +33,10 @@ func dispatchInline(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplicat
     if app.screened && answeredBeforeRouting(x, app) { return }
     if x.pointee.compress { x.pointee.negotiateCoding() }
     if x.pointee.site != nil, await serveStatic(x) { return }
+    // --cache-size: once the coding is settled, since a copy is compressed
+    // for the client it goes to, and after everything that answers without
+    // the application, since a copy stands in for it.
+    if app.cache != nil && cacheDispatch(x, app) { return }
     let path = x.pointee.head.path
     let base = x.pointee.base + Int(path.offset)
     var count = path.count

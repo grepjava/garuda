@@ -306,6 +306,8 @@ final class CompiledApplication: @unchecked Sendable {
     /// --metrics-port counters (SharedMemory.swift). Set before it serves.
     var rateLimiter: RateLimiter?
     var metrics: MetricsPage?
+    /// --cache-size's table.
+    var cache: ResponseCache?
     /// --health-check-path.
     var healthPath: [UInt8]?
     /// Any of the three is on: a request is looked at before routing.

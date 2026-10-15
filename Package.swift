@@ -77,8 +77,11 @@ let package = Package(
         // cryptography of its own. Signed and
         // encrypted cookies (HMAC, HKDF, AES-GCM), JWT signing and verifying,
         // password hashes and tokens all use it.
+        // What the shards share that needs C's atomics over raw memory: the
+        // response cache's table (garuda_cache.c).
+        .target(name: "CGarudaShared"),
         .target(name: "Garuda",
-                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS"),
+                dependencies: ["GarudaWire", "CGarudaShared", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS"),
                                vega("VegaFS"), vega("VegaExtras")],
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaTesting",
@@ -97,7 +100,7 @@ let package = Package(
         .executableTarget(name: "garuda-server", dependencies: ["Garuda", "GarudaJSON", vega("Vega")],
                           path: "Sources/garuda-server",
                           swiftSettings: sharedSwiftSettings),
-        .executableTarget(name: "garuda-conformance", dependencies: ["Garuda", vega("VegaExtras")],
+        .executableTarget(name: "garuda-conformance", dependencies: ["Garuda", vega("Vega"), vega("VegaExtras")],
                           path: "Sources/garuda-conformance",
                           swiftSettings: sharedSwiftSettings),
 

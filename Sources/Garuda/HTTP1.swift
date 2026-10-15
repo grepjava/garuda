@@ -399,6 +399,7 @@ struct HTTP1Connection: ~Copyable {
         // `Response.onSend` hooks see the answer once it is final, while it
         // can still change (ResponseHooks.swift).
         if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
+        if x.pointee.touchedStream { cacheAnswer(x) }
         if x.pointee.compress && !x.pointee.noCompress { x.pointee.compressAnswer(omitBody: omitBody) }
         let forbids = HTTPResponseWriter.statusForbidsBody(x.pointee.status)
         let count = forbids ? 0 : x.pointee.responseBody.readableBytes

@@ -220,6 +220,9 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
     let status = x.pointee.status
     let bodyless = HTTPResponseWriter.statusForbidsBody(status) || x.pointee.head.method == .head
     let declared = x.pointee.headerKinds.contains(.contentLength) ? declaredLength(x) : -1
+    // --cache-size: the copy is of the application's bytes, before any
+    // compression.
+    let capture = x.pointee.cacheInvalidates != 0 || x.pointee.capture != nil ? cacheStreamStart(x) : nil
     // --compress: compressed as written, with no length to state, though the
     // declared one still bounds what the handler writes.
     let encoder = x.pointee.compress && !x.pointee.noCompress ? x.pointee.streamEncoder(bodyless: bodyless) : nil
@@ -256,6 +259,7 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
         channel = BodyChannel(dropping: ())
     }
     channel.runtime = x.pointee.application?.takeUnretainedValue().runtime
+    channel.capture = bodyless ? nil : capture
     x.pointee.channel = channel
     x.pointee.touchedStream = true
     return channel
@@ -380,6 +384,9 @@ final class BodyChannel: @unchecked Sendable {
     /// --compress: the body is compressed as it is written, each write
     /// flushed through (Compression.swift). Under the state's lock.
     private let encoder: ResponseEncoder?
+    /// --cache-size: the copy being made, stored when the body ends whole.
+    /// Under the state's lock.
+    var capture: ResponseCapture?
 
     /// One whose writes throw: the request had been answered already.
     init(refusing: Void) {
@@ -473,6 +480,7 @@ final class BodyChannel: @unchecked Sendable {
             }
             if take > 0 {
                 if keepAliveTask != nil { lastWrite = monotonicNanos() }
+                capture?.append(base, take)
                 if let encoder {
                     // Flushed with each write, so what the handler sent is
                     // what the client can read now.
@@ -679,7 +687,9 @@ final class BodyChannel: @unchecked Sendable {
                 }
                 // A body delimited by the close has no other end.
                 if !bodyless && !chunked && remaining < 0 { keep = false }
+                if let capture, remaining <= 0, state == .finished { _ = capture.store() }
             }
+            capture = nil
         }
         // A writer the handler left behind -- a keep-alive comment, a task
         // not its child -- may still be taking the queue out: the
@@ -722,7 +732,9 @@ final class BodyChannel: @unchecked Sendable {
             s.resumeWaiters(false)
         } else {
             endLocked()
+            if let capture, state == .finished { _ = capture.store() }
         }
+        capture = nil
     }
 
     // MARK: Files
