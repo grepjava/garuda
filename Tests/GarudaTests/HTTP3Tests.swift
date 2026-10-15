@@ -485,3 +485,66 @@ struct HTTP3Tests {
         }
     }
 }
+
+@Suite struct HTTP3CommandLineTests {
+    func parse(_ args: String...) -> ServerConfig? {
+        if case .run(let config) = ServerConfig.parse(["garuda"] + args) { return config }
+        return nil
+    }
+
+    @Test func http3TakesItsPortAndHSTSItsAge() throws {
+        let config = try #require(parse("--tls-cert", "a.crt", "--tls-key", "a.key", "--port", "8443",
+                                        "--http3", "--quic-port", "9443", "--hsts", "600"))
+        #expect(config.http3Enabled)
+        #expect(config.quicPort == 9443)
+        #expect(config.hstsMaxAge == 600)
+    }
+
+    @Test func mistakesAreRefused() {
+        // QUIC has no cleartext form.
+        #expect(parse("--http3") == nil)
+        #expect(parse("--tls-cert", "a.crt", "--tls-key", "a.key", "--quic-port", "9443") == nil)
+        #expect(parse("--tls-cert", "a.crt", "--tls-key", "a.key", "--http3", "--quic-port", "0") == nil)
+        // Strict-Transport-Security means nothing over plain HTTP.
+        #expect(parse("--hsts", "600") == nil)
+        #expect(parse("--tls-cert", "a.crt", "--tls-key", "a.key", "--hsts", "soon") == nil)
+    }
+
+    @Test func altSvcNamesTheQUICPortOnTCPOnly() throws {
+        var config = ServerConfig()
+        config.port = 8443
+        config.http3Enabled = true
+        var limits = ConnectionLimits(config)
+        #expect(limits.plainFields?.altSvc == Array("h3=\":8443\"; ma=86400".utf8))
+        #expect(limits.secureFields?.altSvc == Array("h3=\":8443\"; ma=86400".utf8))
+        #expect(limits.quicFields == nil)
+        config.quicPort = 9443
+        config.hstsMaxAge = 60
+        limits = ConnectionLimits(config)
+        #expect(limits.secureFields?.altSvc == Array("h3=\":9443\"; ma=86400".utf8))
+        #expect(limits.secureFields?.hsts == Array("max-age=60".utf8))
+        // HSTS is only for TLS, and Alt-Svc never over HTTP/3 itself.
+        #expect(limits.plainFields?.hsts == nil)
+        #expect(limits.quicFields?.hsts == Array("max-age=60".utf8))
+        #expect(limits.quicFields?.altSvc == nil)
+        // Nothing to add without HTTP/3 or --hsts.
+        #expect(ConnectionLimits(ServerConfig()).secureFields == nil)
+    }
+
+    @Test func anHTTP1AnswerAdvertisesHTTP3OnceAndKeepsAHandlersOwn() throws {
+        let app = Application()
+        app.get("/") { _, response in response.send(status: .ok) }
+        app.get("/own") { _, response in
+            response.addHeader("alt-svc", "h3=\":9999\"")
+            response.send(status: .ok)
+        }
+        var config = ServerConfig()
+        config.port = 8443
+        config.http3Enabled = true
+        let client = app.testClient(configuration: config)
+        let plain = try client.get("/")
+        #expect(plain.headers(named: "alt-svc") == ["h3=\":8443\"; ma=86400"])
+        #expect(plain.header("strict-transport-security") == nil)
+        #expect(try client.get("/own").headers(named: "alt-svc") == ["h3=\":9999\""])
+    }
+}
