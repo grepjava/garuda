@@ -567,6 +567,8 @@ app.concurrencyLimit(8) {
 - **`maxBodySize(bytes)`** replaces `--max-body` for the routes inside, larger
   or smaller; nested, the innermost applies. A declared length past it is 413
   before the body is read, and a chunked body is refused when it grows past it.
+  An `onStreamingBody` route is the exception: its own `maxBodySize:`
+  argument, `Int.max` when left out, takes the place of the scope's.
 - **`concurrencyLimit(max)`** lets `max` of those handlers run at once in each
   shard and answers the next one 503 at once, without queueing it. With four
   shards, up to `4 × max` run in total. Middleware is not counted, so a
