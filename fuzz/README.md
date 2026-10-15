@@ -10,12 +10,28 @@ mutation fuzzer in this package. The targets live in
 | Target | What it feeds |
 | --- | --- |
 | `http-head` | the HTTP/1.1 request-head parser |
+| `http-response` | the HTTP/1.1 response-head parser the HTTP client reads with |
 | `chunked` | the chunked transfer decoder |
 | `hpack` | the HPACK decoder |
+| `qpack` | the QPACK decoder (HTTP/3 field sections) |
 | `websocket` | the WebSocket frame header parser |
 | `quic-packet` | the QUIC packet header parser |
+| `quic-frames` | a server QUIC connection, the input sealed as one 1-RTT packet |
+| `tls-hello` | a new server QUIC connection, the input as its ClientHello |
+| `h2` | a whole HTTP/2 connection, the input after the preface and SETTINGS |
+| `h3` | a whole HTTP/3 connection over loopback UDP, the input on a stream |
 | `json` | the JSON decoder and encoder |
 | `resp` | the Redis reply parser, whole and a byte at a time |
+| `postgres` | PostgreSQL backend messages: framing, every message body, column values, arrays and COPY rows |
+
+The connection targets run in process with no I/O except `h3`'s socket:
+`quic-frames` and `tls-hello` drive `GarudaQUIC` against the tests' own client
+(`Tests/QUICTestPeer`), `h2` serves an `Application` over GarudaTesting's
+in-memory duplex, and `h3` serves one on 127.0.0.1 for the whole run. They
+take milliseconds an input where the parsers take microseconds. For `h3`, the
+input's first byte picks where the rest goes: 0, request stream 0; 1, the
+client's control stream after SETTINGS; 2, a unidirectional stream, its type
+included.
 
 Not crashing is only part of the check. Each target also tests an invariant
 that a wrong parse breaks even when nothing traps:
@@ -32,7 +48,18 @@ that a wrong parse breaks even when nothing traps:
 - **Decoding is repeatable.** The same HPACK block decodes to the same fields
   in two fresh decoders.
 - **JSON round-trips.** A document that decodes must encode, and decode again
-  to the same value.
+  to the same value. So do PostgreSQL array literals and COPY rows, which a
+  client writes back.
+- **What a connection sends is legible.** Every packet a QUIC connection sends
+  opens at the client and its frames parse; every HTTP/2 frame has the length
+  its type needs and every header block decodes, in order; every HTTP/3 stream
+  the server ends holds whole frames.
+- **A connection does not hang.** An HTTP/2 connection closes once the client
+  has; on HTTP/3, a request after the input is still answered, and a request
+  stream the client ended is answered or refused.
+- **No amplification.** Before the client's address is validated, a QUIC
+  server sends at most three times what it received, retransmissions
+  included. The target serves a certificate large enough to reach the limit.
 
 ## Running
 
@@ -47,7 +74,7 @@ swift run -c release pgfuzz --corpus-only          # replay seeds and corpus onl
 | --- | --- | --- |
 | `target ...` | all | which targets to run |
 | `--seconds N` | 5 | time per target |
-| `--seed N` | monotonic clock | seed for the mutations, printed at start |
+| `--seed N` | random | seed for the mutations, printed at start |
 | `--corpus DIR` | `fuzz/corpus` | corpus root |
 | `--max-len N` | 4096 | longest input a mutation may produce |
 | `--corpus-only` | off | run the seeds and corpus without mutating |
@@ -58,7 +85,9 @@ byte changes, inserted protocol tokens (`\r\n`, `chunked`, large numbers),
 deleted and duplicated runs, splices between inputs, truncation, and repeated
 bytes. There is no coverage feedback.
 
-A run is reproducible from its seed with the same corpus.
+A run is reproducible from its seed with the same corpus. For the connection
+targets this holds up to what the scheduler and the connection's own random
+connection IDs and keys decide.
 
 ## Sanitizers
 

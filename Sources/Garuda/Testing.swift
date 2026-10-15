@@ -8,6 +8,7 @@
 
 import Synchronization
 import Vega
+import VegaCrypto
 import VegaIO
 
 extension Application {
@@ -106,5 +107,36 @@ extension Application {
                                      peer: SocketPeer(address: remoteAddress, port: remotePort), secure: false,
                                      http2: limits.http2.enabled ? HTTP2Service.forTesting(runtime) : nil,
                                      halves: halves, close: { _ in }, closeWriter: { _ in })
+    }
+}
+
+/// HTTP/3 for `app` on a UDP socket of 127.0.0.1, served as a shard serves
+/// it: for a test that needs whole connections over a real socket, such as
+/// the `h3` fuzz target. `prepareForTesting` must have been called.
+@_spi(Testing)
+public final class HTTP3TestServer: @unchecked Sendable {
+    let service: HTTP3Service
+    /// The port it is listening on.
+    public let port: Int
+
+    public init(_ app: Application, config: ServerConfig, on runtime: Runtime,
+                certificate: CertificateKey) throws {
+        guard let compiled = app.compiledApplication else {
+            preconditionFailure("HTTP3TestServer before prepareForTesting")
+        }
+        try app.startForTesting(on: runtime)
+        let service = HTTP3Service(runtime: runtime, app: compiled, limits: ConnectionLimits(config),
+                                   certificates: { [certificate] })
+        self.service = service
+        port = try runtime.block { () async throws -> Int in
+            try service.start(host: "127.0.0.1", port: 0, count: 1)
+        }
+    }
+
+    /// Closes every connection at once and returns when the endpoint has
+    /// ended.
+    public func stop() async {
+        service.shutdown(grace: .zero)
+        await service.wait()
     }
 }
