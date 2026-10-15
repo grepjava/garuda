@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Router routes over HTTP/2, against an independent client.
+"""Router routes over HTTP/2 and HTTP/3, against independent clients.
 
     <venv>/bin/python scripts/router-streams-test.py [path-to-garuda]
 
 The routes answer at the dispatch seam whatever the protocol. What this checks
 is that a stream gets the answers a connection does -- a body where the route
 has one, a delay that waits on its timer -- and that a stream abandoned while
-it waits leaves nothing behind: no late response, no stuck task. The client is
-the `h2` library, which shares no code with the server. The server is Garuda
-2's `garuda` binary (Sources/garuda-server), which serves GET /, GET
-/user/:id, POST /user and GET /delay/:ms.
+it waits leaves nothing behind: no late response, no stuck task. The clients
+are the `h2` library and aioquic, which share no code with the server. The
+server is Garuda 2's `garuda` binary (Sources/garuda-server), which serves GET
+/, GET /user/:id, POST /user and GET /delay/:ms.
 
-Garuda 1's copy of this script also ran every check over HTTP/3 with aioquic,
-and limited the server with --max-connections. Garuda 2 has neither yet
-(HTTP/3 is phase P6), so those parts are left out until it does.
+Garuda 1's copy also limited the server with --max-connections, which Garuda 2
+does not have, and sent extended CONNECTs over HTTP/3, which Garuda 2 does not
+offer yet (WebSockets and WebTransport over HTTP/3 come with them).
 
-Needs `h2` in the interpreter running it:  pip install h2
+Needs `h2` and `aioquic` in the interpreter running it:  pip install h2 aioquic
 """
 
+import asyncio
 import os
 import socket
 import ssl
@@ -31,12 +32,20 @@ try:
     import h2.connection
     import h2.errors
     import h2.events
+    from aioquic.asyncio.client import connect
+    from aioquic.asyncio.protocol import QuicConnectionProtocol
+    from aioquic.h3.connection import H3Connection
+    from aioquic.h3.events import DataReceived, HeadersReceived
+    from aioquic.quic.configuration import QuicConfiguration
 except ImportError:
-    sys.stderr.write("this script needs h2: pip install h2\n")
+    sys.stderr.write("this script needs h2 and aioquic: pip install h2 aioquic\n")
     raise SystemExit(2)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, ".build", "release", "garuda")
+
+# H3_REQUEST_CANCELLED, RFC 9114 section 8.1.
+H3_REQUEST_CANCELLED = 0x10C
 
 PASS = 0
 FAIL = 0
@@ -88,18 +97,28 @@ def make_certs():
 
 
 def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    # One port serves TLS over TCP and QUIC over UDP, so it has to be free for
+    # both.
+    while True:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tcp = socket.socket()
+        try:
+            udp.bind(("127.0.0.1", 0))
+            port = udp.getsockname()[1]
+            tcp.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            pass
+        finally:
+            tcp.close()
+            udp.close()
 
 
 class Server:
     def __init__(self, *args):
         self.port = free_port()
         cert, key = make_certs()
-        cmd = [BIN, "--port", str(self.port), "--log-level", "error", "--shards", "0",
+        cmd = [BIN, "--port", str(self.port), "--log-level", "error", "--shards", "0", "--http3",
                "--tls-cert", cert, "--tls-key", key] + list(args)
         self.proc = subprocess.Popen(cmd)
         deadline = time.monotonic() + 15
@@ -318,6 +337,175 @@ def h2_abandoned():
         check("the server is still running", server.alive())
 
 
+# -------------------------------------------------------------------- HTTP/3
+
+
+class H3Client(QuicConnectionProtocol):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._http = H3Connection(self._quic)
+        self.status, self.headers, self.body = {}, {}, {}
+        self.started, self.ended = {}, {}
+        self._done = {}
+
+    def request(self, method, path, body=None):
+        stream = self._quic.get_next_available_stream_id()
+        block = [(b":method", method.encode()), (b":scheme", b"https"),
+                 (b":authority", b"localhost"), (b":path", path.encode())]
+        if body is not None:
+            block.append((b"content-length", str(len(body)).encode()))
+        self._http.send_headers(stream_id=stream, headers=block, end_stream=body is None)
+        if body is not None:
+            self._http.send_data(stream_id=stream, data=body, end_stream=True)
+        self.started[stream] = time.monotonic()
+        self._done[stream] = asyncio.get_running_loop().create_future()
+        self.transmit()
+        return stream
+
+    def extended_connect(self, path, protocol):
+        """Opens an extended CONNECT stream, left open as a session would be."""
+        stream = self._quic.get_next_available_stream_id()
+        block = [(b":method", b"CONNECT"), (b":protocol", protocol.encode()),
+                 (b":scheme", b"https"), (b":authority", b"localhost"),
+                 (b":path", path.encode())]
+        self._http.send_headers(stream_id=stream, headers=block, end_stream=False)
+        self.started[stream] = time.monotonic()
+        self._done[stream] = asyncio.get_running_loop().create_future()
+        self.transmit()
+        return stream
+
+    def cancel(self, stream):
+        self._quic.reset_stream(stream, H3_REQUEST_CANCELLED)
+        self.transmit()
+
+    async def collect(self, streams, timeout=15.0):
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(asyncio.shield(self._done[s]) for s in streams)), timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    def quic_event_received(self, event):
+        for http_event in self._http.handle_event(event):
+            if not isinstance(http_event, (HeadersReceived, DataReceived)):
+                continue
+            stream = http_event.stream_id
+            if isinstance(http_event, HeadersReceived):
+                fields = {}
+                for name, value in http_event.headers:
+                    if name == b":status":
+                        self.status[stream] = int(value)
+                    else:
+                        fields[name] = value
+                self.headers[stream] = fields
+            else:
+                self.body[stream] = self.body.get(stream, b"") + http_event.data
+            if http_event.stream_ended:
+                self.ended[stream] = time.monotonic()
+                done = self._done.get(stream)
+                if done is not None and not done.done():
+                    done.set_result(None)
+
+
+def configuration():
+    config = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
+    config.verify_mode = ssl.CERT_NONE
+    return config
+
+
+def h3_connect(server):
+    return connect("127.0.0.1", server.port, configuration=configuration(),
+                   create_protocol=H3Client)
+
+
+async def h3_routes():
+    print("\nHTTP/3: routes")
+    with Server() as server:
+        async with h3_connect(server) as client:
+            root = client.request("GET", "/")
+            user = client.request("GET", "/user/42")
+            create = client.request("POST", "/user", body=b"name=garuda")
+            missing = client.request("GET", "/nope")
+            await client.collect([root, user, create, missing])
+            is_("GET / is 200", client.status.get(root), 200)
+            is_("GET / has no body", client.body.get(root, b""), b"")
+            is_("GET /user/42 is 200", client.status.get(user), 200)
+            is_("GET /user/42 carries the id", client.body.get(user, b""), b"42")
+            is_("and declares its length",
+                client.headers.get(user, {}).get(b"content-length"), b"2")
+            is_("the server names itself", client.headers.get(user, {}).get(b"server"), b"garuda")
+            is_("POST /user is 200", client.status.get(create), 200)
+            is_("an unknown path is 404", client.status.get(missing), 404)
+
+
+async def h3_delays():
+    print("\nHTTP/3: delays")
+    with Server() as server:
+        async with h3_connect(server) as client:
+            slow = client.request("GET", "/delay/600")
+            fast = client.request("GET", "/delay/200")
+            user = client.request("GET", "/user/7")
+            await client.collect([slow, fast, user])
+            is_("every stream is answered 200",
+                [client.status.get(s) for s in (slow, fast, user)], [200, 200, 200])
+            check("/delay/200 waits at least 200 ms", waited(client, fast) >= 0.2,
+                  waited(client, fast))
+            check("/delay/600 waits at least 600 ms", waited(client, slow) >= 0.6,
+                  waited(client, slow))
+            check("a delay does not hold up the request beside it",
+                  client.ended.get(user, float("inf")) < client.ended.get(fast, float("inf")))
+            check("the shorter delay finishes first",
+                  client.ended.get(fast, float("inf")) < client.ended.get(slow, float("inf")))
+
+            streams = [client.request("GET", "/delay/100") for _ in range(50)]
+            await client.collect(streams)
+            is_("fifty delays on one connection all answer 200",
+                [client.status.get(s) for s in streams], [200] * 50)
+
+
+async def h3_cancellation():
+    print("\nHTTP/3: cancellation")
+    with Server() as server:
+        async with h3_connect(server) as client:
+            doomed = client.request("GET", "/delay/1000")
+            await asyncio.sleep(0.1)
+            client.cancel(doomed)
+            after = client.request("GET", "/user/9")
+            await client.collect([after])
+            is_("the connection serves on after a cancelled delay", client.body.get(after), b"9")
+            await asyncio.sleep(1.3)
+            check("the cancelled delay never answers", doomed not in client.status,
+                  client.status.get(doomed))
+            again = client.request("GET", "/")
+            await client.collect([again])
+            is_("nor does its timer disturb the connection", client.status.get(again), 200)
+
+
+async def h3_abandoned():
+    print("\nHTTP/3: abandoned delays")
+    # Twelve rounds of forty delays, half of them hung up on as their timers
+    # fire, would exhaust a server that leaked its requests' tasks or streams.
+    with Server() as server:
+        for round_ in range(12):
+            delay = 3000 if round_ % 2 else 150
+            async with h3_connect(server) as client:
+                for _ in range(40):
+                    client.request("GET", "/delay/%d" % delay)
+                await asyncio.sleep(0.15)
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)
+        async with h3_connect(server) as client:
+            streams = [client.request("GET", "/delay/100") for _ in range(40)]
+            await client.collect(streams)
+            is_("a fresh connection's delays all answer 200",
+                [client.status.get(s) for s in streams], [200] * 40)
+        check("the server is still running", server.alive())
+
+
+def run(coro):
+    asyncio.run(asyncio.wait_for(coro, timeout=120))
+
+
 def main():
     if not os.path.exists(BIN):
         raise SystemExit("no server binary at %s" % BIN)
@@ -325,6 +513,10 @@ def main():
     h2_delays()
     h2_cancellation()
     h2_abandoned()
+    run(h3_routes())
+    run(h3_delays())
+    run(h3_cancellation())
+    run(h3_abandoned())
     print("\n%d passed, %d failed" % (PASS, FAIL))
     raise SystemExit(1 if FAIL else 0)
 
