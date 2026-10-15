@@ -309,9 +309,14 @@ final class H3Connection {
         if id == peerControl {
             readControl(stream)
         } else if id == peerEncoder {
-            // With a table capacity of zero the peer has nothing legitimate
-            // to say here, and saying it anyway is an error, not noise.
-            if stream.receive.ready.readableBytes > 0 { return fail(HTTP3Error.qpackEncoderStreamError) }
+            // With a table capacity of zero the peer has only one thing it
+            // may say here: Set Dynamic Table Capacity to zero, 0x20 (RFC
+            // 9204 section 4.3.1). Anything else is an error, not noise.
+            let ready = stream.receive.ready
+            for i in 0..<ready.readableBytes where ready.readPointer[i] != 0x20 {
+                return fail(HTTP3Error.qpackEncoderStreamError)
+            }
+            stream.receive.ready.clear()
         } else if id == peerDecoder {
             // Acknowledgements for a table we never fill.
             stream.receive.ready.clear()
@@ -420,7 +425,7 @@ final class H3Connection {
                 return adopt(id, sessionID: sessionID, bidirectional: true, prefix: r.offset)
             }
         }
-        while true {
+        reading: while true {
             let available = stream.receive.ready.readableBytes
             if available == 0 { break }
             // Mid-frame: DATA, or a frame being skipped, continues into
@@ -454,7 +459,7 @@ final class H3Connection {
                     }
                     return
                 }
-                if available &- header < length { return extend(stream, s) }
+                if available &- header < length { break reading }
                 if let current = s {
                     // A second HEADERS is the trailer section, and the last
                     // thing on the stream: nothing downstream wants it, but
@@ -463,11 +468,16 @@ final class H3Connection {
                         return fail(HTTP3Error.frameUnexpected)
                     }
                     var decoded = true
+                    var tooLarge = false
                     do {
                         try decoder.decode(base + header, length) { _ in }
+                    } catch QPACKError.tooLarge {
+                        tooLarge = true
                     } catch {
                         decoded = false
                     }
+                    // Too large is the request's failing, as its head's is.
+                    if tooLarge { return abort(current, code: HTTP3Error.excessiveLoad) }
                     if !decoded { return fail(HTTP3Error.qpackDecompressionFailed) }
                     current.trailersSeen = true
                     stream.receive.ready.consume(header &+ length)
@@ -503,16 +513,15 @@ final class H3Connection {
                 } else if available &- header >= length {
                     stream.receive.ready.consume(header &+ length)
                 } else {
-                    if length > settings.streamWindow { refuse(id, code: HTTP3Error.excessiveLoad) }
-                    return
+                    if header &+ length > settings.streamWindow { return refuse(id, code: HTTP3Error.excessiveLoad) }
+                    break reading
                 }
             }
         }
         guard let current = s else {
-            // Ended without a request (RFC 9114 section 4.1).
-            if stream.receive.finished && stream.receive.ready.readableBytes == 0 {
-                refuse(id, code: HTTP3Error.requestIncomplete)
-            }
+            // Ended without a request (RFC 9114 section 4.1): nothing, or a
+            // frame the end cut short.
+            if stream.receive.finished { refuse(id, code: HTTP3Error.requestIncomplete) }
             return
         }
         guard current.inTable else { return }
@@ -525,6 +534,8 @@ final class H3Connection {
             if let inbound = current.inbound { extendTunnel(current, inbound) }
             return
         }
+        // A frame the stream's end cut short (RFC 9114 section 7.1).
+        if stream.receive.finished && stream.receive.ready.readableBytes > 0 { return fail(HTTP3Error.frameError) }
         if stream.receive.finished && stream.receive.ready.readableBytes == 0 && (current.receiving || current.refused) {
             if current.frameRemaining > 0 { return fail(HTTP3Error.frameError) }
             if current.refused {
@@ -588,11 +599,31 @@ final class H3Connection {
             return nil
         }
         let s = take(id)
+        var tooLarge = false
         let outcome = buildRequestHead(s.x, into: &s.head, cookies: &cookies, limits: endpoint.limits,
                                        acceptsConnectProtocol: true, major: 3) { field throws in
-            try decoder.decode(block, length, field)
+            do {
+                try decoder.decode(block, length, field)
+            } catch QPACKError.tooLarge {
+                tooLarge = true
+                throw QPACKError.tooLarge
+            }
         }
         switch outcome {
+        case .compression where tooLarge:
+            // Past the field section size. With no dynamic table there is no
+            // compressor state to lose, so it is this request's failing, not
+            // the connection's: answered 431, as on HTTP/1.1, and whatever
+            // follows on the stream dropped.
+            streams[id] = s
+            s.inTable = true
+            if Int64(id) > highestRequest { highestRequest = Int64(id) }
+            s.refused = true
+            s.x.pointee.answer(431, nil, 0)
+            endpoint.frameWhole(s, headParsed: false)
+            endpoint.lock.withLock { _ in s.answerReady = true }
+            pump(s)
+            return s
         case .compression:
             recycle(s)
             fail(HTTP3Error.qpackDecompressionFailed)

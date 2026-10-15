@@ -297,12 +297,13 @@ extension QUICEndpoint {
     }
 
     /// Frames `s`'s whole answer: the HEADERS frame and the DATA frame's
-    /// header in `outHead`, the body left in the exchange.
-    func frameWhole(_ s: H3Stream) {
+    /// header in `outHead`, the body left in the exchange. `headParsed`:
+    /// false for an answer to a request whose head could not be read.
+    func frameWhole(_ s: H3Stream, headParsed: Bool = true) {
         let count = prepareAnswer(s.x)
         s.bodyLength = count
         s.outHead.clear()
-        encodeHead(s, streamed: false, declared: -1, into: &s.outHead)
+        encodeHead(s, streamed: false, declared: -1, headParsed: headParsed, into: &s.outHead)
         if count > 0 {
             s.outHead.writeVarint(HTTP3FrameType.data)
             s.outHead.writeVarint(UInt64(count))
@@ -356,7 +357,8 @@ extension QUICEndpoint {
     /// content-length added, the headers that frame an HTTP/1 message or
     /// manage its connection dropped. A streamed answer's length is the one
     /// its handler declared, if it did.
-    func encodeHead(_ s: H3Stream, streamed: Bool, declared: Int, into out: inout ByteBuffer) {
+    func encodeHead(_ s: H3Stream, streamed: Bool, declared: Int, headParsed: Bool = true,
+                    into out: inout ByteBuffer) {
         let x = s.x
         // `Response.onSend` hooks see the answer once it is final, while it
         // can still change (ResponseHooks.swift).
@@ -401,7 +403,7 @@ extension QUICEndpoint {
         out.writeVarint(HTTP3FrameType.headers)
         out.writeVarint(UInt64(s.block.readableBytes))
         out.write(s.block.readPointer, s.block.readableBytes)
-        if observing { reportAnswer(x, limits: limits, status: status) }
+        if observing { reportAnswer(x, limits: limits, status: status, headParsed: headParsed) }
     }
 }
 

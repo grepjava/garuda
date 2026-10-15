@@ -30,6 +30,7 @@ func h3App() -> Application {
         let body = response.stream(contentType: "text/plain")
         for i in 1...3 { try await body.write("line \(i)\n") }
     }
+    app.get("/big") { _, response in response.send(String(repeating: "a", count: 30_000)) }
     app.get("/delay/:ms") { request, response in
         try await Runtime.sleep(for: .milliseconds(Int(request.parameter(0)) ?? 1))
         response.send(status: .ok)
@@ -155,30 +156,26 @@ final class H3Client: @unchecked Sendable {
                 at += n
             } while at < body.count
         }
-        // In packets that fit a datagram, as a client's must.
-        var at = 0
-        repeat {
-            let n = min(1000, frames.count - at)
-            let last = at + n == frames.count
-            try await send(try peer.packet(.application, peer.ack(.application)
-                + streamFrame(id, offset: at, Array(frames[at..<(at + n)]), fin: fin && last)))
-            at += n
-        } while at < frames.count
-        offsets[id] = frames.count
+        try await sendStream(id, frames, fin: fin)
     }
 
-    /// `bytes` on stream `id`, after whatever was sent on it before.
-    func write(_ id: UInt64, _ bytes: [UInt8], fin: Bool = false) async throws {
+    /// `bytes` on stream `id` from `offset`, in packets that fit a
+    /// datagram, as a client's must.
+    func sendStream(_ id: UInt64, _ bytes: [UInt8], offset: Int = 0, fin: Bool) async throws {
         var at = 0
-        let base = offsets[id] ?? 0
         repeat {
             let n = min(1000, bytes.count - at)
             let last = at + n == bytes.count
             try await send(try peer.packet(.application, peer.ack(.application)
-                + streamFrame(id, offset: base + at, Array(bytes[at..<(at + n)]), fin: fin && last)))
+                + streamFrame(id, offset: offset + at, Array(bytes[at..<(at + n)]), fin: fin && last)))
             at += n
         } while at < bytes.count
-        offsets[id] = base + bytes.count
+        offsets[id] = offset + bytes.count
+    }
+
+    /// `bytes` on stream `id`, after whatever was sent on it before.
+    func write(_ id: UInt64, _ bytes: [UInt8], fin: Bool = false) async throws {
+        try await sendStream(id, bytes, offset: offsets[id] ?? 0, fin: fin)
     }
 
     /// One DATAGRAM frame (RFC 9221).
@@ -502,6 +499,84 @@ struct HTTP3Tests {
             let differs = try await client.get(4, "/", headers: [("host", "elsewhere")])
             #expect(differs.reset == HTTP3Error.messageError)
             #expect(try await client.get(8, "/user/still").text == "still")
+        }
+    }
+
+    @Test func aHeadTooLargeIsAnswered431AndTheConnectionGoesOn() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            // Past the 32 KiB field section size once decoded.
+            let answer = try await client.get(0, "/", headers: [("x-big", String(repeating: "a", count: 40_000))])
+            #expect(answer.status == 431)
+            #expect(client.peer.closeCode == nil)
+            #expect(try await client.get(4, "/user/after").text == "after")
+        }
+    }
+
+    @Test func trailersTooLargeResetTheirRequestAlone() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            let frames = headersFrame([(":method", "POST"), (":scheme", "https"), (":authority", "localhost"),
+                                       (":path", "/echo")])
+                + hsVarint(0) + hsVarint(3) + [1, 2, 3]
+                + headersFrame([("x-big", String(repeating: "a", count: 40_000))])
+            try await client.sendStream(0, frames, fin: true)
+            #expect(try await client.answer(0).reset == HTTP3Error.excessiveLoad)
+            #expect(client.peer.closeCode == nil)
+            #expect(try await client.get(4, "/user/after").text == "after")
+        }
+    }
+
+    @Test func anEncoderStreamMaySetTheTableCapacityToZeroAndNothingElse() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            // The client's encoder stream: its type, then Set Dynamic Table
+            // Capacity to zero, twice.
+            try await client.sendStream(2, [0x02, 0x20, 0x20], fin: false)
+            #expect(try await client.get(0, "/user/fine").text == "fine")
+            #expect(client.peer.closeCode == nil)
+            // A capacity of one, past the zero the server allows.
+            try await client.sendStream(2, [0x21], offset: 3, fin: false)
+            try await client.pump { client.peer.closeCode != nil }
+            #expect(client.peer.closeCode == HTTP3Error.qpackEncoderStreamError)
+        }
+    }
+
+    @Test func aStreamThatEndsMidFrameOrCannotFitItsFrameIsRefused() throws {
+        let config = h3Config { $0.h2InitialWindowSize = 16_384 }
+        try withServer(h3App(), config) { client, _ in
+            try await client.connect()
+            // A frame header the stream's end cuts off: HEADERS' type alone.
+            try await client.sendStream(0, [0x01], fin: true)
+            #expect(try await client.answer(0).reset == HTTP3Error.requestIncomplete)
+            // A HEADERS frame cut short.
+            let head = headersFrame([(":method", "GET"), (":scheme", "https"), (":authority", "localhost"),
+                                     (":path", "/")])
+            try await client.sendStream(4, Array(head.dropLast(2)), fin: true)
+            #expect(try await client.answer(4).reset == HTTP3Error.requestIncomplete)
+            // An unknown frame ahead of the request that fits the window by
+            // its length, but not with its header too.
+            try await client.sendStream(8, hsVarint(0x21) + hsVarint(16_383), fin: false)
+            #expect(try await client.answer(8).reset == HTTP3Error.excessiveLoad)
+            #expect(try await client.get(12, "/user/after").text == "after")
+        }
+    }
+
+    @Test func aConnectionCutShortOfItsTurnGoesOnAtOnce() throws {
+        try withServer(h3App()) { client, service in
+            try await client.connect()
+            for endpoint in service.endpoints { endpoint.datagramsPerTurn = 1 }
+            try await client.request(0, [(":method", "GET"), (":scheme", "https"), (":authority", "localhost"),
+                                         (":path", "/big")])
+            // Nothing is acknowledged, so what arrives the server sent on
+            // its own: the rest of its congestion window, at once, not a
+            // datagram a probe timeout (25 ms of ack delay and more).
+            guard try await client.receiveOne(timeout: .seconds(2)) != nil else {
+                throw QUICTestPeerError("no answer")
+            }
+            var count = 1
+            while try await client.receiveOne(timeout: .milliseconds(10)) != nil { count += 1 }
+            #expect(count >= 4)
         }
     }
 
