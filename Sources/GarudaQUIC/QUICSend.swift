@@ -64,10 +64,10 @@ extension QUICConnection {
         var budget = min(capacity, recovery.maxDatagramSize)
         if !addressValidated {
             let allowance = 3 * bytesReceived - bytesSent
-            if allowance <= 0 { return 0 }
+            if allowance <= 0 { return closeUnsendable(nowMs: nowMs) }
             budget = min(budget, allowance)
         }
-        if budget < 64 { return 0 }
+        if budget < 64 { return closeUnsendable(nowMs: nowMs) }
 
         // A closing connection sends nothing but its close, and sends it
         // sparingly: the peer may not have heard, but repeating it on every
@@ -575,10 +575,10 @@ extension QUICConnection {
         if !keys[QUICLevel.application.rawValue].send.isValid || !handshakeComplete {
             level = keys[QUICLevel.handshake.rawValue].send.isValid ? .handshake : .initial
         }
-        guard keys[level.rawValue].send.isValid else { return 0 }
+        guard keys[level.rawValue].send.isValid else { return closeUnsendable(nowMs: nowMs) }
 
         guard var packet = buildCloseFrame(level: level, out: out, limit: budget) else {
-            return 0
+            return closeUnsendable(nowMs: nowMs)
         }
         if level != .application {
             let length = packet.pnLength + packet.payloadLength + quicAEADTagLength
@@ -590,7 +590,7 @@ extension QUICConnection {
                                             packetNumber: packet.packetNumber,
                                             keys: keys[level.rawValue].send.keys,
                                             header: keys[level.rawValue].send.header)
-        else { return 0 }
+        else { return closeUnsendable(nowMs: nowMs) }
         spaces[level.rawValue].nextPacketNumber += 1
         closeFramePending = false
         closeSentAtMs = nowMs
@@ -598,6 +598,18 @@ extension QUICConnection {
         bytesSent += sealed
         packet.payloadLength = 0
         return sealed
+    }
+
+    /// A close that cannot be sent -- no keys, or no allowance left before
+    /// the peer's address is validated -- is given up on as if it had been:
+    /// the draining period starts now, rather than the connection waiting
+    /// for ever on a close it can never send.
+    private func closeUnsendable(nowMs: UInt64) -> Int {
+        if status == .closing && closeFramePending {
+            closeFramePending = false
+            closeSentAtMs = nowMs
+        }
+        return 0
     }
 
     private func buildCloseFrame(level: QUICLevel, out: UnsafeMutablePointer<UInt8>,
@@ -696,6 +708,9 @@ extension QUICConnection {
     public func nextTimeout(nowMs: UInt64) -> UInt64? {
         if status == .drained { return nil }
         if status == .closing {
+            // A close not yet sent is due at the next send, not at a timer:
+            // the draining period starts once it has gone.
+            if closeFramePending && !closeWasReceived { return nil }
             return closeSentAtMs + 3 * recovery.ptoMs(includeMaxAckDelay: true)
         }
 
@@ -738,6 +753,7 @@ extension QUICConnection {
     public func onTimeout(nowMs: UInt64) {
         if status == .drained { return }
         if status == .closing {
+            if closeFramePending && !closeWasReceived { return }
             if nowMs >= closeSentAtMs + 3 * recovery.ptoMs(includeMaxAckDelay: true) {
                 status = .drained
             }
