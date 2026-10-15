@@ -55,7 +55,13 @@ func serveDirectory(_ x: UnsafeMutablePointer<Exchange>, _ site: StaticSite, _ r
         segments.append(segment)
     }
     guard let root = try? await FileSystem.canonicalPath(route.directory) else { return false }
-    let directory = segments.isEmpty ? root : root + "/" + segments.joined(separator: "/")
+    #if os(Windows)
+    // What canonicalPath gives back there: backslashes.
+    let separator = "\\"
+    #else
+    let separator = "/"
+    #endif
+    let directory = segments.isEmpty ? root : root + separator + segments.joined(separator: separator)
     guard let resolved = try? await FileSystem.canonicalPath(directory), resolved == directory,
           let metadata = try? await FileSystem.metadata(directory, followingSymbolicLinks: false),
           metadata.isDirectory else {
