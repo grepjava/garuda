@@ -525,6 +525,26 @@ struct HTTP3Tests {
         }
     }
 
+    @Test func aStreamThatEndsMidFrameOrCannotFitItsFrameIsRefused() throws {
+        let config = h3Config { $0.h2InitialWindowSize = 16_384 }
+        try withServer(h3App(), config) { client, _ in
+            try await client.connect()
+            // A frame header the stream's end cuts off: HEADERS' type alone.
+            try await client.sendStream(0, [0x01], fin: true)
+            #expect(try await client.answer(0).reset == HTTP3Error.requestIncomplete)
+            // A HEADERS frame cut short.
+            let head = headersFrame([(":method", "GET"), (":scheme", "https"), (":authority", "localhost"),
+                                     (":path", "/")])
+            try await client.sendStream(4, Array(head.dropLast(2)), fin: true)
+            #expect(try await client.answer(4).reset == HTTP3Error.requestIncomplete)
+            // An unknown frame ahead of the request that fits the window by
+            // its length, but not with its header too.
+            try await client.sendStream(8, hsVarint(0x21) + hsVarint(16_383), fin: false)
+            #expect(try await client.answer(8).reset == HTTP3Error.excessiveLoad)
+            #expect(try await client.get(12, "/user/after").text == "after")
+        }
+    }
+
     @Test func aStreamedAnswerEndsWithTheStream() throws {
         try withServer(h3App()) { client, _ in
             try await client.connect()

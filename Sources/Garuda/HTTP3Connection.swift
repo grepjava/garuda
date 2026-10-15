@@ -342,7 +342,7 @@ final class H3Connection {
             return
         }
         var s = streams[id]
-        while true {
+        reading: while true {
             let available = stream.receive.ready.readableBytes
             if available == 0 { break }
             // Mid-frame: DATA, or a frame being skipped, continues into
@@ -376,7 +376,7 @@ final class H3Connection {
                     }
                     return
                 }
-                if available &- header < length { return extend(stream, s) }
+                if available &- header < length { break reading }
                 if let current = s {
                     // A second HEADERS is the trailer section, and the last
                     // thing on the stream: nothing downstream wants it, but
@@ -428,19 +428,20 @@ final class H3Connection {
                 } else if available &- header >= length {
                     stream.receive.ready.consume(header &+ length)
                 } else {
-                    if length > settings.streamWindow { refuse(id, code: HTTP3Error.excessiveLoad) }
-                    return
+                    if header &+ length > settings.streamWindow { return refuse(id, code: HTTP3Error.excessiveLoad) }
+                    break reading
                 }
             }
         }
         guard let current = s else {
-            // Ended without a request (RFC 9114 section 4.1).
-            if stream.receive.finished && stream.receive.ready.readableBytes == 0 {
-                refuse(id, code: HTTP3Error.requestIncomplete)
-            }
+            // Ended without a request (RFC 9114 section 4.1): nothing, or a
+            // frame the end cut short.
+            if stream.receive.finished { refuse(id, code: HTTP3Error.requestIncomplete) }
             return
         }
         guard current.inTable else { return }
+        // A frame the stream's end cut short (RFC 9114 section 7.1).
+        if stream.receive.finished && stream.receive.ready.readableBytes > 0 { return fail(HTTP3Error.frameError) }
         if stream.receive.finished && stream.receive.ready.readableBytes == 0 && (current.receiving || current.refused) {
             if current.frameRemaining > 0 { return fail(HTTP3Error.frameError) }
             if current.refused {
