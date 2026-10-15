@@ -156,7 +156,9 @@ let package = Package(
                           dependencies: ["Garuda", "GarudaJSON", "GarudaPostgres", "GarudaSQL", vega("Vega")],
                           path: "Sources/garuda-server",
                           swiftSettings: sharedSwiftSettings),
-        .executableTarget(name: "garuda-conformance", dependencies: ["Garuda", vega("Vega"), vega("VegaExtras")],
+        .executableTarget(name: "garuda-conformance",
+                          dependencies: ["Garuda", "GarudaUploads", vega("Vega"), vega("VegaExtras"),
+                                         vega("VegaFS")],
                           path: "Sources/garuda-conformance",
                           swiftSettings: sharedSwiftSettings),
 

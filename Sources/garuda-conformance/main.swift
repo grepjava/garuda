@@ -11,6 +11,7 @@
 //   /broadcast/...               scripts/broadcast-test.py (BroadcastRoutes.swift)
 //   /ws/...                      scripts/websocket-test.py (WebSocketRoutes.swift)
 //   /wt...                       scripts/webtransport-test.py (WebTransportRoutes.swift)
+//   /body-..., /files, /uploads  scripts/upload-test.py (UploadRoutes.swift)
 //
 // One shard unless the command line asks for more: a script reads back what
 // a handler saw on the shard it ran on.
@@ -29,6 +30,7 @@ addCacheRoutes(app)
 addBroadcastRoutes(app)
 addWebSocketRoutes(app)
 addWebTransportRoutes(app)
+addUploadRoutes(app)
 
 let arguments = CommandLine.arguments
 let sharded = arguments.contains { $0 == "--shards" || $0 == "--workers" }
