@@ -28,10 +28,12 @@
 // write, or with `flush()`: a handler that has something to say soon says
 // it in the same write as the head.
 //
-// A write returns once its bytes are on their way, unless what is still
-// waiting to go out has passed `ServerConfig.writeHighWaterMark`. Then it
-// waits until that has fallen to `writeLowWaterMark`: a client that reads
-// slowly slows the handler writing to it and nothing else. Writers in child
+// A write queues its bytes and returns, unless what is still waiting to go
+// out has passed `ServerConfig.writeHighWaterMark`. Then it waits until that
+// has fallen to `writeLowWaterMark`: a client that reads slowly slows the
+// handler writing to it and nothing else. What is queued goes out once the
+// handler next waits or returns -- over HTTP/1 a run of writes is one system
+// call, as an answer is -- or at once with `flush()`. Writers in child
 // tasks of the handler may write at once, and every one of them waits. A
 // client that goes away, or takes no part of one write for
 // `ServerConfig.writeTimeout`, ends every write with
@@ -364,6 +366,11 @@ final class BodyChannel: @unchecked Sendable {
     /// A writer is taking the queue out, and this much is in its hands.
     private var flushing = false
     private var inFlight = 0
+    /// A flush is spawned to take the queue out and has not begun.
+    private var flushSpawned = false
+    /// The handler has returned and the connection has the stream back:
+    /// a spawned flush that begins now takes nothing.
+    private var detached = false
     /// Writers waiting for the backlog to fall.
     private var waiters: [UnsafeContinuation<Bool, Never>] = []
     private let timeout: Duration
@@ -536,6 +543,7 @@ final class BodyChannel: @unchecked Sendable {
         case .sent: break
         }
         if let h2 { return try await settleH2(h2, force: force) }
+        if !force, let runtime, deferFlush(runtime) { return }
         while true {
             switch await drain() {
             case .done: return
@@ -563,6 +571,29 @@ final class BodyChannel: @unchecked Sendable {
         }
     }
 
+    /// Over HTTP/1, a write that leaves the backlog under the high-water
+    /// mark: true when it may return without writing, a flush spawned to
+    /// take the queue out once this task waits or returns, unless one is
+    /// already on its way. The handler's run of writes then goes in one
+    /// system call rather than one each.
+    private func deferFlush(_ runtime: Runtime) -> Bool {
+        let spawn = lock.withLock { _ -> Bool? in
+            guard state == .open, !detached, pending.readableBytes &+ inFlight <= high else { return nil }
+            // A writer taking the queue out takes this too.
+            if flushing || flushSpawned { return false }
+            flushSpawned = true
+            return true
+        }
+        guard let spawn else { return false }
+        if spawn {
+            runtime.spawn { [self] in
+                lock.withLock { _ in flushSpawned = false }
+                _ = await drain()
+            }
+        }
+        return true
+    }
+
     private enum Drain { case done, busy, failed }
     private enum Take { case take(ByteBuffer), empty, busy, failed }
 
@@ -572,6 +603,7 @@ final class BodyChannel: @unchecked Sendable {
         guard let held else { return .done }
         var buffer: ByteBuffer
         switch lock.withLock({ _ -> Take in
+            if detached { return .empty }
             if state == .failed && pending.readableBytes == 0 { return .failed }
             if flushing { return .busy }
             if pending.readableBytes == 0 { return .empty }
@@ -706,25 +738,28 @@ final class BodyChannel: @unchecked Sendable {
             }
             capture = nil
         }
-        // A writer the handler left behind -- a keep-alive comment, a task
-        // not its child -- may still be taking the queue out: the
-        // connection writes nothing until it is done.
+        // A writer the handler left behind -- a spawned flush, a keep-alive
+        // comment, a task not its child -- may still be taking the queue
+        // out: the connection writes nothing until it is done. Then what is
+        // queued goes with the connection's own output, and a flush that
+        // has yet to begin finds nothing to take.
         while true {
             let waited = await withUnsafeContinuation { (c: UnsafeContinuation<Bool, Never>) in
                 let parked = lock.withLock { _ -> Bool in
-                    guard flushing else { return false }
-                    waiters.append(c)
-                    return true
+                    if flushing {
+                        waiters.append(c)
+                        return true
+                    }
+                    detached = true
+                    if pending.readableBytes > 0 {
+                        parts.pointee.output.write(pending.readPointer, pending.readableBytes)
+                        pending.clear()
+                    }
+                    return false
                 }
                 if !parked { c.resume(returning: false) }
             }
             if !waited { break }
-        }
-        lock.withLock { _ in
-            if pending.readableBytes > 0 {
-                parts.pointee.output.write(pending.readPointer, pending.readableBytes)
-                pending.clear()
-            }
         }
         wakeWaiters(drained: false)
         return keep
