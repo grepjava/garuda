@@ -99,8 +99,12 @@ final class ConnectionCache: @unchecked Sendable {
     func give(_ p: UnsafeMutablePointer<ConnectionParts>, limits: ConnectionLimits) {
         // Parts whose buffers grew past this are freed rather than kept.
         let keepUpTo = max(limits.readBufferSize, 16 * 1024) * 4
+        let x = p.pointee.exchange
         let small = p.pointee.input.capacity <= keepUpTo && p.pointee.output.allocatedCapacity <= keepUpTo
-            && p.pointee.exchange.pointee.decodedBody.allocatedCapacity <= keepUpTo
+            && x.pointee.decodedBody.allocatedCapacity <= keepUpTo
+            && x.pointee.responseBody.allocatedCapacity <= keepUpTo
+            && x.pointee.compressed.allocatedCapacity <= keepUpTo
+            && x.pointee.cacheScratch.allocatedCapacity <= keepUpTo
         guard small, let w = Runtime.currentWorker, w < ConnectionCache.maxWorkers,
               counts[w] < ConnectionCache.depth else {
             free(p)
