@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Testing
 import GarudaSQLite
@@ -75,7 +77,7 @@ struct AuthExampleTests {
     @Test func aWeakerHashIsUpgradedAtLogin() throws {
         // Signed up when the iteration count was lower; logging in under a
         // higher one stores a new hash.
-        let path = "/tmp/garuda-auth-example-\(getpid()).db"
+        let path = "\(scratchRoot)/garuda-auth-example-\(getpid()).db"
         defer { for suffix in ["", "-wal", "-shm"] { unlink(path + suffix) } }
         do {
             let before = authApp(databasePath: path, iterations: 1_000).test

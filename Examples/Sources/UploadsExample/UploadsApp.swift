@@ -50,6 +50,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 
 import Garuda
@@ -100,9 +102,16 @@ public func uploadsApp(_ configuration: UploadsConfiguration) -> Application {
     // Before the server starts, so on no worker thread: plain mkdir will do.
     for path in [configuration.directory, configuration.uploadDirectory,
                  configuration.photoDirectory] {
+        #if os(Windows)
+        // ucrt's mkdir takes no mode, and its errno is behind a function.
+        if _mkdir(path) != 0 && _errno().pointee != EEXIST {
+            fatalError("cannot make \(path): errno \(_errno().pointee)")
+        }
+        #else
         if mkdir(path, 0o755) != 0 && errno != EEXIST {
             fatalError("cannot make \(path): errno \(errno)")
         }
+        #endif
     }
     let store = try! FileUploadStore(directory: configuration.uploadDirectory)
     let settled = configuration

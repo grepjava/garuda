@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Testing
 import Garuda
@@ -11,12 +13,11 @@ import GarudaTesting
 @Suite("Streaming example")
 struct StreamingExampleTests {
     private func directory() -> String {
-        var template = Array("/tmp/garuda-streaming-XXXXXX".utf8CString)
-        return template.withUnsafeMutableBufferPointer { String(cString: mkdtemp($0.baseAddress!)!) }
+        makeScratchDirectory("garuda-streaming")
     }
 
     @Test func aCountdownIsEventsAndThenTheEnd() throws {
-        let client = streamingApp(uploadDirectory: "/tmp", tick: .milliseconds(1)).test
+        let client = streamingApp(uploadDirectory: scratchRoot, tick: .milliseconds(1)).test
         let response = try client.get("/countdown?from=3")
         #expect(response.status == .ok)
         #expect(response.header("content-type")?.hasPrefix("text/event-stream") == true)
@@ -41,7 +42,7 @@ struct StreamingExampleTests {
     }
 
     @Test func anExportIsEveryRow() throws {
-        let client = streamingApp(uploadDirectory: "/tmp").test
+        let client = streamingApp(uploadDirectory: scratchRoot).test
         #expect(try client.get("/export.csv?rows=3").text == "id,square,label\n0,0,row 0\n1,1,row 1\n2,4,row 2\n")
         // Past one batch: every row, in order, none repeated.
         let lines = try client.get("/export.csv?rows=20000").text.split(separator: "\n")
@@ -63,17 +64,8 @@ struct StreamingExampleTests {
         #expect(try client.get("/uploads/data.bin").json(Info.self).bytes == 300_000)
 
         // Read back from disk: the same bytes.
-        let fd = open(dir + "/data.bin", O_RDONLY)
-        #expect(fd >= 0)
-        var back = [UInt8](repeating: 0, count: 400_000)
-        var total = 0
-        while true {
-            let n = back.withUnsafeMutableBytes { read(fd, $0.baseAddress! + total, $0.count - total) }
-            if n <= 0 { break }
-            total += n
-        }
-        close(fd)
-        #expect(total == 300_000 && Array(back[0..<total]) == bytes)
+        let back = fileBytes(dir + "/data.bin")
+        #expect(back == bytes)
         unlink(dir + "/data.bin")
 
         let hidden = Result { try client.put("/uploads/..hidden", body: [1]) }
@@ -83,7 +75,7 @@ struct StreamingExampleTests {
         // Over the limit: refused, and nothing left behind under either name.
         let big = Result { try client.put("/uploads/big", body: [UInt8](repeating: 0, count: 500_000)) }
         #expect((try? big.get())?.status == .contentTooLarge, "\(big)")
-        #expect(access(dir + "/big", F_OK) != 0)
-        #expect(access(dir + "/big.partial", F_OK) != 0)
+        #expect(!fileExists(dir + "/big"))
+        #expect(!fileExists(dir + "/big.partial"))
     }
 }

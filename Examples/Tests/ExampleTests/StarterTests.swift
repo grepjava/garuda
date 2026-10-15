@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Testing
 import GarudaPostgres
@@ -444,7 +446,7 @@ struct StarterConfigurationTests {
     }
 
     @Test func aKeyCanComeFromAFile() throws {
-        let path = "/tmp/starter-key-\(getpid()).pem"
+        let path = "\(scratchRoot)/starter-key-\(getpid()).pem"
         let pem = try #require(try JWTKey.generate(.ES256).privatePEM)
         #expect(pem.withCString { text in
             guard let file = fopen(path, "wb") else { return false }
@@ -456,7 +458,7 @@ struct StarterConfigurationTests {
         #expect(configuration.signingKeyPEM == pem)
 
         do {
-            _ = try StarterConfiguration.fromEnvironment(read(["JWT_PRIVATE_KEY_FILE": "/tmp/nothing-here.pem"]))
+            _ = try StarterConfiguration.fromEnvironment(read(["JWT_PRIVATE_KEY_FILE": "\(scratchRoot)/nothing-here.pem"]))
             Issue.record("a key file that cannot be read should not pass")
         } catch let error as AppEnvironmentError {
             #expect(error.problems[0].contains("cannot be read"))

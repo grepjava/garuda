@@ -30,6 +30,9 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
+import WinSDK
 #endif
 
 import Garuda
@@ -94,12 +97,31 @@ public final class UploadHandle: @unchecked Sendable {
     /// Bytes stored so far, including this handle's appends.
     public private(set) var offset: Int
 
+    #if os(Windows)
+    /// The data file opened again, to read and write, which holds the lock
+    /// and truncates: LockFileEx and setting the end of a file take a handle
+    /// that may write the whole file, and one opened to append may not.
+    private let lock: File
+
+    init(id: String, store: FileUploadStore, file: consuming File, lock: consuming File, offset: Int) {
+        self.id = id
+        self.store = store
+        self.file = file
+        self.lock = lock
+        self.offset = offset
+    }
+
+    private var lockDescriptor: Int32 { lock.descriptor }
+    #else
     init(id: String, store: FileUploadStore, file: consuming File, offset: Int) {
         self.id = id
         self.store = store
         self.file = file
         self.offset = offset
     }
+
+    private var lockDescriptor: Int32 { file.descriptor }
+    #endif
 
     deinit { release() }
 
@@ -128,7 +150,11 @@ public final class UploadHandle: @unchecked Sendable {
         precondition(held, "truncate of a released upload")
         precondition(offset <= self.offset, "truncate can only drop bytes")
         do {
+            #if os(Windows)
+            try await lock.setLength(offset)
+            #else
             try await file.setLength(offset)
+            #endif
         } catch {
             throw UploadStoreError.system("ftruncate", error.code)
         }
@@ -140,7 +166,7 @@ public final class UploadHandle: @unchecked Sendable {
     public func release() {
         if held {
             held = false
-            _ = flock(file.descriptor, LOCK_UN)
+            unlockUpload(lockDescriptor)
         }
     }
 }
@@ -150,7 +176,7 @@ public final class FileUploadStore: Sendable {
     /// Seconds since the epoch, which ages every upload and answer. Tests
     /// set their own, before the store is used: sleeping past a second on
     /// the wall clock fails whenever WSL steps that clock back.
-    let clockSource = Mutex<@Sendable () -> Int>({ Int(time(nil)) })
+    let clockSource = Mutex<@Sendable () -> Int>({ secondsSinceEpoch() })
     /// Names the files written aside before they are renamed into place, so
     /// two tasks of a process never write the same one.
     private let written = Atomic<UInt64>(0)
@@ -168,7 +194,12 @@ public final class FileUploadStore: Sendable {
         var trimmed = directory
         while trimmed.count > 1 && trimmed.hasSuffix("/") { trimmed.removeLast() }
         self.directory = trimmed
-        if mkdir(trimmed, 0o700) != 0 && errno != EEXIST {
+        #if os(Windows)
+        let made = _mkdir(trimmed)
+        #else
+        let made = mkdir(trimmed, 0o700)
+        #endif
+        if made != 0 && errno != EEXIST {
             throw UploadStoreError.system("mkdir", errno)
         }
     }
@@ -231,21 +262,32 @@ public final class FileUploadStore: Sendable {
             if error.code == ENOENT { throw UploadStoreError.notFound }
             throw UploadStoreError.system("open", error.code)
         }
+        #if os(Windows)
+        let lock: File
+        do {
+            lock = try await File.open(dataPath(id), options: File.Options(read: true, write: true))
+        } catch {
+            throw UploadStoreError.system("open", error.code)
+        }
+        let locked = lock.descriptor
+        #else
+        let locked = file.descriptor
+        #endif
         // Never waits: a request holding it may be in another process, and
         // the caller decides how long to wait for it.
-        if flock(file.descriptor, LOCK_EX | LOCK_NB) != 0 {
-            let e = errno
-            if e == EWOULDBLOCK { return nil }
-            throw UploadStoreError.system("flock", e)
-        }
+        guard try lockUpload(locked) else { return nil }
         let size: Int
         do {
             size = try file.metadataNow().size
         } catch {
-            _ = flock(file.descriptor, LOCK_UN)
+            unlockUpload(locked)
             throw UploadStoreError.system("fstat", error.code)
         }
+        #if os(Windows)
+        return UploadHandle(id: id, store: self, file: file, lock: lock, offset: size)
+        #else
         return UploadHandle(id: id, store: self, file: file, offset: size)
+        #endif
     }
 
     /// Records the declared length, or that the upload is whole.
@@ -313,6 +355,9 @@ public final class FileUploadStore: Sendable {
         bytes.append(UInt8(ascii: "\n"))
         bytes += body
         let temporary = asideName(donePath(id))
+        #if os(Windows)
+        try writeReplacing(donePath(id), through: temporary, bytes)
+        #else
         let fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         if fd < 0 { throw UploadStoreError.system("open", errno) }
         var done = 0
@@ -333,6 +378,7 @@ public final class FileUploadStore: Sendable {
             _ = unlink(temporary)
             throw UploadStoreError.system("rename", e)
         }
+        #endif
     }
 
     /// The answer a completed upload was given, or nil for an upload that has
@@ -438,3 +484,83 @@ public final class FileUploadStore: Sendable {
         }
     }
 }
+
+// MARK: - The few calls each platform makes its own way
+
+#if os(Windows)
+/// The C library's errno, which ucrt keeps behind a function.
+private var errno: Int32 { _errno().pointee }
+#endif
+
+/// Seconds since the epoch, from the wall clock.
+private func secondsSinceEpoch() -> Int {
+    #if os(Windows)
+    Int(_time64(nil))
+    #else
+    Int(time(nil))
+    #endif
+}
+
+/// Takes the exclusive lock on an upload's data file without waiting: false
+/// while another request, in this process or another, holds it.
+private func lockUpload(_ descriptor: Int32) throws -> Bool {
+    #if os(Windows)
+    // A byte far past any data, so the lock bars other lockers and never a
+    // reader: Windows' locks are mandatory over the range they cover.
+    var at = OVERLAPPED()
+    at.Offset = 0xFFFF_FFFE
+    at.OffsetHigh = 0x7FFF_FFFF
+    let handle = HANDLE(bitPattern: Int(descriptor))
+    if LockFileEx(handle, DWORD(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY), 0, 1, 0, &at) {
+        return true
+    }
+    let e = GetLastError()
+    if e == DWORD(ERROR_LOCK_VIOLATION) || e == DWORD(ERROR_IO_PENDING) { return false }
+    throw UploadStoreError.system("LockFileEx", Int32(bitPattern: e))
+    #else
+    if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+        let e = errno
+        if e == EWOULDBLOCK { return false }
+        throw UploadStoreError.system("flock", e)
+    }
+    return true
+    #endif
+}
+
+/// Lets the next request take the upload.
+private func unlockUpload(_ descriptor: Int32) {
+    #if os(Windows)
+    var at = OVERLAPPED()
+    at.Offset = 0xFFFF_FFFE
+    at.OffsetHigh = 0x7FFF_FFFF
+    _ = UnlockFileEx(HANDLE(bitPattern: Int(descriptor)), 0, 1, 0, &at)
+    #else
+    _ = flock(descriptor, LOCK_UN)
+    #endif
+}
+
+#if os(Windows)
+/// `bytes` written to `temporary` and moved over `path`, so a reader sees
+/// the old file or the new one: stdio, as ucrt's open is variadic, and
+/// MoveFileExW, as its rename will not replace a file.
+private func writeReplacing(_ path: String, through temporary: String, _ bytes: [UInt8]) throws {
+    guard let file = fopen(temporary, "wb") else { throw UploadStoreError.system("open", errno) }
+    let written = bytes.withUnsafeBufferPointer { fwrite($0.baseAddress, 1, $0.count, file) }
+    let flushed = fclose(file) == 0
+    if written != bytes.count || !flushed {
+        let e = errno
+        _ = remove(temporary)
+        throw UploadStoreError.system("write", e)
+    }
+    let moved = temporary.withCString(encodedAs: UTF16.self) { from in
+        path.withCString(encodedAs: UTF16.self) { to in
+            MoveFileExW(from, to, DWORD(MOVEFILE_REPLACE_EXISTING))
+        }
+    }
+    if !moved {
+        let e = GetLastError()
+        _ = remove(temporary)
+        throw UploadStoreError.system("rename", Int32(bitPattern: e))
+    }
+}
+#endif

@@ -24,6 +24,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 
 import VegaCrypto
@@ -39,6 +41,23 @@ public enum Digest {
     /// workers, on the blocking pool, unless the file is known to be small.
     /// Nil when the file cannot be read.
     public static func sha256(contentsOfFile path: String, chunkSize: Int = 256 * 1024) -> [UInt8]? {
+        #if os(Windows)
+        // ucrt's open is variadic, which Swift cannot call: stdio, in binary.
+        guard let file = fopen(path, "rb") else { return nil }
+        defer { _ = fclose(file) }
+        let hash = SHA256Digest()
+        let chunk = UnsafeMutableRawBufferPointer.allocate(byteCount: max(1, chunkSize), alignment: 1)
+        defer { chunk.deallocate() }
+        while true {
+            let n = fread(chunk.baseAddress!, 1, chunk.count, file)
+            if n == 0 {
+                if ferror(file) != 0 { return nil }
+                break
+            }
+            hash.update(UnsafeRawBufferPointer(start: chunk.baseAddress!, count: n))
+        }
+        return hash.digest()
+        #else
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { return nil }
         defer { _ = close(fd) }
@@ -55,6 +74,7 @@ public enum Digest {
             hash.update(UnsafeRawBufferPointer(start: chunk.baseAddress!, count: n))
         }
         return hash.digest()
+        #endif
     }
 
     /// A digest as `Content-Digest` and `Repr-Digest` carry it:

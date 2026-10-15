@@ -34,6 +34,9 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
+import WinSDK
 #endif
 import Garuda
 import Vega
@@ -52,9 +55,15 @@ private func appendMarker(_ path: String, _ line: String) {
 }
 
 private func wallMicros() -> Int {
+    #if os(Windows)
+    var now = timespec()
+    _ = timespec_get(&now, TIME_UTC)
+    return Int(now.tv_sec) * 1_000_000 + Int(now.tv_nsec) / 1000
+    #else
     var now = timespec()
     clock_gettime(CLOCK_REALTIME, &now)
     return now.tv_sec * 1_000_000 + now.tv_nsec / 1000
+    #endif
 }
 
 private struct HandlerFailure: Error {}
@@ -319,7 +328,11 @@ func addHandlerRoutes(_ app: Application) {
             appendMarker(path, "shutdown \(getpid()) \(stop.shard.index) \(wallMicros())")
         }
         if environment("GARUDA_SHUTDOWN_HANG") != nil {
+            #if os(Windows)
+            while true { Sleep(1000) }
+            #else
             while true { sleep(1) }
+            #endif
         }
     }
 }

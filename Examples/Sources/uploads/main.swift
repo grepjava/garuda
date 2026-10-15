@@ -16,10 +16,17 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import UploadsExample
 
-let directory = getenv("UPLOADS_DIR").map { String(cString: $0) } ?? "/tmp/garuda-uploads"
+#if os(Windows)
+let scratch = getenv("TEMP").map { String(cString: $0) } ?? "C:/Windows/Temp"
+#else
+let scratch = "/tmp"
+#endif
+let directory = getenv("UPLOADS_DIR").map { String(cString: $0) } ?? scratch + "/garuda-uploads"
 let configuration = UploadsConfiguration(directory: directory,
                                          tokens: ["ada-token": "ada", "grace-token": "grace"])
 uploadsApp(configuration).run()
