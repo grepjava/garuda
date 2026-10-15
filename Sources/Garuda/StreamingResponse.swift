@@ -439,12 +439,11 @@ final class BodyChannel: @unchecked Sendable {
         high = limits.high
         low = limits.low
         keepAliveDefault = limits.eventKeepAlive
-        // The head, behind whatever pipelined answers were still to go.
-        let output = parts.pointee.output
-        if output.readableBytes > 0 {
-            pending.write(output.readPointer, output.readableBytes)
-            parts.pointee.output.clear()
-        }
+        // The head, behind whatever pipelined answers were still to go: the
+        // connection's output itself, lent for the body and handed back by
+        // `close`, so that one buffer, grown once, serves every streamed
+        // answer on the connection and the body is never copied across.
+        swap(&pending, &parts.pointee.output)
     }
 
     init(http2 s: H2Stream, bodyless: Bool, declared: Int, encoder: ResponseEncoder? = nil) {
@@ -751,10 +750,14 @@ final class BodyChannel: @unchecked Sendable {
                         return true
                     }
                     detached = true
-                    if pending.readableBytes > 0 {
+                    if parts.pointee.output.readableBytes == 0 {
+                        // The buffer lent goes back, or the one the queue
+                        // moved to: the output's own is the channel's to free.
+                        swap(&pending, &parts.pointee.output)
+                    } else if pending.readableBytes > 0 {
                         parts.pointee.output.write(pending.readPointer, pending.readableBytes)
-                        pending.clear()
                     }
+                    pending.clear()
                     return false
                 }
                 if !parked { c.resume(returning: false) }
