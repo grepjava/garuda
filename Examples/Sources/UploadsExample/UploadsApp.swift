@@ -20,6 +20,10 @@
 // - `resumableUploads` inside `group("/users/:user")`. The upload's URL is
 //   made from the path the client used, so it lands under the same user, and
 //   the upload's id is read after the parameters the group captured.
+// - Middleware in the group: `authenticate(bearer:)` says who the token
+//   belongs to, and a `use` after it says whether that is the user in the
+//   path. Both run before every route of the group, the upload's own routes
+//   among them.
 // - `onCreate`. The request that creates an upload and the one that completes
 //   it are different requests, often minutes apart. The creating one has been
 //   through the group's authentication, so `onCreate` records who it was, and
@@ -30,13 +34,14 @@
 // - Checking what the bytes are. `Content-Type` is the client's word. The
 //   first bytes of the file are the file's, so a PNG is kept only if it
 //   starts like one, and served back with the type that was checked.
-// - `await upload.digest()`, which hashes on the blocking pool: a large file
-//   would otherwise hold up every other request on the worker.
+// - `await upload.digest()`, which hashes on the blocking pool, and VegaFS for
+//   every file the routes touch: a large file would otherwise hold up every
+//   other request on the worker.
 // - An answer with a `Location`. A client whose connection dies as the upload
 //   completes asks the upload's URL again, and is given the same 201 with the
 //   same `Location`, so it still learns where its photo went.
 //
-// Nothing is held in memory, so any number of workers can serve it: uploads
+// Nothing is held in memory, so any number of shards can serve it: uploads
 // live in one directory as they arrive, and a finished photo is renamed into
 // its owner's.
 //===----------------------------------------------------------------------===//
@@ -49,6 +54,8 @@ import Darwin
 
 import Garuda
 import GarudaUploads
+import Vega
+import VegaFS
 
 /// Who a request's bearer token belongs to.
 public enum CurrentUser: RequestContextKey {
@@ -90,25 +97,28 @@ public struct UploadsConfiguration: Sendable {
 /// The photo service. `configuration.directory` is made if it is not there.
 public func uploadsApp(_ configuration: UploadsConfiguration) -> Application {
     let app = Application()
+    // Before the server starts, so on no worker thread: plain mkdir will do.
     for path in [configuration.directory, configuration.uploadDirectory,
                  configuration.photoDirectory] {
-        makeDirectory(path)
+        if mkdir(path, 0o755) != 0 && errno != EEXIST {
+            fatalError("cannot make \(path): errno \(errno)")
+        }
     }
     let store = try! FileUploadStore(directory: configuration.uploadDirectory)
     let settled = configuration
 
-    app.get("/") { () -> HTML in HTML(page) }
+    app.get("/") { HTML(page) }
 
     app.group("/users/:user") {
         app.authenticate(bearer: CurrentUser.self) { token in settled.tokens[token] }
         // A token is good for its own user's routes and nobody else's. The
         // group's `:user` is the request's first parameter.
-        app.use { request, _ in
+        app.use { request, _, next in
             guard request.parameterCount > 0,
                   request.parameter(0) == request[context: CurrentUser.self] else {
                 throw AuthorizationError(needs: "the owner of these photos")
             }
-            return nil
+            try await next()
         }
 
         // Uploads are made at /users/:user/photos and live at
@@ -130,16 +140,13 @@ public func uploadsApp(_ configuration: UploadsConfiguration) -> Application {
             }
 
         app.get("/photos") { (user: Context<CurrentUser>) async throws -> JSON<[Photo]> in
-            JSON(try await photos(of: user.value, in: settled))
+            JSON(await photos(of: user.value, in: settled))
         }
             .summary("The user's photos")
 
         app.get("/photos/:id") { (user: Context<CurrentUser>, _: Path<String>, id: Path<String>)
-            async throws -> StoredPhoto in
-            guard let photo = try await load(id.value, of: user.value, in: settled) else {
-                throw HTTPError.notFound
-            }
-            return photo
+            async throws -> StoredPhoto? in
+            await load(id.value, of: user.value, in: settled)
         }
             .summary("One photo")
 
@@ -147,8 +154,12 @@ public func uploadsApp(_ configuration: UploadsConfiguration) -> Application {
             async throws -> HTTPStatus in
             guard validID(id.value) else { throw HTTPError.notFound }
             let base = userDirectory(user.value, in: settled) + "/" + id.value
-            guard unlink(base) == 0 else { throw HTTPError.notFound }
-            _ = unlink(base + ".json")
+            do {
+                try await FileSystem.removeFile(base)
+            } catch {
+                throw HTTPError.notFound
+            }
+            try? await FileSystem.removeFile(base + ".json")
             return .noContent
         }
             .summary("Remove a photo")
@@ -168,40 +179,43 @@ func file(_ upload: CompletedUpload, in configuration: UploadsConfiguration) asy
           let type = upload.metadata["type"] else {
         throw HTTPError(.internalServerError, "an upload with no owner")
     }
-    guard sniff(upload.path) == type else {
+    guard await sniff(upload.path) == type else {
         // What arrived is not what the client said it was. It goes, and the
         // answer says why; the answer is remembered like any other, so a
         // client that asks again hears the same.
-        try? upload.remove()
+        try? await upload.remove()
         return Created(status: .unsupportedMediaType, location: nil,
                        error: "the file is not the \(type) it says it is")
     }
 
-    // Hashed off the worker's thread. Computed already if the client sent
+    // Hashed on the blocking pool. Computed already if the client sent
     // Repr-Digest or Want-Repr-Digest, in which case this costs nothing.
     let digest = hex(await upload.digest() ?? [])
     let id = upload.info.id
     let directory = userDirectory(owner, in: configuration)
-    makeDirectory(directory)
     let destination = directory + "/" + id
-    // A rename within one filesystem: the photo appears whole or not at all.
-    guard rename(upload.path, destination) == 0 else {
-        throw HTTPError(.internalServerError, "the photo could not be stored")
-    }
     let url = "/users/\(owner)/photos/\(id)"
     let photo = Photo(id: id, owner: owner, type: type, size: upload.length,
                       sha256: digest, url: url)
-    try writeFile(try JSONCoder.encode(photo), to: destination + ".json")
+    do {
+        try await FileSystem.createDirectory(directory, intermediates: true, permissions: 0o755)
+        // A rename within one file system: the photo appears whole or not at
+        // all.
+        try await FileSystem.rename(upload.path, to: destination)
+        try await FileSystem.write(destination + ".json", contents: try JSONCoder.encode(photo))
+    } catch {
+        throw HTTPError(.internalServerError, "the photo could not be stored")
+    }
     // The bytes have moved; what is left of the upload goes, except the
     // answer below, which the upload's URL keeps giving until `maxAge`.
-    try? upload.remove()
+    try? await upload.remove()
     return Created(photo, location: url)
 }
 
 /// 201 with a `Location` and the photo, or an error with a reason. The
 /// `Location` is replayed with the rest of the answer to a client that asks
 /// the upload's URL again.
-struct Created<Value: Encodable>: ResponseConvertible {
+struct Created<Value: Encodable & Sendable>: ResponseConvertible, Sendable {
     var value: Value?
     var status: HTTPStatus
     var location: String?
@@ -220,7 +234,7 @@ struct Created<Value: Encodable>: ResponseConvertible {
     }
 
     func write(to response: borrowing Response) throws {
-        if let location { _ = response.addHeader("Location", location) }
+        if let location { response.addHeader("Location", location) }
         if let value {
             try response.send(status: status, json: value)
         } else {
@@ -232,46 +246,40 @@ struct Created<Value: Encodable>: ResponseConvertible {
 // MARK: - Reading photos back
 
 /// A photo's bytes, sent with the type that was checked when it was stored.
-struct StoredPhoto: ResponseConvertible {
+struct StoredPhoto: ResponseConvertible, Sendable {
     let type: String
     let bytes: [UInt8]
 
     func write(to response: borrowing Response) throws {
-        _ = response.addHeader("Content-Type", type)
-        _ = response.addHeader("X-Content-Type-Options", "nosniff")
+        response.addHeader("Content-Type", type)
+        response.addHeader("X-Content-Type-Options", "nosniff")
         response.send(bytes)
     }
 }
 
-func load(_ id: String, of user: String, in configuration: UploadsConfiguration) async throws -> StoredPhoto? {
+/// A photo, or nil -- which a route answers 404 -- when there is none by
+/// that id. Read through VegaFS, on the blocking pool: a large one would
+/// hold the worker.
+func load(_ id: String, of user: String, in configuration: UploadsConfiguration) async -> StoredPhoto? {
     guard validID(id) else { return nil }
     let base = userDirectory(user, in: configuration) + "/" + id
-    // Reading a file is blocking work: a large one would hold the worker.
-    return try await blocking { () -> StoredPhoto? in
-        guard let about = readFile(base + ".json"),
-              let photo = try? JSONCoder.decode(Photo.self, from: about),
-              let bytes = readFile(base) else { return nil }
-        return StoredPhoto(type: photo.type, bytes: bytes)
-    }
+    guard let about = try? await FileSystem.read(base + ".json"),
+          let photo = try? JSONCoder.decode(Photo.self, from: about),
+          let bytes = try? await FileSystem.read(base) else { return nil }
+    return StoredPhoto(type: photo.type, bytes: bytes)
 }
 
-func photos(of user: String, in configuration: UploadsConfiguration) async throws -> [Photo] {
+func photos(of user: String, in configuration: UploadsConfiguration) async -> [Photo] {
     let directory = userDirectory(user, in: configuration)
-    return try await blocking { () -> [Photo] in
-        guard let dir = opendir(directory) else { return [] }
-        defer { closedir(dir) }
-        var found: [Photo] = []
-        while let entry = readdir(dir) {
-            let name = withUnsafeBytes(of: entry.pointee.d_name) {
-                String(cString: $0.bindMemory(to: CChar.self).baseAddress!)
-            }
-            guard name.hasSuffix(".json"),
-                  let about = readFile(directory + "/" + name),
-                  let photo = try? JSONCoder.decode(Photo.self, from: about) else { continue }
-            found.append(photo)
-        }
-        return found.sorted { $0.id < $1.id }
+    // A user who has stored nothing has no directory yet.
+    guard let entries = try? await FileSystem.contentsOfDirectory(directory) else { return [] }
+    var found: [Photo] = []
+    for entry in entries where entry.name.hasSuffix(".json") {
+        guard let about = try? await FileSystem.read(entry.path),
+              let photo = try? JSONCoder.decode(Photo.self, from: about) else { continue }
+        found.append(photo)
     }
+    return found.sorted { $0.id < $1.id }
 }
 
 // MARK: - What a file is
@@ -286,14 +294,11 @@ func imageType(_ header: String?) -> String? {
 }
 
 /// The image type a file's first bytes say it is, or nil.
-func sniff(_ path: String) -> String? {
-    let fd = open(path, O_RDONLY)
-    guard fd >= 0 else { return nil }
-    defer { _ = close(fd) }
-    var head = [UInt8](repeating: 0, count: 12)
-    let n = head.withUnsafeMutableBytes { read(fd, $0.baseAddress, 12) }
-    guard n > 0 else { return nil }
-    return imageType(ofBytes: Array(head[0..<n]))
+func sniff(_ path: String) async -> String? {
+    guard let file = try? await File.open(path) else { return nil }
+    var head = IOBuffer(capacity: 12)
+    while head.count < 12, let n = try? await file.read(into: &head), n > 0 {}
+    return imageType(ofBytes: head.withUnsafeBytes { Array($0) })
 }
 
 func imageType(ofBytes head: [UInt8]) -> String? {
@@ -307,7 +312,7 @@ func imageType(ofBytes head: [UInt8]) -> String? {
     return nil
 }
 
-// MARK: - Names and files
+// MARK: - Names
 
 /// User names are 1 to 32 lowercase letters and digits: they become directory
 /// names, so nothing else is allowed.
@@ -324,38 +329,6 @@ func validID(_ id: String) -> Bool {
 func userDirectory(_ user: String, in configuration: UploadsConfiguration) -> String {
     precondition(validUser(user), "a user name that is not a directory name")
     return configuration.photoDirectory + "/" + user
-}
-
-func makeDirectory(_ path: String) {
-    if mkdir(path, 0o755) != 0 && errno != EEXIST {
-        fatalError("cannot make \(path): errno \(errno)")
-    }
-}
-
-func readFile(_ path: String) -> [UInt8]? {
-    let fd = open(path, O_RDONLY)
-    guard fd >= 0 else { return nil }
-    defer { _ = close(fd) }
-    var all: [UInt8] = []
-    var chunk = [UInt8](repeating: 0, count: 64 * 1024)
-    while true {
-        let n = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
-        if n < 0 { return nil }
-        if n == 0 { return all }
-        all += chunk[0..<n]
-    }
-}
-
-func writeFile(_ bytes: [UInt8], to path: String) throws {
-    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-    guard fd >= 0 else { throw HTTPError(.internalServerError, "cannot write \(path)") }
-    defer { _ = close(fd) }
-    var done = 0
-    while done < bytes.count {
-        let n = bytes.withUnsafeBytes { write(fd, $0.baseAddress! + done, $0.count - done) }
-        if n <= 0 { throw HTTPError(.internalServerError, "cannot write \(path)") }
-        done += n
-    }
 }
 
 func hex(_ bytes: [UInt8]) -> String {

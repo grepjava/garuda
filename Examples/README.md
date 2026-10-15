@@ -1,12 +1,6 @@
 # Examples
 
-> **Not yet ported to Garuda 2: `files` and `uploads`.** Both need
-> `GarudaUploads`, which Garuda 2 does not have yet. Their sources stay in
-> `Sources/FilesExample`, `Sources/UploadsExample`, `Sources/files`,
-> `Sources/uploads` and `Tests/ExampleTests/{Files,Uploads}Tests.swift`, outside
-> every target, until it does.
-
-Six applications built on Garuda's public API. Five are small enough to read
+Eight applications built on Garuda's public API. Seven are small enough to read
 in one sitting, each showing one thing; the starter shows the shape of a whole
 application and is the one to copy when beginning. They build against the
 Garuda checkout this directory sits in.
@@ -15,9 +9,11 @@ Garuda checkout this directory sits in.
 |---|---|---|
 | [Todo](Sources/TodoExample/TodoApp.swift) | `swift run todo` | A JSON CRUD API on SQLite (`GarudaSQLite`): typed routes, validation answered as 422 and 409, migrations, paging |
 | [Auth](Sources/AuthExample/AuthApp.swift) | `swift run auth` | Sign-up, login and logout: PBKDF2 password hashes, random session tokens stored as digests, `authenticate(bearer:state:)`, an extractor of its own that awaits |
-| [Streaming](Sources/StreamingExample/StreamingApp.swift) | `swift run streaming` | Server-sent events, a CSV export written as it is produced, and uploads written to disk by an offloaded route with a body limit of its own |
+| [Streaming](Sources/StreamingExample/StreamingApp.swift) | `swift run streaming` | Server-sent events, a CSV export written as it is produced, an upload read as it arrives and written to disk with a body limit of its own, and an offloaded route |
 | [Chat](Sources/ChatExample/ChatApp.swift) | `swift run chat` | Rooms over WebSockets and server-sent events, heard across every shard through `Topic` |
 | [WebTransport](Sources/WebTransportExample/WebTransportApp.swift) | `swift run webtransport -- --tls-cert cert.pem --tls-key key.pem` | A network probe over HTTP/3: datagram round trips, download and upload throughput on streams, a stream the server opens, an extractor that refuses a session before it starts, and a browser page that trusts a self-signed certificate by its hash |
+| [Files](Sources/FilesExample/FilesApp.swift) | `swift run files` | A file service: resumable uploads (`GarudaUploads`) with size limits and SHA-256 digests, the files served back by `--static-dir` with byte ranges, `ETag` and a listing |
+| [Uploads](Sources/UploadsExample/UploadsApp.swift) | `swift run uploads` | Photo uploads per user: resumable uploads inside `group("/users/:user")` behind bearer tokens, `onCreate` recording whose upload it is, the bytes checked for the image type they claim, and an answer with a `Location` replayed to a client that lost it |
 | [**Starter**](STARTER.md) | `swift run starter` | A whole application on PostgreSQL (`GarudaPostgres`): accounts with JWT access and refresh tokens, roles and admin-only routes, input rules answered as 422, migrations, configuration from the environment, OpenAPI, health and readiness, and a deployment recipe |
 
 ```bash
@@ -55,10 +51,12 @@ reads from its environment (a database path, a directory) is read in
 `main.swift` and passed in.
 
 The package depends on Garuda's products -- `Garuda`, and `GarudaSQLite`,
-`GarudaPostgres` and `GarudaTesting` where an example needs them -- and on
-Vega, the runtime Garuda is built on, for two things Garuda does not export:
-SHA-256 (`VegaCrypto`, in the webtransport example) and a runtime for work
-outside the server (`Vega`, in the starter's `withServices`).
+`GarudaPostgres`, `GarudaUploads` and `GarudaTesting` where an example needs
+them -- and on Vega, the runtime Garuda is built on, for what Garuda does not
+export: SHA-256 (`VegaCrypto`, in the webtransport example), a runtime for
+work outside the server (`Vega`, in the starter's `withServices`), and file
+system calls that run on the blocking pool (`VegaFS`, in the streaming, files
+and uploads examples).
 
 ## Notes for copying
 
@@ -74,14 +72,29 @@ outside the server (`Vega`, in the starter's `withServices`).
 - **Passwords cost CPU on purpose.** The auth example hashes with 600,000
   iterations on Vega's blocking pool. Run it with `--rate-limit`, and behind
   TLS.
-- **Blocking work goes off the shard's threads.** The streaming example's
-  upload routes are `app.offload.put` and `app.offload.get`: their handlers
-  block on the file system, so they run on the blocking pool.
-- **Uploads** in the streaming example go to a partial file that is renamed
-  when complete, and are limited in size per route with `maxBodySize`. Garuda
-  2 reads a request body whole before the handler runs, so the limit is also
-  what an upload may hold in memory. Serve the directory with a separate
-  route or `--static-dir` if they should be downloadable.
+- **Blocking work goes off the shard's threads.** A handler that blocks, as
+  the streaming example's `stat` does, is an `app.offload` route and runs on
+  the blocking pool. VegaFS's calls, which the uploads use, run there by
+  themselves.
+- **Uploads** in the streaming example are read as they arrive, with
+  `onStreamingBody`, and go to a partial file that is renamed when complete.
+  Every other route is given its body whole, so for those the route's
+  `maxBodySize` is also what a request may hold in memory; a streaming route's
+  limit is only how much it takes. Serve the directory with a separate route
+  or `--static-dir` if they should be downloadable.
+- **Resumable uploads** in the files example are `app.resumableUploads`: the
+  body goes to disk as it arrives, a client that speaks the draft protocol can
+  ask how much arrived and send the rest after a dropped connection, and the
+  handler is called once, with the whole file on disk, to move it into place.
+  The files go back out through `--static-dir`, which `main.swift` adds to the
+  command line, so the application writes no download code at all.
+- **Whose upload it is** is decided once, on the request that creates it. The
+  request that completes an upload is a later one, perhaps on another
+  connection; the uploads example's `onCreate` records the owner from the
+  group's authentication, and the completion handler reads it from
+  `upload.metadata`, which no client can write. `Content-Type` and the file
+  name are the client's word, so the example checks the first bytes before it
+  keeps a photo.
 - **WebTransport needs HTTP/3**, and so TLS. A browser trusts a self-signed
   certificate over WebTransport only through `serverCertificateHashes`, and
   only an ECDSA one valid for at most 14 days; the webtransport example's

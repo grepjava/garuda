@@ -1,9 +1,4 @@
-//===----------------------------------------------------------------------===//
-// Photo uploads, per user and resumable.
-//
-//   swift run uploads                        serve on :8080, storing in /tmp/garuda-uploads
-//   swift run uploads -- --port 9000         the server's own flags still apply
-//   UPLOADS_DIR=/srv/photos swift run uploads
+// swift run uploads -- --port 8080
 //
 // Two users, with the tokens `ada-token` and `grace-token`:
 //
@@ -13,18 +8,18 @@
 //   curl -H 'Authorization: Bearer ada-token' localhost:8080/users/ada/photos
 //
 // Open http://localhost:8080 for resuming an upload by hand.
-//===----------------------------------------------------------------------===//
+//
+// UPLOADS_DIR sets where uploads and photos are kept (/tmp/garuda-uploads
+// unless it says otherwise); it is created if missing.
 
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
 #endif
-
-import Garuda
 import UploadsExample
 
 let directory = getenv("UPLOADS_DIR").map { String(cString: $0) } ?? "/tmp/garuda-uploads"
 let configuration = UploadsConfiguration(directory: directory,
                                          tokens: ["ada-token": "ada", "grace-token": "grace"])
-exit(uploadsApp(configuration).run())
+uploadsApp(configuration).run()

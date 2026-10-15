@@ -3,7 +3,7 @@
 //
 //   GET /countdown?from=10    server-sent events, one a second, then the end
 //   GET /export.csv?rows=N    a CSV of N rows, written as it is produced
-//   PUT /uploads/:name        the body written to disk
+//   PUT /uploads/:name        the body written to disk as it arrives
 //   GET /uploads/:name        how many bytes the upload holds
 //
 // What it shows:
@@ -13,15 +13,13 @@
 // - `StreamingBody` for a body too large to build in memory. A write waits
 //   while the client is behind, so a slow reader slows the producer, not the
 //   server's memory.
-// - An upload with a size limit of its own (`maxBodySize`), written to disk by
-//   an offloaded route (`app.offload`): the handler blocks on the file
-//   system, so it runs on Vega's blocking pool rather than on one of the
-//   shard's worker threads.
-//
-// Garuda 1 read an upload as it arrived (`onStreamingBody`), so the disk set
-// the pace and the body was never all in memory. Garuda 2 does not stream a
-// request body yet: the body is read whole, within its route's limit, before
-// the handler runs.
+// - An upload read as it arrives (`onStreamingBody`), with a size limit of
+//   its own, and written to disk a buffer at a time through VegaFS. The body
+//   is never all in memory, and the disk sets the pace: the client is let
+//   send more only as the handler reads.
+// - An offloaded route (`app.offload`) for a handler that blocks on the file
+//   system: it runs on Vega's blocking pool rather than on one of the shard's
+//   worker threads.
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
@@ -30,6 +28,8 @@ import Glibc
 import Darwin
 #endif
 import Garuda
+import Vega
+import VegaFS
 
 struct CountdownQuery: Decodable {
     let from: Int?
@@ -50,45 +50,6 @@ private func validName(_ name: String) -> Bool {
     !name.isEmpty && name.utf8.count <= 100 && !name.hasPrefix(".") && name.utf8.allSatisfy {
         ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) || ($0 >= 48 && $0 <= 57)
             || $0 == 46 || $0 == 45 || $0 == 95
-    }
-}
-
-/// Why a file operation failed, with the errno.
-struct FileError: Error {
-    let operation: String
-    let errno: Int32
-}
-
-/// The request body as it came, whatever its type: an upload is bytes, not
-/// JSON. An extractor of its own is a few lines.
-struct RawBody: RequestExtractor, Sendable {
-    let bytes: [UInt8]
-
-    static func extract(from request: borrowing Request, parameter: inout Int) async throws -> RawBody {
-        RawBody(bytes: request.body)
-    }
-}
-
-/// Writes `bytes` to `path` and makes them durable, or throws and leaves
-/// nothing behind. Blocks: call it from the blocking pool.
-private func writeFile(_ bytes: [UInt8], to path: String) throws {
-    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-    guard fd >= 0 else { throw FileError(operation: "open", errno: errno) }
-    // Closed exactly once whatever happens: a second close could hit a file
-    // another thread has opened since under the same number.
-    defer { close(fd) }
-    do {
-        var offset = 0
-        while offset < bytes.count {
-            let n = bytes.withUnsafeBytes { write(fd, $0.baseAddress! + offset, $0.count - offset) }
-            if n < 0 && errno == EINTR { continue }
-            guard n > 0 else { throw FileError(operation: "write", errno: errno) }
-            offset += n
-        }
-        guard fsync(fd) == 0 else { throw FileError(operation: "fsync", errno: errno) }
-    } catch {
-        unlink(path)
-        throw error
     }
 }
 
@@ -130,26 +91,39 @@ public func streamingApp(uploadDirectory: String, tick: Duration = .seconds(1),
         }
     }
 
-    // A body past the limit is answered 413 before the handler runs, and
-    // before more of it than the limit is read.
-    app.maxBodySize(maxUploadBytes) {
-        app.offload.put("/uploads/:name") { (name: Path<String>, body: RawBody) throws -> JSON<UploadInfo> in
-            guard validName(name.value) else { throw HTTPError(.badRequest, "not an upload name") }
-            let final = uploadDirectory + "/" + name.value
-            let partial = final + ".partial"
-            // Written to a partial file and renamed when complete, so a reader
-            // never sees half an upload under its name.
-            try writeFile(body.bytes, to: partial)
-            guard rename(partial, final) == 0 else {
-                let failure = FileError(operation: "rename", errno: errno)
-                unlink(partial)
-                throw failure
+    // Read as it arrives, never more than `maxUploadBytes`: a declared length
+    // past it is answered 413 before the handler runs, and a body that grows
+    // past it makes the read throw, which answers 413.
+    app.onStreamingBody(.put, "/uploads/:name", maxBodySize: maxUploadBytes) { request, response, body in
+        let name = request.parameter(0)
+        guard validName(name) else { throw HTTPError(.badRequest, "not an upload name") }
+        let final = uploadDirectory + "/" + name
+        let partial = final + ".partial"
+        // Written to a partial file and renamed when complete, so a reader
+        // never sees half an upload under its name.
+        var bytes = 0
+        do {
+            let file = try await File.create(partial, permissions: 0o644)
+            var buffer = IOBuffer(capacity: 256 * 1024)
+            // A read waits for the client, a write for the disk; neither holds
+            // a worker thread meanwhile.
+            while try await body.read(into: &buffer) > 0 {
+                try await file.write(buffer)
+                bytes += buffer.count
+                buffer.clear()
             }
-            return JSON(UploadInfo(name: name.value, bytes: body.bytes.count), status: .created)
+            try await file.sync()
+            try await FileSystem.rename(partial, to: final)
+        } catch {
+            // Too large, cut off, or the disk said no: nothing is left behind.
+            try? await FileSystem.removeFile(partial)
+            throw error
         }
+        try response.send(status: .created, json: UploadInfo(name: name, bytes: bytes))
     }
 
-    // `stat` blocks on the disk too, so this one is offloaded as well.
+    // `stat` blocks on the disk, so this handler is offloaded: it runs on the
+    // blocking pool, and the worker thread goes on serving.
     app.offload.get("/uploads/:name") { (name: Path<String>) throws -> JSON<UploadInfo>? in
         guard validName(name.value) else { throw HTTPError(.badRequest, "not an upload name") }
         var info = stat()
