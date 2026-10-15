@@ -28,10 +28,11 @@ let swiftSettings: [SwiftSetting] = [
     .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
 ]
 
-// Vega, the runtime Garuda is built on, for the one thing an example needs
-// that Garuda does not export: VegaCrypto's SHA-256, in the webtransport
-// example. The same checkout Garuda builds on (GARUDA_VEGA_PATH), or the same
-// release, and BoringSSL under its TLS as Garuda's default has it.
+// Vega, the runtime Garuda is built on, for what an example needs that Garuda
+// does not export: VegaCrypto's SHA-256 in the webtransport example, and a
+// runtime for work outside the server in the starter's `withServices`. The
+// same checkout Garuda builds on (GARUDA_VEGA_PATH), or the same release, and
+// BoringSSL under its TLS as Garuda's default has it.
 let vega: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: ["BoringSSL"])
 } ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.4"), traits: ["BoringSSL"])
@@ -69,15 +70,18 @@ let package = Package(
                           swiftSettings: swiftSettings),
 
         .target(name: "StarterExample",
-                dependencies: [garuda("Garuda"), garuda("GarudaPostgres"), .product(name: "Vega", package: "vega")],
+                dependencies: [garuda("Garuda"), garuda("GarudaPostgres"),
+                               .product(name: "Vega", package: "vega")],
                 swiftSettings: swiftSettings),
         .executableTarget(name: "starter", dependencies: ["StarterExample", garuda("Garuda")],
                           swiftSettings: swiftSettings),
 
         .testTarget(name: "ExampleTests",
-                    dependencies: ["TodoExample", "AuthExample", "StreamingExample", "ChatExample", "WebTransportExample", "StarterExample",
-                                   garuda("Garuda"), garuda("GarudaSQLite"), garuda("GarudaPostgres"), garuda("GarudaTesting"), .product(name: "VegaCrypto", package: "vega")],
-                    // Waiting for GarudaUploads.
+                    dependencies: ["TodoExample", "AuthExample", "StreamingExample", "ChatExample",
+                                   "WebTransportExample", "StarterExample",
+                                   garuda("Garuda"), garuda("GarudaSQLite"), garuda("GarudaPostgres"),
+                                   garuda("GarudaTesting"), .product(name: "VegaCrypto", package: "vega")],
+                    // The files and uploads examples' tests, kept until GarudaUploads is there.
                     exclude: ["FilesTests.swift", "UploadsTests.swift"],
                     swiftSettings: swiftSettings),
     ]
