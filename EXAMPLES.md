@@ -1,8 +1,10 @@
 # Examples
 
 Two kinds of example: eight runnable applications in [Examples/](Examples/),
-and short recipes for common tasks below. Every recipe uses the public API and
-compiles as written. For flags, see [CONFIG.md](CONFIG.md); for middleware in
+all on Garuda 2, and short recipes for common tasks below. The recipes are
+still being ported from Garuda 1: some use its API (`exit(app.run())`,
+`blocking { }`, `app.prepare`, workers rather than shards), and
+[COMPATIBILITY.md](COMPATIBILITY.md) has what changed. For flags, see [CONFIG.md](CONFIG.md); for middleware in
 depth, [MIDDLEWARE.md](MIDDLEWARE.md).
 
 - [Runnable applications](#runnable-applications)
@@ -30,7 +32,7 @@ swift test                             # every example, through app.test
 | [Todo](Examples/Sources/TodoExample/TodoApp.swift) | A JSON CRUD API on SQLite: `Path`, `Query` and `Body`, migrations, 422 and 409 with JSON reasons, an optional return for 404, paging | `curl -s localhost:8080/todos -d '{"title":"write the docs"}'` |
 | [Auth](Examples/Sources/AuthExample/AuthApp.swift) | Sign-up, login and logout: PBKDF2 password hashes on the blocking pool, random tokens stored as digests, `authenticate(bearer:state:)`, and `SignedInUser`, an async extractor | `curl -s localhost:8080/signup -d '{"username":"ada","password":"correct horse"}'` |
 | [Streaming](Examples/Sources/StreamingExample/StreamingApp.swift) | `EventStream`, a CSV export written as it is produced with backpressure, uploads written to disk as they arrive | `curl -N localhost:8080/countdown?from=5` |
-| [Chat](Examples/Sources/ChatExample/ChatApp.swift) | Rooms over WebSockets and server-sent events, heard across every worker through `Topic`, with replay for reconnecting clients | `swift run chat -- --workers 4`, then open two browser windows |
+| [Chat](Examples/Sources/ChatExample/ChatApp.swift) | Rooms over WebSockets and server-sent events, heard across every shard through `Topic`, with replay for reconnecting clients | `swift run chat -- --shards 4`, then open two browser windows |
 | [Files](Examples/Sources/FilesExample/FilesApp.swift) | Uploads that survive a dropped connection and downloads that resume: the resumable upload protocol, size limits at both ends, digests, and `--static-dir` serving the store with byte ranges | `curl -X POST --data-binary @photo.jpg -H 'Upload-Complete: ?1' localhost:8080/files` |
 | [Uploads](Examples/Sources/UploadsExample/UploadsApp.swift) | Per-user photo uploads: `resumableUploads` inside `group("/users/:user")`, bearer tokens guarding the upload's own URL, `onCreate` recording the owner, types checked from the bytes, `await upload.digest()`, an answer replayed with its `Location` | `curl -X POST --data-binary @cat.png -H 'Authorization: Bearer ada-token' -H 'Content-Type: image/png' -H 'Upload-Complete: ?1' localhost:8080/users/ada/photos` |
 | [WebTransport](Examples/Sources/WebTransportExample/WebTransportApp.swift) | A network probe over HTTP/3: `app.webTransport` with an extractor that refuses before a session starts, datagram round trips, download and upload tests on streams with backpressure, a server-opened stream, and a browser page trusting a self-signed certificate by its hash | `swift run webtransport -- --port 8443 --tls-cert cert.pem --tls-key key.pem`, then open `https://localhost:8443` |
