@@ -68,17 +68,22 @@ process model and some of the decisions below are not.
 8. **The connection writes the answer.** It runs the `onSend` hooks and adds
    the server's headers (Date, Server, and Alt-Svc, Strict-Transport-Security
    and X-Request-ID where configured). It sets Content-Length from the body
-   and frames it. A Content-Length, Transfer-Encoding or Connection header
-   the handler set is dropped, since the server owns framing and the
-   connection; a streamed body is the exception, where a declared
-   Content-Length is honoured. A handler that returns without answering is
-   answered 500, with a line in the log.
+   and frames it. A Transfer-Encoding or Connection header the handler set
+   is dropped, since the server owns framing and the connection. A
+   Content-Length the handler set is kept and held to, on a whole body and a
+   streamed one: a longer body is cut to it, and a shorter one is never ended
+   as if it were whole (the HTTP/1.1 connection is closed, the HTTP/2 or
+   HTTP/3 stream reset). A 304 keeps it, a HEAD states it, and a 204 states
+   none. A handler that returns without answering is answered 500, with a
+   line in the log.
 9. **Cancellation.** On HTTP/2 and HTTP/3, a stream the client resets has its
    task cancelled, so a handler waiting on I/O or a sleep stops waiting, and
    whatever it answers is dropped. A cancelled task is not reused. On
    HTTP/1, nothing interrupts a handler whose client has gone. A streamed
    write throws `HandlerWaitError.cancelled` once the client is gone, and
-   any other answer goes nowhere.
+   any other answer goes nowhere. A streaming-body route is not cancelled by
+   a reset: its body throws `RequestBodyError.incomplete` instead (see
+   [Request bodies read as they arrive](#request-bodies-read-as-they-arrive)).
 
 ## Decisions
 
@@ -458,8 +463,81 @@ In both handlers the session comes first (`webSocket(_:subprotocols:_:)`
 hands a `WebSocket`, `webTransport(_:_:)` a `WebTransportSession`), because
 Swift will not pass arguments after a parameter pack.
 
-Request bodies are collected whole before the handler runs. Resumable uploads
-are coming.
+### Request bodies read as they arrive
+
+Every route is given its body whole, read up to its limit before the handler
+runs, except one registered with `onStreamingBody`. That route is dispatched
+once the request's head has arrived, and its handler takes the body as it
+asks for it, through a `RequestBody`:
+
+```swift
+import Garuda
+import Vega      // IOBuffer
+import VegaFS    // File
+
+app.onStreamingBody(.put, "/uploads/:name", maxBodySize: 64 << 20) { request, response, body in
+    let file = try await File.create(uploadDirectory + "/" + request.parameter(0), permissions: 0o644)
+    var buffer = IOBuffer(capacity: 256 * 1024)
+    var bytes = 0
+    while try await body.read(into: &buffer) > 0 {
+        try await file.write(buffer)
+        bytes += buffer.count
+        buffer.clear()
+    }
+    response.send("\(bytes)")
+}
+```
+
+| `RequestBody` | |
+|---|---|
+| `read(into: &buffer)` | reads into the buffer's spare room, waiting when nothing has arrived; returns the count, 0 at the end |
+| `read(maxBytes:)` | up to `maxBytes` (64 KiB by default) as `[UInt8]`, or `nil` at the end |
+| `readAll(maxBytes:)` | the rest of the body, or `tooLarge` once it passes `maxBytes` |
+| `bytesRead` | how many bytes have been read so far |
+| `expectedLength` | the `Content-Length` the client declared, or `nil` |
+| `cancel()` | ends the request: an HTTP/1.1 connection is closed, an HTTP/2 or HTTP/3 stream reset; the reader throws `incomplete` |
+
+A read throws `RequestBodyError`, which answers for itself when the handler
+lets it go:
+
+- `.incomplete`, 400: the request ended before its body did. The client
+  closed the connection, reset the stream, or the request was cancelled.
+  Every byte that arrived is read first, and then the read throws. That is
+  what makes an upload resumable from where it stopped.
+- `.tooLarge`, 413: the body passed the route's `maxBodySize`, or
+  `readAll`'s limit. Nothing past the limit is handed over.
+
+**Limits.** `maxBodySize` is the route's own and takes the place of
+`--max-body`; left out, it is `Int.max`. A declared length past it is
+answered 413 before the handler runs. A chunked, HTTP/2 or HTTP/3 body is
+counted as it arrives.
+
+**Flow control.** Reading is what lets more in. On HTTP/1.1 the handler's
+read is the connection's read, through a 256 KiB buffer; on HTTP/2 the
+stream's window is given back as bytes are read, not as they arrive; on
+HTTP/3 QUIC's stream window grows the same way. A handler that stops reading
+holds its client to one window, and a slow disk slows its own upload and
+nothing else. `Expect: 100-continue` is answered on the first read, and not
+at all when the body has already arrived.
+
+**Resets.** A reset HTTP/2 or HTTP/3 stream does not cancel a streaming
+handler's task, as it does any other handler's. The body ending is how such
+a handler learns its request did, and a cancelled task could not store what
+it had been given. The body throws `incomplete` once what arrived has been
+read.
+
+A body the handler leaves unread costs an HTTP/1.1 connection nothing when
+all of it has arrived; otherwise the connection is closed rather than read
+for a body nobody wants. `RequestBody` may be read from the handler or from
+tasks it starts, one read at a time, and means nothing once the handler has
+returned.
+
+**Resumable uploads** (`GarudaUploads`) are built on this:
+`app.resumableUploads("/files", store: store) { upload in … }` serves
+draft-ietf-httpbis-resumable-upload over every protocol, keeps the bytes on
+disk as they arrive, and calls the handler once with the whole upload. See
+the [README](README.md#resumable-uploads) and the files and uploads examples
+in [Examples/](Examples/README.md).
 
 ## Where it lives
 
