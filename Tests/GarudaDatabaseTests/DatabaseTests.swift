@@ -249,3 +249,100 @@ struct RedisJSONTests {
         #expect(missing == nil)
     }
 }
+
+// MARK: - Session stores
+
+/// The ID in a Set-Cookie header for `name`, or nil.
+private func sessionID(_ headers: [String], _ name: String = "id") -> String? {
+    for header in headers where header.hasPrefix(name + "=") {
+        return String(header.dropFirst(name.count + 1).prefix { $0 != ";" })
+    }
+    return nil
+}
+
+private func visitingApp(_ store: @escaping @Sendable (borrowing Request) throws -> any SessionStore,
+                         configuration: SessionConfiguration = SessionConfiguration()) -> Application {
+    let app = Application()
+    app.group("/s") {
+        app.sessions(configuration, store: store)
+        app.post("/visit") { (session: Session) async throws -> String in
+            let visits = (Int(session["visits"] ?? "0") ?? 0) + 1
+            try await session.set("visits", "\(visits)")
+            return "\(visits)"
+        }
+        app.post("/logout") { (session: Session) async throws -> String in
+            try await session.destroy()
+            return "bye"
+        }
+    }
+    return app
+}
+
+private func written(_ data: [String: String]?) -> String {
+    guard let data else { return "-" }
+    return data.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+}
+
+@Suite("Session stores")
+struct SessionStoreTests {
+    @Test func theSQLiteStoreSavesLoadsExpiresAndReplacesOnlyLiveSessions() throws {
+        let path = "/tmp/garuda-db-\(getpid())-sessions.sqlite"
+        defer { unlink(path); unlink(path + "-wal"); unlink(path + "-shm") }
+        let out = try DatabaseTestRuntime.shared.block { () async throws -> String in
+            let db = try SQLiteDatabase(SQLiteConfiguration(path: path))
+            defer { db.close() }
+            let store = SQLiteSessionStore(db, table: "web_sessions")
+            try await store.createTable()
+            var out: [String] = []
+            try await store.save(id: "one", data: ["user": "ada", "quote": "a \"b\" é"], ttlMilliseconds: 60_000)
+            try await store.save(id: "gone", data: ["k": "v"], ttlMilliseconds: 1)
+            out.append(written(try await store.load(id: "one", ttlMilliseconds: 60_000)))
+            try await Runtime.sleep(for: .milliseconds(20))
+            out.append(written(try await store.load(id: "gone", ttlMilliseconds: 60_000)))
+            out.append("\(try await store.deleteExpired())")
+            let absent = try await store.replace(id: "none", data: ["k": "v"], ttlMilliseconds: 60_000)
+            let present = try await store.replace(id: "one", data: ["k": "w"], ttlMilliseconds: 60_000)
+            out.append("\(absent) \(present) \(written(try await store.load(id: "one", ttlMilliseconds: 60_000)))")
+            let removed = try await store.remove(id: "one")
+            let again = try await store.remove(id: "one")
+            out.append("\(removed) \(again)")
+            return out.joined(separator: " | ")
+        }
+        #expect(out == #"quote=a "b" é,user=ada | - | 1 | false true k=w | true false"#)
+    }
+
+    @Test func sessionsWorkOverTheSQLiteStore() throws {
+        let path = "/tmp/garuda-db-\(getpid())-web.sqlite"
+        defer { unlink(path); unlink(path + "-wal"); unlink(path + "-shm") }
+        let app = visitingApp { request in SQLiteSessionStore(try request.state(SQLiteDatabase.self)) }
+        app.state { _ in
+            let db = try SQLiteDatabase(SQLiteConfiguration(path: path))
+            try await SQLiteSessionStore(db).createTable()
+            return db
+        }
+        let client = app.test
+        let first = try client.post("/s/visit")
+        #expect(first.text == "1")
+        let id = try #require(sessionID(first.headers(named: "set-cookie")))
+        #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "2")
+        #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "3")
+        #expect(try client.post("/s/logout", headers: [("cookie", "id=\(id)")]).text == "bye")
+        #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "1")
+    }
+
+    @Test(.enabled(if: redisTarget != nil, "set GARUDA_REDIS to run"))
+    func sessionsWorkOverTheRedisStore() throws {
+        let configuration = redisTarget!
+        let prefix = "garuda-test:session:\(getpid()):"
+        let app = visitingApp({ request in RedisSessionStore(try request.state(RedisPool.self), prefix: prefix) },
+                              configuration: SessionConfiguration(idleTimeoutSeconds: 30))
+        app.state { _ in RedisPool(configuration, maxConnections: 2) }
+        let client = app.test
+        let first = try client.post("/s/visit")
+        #expect(first.text == "1")
+        let id = try #require(sessionID(first.headers(named: "set-cookie")))
+        #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "2")
+        #expect(try client.post("/s/logout", headers: [("cookie", "id=\(id)")]).text == "bye")
+        #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "1")
+    }
+}
