@@ -175,6 +175,9 @@ struct HTTP1Connection: ~Copyable {
     let x: UnsafeMutablePointer<Exchange>
     /// Responses in `output` not yet flushed.
     var batched = 0
+    /// A body of at least `outputFlushThreshold` that `writeResponse` left
+    /// in the exchange's buffer, for `serveOne` to send from there.
+    var largeBody = 0
     var served = 0
     /// Something sees each answer -- the access log or `app.onResponse` --
     /// so requests are timed and reported (ResponseObservers.swift).
@@ -260,6 +263,13 @@ struct HTTP1Connection: ~Copyable {
             // framed: never on HEAD, 1xx, 204 or 304.
             writeResponse(keepAlive: keepAlive, omitBody: head.method == .head)
             if observing { report(status: x.pointee.status) }
+            if largeBody > 0 {
+                let count = largeBody
+                largeBody = 0
+                try await flush(stream)
+                try await stream.write(UnsafeRawBufferPointer(start: x.pointee.responseBody.readPointer,
+                                                              count: count))
+            }
         }
         start &+= head.headEnd &+ x.pointee.consumedBody
         batched &+= 1
@@ -446,7 +456,14 @@ struct HTTP1Connection: ~Copyable {
         let count = forbids ? 0 : x.pointee.responseBody.readableBytes
         writeHTTP1Head(x, parts, keepAlive: keepAlive, framing: forbids ? .none : .length(count))
         if count > 0 && !omitBody {
-            parts.pointee.output.write(x.pointee.responseBody.readPointer, count)
+            // A large body is sent from where it is, after the head, rather
+            // than copied behind it: a copy of a megabyte costs more than
+            // the extra write.
+            if count >= outputFlushThreshold {
+                largeBody = count
+            } else {
+                parts.pointee.output.write(x.pointee.responseBody.readPointer, count)
+            }
         }
     }
 
