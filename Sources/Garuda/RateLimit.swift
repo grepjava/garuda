@@ -176,7 +176,8 @@ final class RateLimiter: @unchecked Sendable {
 
 /// Answers a request before routing: the health probe, which an
 /// orchestrator sends from one address on a schedule and must never be
-/// refused, then --rate-limit. True when it answered.
+/// refused, then --rate-limit. True when it answered. The probe is 503 once
+/// SIGTERM has arrived, so that traffic is routed elsewhere.
 @inline(never)
 func answeredBeforeRouting(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication) -> Bool {
     if let health = app.healthPath {
@@ -184,7 +185,7 @@ func answeredBeforeRouting(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledA
         let path = x.pointee.slice(x.pointee.head.path)
         if (method == .get || method == .head) && path.count == health.count
             && (0..<path.count).allSatisfy({ path.base[$0] == health[$0] }) {
-            x.pointee.answer(200, nil, 0)
+            x.pointee.answer(app.unready.load(ordering: .relaxed) ? 503 : 200, nil, 0)
             return true
         }
     }

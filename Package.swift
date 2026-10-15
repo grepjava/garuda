@@ -33,7 +33,7 @@ let vegaTraits: Set<Package.Dependency.Trait> = [
 /// Garuda needs.
 let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.3"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.4"), traits: vegaTraits)
 
 /// vega-db, by version; or, with GARUDA_VEGA_DB_PATH set, a local checkout.
 /// A local Vega under it as well takes VEGA_PATH, which vega-db reads, set

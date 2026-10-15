@@ -79,6 +79,17 @@ public struct ServerConfig: Sendable {
     public var broadcastQueue = 1024
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
+    /// How long SIGTERM leaves the server serving, with only the health
+    /// check failing, before it stops accepting and drains.
+    ///
+    /// A load balancer or a Kubernetes Service goes on sending traffic for
+    /// a few seconds after it is told to stop: taking an endpoint out of
+    /// rotation has to propagate. A server that stops accepting the moment
+    /// SIGTERM arrives refuses that traffic. In this gap the probe says
+    /// 503, the balancer stops routing, and only then does the server stop
+    /// taking connections. SIGINT and SIGQUIT do not wait, and neither does
+    /// a reload.
+    public var drainDelay: Duration = .zero
 
     // --- compression (Compression.swift) ---
     /// Compress responses for clients that accept it: text and its kin, and

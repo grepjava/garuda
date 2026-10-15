@@ -79,7 +79,7 @@ extension Application {
         case .shared?: options.listenerMode = .shared
         case nil: break
         }
-        options.shutdownGracePeriod = config.gracefulShutdown + .seconds(5)
+        options.shutdownGracePeriod = config.drainDelay + config.gracefulShutdown + .seconds(5)
         options.listeners = [.tcp(host: config.host, port: config.port, backlog: config.backlog)]
         if let redirect = config.redirectHTTPPort {
             options.listeners.append(.tcp(host: config.host, port: redirect, backlog: config.backlog))
@@ -92,9 +92,8 @@ extension Application {
         let layout = SharedLayout(config)
         options.sharedRegions = layout.sizes
         options.name = "garuda-s"
-        options.onEvent = { event in
-            if case .reloading = event { Log.info("reloading workers") }
-        }
+        let reload = ReloadLog()
+        options.onEvent = { event in reload.saw(event) }
         Runtime.sharded(options) { shard in
             let info = ShardInfo(index: shard.index, count: shard.count, threads: shard.runtime.workerCount)
             MemoryStores.warnIfSharded(info)
@@ -138,6 +137,28 @@ extension Application {
         Application.serve(runtime, app: app, shard: info, limits: limits, config: config, listening: listening)
         exit(0)
         #endif
+    }
+
+    /// The first of `streams` to deliver a signal, or nil after `delay`.
+    @discardableResult
+    static func firstSignal(_ streams: [SignalStream], orAfter delay: Duration? = nil) async -> Int32? {
+        await withTaskGroup(of: Int32?.self) { group in
+            for stream in streams {
+                group.addTask {
+                    var stream = stream
+                    return await stream.recv() ? stream.signal : nil
+                }
+            }
+            if let delay {
+                group.addTask {
+                    try? await Runtime.sleep(for: delay)
+                    return nil
+                }
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
     }
 
     /// The protocols offered by ALPN, most wanted first.
@@ -276,18 +297,23 @@ extension Application {
                 let all = servers
                 #if !os(Windows)
                 let grace = config.gracefulShutdown
+                let delay = config.drainDelay
                 runtime.spawn {
+                    // SIGTERM may put the stop off; SIGINT and SIGQUIT do
+                    // not. Under a supervisor, SIGQUIT arrives as SIGINT,
+                    // and so does a rolling restart's stop.
                     let terms = try? Runtime.signals(SIGTERM)
-                    let ints = try? Runtime.signals(SIGINT)
-                    // Whichever comes first.
-                    await withTaskGroup(of: Void.self) { group in
-                        for stream in [terms, ints] {
-                            guard var stream else { continue }
-                            group.addTask { _ = await stream.recv() }
-                        }
-                        await group.next()
-                        group.cancelAll()
+                    let nows = [SIGINT, SIGQUIT].compactMap { try? Runtime.signals($0) }
+                    let first = await firstSignal(terms.map { [$0] + nows } ?? nows)
+                    if first == SIGTERM && delay > .zero {
+                        app.unready.store(true, ordering: .relaxed)
+                        Log.info("failing the health check; draining in \(delay)")
+                        // A second SIGTERM -- from the supervisor and from
+                        // an init system signalling the process group -- is
+                        // not a reason to cut it short.
+                        await firstSignal(nows, orAfter: delay)
                     }
+                    app.unready.store(true, ordering: .relaxed)
                     // WebSockets are sent 1001. HTTP/2 connections are sent
                     // GOAWAY -- once their WebSockets have closed -- and
                     // finish the streams they have, as HTTP/1 ones finish
@@ -401,6 +427,9 @@ extension ServerConfig {
           --graceful-timeout SECS
                                how long requests, streams and WebSockets in
                                progress have to finish at shutdown (10)
+          --drain-delay MS     on SIGTERM, serve this long with the health
+                               check failing before draining (0); SIGINT and
+                               SIGQUIT do not wait
           --no-websockets      refuse WebSocket upgrades with 501
           --ws-max-message BYTES
                                the largest WebSocket message taken (16 MiB)
@@ -661,6 +690,11 @@ extension ServerConfig {
                 guard v.withCString({ config.trust.parse($0) }) else {
                     return fail("--forwarded-allow-ips contains an address that is not valid")
                 }
+            case "--drain-delay":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--drain-delay must be milliseconds")
+                }
+                config.drainDelay = .milliseconds(n)
             case "--graceful-timeout":
                 guard let n = value().flatMap({ Int($0) }), n >= 0 else {
                     return fail("--graceful-timeout must be a number of seconds")
@@ -823,3 +857,31 @@ func isReadable(_ path: String) -> Bool {
     return access(path, R_OK) == 0
     #endif
 }
+
+#if os(Linux) || os(macOS)
+/// The supervisor's log of a rolling restart (SIGHUP): when it begins, and
+/// when every shard running then has started again.
+final class ReloadLog: @unchecked Sendable {
+    // The supervisor is one thread, and calls `saw` from it alone.
+    private var running: Set<Int> = []
+    private var waiting: Set<Int>?
+
+    func saw(_ event: ShardEvent) {
+        switch event {
+        case .started(let shard, _):
+            running.insert(shard)
+            guard var left = waiting else { return }
+            left.remove(shard)
+            waiting = left.isEmpty ? nil : left
+            if left.isEmpty { Log.info("workers reloaded") }
+        case .exited(let shard, _, _, _):
+            running.remove(shard)
+        case .reloading:
+            Log.info("reloading workers")
+            waiting = running.isEmpty ? nil : running
+        default:
+            break
+        }
+    }
+}
+#endif

@@ -2,7 +2,7 @@ import Testing
 import GarudaTesting
 @testable import Garuda
 
-// --rate-limit's table, --health-check-path and the --metrics-port page.
+// --rate-limit's table, --health-check-path, --drain-delay and the --metrics-port page.
 
 private func limiter(_ count: Int, perMs period: UInt64, burst: Int = 0) -> RateLimiter {
     var config = ServerConfig()
@@ -63,7 +63,8 @@ struct RateLimitTests {
         guard case .run(let config) = ServerConfig.parse(["garuda", "--rate-limit", "600/m",
                                                            "--rate-limit-burst", "50",
                                                            "--health-check-path", "/healthz",
-                                                           "--metrics-port", "9100"]) else {
+                                                           "--metrics-port", "9100",
+                                                           "--drain-delay", "2500"]) else {
             Issue.record("the flags did not parse")
             return
         }
@@ -71,8 +72,10 @@ struct RateLimitTests {
         #expect(config.rateLimitBurst == 50)
         #expect(config.healthCheckPath == "/healthz")
         #expect(config.metricsPort == 9100)
+        #expect(config.drainDelay == .milliseconds(2500))
         for bad in [["--rate-limit", "10"], ["--rate-limit", "10/d"], ["--rate-limit", "0/s"],
-                    ["--rate-limit", "x/s"], ["--health-check-path", "healthz"], ["--metrics-port", "0"]] {
+                    ["--rate-limit", "x/s"], ["--health-check-path", "healthz"], ["--metrics-port", "0"],
+                    ["--drain-delay", "-1"], ["--drain-delay", "2s"]] {
             if case .exit(let status) = ServerConfig.parse(["garuda"] + bad) {
                 #expect(status == 2)
             } else {

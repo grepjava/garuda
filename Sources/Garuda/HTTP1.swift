@@ -265,6 +265,9 @@ struct HTTP1Connection: ~Copyable {
         var keepAlive = head.isKeepAlive
         served &+= 1
         if limits.maxRequests > 0 && served >= limits.maxRequests { keepAlive = false }
+        // Through --drain-delay: a client reconnecting is sent to a server
+        // that is staying.
+        if keepAlive && app.unready.load(ordering: .relaxed) { keepAlive = false }
         x.pointee.keepAlive = keepAlive
 
         // Before anything can answer, so every answer carries them.

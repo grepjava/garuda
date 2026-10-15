@@ -318,6 +318,9 @@ final class CompiledApplication: @unchecked Sendable {
     var cache: ResponseCache?
     /// --health-check-path.
     var healthPath: [UInt8]?
+    /// SIGTERM has arrived: the health check answers 503 and HTTP/1
+    /// connections close after their response, through --drain-delay.
+    let unready = Atomic<Bool>(false)
     /// What `app.tracing` makes each shard's tracer with, and the one this
     /// shard made: set before it serves (Tracing.swift).
     let makeTracer: (@Sendable (Int) -> any Tracer)?
