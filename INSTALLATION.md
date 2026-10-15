@@ -110,6 +110,7 @@ swift build -c release
 |---|---|---|
 | `garuda` | `.build/release/garuda` | the server with the benchmark application |
 | `garuda-conformance` | `.build/release/garuda-conformance` | routes used by the end-to-end test suites |
+| `pgfuzz` | `.build/release/pgfuzz` | the fuzzer ([fuzz/README.md](fuzz/README.md)) |
 
 Build one with `swift build -c release --product garuda`.
 
@@ -179,14 +180,15 @@ let package = Package(
 | `GarudaRedis` | vega-db's Redis driver |
 | `GarudaSQLite` | vega-db's SQLite driver |
 | `GarudaSQL` | `@PostgresRow`, which does for a result row what `@JSON` does for JSON |
+| `GarudaUploads` | resumable uploads (draft-ietf-httpbis-resumable-upload): `app.resumableUploads` and a file store |
 
 `GarudaJSON` and `GarudaSQL` are separate because they are the only parts of
 Garuda that need swift-syntax: a target that does not depend on them never
 builds the macro plugin, although the package is still fetched when Garuda's
 dependencies are resolved. The database products are separate so that an
 application builds only the drivers it imports.
-[CONNECTORS.md](CONNECTORS.md) covers them. Resumable uploads (Garuda 1's
-`GarudaUploads`) are coming.
+[CONNECTORS.md](CONNECTORS.md) covers them.
+[README.md](README.md#resumable-uploads) shows `GarudaUploads`.
 
 `Application.run()` reads the flags in [CONFIG.md](CONFIG.md), so your binary is
 started the same way as `garuda`. [README.md](README.md) has a first
@@ -286,8 +288,16 @@ swift build -c release --product garuda-conformance
 
 The database tests skip themselves unless a database is reachable. The
 end-to-end suites in `scripts/` run the release binaries. The shell suites
-need `curl`, and some need `openssl` or `nc`. The HTTP/2, HTTP/3 and handler
-suites are Python test clients that need `h2` and `aioquic`.
+need `curl`, and some need `openssl` or `nc`. The HTTP/2, HTTP/3, handler and
+upload suites are Python test clients that need `h2` and `aioquic`.
+
+`swift test` also replays the fuzz corpus (`GarudaFuzzTests`). The fuzzer
+itself runs longer, and is most useful under AddressSanitizer:
+
+```bash
+swift build -c release --product pgfuzz -Xswiftc -sanitize=address
+.build/release/pgfuzz --seconds 60
+```
 
 ---
 
