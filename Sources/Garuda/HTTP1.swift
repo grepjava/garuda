@@ -256,10 +256,17 @@ struct HTTP1Connection: ~Copyable {
         // A route matched before its body was read, for its scope's body
         // limit; -1 when the dispatch matches (RequestLimits.swift).
         var matched: Int32 = -1
+        // A body its route reads as it arrives (RequestBody.swift).
+        var streamed: H1RequestBody? = nil
         if head.hasBody {
-            let limit = app.hasBodyLimits ? bodyLimit(app, matched: &matched) : limits.maxBodySize
-            x.pointee.bodyLimit = limit
-            guard try await readBody(stream, limit: limit) else { return false }
+            let rule = app.hasBodyLimits ? bodyRule(app, matched: &matched) : BodyRule(limit: limits.maxBodySize)
+            x.pointee.bodyLimit = rule.limit
+            if rule.streamed {
+                guard let body = try await beginStreamedBody(stream, limit: rule.limit) else { return false }
+                streamed = body
+            } else {
+                guard try await readBody(stream, limit: rule.limit) else { return false }
+            }
         }
 
         var keepAlive = head.isKeepAlive
@@ -275,7 +282,19 @@ struct HTTP1Connection: ~Copyable {
         if limits.traceContext { x.pointee.readTraceParent() }
         if observing { x.pointee.started = monotonicNanos() }
 
+        streamed?.attach(true)
         await dispatch(app, matched: matched)
+        if let body = streamed {
+            body.attach(false)
+            // The next request starts where the body ended. A body the
+            // handler left unread, or one cut off, leaves nowhere to start.
+            if !body.broken && body.skipRest() {
+                x.pointee.consumedBody = body.consumed
+            } else {
+                keepAlive = false
+                x.pointee.keepAlive = false
+            }
+        }
 
         if let upgrade = x.pointee.upgrade {
             // The connection is the WebSocket's from here: the 101, and
@@ -448,6 +467,37 @@ struct HTTP1Connection: ~Copyable {
                 if n == 0 { return false }
             }
         }
+    }
+
+    /// Readies a body the handler reads as it arrives, which it does from
+    /// this connection, in this task: answers still batched go first, so a
+    /// client that waits for them before sending more is not left waiting,
+    /// and the head goes to the front of the read buffer with room behind it
+    /// for the body. Nil, answered, when the request cannot be served.
+    mutating func beginStreamedBody<S: AsyncReader & AsyncWriter & ~Copyable>(
+        _ stream: borrowing S, limit: Int
+    ) async throws -> H1RequestBody? {
+        let head = x.pointee.head
+        if !head.isChunked && head.contentLength > limit {
+            try await failAndClose(stream, status: 413)
+            return nil
+        }
+        guard case .http1(let held, _, _) = x.pointee.link else { return nil }
+        try await flush(stream)
+        compact()
+        // Made large enough now: the buffer must not move while the handler
+        // runs, with the head, and what middleware noted of it, in it.
+        let room = head.headEnd &+ streamedBodyBuffer
+        if parts.pointee.input.capacity < room {
+            parts.pointee.input.reserveCapacity(room)
+            rebase()
+        }
+        let body = x.pointee.h1Body ?? H1RequestBody(parts: parts)
+        x.pointee.h1Body = body
+        body.begin(held: held, reader: HeldReader<S>.self, limits: limits, limit: limit)
+        x.pointee.bodySource = body
+        x.pointee.touchedStream = true
+        return body
     }
 
     /// `Expect: 100-continue`: the client is waiting to be told to send.

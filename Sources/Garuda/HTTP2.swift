@@ -23,7 +23,10 @@
 // middleware, extractors and the heavy lane see a request like any other.
 // Its body is collected whole before
 // dispatch, as HTTP/1 collects one, held to the same body limit, with the
-// window given back as it arrives. Then the stream runs `dispatch` in a task
+// window given back as it arrives -- unless its route reads the body as it
+// arrives (RequestBody.swift): that stream is dispatched at its HEADERS, and
+// its DATA goes to the handler through a `BodyPipe`, the window given back
+// as the handler reads. Then the stream runs `dispatch` in a task
 // from the shard's `TaskPool`, so a handler that waits holds up no other
 // stream, and its answer is written within the stream's and the
 // connection's send windows.
@@ -355,6 +358,13 @@ final class H2Stream: @unchecked Sendable {
     /// the reader's table until it ends too. Under the lock.
     @exclusivity(unchecked) var lingering = false
 
+    // A request body read as it arrives (RequestBody.swift).
+    /// This request's body goes to its handler through `pipe`. Set by the
+    /// reader before the task runs.
+    @exclusivity(unchecked) var streaming = false
+    /// Made for the first such request on the stream, and kept.
+    @exclusivity(unchecked) var pipe: BodyPipe?
+
     init(connection: H2Connection, maxHeaders: Int, peer: SocketPeer) {
         self.connection = connection
         x = .allocate(capacity: 1)
@@ -639,10 +649,16 @@ final class H2Connection: @unchecked Sendable {
         }
     }
 
-    /// Under the lock: a stream's answer is no longer wanted.
+    /// Under the lock: a stream's answer is no longer wanted. A handler
+    /// reading its body learns it from the body, which hands over what
+    /// arrived first; its task is left to store it (RequestBody.swift).
     func cancel(_ s: H2Stream) {
         s.reset = true
-        s.task?.cancel()
+        if s.streaming {
+            s.pipe?.fail(.incomplete)
+        } else {
+            s.task?.cancel()
+        }
         s.resumeWaiters(false)
         s.inbound?.fail()
     }
@@ -677,6 +693,12 @@ final class H2Connection: @unchecked Sendable {
         while i < streams.count {
             let s = streams[i]
             if s.receiving && now &- s.lastActivity > limit {
+                // A body its handler has not read yet: the window is what
+                // stopped the client.
+                if s.streaming, let pipe = s.pipe, pipe.held > 0 {
+                    i &+= 1
+                    continue
+                }
                 if s.inbound == nil {
                     streamError(s.id, .cancel)
                     continue
@@ -849,6 +871,7 @@ final class H2Connection: @unchecked Sendable {
             releaseConnectionWindow()
             return true
         }
+        if s.streaming, let pipe = s.pipe { return deliverBody(s, pipe, header, payload + offset, length) }
         s.recvWindow -= header.length
         if s.recvWindow < 0 {
             releaseConnectionWindow()
@@ -892,6 +915,42 @@ final class H2Connection: @unchecked Sendable {
             s.recvWindow += bump
             frame(&outgoing, 4, .windowUpdate, [], s.id)
             HTTP2.writeUInt32(UInt32(bump), into: &outgoing)
+        }
+        releaseConnectionWindow()
+        return true
+    }
+
+    /// DATA for a body its handler reads as it arrives: handed to the pipe,
+    /// which gives the stream's window back as the handler reads. Held to
+    /// the declared length and the route's limit as a collected body is.
+    func deliverBody(_ s: H2Stream, _ pipe: BodyPipe, _ header: H2FrameHeader, _ p: UnsafePointer<UInt8>,
+                     _ length: Int) -> Bool {
+        s.received += length
+        let head = s.x.pointee.head
+        let declared = head.flags.contains(.hasContentLength)
+        if declared && s.received > head.contentLength {
+            releaseConnectionWindow()
+            streamError(header.streamID, .protocolError)
+            return true
+        }
+        // Past the limit the rest is not taken: the reader throws `tooLarge`,
+        // and the handler's answer -- a 413 unless it says otherwise -- is
+        // followed by a reset that tells the client to stop.
+        let over = s.received > s.bodyLimit
+        if over { pipe.fail(.tooLarge) }
+        if !pipe.deliver(p, over ? 0 : length, spent: header.length) {
+            releaseConnectionWindow()
+            streamError(header.streamID, .flowControlError)
+            return true
+        }
+        if header.flags.contains(.endStream) {
+            s.receiving = false
+            if declared && head.contentLength != s.received {
+                releaseConnectionWindow()
+                streamError(header.streamID, .protocolError)
+                return true
+            }
+            pipe.end()
         }
         releaseConnectionWindow()
         return true
@@ -1025,6 +1084,11 @@ final class H2Connection: @unchecked Sendable {
                 streamError(id, .protocolError)
                 return true
             }
+            if s.streaming {
+                s.receiving = false
+                s.pipe?.end()
+                return true
+            }
             run(s)
             return true
         }
@@ -1081,10 +1145,16 @@ final class H2Connection: @unchecked Sendable {
         // request's is, and held to the limit of the route it goes to.
         s.receiving = true
         s.lastActivity = monotonicNanos()
-        s.bodyLimit = app.hasBodyLimits ? bodyLimit(s.x, app, limits, matched: &s.matched) : limits.maxBodySize
+        let rule = app.hasBodyLimits ? bodyRule(s.x, app, limits, matched: &s.matched)
+            : BodyRule(limit: limits.maxBodySize)
+        s.bodyLimit = rule.limit
         // A declared length past the limit is refused before a byte of the
         // body is taken.
-        if head.flags.contains(.hasContentLength) && head.contentLength > s.bodyLimit { refuseBody(s) }
+        if head.flags.contains(.hasContentLength) && head.contentLength > s.bodyLimit {
+            refuseBody(s)
+        } else if rule.streamed {
+            runStreamed(s)
+        }
         return true
     }
 
@@ -1132,6 +1202,7 @@ final class H2Connection: @unchecked Sendable {
             s.ending = false
         }
         s.receiving = false
+        s.streaming = false
         s.recvWindow = settings.initialWindowSize
         s.pendingUpdate = 0
         s.received = 0
@@ -1185,6 +1256,39 @@ final class H2Connection: @unchecked Sendable {
         service.pool.run(s)
     }
 
+    /// A request whose route reads its body as it arrives: its handler runs
+    /// in a pooled task now -- never on the reader, which feeds it -- with
+    /// the body still to come through the stream's pipe.
+    func runStreamed(_ s: H2Stream) {
+        let pipe = s.pipe ?? BodyPipe(.h2(Unmanaged.passUnretained(s)))
+        s.pipe = pipe
+        pipe.begin(window: settings.initialWindowSize)
+        s.streaming = true
+        s.started = true
+        s.x.pointee.bodySource = pipe
+        s.x.pointee.touchedStream = true
+        lock.withLock { _ in
+            s.holds &+= 1
+            tasks &+= 1
+            unstarted &-= 1
+        }
+        service.pool.run(s)
+    }
+
+    /// `RequestBody.cancel`, from any task: the stream is reset as
+    /// cancelled, and the handler's reads end once they have what arrived.
+    /// Marked closed, so the reader's next sweep drops it from its table.
+    func cancelStreamedBody(_ s: H2Stream) {
+        lock.withLock { _ in
+            guard s.streaming, !s.reset, !s.closed else { return }
+            frame(&control, 4, .rstStream, [], s.id)
+            HTTP2.writeUInt32(H2Error.cancel.rawValue, into: &control)
+            cancel(s)
+            s.closed = true
+            wake.notifyOne()
+        }
+    }
+
     /// The request is whole: its handler runs in a pooled task.
     func run(_ s: H2Stream) {
         s.receiving = false
@@ -1217,10 +1321,13 @@ final class H2Connection: @unchecked Sendable {
     func answer(_ s: H2Stream) async {
         withUnsafeCurrentTask { task in
             lock.withLock { _ in
-                if s.reset { task?.cancel() } else { s.task = task }
+                if s.reset && !s.streaming { task?.cancel() } else { s.task = task }
             }
         }
         await dispatchStream(s)
+        // Answered before the client sent the whole body: it is told to stop
+        // sending the rest (RFC 9113 section 8.1).
+        if s.streaming, let pipe = s.pipe, !pipe.close() { s.resetAfter = .noError }
         if let inbound = s.inbound {
             if let upgrade = s.x.pointee.upgrade {
                 s.x.pointee.upgrade = nil

@@ -129,9 +129,19 @@ struct Exchange: ~Copyable {
     /// as the CONNECT it is. Set per stream.
     var connectProtocol = ConnectProtocol.none
 
+    // MARK: A streamed request body (RequestBody.swift)
+
+    /// Where the body of a request to a streaming route comes from as it
+    /// arrives, set by the connection before the handler runs; nil for a
+    /// body that arrived whole.
+    var bodySource: RequestBodySource?
+    /// HTTP/1's source, kept for the connection's next streamed body.
+    var h1Body: H1RequestBody?
+
     @usableFromInline
     mutating func resetStream() {
         touchedStream = false
+        bodySource = nil
         upgrade = nil
         webTransport = nil
         channel = nil

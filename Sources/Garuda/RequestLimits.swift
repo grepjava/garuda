@@ -85,6 +85,12 @@ struct ConcurrencyLimitMarker: ScopeLimitMarker {
     let max: Int
 }
 
+/// `onStreamingBody`'s scope, around its one route: the body is read as it
+/// arrives, held to `bytes` (RequestBody.swift).
+struct StreamingBodyMarker: ScopeLimitMarker {
+    let bytes: Int
+}
+
 // MARK: - Compiling
 
 /// The limits of each scope, made as the application compiles.
@@ -95,23 +101,28 @@ struct ScopeLimits {
     private var semaphores: [Int: Vega.Semaphore] = [:]
 
     /// The body limit of a route in `groups` (outermost first), or -1 for
-    /// `--max-body`, and the semaphores its handler takes a place in.
+    /// `--max-body`; whether its handler reads the body as it arrives; and
+    /// the semaphores its handler takes a place in.
     mutating func limits(of groups: [Int],
                          in scopes: [(prefix: String, middleware: [any Middleware])])
-        -> (bodyLimit: Int, permits: [Vega.Semaphore]) {
+        -> (bodyLimit: Int, streamed: Bool, permits: [Vega.Semaphore]) {
         var bodyLimit = -1
+        var streamed = false
         var permits: [Vega.Semaphore] = []
         for group in groups {
             for layer in scopes[group].middleware {
                 if let marker = layer as? BodyLimitMarker {
                     bodyLimit = marker.bytes
+                } else if let marker = layer as? StreamingBodyMarker {
+                    bodyLimit = marker.bytes
+                    streamed = true
                 } else if let marker = layer as? ConcurrencyLimitMarker {
                     if semaphores[group] == nil { semaphores[group] = Vega.Semaphore(permits: marker.max) }
                     permits.append(semaphores[group]!)
                 }
             }
         }
-        return (bodyLimit, permits)
+        return (bodyLimit, streamed, permits)
     }
 }
 
@@ -141,21 +152,29 @@ func acquirePlaces(_ permits: [Vega.Semaphore]) -> Bool {
 // MARK: - The connection side
 
 extension HTTP1Connection {
-    /// `bodyLimit(_:_:_:matched:)` for this connection's exchange.
-    mutating func bodyLimit(_ app: CompiledApplication, matched: inout Int32) -> Int {
-        Garuda.bodyLimit(x, app, limits, matched: &matched)
+    /// `bodyRule(_:_:_:matched:)` for this connection's exchange.
+    mutating func bodyRule(_ app: CompiledApplication, matched: inout Int32) -> BodyRule {
+        Garuda.bodyRule(x, app, limits, matched: &matched)
     }
 }
 
-/// The body limit of the route the request's head goes to, in an
+/// What the route a request goes to says of its body, worked out from the
+/// head: the most it may be, and whether the handler reads it as it arrives
+/// rather than being given it whole (RequestBody.swift).
+struct BodyRule {
+    var limit: Int
+    var streamed = false
+}
+
+/// The body rule of the route the request's head goes to, in an
 /// application where some scope has one: matched now, before the body is
 /// read. A route that matched as the path came is put in `matched`, with
 /// its parameters in the exchange, for the dispatch to use rather than
 /// match again; any other outcome -- a trailing slash, a fallback, a miss
 /// -- the dispatch works out again, as it is rare and cheap next to a
 /// body. An HTTP/2 stream asks the same when its HEADERS arrive (HTTP2.swift).
-func bodyLimit(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, _ limits: ConnectionLimits,
-               matched: inout Int32) -> Int {
+func bodyRule(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, _ limits: ConnectionLimits,
+              matched: inout Int32) -> BodyRule {
     let path = x.pointee.head.path
     let base = x.pointee.base + Int(path.offset)
     let method = x.pointee.head.method
@@ -175,6 +194,7 @@ func bodyLimit(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, 
             route = app.fallbacks.match(base, count)
         }
     }
-    let limit = route >= 0 ? app.bodyLimits[Int(route)] : -1
-    return limit >= 0 ? limit : limits.maxBodySize
+    guard route >= 0 else { return BodyRule(limit: limits.maxBodySize) }
+    let limit = app.bodyLimits[Int(route)]
+    return BodyRule(limit: limit >= 0 ? limit : limits.maxBodySize, streamed: app.streamedBodies[Int(route)])
 }

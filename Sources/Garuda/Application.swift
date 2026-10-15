@@ -250,9 +250,11 @@ public final class Application: RouteBuilder, @unchecked Sendable {
         var serving = routes + fallbacks
         var scopeLimits = ScopeLimits()
         var bodyLimits: [Int] = []
+        var streamedBodies: [Bool] = []
         for i in serving.indices {
-            let (bodyLimit, permits) = scopeLimits.limits(of: serving[i].groups, in: groups)
+            let (bodyLimit, streamed, permits) = scopeLimits.limits(of: serving[i].groups, in: groups)
             bodyLimits.append(bodyLimit)
+            streamedBodies.append(streamed)
             serving[i].handler = limited(serving[i].handler, permits)
             let layers = middleware(of: serving[i])
             if !layers.isEmpty { serving[i].handler = compose(layers, around: serving[i].handler) }
@@ -265,7 +267,8 @@ public final class Application: RouteBuilder, @unchecked Sendable {
                                            observers: responseObservers,
                                            fallbacks: CompiledFallbacks(fallbacks.map(\.pattern),
                                                                         first: routes.count),
-                                           bodyLimits: bodyLimits, makeTracer: makeTracer,
+                                           bodyLimits: bodyLimits, streamedBodies: streamedBodies,
+                                           makeTracer: makeTracer,
                                            scheduledJobs: scheduledJobs)
         compiledApplication = compiled
         return compiled
@@ -355,6 +358,10 @@ final class CompiledApplication: @unchecked Sendable {
     /// body only then (RequestLimits.swift).
     let bodyLimits: [Int]
     let hasBodyLimits: Bool
+    /// Whether each handler reads its body as it arrives, by route index
+    /// (RequestBody.swift). Such a route always has a body limit of its own,
+    /// so its requests are matched at the head.
+    let streamedBodies: [Bool]
 
     init(table: CompiledRoutes, routes: [RouteEntry], stateFactories: [StateFactory] = [],
          startHooks: [@Sendable (ShardContext) async throws -> Void] = [],
@@ -363,6 +370,7 @@ final class CompiledApplication: @unchecked Sendable {
          observers: [ResponseObserver] = [],
          fallbacks: CompiledFallbacks = CompiledFallbacks(),
          bodyLimits: [Int] = [],
+         streamedBodies: [Bool] = [],
          makeTracer: (@Sendable (Int) -> any Tracer)? = nil,
          scheduledJobs: [ScheduledJob] = []) {
         self.table = table
@@ -373,6 +381,8 @@ final class CompiledApplication: @unchecked Sendable {
         self.fallbacks = fallbacks
         self.bodyLimits = bodyLimits
         hasBodyLimits = bodyLimits.contains { $0 >= 0 }
+        self.streamedBodies = streamedBodies.count == routes.count
+            ? streamedBodies : [Bool](repeating: false, count: routes.count)
         // A fallback is never reported as a route.
         let routed = routes.count - fallbacks.routes.count
         patterns = routes[..<routed].map(\.pattern)

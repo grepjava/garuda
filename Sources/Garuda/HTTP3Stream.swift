@@ -5,8 +5,11 @@
 // own `Exchange`, exactly as HTTP/2 rebuilds one: described as the HTTP/1
 // parser would describe the HTTP/1.1 head it amounts to, with its version set
 // to 3. Its body is collected whole before dispatch, held to the same body
-// limit. Then the stream runs `dispatch` in a task from the shard's stream
-// pool, and a stream the client cancels has its task cancelled. An extended
+// limit -- unless its route reads the body as it arrives (RequestBody.swift):
+// that stream is dispatched at its HEADERS, and its DATA goes to the handler
+// through a `BodyPipe`, QUIC's window growing as the handler reads. Then the
+// stream runs `dispatch` in a task from the shard's stream pool, and a
+// stream the client cancels has its task cancelled. An extended
 // CONNECT is dispatched on its HEADERS instead, and its stream is then a
 // tunnel: a WebSocket's (HTTP3WebSocket.swift), or a WebTransport session's
 // (HTTP3WebTransport.swift).
@@ -90,6 +93,11 @@ final class H3Stream: @unchecked Sendable {
     @exclusivity(unchecked) var inbound: H3Inbound?
     /// A WebTransport session's, once the endpoint has its 200.
     @exclusivity(unchecked) var liveSession: WTSession?
+    /// This request's body goes to its handler through `pipe`, as it
+    /// arrives (RequestBody.swift). Set before the task runs.
+    @exclusivity(unchecked) var streaming = false
+    /// Made for the first such request on the stream, and kept.
+    @exclusivity(unchecked) var pipe: BodyPipe?
 
     // MARK: Shared, under the endpoint's lock
 
@@ -123,6 +131,9 @@ final class H3Stream: @unchecked Sendable {
     /// The endpoint is answering it itself: its writes cannot wait for the
     /// endpoint to take what they staged.
     @exclusivity(unchecked) var runsInline = false
+    /// `RequestBody.cancel` asked for the stream to be reset, which the
+    /// endpoint does when it next takes the stream's posts.
+    @exclusivity(unchecked) var cancelRequested = false
 
     // MARK: The task's (or the endpoint's, when it answers itself)
 
@@ -237,10 +248,15 @@ extension QUICEndpoint {
     func answer(_ s: H3Stream) async {
         withUnsafeCurrentTask { task in
             lock.withLock { _ in
-                if s.reset { task?.cancel() } else { s.task = task }
+                // A handler reading its body learns of a reset from the body
+                // (RequestBody.swift).
+                if s.reset && !s.streaming { task?.cancel() } else { s.task = task }
             }
         }
         await dispatchStream(s)
+        // Answered before the client sent the whole body: the endpoint tells
+        // it to stop once the answer has gone.
+        if s.streaming { _ = s.pipe?.close() }
         if let inbound = s.inbound {
             if let upgrade = s.x.pointee.upgrade {
                 s.x.pointee.upgrade = nil
@@ -322,6 +338,16 @@ extension QUICEndpoint {
         lock.withLock { _ in
             s.streamed = true
             s.staged.write(s.outHead.readPointer, s.outHead.readableBytes)
+            post(s)
+        }
+    }
+
+    /// `RequestBody.cancel`, from any task: the endpoint resets the stream
+    /// when it next takes its posts.
+    func cancelStreamedBody(_ s: H3Stream) {
+        lock.withLock { _ in
+            guard s.streaming, !s.reset else { return }
+            s.cancelRequested = true
             post(s)
         }
     }

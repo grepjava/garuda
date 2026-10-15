@@ -580,10 +580,28 @@ final class H3Connection {
             if head.flags.contains(.hasContentLength) && head.contentLength != current.received {
                 return abort(current, code: HTTP3Error.messageError)
             }
+            if current.streaming {
+                current.receiving = false
+                current.pipe?.end()
+                return
+            }
             run(current)
             return
         }
-        extend(stream, current)
+        if current.streaming, let pipe = current.pipe {
+            extendBody(current, pipe)
+        } else {
+            extend(stream, current)
+        }
+    }
+
+    /// Opens a streamed body's window by what its handler has read: what
+    /// arrived and is still in the pipe holds it back.
+    private func extendBody(_ s: H3Stream, _ pipe: BodyPipe) {
+        guard s.receiving, let stream = quic.stream(s.id), !stream.released else { return }
+        let held = UInt64(stream.receive.ready.readableBytes &+ pipe.held)
+        let received = stream.receive.received
+        quic.extendStreamWindow(s.id, consumed: received > held ? received &- held : 0)
     }
 
     /// Opens the stream's window by what has been read: the body is the
@@ -608,6 +626,16 @@ final class H3Connection {
         if head.flags.contains(.hasContentLength) && s.received > head.contentLength {
             abort(s, code: HTTP3Error.messageError)
             return false
+        }
+        if s.streaming, let pipe = s.pipe {
+            // Its handler's, as they come. Past the limit the rest is
+            // counted and dropped, and the reader throws `tooLarge`.
+            if s.received > s.bodyLimit {
+                pipe.fail(.tooLarge)
+            } else {
+                _ = pipe.deliver(p, n, spent: n)
+            }
+            return true
         }
         // Answered already: the bytes are counted and checked, and dropped.
         if s.refused || !s.receiving { return true }
@@ -687,12 +715,17 @@ final class H3Connection {
             return s
         }
         let app = endpoint.app
-        s.bodyLimit = app.hasBodyLimits ? bodyLimit(s.x, app, endpoint.limits, matched: &s.matched)
-            : endpoint.limits.maxBodySize
+        let rule = app.hasBodyLimits ? bodyRule(s.x, app, endpoint.limits, matched: &s.matched)
+            : BodyRule(limit: endpoint.limits.maxBodySize)
+        s.bodyLimit = rule.limit
         // A declared length past the limit is refused before a byte of the
         // body is taken.
         let head = s.x.pointee.head
-        if head.flags.contains(.hasContentLength) && head.contentLength > s.bodyLimit { refuseBody(s) }
+        if head.flags.contains(.hasContentLength) && head.contentLength > s.bodyLimit {
+            refuseBody(s)
+        } else if rule.streamed {
+            runStreamed(s)
+        }
         return s
     }
 
@@ -732,8 +765,10 @@ final class H3Connection {
         s.isTunnel = false
         s.inbound = nil
         s.liveSession = nil
+        s.streaming = false
         endpoint.lock.withLock { _ in
             s.reset = false
+            s.cancelRequested = false
             s.task = nil
             s.taskDone = false
             s.answerReady = false
@@ -777,6 +812,21 @@ final class H3Connection {
         if s.x.pointee.connectProtocol == .websocket {
             s.inbound = H3Inbound(stream: s, window: settings.streamWindow)
         }
+        s.taskActive = true
+        tasks &+= 1
+        endpoint.pool.run(s)
+    }
+
+    /// A request whose route reads its body as it arrives: its handler runs
+    /// in a pooled task now -- never the endpoint's own, which feeds it --
+    /// with the body still to come through the stream's pipe.
+    private func runStreamed(_ s: H3Stream) {
+        let pipe = s.pipe ?? BodyPipe(.h3(Unmanaged.passUnretained(s)))
+        s.pipe = pipe
+        pipe.begin(window: nil)
+        s.streaming = true
+        s.x.pointee.bodySource = pipe
+        s.x.pointee.touchedStream = true
         s.taskActive = true
         tasks &+= 1
         endpoint.pool.run(s)
@@ -851,10 +901,13 @@ final class H3Connection {
     func abort(_ s: H3Stream, code: UInt64) {
         endpoint.lock.withLock { _ in
             s.reset = true
-            s.task?.cancel()
+            // A handler reading its body learns of it from the body, which
+            // hands over what arrived first; its task is left to store it.
+            if !s.streaming { s.task?.cancel() }
             s.resumeWaiters(false)
         }
         s.inbound?.fail()
+        if s.streaming { s.pipe?.fail(.incomplete) }
         if !s.sendEnded {
             s.sendEnded = true
             quic.resetStream(s.id, code: code)
@@ -902,17 +955,23 @@ final class H3Connection {
 
     /// A task posted `s`: an answer, body bytes, an end, or its own end.
     func posted(_ s: H3Stream) {
-        let (done, session) = endpoint.lock.withLock { _ -> (Bool, WTSession?) in
+        let (done, session, cancelled) = endpoint.lock.withLock { _ -> (Bool, WTSession?, Bool) in
             s.queued = false
-            return (s.taskDone, s.wt)
+            let cancelled = s.cancelRequested
+            s.cancelRequested = false
+            return (s.taskDone, s.wt, cancelled)
         }
+        // `RequestBody.cancel`: the stream is reset as cancelled.
+        if cancelled && s.inTable && !closed { abort(s, code: HTTP3Error.requestCancelled) }
         if done && s.taskActive {
             s.taskActive = false
             tasks &-= 1
         }
         if s.inTable && !closed {
-            // A WebSocket's session took some of what arrived.
+            // A WebSocket's session took some of what arrived, or a handler
+            // some of its body.
             if let inbound = s.inbound { extendTunnel(s, inbound) }
+            if s.streaming, let pipe = s.pipe { extendBody(s, pipe) }
             // A WebTransport session's streams, and what it sent.
             if let session { serviceSession(session, on: s) }
             pump(s)
@@ -988,7 +1047,12 @@ final class H3Connection {
         guard began, !closed else { return }
         let limit = settings.bodyTimeoutMs
         var stalled: [H3Stream] = []
-        for s in streams.values where s.receiving && now &- s.lastActivity > limit { stalled.append(s) }
+        for s in streams.values where s.receiving && now &- s.lastActivity > limit {
+            // A body its handler has not read yet: the window is what
+            // stopped the client.
+            if s.streaming, let pipe = s.pipe, pipe.held > 0 { continue }
+            stalled.append(s)
+        }
         for s in stalled { abort(s, code: HTTP3Error.requestIncomplete) }
         if !stalled.isEmpty { endpoint.touch(self) }
     }
