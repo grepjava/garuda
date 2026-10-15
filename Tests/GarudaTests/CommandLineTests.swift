@@ -43,16 +43,25 @@ private func refused(_ flags: [String]) -> Bool {
     }
 
     @Test func limitsAndListeningAreParsed() {
+        #if os(Windows)
+        // No unix sockets to serve on there: the flag is refused.
+        let listening: [String] = []
+        #expect(refused(["--unix", "/tmp/g.sock"]))
+        #else
+        let listening = ["--unix", "/tmp/g.sock"]
+        #endif
         guard let config = parsed(["--backlog", "512", "--max-connections", "64",
-                                   "--max-header-size", "8192", "--unix", "/tmp/g.sock",
-                                   "--blocking-threads", "8", "--blocking-queue", "0"]) else {
+                                   "--max-header-size", "8192"] + listening
+                                  + ["--blocking-threads", "8", "--blocking-queue", "0"]) else {
             Issue.record("the flags did not parse")
             return
         }
         #expect(config.backlog == 512)
         #expect(config.maxConnections == 64)
         #expect(config.maxHeadSize == 8192)
+        #if !os(Windows)
         #expect(config.unixPath == "/tmp/g.sock")
+        #endif
         #expect(config.blockingThreads == 8)
         #expect(config.blockingQueue == 0)
         #expect(ServerConfig().maxConnections == nil && ServerConfig().blockingQueue == nil)
