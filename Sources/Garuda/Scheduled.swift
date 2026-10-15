@@ -3,12 +3,12 @@
 // expired, refreshing a cache, sending what a queue has collected.
 //
 //     // Every shard, every five minutes.
-//     app.every(.minutes(5)) { shard in
+//     app.every(.seconds(300)) { shard in
 //         try await shard.state(Caches.self).refresh()
 //     }
 //
 //     // One shard, hourly: housekeeping nobody needs done four times.
-//     app.every(.hours(1), onShard: 0) { shard in
+//     app.every(.seconds(3600), onShard: 0) { shard in
 //         try await SQLiteRefreshTokenStore(shard.state(SQLiteDatabase.self)).deleteExpired()
 //     }
 //
