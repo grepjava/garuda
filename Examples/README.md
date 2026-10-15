@@ -9,7 +9,7 @@ Garuda checkout this directory sits in.
 |---|---|---|
 | [Todo](Sources/TodoExample/TodoApp.swift) | `swift run todo` | A JSON CRUD API on SQLite (`GarudaSQLite`): typed routes, validation answered as 422 and 409, migrations, paging |
 | [Auth](Sources/AuthExample/AuthApp.swift) | `swift run auth` | Sign-up, login and logout: PBKDF2 password hashes, random session tokens stored as digests, `authenticate(bearer:state:)`, an extractor of its own that awaits |
-| [Streaming](Sources/StreamingExample/StreamingApp.swift) | `swift run streaming` | Server-sent events, a CSV export written as it is produced, and uploads written to disk by an offloaded route with a body limit of its own |
+| [Streaming](Sources/StreamingExample/StreamingApp.swift) | `swift run streaming` | Server-sent events, a CSV export written as it is produced, an upload read as it arrives and written to disk with a body limit of its own, and an offloaded route |
 | [Chat](Sources/ChatExample/ChatApp.swift) | `swift run chat` | Rooms over WebSockets and server-sent events, heard across every shard through `Topic` |
 | [WebTransport](Sources/WebTransportExample/WebTransportApp.swift) | `swift run webtransport -- --tls-cert cert.pem --tls-key key.pem` | A network probe over HTTP/3: datagram round trips, download and upload throughput on streams, a stream the server opens, an extractor that refuses a session before it starts, and a browser page that trusts a self-signed certificate by its hash |
 | [Files](Sources/FilesExample/FilesApp.swift) | `swift run files` | A file service: resumable uploads (`GarudaUploads`) with size limits and SHA-256 digests, the files served back by `--static-dir` with byte ranges, `ETag` and a listing |
@@ -55,8 +55,8 @@ The package depends on Garuda's products -- `Garuda`, and `GarudaSQLite`,
 them -- and on Vega, the runtime Garuda is built on, for what Garuda does not
 export: SHA-256 (`VegaCrypto`, in the webtransport example), a runtime for
 work outside the server (`Vega`, in the starter's `withServices`), and file
-system calls that run on the blocking pool (`VegaFS`, in the files and uploads
-examples).
+system calls that run on the blocking pool (`VegaFS`, in the streaming, files
+and uploads examples).
 
 ## Notes for copying
 
@@ -72,14 +72,16 @@ examples).
 - **Passwords cost CPU on purpose.** The auth example hashes with 600,000
   iterations on Vega's blocking pool. Run it with `--rate-limit`, and behind
   TLS.
-- **Blocking work goes off the shard's threads.** The streaming example's
-  upload routes are `app.offload.put` and `app.offload.get`: their handlers
-  block on the file system, so they run on the blocking pool.
-- **Uploads** in the streaming example go to a partial file that is renamed
-  when complete, and are limited in size per route with `maxBodySize`. Garuda
-  2 reads a request body whole before the handler runs, so the limit is also
-  what an upload may hold in memory. Serve the directory with a separate
-  route or `--static-dir` if they should be downloadable.
+- **Blocking work goes off the shard's threads.** A handler that blocks, as
+  the streaming example's `stat` does, is an `app.offload` route and runs on
+  the blocking pool. VegaFS's calls, which the uploads use, run there by
+  themselves.
+- **Uploads** in the streaming example are read as they arrive, with
+  `onStreamingBody`, and go to a partial file that is renamed when complete.
+  Every other route is given its body whole, so for those the route's
+  `maxBodySize` is also what a request may hold in memory; a streaming route's
+  limit is only how much it takes. Serve the directory with a separate route
+  or `--static-dir` if they should be downloadable.
 - **Resumable uploads** in the files example are `app.resumableUploads`: the
   body goes to disk as it arrives, a client that speaks the draft protocol can
   ask how much arrived and send the rest after a dropped connection, and the
