@@ -115,6 +115,17 @@ extension Application {
             Application.serve(shard.runtime, app: app, shard: info, limits: limits, config: config, listening: listening)
         }
         #else
+        // One process, as Runtime.sharded and the memory shards share are
+        // POSIX only; and Vega's one I/O driver here, AFD polling.
+        if let shards = config.shards, shards > 0 {
+            Log.error("--shards \(shards): shards are not supported on this platform; --shards 0 serves in this process")
+            exit(2)
+        }
+        if config.balance != nil { Log.warning("--balance is ignored: there are no shards on this platform") }
+        if config.io != nil { Log.warning("--io is ignored: there is one I/O driver on this platform") }
+        if config.acceptors.map({ $0 > 1 }) == true {
+            Log.warning("--acceptors is ignored: one accept loop on this platform")
+        }
         let runtime = Runtime(workers: config.threads)
         let info = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
         let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
@@ -245,7 +256,13 @@ extension Application {
                 // Vega sets TCP_NODELAY on every accepted socket. One accept
                 // loop per thread: a connection then usually starts on the
                 // thread that accepted it, rather than one woken to steal it.
+                #if os(Windows)
+                // No SO_REUSEPORT, and one process: a socket bound once,
+                // and one accept loop on it.
+                let acceptors = 1
+                #else
                 let acceptors = max(1, config.acceptors ?? runtime.workerCount)
+                #endif
                 var servers: [TCPServer] = []
                 for _ in 0..<acceptors {
                     servers.append(try TCPServer.serve(try listening.main()) { stream in
@@ -295,7 +312,6 @@ extension Application {
                     runtime.spawn { await watchCertificates(tls, every: interval) }
                 }
                 let all = servers
-                #if !os(Windows)
                 let grace = config.gracefulShutdown
                 let delay = config.drainDelay
                 runtime.spawn {
@@ -303,7 +319,14 @@ extension Application {
                     // not. Under a supervisor, SIGQUIT arrives as SIGINT,
                     // and so does a rolling restart's stop.
                     let terms = try? Runtime.signals(SIGTERM)
+                    #if os(Windows)
+                    // Vega's console handler: Ctrl-C as SIGINT, Ctrl-Break
+                    // as SIGBREAK; closing the console, logging off or
+                    // shutting down as SIGTERM.
+                    let nows = [SIGINT, SIGBREAK].compactMap { try? Runtime.signals($0) }
+                    #else
                     let nows = [SIGINT, SIGQUIT].compactMap { try? Runtime.signals($0) }
+                    #endif
                     let first = await firstSignal(terms.map { [$0] + nows } ?? nows)
                     if first == SIGTERM && delay > .zero {
                         app.unready.store(true, ordering: .relaxed)
@@ -325,7 +348,6 @@ extension Application {
                         for server in all { group.addTask { await server.shutdown(gracePeriod: grace) } }
                     }
                 }
-                #endif
                 for server in all { await server.wait() }
                 await quic?.wait()
                 await app.stopShard(shard)

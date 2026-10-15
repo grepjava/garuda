@@ -138,8 +138,12 @@ static void yield(void) {
 
 static int process_gone(uint64_t pid) {
 #if defined(_WIN32)
-    (void)pid;
-    return 0;
+    if (pid > UINT32_MAX) return 1;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (h == NULL) return GetLastError() == ERROR_INVALID_PARAMETER;
+    int gone = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+    CloseHandle(h);
+    return gone;
 #else
     return kill((pid_t)pid, 0) != 0 && errno == ESRCH;
 #endif

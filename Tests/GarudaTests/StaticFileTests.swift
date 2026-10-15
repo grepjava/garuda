@@ -3,6 +3,9 @@ import Testing
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
+import WinSDK
 #endif
 import GarudaTesting
 import GarudaWire
@@ -15,29 +18,62 @@ final class Site {
     let path: String
 
     init() {
+        #if os(Windows)
+        path = "\(temporaryDirectory)/garuda-static-\(_getpid())-\(UInt32.random(in: 0...UInt32.max))"
+        precondition(_mkdir(path) == 0, "no temporary directory")
+        #else
         var template = Array("/tmp/garuda-static-XXXXXX".utf8CString)
         let made = template.withUnsafeMutableBufferPointer { mkdtemp($0.baseAddress!) }
         precondition(made != nil, "no temporary directory")
         path = String(cString: template)
         chmod(path, 0o755)
+        #endif
     }
 
+    #if os(Windows)
+    func directory(_ name: String) { _mkdir(path + name) }
+    #else
     func directory(_ name: String) { mkdir(path + name, 0o755) }
+    #endif
 
     func write(_ name: String, _ bytes: [UInt8]) {
-        let file = fopen(path + name, "w")!
+        let file = fopen(path + name, "wb")!
         bytes.withUnsafeBufferPointer { _ = fwrite($0.baseAddress, 1, $0.count, file) }
         fclose(file)
     }
 
     func write(_ name: String, _ text: String) { write(name, Array(text.utf8)) }
 
+    #if os(Windows)
+    /// Unprivileged, as Developer Mode allows; a relative target is relative
+    /// to the link's directory, as on POSIX.
+    func link(_ name: String, to target: String) {
+        let native = { (p: String) in String(p.map { $0 == "/" ? "\\" : $0 }) }
+        let linkPath = native(path + name)
+        let absolute = target.first == "/" || target.dropFirst().first == ":"
+        let resolved = absolute ? target : String(linkPath[..<(linkPath.lastIndex(of: "\\") ?? linkPath.startIndex)]) + "\\" + native(target)
+        var flags = DWORD(SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)
+        let attributes = resolved.withCString(encodedAs: UTF16.self) { GetFileAttributesW($0) }
+        if attributes != INVALID_FILE_ATTRIBUTES && attributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0 {
+            flags |= DWORD(SYMBOLIC_LINK_FLAG_DIRECTORY)
+        }
+        _ = linkPath.withCString(encodedAs: UTF16.self) { l in
+            native(target).withCString(encodedAs: UTF16.self) { t in CreateSymbolicLinkW(l, t, flags) }
+        }
+    }
+
+    deinit {
+        let command = "rmdir /s /q \"\(String(path.map { $0 == "/" ? "\\" : $0 }))\""
+        _ = command.withCString { system($0) }
+    }
+    #else
     func link(_ name: String, to target: String) { symlink(target, path + name) }
 
     deinit {
         let command = "rm -rf '\(path)'"
         _ = command.withCString { system($0) }
     }
+    #endif
 }
 
 private func pattern(_ count: Int) -> [UInt8] {

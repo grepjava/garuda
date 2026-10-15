@@ -11,6 +11,8 @@
 @_exported import Glibc
 #elseif canImport(Darwin)
 @_exported import Darwin
+#elseif os(Windows)
+@_exported import ucrt
 #endif
 
 public let cCR: UInt8 = 13

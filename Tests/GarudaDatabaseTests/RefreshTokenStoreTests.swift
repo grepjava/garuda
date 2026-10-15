@@ -2,6 +2,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Garuda
 import GarudaPostgres
@@ -73,7 +75,7 @@ struct RefreshTokenDatabaseStoreTests {
     }
 
     @Test func sqlite() throws {
-        let path = "/tmp/garuda-db-\(getpid())-refresh.sqlite"
+        let path = "\(temporaryDirectory)/garuda-db-\(getpid())-refresh.sqlite"
         defer { unlink(path); unlink(path + "-wal"); unlink(path + "-shm") }
         let text = try DatabaseTestRuntime.shared.block { () async throws -> String in
             let db = try SQLiteDatabase(SQLiteConfiguration(path: path))

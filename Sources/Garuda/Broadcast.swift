@@ -41,6 +41,8 @@ import Vega
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 
 /// A named stream of messages. Anyone may publish on it and any request may

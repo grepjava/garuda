@@ -29,7 +29,7 @@ final class AllocationProbe: @unchecked Sendable {
     func take() {
         guard taken < capacity else { return }
         stamps[taken] = Runtime.currentJobStamp
-        counts[taken] = garuda_test_allocations()
+        counts[taken] = Int(garuda_test_allocations())
         taken += 1
     }
 
