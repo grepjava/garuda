@@ -936,9 +936,23 @@ public final class QUICConnection {
             ? 0
             : localParameters.initialMaxStreamDataBidiLocal
         stream.receive.announced = stream.receive.limit
+        // Nothing ever arrives on it, so its receiving side is over from the
+        // start, and the stream can be retired once released and sent.
+        if unidirectional { stream.receive.finished = true }
         streams[id] = stream
         if unidirectional { nextLocalStreamUni += 1 } else { nextLocalStreamBidi += 1 }
         return id
+    }
+
+    /// How many streams of a kind the peer allows this side to open, in all:
+    /// its MAX_STREAMS, opened ones included.
+    public func peerStreamLimit(unidirectional: Bool) -> UInt64 {
+        unidirectional ? peerMaxStreamsUni : peerMaxStreamsBidi
+    }
+
+    /// How many streams of a kind this side has opened.
+    public func localStreamsOpened(unidirectional: Bool) -> UInt64 {
+        unidirectional ? nextLocalStreamUni : nextLocalStreamBidi
     }
 
     public func stream(_ id: UInt64) -> QUICStream? { streams[id] }
