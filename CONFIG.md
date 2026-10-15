@@ -57,7 +57,7 @@ changed between the two.
 | `--io uring\|epoll` | io_uring where the kernel has it | the I/O driver (Linux) |
 | `--heavy-threshold US` | `500` | microseconds a route may hold a thread, on average, before it runs in the heavy lane |
 | `--no-heavy-lane` | lane on | let every route use every thread |
-| `--sched-slice MICROS` | -- | Garuda 1's scheduler slice; accepted, with a warning that it has no effect |
+| `--sched-slice US` | -- | Garuda 1's scheduler slice; accepted (0, or 100 to 100000), with a warning that it has no effect |
 
 **Shards.** A shard is a process with its own work-stealing runtime on its
 own CPUs. With one shard or more, the process that was started becomes a
@@ -140,21 +140,21 @@ that may change in between.
 
 | flag | default | what it does |
 |---|---|---|
-| `--max-connections N` | `4096` | concurrent connections per shard |
+| `--max-connections N` | no limit | connections a shard has open at once; more wait in the backlog |
 | `--max-body BYTES` | 16 MiB | largest request body; larger gets 413 |
 | `--max-header-size BYTES` | 32 KiB | largest request head; larger gets 431; minimum 1024 |
 | `--keep-alive MS` | `5000` | idle time allowed on a connection between requests |
 | `--request-timeout MS` | `30000` | how long a request may stall part-way through |
 | `--graceful-timeout MS` | `10000` | time requests, streams and WebSockets in progress get at shutdown |
 | `--drain-delay MS` | `0` | on `SIGTERM`, keep serving this long with the health check failing |
-| `--blocking-threads N` | `16` | threads per shard that blocking work (`app.offload`) runs on |
-| `--blocking-queue N` | `1024` | blocking work waiting for a thread, per shard, before it is refused 503 |
+| `--blocking-threads N` | Vega's, `512` | threads per shard that blocking work (`app.offload`) runs on |
+| `--blocking-queue N` | no limit | blocking work waiting for a thread, per shard, before it is refused 503 |
 | `--sse-keep-alive SECS` | `15` | an event stream quiet this long is sent a comment; `0` sends none |
 | `--broadcast-size MIB` | `4` | the ring a `Topic`'s messages cross shards in; `0` turns topics off |
 | `--broadcast-queue N` | `1024` | messages a subscriber may fall behind by before it is told it missed some |
 
 - **`--max-connections`** is per shard. A connection that arrives at a full
-  shard is refused.
+  shard is not accepted until one closes; it waits in the listen backlog.
 - **`--max-body`** is checked against a declared `Content-Length` before the
   body is read, and against the bytes received for a chunked, HTTP/2 or HTTP/3
   body. Routes inside `app.maxBodySize(bytes) { … }` use that limit instead.
@@ -212,7 +212,7 @@ The limits below have no flag; set them on a `ServerConfig` and call
 | `--acme-webroot DIR` | none | on the `--redirect-http` port, serve ACME HTTP-01 challenges from DIR |
 | `--hsts SECS` | none | send `Strict-Transport-Security: max-age=SECS` on TLS responses |
 | `--tls-ciphers LIST` | the library's | cipher list for TLS 1.2; TLS 1.3 suites are not configurable |
-| `--ktls`, `--no-ktls` | -- | accepted, with a warning that they have no effect |
+| `--ktls`, `--no-ktls` | -- | Garuda 1's; accepted. `--ktls` warns that it has no effect, and `--no-ktls` asks for what is already so |
 
 `--tls-cert` and `--tls-key` turn on TLS for the TCP port. ALPN chooses HTTP/2
 or HTTP/1.1. The files are loaded and checked before any shard starts, so an
@@ -312,7 +312,7 @@ Start with a short value such as `300`. A browser that has seen a long
 | `--http3` | off | also serve HTTP/3 over QUIC; needs `--tls-cert` |
 | `--quic-port PORT` | `--port` | UDP port for HTTP/3; needs `--http3` |
 | `--no-websockets` | off | refuse WebSocket requests with 501 |
-| `--websocket-protocols L` | `http1,http2,http3` | which protocols carry WebSockets |
+| `--websocket-protocols LIST` | `http1,http2,http3` | which protocols carry WebSockets |
 | `--ws-max-message BYTES` | 16 MiB | largest message taken, after inflating; at least 125 |
 | `--ws-ping-interval MS` | `20000` | ping a WebSocket quiet this long; `0` sends none |
 | `--ws-ping-timeout MS` | `20000` | close one whose ping, or whose close, has gone unanswered this long |
@@ -369,11 +369,11 @@ details of every protocol.
 
 | flag | default | what it does |
 |---|---|---|
-| `--static-dir P=DIR` | none | serve URL prefix P from DIR; repeatable |
+| `--static-dir PREFIX=DIR` | none | serve URL prefix PREFIX from DIR; a path naming no file falls through; repeatable |
 | `--static-index` | off | answer a `--static-dir` directory with its `index.html` |
 | `--static-listing` | off | list a `--static-dir` directory that has no `index.html` |
 | `--static-listing-limit N` | `10000` | list at most N entries; `0` for no limit |
-| `--spa-fallback P=FILE` | none | answer a browser navigation under P that nothing else answers with FILE; repeatable |
+| `--spa-fallback PREFIX=FILE` | none | answer a browser navigation under PREFIX that nothing else answers with FILE; repeatable |
 | `--compress-static` | off | serve `FILE.br`, `FILE.zst` or `FILE.gz` beside a static file when accepted |
 | `--compress` | off | compress handler responses with brotli, zstd or gzip, as the client accepts |
 | `--compress-min-size BYTES` | `1024` | leave a body declared smaller than this uncompressed |
@@ -518,8 +518,8 @@ shard, so a copy one shard stores, every shard serves, over any protocol.
 
 | flag | default | what it does |
 |---|---|---|
-| `--rate-limit RATE` | none | 429 past RATE requests per client: `N/s`, `N/m` or `N/h` |
-| `--rate-limit-burst N` | the count in RATE | requests allowed at once before the rate applies |
+| `--rate-limit N/s\|m\|h` | none | 429 past N requests per client a second, minute or hour, counted across every shard |
+| `--rate-limit-burst N` | the rate's count | requests allowed at once before the rate applies |
 
 ```bash
 garuda --rate-limit 100/s --rate-limit-burst 200
@@ -551,7 +551,7 @@ bounds how many requests a group of routes runs at once in one shard
 | `--forwarded-allow-ips LIST` | nobody | peers whose forwarded headers are believed |
 | `--request-id` | off | give every request an `X-Request-ID` |
 | `--trace-context` | off | record a W3C `traceparent` in the logs |
-| `--scheme http\|https` | `https` with TLS, else `http` | the scheme a request is taken to have arrived over, when nothing better says |
+| `--scheme http\|https` | `http` | the scheme a request without TLS arrived by, behind a proxy that terminates TLS and does not say so; a request over TLS is always `https` |
 | `--request-start-header` | off | make the arrival time available as `request.requestStart` |
 
 ### `--forwarded-allow-ips`
@@ -624,6 +624,7 @@ the server's own, see `app.tracing` in [MIDDLEWARE.md](MIDDLEWARE.md).
 | `--health-check-path P` | none | answer `GET` and `HEAD` for P with 200 |
 | `--metrics-port PORT` | none | serve Prometheus metrics on a separate port |
 | `--metrics-host HOST` | `--host` | interface the metrics port binds |
+| `--slow-handler-ms MS` | -- | Garuda 1's slow-handler warning; accepted, with a warning that it has no effect |
 
 `--slow-handler-ms` is accepted, with a warning that it has no effect in
 Garuda 2. The heavy lane measures what it measured and acts on it;
