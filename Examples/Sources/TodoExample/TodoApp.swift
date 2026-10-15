@@ -8,12 +8,12 @@
 //   DELETE /todos/:id                              204, or 404
 //
 // What it shows: typed routes with `Path`, `Query` and `Body`; state built in
-// each worker with `app.state`; a schema migrated at start-up; validation
+// each shard with `app.state`; a schema migrated at start-up; validation
 // answered as 422 and a unique title as 409, both with a JSON reason; and an
 // Optional return for 404.
 //===----------------------------------------------------------------------===//
 
-import Garuda
+import GarudaSQLite
 
 public struct Todo: Codable, Equatable, Sendable {
     public let id: Int
@@ -78,15 +78,21 @@ private func uniqueTitle<T>(_ body: () async throws -> T) async throws -> T {
     }
 }
 
-/// The todo API over the database at `path`. `:memory:` gives each worker an
+/// The todo API over the database at `path`. `:memory:` gives each shard an
 /// empty database of its own, which suits tests.
 public func todoApp(databasePath path: String) -> Application {
     let app = Application()
 
+    // Each shard opens the file for itself and brings the schema up to date
+    // before it accepts a request. Migrating is safe from every shard at once:
+    // SQLite lets one writer in at a time, and a migration already applied is
+    // skipped.
     app.state { _ in
         let db = try SQLiteDatabase(SQLiteConfiguration(path: path))
-        try db.migrate(migrations)
+        try await db.migrate(migrations)
         return db
+    } shutdown: { db in
+        db.close()
     }
 
     app.get("/todos") { (query: Query<ListQuery>, db: State<SQLiteDatabase>) async throws -> JSON<[Todo]> in

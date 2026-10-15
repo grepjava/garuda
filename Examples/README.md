@@ -1,5 +1,11 @@
 # Examples
 
+> **Not yet ported to Garuda 2: `files` and `uploads`.** Both need
+> `GarudaUploads`, which Garuda 2 does not have yet. Their sources stay in
+> `Sources/FilesExample`, `Sources/UploadsExample`, `Sources/files`,
+> `Sources/uploads` and `Tests/ExampleTests/{Files,Uploads}Tests.swift`, outside
+> every target, until it does.
+
 Eight applications built on Garuda's public API. Seven are small enough to read
 in one sitting, each showing one thing; the starter shows the shape of a whole
 application and is the one to copy when beginning. They build against the
