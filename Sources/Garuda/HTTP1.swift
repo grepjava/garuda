@@ -364,7 +364,10 @@ struct HTTP1Connection: ~Copyable {
                     try await failAndClose(stream, status: error.status, headParsed: false)
                     return false
                 case .incomplete:
-                    break
+                    // The parser starts from a fresh head, and parses all of
+                    // it again once more has arrived: what it noted of this
+                    // part -- a Host seen, a length -- would be noted twice.
+                    x.pointee.head = HTTPRequestHead()
                 }
             }
             // Waiting: whatever has been answered goes out first.

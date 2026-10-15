@@ -1,6 +1,8 @@
 import Testing
 @testable import Garuda
 import GarudaTesting
+import Vega
+import VegaIO
 
 // The command line: Garuda 1's flags, and its units, on Garuda 2.
 
@@ -182,4 +184,35 @@ private func refused(_ flags: [String]) -> Bool {
         admission.leave()
         #expect(admission.enter())
     }
+
+    #if !os(Windows)
+    /// A head that arrives in pieces is parsed again whole once the rest is
+    /// here, and the parts parsed the first time are not counted twice: a
+    /// Host seen once is not a second Host.
+    @Test func aHeadThatArrivesInPiecesIsReadWhole() throws {
+        let app = Application()
+        app.get("/x") { _, response in response.send("x") }
+        let compiled = app.compile()
+        let rt = Runtime(workers: 1)
+        defer { rt.shutdown() }
+        let limits = ConnectionLimits(ServerConfig())
+        let reply = try rt.block { () async throws(IOError) -> String in
+            let pair = try UnixStream.pair()
+            let client = pair.first
+            rt.spawn(with: pair.second) { stream in
+                _ = await serveHTTP1(stream, app: compiled, limits: limits, peer: .none)
+            }
+            for piece in ["GET /x HTTP/1.1\r\nHost: example.com\r\n", "Connection: close\r\n\r\n"] {
+                var out = IOBuffer(capacity: 64)
+                _ = out.append(piece)
+                try await client.write(out)
+                try? await Runtime.sleep(for: .milliseconds(50))
+            }
+            var buffer = IOBuffer(capacity: 4096)
+            while try await client.read(into: &buffer) > 0 {}
+            return buffer.string
+        }
+        #expect(reply.hasPrefix("HTTP/1.1 200"), "\(reply)")
+    }
+    #endif
 }
