@@ -220,8 +220,14 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
         return BodyChannel(dropping: ())
     }
     let status = x.pointee.status
-    let bodyless = HTTPResponseWriter.statusForbidsBody(status) || x.pointee.head.method == .head
+    let forbids = HTTPResponseWriter.statusForbidsBody(status)
+    let bodyless = forbids || x.pointee.head.method == .head
     let declared = x.pointee.headerKinds.contains(.contentLength) ? declaredLength(x) : -1
+    // A bodyless answer still states a declared length when it describes a
+    // body sent elsewhere: a HEAD's is the GET's, and a 304's that of the
+    // representation it stands for (RFC 9110 section 8.6). A 204's or a
+    // 1xx's never is.
+    let keepsDeclared = forbids ? status == 304 : x.pointee.head.method == .head
     // --cache-size: the copy is of the application's bytes, before any
     // compression.
     let capture = x.pointee.cacheInvalidates != 0 || x.pointee.capture != nil ? cacheStreamStart(x) : nil
@@ -234,8 +240,7 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
     case .http1(let held, let parts, let limits):
         let framing: H1Framing
         if bodyless {
-            // A HEAD says the GET's length, when it is known.
-            framing = declared >= 0 && x.pointee.head.method == .head ? .length(declared) : .none
+            framing = declared >= 0 && keepsDeclared ? .length(declared) : .none
         } else if stated >= 0 {
             framing = .length(declared)
         } else if x.pointee.head.httpMinor == 0 {
@@ -252,16 +257,13 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
         let s = stream.takeUnretainedValue()
         channel = BodyChannel(http2: s, bodyless: bodyless, declared: bodyless ? -1 : declared, encoder: encoder)
         x.pointee.committed = true
-        // A HEAD says the GET's length, when it is known.
-        let said = x.pointee.head.method == .head && !HTTPResponseWriter.statusForbidsBody(status) ? declared
-            : bodyless ? -1 : stated
+        let said = bodyless ? (keepsDeclared ? declared : -1) : stated
         s.connection.startStreamedAnswer(s, channel: channel, declared: said)
     case .http3(let stream):
         let s = stream.takeUnretainedValue()
         channel = BodyChannel(http3: s, bodyless: bodyless, declared: bodyless ? -1 : declared, encoder: encoder)
         x.pointee.committed = true
-        let said = x.pointee.head.method == .head && !HTTPResponseWriter.statusForbidsBody(status) ? declared
-            : bodyless ? -1 : stated
+        let said = bodyless ? (keepsDeclared ? declared : -1) : stated
         s.endpoint.startStreamedAnswer(s, declared: said)
     case .none:
         x.pointee.committed = true
