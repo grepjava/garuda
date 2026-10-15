@@ -35,6 +35,18 @@ let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].ma
     .package(path: $0, traits: vegaTraits)
 } ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.0"), traits: vegaTraits)
 
+/// vega-db, by version; or, with GARUDA_VEGA_DB_PATH set, a local checkout.
+/// A local Vega under it as well takes VEGA_PATH, which vega-db reads, set
+/// to the same checkout as GARUDA_VEGA_PATH.
+let vegaDBPackage: Package.Dependency = Context.environment["GARUDA_VEGA_DB_PATH"].map {
+    .package(path: $0, traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.2.0"), traits: vegaTraits)
+
+/// A module of vega-db.
+func vegaDB(_ name: String) -> Target.Dependency {
+    .product(name: name, package: "vega-db")
+}
+
 let package = Package(
     name: "garuda",
     // Vega's floor: its executor needs macOS 26.4's custom-executor hooks.
@@ -51,6 +63,16 @@ let package = Package(
         // that needs swift-syntax: an application that does not import it
         // never builds the macro plugin.
         .library(name: "GarudaJSON", targets: ["GarudaJSON"]),
+        // The databases, each vega-db's driver re-exported with what joins it
+        // to Garuda: its UUID and Timestamp as columns, JSON through its
+        // coder. Separate products, so an application builds only the
+        // drivers it imports.
+        .library(name: "GarudaPostgres", targets: ["GarudaPostgres"]),
+        .library(name: "GarudaRedis", targets: ["GarudaRedis"]),
+        .library(name: "GarudaSQLite", targets: ["GarudaSQLite"]),
+        // `@PostgresRow`, apart from GarudaPostgres for the same reason
+        // GarudaJSON is apart: only it needs swift-syntax.
+        .library(name: "GarudaSQL", targets: ["GarudaSQL"]),
     ],
     // The TLS library under Vega's TLS. BoringSSL, vendored in Vega, is the
     // default: Garuda 1's library, cheaper a request than OpenSSL 3, and no
@@ -66,6 +88,9 @@ let package = Package(
         // TLS. upToNextMinor, not `from:`: Vega is below 1.0, so a minor
         // release may change its API.
         vegaPackage,
+        // PostgreSQL, Redis and SQLite. Resolved by everyone, built only for
+        // an application that imports one of the database products.
+        vegaDBPackage,
         // Only the `GarudaJSON` plugin builds against this. It is still
         // resolved by everyone who depends on Garuda, because SwiftPM resolves
         // a package's dependencies whether or not a product uses them.
@@ -99,6 +124,14 @@ let package = Package(
                swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaJSON", dependencies: ["Garuda", "GarudaMacros"],
                 swiftSettings: sharedSwiftSettings),
+        .target(name: "GarudaPostgres", dependencies: ["Garuda", vegaDB("VegaPostgres")],
+                swiftSettings: sharedSwiftSettings),
+        .target(name: "GarudaRedis", dependencies: ["Garuda", vegaDB("VegaRedis")],
+                swiftSettings: sharedSwiftSettings),
+        .target(name: "GarudaSQLite", dependencies: ["Garuda", "GarudaWire", vegaDB("VegaSQLite")],
+                swiftSettings: sharedSwiftSettings),
+        .target(name: "GarudaSQL", dependencies: ["GarudaPostgres", "GarudaMacros"],
+                swiftSettings: sharedSwiftSettings),
         // The benchmark server: the-benchmarker's routes plus the workloads.
         .executableTarget(name: "garuda-server", dependencies: ["Garuda", "GarudaJSON", vega("Vega")],
                           path: "Sources/garuda-server",
@@ -115,6 +148,10 @@ let package = Package(
                                    vega("Vega")],
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaJSONTests", dependencies: ["Garuda", "GarudaJSON"],
+                    swiftSettings: sharedSwiftSettings),
+        .testTarget(name: "GarudaDatabaseTests",
+                    dependencies: ["Garuda", "GarudaPostgres", "GarudaRedis", "GarudaSQLite", "GarudaSQL",
+                                   "GarudaWire", "GarudaTesting", vega("Vega")],
                     swiftSettings: sharedSwiftSettings),
     ]
 )

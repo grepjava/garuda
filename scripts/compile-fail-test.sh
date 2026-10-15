@@ -9,7 +9,8 @@
 #
 # BUILD names the build directory when it is not .build/debug (a
 # --scratch-path build), and VEGA the Vega checkout when it is not SwiftPM's
-# (GARUDA_VEGA_PATH, when that is set, is the one the build used).
+# (GARUDA_VEGA_PATH, when that is set, is the one the build used), and
+# VEGA_DB the vega-db checkout the same way (GARUDA_VEGA_DB_PATH).
 #
 # Tests/CompileFail/control holds code that must compile, so that a harness
 # that cannot find the Garuda module does not pass everything by failing it.
@@ -21,6 +22,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=${BUILD:-$ROOT/.build/debug}
 SWIFTC=${SWIFTC:-swiftc}
 VEGA=${VEGA:-${GARUDA_VEGA_PATH:-$ROOT/.build/checkouts/vega}}
+VEGA_DB=${VEGA_DB:-${GARUDA_VEGA_DB_PATH:-$ROOT/.build/checkouts/vega-db}}
 
 # Every C target Garuda's module was built against, Vega's included: a
 # swiftmodule names the clang modules it needs, and swiftc refuses to load
@@ -31,7 +33,7 @@ CMODULES=()
 for map in "$BUILD"/*.build/module.modulemap; do
     [ -f "$map" ] && CMODULES+=(-Xcc -fmodule-map-file="$map")
 done
-for include in "$VEGA"/Sources/*/include "$ROOT"/Sources/*/include; do
+for include in "$VEGA"/Sources/*/include "$VEGA_DB"/Sources/*/include "$ROOT"/Sources/*/include; do
     [ -d "$include" ] && CMODULES+=(-Xcc -I"$include")
 done
 
