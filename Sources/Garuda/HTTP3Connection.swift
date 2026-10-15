@@ -794,10 +794,21 @@ final class H3Connection {
             quic.close(0)
             return
         }
-        if force || (streams.isEmpty && tasks == 0) {
+        if force || (streams.isEmpty && tasks == 0 && settled) {
             closeHTTP()
             quic.close(HTTP3Error.noError, application: true)
         }
+    }
+
+    /// Everything sent has been acknowledged -- GOAWAY, and every answer --
+    /// and no request is left on the transport: a close now cuts nothing
+    /// off. (A closing connection sends nothing but its close.)
+    private var settled: Bool {
+        if controlOut != .max, let control = quic.stream(controlOut), control.send.data.readableBytes > 0 {
+            return false
+        }
+        for (id, _) in quic.streams where QUICStreamKind.isBidirectional(id) { return false }
+        return true
     }
 
     /// The connection is over for its requests: every one is cancelled, and

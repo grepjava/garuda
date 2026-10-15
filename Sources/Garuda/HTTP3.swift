@@ -308,6 +308,8 @@ final class QUICEndpoint: @unchecked Sendable {
             }
             busy = service(nowMs: now)
             await flush(socket, nowMs: now)
+            // After the flush: what was just sent set loss and probe timers.
+            nextTimerMs = earliestTimer(nowMs: now)
             if stopping && live.isEmpty { break }
         }
         // Whatever is left -- only when the runtime is going away -- goes
@@ -368,21 +370,25 @@ final class QUICEndpoint: @unchecked Sendable {
         }
     }
 
-    /// Runs the timers that are due and works out when the next one is.
+    /// Runs the timers that are due.
     func runTimers(nowMs now: UInt64) {
-        var earliest = UInt64.max
+        guard now >= nextTimerMs else { return }
         for connection in live {
             let quic = connection.quic
-            guard var at = quic.nextTimeout(nowMs: now) else { continue }
-            if now >= at {
+            if let at = quic.nextTimeout(nowMs: now), now >= at {
                 quic.onTimeout(nowMs: now)
                 touch(connection)
-                guard let next = quic.nextTimeout(nowMs: now) else { continue }
-                at = next
             }
-            if at < earliest { earliest = at }
         }
-        nextTimerMs = earliest
+    }
+
+    /// When the next QUIC timer is due; `UInt64.max` for none.
+    func earliestTimer(nowMs now: UInt64) -> UInt64 {
+        var earliest = UInt64.max
+        for connection in live {
+            if let at = connection.quic.nextTimeout(nowMs: now), at < earliest { earliest = at }
+        }
+        return earliest
     }
 
     /// Takes what the request tasks posted.
