@@ -131,7 +131,10 @@ extension Application {
         if config.acceptors.map({ $0 > 1 }) == true {
             Log.warning("--acceptors is ignored: one accept loop on this platform")
         }
-        let runtime = Runtime(workers: config.threads)
+        if config.reload {
+            Log.warning("--reload is ignored: restarting on a rebuilt executable needs the shard supervisor")
+        }
+        let runtime = Runtime(workers: config.threads, blockingThreads: config.blockingThreads ?? 512)
         let info = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
         let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
             try TCPListener.bind(host: config.host, port: config.port, backlog: config.backlog)
