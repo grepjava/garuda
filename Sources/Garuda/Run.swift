@@ -271,6 +271,7 @@ extension Application {
                     // HTTP/2 connections are sent GOAWAY and finish the streams
                     // they have, as HTTP/1 ones finish their request.
                     http2?.shutdown()
+                    app.webSockets.shutdown()
                     await withTaskGroup(of: Void.self) { group in
                         for server in all { group.addTask { await server.shutdown(gracePeriod: grace) } }
                     }
@@ -373,6 +374,21 @@ extension ServerConfig {
                                proxies whose forwarded headers are trusted:
                                addresses, CIDR blocks, unix, or *
           --no-http2           refuse HTTP/2 and answer HTTP/1.1 only
+          --graceful-timeout SECS
+                               how long requests, streams and WebSockets in
+                               progress have to finish at shutdown (10)
+          --no-websockets      refuse WebSocket upgrades with 501
+          --ws-max-message BYTES
+                               the largest WebSocket message taken (16 MiB)
+          --ws-ping-interval MS
+                               ping a quiet WebSocket this often; 0 for never
+                               (20000)
+          --ws-ping-timeout MS how long a ping, or a close, may go unanswered
+                               (20000)
+          --ws-max-queue N     messages held for a handler not reading (32)
+          --ws-max-queue-bytes BYTES
+                               and bytes (4 MiB)
+          --ws-compress        permessage-deflate with clients that offer it
           --http2-only         serve only HTTP/2 (h2c), with no HTTP/1 fallback
           --request-id         give every request an X-Request-ID, echoed on
                                the response and logged; one a
@@ -613,6 +629,40 @@ extension ServerConfig {
                 guard v.withCString({ config.trust.parse($0) }) else {
                     return fail("--forwarded-allow-ips contains an address that is not valid")
                 }
+            case "--graceful-timeout":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--graceful-timeout must be a number of seconds")
+                }
+                config.gracefulShutdown = .seconds(n)
+            case "--no-websockets":
+                config.websocketsEnabled = false
+            case "--ws-max-message":
+                guard let n = value().flatMap({ Int($0) }), n >= 125 else {
+                    return fail("--ws-max-message must be a byte count of at least 125")
+                }
+                config.maxWebsocketMessageSize = n
+            case "--ws-ping-interval":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--ws-ping-interval must be milliseconds, or 0 for none")
+                }
+                config.websocketPingInterval = .milliseconds(n)
+            case "--ws-ping-timeout":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--ws-ping-timeout must be milliseconds")
+                }
+                config.websocketPingTimeout = .milliseconds(n)
+            case "--ws-max-queue":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--ws-max-queue must be a count above 0")
+                }
+                config.maxWebsocketQueue = n
+            case "--ws-max-queue-bytes":
+                guard let n = value().flatMap({ Int($0) }), n > 0 else {
+                    return fail("--ws-max-queue-bytes must be a byte count")
+                }
+                config.maxWebsocketQueueBytes = n
+            case "--ws-compress":
+                config.websocketCompress = true
             case "--no-http2":
                 config.http2Enabled = false
                 config.http2Only = false

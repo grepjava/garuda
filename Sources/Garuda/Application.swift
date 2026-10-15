@@ -299,6 +299,8 @@ final class CompiledApplication: @unchecked Sendable {
     let costs: RouteCosts
     /// Spare connection memory, by worker thread.
     let connections = ConnectionCache()
+    /// Open WebSockets, closed with 1001 at shutdown (WebSocketSession.swift).
+    let webSockets = WebSocketRegistry()
     /// The runtime serving it, for the work a request leaves running beside
     /// its handler: an event stream's keep-alive. Set before it serves.
     var runtime: Runtime?

@@ -397,6 +397,21 @@ final class BodyChannel: @unchecked Sendable {
         timeout = .seconds(0); high = 0; low = 0; keepAliveDefault = .zero
     }
 
+    /// A WebSocket's (WebSocketSession.swift): frames written as they are,
+    /// on a stream of their own, with no body to end.
+    init(raw held: HeldStream, limits: StreamLimits) {
+        self.held = held
+        bodyless = false
+        chunked = false
+        remaining = -1
+        h2 = nil
+        encoder = nil
+        timeout = limits.writeTimeout
+        high = limits.high
+        low = limits.low
+        keepAliveDefault = .zero
+    }
+
     /// One whose writes go nowhere.
     init(dropping: Void) {
         bodyless = true
@@ -735,6 +750,28 @@ final class BodyChannel: @unchecked Sendable {
             if let capture, state == .finished { _ = capture.store() }
         }
         capture = nil
+    }
+
+    /// A WebSocket's, once it has ended: what is queued goes, waiting at
+    /// most the write timeout, and then nothing more is written, so the
+    /// stream can be let go of.
+    func stopAfterDraining() async {
+        try? await settle(.sent, flushing: true)
+        lock.withLock { _ in state = .failed }
+        // A writer still taking the queue out finishes first.
+        while true {
+            let waited = await withUnsafeContinuation { (c: UnsafeContinuation<Bool, Never>) in
+                let parked = lock.withLock { _ -> Bool in
+                    guard flushing else { return false }
+                    waiters.append(c)
+                    return true
+                }
+                if !parked { c.resume(returning: false) }
+            }
+            if !waited { break }
+        }
+        lock.withLock { _ in pending.clear() }
+        wakeWaiters(drained: false)
     }
 
     // MARK: Files

@@ -10,6 +10,9 @@
 //                                    Last-Event-ID; ?keepalive=S
 //   GET  /broadcast/:topic/poll      the next message as "id event data", or
 //                                    204 after ?timeout=MS; ?after=ID
+//   GET  /broadcast/:topic/ws        a WebSocket: "pid N" first, then each
+//                                    message as "id event data"; text it is
+//                                    sent is published
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
@@ -69,6 +72,34 @@ func addBroadcastRoutes(_ app: Application) {
         case .message(let message)?: response.send(broadcastLine(message))
         case .missed?: response.send("missed")
         case nil: response.send(status: .noContent)
+        }
+    }
+
+    app.webSocket("/broadcast/:topic/ws") { (ws: WebSocket, name: Path<String>) async throws in
+        let topic = Topic(name.value)
+        let messages = try ws.subscribe(topic)
+        try await ws.send("pid \(getpid())")
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                while true {
+                    switch try await messages.next() {
+                    case .message(let message): try await ws.send(broadcastLine(message))
+                    case .missed: try await ws.send("missed")
+                    }
+                }
+            }
+            group.addTask {
+                while let incoming = try await ws.receive() {
+                    if case .text(let text) = incoming { try topic.publish(text, event: "ws") }
+                }
+                messages.cancel()
+            }
+            do {
+                try await group.next()
+                group.cancelAll()
+            } catch {
+                group.cancelAll()
+            }
         }
     }
 }

@@ -195,7 +195,8 @@ public final class TestClient: @unchecked Sendable {
         let received: [UInt8] = try rt.block { () async throws -> [UInt8] in
             let pair = duplex(capacity: 1 << 20)
             rt.spawn(with: pair.second) { stream in
-                await app.serveConnection(stream, config: config, remoteAddress: address, remotePort: port)
+                await app.serveConnection(stream, halves: { $0.halves() }, config: config,
+                                          remoteAddress: address, remotePort: port)
             }
             let client = pair.first
             do {

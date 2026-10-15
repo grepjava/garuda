@@ -108,10 +108,21 @@ struct Exchange: ~Copyable {
     var streamStarting = false
     /// Something above was set, for `reset` to undo.
     @usableFromInline var touchedStream = false
+    /// An accepted WebSocket upgrade, for the connection to carry out once
+    /// the handler has returned (WebSocket.swift).
+    var upgrade: WebSocketUpgrade?
+    /// The connection can become a WebSocket's: HTTP/1, served where its
+    /// stream can be split. Set per connection.
+    var canUpgrade = false
+    /// --no-websockets.
+    var websocketsRefused = false
+    /// --ws-*, set per connection that can upgrade.
+    var websocketLimits = WebSocketLimits()
 
     @usableFromInline
     mutating func resetStream() {
         touchedStream = false
+        upgrade = nil
         channel = nil
         producer = nil
         bodyReplaced = false

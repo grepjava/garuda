@@ -58,8 +58,11 @@ struct ConnectionLimits: Sendable {
     /// --compress and --compress-min-size (Compression.swift).
     var compress: Bool
     var compressMinimum: Int
+    /// --ws-* (WebSocket.swift).
+    var websocket: WebSocketLimits
 
     init(_ config: ServerConfig) {
+        websocket = WebSocketLimits(config)
         http2 = HTTP2Limits(config)
         site = StaticSite(config)
         compress = config.compress
@@ -100,19 +103,40 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     _ stream: consuming S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer,
     secure: Bool = false, writer: (any HeldWriting.Type)? = nil
 ) async -> S {
+    var upgrade: WebSocketUpgrade? = nil
+    return await serveHTTP1(stream, parts: app.connections.take(limits: limits, peer: peer), app: app,
+                            limits: limits, secure: secure, writer: writer, upgrade: &upgrade, upgradable: false)
+}
+
+/// The same, and a WebSocket upgrade a request was answered with is put in
+/// `upgrade`, the stream handed back for it to be served on.
+func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
+    _ stream: consuming S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer,
+    secure: Bool = false, writer: (any HeldWriting.Type)? = nil, upgrade: inout WebSocketUpgrade?
+) async -> S {
     await serveHTTP1(stream, parts: app.connections.take(limits: limits, peer: peer), app: app, limits: limits,
-                     secure: secure, writer: writer)
+                     secure: secure, writer: writer, upgrade: &upgrade, upgradable: true)
 }
 
 /// The same, on parts already taken, whose input may hold the connection's
 /// first bytes: read while looking for the HTTP/2 preface (HTTP2.swift).
-@discardableResult
+/// `upgradable`: the caller serves a WebSocket put in `upgrade`.
 func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     _ stream: consuming S, parts: UnsafeMutablePointer<ConnectionParts>, app: CompiledApplication,
-    limits: ConnectionLimits, secure: Bool, writer: (any HeldWriting.Type)? = nil
+    limits: ConnectionLimits, secure: Bool, writer: (any HeldWriting.Type)? = nil,
+    upgrade: inout WebSocketUpgrade?, upgradable: Bool
 ) async -> S {
     let x = parts.pointee.exchange
     x.pointee.application = Unmanaged.passUnretained(app)
+    // The exchange is reused from connection to connection: set every time.
+    let canUpgrade = upgradable && limits.websocket.enabled
+    if canUpgrade || x.pointee.canUpgrade {
+        x.pointee.canUpgrade = canUpgrade
+        if canUpgrade { x.pointee.websocketLimits = limits.websocket }
+    }
+    if x.pointee.websocketsRefused != !limits.websocket.enabled {
+        x.pointee.websocketsRefused = !limits.websocket.enabled
+    }
     // The exchange is reused from connection to connection: set both.
     x.pointee.secure = secure
     if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
@@ -129,6 +153,10 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
                                      observing: limits.accessLog || !app.observers.isEmpty || app.metrics != nil)
     await connection.run(held.pointee, app: app)
     x.pointee.link = .none
+    if x.pointee.upgrade != nil {
+        upgrade = x.pointee.upgrade
+        x.pointee.upgrade = nil
+    }
     let back = held.move()
     held.deallocate()
     return back
@@ -207,6 +235,19 @@ struct HTTP1Connection: ~Copyable {
         if observing { x.pointee.started = monotonicNanos() }
 
         await dispatch(app, matched: matched)
+
+        if let upgrade = x.pointee.upgrade {
+            // The connection is the WebSocket's from here: the 101, and
+            // whatever followed the request is frames (WebSocket.swift).
+            writeHTTP1Head(x, parts, keepAlive: true, framing: .none, upgrading: true)
+            if observing { report(status: 101) }
+            start &+= head.headEnd &+ x.pointee.consumedBody
+            try await flush(stream)
+            if start < parts.pointee.input.count {
+                upgrade.leftover = parts.pointee.input.withUnsafeBytes { Array($0[start...]) }
+            }
+            return false
+        }
 
         if let channel = x.pointee.channel {
             // Streamed: the head and most of the body have gone; the rest
@@ -434,7 +475,7 @@ struct HTTP1Connection: ~Copyable {
 /// Writes the head of `x`'s response into the connection's output, the
 /// body delimited as `framing` says, and commits it.
 func writeHTTP1Head(_ x: UnsafeMutablePointer<Exchange>, _ parts: UnsafeMutablePointer<ConnectionParts>,
-                    keepAlive: Bool, framing: H1Framing) {
+                    keepAlive: Bool, framing: H1Framing, upgrading: Bool = false) {
     x.pointee.committed = true
     parts.pointee.dates.refresh()
     parts.pointee.output.reserve(256 &+ x.pointee.responseHeaders.readableBytes)
@@ -459,7 +500,9 @@ func writeHTTP1Head(_ x: UnsafeMutablePointer<Exchange>, _ parts: UnsafeMutableP
     case .chunked: HTTPResponseWriter.writeChunkedEncoding(&parts.pointee.output)
     case .none: break
     }
-    if !keepAlive {
+    if upgrading {
+        parts.pointee.output.write("Connection: Upgrade\r\n")
+    } else if !keepAlive {
         parts.pointee.output.write("Connection: close\r\n")
     } else if x.pointee.head.httpMinor == 0 {
         parts.pointee.output.write("Connection: keep-alive\r\n")

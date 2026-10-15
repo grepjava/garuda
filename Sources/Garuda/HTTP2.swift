@@ -180,17 +180,27 @@ func serveConnection<S: AsyncReader & AsyncWriter & ~Copyable, R: AsyncReader & 
     app.metrics?.add(.connectionsAccepted)
     defer { app.metrics?.add(.connectionsClosed) }
     guard let http2, limits.http2.enabled else {
+        var upgrade: WebSocketUpgrade? = nil
         let stream = await serveHTTP1(stream, app: app, limits: limits, peer: peer, secure: secure,
-                                      writer: heldWriter)
-        await close(stream)
+                                      writer: heldWriter, upgrade: &upgrade)
+        if let upgrade {
+            await serveWebSocket(halves(stream), upgrade, app: app, limits: limits, closeWriter: closeWriter)
+        } else {
+            await close(stream)
+        }
         return
     }
     let parts = app.connections.take(limits: limits, peer: peer)
     switch await opening(stream, parts, limits, strict: negotiatedH2 || limits.http2.only) {
     case .http1:
+        var upgrade: WebSocketUpgrade? = nil
         let stream = await serveHTTP1(stream, parts: parts, app: app, limits: limits, secure: secure,
-                                      writer: heldWriter)
-        await close(stream)
+                                      writer: heldWriter, upgrade: &upgrade, upgradable: true)
+        if let upgrade {
+            await serveWebSocket(halves(stream), upgrade, app: app, limits: limits, closeWriter: closeWriter)
+        } else {
+            await close(stream)
+        }
     case .http2:
         await serveHTTP2(halves(stream), parts: parts, app: app, limits: limits, service: http2, secure: secure,
                          closeWriter: closeWriter)

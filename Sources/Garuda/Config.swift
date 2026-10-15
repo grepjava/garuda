@@ -166,6 +166,22 @@ public struct ServerConfig: Sendable {
     /// Serve only HTTP/2 in cleartext (h2c), with no HTTP/1 fallback: what a
     /// proxy that talks h2c upstream (Envoy, Caddy) and a gRPC client expect.
     public var http2Only = false
+
+    // --- WebSockets (WebSocket.swift) ---
+    /// --no-websockets: upgrades are refused with 501.
+    public var websocketsEnabled = true
+    /// The largest message taken from a peer, after inflating.
+    public var maxWebsocketMessageSize = 16 * 1024 * 1024
+    /// How long a WebSocket may be quiet before it is pinged; zero for never.
+    public var websocketPingInterval: Duration = .seconds(20)
+    /// How long a ping, or a close the server sent, may go unanswered.
+    public var websocketPingTimeout: Duration = .seconds(20)
+    /// Messages, and bytes, held for a handler that is not reading before
+    /// the socket stops being read.
+    public var maxWebsocketQueue = 32
+    public var maxWebsocketQueueBytes = 4 * 1024 * 1024
+    /// --ws-compress: permessage-deflate with clients that offer it.
+    public var websocketCompress = false
     /// Streams a client may have open at once on one connection.
     public var h2MaxConcurrentStreams = 128
     /// The largest frame payload a client may send.
