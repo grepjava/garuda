@@ -115,6 +115,17 @@ extension Application {
             Application.serve(shard.runtime, app: app, shard: info, limits: limits, config: config, listening: listening)
         }
         #else
+        // One process, as Runtime.sharded and the memory shards share are
+        // POSIX only; and Vega's one I/O driver here, AFD polling.
+        if let shards = config.shards, shards > 0 {
+            Log.error("--shards \(shards): shards are not supported on this platform; --shards 0 serves in this process")
+            exit(2)
+        }
+        if config.balance != nil { Log.warning("--balance is ignored: there are no shards on this platform") }
+        if config.io != nil { Log.warning("--io is ignored: there is one I/O driver on this platform") }
+        if config.acceptors.map({ $0 > 1 }) == true {
+            Log.warning("--acceptors is ignored: one accept loop on this platform")
+        }
         let runtime = Runtime(workers: config.threads)
         let info = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
         let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
