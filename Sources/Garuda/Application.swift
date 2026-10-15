@@ -125,6 +125,8 @@ public final class Application: RouteBuilder, @unchecked Sendable {
     var responseObservers: [ResponseObserver] = []
     /// What `tracing` makes each shard's tracer with (Tracing.swift).
     var makeTracer: (@Sendable (Int) -> any Tracer)?
+    /// `app.every` registrations (Scheduled.swift).
+    var scheduledJobs: [ScheduledJob] = []
     /// Each route's OpenAPI entry, what scopes add to them, and the
     /// documents `openAPI` serves (OpenAPI.swift).
     var documentation = APIDocumentation()
@@ -263,7 +265,8 @@ public final class Application: RouteBuilder, @unchecked Sendable {
                                            observers: responseObservers,
                                            fallbacks: CompiledFallbacks(fallbacks.map(\.pattern),
                                                                         first: routes.count),
-                                           bodyLimits: bodyLimits, makeTracer: makeTracer)
+                                           bodyLimits: bodyLimits, makeTracer: makeTracer,
+                                           scheduledJobs: scheduledJobs)
         compiledApplication = compiled
         return compiled
     }
@@ -319,6 +322,9 @@ final class CompiledApplication: @unchecked Sendable {
     /// shard made: set before it serves (Tracing.swift).
     let makeTracer: (@Sendable (Int) -> any Tracer)?
     var tracer: (any Tracer)?
+    /// `app.every`'s jobs, and the ones running in this shard (Scheduled.swift).
+    let scheduledJobs: [ScheduledJob]
+    let scheduled = ScheduledRun()
     /// Any of the three is on: a request is looked at before routing.
     var screened = false
     /// This shard's state, and what builds it and stops it (State.swift).
@@ -354,9 +360,11 @@ final class CompiledApplication: @unchecked Sendable {
          observers: [ResponseObserver] = [],
          fallbacks: CompiledFallbacks = CompiledFallbacks(),
          bodyLimits: [Int] = [],
-         makeTracer: (@Sendable (Int) -> any Tracer)? = nil) {
+         makeTracer: (@Sendable (Int) -> any Tracer)? = nil,
+         scheduledJobs: [ScheduledJob] = []) {
         self.table = table
         self.makeTracer = makeTracer
+        self.scheduledJobs = scheduledJobs
         self.trailingSlash = trailingSlash
         self.observers = observers
         self.fallbacks = fallbacks

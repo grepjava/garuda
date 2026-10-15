@@ -10,6 +10,7 @@ import GarudaRedis
 import GarudaSQL
 import GarudaTesting
 import InMemoryTracing
+import Synchronization
 import Testing
 import Vega
 
@@ -344,5 +345,44 @@ struct SessionStoreTests {
         #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "2")
         #expect(try client.post("/s/logout", headers: [("cookie", "id=\(id)")]).text == "bye")
         #expect(try client.post("/s/visit", headers: [("cookie", "id=\(id)")]).text == "1")
+    }
+}
+
+// MARK: - Listening
+
+@Suite("app.listen", .enabled(if: postgresTarget != nil, "set GARUDA_POSTGRES to run"))
+struct ListenTests {
+    @Test func aNotificationReachesTheShardsHandler() throws {
+        let configuration = postgresTarget!
+        let heard = Mutex<[String]>([])
+        let listening = Mutex(0)
+        let app = Application()
+        app.state { _ in PostgresPool(configuration, maxConnections: 2) }
+        app.listen("garuda_test", whenListening: { _ in listening.withLock { $0 += 1 } }) { notification, _ in
+            heard.withLock { $0.append(notification.payload) }
+        }
+        app.post("/notify") { (db: State<PostgresPool>) async throws -> String in
+            _ = try await db.value.execute("select pg_notify('garuda_test', 'hello')")
+            return "sent"
+        }
+        app.get("/ping") { _, response in response.send("pong") }
+        let client = app.test
+        // The first request starts the shard, and its listener with it.
+        #expect(try client.get("/ping").text == "pong")
+        let until = ContinuousClock.now + .seconds(5)
+        while listening.withLock({ $0 }) == 0 && ContinuousClock.now < until {
+            _ = try DatabaseTestRuntime.shared.block { () async throws -> Int in
+                try await Runtime.sleep(for: .milliseconds(10))
+                return 0
+            }
+        }
+        #expect(try client.post("/notify").text == "sent")
+        while heard.withLock({ $0 }).isEmpty && ContinuousClock.now < until {
+            _ = try DatabaseTestRuntime.shared.block { () async throws -> Int in
+                try await Runtime.sleep(for: .milliseconds(10))
+                return 0
+            }
+        }
+        #expect(heard.withLock { $0 } == ["hello"])
     }
 }

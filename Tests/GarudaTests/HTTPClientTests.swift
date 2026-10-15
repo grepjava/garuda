@@ -759,7 +759,7 @@ struct HTTPClientTracingTests {
             return (text, origin.log)
         }
         #expect(text == "upstream")
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         let request = try #require(spans.first { $0.operationName == "GET /call" })
         let call = try #require(spans.first { $0.kind == .client })
         #expect(call.operationName == "GET")

@@ -20,6 +20,18 @@ private func tracedApp(_ tracer: InMemoryTracer) -> Application {
     return app
 }
 
+extension InMemoryTracer {
+    /// The spans of the traces this test's requests began. Tests share a
+    /// process, and a shard's tracer is the process's: a pool another suite
+    /// made while this tracer was installed reports its round trips here, as
+    /// traces of their own.
+    var ownSpans: [FinishedInMemorySpan] {
+        let all = finishedSpans
+        let traces = Set(all.filter { $0.kind == .server }.map(\.traceID))
+        return all.filter { traces.contains($0.traceID) }
+    }
+}
+
 private func duration(_ span: FinishedInMemorySpan) -> UInt64 {
     span.endInstant.nanosecondsSinceEpoch - span.startInstant.nanosecondsSinceEpoch
 }
@@ -34,7 +46,7 @@ struct TracingTests {
         let response = try app.test.get("/users/42", headers: [("User-Agent", "probe/1")])
         #expect(response.status == 200)
 
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         let span = try #require(spans.first)
         #expect(spans.count == 1)
         #expect(span.operationName == "GET /users/:id")
@@ -60,7 +72,7 @@ struct TracingTests {
         let h2 = try app.test.http2()
         #expect(try h2.get("/users/7").text == "user 7")
         #expect(try h2.get("/users/8").text == "user 8")
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         #expect(spans.count == 2)
         #expect(spans.allSatisfy { $0.operationName == "GET /users/:id" })
         #expect(spans.allSatisfy { $0.attributes.get("network.protocol.version") == .string("2") })
@@ -76,7 +88,7 @@ struct TracingTests {
         let app = tracedApp(tracer)
         app.get("/here") { _, response in response.send("here") }
         #expect(try app.test.get("/users/42").status == 404)
-        let span = try #require(tracer.finishedSpans.first)
+        let span = try #require(tracer.ownSpans.first)
         // Never the path: every path a scanner tries would be a name.
         #expect(span.operationName == "GET")
         #expect(span.attributes.get("http.route") == nil)
@@ -91,7 +103,7 @@ struct TracingTests {
         app.get("/") { _, response in response.send("ok") }
         _ = try app.test.get("/", headers: [(InMemoryTracer.traceIDKey, "trace-7"),
                                             (InMemoryTracer.spanIDKey, "caller-3")])
-        let span = try #require(tracer.finishedSpans.first)
+        let span = try #require(tracer.ownSpans.first)
         #expect(span.traceID == "trace-7")
         #expect(span.parentSpanID == "caller-3")
     }
@@ -105,7 +117,7 @@ struct TracingTests {
         #expect(try client.get("/boom").status == 500)
         #expect(try client.get("/forbidden").status == 403)
 
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         #expect(spans.count == 2)
         let boom = try #require(spans.first { $0.operationName == "GET /boom" })
         #expect(boom.status?.code == .error)
@@ -133,7 +145,7 @@ struct TracingTests {
         _ = try client.get("/sync")
         _ = try client.get("/async")
 
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         for (child, parent) in [("render", "GET /sync"), ("load", "GET /async")] {
             let inner = try #require(spans.first { $0.operationName == child })
             let outer = try #require(spans.first { $0.operationName == parent })
@@ -152,7 +164,7 @@ struct TracingTests {
         let client = app.test
         let first = try client.get("/who").text
         let second = try client.get("/who").text
-        let ids = tracer.finishedSpans.map(\.spanID)
+        let ids = tracer.ownSpans.map(\.spanID)
         #expect(ids == [first, second])
         #expect(first != second)
     }
@@ -168,8 +180,8 @@ struct TracingTests {
         }
         let response = try app.test.get("/lines")
         #expect(response.text == "one\ntwo\n")
-        let span = try #require(tracer.finishedSpans.first)
-        #expect(tracer.finishedSpans.count == 1)
+        let span = try #require(tracer.ownSpans.first)
+        #expect(tracer.ownSpans.count == 1)
         #expect(span.operationName == "GET /lines")
         #expect(span.attributes.get("http.response.status_code") == .int64(200))
         // Not ended with the head, which went out before the wait.
@@ -185,7 +197,7 @@ struct TracingTests {
             throw Boom()
         }
         _ = try? app.test.get("/half")
-        let span = try #require(tracer.finishedSpans.first)
+        let span = try #require(tracer.ownSpans.first)
         #expect(span.status?.code == .error)
         #expect(span.errors.count == 1)
     }
@@ -212,7 +224,7 @@ struct TracingTests {
             response.send(configured == nil ? "untraced" : "traced")
         }
         #expect(try app.test.get("/query").text == "traced")
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         let request = try #require(spans.first { $0.operationName == "GET /query" })
         let select = try #require(spans.first { $0.operationName == "SELECT" })
         let get = try #require(spans.first { $0.operationName == "GET" })

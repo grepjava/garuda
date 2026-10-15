@@ -169,11 +169,13 @@ extension CompiledApplication {
             }
         }
         makeShardTracer(shard)
+        startScheduledJobs(context)
     }
 
     /// Runs the stop hooks, then shuts the state down, newest first.
     func stopShard(_ shard: ShardInfo) async {
         let context = ShardContext(shard: shard, services: services)
+        await stopScheduledJobs()
         for hook in stopHooks.reversed() { await hook(context) }
         for i in stride(from: services.count - 1, through: 0, by: -1) {
             let (key, value) = services.value(at: i)
