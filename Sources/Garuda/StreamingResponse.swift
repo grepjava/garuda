@@ -1013,6 +1013,9 @@ final class BodyChannel: @unchecked Sendable {
             let drained = await withUnsafeContinuation { (c: UnsafeContinuation<Bool, Never>) in
                 let resume = endpoint.lock.withLock { _ -> Bool? in
                     if s.reset || state == .failed { return false }
+                    // The endpoint answering the stream itself cannot wait for
+                    // itself to take what was staged.
+                    if s.runsInline { return true }
                     if s.staged.readableBytes <= (force ? 0 : high) { return true }
                     s.waiters.append(c)
                     return nil
@@ -1021,7 +1024,7 @@ final class BodyChannel: @unchecked Sendable {
             }
             if !drained { throw .cancelled }
             let more = endpoint.lock.withLock { _ in
-                s.staged.readableBytes > (force ? 0 : high) && !s.reset && state != .failed
+                !s.runsInline && s.staged.readableBytes > (force ? 0 : high) && !s.reset && state != .failed
             }
             if !more { return }
         }

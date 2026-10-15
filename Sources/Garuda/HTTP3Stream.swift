@@ -104,6 +104,9 @@ final class H3Stream: @unchecked Sendable {
     @exclusivity(unchecked) var bodyFailed = false
     /// Writers of a streamed body waiting for `staged` to drain.
     @exclusivity(unchecked) var waiters: [UnsafeContinuation<Bool, Never>] = []
+    /// The endpoint is answering it itself: its writes cannot wait for the
+    /// endpoint to take what they staged.
+    @exclusivity(unchecked) var runsInline = false
 
     // MARK: The task's (or the endpoint's, when it answers itself)
 
@@ -153,7 +156,63 @@ extension QUICEndpoint {
         s.queued = true
         let first = posted.isEmpty
         posted.append(Unmanaged.passUnretained(s))
-        if first { wake.fire() }
+        if first && !answering { wake.fire() }
+    }
+
+    /// Whether `s` is answered by the endpoint rather than in a task of its
+    /// own: its route has never been seen to suspend, and is not heavy.
+    /// Matches the route, for the dispatch to use.
+    func runsInline(_ s: H3Stream) -> Bool {
+        let x = s.x
+        if s.matched < 0 {
+            let path = x.pointee.head.path
+            s.matched = app.table.match(x.pointee.head.method, x.pointee.base + Int(path.offset), path.count,
+                                        into: &x.pointee.parameters)
+            if s.matched < 0 {
+                // The dispatch works a miss out again, from nothing.
+                x.pointee.parameters = RouteParameters()
+                return false
+            }
+        }
+        let route = Int(s.matched)
+        // A file served before the route would stream from the endpoint.
+        if x.pointee.site != nil && staticMayServe(x) { return false }
+        return app.costs.neverSuspends(route) && !app.costs.isHeavy(route)
+    }
+
+    /// Answers the requests in `inline` here. A cancellation cannot arrive
+    /// meanwhile -- the endpoint is busy -- so there is no task to cancel;
+    /// one read afterwards is for an answered request. What they post is
+    /// taken once they are all answered.
+    func answerInline() async {
+        let list = inline
+        inline.removeAll(keepingCapacity: true)
+        lock.withLock { _ in answering = true }
+        for s in list {
+            let wanted = lock.withLock { _ -> Bool in
+                s.runsInline = true
+                return !s.reset
+            }
+            if wanted { await dispatchStream(s) }
+            if let channel = s.x.pointee.channel {
+                lock.withLock { _ in
+                    s.runsInline = false
+                    channel.closeH3Locked(s, failed: channel.handlerFailed)
+                    s.taskDone = true
+                    post(s)
+                }
+                continue
+            }
+            let framing = wanted && lock.withLock { _ in !s.reset }
+            if framing { frameWhole(s) }
+            lock.withLock { _ in
+                s.runsInline = false
+                if framing && !s.reset { s.answerReady = true }
+                s.taskDone = true
+                post(s)
+            }
+        }
+        lock.withLock { _ in answering = false }
     }
 
     /// The stream's task (HTTP2Pool.swift): the handler, which a reset
@@ -221,6 +280,10 @@ extension QUICEndpoint {
     /// The head of `s`'s streamed answer is made: framed now, and staged
     /// ahead of the body.
     func startStreamedAnswer(_ s: H3Stream, declared: Int) {
+        // Its route waits on its client from now on: never again answered
+        // by the endpoint, which is the one to send what it waits for.
+        let route = s.x.pointee.route
+        if route >= 0 { app.costs.markSuspends(Int(route)) }
         s.outHead.clear()
         encodeHead(s, streamed: true, declared: declared, into: &s.outHead)
         lock.withLock { _ in

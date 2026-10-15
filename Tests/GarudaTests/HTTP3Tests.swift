@@ -392,6 +392,31 @@ struct HTTP3Tests {
         }
     }
 
+    @Test func aRouteThatNeverWaitsIsAnsweredByTheEndpointAsWell() throws {
+        let app = h3App()
+        try withServer(app) { client, service in
+            try await client.connect()
+            // Past the runs it takes to be answered without a task of its
+            // own, one at a time and then many at once.
+            var id: UInt64 = 0
+            for i in 0..<24 {
+                #expect(try await client.get(id, "/user/\(i)").text == "\(i)")
+                id += 4
+            }
+            let route = try #require(app.routes.firstIndex { $0.method == .get && $0.pattern == "/user/:id" })
+            #expect(service.app.costs.neverSuspends(route))
+            let first = id
+            for i in 0..<20 {
+                try await client.request(id, [(":method", "GET"), (":scheme", "https"), (":authority", "localhost"),
+                                              (":path", "/user/many\(i)")])
+                id += 4
+            }
+            for i in 0..<20 {
+                #expect(try await client.answer(first + UInt64(i) * 4).text == "many\(i)")
+            }
+        }
+    }
+
     @Test func aBodyArrivesWholeAcrossDataFrames() throws {
         try withServer(h3App()) { client, _ in
             try await client.connect()

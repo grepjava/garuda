@@ -595,7 +595,11 @@ final class H3Connection {
         }
         s.taskActive = true
         tasks &+= 1
-        endpoint.pool.run(s)
+        if endpoint.runsInline(s) {
+            endpoint.inline.append(s)
+        } else {
+            endpoint.pool.run(s)
+        }
     }
 
     // MARK: - Cancellation

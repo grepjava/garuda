@@ -31,6 +31,13 @@
 // far as the stream's send budget allows, and the rest as acknowledgements
 // free room.
 //
+// Except when nothing could be held up for long: a request to a route that
+// has run many times without ever suspending, and is not heavy, is answered
+// by the endpoint itself once the datagrams in hand are handled, as an HTTP/2
+// connection's only stream is by its reader. It saves the hand-off to a task
+// and the wake-up back, which cost more than such a route does. One run that
+// does suspend sends the route to the pool for good.
+//
 // Shutdown sends every connection GOAWAY on its control stream, refuses new
 // requests, and closes each connection with H3_NO_ERROR once its requests are
 // answered -- or when the grace period runs out.
@@ -192,6 +199,9 @@ final class QUICEndpoint: @unchecked Sendable {
     @exclusivity(unchecked) var posted: [Unmanaged<H3Stream>] = []
     @exclusivity(unchecked) var stopRequested = false
     @exclusivity(unchecked) var graceMs: UInt64 = 0
+    /// The endpoint is answering requests itself, and takes what is posted
+    /// meanwhile once it is done: a post need not wake it.
+    @exclusivity(unchecked) var answering = false
 
     // MARK: The endpoint task's own
 
@@ -204,6 +214,9 @@ final class QUICEndpoint: @unchecked Sendable {
     /// Connections with something to look at since the last pass.
     @exclusivity(unchecked) var touched: [H3Connection] = []
     @exclusivity(unchecked) var draining: [Unmanaged<H3Stream>] = []
+    /// Requests the endpoint answers itself, once the datagrams in hand are
+    /// handled.
+    @exclusivity(unchecked) var inline: [H3Stream] = []
     /// Version negotiation packets to send: rare, and each its own.
     @exclusivity(unchecked) var replies: [(bytes: [UInt8], to: SocketAddress, from: SocketAddress?)] = []
     /// Outgoing datagrams, back to back, waiting to go out as one send.
@@ -309,6 +322,11 @@ final class QUICEndpoint: @unchecked Sendable {
                                from: from, to: batch.localAddress(at: i), ecn: batch.ecn(at: i), nowMs: now)
             }
             busy = service(nowMs: now)
+            if !inline.isEmpty {
+                await answerInline()
+                takePosts()
+                serviceTouched(nowMs: now)
+            }
             await flush(socket, nowMs: now)
             // After the flush: what was just sent set loss and probe timers.
             nextTimerMs = earliestTimer(nowMs: now)
