@@ -8,6 +8,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Garuda
 import Synchronization
@@ -41,11 +43,18 @@ private let cacheRoutes: [String: [(String, String)]] = [
 
 /// Appends `line` to the file at `path`.
 func appendLine(_ path: String, _ line: String) {
+    var text = line + "\n"
+    #if os(Windows)
+    // ucrt's open is variadic, which Swift cannot call.
+    guard let file = fopen(path, "ab") else { return }
+    text.withUTF8 { _ = fwrite($0.baseAddress, 1, $0.count, file) }
+    fclose(file)
+    #else
     let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
     guard fd >= 0 else { return }
-    var text = line + "\n"
     text.withUTF8 { _ = write(fd, $0.baseAddress, $0.count) }
     close(fd)
+    #endif
 }
 
 /// The call as the application sees it: logged to CACHE_LOG, and numbered in
