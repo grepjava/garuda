@@ -174,17 +174,20 @@ func serveConnection<S: AsyncReader & AsyncWriter & ~Copyable, R: AsyncReader & 
     secure: Bool, http2: HTTP2Service?, negotiatedH2: Bool = false,
     halves: (consuming S) -> StreamHalves<R, W>,
     close: (consuming S) async -> Void,
-    closeWriter: @escaping @Sendable (borrowing W) async -> Void
+    closeWriter: @escaping @Sendable (borrowing W) async -> Void,
+    heldWriter: (any HeldWriting.Type)? = nil
 ) async {
     guard let http2, limits.http2.enabled else {
-        let stream = await serveHTTP1(stream, app: app, limits: limits, peer: peer, secure: secure)
+        let stream = await serveHTTP1(stream, app: app, limits: limits, peer: peer, secure: secure,
+                                      writer: heldWriter)
         await close(stream)
         return
     }
     let parts = app.connections.take(limits: limits, peer: peer)
     switch await opening(stream, parts, limits, strict: negotiatedH2 || limits.http2.only) {
     case .http1:
-        let stream = await serveHTTP1(stream, parts: parts, app: app, limits: limits, secure: secure)
+        let stream = await serveHTTP1(stream, parts: parts, app: app, limits: limits, secure: secure,
+                                      writer: heldWriter)
         await close(stream)
     case .http2:
         await serveHTTP2(halves(stream), parts: parts, app: app, limits: limits, service: http2, secure: secure,
@@ -1013,6 +1016,7 @@ final class H2Connection: @unchecked Sendable {
             s.x.pointee.application = Unmanaged.passUnretained(app)
             s.x.pointee.secure = secure
             s.x.pointee.trust = limits.trust
+            s.x.pointee.site = limits.site
             made.append(s)
         }
         s.id = id
@@ -1364,6 +1368,8 @@ final class H2Connection: @unchecked Sendable {
             }
         }
         let route = Int(s.matched)
+        // A file served before the route would stream from the reader.
+        if x.pointee.site != nil && staticMayServe(x) { return false }
         return app.costs.neverSuspends(route) && !app.costs.isHeavy(route)
     }
 

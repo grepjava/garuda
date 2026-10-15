@@ -46,7 +46,15 @@
 import GarudaWire
 import Synchronization
 import Vega
+import VegaFS
 import VegaIO
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#elseif os(Windows)
+import ucrt
+#endif
 
 /// A wait a handler made was given up: the client went away, or the body
 /// it was writing has ended.
@@ -217,7 +225,8 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
     case .http1(let held, let parts, let limits):
         let framing: H1Framing
         if bodyless {
-            framing = .none
+            // A HEAD says the GET's length, when it is known.
+            framing = declared >= 0 && x.pointee.head.method == .head ? .length(declared) : .none
         } else if declared >= 0 {
             framing = .length(declared)
         } else if x.pointee.head.httpMinor == 0 {
@@ -234,7 +243,10 @@ func startStream(_ x: UnsafeMutablePointer<Exchange>) -> BodyChannel {
         let s = stream.takeUnretainedValue()
         channel = BodyChannel(http2: s, bodyless: bodyless, declared: bodyless ? -1 : declared)
         x.pointee.committed = true
-        s.connection.startStreamedAnswer(s, channel: channel, declared: bodyless ? -1 : declared)
+        // A HEAD says the GET's length, when it is known.
+        let said = x.pointee.head.method == .head && !HTTPResponseWriter.statusForbidsBody(status) ? declared
+            : bodyless ? -1 : declared
+        s.connection.startStreamedAnswer(s, channel: channel, declared: said)
     case .none:
         x.pointee.committed = true
         channel = BodyChannel(dropping: ())
@@ -266,10 +278,46 @@ struct HeldStream {
     func write(_ bytes: UnsafeRawBufferPointer) async throws(IOError) {
         try await writer.write(pointer, bytes)
     }
+
+    /// Whether the stream can take a file from the kernel: plain TCP.
+    var sendsFiles: Bool { writer.sendsFiles }
+
+    func sendFile(_ file: Int32, offset: Int, count: Int) async throws(IOError) -> Int {
+        try await writer.sendFile(pointer, file, offset: offset, count: count)
+    }
 }
 
 protocol HeldWriting {
     static func write(_ stream: UnsafeMutableRawPointer, _ bytes: UnsafeRawBufferPointer) async throws(IOError)
+    static var sendsFiles: Bool { get }
+    /// Up to `count` bytes of `file` from `offset`, sent by the kernel: the
+    /// bytes sent, fewer when the file ends first.
+    static func sendFile(_ stream: UnsafeMutableRawPointer, _ file: Int32, offset: Int,
+                         count: Int) async throws(IOError) -> Int
+}
+
+extension HeldWriting {
+    static var sendsFiles: Bool { false }
+
+    static func sendFile(_ stream: UnsafeMutableRawPointer, _ file: Int32, offset: Int,
+                         count: Int) async throws(IOError) -> Int {
+        throw IOError(code: ENOSYS)
+    }
+}
+
+/// A plain TCP connection, which hands files to sendfile(2).
+enum HeldTCPStream: HeldWriting {
+    static func write(_ stream: UnsafeMutableRawPointer, _ bytes: UnsafeRawBufferPointer) async throws(IOError) {
+        try await stream.assumingMemoryBound(to: TCPStream.self).pointee.write(bytes)
+    }
+
+    static var sendsFiles: Bool { true }
+
+    static func sendFile(_ stream: UnsafeMutableRawPointer, _ file: Int32, offset: Int,
+                         count: Int) async throws(IOError) -> Int {
+        try await stream.assumingMemoryBound(to: TCPStream.self).pointee.sendFile(file, offset: Int64(offset),
+                                                                                   count: count)
+    }
 }
 
 enum HeldWriter<S: AsyncWriter & ~Copyable>: HeldWriting {
@@ -627,6 +675,70 @@ final class BodyChannel: @unchecked Sendable {
             s.resumeWaiters(false)
         } else {
             endLocked()
+        }
+    }
+
+    // MARK: Files
+
+    /// Sends `count` bytes of `file` from `start` as the body: by the kernel
+    /// over a stream that can take a file, else read a block at a time and
+    /// written as any other bytes are. Throws `cancelled` when the body
+    /// cannot be finished -- the client went, or the file ended early.
+    func sendFile(_ file: borrowing File, from start: Int, count: Int) async throws(HandlerWaitError) {
+        if bodyless || count == 0 { return }
+        if let held, held.sendsFiles, !chunked {
+            // What is queued -- the head -- goes first.
+            try await settle(.sent, flushing: true)
+            let taken = lock.withLock { _ -> Bool in
+                guard state == .open, !flushing else { return false }
+                flushing = true
+                inFlight = count
+                if remaining >= 0 { remaining = max(0, remaining &- count) }
+                return true
+            }
+            guard taken else { throw .cancelled }
+            var sent = 0
+            while sent < count {
+                let n: Int
+                do {
+                    let at = start + sent
+                    let left = count - sent
+                    n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+                        try await held.sendFile(file.descriptor, offset: at, count: left)
+                    }
+                } catch {
+                    break
+                }
+                if n <= 0 { break }
+                sent += n
+            }
+            let ok = sent == count
+            lock.withLock { _ in
+                flushing = false
+                inFlight = 0
+                if !ok { state = .failed }
+            }
+            wakeWaiters(drained: ok)
+            if !ok { throw .cancelled }
+            return
+        }
+        var buffer = IOBuffer(capacity: min(count, fileBlockBytes))
+        var offset = start
+        var left = count
+        while left > 0 {
+            buffer.clear()
+            let n: Int
+            do {
+                n = try await file.read(into: &buffer, at: offset)
+            } catch {
+                throw .cancelled
+            }
+            if n <= 0 { throw .cancelled }
+            let take = min(n, left)
+            let queued = buffer.withUnsafeBytes { queue(UnsafeRawBufferPointer(rebasing: $0[0..<take])) }
+            try await settle(queued)
+            offset += take
+            left -= take
         }
     }
 

@@ -70,6 +70,27 @@ public struct ServerConfig: Sendable {
     /// How long shutting down waits for requests in progress.
     public var gracefulShutdown: Duration = .seconds(10)
 
+    // --- static files (StaticFiles.swift) ---
+    /// URL prefixes answered from directories, `--static-dir /static=/srv/www`:
+    /// a GET or HEAD under a prefix is served the file it names, and one
+    /// naming no file falls through to the routes.
+    public var staticDirectories: [(prefix: String, directory: String)] = []
+    /// A single-page application's page, served for browser navigations no
+    /// route answers: `--spa-fallback /app=/srv/app/index.html`. `file` is
+    /// its name under `directory`.
+    public var spaFallbacks: [(prefix: String, directory: String, file: String)] = []
+    /// Answer a request for a `--static-dir` directory with its `index.html`.
+    /// Off by default: a directory that is not served falls through to the
+    /// application, and taking that path away is the operator's decision.
+    public var staticIndex = false
+    /// Answer a request for a directory that has no index with a listing of
+    /// what is in it. Implies `staticIndex`. Off by default, and deliberately:
+    /// a listing tells whoever asks every name in the directory.
+    public var staticListing = false
+    /// The most entries a listing shows; 0 for no limit. Past it the
+    /// directory is not read further, and the page says there are more.
+    public var staticListingLimit = 10_000
+
     // --- TLS (TLS.swift) ---
     /// The certificates served, each with its key; none serves plain HTTP.
     /// The client's SNI picks the first that covers the name it asks for,

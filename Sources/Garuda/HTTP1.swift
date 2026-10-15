@@ -53,9 +53,12 @@ struct ConnectionLimits: Sendable {
     var accessLogJSON: Bool
     /// HTTP/2's settings and limits (HTTP2.swift).
     var http2: HTTP2Limits
+    /// --static-dir and --spa-fallback, or nil for neither (StaticFiles.swift).
+    var site: StaticSite?
 
     init(_ config: ServerConfig) {
         http2 = HTTP2Limits(config)
+        site = StaticSite(config)
         readBufferSize = max(1024, config.readBufferSize)
         maxHeadSize = config.maxHeadSize
         maxHeaders = max(1, config.maxHeaders)
@@ -90,10 +93,10 @@ let separateBodyThreshold = 16 * 1024
 @discardableResult
 func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     _ stream: consuming S, app: CompiledApplication, limits: ConnectionLimits, peer: SocketPeer,
-    secure: Bool = false
+    secure: Bool = false, writer: (any HeldWriting.Type)? = nil
 ) async -> S {
     await serveHTTP1(stream, parts: app.connections.take(limits: limits, peer: peer), app: app, limits: limits,
-                     secure: secure)
+                     secure: secure, writer: writer)
 }
 
 /// The same, on parts already taken, whose input may hold the connection's
@@ -101,18 +104,19 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
 @discardableResult
 func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     _ stream: consuming S, parts: UnsafeMutablePointer<ConnectionParts>, app: CompiledApplication,
-    limits: ConnectionLimits, secure: Bool
+    limits: ConnectionLimits, secure: Bool, writer: (any HeldWriting.Type)? = nil
 ) async -> S {
     let x = parts.pointee.exchange
     x.pointee.application = Unmanaged.passUnretained(app)
     // The exchange is reused from connection to connection: set both.
     x.pointee.secure = secure
     if x.pointee.trust != nil || limits.trust != nil { x.pointee.trust = limits.trust }
+    if x.pointee.site != nil || limits.site != nil { x.pointee.site = limits.site }
     // Held where a streamed body's writes can reach it while the handler
     // writing it runs (StreamingResponse.swift).
     let held = UnsafeMutablePointer<S>.allocate(capacity: 1)
     held.initialize(to: stream)
-    x.pointee.link = .http1(HeldStream(pointer: UnsafeMutableRawPointer(held), writer: HeldWriter<S>.self),
+    x.pointee.link = .http1(HeldStream(pointer: UnsafeMutableRawPointer(held), writer: writer ?? HeldWriter<S>.self),
                             parts, StreamLimits(limits))
     var connection = HTTP1Connection(limits: limits, parts: parts, cache: app.connections,
                                      observing: limits.accessLog || !app.observers.isEmpty)

@@ -264,6 +264,20 @@ extension ServerConfig {
           --log-level LEVEL    debug, info, warning, error or silent
           --max-body BYTES     largest request body (default 16 MiB)
           --keep-alive SECS    idle keep-alive timeout (default 5)
+          --sse-keep-alive SECS
+                               a comment to an event stream quiet this long
+                               (default 15; 0 for none)
+          --static-dir PREFIX=DIR
+                               answer GET and HEAD under PREFIX from the files
+                               in DIR; a path naming no file falls through
+          --static-index       answer a --static-dir directory with its
+                               index.html
+          --static-listing     and list one that has no index
+          --static-listing-limit N
+                               entries a listing shows (default 10000; 0 for all)
+          --spa-fallback PREFIX=FILE
+                               answer browser navigations under PREFIX that
+                               nothing else answers with FILE
           --tls-cert PATH      a PEM certificate chain to serve HTTPS with;
                                give one --tls-key for each, in order. With
                                several, SNI picks the one covering the name
@@ -337,6 +351,41 @@ extension ServerConfig {
                 } else {
                     return fail("--shards must be a count or auto")
                 }
+            case "--workers":
+                // Garuda 1's name for its processes, which are shards here.
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--workers must be a count")
+                }
+                config.shards = n
+            case "--static-dir":
+                guard let v = value(), let eq = v.firstIndex(of: "="), eq != v.startIndex,
+                      v.index(after: eq) != v.endIndex else {
+                    return fail("--static-dir takes PREFIX=DIRECTORY, as in /static=/var/www/static")
+                }
+                let prefix = String(v[..<eq])
+                guard prefix.hasPrefix("/") else { return fail("--static-dir prefix must start with /") }
+                config.staticDirectories.append((prefix, String(v[v.index(after: eq)...])))
+            case "--spa-fallback":
+                guard let v = value(), let eq = v.firstIndex(of: "="), eq != v.startIndex,
+                      v.hasPrefix("/"), v.index(after: eq) != v.endIndex else {
+                    return fail("--spa-fallback takes PREFIX=FILE, as in /=/srv/app/index.html")
+                }
+                let path = String(v[v.index(after: eq)...])
+                guard isReadable(path) else { return fail("--spa-fallback: cannot read \(path)") }
+                let slash = path.lastIndex(of: "/")
+                let directory = slash.map { $0 == path.startIndex ? "/" : String(path[..<$0]) } ?? "."
+                let file = slash.map { String(path[$0...]) } ?? "/" + path
+                config.spaFallbacks.append((String(v[..<eq]), directory, file))
+            case "--static-index":
+                config.staticIndex = true
+            case "--static-listing":
+                config.staticListing = true
+                config.staticIndex = true
+            case "--static-listing-limit":
+                guard let n = value().flatMap({ Int($0) }), n >= 0 else {
+                    return fail("--static-listing-limit must be a count")
+                }
+                config.staticListingLimit = n
             case "--threads":
                 guard let n = value().flatMap({ Int($0) }), n > 0 else {
                     return fail("--threads must be a positive count")
@@ -490,4 +539,13 @@ func peerName(of fd: Int32) -> (String, Int)? {
 
 func environment(_ name: String) -> String? {
     getenv(name).map { String(cString: $0) }
+}
+
+/// Whether the process can read the file at `path`.
+func isReadable(_ path: String) -> Bool {
+    #if os(Windows)
+    return _access(path, 4) == 0
+    #else
+    return access(path, R_OK) == 0
+    #endif
 }

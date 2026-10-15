@@ -47,6 +47,8 @@ struct Exchange: ~Copyable {
     @usableFromInline var trust: ForwardedTrust?
     /// What those headers said for this request, read when first asked for.
     @usableFromInline var forwardedState = ForwardedState.unknown
+    /// --static-dir and --spa-fallback, set per connection (StaticFiles.swift).
+    var site: StaticSite?
     /// The application serving the connection, for its state. It outlives
     /// every connection it serves.
     var application: Unmanaged<CompiledApplication>?

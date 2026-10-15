@@ -183,7 +183,8 @@ func serveTCP(_ stream: consuming TCPStream, app: CompiledApplication, limits: C
               http2: HTTP2Service?) async {
     let peer = socketPeer(stream)
     await serveConnection(stream, app: app, limits: limits, peer: peer, secure: false, http2: http2,
-                          halves: { $0.halves() }, close: { _ in }, closeWriter: { _ in })
+                          halves: { $0.halves() }, close: { _ in }, closeWriter: { _ in },
+                          heldWriter: HeldTCPStream.self)
 }
 
 /// Serves an accepted connection over TLS: HTTP/2 when the client chose

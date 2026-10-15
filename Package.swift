@@ -30,7 +30,7 @@ let vegaTraits: Set<Package.Dependency.Trait> = [
 /// Garuda needs.
 let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.3.0"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.3.3"), traits: vegaTraits)
 
 let package = Package(
     name: "garuda",
@@ -76,7 +76,8 @@ let package = Package(
         // encrypted cookies (HMAC, HKDF, AES-GCM), JWT signing and verifying,
         // password hashes and tokens all use it.
         .target(name: "Garuda",
-                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS")],
+                dependencies: ["GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS"),
+                               vega("VegaFS")],
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaTesting",
                 dependencies: ["Garuda", "GarudaWire", vega("Vega"), vega("VegaIO"), vega("VegaTest")],

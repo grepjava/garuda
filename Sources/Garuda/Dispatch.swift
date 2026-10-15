@@ -26,6 +26,9 @@ func dispatch(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, m
 @inline(__always)
 func dispatchInline(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, matched: Int32 = -1,
                     observing: Bool) async {
+    // --static-dir comes before the routes; a path naming no file falls
+    // through to them (StaticFiles.swift).
+    if x.pointee.site != nil, await serveStatic(x) { return }
     let path = x.pointee.head.path
     let base = x.pointee.base + Int(path.offset)
     var count = path.count
@@ -51,6 +54,8 @@ func dispatchInline(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplicat
             // route: `x.pointee.route` stays -1.
             let fallback = app.fallbacks.isEmpty ? -1 : app.fallbacks.match(base, count)
             if fallback >= 0 { return await runHandler(x, app, Int(fallback), observing: observing) }
+            // A browser navigating to a single-page application's route.
+            if x.pointee.site != nil, await serveSPAFallback(x) { return }
             x.pointee.answer(404, nil, 0)
         } else if x.pointee.head.method == .options && app.hasCORS
                     && answerPreflight(x, app, allowed: allowed, base, count) {
