@@ -97,6 +97,12 @@ final class ReloadWatcher: @unchecked Sendable {
             }
             options.shards = 1
         }
+        // A shard that stops closes the sockets it bound, and with a socket
+        // of its own per shard (SO_REUSEPORT) the connections the kernel had
+        // queued on it go with it, reset. One socket the supervisor holds
+        // outlives every shard, so a restart costs a client nothing; and
+        // reloading is what --reload is for, where spreading load is not.
+        if config.balance == nil { options.listenerMode = .shared }
         let watcher = ReloadWatcher(config)
         options.watch = { watcher.check() }
         options.watchInterval = .milliseconds(50)
