@@ -32,10 +32,11 @@ exits with status 2. So does a route table with problems, and a certificate
 that cannot be loaded.
 
 **Units.** Each flag takes the unit its name in `--help` says, and they are not
-all the same. Several differ from Garuda 1: `--keep-alive` and
-`--graceful-timeout` are seconds, while `--drain-delay` and the `--ws-ping-*`
-flags are milliseconds. [COMPATIBILITY.md](COMPATIBILITY.md) lists every
-change.
+all the same: `--keep-alive`, `--request-timeout`, `--graceful-timeout`,
+`--drain-delay` and the `--ws-ping-*` flags are milliseconds, while
+`--sse-keep-alive`, `--cache-ttl-max`, `--hsts` and `--tls-reload` are seconds.
+The units are Garuda 1's. [COMPATIBILITY.md](COMPATIBILITY.md) lists what
+changed between the two.
 
 ---
 
@@ -45,6 +46,9 @@ change.
 |---|---|---|
 | `--host HOST` | `127.0.0.1` | interface to bind |
 | `--port PORT` | `8000` | TCP port, and the HTTP/3 UDP port unless `--quic-port` is given; `0` picks a free one |
+| `--unix PATH` | none | listen on a unix socket instead of TCP |
+| `--backlog N` | `2048` | listen backlog |
+| `--root-path PATH` | none | prefix removed from the path before routes match |
 | `--shards N\|auto` | `auto` on Linux, `0` elsewhere | shard processes; `0` serves in this process |
 | `--balance MODE` | `auto` | how shards share the port: `reuseport`, `shared` or `auto` |
 | `--threads N` | the shard's CPUs | worker threads per shard |
@@ -53,6 +57,7 @@ change.
 | `--io uring\|epoll` | io_uring where the kernel has it | the I/O driver (Linux) |
 | `--heavy-threshold US` | `500` | microseconds a route may hold a thread, on average, before it runs in the heavy lane |
 | `--no-heavy-lane` | lane on | let every route use every thread |
+| `--sched-slice MICROS` | -- | Garuda 1's scheduler slice; accepted, with a warning that it has no effect |
 
 **Shards.** A shard is a process with its own work-stealing runtime on its
 own CPUs. With one shard or more, the process that was started becomes a
@@ -90,6 +95,21 @@ given, or, with `--shards 0`, one per CPU. **`--no-pin`** leaves the threads
 unpinned, which matters where the machine's CPUs are shared with something
 else.
 
+**Unix sockets.** Every shard accepts on the one socket, which the
+supervisor binds. A stale socket file at the path is removed at start-up. A
+unix peer has no address: list `unix` in `--forwarded-allow-ips` to believe a
+proxy connecting over it. `--http3` and `--redirect-http` cannot be used with
+`--unix`.
+
+```bash
+garuda --unix /run/app.sock --forwarded-allow-ips unix
+```
+
+**`--root-path`.** `--root-path /api` answers `GET /api/user/7` with the route
+for `/user/7`. Only a whole segment is removed, and a path that does not start
+with the prefix is routed as it came. It applies to routes only:
+`--static-dir` and `--health-check-path` match the path as the client sent it.
+
 **`--acceptors`** sets how many accept loops each shard runs. One per thread
 means a new connection usually starts on the thread that accepted it rather
 than on a thread woken to steal it.
@@ -120,19 +140,29 @@ that may change in between.
 
 | flag | default | what it does |
 |---|---|---|
+| `--max-connections N` | `4096` | concurrent connections per shard |
 | `--max-body BYTES` | 16 MiB | largest request body; larger gets 413 |
-| `--keep-alive SECS` | `5` | idle time allowed on a connection between requests |
-| `--graceful-timeout SECS` | `10` | time requests, streams and WebSockets in progress get at shutdown |
+| `--max-header-size BYTES` | 32 KiB | largest request head; larger gets 431; minimum 1024 |
+| `--keep-alive MS` | `5000` | idle time allowed on a connection between requests |
+| `--request-timeout MS` | `30000` | how long a request may stall part-way through |
+| `--graceful-timeout MS` | `10000` | time requests, streams and WebSockets in progress get at shutdown |
 | `--drain-delay MS` | `0` | on `SIGTERM`, keep serving this long with the health check failing |
+| `--blocking-threads N` | `16` | threads per shard that blocking work (`app.offload`) runs on |
+| `--blocking-queue N` | `1024` | blocking work waiting for a thread, per shard, before it is refused 503 |
 | `--sse-keep-alive SECS` | `15` | an event stream quiet this long is sent a comment; `0` sends none |
 | `--broadcast-size MIB` | `4` | the ring a `Topic`'s messages cross shards in; `0` turns topics off |
 | `--broadcast-queue N` | `1024` | messages a subscriber may fall behind by before it is told it missed some |
 
+- **`--max-connections`** is per shard. A connection that arrives at a full
+  shard is refused.
 - **`--max-body`** is checked against a declared `Content-Length` before the
   body is read, and against the bytes received for a chunked, HTTP/2 or HTTP/3
   body. Routes inside `app.maxBodySize(bytes) { … }` use that limit instead.
+- **`--max-header-size`** bounds the HTTP/1.1 head. It is also the HTTP/2
+  header list size and the HTTP/3 field section size.
 - **`--keep-alive`** is the HTTP/1.1 idle time between requests. It also closes
   an idle HTTP/2 connection and is the QUIC idle timeout.
+- **`--request-timeout`** covers a request head or body that stops arriving.
 - **`--sse-keep-alive`** is kept by the server whatever the handler is waiting
   on, so a proxy that closes idle connections sees traffic and a client that
   has gone is found when the write fails. `EventStream(keepAlive:)` sets it
@@ -151,19 +181,15 @@ that may change in between.
 `--drain-delay` and `--graceful-timeout` are described under
 [Signals](#signals) and in [DEPLOYMENT.md](DEPLOYMENT.md).
 
-Garuda 2 has no connection cap (`--max-connections`), no `--request-timeout`,
-no `--max-header-size` flag and no blocking-pool flags. The limits below have
-no flag; set them on a `ServerConfig` and call `app.run(config:)`:
+The limits below have no flag; set them on a `ServerConfig` and call
+`app.run(config:)`:
 
 | `ServerConfig` field | default | what it does |
 |---|---|---|
-| `backlog` | `2048` | listen backlog |
 | `readBufferSize` | 16 KiB | per-connection read buffer (at least 1024) |
-| `maxHeadSize` | 32 KiB | largest request head; larger gets 431 |
 | `maxHeaders` | `100` | most header fields in a request |
 | `maxRequestsPerConnection` | `0` | requests before a polite close; `0` is unlimited |
 | `pipelineDepth` | `16` | pipelined HTTP/1.1 responses written as one batch |
-| `requestHeadTimeout` | 30 s | how long each read of a request head may wait once the head has started |
 | `bodyTimeout` | 30 s | how long each read of a request body may wait |
 | `writeTimeout` | 30 s | how long one write of a streamed body may wait on an HTTP/1.1 client that is not reading |
 | `writeHighWaterMark`, `writeLowWaterMark` | 512 KiB, 128 KiB | a streamed body's writes wait above the first until it is down to the second |
@@ -185,6 +211,8 @@ no flag; set them on a `ServerConfig` and call `app.run(config:)`:
 | `--redirect-http PORT` | none | answer plain HTTP on PORT with a redirect to https |
 | `--acme-webroot DIR` | none | on the `--redirect-http` port, serve ACME HTTP-01 challenges from DIR |
 | `--hsts SECS` | none | send `Strict-Transport-Security: max-age=SECS` on TLS responses |
+| `--tls-ciphers LIST` | the library's | cipher list for TLS 1.2; TLS 1.3 suites are not configurable |
+| `--ktls`, `--no-ktls` | -- | accepted, with a warning that they have no effect |
 
 `--tls-cert` and `--tls-key` turn on TLS for the TCP port. ALPN chooses HTTP/2
 or HTTP/1.1. The files are loaded and checked before any shard starts, so an
@@ -193,7 +221,7 @@ with status 2.
 
 TLS is Vega's, on BoringSSL by default or on the system's OpenSSL 3 when built
 with the `OpenSSL` trait ([INSTALLATION.md](INSTALLATION.md#the-tls-library)).
-There are no cipher or kernel TLS flags.
+There is no kernel TLS.
 
 Session tickets let a returning client skip the full handshake. The ticket key
 lives in memory every shard shares, so a client whose next connection lands
@@ -523,6 +551,8 @@ bounds how many requests a group of routes runs at once in one shard
 | `--forwarded-allow-ips LIST` | nobody | peers whose forwarded headers are believed |
 | `--request-id` | off | give every request an `X-Request-ID` |
 | `--trace-context` | off | record a W3C `traceparent` in the logs |
+| `--scheme http\|https` | `https` with TLS, else `http` | the scheme a request is taken to have arrived over, when nothing better says |
+| `--request-start-header` | off | make the arrival time available as `request.requestStart` |
 
 ### `--forwarded-allow-ips`
 
@@ -533,7 +563,7 @@ garuda --forwarded-allow-ips 10.0.0.0/8,127.0.0.1
 `X-Forwarded-For`, `X-Forwarded-Proto` and `Forwarded` are read only when the
 connecting peer is on the list. From any other peer they are ignored, because
 a client can send them too. The list is comma-separated addresses, CIDR
-blocks, or `*`. An entry that does not parse stops start-up. Use `*` only when
+blocks, `unix`, or `*`. An entry that does not parse stops start-up. Use `*` only when
 nothing but the proxy can reach the server.
 
 Trusted forwarded information is used for:
@@ -544,8 +574,18 @@ Trusted forwarded information is used for:
 - handlers, through `request.remoteAddress`, `request.remotePort` and
   `request.arrivedOverHTTPS`.
 
-There is no `--scheme` flag: a proxy that terminates TLS should send
-`X-Forwarded-Proto` and be trusted.
+### `--scheme`
+
+A request arrived over HTTPS when it came over TLS, when an HTTP/2 or HTTP/3
+request's `:scheme` says so, or when a trusted proxy says so. Otherwise
+`--scheme` decides. Set `--scheme https` behind a proxy that terminates TLS
+and does not send forwarded headers.
+
+### `--request-start-header`
+
+`request.requestStart` is the time the request arrived, in microseconds since
+the epoch. It is `nil` without the flag. APM agents use it to report queue
+time.
 
 ### `--request-id`
 
@@ -585,9 +625,10 @@ the server's own, see `app.tracing` in [MIDDLEWARE.md](MIDDLEWARE.md).
 | `--metrics-port PORT` | none | serve Prometheus metrics on a separate port |
 | `--metrics-host HOST` | `--host` | interface the metrics port binds |
 
-Garuda 2 has no slow-handler warning (`--slow-handler-ms`). The heavy lane
-measures the same thing and acts on it; `--log-level debug` logs each route
-that enters or leaves the lane, with its average.
+`--slow-handler-ms` is accepted, with a warning that it has no effect in
+Garuda 2. The heavy lane measures what it measured and acts on it;
+`--log-level debug` logs each route that enters or leaves the lane, with its
+average.
 
 ### Access log
 
@@ -678,12 +719,17 @@ Without `--metrics-port`, nothing is counted.
 
 When a shard drains it stops accepting, sends WebSockets a 1001 close and
 HTTP/2 connections a GOAWAY, and gives what is in progress
-`--graceful-timeout` seconds. The supervisor kills any shard still running
+`--graceful-timeout` milliseconds. The supervisor kills any shard still running
 after `--drain-delay` + `--graceful-timeout` + 5 seconds.
 [DEPLOYMENT.md](DEPLOYMENT.md) covers signals, draining behind a load
 balancer, and reloads. On Windows no signal is handled.
 
-Garuda 2 has no `--reload` development watcher.
+| flag | default | what it does |
+|---|---|---|
+| `--reload` | off | development: restart on a rebuilt executable; replace the shards when a certificate file changes |
+| `--reload-interval MS` | `500` | how often `--reload` rescans; minimum 50 |
+
+`--reload` is for development. Do not use it in production.
 
 ---
 
@@ -697,7 +743,7 @@ garuda \
     --http3 --redirect-http 80 --hsts 300 \
     --forwarded-allow-ips 10.0.0.0/8 \
     --static-dir /static=/srv/app/static --compress-static \
-    --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30 \
+    --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30000 \
     --max-body 8388608 \
     --metrics-port 9100 --metrics-host 127.0.0.1 \
     --access-log --access-log-format json
@@ -738,8 +784,11 @@ Most fields share the flag's name. These do not:
 | `--no-pin` | `pinThreads = false` |
 | `--heavy-threshold` | `heavyThreshold`, a `Duration` |
 | `--no-heavy-lane` | `heavyLane = false` |
+| `--unix` | `unixPath` |
 | `--max-body` | `maxBodySize` |
+| `--max-header-size` | `maxHeadSize` |
 | `--keep-alive` | `keepAliveTimeout` |
+| `--request-timeout` | `requestHeadTimeout` |
 | `--sse-keep-alive` | `eventKeepAlive` |
 | `--graceful-timeout` | `gracefulShutdown` |
 | `--drain-delay` | `drainDelay` |
