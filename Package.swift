@@ -156,13 +156,16 @@ let package = Package(
         .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),
         .testTarget(name: "GarudaWireTests", dependencies: ["GarudaWire"],
                     swiftSettings: sharedSwiftSettings),
+        // The tests' own QUIC client, for GarudaQUICTests and GarudaTests.
+        .target(name: "QUICTestPeer", dependencies: ["GarudaQUIC", "GarudaWire", vega("VegaCrypto"), vega("VegaTLS")],
+                path: "Tests/QUICTestPeer", swiftSettings: sharedSwiftSettings),
         // VegaTLS only for a self-signed certificate the handshake test serves.
         .testTarget(name: "GarudaQUICTests",
-                    dependencies: ["GarudaQUIC", "GarudaWire", vega("VegaCrypto"), vega("VegaTLS")],
+                    dependencies: ["GarudaQUIC", "GarudaWire", "QUICTestPeer", vega("VegaCrypto"), vega("VegaTLS")],
                     swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaTests",
                     dependencies: ["Garuda", "GarudaWire", "GarudaTesting", "CAllocationCounter",
-                                   vega("Vega"),
+                                   "GarudaQUIC", "QUICTestPeer", vega("Vega"),
                                    .product(name: "Tracing", package: "swift-distributed-tracing"),
                                    .product(name: "InMemoryTracing", package: "swift-distributed-tracing"),
                                    vegaDB("VegaDBTracing")],
