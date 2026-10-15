@@ -69,6 +69,12 @@ public enum QUICFrameType {
     /// Acknowledging an acknowledgement forever is how two idle peers keep
     /// each other awake.
     @inlinable
+    /// RFC 9000 section 9.1: the frames a packet probing a new path may
+    /// carry. A packet of nothing else does not move the connection.
+    public static func isProbing(_ type: UInt64) -> Bool {
+        type == padding || type == pathChallenge || type == pathResponse || type == newConnectionID
+    }
+
     public static func isAckEliciting(_ type: UInt64) -> Bool {
         switch type {
         case padding, ack, ackECN, connectionCloseTransport, connectionCloseApplication:

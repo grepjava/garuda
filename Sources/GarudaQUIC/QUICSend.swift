@@ -50,7 +50,7 @@ struct QUICFrameWriter {
 extension QUICConnection {
     /// The largest packet number we might use next, which decides how many
     /// bytes the packet number field needs.
-    private func packetNumberLength(_ level: QUICLevel) -> Int {
+    func packetNumberLength(_ level: QUICLevel) -> Int {
         quicPacketNumberLength(spaces[level.rawValue].nextPacketNumber,
                                largestAcked: spaces[level.rawValue].largestAckedPacket)
     }
@@ -743,6 +743,8 @@ extension QUICConnection {
             consider(lastActivityMs + recovery.ptoMs(includeMaxAckDelay: false))
         }
 
+        pathTimeout(consider)
+
         if idleTimeoutMs > 0 {
             let floor = 3 * recovery.ptoMs(includeMaxAckDelay: true)
             consider(lastActivityMs + max(idleTimeoutMs, floor))
@@ -764,6 +766,7 @@ extension QUICConnection {
             events.append(QUICEvent(.closed, code: QUICError.noError.rawValue))
             return
         }
+        pathTimers(nowMs: nowMs)
 
         for space in spaces where space.ackDeadlineMs != 0 && nowMs >= space.ackDeadlineMs {
             // Handled below by clearing the deadline; the ACK goes out with

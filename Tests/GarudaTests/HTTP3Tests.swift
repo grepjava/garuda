@@ -30,6 +30,7 @@ private func h3App() -> Application {
         let body = response.stream(contentType: "text/plain")
         for i in 1...3 { try await body.write("line \(i)\n") }
     }
+    app.get("/big") { _, response in response.send(String(repeating: "a", count: 30_000)) }
     app.get("/delay/:ms") { request, response in
         try await Runtime.sleep(for: .milliseconds(Int(request.parameter(0)) ?? 1))
         response.send(status: .ok)
@@ -86,17 +87,41 @@ private func longHeader(version: UInt32, dcid: [UInt8], scid: [UInt8], size: Int
 /// an HTTP/3 request's worth of framing.
 private final class H3Client: @unchecked Sendable {
     let peer: QUICTestPeer
-    let socket: UnsafeMutablePointer<UDPSocket>
+    let port: Int
+    /// The socket in use, and every one made.
+    var socket: UnsafeMutablePointer<UDPSocket>
+    var sockets: [UnsafeMutablePointer<UDPSocket>] = []
+    var bytesSent = 0
 
     init(port: Int) throws {
         peer = try QUICTestPeer()
-        socket = .allocate(capacity: 1)
-        socket.initialize(to: try UDPSocket.connect(to: SocketAddress(numericHost: "127.0.0.1", port: port)!))
+        self.port = port
+        socket = try H3Client.socket(port)
+        sockets.append(socket)
     }
 
     deinit {
-        socket.deinitialize(count: 1)
-        socket.deallocate()
+        for socket in sockets {
+            socket.deinitialize(count: 1)
+            socket.deallocate()
+        }
+    }
+
+    private static func socket(_ port: Int) throws -> UnsafeMutablePointer<UDPSocket> {
+        let socket = UnsafeMutablePointer<UDPSocket>.allocate(capacity: 1)
+        socket.initialize(to: try UDPSocket.connect(to: SocketAddress(numericHost: "127.0.0.1", port: port)!))
+        return socket
+    }
+
+    /// Goes on from a new port, as a client behind a NAT that rebinds does,
+    /// or as an attacker rewriting its packets' source would. Returns the
+    /// socket it had.
+    @discardableResult
+    func move() throws -> UnsafeMutablePointer<UDPSocket> {
+        let old = socket
+        socket = try H3Client.socket(port)
+        sockets.append(socket)
+        return old
     }
 
     func send(_ bytes: [UInt8]) async throws {
@@ -104,6 +129,7 @@ private final class H3Client: @unchecked Sendable {
         defer { raw.deallocate() }
         raw.copyBytes(from: bytes)
         _ = try await socket.pointee.send(UnsafeRawBufferPointer(raw))
+        bytesSent += bytes.count
     }
 
     /// One datagram, or nil once `timeout` has passed.
@@ -477,6 +503,81 @@ struct HTTP3Tests {
             let differs = try await client.get(4, "/", headers: [("host", "elsewhere")])
             #expect(differs.reset == HTTP3Error.messageError)
             #expect(try await client.get(8, "/user/still").text == "still")
+        }
+    }
+
+    // MARK: A peer that moves
+
+    @Test func aPeerThatMovesIsBelievedOnceItAnswersAChallenge() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            #expect(try await client.get(0, "/user/here").text == "here")
+            try client.move()
+            // A PING is more than a probe: the new address is challenged.
+            try await client.send(try client.peer.packet(.application, client.peer.ack(.application) + [0x01]))
+            let challenge = try #require(try await client.receiveOne(timeout: .seconds(2)))
+            try client.peer.receive(challenge)
+            let data = try #require(client.peer.pathChallenges.first)
+            try await client.send(try client.peer.packet(.application, client.peer.ack(.application) + [0x1b] + data))
+            // Answered: the connection has moved.
+            #expect(try await client.get(4, "/big").body.count == 30_000)
+        }
+    }
+
+    @Test func aPacketFromASpoofedSourceDoesNotRedirectTheConnection() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            #expect(try await client.get(0, "/user/here").text == "here")
+            // A request whose source an attacker on the path rewrote, for an
+            // answer far larger than it.
+            let home = try client.move()
+            client.bytesSent = 0
+            try await client.request(4, [(":method", "GET"), (":scheme", "https"), (":authority", "localhost"),
+                                         (":path", "/big")])
+            let brought = client.bytesSent
+            // At that address: a challenge, held to three times what came
+            // from there, and nothing else.
+            var arrived = 0
+            while let datagram = try await client.receiveOne(timeout: .milliseconds(300)) { arrived += datagram.count }
+            #expect(arrived > 0)
+            #expect(arrived <= 3 * brought)
+            // The answer went where the connection was.
+            client.socket = home
+            #expect(try await client.answer(4).body.count == 30_000)
+        }
+    }
+
+    @Test func aProbeIsAnsweredTheWayItCameAndMovesNothing() throws {
+        try withServer(h3App()) { client, _ in
+            try await client.connect()
+            let home = try client.move()
+            // A probe as a client sends one: padded to fill a datagram.
+            let probe: [UInt8] = [0x1a] + [UInt8](repeating: 7, count: 8) + [UInt8](repeating: 0, count: 1100)
+            try await client.send(try client.peer.packet(.application, probe))
+            let reply = try #require(try await client.receiveOne(timeout: .seconds(2)))
+            #expect(reply.count >= 1100)
+            try client.peer.receive(reply)
+            #expect(client.peer.pathResponses == [[UInt8](repeating: 7, count: 8)])
+            // A probe is not a move: nothing is challenged, and the
+            // connection stays where it was.
+            #expect(client.peer.pathChallenges.isEmpty)
+            client.socket = home
+            #expect(try await client.get(0, "/user/stayed").text == "stayed")
+        }
+    }
+
+    @Test func aMoveNobodyAnswersFailsAndTheConnectionStays() throws {
+        try withServer(h3App()) { client, service in
+            try await client.connect()
+            let home = try client.move()
+            try await client.send(try client.peer.packet(.application, client.peer.ack(.application) + [0x01]))
+            _ = try #require(try await client.receiveOne(timeout: .seconds(2)))
+            // Past the deadline: about two seconds, six initial round trips.
+            try await Runtime.sleep(for: .milliseconds(2500))
+            client.socket = home
+            #expect(try await client.get(0, "/user/stayed").text == "stayed")
+            let connection = try #require(service.endpoints.first?.live.first)
+            #expect(connection.paths.isEmpty)
         }
     }
 

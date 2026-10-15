@@ -38,6 +38,10 @@ final class H3Connection {
     /// connection's datagrams are sent to and from.
     var peer: SocketAddress
     var local: SocketAddress?
+    /// Other addresses packets have come from, by the transport's path
+    /// identifier for each: where a move would go, or a probe came from.
+    var paths: [(id: Int, peer: SocketAddress, local: SocketAddress?)] = []
+    var nextPathID = 1
     let localCID: QUICConnectionID
     let originalDCID: QUICConnectionID
     /// On the endpoint's list of connections to look at.
@@ -99,6 +103,23 @@ final class H3Connection {
 
     var settings: HTTP3Limits { endpoint.settings }
 
+    /// The most other addresses remembered: the transport keeps fewer.
+    static let maxPaths = 8
+
+    /// The path identifier for `address`, and whether it was made now.
+    func path(for address: SocketAddress, local: SocketAddress?) -> (id: Int, made: Bool) {
+        if let known = paths.first(where: { $0.peer == address }) { return (known.id, false) }
+        if paths.count == H3Connection.maxPaths { paths.removeFirst() }
+        let id = nextPathID
+        nextPathID &+= 1
+        paths.append((id, address, local))
+        return (id, true)
+    }
+
+    func forgetPath(_ id: Int) {
+        paths.removeAll { $0.id == id }
+    }
+
     /// A connection error: CONNECTION_CLOSE with an HTTP/3 code.
     func fail(_ code: UInt64) {
         Log.debug("h3 connection error, code \(code)")
@@ -133,6 +154,17 @@ final class H3Connection {
                 quic.incomingDatagrams.removeAll(keepingCapacity: true)
             case .closed:
                 closeHTTP()
+            case .pathValidated:
+                // The peer has moved, and proved it: what is sent goes there
+                // now.
+                guard let moved = paths.first(where: { $0.id == Int(event.code) }) else { return }
+                let portOnly = moved.peer.host == peer.host
+                peer = moved.peer
+                local = moved.local
+                paths.removeAll()
+                quic.movedToValidatedPath(portOnly: portOnly)
+            case .pathFailed:
+                forgetPath(Int(event.code))
             }
         }
         if !quic.events.isEmpty { endpoint.touch(self) }
