@@ -220,6 +220,8 @@ final class QUICEndpoint: @unchecked Sendable {
     /// Shutdown has begun here: GOAWAY sent, no new connections.
     @exclusivity(unchecked) var stopping = false
     @exclusivity(unchecked) var stopDeadlineMs = UInt64.max
+    /// The grace period is over: every connection has been closed.
+    @exclusivity(unchecked) var forced = false
 
     init(app: CompiledApplication, limits: ConnectionLimits, pool: StreamPool,
          certificates: @escaping @Sendable () -> [CertificateKey]) {
@@ -310,13 +312,22 @@ final class QUICEndpoint: @unchecked Sendable {
             await flush(socket, nowMs: now)
             // After the flush: what was just sent set loss and probe timers.
             nextTimerMs = earliestTimer(nowMs: now)
-            if stopping && live.isEmpty { break }
+            if stopping && (live.isEmpty || forced && closesSent) { break }
         }
-        // Whatever is left -- only when the runtime is going away -- goes
-        // with it.
+        // Whatever is left -- connections draining past the grace period, or
+        // everything when the runtime is going away -- has its requests
+        // cancelled. The connections stay with the endpoint, which outlives
+        // any task still finishing with one of their streams.
         for connection in live { connection.abandon() }
-        live.removeAll()
         connections.removeAll()
+    }
+
+    /// Every connection left has sent its CONNECTION_CLOSE. Draining one
+    /// for three probe timeouts only answers a peer that missed the close,
+    /// and a peer that has gone quiet backs those timeouts off for longer
+    /// than shutdown has.
+    private var closesSent: Bool {
+        live.allSatisfy { $0.quic.isClosed || $0.quic.status == .closing && !$0.quic.hasOutput }
     }
 
     /// How long the socket may be waited on: until the earliest timer, and
@@ -431,9 +442,13 @@ final class QUICEndpoint: @unchecked Sendable {
             stopDeadlineMs = now &+ grace
             for connection in live { connection.goaway() }
         }
-        let late = now >= stopDeadlineMs
+        if now >= stopDeadlineMs {
+            // Once: the deadline is not waited for again.
+            forced = true
+            stopDeadlineMs = .max
+        }
         for connection in live where !connection.quic.isClosed {
-            connection.closeIfDone(force: late)
+            connection.closeIfDone(force: forced)
         }
     }
 
