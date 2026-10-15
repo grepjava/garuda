@@ -300,3 +300,23 @@ jobs:
           }
           EOF
           cd /tmp/consumer && swift build -c release
+
+  windows:
+    name: windows · build and unit tests
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          branch: swift-6.3.3-release
+          tag: 6.3.3-RELEASE
+
+      # One process, no shards: Runtime.sharded and the shared memory between
+      # shards are POSIX only. The tests that need what Windows lacks skip
+      # themselves and say why: compression, Vega having no zlib on Windows,
+      # and allocation counting, which hooks glibc's malloc.
+      - name: Build
+        run: swift build --build-tests
+
+      - name: Unit tests
+        run: swift test --skip-build
