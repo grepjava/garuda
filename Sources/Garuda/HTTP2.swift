@@ -329,6 +329,9 @@ final class H2Stream: @unchecked Sendable {
     @exclusivity(unchecked) var sent = 0
     @exclusivity(unchecked) var length = 0
     @exclusivity(unchecked) var grant = 0
+    /// A whole answer short of its declared length: reset after its last
+    /// bytes rather than ended. Set by `encodeHead` for every answer.
+    @exclusivity(unchecked) var short = false
 
     // A streamed body (StreamingResponse.swift). Under the connection's
     // lock, but for `ending`, which is the writer's.

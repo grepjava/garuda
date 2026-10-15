@@ -318,7 +318,7 @@ struct HTTP1Connection: ~Copyable {
         } else {
             // A handler's body is only sent when there is room for it to be
             // framed: never on HEAD, 1xx, 204 or 304.
-            writeResponse(keepAlive: keepAlive, omitBody: head.method == .head)
+            writeResponse(keepAlive: &keepAlive, omitBody: head.method == .head)
             if observing { report(status: x.pointee.status) }
             if largeBody > 0 {
                 let count = largeBody
@@ -533,17 +533,28 @@ struct HTTP1Connection: ~Copyable {
 
     // MARK: Writing
 
-    /// Writes the exchange's response into `output`.
-    mutating func writeResponse(keepAlive: Bool, omitBody: Bool) {
+    /// Writes the exchange's response into `output`. `keepAlive` turns false
+    /// when a body that disagrees with its declared length leaves the
+    /// connection unable to frame another.
+    mutating func writeResponse(keepAlive: inout Bool, omitBody: Bool) {
         // `Response.onSend` hooks see the answer once it is final, while it
         // can still change (ResponseHooks.swift).
         if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
         if x.pointee.touchedStream { cacheAnswer(x) }
         if x.pointee.compress && !x.pointee.noCompress { x.pointee.compressAnswer(omitBody: omitBody) }
-        let forbids = HTTPResponseWriter.statusForbidsBody(x.pointee.status)
-        let count = forbids ? 0 : x.pointee.responseBody.readableBytes
-        writeHTTP1Head(x, parts, keepAlive: keepAlive, framing: forbids ? .none : .length(count))
-        if count > 0 && !omitBody {
+        let framing = wholeFraming(x, omitBody: omitBody)
+        if framing.misframed {
+            // Bytes past the declared length would be read as the next
+            // response, and a body short of it leaves the client waiting for
+            // the rest: either way this is the last response the connection
+            // carries, and its close is what tells the client it is cut short.
+            keepAlive = false
+            x.pointee.keepAlive = false
+        }
+        writeHTTP1Head(x, parts, keepAlive: keepAlive,
+                       framing: framing.stated >= 0 ? .length(framing.stated) : .none)
+        let count = framing.sending
+        if count > 0 {
             // A large body is sent from where it is, after the head, rather
             // than copied behind it: a copy of a megabyte costs more than
             // the extra write.

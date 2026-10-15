@@ -295,9 +295,10 @@ extension H2Connection {
     }
 
     /// The DATA bytes `s`'s answer sends, once its `onSend` hooks have had
-    /// their say: none for a HEAD or a status that forbids a body.
+    /// their say: none for a HEAD or a status that forbids a body, and no
+    /// more than the handler's declared length.
     func prepareAnswer(_ s: H2Stream) -> Int {
-        Garuda.prepareAnswer(s.x)
+        Garuda.prepareAnswer(s.x).sending
     }
 
     /// Under the lock: takes the write role for `s`'s answer of `data`
@@ -329,7 +330,8 @@ extension H2Connection {
             var sent = 0
             while sent < s.length {
                 let n = min(s.length &- sent, frameSize)
-                frame(&wOut, n, .data, sent &+ n == s.length ? .endStream : [], s.id)
+                // A short body is not ended: `ended` resets it.
+                frame(&wOut, n, .data, sent &+ n == s.length && !s.short ? .endStream : [], s.id)
                 wOut.write(body + sent, n)
                 sent &+= n
             }
@@ -392,7 +394,6 @@ extension H2Connection {
         parts.pointee.dates.refresh()
         let status = x.pointee.status
         let forbids = HTTPResponseWriter.statusForbidsBody(status)
-        let count = forbids ? 0 : x.pointee.responseBody.readableBytes
         let streamed = s.streamed
         block.clear()
         encoder.encodeStatus(status, into: &block)
@@ -439,15 +440,24 @@ extension H2Connection {
             fieldCache.encode(encoder, name.base, name.count, value.count > 0 ? value.base : emptyBlock, value.count,
                               into: &block)
         }
-        if streamed {
-            // Its length is known only when the handler said it.
-            if !forbids && s.declared >= 0 { encodeContentLength(s.declared, into: &block) }
-        } else if !forbids {
-            encodeContentLength(count, into: &block)
-        }
         // A HEAD answer carries the GET's headers and none of its body.
-        let hasData = (streamed ? !forbids : count > 0) && x.pointee.head.method != .head
-        writeHeaderBlock(&block, stream: s.id, endStream: !hasData, frameSize: frameSize, into: &out)
+        let head = x.pointee.head.method == .head
+        let count: Int
+        if streamed {
+            // Its length is known only when the handler said it, and
+            // `startStream` has already settled whether it is said.
+            if s.declared >= 0 { encodeContentLength(s.declared, into: &block) }
+            count = 0
+            s.short = false
+        } else {
+            let framing = wholeFraming(x, omitBody: head)
+            if framing.stated >= 0 { encodeContentLength(framing.stated, into: &block) }
+            count = framing.sending
+            s.short = framing.short
+        }
+        let hasData = streamed ? !forbids && !head : count > 0
+        // A short answer with nothing to send still must not end cleanly.
+        writeHeaderBlock(&block, stream: s.id, endStream: !hasData && !s.short, frameSize: frameSize, into: &out)
         if observing { reportAnswer(x, limits: limits, status: status) }
         if hasData {
             s.sent = 0
@@ -537,7 +547,7 @@ extension H2Connection {
                 let body = UnsafePointer(s.x.pointee.responseBody.readPointer)
                 while grant > 0 {
                     let n = min(grant, frameSize)
-                    let end = last && s.sent + n == s.length
+                    let end = last && s.sent + n == s.length && !s.short
                     frame(&out, n, .data, end ? .endStream : [], s.id)
                     out.write(body + s.sent, n)
                     s.sent += n
@@ -578,24 +588,31 @@ extension H2Connection {
         s.ending = s.bodyEnded
     }
 
-    /// After a stream's END_STREAM: the reset a 413 asks for.
+    /// After a stream's END_STREAM: the reset a 413 asks for. Or in place of
+    /// it, for an answer short of its declared length: ending that stream
+    /// would tell the client the truncated body was all of it.
     func ended(_ s: H2Stream, into out: inout ByteBuffer) {
+        if s.short {
+            frame(&out, 4, .rstStream, [], s.id)
+            HTTP2.writeUInt32(H2Error.internalError.rawValue, into: &out)
+            return
+        }
         guard let code = s.resetAfter else { return }
         frame(&out, 4, .rstStream, [], s.id)
         HTTP2.writeUInt32(code.rawValue, into: &out)
     }
 }
 
-/// The body bytes `x`'s whole answer sends, once its `onSend` hooks have
-/// had their say, the response cache its copy, and --compress its turn:
-/// none for a HEAD or a status that forbids a body. HTTP/2's and HTTP/3's.
-func prepareAnswer(_ x: UnsafeMutablePointer<Exchange>) -> Int {
+/// How `x`'s whole answer is framed, once its `onSend` hooks have had their
+/// say, the response cache its copy, and --compress its turn: no body for a
+/// HEAD or a status that forbids one, and none past the handler's declared
+/// length. HTTP/2's and HTTP/3's.
+func prepareAnswer(_ x: UnsafeMutablePointer<Exchange>) -> WholeFraming {
     if !x.pointee.sendHooks.isEmpty { runSendHooks(x) }
     if x.pointee.touchedStream { cacheAnswer(x) }
     if x.pointee.compress && !x.pointee.noCompress {
         x.pointee.compressAnswer(omitBody: x.pointee.head.method == .head)
     }
     x.pointee.committed = true
-    if HTTPResponseWriter.statusForbidsBody(x.pointee.status) || x.pointee.head.method == .head { return 0 }
-    return x.pointee.responseBody.readableBytes
+    return wholeFraming(x, omitBody: x.pointee.head.method == .head)
 }
