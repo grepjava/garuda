@@ -40,7 +40,7 @@ let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].ma
 /// to the same checkout as GARUDA_VEGA_PATH.
 let vegaDBPackage: Package.Dependency = Context.environment["GARUDA_VEGA_DB_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.2.3"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.2.4"), traits: vegaTraits)
 
 /// A module of vega-db.
 func vegaDB(_ name: String) -> Target.Dependency {
