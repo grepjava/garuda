@@ -24,6 +24,15 @@ struct ConnectionParts: ~Copyable {
     var output: ByteBuffer
     var dates = DateCache()
     let exchange: UnsafeMutablePointer<Exchange>
+    /// --request-start-header: what the kernel said of when the bytes of
+    /// the read that began a request arrived, filled by that read. Its own
+    /// allocation, made with the parts, because it must not move while the
+    /// read waits and a pointer into these parts cannot be formed.
+    let arrival: UnsafeMutablePointer<ReadArrival>
+    /// When the request at the start of `input` arrived, in wall-clock
+    /// microseconds, or 0 when no read has begun one since the last was
+    /// served: a pipelined request was waiting before it was looked at.
+    var arrived: UInt64 = 0
 
     init(limits: ConnectionLimits, peer: SocketPeer) {
         input = IOBuffer(capacity: limits.readBufferSize)
@@ -31,6 +40,8 @@ struct ConnectionParts: ~Copyable {
         output.reserve(4096)
         exchange = .allocate(capacity: 1)
         exchange.initialize(to: Exchange(maxHeaders: limits.maxHeaders, remote: peer))
+        arrival = .allocate(capacity: 1)
+        arrival.initialize(to: ReadArrival())
     }
 
     deinit {
@@ -38,6 +49,7 @@ struct ConnectionParts: ~Copyable {
         output.destroy()
         exchange.deinitialize(count: 1)
         exchange.deallocate()
+        arrival.deallocate()
     }
 }
 
@@ -112,6 +124,7 @@ final class ConnectionCache: @unchecked Sendable {
         }
         p.pointee.input.clear()
         p.pointee.output.clear()
+        p.pointee.arrived = 0
         p.pointee.exchange.pointee.reset()
         lists[w * ConnectionCache.depth + counts[w]] = p
         counts[w] += 1

@@ -115,6 +115,24 @@ struct ConnectionLimits: Sendable {
     }
 }
 
+/// Reads the first bytes of a request, for --request-start-header, and
+/// notes in `parts.arrived` when they arrived. On a plaintext TCP stream
+/// the read is a recvmsg that hands over the kernel's receive time with the
+/// bytes (the listener has `receiveTimestamps`), which no clock read after
+/// it can know: the request may have queued behind a busy thread, or in
+/// the accept queue, for any time before this read was made. Elsewhere the
+/// time it was read is the best there is.
+func readArrival<S: AsyncReader & ~Copyable>(
+    _ stream: borrowing S, _ parts: UnsafeMutablePointer<ConnectionParts>, timeout: Duration
+) async throws(IOError) -> Int {
+    let arrival = parts.pointee.arrival
+    let n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+        try await stream.read(into: &parts.pointee.input, arrival: arrival)
+    }
+    if n > 0 { parts.pointee.arrived = arrival.pointee.microseconds ?? wallClockMicros() }
+    return n
+}
+
 /// Header fields the server adds to an answer, worked out once.
 final class ServerFields: Sendable {
     /// `h3=":443"; ma=86400`, or nil.
@@ -257,10 +275,14 @@ struct HTTP1Connection: ~Copyable {
         _ stream: borrowing S, app: CompiledApplication
     ) async throws -> Bool {
         x.pointee.reset()
-        if limits.requestStart { x.pointee.requestStart = 0 }
         guard try await readHead(stream) else { return false }
-        // Pipelined: its bytes were here before it was looked at.
-        if limits.requestStart && x.pointee.requestStart == 0 { x.pointee.requestStart = wallClockMicros() }
+        if limits.requestStart {
+            // Stamped by the read its first bytes came in, here or while the
+            // protocol was being found (`opening`). A pipelined request has
+            // none: its bytes were here before it was looked at.
+            x.pointee.requestStart = parts.pointee.arrived != 0 ? parts.pointee.arrived : wallClockMicros()
+            parts.pointee.arrived = 0
+        }
         if let root = app.rootPath { stripRootPath(x, root) }
 
         let head = x.pointee.head
@@ -404,12 +426,15 @@ struct HTTP1Connection: ~Copyable {
             }
             makeRoom(for: limits.maxHeadSize)
             let timeout = available == 0 ? limits.keepAliveTimeout : limits.requestHeadTimeout
-            let n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
-                try await stream.read(into: &parts.pointee.input)
+            let n: Int
+            if available == 0 && limits.requestStart {
+                n = try await readArrival(stream, parts, timeout: timeout)
+            } else {
+                n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+                    try await stream.read(into: &parts.pointee.input)
+                }
             }
             if n == 0 { return false }
-            // The request's first bytes: when it arrived.
-            if available == 0 && limits.requestStart { x.pointee.requestStart = wallClockMicros() }
         }
     }
 

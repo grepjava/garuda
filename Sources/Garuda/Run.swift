@@ -274,7 +274,16 @@ extension Application {
                 let accepting = config.serverConfiguration(acceptors: acceptors)
                 var servers: [TCPServer] = []
                 for _ in 0..<acceptors {
-                    servers.append(try TCPServer.serve(try listening.main(), configuration: accepting) { stream in
+                    let listener = try listening.main()
+                    if limits.requestStart && tls == nil {
+                        // The kernel stamps what arrives, and the connections
+                        // accepted inherit it, so the read that begins a
+                        // request can say when it arrived (HTTP1.swift's
+                        // readArrival). Over TLS the reads are of decrypted
+                        // bytes, which carry no stamp.
+                        try? listener.setOption(.receiveTimestamps, to: true)
+                    }
+                    servers.append(try TCPServer.serve(listener, configuration: accepting) { stream in
                         guard let tls else {
                             return await serveTCP(stream, app: app, limits: limits, http2: http2)
                         }
