@@ -1,0 +1,2 @@
+db        garuda               30169 req/s   p50    1.946   p95    3.136   p99     3.346 ms   cpu    92 us/req   mem    20 MiB   errors 0
+7 s

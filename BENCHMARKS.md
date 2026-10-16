@@ -296,7 +296,13 @@ request). The last column gives each server's lowest and highest round.
 | stream | **37,707** (2.17; 92) | 36,900 (2.06; 88) | 31,560 (2.40; 83) | -2.1% | +16.9% | 37.5-37.9k / 35.9-37.0k / 31.3-31.8k |
 | download | **2,094** (55.2; 1,640) | 2,083 (43.6; 1,767) | 2,089 (41.8; 1,772) | -0.5% | -0.3% | 2.08-2.58k / 2.08-2.09k / 2.08-2.10k |
 | upload | 2,037 (104; 1,976) | **2,180** (59.0; 1,726) | 1,366 (90.4; 2,942) | +7.0% | +59.6% | 2.02-2.04k / 2.17-2.19k / 1.35-1.37k |
-| db | 30,132 (3.21; 93) | 28,686 (5.16; 98) | **32,631** (3.04; 78) | -4.8% | -12.1% | 30.0-30.3k / 28.6-28.8k / 32.5-32.8k |
+| db | 30,209 (3.36; 92) | 29,227 (5.12; 95) | **32,640** (3.03; 78) | -3.3% | -10.5% | 30.1-30.3k / 29.1-29.3k / 32.6-32.8k |
+
+The `db` row was taken again after vega-db 0.2.4 (Garuda 2 at `cefe899`), six
+more rotated rounds of `db` alone
+([workloads/db-vega-db-0.2.4](benchmarks/results/2.0.0/workloads/db-vega-db-0.2.4)).
+On vega-db 0.2.3 the same row read 30,132 / 28,686 / 32,631, Garuda 2 at 98 us
+a request: -4.8% against Garuda 1 and -12.1% against axum.
 
 What the table shows:
 
@@ -304,7 +310,7 @@ What the table shows:
   on `user`, `json`, `h2`, `upload`, `skew` and `spike`, with a lower p99
   on each, and serves 570 of the slow requests a second to Garuda 1's 638
   on the slow side. `churn`, `stream` and `download` are within 2.1%, which is
-  inside what single rounds move by. It trails only on `db`, by 4.8%.
+  inside what single rounds move by. It trails only on `db`, by 3.3%.
 - **`skew` and `spike` are where Garuda 2 gained most.** A slow handler runs
   in the heavy lane, and the lane now keeps two slow handlers off the
   hyperthreads of one core while another core runs none. Before that, the
@@ -320,11 +326,19 @@ What the table shows:
   with a p99 of 9.4 ms. In exchange it serves the most slow requests, 1,108
   a second. `spawn_blocking` would change both figures. The application is
   written as documented, so it stays as it is.
-- **`db` is the gap that is left.** axum leads both Garudas, at 78 us of
-  CPU a request against Garuda 1's 93 and Garuda 2's 98. Garuda 2 profiles
-  much like Garuda 1 here, kernel and user time alike, so the difference is
-  the per-request cost that also shows in the hello-world `pinned` pass
-  below, together with vega-db's driver and pool.
+- **`db` is the gap that is left, and it is the server's CPU.** PostgreSQL
+  runs on all eight CPUs, beside the server and oha, and spends about 160
+  us a query for every one of the three servers alike, so the box is full
+  and what a server spends itself comes off its throughput. axum spends 78
+  us a request, Garuda 1 92 and Garuda 2 95. The kernel's share is about the
+  same for all three (46-49 us); the difference is user time, 31 us for
+  axum's tokio-postgres against 43 and 49 for the Garudas. vega-db 0.2.4
+  took out what was Garuda 2's alone: two `poll` calls a query (the pool
+  probing the socket of a connection the server had just answered) and
+  three locks every worker shared, the pool's idle stack and two type
+  caches, each a futex call when contended. What remains is the per-request
+  cost of running a request as Swift tasks, which the hello-world `pinned`
+  pass below shows too.
 - **`churn` measures oha, not the servers.** All three read 24.8-25.3k in
   every round. The difference shows in CPU instead: a new connection costs
   Garuda 1 60 us, Garuda 2 90 and axum 140.

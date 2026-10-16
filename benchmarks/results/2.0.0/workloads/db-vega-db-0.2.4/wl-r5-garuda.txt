@@ -1,0 +1,2 @@
+db        garuda               30222 req/s   p50    2.052   p95    2.844   p99     3.150 ms   cpu    92 us/req   mem    20 MiB   errors 0
+7 s

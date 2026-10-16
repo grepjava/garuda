@@ -1,0 +1,2 @@
+db        garuda               30093 req/s   p50    2.062   p95    2.891   p99     3.201 ms   cpu    93 us/req   mem    20 MiB   errors 0
+7 s
