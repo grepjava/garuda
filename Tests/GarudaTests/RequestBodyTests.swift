@@ -144,6 +144,52 @@ struct RequestBodyTests {
         #expect(seen.ending == "incomplete")
     }
 
+    /// A cancelled body -- an upload another request superseded -- hands
+    /// over what had arrived before it throws, and the handler's task is not
+    /// cancelled with it: the handler can still store those bytes.
+    @Test func aCancelledBodyHandsOverWhatArrivedAndLeavesTheTaskRunning() throws {
+        let seen = Seen()
+        let stillRunning = Mutex<Bool?>(nil)
+        let app = Application()
+        app.onStreamingBody(.post, "/cancel") { request, response, body in
+            if request.query.contains("wait=1") {
+                // Cancelled from elsewhere while the read waits on the client.
+                Runtime.spawn {
+                    try? await Runtime.sleep(for: .milliseconds(100))
+                    body.cancel()
+                }
+            } else {
+                body.cancel()
+            }
+            var buffer = IOBuffer(capacity: 64 * 1024)
+            do {
+                while try await body.read(into: &buffer) > 0 {
+                    seen.add(buffer.count)
+                    buffer.clear()
+                }
+                seen.end("end")
+            } catch {
+                stillRunning.withLock { $0 = !Task.isCancelled }
+                seen.end("\(error)")
+            }
+            response.send("\(seen.bytes)")
+        }
+        for path in ["/cancel", "/cancel?wait=1"] {
+            seen.state.withLock { $0 = (0, nil) }
+            stillRunning.withLock { $0 = nil }
+            // 400 of the 1000 bytes, and the connection left open: the rest
+            // never comes.
+            let connection = try app.test.http2(handshake: false)
+            let head = "POST \(path) HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n"
+            try connection.send(raw: Array(head.utf8) + pattern(400))
+            seen.wait { $1 != nil }
+            #expect(seen.bytes == 400, "what arrived was handed over (\(path))")
+            #expect(seen.ending == "incomplete")
+            #expect(stillRunning.withLock { $0 } == true, "the handler's task was not cancelled (\(path))")
+            connection.close()
+        }
+    }
+
     @Test func aBodyLeftUnreadDoesNotCostTheConnectionWhenItHasArrived() throws {
         let app = Application()
         app.onStreamingBody(.post, "/ignore") { _, response, _ in

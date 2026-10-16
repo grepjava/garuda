@@ -225,8 +225,12 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
     // What another task may touch, under `lock`.
     private let lock = Mutex<Void>(())
     private var cancelled = false
-    /// The connection's task while the handler runs, for `cancel`.
-    private var task: UnsafeCurrentTask?
+    /// Ends a read waiting on the client, for `cancel`. Not the task: a
+    /// cancelled task could not store what it had been given -- a file
+    /// write on io_uring fails at once with ECANCELED.
+    private let wake = IODeadlineTrigger()
+    /// The handler is running, between the two `attach` calls.
+    private var running = false
 
     // The connection task's.
     private var held: HeldStream?
@@ -275,10 +279,8 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
 
     /// The handler is about to run in the current task, or has returned.
     func attach(_ running: Bool) {
-        if running {
-            withUnsafeCurrentTask { current in lock.withLock { _ in task = current } }
-        } else {
-            lock.withLock { _ in task = nil }
+        lock.withLock { _ in self.running = running }
+        if !running {
             held = nil
             reader = nil
         }
@@ -308,23 +310,28 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
     }
 
     override func cancel(_ generation: UInt64) {
-        lock.withLock { _ in
-            guard self.generation.load(ordering: .relaxed) == generation, !cancelled else { return }
+        let waking = lock.withLock { _ -> Bool in
+            guard self.generation.load(ordering: .relaxed) == generation, !cancelled else { return false }
             cancelled = true
-            // The handler may be waiting on the client, which has gone quiet:
-            // the wait is ended by ending the connection's task, which ends
-            // the connection.
-            task?.cancel()
+            return running
         }
+        // The handler may be waiting on the client, which has gone quiet: the
+        // wait ends as if its deadline had passed, and the connection, broken,
+        // closes once the handler returns. A handler busy with anything else
+        // finds out at its next read. Only while it runs: a fire nobody takes
+        // is kept for the next read, which would be the next request's.
+        if waking { wake.fire() }
     }
 
     override func read(into buffer: inout IOBuffer) async throws(RequestBodyError) -> Int {
         while true {
             if let failure { throw failure }
-            if lock.withLock({ _ in cancelled }) { throw fail(.incomplete) }
             if ended { return 0 }
+            // What arrived before the request was cancelled is handed over
+            // first, as when the client goes: a superseded upload keeps it.
             let n = try take(into: &buffer)
             if n > 0 || ended { return n }
+            if lock.withLock({ _ in cancelled }) { throw fail(.incomplete) }
             try await fill()
         }
     }
@@ -384,7 +391,7 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
             continueOwed = false
             let line: StaticString = "HTTP/1.1 100 Continue\r\n\r\n"
             do {
-                try await Runtime.withIODeadline(writeTimeout) { () async throws(IOError) -> Void in
+                try await Runtime.withIODeadline(writeTimeout, trigger: wake) { () async throws(IOError) -> Void in
                     try await held.write(UnsafeRawBufferPointer(start: line.utf8Start, count: line.utf8CodeUnitCount))
                 }
             } catch {
@@ -404,7 +411,7 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
         }
         let n: Int
         do {
-            n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+            n = try await Runtime.withIODeadline(timeout, trigger: wake) { () async throws(IOError) -> Int in
                 try await reader.read(held.pointer, into: &parts.pointee.input)
             }
         } catch {
