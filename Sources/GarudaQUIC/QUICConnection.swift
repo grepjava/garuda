@@ -750,7 +750,11 @@ public final class QUICConnection {
             close(QUICError.streamStateError.rawValue)
             return false
         }
-        guard let stream = openOrFind(id) else { return false }
+        // A stream already retired: its bytes arrived before, and this is a
+        // retransmission (RFC 9000 section 3.2). Ignored, not the packet: a
+        // packet left unacknowledged is sent again with the frame in it, and
+        // whatever shares it never arrives either.
+        guard let stream = openOrFind(id) else { return true }
 
         // Connection-level flow control counts the highest offset seen on
         // every stream, not the bytes delivered: a peer cannot evade the limit
@@ -794,7 +798,9 @@ public final class QUICConnection {
             close(QUICError.streamStateError.rawValue)
             return false
         }
-        guard let stream = openOrFind(id) else { return false }
+        // Retired: the stream had ended already, and the peer's reset of it --
+        // its answer to our STOP_SENDING, most often -- changes nothing.
+        guard let stream = openOrFind(id) else { return true }
         if let known = stream.receive.finalSize, known != finalSize {
             close(QUICError.finalSizeError.rawValue)
             return false
@@ -830,7 +836,8 @@ public final class QUICConnection {
             close(QUICError.streamStateError.rawValue)
             return false
         }
-        guard let stream = openOrFind(id) else { return false }
+        // Retired: everything we had to send on it was sent and acknowledged.
+        guard let stream = openOrFind(id) else { return true }
         stream.stopSending = code
         if stream.send.resetCode == nil {
             stream.send.resetCode = code

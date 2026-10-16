@@ -131,3 +131,52 @@ func quicHandshakeRefusesUnknownSuite() throws {
     #expect(server.status == .closing)
     #expect(server.closeError == quicCryptoError(TLSAlert.handshakeFailure))
 }
+
+@Test("frames for a stream the server has retired are ignored, and the packets carrying them still count")
+func quicRetiredStreamFramesAreIgnored() throws {
+    let identity = try TLSIdentity.selfSigned(names: ["localhost"])
+    let certificate = try CertificateKey(chainPEM: identity.certificateChain, keyPEM: identity.privateKey)
+    let config = QUICServerConfig(certKey: certificate, alpn: [Array("h3".utf8)])
+    let client = try QUICTestPeer()
+    var now: UInt64 = 1_000
+    let first = try client.packet(.initial, cryptoFrame(offset: 0, client.clientHello(serverName: "localhost",
+                                                                                      alpn: ["h3"])))
+    let header = first.withUnsafeBufferPointer {
+        QUICPacket.parseHeader($0.baseAddress!, $0.count, localCIDLength: quicLocalCIDLength)
+    }
+    let server = try #require(QUICConnection(config: config, version: header.version,
+                                             clientDCID: header.dcid, clientSCID: header.scid,
+                                             localCID: QUICConnectionID.random(), nowMs: now))
+    deliver(first, to: server, nowMs: now)
+    for datagram in drain(server, nowMs: now) { try client.receive(datagram) }
+    now += 10
+    deliver(try client.finishedPacket(), to: server, nowMs: now)
+    #expect(server.status == .connected)
+    _ = server.takeEvents()
+
+    // Stream 0 asked and answered, the answer acknowledged, and the stream
+    // let go of: the server forgets it.
+    now += 10
+    deliver(try client.packet(.application, client.ack(.application) + streamFrame(0, [1, 2, 3], fin: true)),
+            to: server, nowMs: now)
+    [UInt8](repeating: 4, count: 3).withUnsafeBufferPointer { server.send(0, $0.baseAddress!, $0.count, fin: true) }
+    for datagram in drain(server, nowMs: now) { try client.receive(datagram) }
+    #expect(client.finished.contains(0))
+    now += 10
+    deliver(try client.packet(.application, client.ack(.application)), to: server, nowMs: now)
+    server.releaseStream(0)
+    #expect(server.stream(0) == nil)
+    _ = server.takeEvents()
+
+    // The client, not having heard its packets were acknowledged, sends
+    // stream 0's bytes again, and resets it, beside a new request each time.
+    // Neither old frame may cost the packet it shares.
+    for (old, id) in [(streamFrame(0, [1, 2, 3], fin: true), UInt64(4)),
+                      (resetStreamFrame(0, code: 0x10c, finalSize: 3), UInt64(8))] {
+        now += 10
+        deliver(try client.packet(.application, old + streamFrame(id, [5], fin: true)), to: server, nowMs: now)
+        #expect(server.status == .connected)
+        #expect(server.acceptedNewPacket, "the packet with a frame for a retired stream is taken")
+        #expect(server.takeEvents().contains { $0.kind == .streamReadable && $0.streamID == id })
+    }
+}
