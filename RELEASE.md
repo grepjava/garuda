@@ -89,11 +89,14 @@ resolves to 2.0.
 
 It needs Swift 6.2 or newer, and runs on Linux and on macOS 26.4 or newer
 (Vega's floor; Garuda 1 ran on macOS 15). Windows is experimental. It depends
-on Vega 0.4.6 and vega-db 0.2.3, and no longer on aviancore.
+on Vega 0.4.10 and vega-db 0.2.3, and no longer on aviancore.
 
-Benchmarks ([BENCHMARKS.md](BENCHMARKS.md#garuda-200), 4 alternating rounds on a clock-capped box), against
-Garuda 1.1: `user` +2%, `json` +6%, `h2` +3%, `upload` +7%; `stream` -28%, `download` -14%, `skew`/`spike`
--10%/-14%, `db` -6%. HTTP/3 does 137k req/s at 8 streams a connection, level with HTTP/2 and 1.8x Garuda 1.
+Benchmarks ([BENCHMARKS.md](BENCHMARKS.md#garuda-200), six rotated rounds on a clock-capped box,
+Garuda 1.1 and axum 0.8 alongside). Against Garuda 1.1: `skew` +41%, `spike` +34%, `json` +9%,
+`upload` +7%, `h2` +3%, `user` +2%; `churn`, `stream` and `download` level (within 2%); `db` -5%.
+Against axum: ahead on every workload but `db` (-12%) and `download` (level). HTTP/3 does 138k req/s
+at 8 streams a connection, level with HTTP/2 and 1.8x Garuda 1. Hello world: +6% closed against
+Garuda 1, -2% on the ramp, -5% on one pinned thread; +17% to +45% against axum.
 
 ### Process model
 

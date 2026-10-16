@@ -1,7 +1,0 @@
-ramp    axum       132283 req/s   p50 1189.376 ms   p99  4610.048 ms   errors 0
-ramp    garuda     122241 req/s   p50 1202.688 ms   p99  4724.736 ms   errors 0
-closed  axum       121903 req/s   p50    0.476 ms   p99     1.362 ms   errors 0
-closed  garuda     107521 req/s   p50    0.304 ms   p99     3.949 ms   errors 0
-pinned  axum        76433 req/s   p50    0.849 ms   p99     1.041 ms   errors 0
-pinned  garuda      83136 req/s   p50    0.764 ms   p99     0.938 ms   errors 0
-98 s
