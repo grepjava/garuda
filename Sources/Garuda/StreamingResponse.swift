@@ -375,8 +375,7 @@ final class BodyChannel: @unchecked Sendable {
     /// A writer is taking the queue out, and this much is in its hands.
     private var flushing = false
     private var inFlight = 0
-    /// A flush is on its way to take the queue out and has not begun: asked
-    /// for at the end of the handler's job, or spawned.
+    /// A flush is spawned to take the queue out and has not begun.
     private var flushSpawned = false
     /// The handler has returned and the connection has the stream back:
     /// a spawned flush that begins now takes nothing.
@@ -606,18 +605,10 @@ final class BodyChannel: @unchecked Sendable {
     }
 
     /// Over HTTP/1, a write that leaves the backlog under the high-water
-    /// mark: true when it may return without writing, the queue to be taken
-    /// out once this task waits or returns, unless a flush is already on its
-    /// way. The handler's run of writes then goes in one system call rather
-    /// than one each.
-    ///
-    /// When the handler's job returns, `jobEnded` looks: a handler that
-    /// returned has left the queue to the connection, which sends it with
-    /// its own output, and only one that went off to wait on something else
-    /// needs a flush of its own. Spawned at the first write instead, as it
-    /// once was, the flush cost every streamed answer a task, and nearly
-    /// always found nothing to take; on a runtime of several threads another
-    /// worker could take it up and contend with the handler for the lock.
+    /// mark: true when it may return without writing, a flush spawned to
+    /// take the queue out once this task waits or returns, unless one is
+    /// already on its way. The handler's run of writes then goes in one
+    /// system call rather than one each.
     private func deferFlush(_ runtime: Runtime) -> Bool {
         let spawn = lock.withLock { _ -> Bool? in
             guard state == .open, !detached, pending.readableBytes &+ inFlight <= high else { return nil }
@@ -627,16 +618,13 @@ final class BodyChannel: @unchecked Sendable {
             return true
         }
         guard let spawn else { return false }
-        if spawn && !Runtime.afterJob(self) { spawnFlush(runtime) }
-        return true
-    }
-
-    /// A task taking the queue out.
-    private func spawnFlush(_ runtime: Runtime) {
-        runtime.spawn { [self] in
-            lock.withLock { _ in flushSpawned = false }
-            _ = await drain()
+        if spawn {
+            runtime.spawn { [self] in
+                lock.withLock { _ in flushSpawned = false }
+                _ = await drain()
+            }
         }
+        return true
     }
 
     private enum Drain { case done, busy, failed }
@@ -1071,26 +1059,6 @@ final class BodyChannel: @unchecked Sendable {
 }
 
 // What a streamed body is held to, from the config.
-extension BodyChannel: JobEndAction {
-    /// The job that queued the first write has returned (`deferFlush`).
-    func jobEnded() {
-        let flush = lock.withLock { _ -> Bool in
-            // Returned, and the connection has the queue; or a writer, or a
-            // failure, got there first.
-            guard state != .failed, !detached, !flushing, pending.readableBytes > 0 else {
-                flushSpawned = false
-                return false
-            }
-            return true
-        }
-        if flush, let runtime {
-            spawnFlush(runtime)
-        } else if flush {
-            lock.withLock { _ in flushSpawned = false }
-        }
-    }
-}
-
 struct StreamLimits {
     var writeTimeout: Duration
     var high: Int
