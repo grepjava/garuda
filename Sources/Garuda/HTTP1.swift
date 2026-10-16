@@ -639,7 +639,16 @@ struct HTTP1Connection: ~Copyable {
         try await Runtime.withWriteStallTimeout(limits.writeTimeout) { () async throws(IOError) in
             try await stream.write(bytes)
         }
-        parts.pointee.output.clear()
+        if parts.pointee.output.allocatedCapacity > limits.readBufferSize * 4 {
+            // One large answer -- a streamed body goes out of this buffer --
+            // does not keep an oversized buffer on the connection, as Garuda
+            // 1's did not: kept on each of many connections, it is memory the
+            // cache has lost by the next answer, where one freed is handed
+            // out again by the allocator while it is still in cache.
+            parts.pointee.output.destroy()
+        } else {
+            parts.pointee.output.clear()
+        }
     }
 
     /// Answers `status` to a request that cannot be read, and closes.
