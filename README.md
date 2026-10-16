@@ -85,9 +85,10 @@ kernel TLS, `multipart/byteranges`, and reads from Redis replicas.
 [What Garuda 2 does not have](COMPATIBILITY.md#what-garuda-2-does-not-have)
 lists what Garuda 1 had.
 
-[BENCHMARKS.md](BENCHMARKS.md) has the benchmark method and the
-[Garuda 2.0.0 results](BENCHMARKS.md#garuda-200), measured against Garuda 1.1
-and axum on the same clock-capped machine.
+[BENCHMARKS.md](BENCHMARKS.md) has the benchmark method and
+[Garuda 2 against Garuda 1 and axum](BENCHMARKS.md#garuda-2-against-garuda-1-and-axum),
+measured on the same clock-capped machine, with links to the code each server
+runs.
 
 ## Quick start
 

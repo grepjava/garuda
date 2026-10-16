@@ -10,6 +10,72 @@ Hummingbird and Vapor on Swift, all from
 Every server but Garuda runs that suite's own application, built as the suite
 builds it, under the suite's load command.
 
+## Garuda 2 against Garuda 1 and axum
+
+The 2.0.0 run, in brief: one i5-8250U with its clock capped at 2.4 GHz, the
+server on four CPUs and the load on the other four, and the servers taking
+turns to go first. Each figure is the median requests a second over the
+rounds. The [full record](#garuda-200) adds p99, CPU a request, every round's
+range and what each row means; the raw logs are in
+[benchmarks/results/2.0.0](benchmarks/results/2.0.0).
+
+**Requests that do work** -- 64 connections, six rounds:
+
+| workload | Garuda 1.1 | Garuda 2.0 | axum 0.8 | 2.0 against 1.1 | 2.0 against axum |
+|---|---:|---:|---:|---:|---:|
+| user | 137,754 | **140,472** | 128,550 | +2.0% | +9.3% |
+| json | 112,920 | **122,978** | 103,597 | +8.9% | +18.7% |
+| churn | **25,288** | 25,058 | 24,860 | -0.9% | +0.8% |
+| skew | 88,166 | **124,506** | 11,838 | +41.2% | +952% |
+| skew, slow side | 638 | 570 | **1,108** | -10.6% | -48.5% |
+| spike | 94,938 | **127,063** | 34,806 | +33.8% | +265% |
+| h2 | 93,514 | **95,870** | 94,123 | +2.5% | +1.9% |
+| stream | **37,707** | 36,900 | 31,560 | -2.1% | +16.9% |
+| download | **2,094** | 2,083 | 2,089 | -0.5% | -0.3% |
+| upload | 2,037 | **2,180** | 1,366 | +7.0% | +59.6% |
+| db | 30,209 | 29,227 | **32,640** | -3.3% | -10.5% |
+
+**Hello world** (`GET /`, empty body) -- `vs-axum.sh`, four rounds with each
+Garuda, eight with axum:
+
+| pass | Garuda 1.1 | Garuda 2.0 | axum 0.8 | 2.0 against 1.1 | 2.0 against axum |
+|---|---:|---:|---:|---:|---:|
+| ramp (zrk, open loop to 500k/s) | **205,438** | 200,934 | 138,602 | -2.2% | +45.0% |
+| closed (oha, 64 connections) | 143,088 | **151,691** | 121,565 | +6.0% | +24.8% |
+| pinned (one thread each) | **93,650** | 89,207 | 76,432 | -4.7% | +16.7% |
+
+**HTTP/3** -- `GET /user/12345` over HTTPS, 64 connections, four rounds.
+axum's application serves no HTTP/3, so this is the two Garudas:
+
+| protocol | Garuda 1.1 | Garuda 2.0 | 2.0 against 1.1 |
+|---|---:|---:|---:|
+| HTTPS/1.1 | 107,450 | **112,776** | +5.0% |
+| HTTP/2, a stream a connection | 70,078 | **71,668** | +2.3% |
+| HTTP/3, a stream a connection | 48,283 | **50,134** | +3.8% |
+| HTTP/2, 8 streams a connection | 127,332 | **138,804** | +9.0% |
+| HTTP/3, 8 streams a connection | 76,952 | **137,717** | +79.0% |
+
+axum's `skew` and `spike` are its application computing `/spin` in an async
+handler, as axum's documentation writes one: a slow request holds the Tokio
+worker its connection is on. That is also why it serves the most slow
+requests. [The full record](#garuda-200) says more about this and the `db` row.
+
+**The code.** Each server answers the same requests with the same bytes:
+
+| what | Garuda 1.1 | Garuda 2.0 | axum 0.8 |
+|---|---|---|---|
+| requests that do work, and HTTP/3 | [workloads/garuda-app](https://github.com/grepjava/garuda/blob/cbad05b/benchmarks/workloads/garuda-app/Sources/workloads/main.swift) at `release/1.x` | [garuda-server/main.swift](Sources/garuda-server/main.swift), the `garuda` executable | [workloads/axum](benchmarks/workloads/axum/src/main.rs), with tokio-postgres and deadpool |
+| hello world | [garuda-server/main.swift](https://github.com/grepjava/garuda/blob/cbad05b/Sources/garuda-server/main.swift) at `release/1.x` | [garuda-server/main.swift](Sources/garuda-server/main.swift) | [benchmarks/axum](benchmarks/axum/src/main.rs), the-benchmarker's `rust/axum` entry |
+
+What drives them:
+
+| script | what it runs |
+|---|---|
+| [benchmarks/workloads.sh](benchmarks/workloads.sh) | the requests that do work: checks each answer, then closed-loop oha |
+| [benchmarks/vs-axum.sh](benchmarks/vs-axum.sh), over [benchmarks/frameworks.sh](benchmarks/frameworks.sh) | hello world: the ramp, closed and pinned passes |
+| [drivers/h3.sh](benchmarks/results/2.0.0/drivers/h3.sh) | HTTP/3 and its HTTPS/1.1 and HTTP/2 rows |
+| [drivers/final.sh](benchmarks/results/2.0.0/drivers/final.sh) | the whole run: capped clock, pinning, rotation of the order, logs |
+
 ## What is measured, and why
 
 The route is hello-world: `GET /`, status 200, empty body. Requests that do
