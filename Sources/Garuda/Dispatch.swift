@@ -106,7 +106,11 @@ func runHandler(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication,
     let heavy = costs.isHeavy(index)
     let lane = heavy ? costs.lane : nil
     // Only fails once the lane is closed, at shutdown: run regardless.
-    if let lane { try? await lane.acquireIgnoringCancellation() }
+    var core = -1
+    if let lane {
+        try? await lane.acquireIgnoringCancellation()
+        core = await costs.claimCore()
+    }
     let start = monotonicNanos()
     let sampled = costs.shouldSample(index, heavy: heavy, now: start)
     let stamp = sampled ? Runtime.currentJobStamp : .none
@@ -148,6 +152,7 @@ func runHandler(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication,
     if sampled && Runtime.currentJobStamp == stamp {
         costs.record(index, nanos: monotonicNanos() &- start)
     }
+    costs.releaseCore(core)
     lane?.release()
 }
 

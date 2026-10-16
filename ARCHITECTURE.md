@@ -327,6 +327,18 @@ holds a thread (`HeavyLane.swift`). A route whose average passes
 shard's heavy-lane permits, of which there are half as many as threads,
 rounded up. The other threads are always left to everything else.
 
+Heavy handlers are also spread over the shard's physical cores. Two on the
+hyperthreads of one core share its execution units, and leave quick requests
+one core fewer than one on each core does: on the `skew` workload, at four
+threads on two cores, that is 84k quick requests a second against 125k. So a
+heavy handler that has its permit, on a core where another already runs while
+some core runs none, moves to whichever worker is free next
+(`Runtime.yieldToAnyWorker`), a few times at most, and is counted on the core
+it ends up on (`Runtime.currentCore`). The permit's next waiter resumes where
+the permit was released, on a core just freed, so once spread the handlers
+stay spread without moving again. Where the platform does not say which CPUs
+share a core (only Linux does), handlers run where they are.
+
 "Holds a thread" is not wall time. A handler that awaits a database or a
 timer gives its thread up while it waits, and is not heavy for waiting. Vega
 stamps each job a thread runs; a handler that finishes in the job it started

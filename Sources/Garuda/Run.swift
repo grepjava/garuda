@@ -229,7 +229,7 @@ extension Application {
     /// its stop hooks and shut its state down.
     static func serve(_ runtime: Runtime, app: CompiledApplication, shard: ShardInfo, limits: ConnectionLimits,
                       config: ServerConfig, listening: Listening) {
-        app.costs.configure(config, threads: runtime.workerCount)
+        app.costs.configure(config, threads: runtime.workerCount, cores: runtime.coreCount)
         app.runtime = runtime
         app.rateLimiter = listening.shared.rateLimiter
         app.metrics = listening.shared.metrics

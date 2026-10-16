@@ -168,7 +168,9 @@ reloads.
 - **The heavy lane.** A route whose handler holds its thread for longer than
   `--heavy-threshold` (500 µs by default) on average, without suspending,
   runs only with one of the shard's heavy-lane permits, half as many as its
-  threads, so quick requests always have threads left. `app.heavy.get(…)`
+  threads, so quick requests always have threads left; on Linux, heavy
+  handlers are spread over the shard's physical cores, one per core while
+  cores are free, rather than doubled up on a core's hyperthreads. `app.heavy.get(…)`
   registers a route heavy from the start; `--no-heavy-lane` turns the lane
   off. It replaces Garuda 1's `--sched-slice` and `--slow-handler-ms`.
 - **`app.offload`** registers a route whose synchronous handler runs on

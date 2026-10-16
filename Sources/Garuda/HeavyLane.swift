@@ -42,6 +42,17 @@ final class RouteCosts: @unchecked Sendable {
     /// The shard's heavy-lane permits; nil leaves every route unbounded.
     var lane: Vega.Semaphore?
 
+    /// Heavy handlers running on each physical core, by `Runtime.currentCore`
+    /// (modulo `coreSlots`): nil unless the shard's threads span two cores or
+    /// more and the platform says which is which. See `claimCore`.
+    private var coreLoad: UnsafeMutablePointer<Atomic<Int32>>?
+    /// The cores the shard's threads run on, and the heavy handlers running.
+    private var shardCores = 0
+    private let heavyRunning = Atomic<Int>(0)
+    private static let coreSlots = 256
+    /// How many times a heavy handler moves before running where it is.
+    private static let maxMoves = 8
+
     /// Per route: how many runs in a row were seen to finish in the job they
     /// started in, up to `steadyRuns`, or `suspends` once one did not.
     private let quiet: UnsafeMutablePointer<Atomic<UInt8>>
@@ -59,6 +70,10 @@ final class RouteCosts: @unchecked Sendable {
     }
 
     deinit {
+        if let coreLoad {
+            coreLoad.deinitialize(count: Self.coreSlots)
+            coreLoad.deallocate()
+        }
         average.deinitialize(count: max(1, count))
         average.deallocate()
         quiet.deinitialize(count: max(1, count))
@@ -102,11 +117,53 @@ final class RouteCosts: @unchecked Sendable {
         declared[index] || average[index].load(ordering: .relaxed) > thresholdNanos
     }
 
-    /// Readies the lane for a shard of `threads` threads.
-    func configure(_ config: ServerConfig, threads: Int) {
+    /// Readies the lane for a shard of `threads` threads on `cores` physical
+    /// cores (0: not known).
+    func configure(_ config: ServerConfig, threads: Int, cores: Int = 0) {
         let (seconds, attos) = config.heavyThreshold.components
         thresholdNanos = UInt64(max(0, seconds)) &* 1_000_000_000 &+ UInt64(max(0, attos) / 1_000_000_000)
         lane = config.heavyLane ? Vega.Semaphore(permits: max(1, (threads + 1) / 2)) : nil
+        if lane != nil, cores > 1, coreLoad == nil {
+            shardCores = cores
+            let load = UnsafeMutablePointer<Atomic<Int32>>.allocate(capacity: Self.coreSlots)
+            for i in 0..<Self.coreSlots { (load + i).initialize(to: Atomic(0)) }
+            coreLoad = load
+        }
+    }
+
+    /// With a lane permit held, before a heavy handler runs: spreads heavy
+    /// handlers over the shard's physical cores. Two on the hyperthreads of
+    /// one core run at about half speed each, and leave the quick requests
+    /// one core fewer than one on each core does: on the `skew` workload,
+    /// 84k quick requests a second against 120k. So while a heavy handler
+    /// already runs on the caller's core and some core runs none, the caller
+    /// moves to whichever worker is free next, a few times at most; then it
+    /// is counted on the core it is on. The permit's next waiter resumes
+    /// where the permit was released, on a core `releaseCore` has just
+    /// freed, so once spread they stay spread without moving again.
+    /// Returns the slot to release, or -1.
+    func claimCore() async -> Int {
+        guard let load = coreLoad else { return -1 }
+        var moves = 0
+        while true {
+            guard let core = Runtime.currentCore else { return -1 }
+            let slot = core % Self.coreSlots
+            if moves == Self.maxMoves || load[slot].load(ordering: .relaxed) == 0
+                || heavyRunning.load(ordering: .relaxed) >= shardCores {
+                load[slot].add(1, ordering: .relaxed)
+                heavyRunning.add(1, ordering: .relaxed)
+                return slot
+            }
+            moves += 1
+            await Runtime.yieldToAnyWorker()
+        }
+    }
+
+    /// The heavy handler counted by `claimCore` on `slot` is done.
+    func releaseCore(_ slot: Int) {
+        guard slot >= 0, let load = coreLoad else { return }
+        load[slot].subtract(1, ordering: .relaxed)
+        heavyRunning.subtract(1, ordering: .relaxed)
     }
 
     /// The smoothed thread-hold time of route `index`.
