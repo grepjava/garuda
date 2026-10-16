@@ -469,6 +469,37 @@ struct HTTP2Tests {
         #expect(try h2.post("/user", body: [UInt8](repeating: 0x79, count: 512)).text == "512")
     }
 
+    /// The body the client sent before it heard the 413 -- in the same read
+    /// as the HEADERS, here -- is dropped, not answered with a STREAM_CLOSED
+    /// reset that would reach it ahead of the 413.
+    @Test func dataBehindARefusedBodyIsIgnored() throws {
+        let client = app().testClient(configuration: config { $0.maxBodySize = 1024 })
+        let h2 = try client.http2()
+        let body = [UInt8](repeating: 0x78, count: 4096)
+        func refused(_ fields: [(String, String)], _ frames: Int) throws {
+            let id = h2.nextStream
+            h2.nextStream += 2
+            var bytes = h2.frame(H2FrameType.headers.rawValue, flags: H2Flags.endHeaders.rawValue, stream: id,
+                                 payload: h2.headerBlock([(":method", "POST"), (":scheme", "http"),
+                                                          (":authority", "test"), (":path", "/user")] + fields))
+            let piece = body.count / frames
+            for i in 0..<frames {
+                bytes += h2.frame(H2FrameType.data.rawValue, flags: i == frames - 1 ? H2Flags.endStream.rawValue : 0,
+                                  stream: id, payload: Array(body[i * piece..<(i + 1) * piece]))
+            }
+            try h2.send(raw: bytes)
+            let response = try h2.response(id)
+            #expect(response.status == .contentTooLarge)
+            let reset = try #require(try h2.nextFrame { $0.kind == .rstStream && $0.stream == id })
+            #expect(reset.payload == h2.uint32(H2Error.noError.rawValue))
+        }
+        // Refused at the HEADERS, for its declared length.
+        try refused([("content-length", "4096")], 1)
+        // Refused at the DATA that passes the limit, with more behind it.
+        try refused([], 4)
+        #expect(try h2.post("/user", body: [UInt8](repeating: 0x79, count: 512)).text == "512")
+    }
+
     // MARK: What the application sees
 
     @Test func observersSeeHTTP2() throws {

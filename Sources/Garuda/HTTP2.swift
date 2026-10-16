@@ -855,6 +855,11 @@ final class H2Connection: @unchecked Sendable {
             // has to be given back, or the peer stalls behind bytes nobody
             // wanted.
             releaseConnectionWindow()
+            // A body refused with a 413: what the client sent before it
+            // heard is dropped. A STREAM_CLOSED reset here would reach the
+            // client ahead of the 413 -- the writer sends control frames
+            // before answers -- and end the stream unanswered.
+            if refusedStreams.contains(header.streamID) { return true }
             if header.streamID <= lastPeerStreamSeen {
                 rst(header.streamID, .streamClosed)
                 return true
@@ -979,6 +984,11 @@ final class H2Connection: @unchecked Sendable {
     /// then reset with NO_ERROR, which tells the client to stop sending the
     /// rest without calling the request malformed (RFC 9113 section 8.1).
     func refuseBody(_ s: H2Stream) {
+        // Its DATA still on the way is ignored (RFC 9113 section 5.1: once
+        // the stream is reset, frames the peer had already sent are). The
+        // last few are enough: the client stops once it has the reset.
+        if refusedStreams.count == H2Connection.refusedKept { refusedStreams.removeFirst() }
+        refusedStreams.append(s.id)
         s.receiving = false
         s.started = true
         s.x.pointee.answer(413, nil, 0)
@@ -999,6 +1009,10 @@ final class H2Connection: @unchecked Sendable {
 
     /// The highest stream the peer has opened, as the reader sees it.
     @exclusivity(unchecked) var lastPeerStreamSeen: UInt32 = 0
+    /// The reader's: streams whose body it refused with a 413, most recent
+    /// last, at most `refusedKept` of them.
+    @exclusivity(unchecked) var refusedStreams: [UInt32] = []
+    static let refusedKept = 16
 
     func handleHeaders(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         let id = header.streamID
