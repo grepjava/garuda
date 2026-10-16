@@ -347,6 +347,7 @@ func cacheAnswer(_ x: UnsafeMutablePointer<Exchange>) {
     guard let capture = x.pointee.capture else { return }
     x.pointee.capture = nil
     capture.settle(x)
+    x.pointee.settleHeldBody()
     let count = x.pointee.responseBody.readableBytes
     // A body that disagrees with the length its head declares is sent as it
     // is, and kept by nobody.

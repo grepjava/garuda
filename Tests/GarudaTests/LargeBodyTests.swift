@@ -42,4 +42,52 @@ struct LargeBodyTests {
         #expect(response.header("content-length") == "\(megabyte.count)")
         #expect(response.body.isEmpty)
     }
+
+    // An array this large is held rather than copied, and sent from where
+    // it is; everything else that reads the body reads it as it would any.
+
+    @Test func aHookSeesALargeBody() throws {
+        let app = largeApp()
+        app.use { _, response, next in
+            response.onSend { outgoing in
+                outgoing.addHeader("x-count", String(outgoing.bodyCount))
+                outgoing.addHeader("x-last", String(outgoing.withBody { $0[$0.count - 1] }))
+            }
+            try await next()
+        }
+        let response = try app.test.get("/large")
+        #expect(response.header("x-count") == "\(megabyte.count)")
+        #expect(response.header("x-last") == "\(megabyte[megabyte.count - 1])")
+        #expect(response.body == megabyte)
+    }
+
+    @Test func aHookCanReplaceALargeBody() throws {
+        let app = largeApp()
+        app.use { _, response, next in
+            response.onSend { outgoing in outgoing.replaceBody("replaced") }
+            try await next()
+        }
+        let response = try app.test.get("/large")
+        #expect(response.header("content-length") == "8")
+        #expect(response.text == "replaced")
+    }
+
+    @Test func aDeclaredShorterLengthCutsALargeBody() throws {
+        let app = Application()
+        app.get("/large") { _, response in
+            response.addHeader("content-length", "1000")
+            response.send(bytes: megabyte, contentType: "application/octet-stream")
+        }
+        let response = try app.test.get("/large")
+        #expect(response.header("content-length") == "1000")
+        #expect(response.body == Array(megabyte[..<1000]))
+    }
+
+    @Test func aLargeBodyArrivesWholeOverHTTP2() throws {
+        let h2 = try largeApp().test.http2()
+        let response = try h2.get("/large")
+        #expect(response.status == .ok)
+        #expect(response.header("content-length") == "\(megabyte.count)")
+        #expect(response.body == megabyte)
+    }
 }

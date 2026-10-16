@@ -150,7 +150,7 @@ extension Exchange {
     /// encoded.
     mutating func compressAnswer(omitBody: Bool) {
         let (eligibility, declared) = compressionEligibility()
-        let count = responseBody.readableBytes
+        let count = responseBodyCount
         let forbids = HTTPResponseWriter.statusForbidsBody(status)
         // A body that disagrees with its own length is sent as it is.
         let misframed = !forbids && declared >= 0 && declared != count
@@ -158,6 +158,7 @@ extension Exchange {
         let coding = eligibility.choose(offered: acceptedCoding, status: status, bodyAllowed: !forbids,
                                         declaredLength: count, minimumLength: compressMinimum)
         guard coding != .identity, let encoder = ResponseEncoder(coding) else { return }
+        settleHeldBody()
         compressed.clear()
         guard encoder.encode(UnsafePointer(responseBody.readPointer), count, flush: false, into: &compressed,
                              chunked: false),

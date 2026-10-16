@@ -96,6 +96,7 @@ public struct OutgoingResponse: ~Copyable {
 
     /// The body, lent for as long as `body` runs.
     public func withBody<R, E: Error>(_ body: (Span<UInt8>) throws(E) -> R) throws(E) -> R {
+        exchange.pointee.settleHeldBody()
         let buffer = exchange.pointee.responseBody
         let count = buffer.readableBytes
         // An empty buffer may never have been given storage to point into.
@@ -104,7 +105,7 @@ public struct OutgoingResponse: ~Copyable {
     }
 
     /// How many bytes the body holds.
-    public var bodyCount: Int { exchange.pointee.responseBody.readableBytes }
+    public var bodyCount: Int { exchange.pointee.responseBodyCount }
 
     /// Sends `bytes` instead of the body, with `contentType` in place of the
     /// content type when one is given. A Content-Length the handler set is
@@ -112,6 +113,7 @@ public struct OutgoingResponse: ~Copyable {
     public mutating func replaceBody(_ bytes: [UInt8], contentType: String? = nil) {
         exchange.pointee.bodyReplaced = true
         exchange.pointee.touchedStream = true
+        exchange.pointee.heldBody = nil
         exchange.pointee.responseBody.clear()
         bytes.withUnsafeBufferPointer { b in
             if let base = b.baseAddress, b.count > 0 { exchange.pointee.responseBody.write(base, b.count) }
