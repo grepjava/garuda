@@ -290,14 +290,15 @@ changed:
 
 | flag | Garuda 1 | Garuda 2 |
 |---|---|---|
-| `--workers N` | N worker processes; `0` one per CPU | accepted as `--shards N`; **`0` now serves in one process** |
+| `--workers N` | N worker processes; `0` one per CPU | accepted as `--shards N --threads 1` (a `--threads` given too wins); **`0` now serves in one process** |
 | `--balance` | `adaptive` (default), `accept`, `reuseport` | `auto` (default), `shared`, `reuseport`; `adaptive` and `accept` are taken as `auto` and `shared` |
 | `--max-connections`, `--blocking-threads`, `--blocking-queue` | per worker | per shard |
 | `--port` | 1 to 65535 | 0 to 65535; 0 picks a free port |
 | `--ktls`, `--no-ktls`, `--sched-slice`, `--slow-handler-ms` | in effect, or accepted and ignored | accepted; all but `--no-ktls` warn that they have no effect |
 
 `--shards 4` is four processes of several threads each, where `--workers 4`
-was four single-threaded ones: a machine that ran `--workers 0` (one per CPU)
+was four single-threaded ones, and is still: `--workers 4` keeps that shape as
+`--shards 4 --threads 1`. A machine that ran `--workers 0` (one per CPU)
 runs the default `--shards auto`, which sizes itself from the CPUs' cache
 domains.
 

@@ -45,11 +45,10 @@ Garuda then axum in each pass:
 Tokio sizes its runtime from `std::thread::available_parallelism`, which reads
 the affinity mask, so pinned axum runs one worker thread.
 
-Garuda 2 reads `--workers N` as `--shards N`, and each shard then takes a
-thread per CPU it is given. So `WORKERS=4` on 8 CPUs is four shards of two
-threads, not Garuda 1's four single-threaded processes. Add `--threads 1`
-(`GARUDA_EXTRA_ARGS`) for Garuda 1's shape. On the bench box that is worth
-43% on the closed pass ([Garuda 2.0.0](#garuda-200)).
+Garuda 2 reads `--workers N` as `--shards N --threads 1`: N single-threaded
+shards, Garuda 1's shape. Before that, `WORKERS=4` on 8 CPUs ran four shards
+of two threads, and the closed pass read 43% lower for it
+([Garuda 2.0.0](#garuda-200)).
 
 It prints one line per pass and server to stdout: requests a second, p50 and
 p99 in milliseconds, and errors. The last line is the total time in seconds.
@@ -405,6 +404,8 @@ the ramp and 106.1-108.4k closed, in both orders.
   ([workers-layout.log](benchmarks/results/2.0.0/vs-axum/workers-layout.log)).
   One shard of eight threads reads 104k. That points to the cost being more
   threads than the load generator leaves CPUs for, not shards as such.
+  `--workers N` has since been made to mean `--shards N --threads 1`, so
+  vs-axum.sh now runs that shape.
 - **Garuda 1 is still well ahead on the ramp**: 205k against 147-151k, even
   with Garuda 2 at four shards of one thread. That pass is zrk's open-loop
   ramp to 500,000 requests a second, so it measures how a server behaves when

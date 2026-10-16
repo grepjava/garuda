@@ -297,6 +297,14 @@ struct StaticFileTests {
         #expect(config.staticListing && config.staticIndex)
         #expect(config.staticListingLimit == 5)
         #expect(config.shards == 2)
+        #expect(config.threads == 1)
+        for order in [["--threads", "3", "--workers", "2"], ["--workers", "2", "--threads", "3"]] {
+            guard case .run(let config) = parsed(order) else {
+                Issue.record("\(order) did not parse")
+                continue
+            }
+            #expect(config.shards == 2 && config.threads == 3, "\(order)")
+        }
         #expect(config.spaFallbacks.map { "\($0.prefix) \($0.directory) \($0.file)" } == ["/app \(site.path) /index.html"])
         for bad in [["--static-dir", "static=/srv"], ["--static-dir", "/static"], ["--static-dir", "=/srv"],
                     ["--spa-fallback", "/=\(site.path)/nope.html"], ["--spa-fallback", "app=\(site.path)/index.html"]] {

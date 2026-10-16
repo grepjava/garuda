@@ -74,7 +74,9 @@ has how this works.
   and the only mode on Windows. Nothing restarts a crashed server, and there
   is no reload: `SIGHUP` is not handled, so the system's default for it ends
   the process.
-- `--workers N` is accepted as Garuda 1's name for `--shards N`.
+- `--workers N` is accepted as Garuda 1's name for `--shards N --threads 1`: N
+  single-threaded shards, the shape Garuda 1's N processes had. A `--threads`
+  given as well wins.
 
 **`--balance`.** How the shards share the listening port:
 

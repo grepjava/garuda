@@ -685,10 +685,14 @@ extension ServerConfig {
                 }
             case "--workers":
                 // Garuda 1's name for its processes, which are shards here.
+                // Its processes were single-threaded, so N of them are N
+                // shards of one thread each unless --threads says otherwise;
+                // N shards of a CPU share each would oversubscribe the CPUs.
                 guard let n = value().flatMap({ Int($0) }), n >= 0 else {
                     return fail("--workers must be a count")
                 }
                 config.shards = n
+                if n > 0 && config.threads == nil { config.threads = 1 }
             case "--static-dir":
                 guard let v = value(), let eq = v.firstIndex(of: "="), eq != v.startIndex,
                       v.index(after: eq) != v.endIndex else {
