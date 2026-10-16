@@ -26,7 +26,8 @@
 # SERVERS names what runs: garuda, axum, and garuda:MODE for Garuda 1 under
 # --balance MODE (garuda:adaptive, garuda:accept, garuda:reuseport), and
 # garuda2:SxT for Garuda 2 (GARUDA2_APP, the garuda executable) with S shards
-# of T threads each (garuda2:1x8, garuda2:2x4).
+# of T threads each (garuda2:1x8, garuda2:2x4), or plain garuda2 for Garuda 2
+# as it sizes itself, with no --shards or --threads.
 #
 # TLS=1 runs both over HTTPS with the same self-signed P-256 certificate:
 # Garuda 1 and Garuda 2 with BoringSSL (each one's default build), axum with
@@ -158,13 +159,14 @@ start() {
             server_start "${PIN_SERVER[@]}" "$GARUDA_APP" \
             --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${balance[@]}" \
             "${GARUDA_TLS[@]}" ${GARUDA_FLAGS:-} ;;
-    garuda2:*)
-        local layout=${1#garuda2:}
+    garuda2|garuda2:*)
+        local layout=() shape=${1#garuda2:}
+        [ "$1" != garuda2 ] && layout=(--shards "${shape%x*}" --threads "${shape#*x}")
         DATABASE_URL=$DATABASE_URL POOL_SIZE=$((WORKERS * POOL_SIZE)) \
             ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT/stream" \
             server_start "${PIN_SERVER[@]}" "$GARUDA2_APP" \
             --log-level error --host 127.0.0.1 --port "$PORT" \
-            --shards "${layout%x*}" --threads "${layout#*x}" "${GARUDA_TLS[@]}" ${GARUDA2_FLAGS:-} ;;
+            "${layout[@]}" "${GARUDA_TLS[@]}" ${GARUDA2_FLAGS:-} ;;
     axum)
         if [ ! -x "$AXUM_APP" ]; then
             (cd "$ROOT/benchmarks/workloads/axum" && "$CARGO" build --release) > "$OUT/cargo.log" 2>&1 \

@@ -45,6 +45,12 @@ Garuda then axum in each pass:
 Tokio sizes its runtime from `std::thread::available_parallelism`, which reads
 the affinity mask, so pinned axum runs one worker thread.
 
+Garuda 2 reads `--workers N` as `--shards N`, and each shard then takes a
+thread per CPU it is given. So `WORKERS=4` on 8 CPUs is four shards of two
+threads, not Garuda 1's four single-threaded processes. Add `--threads 1`
+(`GARUDA_EXTRA_ARGS`) for Garuda 1's shape. On the bench box that is worth
+43% on the closed pass ([Garuda 2.0.0](#garuda-200)).
+
 It prints one line per pass and server to stdout: requests a second, p50 and
 p99 in milliseconds, and errors. The last line is the total time in seconds.
 `GARUDA` points it at a binary other than `.build/release/garuda`. It needs
@@ -241,7 +247,175 @@ what it is good for is the differences that are larger than that.
 
 ## Recorded runs
 
-Every figure below was taken on **2026-09-20**, on one machine, from the tree
+### Garuda 2.0.0
+
+Taken on **2026-10-16**, on the same i5-8250U as the Garuda 1 runs after this
+one, from the tree at `aebd720` on Vega 0.4.8 and vega-db 0.2.3. Garuda 1 is
+the reference, at 1.1.0 (`release/1.x`, `cbad05b`), built with the same Swift
+6.3.3. The raw logs, and the scripts that drove them, are in
+[benchmarks/results/2.0.0](benchmarks/results/2.0.0).
+
+**The method.** Three things are new since the Garuda 1 runs below, and each
+takes one of the box's own effects out of the comparison:
+
+- **The clock is capped at 2.4 GHz** (`scaling_max_freq` on every CPU). Left
+  alone, the CPU runs at 3.4 GHz until its turbo budget runs out, then at
+  about 2.7. Throughput follows the clock, so whichever server ran first
+  after an idle gap won. With the cap, the same binary repeats to within
+  about 1%. That also makes every figure lower than the uncapped ones below,
+  so the two sets cannot be compared.
+- **The server and the load run on separate physical cores.** CPU *n* and
+  *n*+4 are hyperthreads of one core, so the server runs on CPUs 0, 1, 4 and
+  5 and oha on 2, 3, 6 and 7 (`PIN="0,1,4,5:2,3,6,7"`). Garuda 1 gets
+  `--workers 4`. Garuda 2 sizes itself, with no `--shards` or `--threads`,
+  and on those four CPUs that is one shard of four threads.
+- **Each server gets its own invocation, and the order alternates.** Garuda
+  1 goes first in rounds 1 and 3, Garuda 2 in rounds 2 and 4. There are four
+  rounds and none is discarded. Each server leads twice, so any advantage
+  from going first falls on both equally.
+
+#### Requests that do work
+
+This is `workloads.sh` with `WORKLOADS="user json churn skew spike h2 stream
+download upload db"`: 64 connections, a 1 s warm-up and a 5 s run. Each cell
+is the median of the four rounds, followed by (p99 ms; CPU microseconds a
+request). The last column gives the lowest and highest round, Garuda 1 first.
+
+| workload | Garuda 1.1 | Garuda 2.0 | 2.0 against 1.1 | rounds, 1.1 / 2.0 |
+|---|---|---|---:|---|
+| user | 137,046 (0.62; 25) | **140,280** (0.55; 28) | +2.4% | 136.4-138.7k / 140.1-141.8k |
+| json | 112,916 (1.01; 35) | **119,286** (0.68; 33) | +5.6% | 112.3-113.5k / 118.5-120.1k |
+| churn | 25,258 (2.82; 61) | 25,097 (2.88; 130) | -0.6% | 25.1-25.3k / 25.1-25.1k |
+| skew | **88,768** (0.99; 41) | 79,912 (1.01; 51) | -10.0% | 88.2-95.9k / 78.3-116.5k |
+| skew, slow side | **636** (36.4) | 584 (20.4) | -8.3% | 632-662 / 573-591 |
+| spike | **130,480** (0.68; 31) | 112,402 (0.75; 37) | -13.9% | 95.4-132.7k / 92.1-121.4k |
+| h2 | 93,176 (0.93; 34) | **96,062** (0.82; 40) | +3.1% | 92.7-93.3k / 96.0-96.3k |
+| stream | **37,896** (2.14; 92) | 27,307 (2.95; 142) | -27.9% | 37.4-38.1k / 27.2-29.0k |
+| download | **2,162** (55.4; 1,390) | 1,868 (68.8; 1,494) | -13.6% | 2.08-2.42k / 1.77-1.88k |
+| upload | 2,028 (103; 1,983) | **2,172** (60.0; 1,750) | +7.1% | 2.02-2.04k / 2.17-2.54k |
+| db | **30,050** (3.34; 93) | 28,185 (5.23; 102) | -6.2% | 30.0-30.2k / 27.5-28.2k |
+
+These match the figures taken when phase 4 of the port closed, on the same box
+with the same settings. Nothing has moved by more than the rounds' own spread.
+Garuda 2 now reads `user` 140k against 141k then, `json` 119k against
+121-122k, `h2` 96k against 96k, `stream` 27.3k against 27.2k, `download`
+1.87k against 1.87k, and `upload` 2.17k against 2.16k. Garuda 1 also reads
+what it read then: 137k, 113k, 93k, 38k, 2.16k and 2.03k.
+
+What the table shows:
+
+- **Garuda 2 is ahead when requests are small and the connection stays
+  open.** It leads on `user`, `json` and `h2`, with a lower p99 on all
+  three: 0.55 against 0.62 ms on `user` and 0.68 against 1.01 on `json`. It
+  also leads on `upload`, at 60 ms p99 against 103. On `user` and `h2` it
+  spends slightly more CPU a request (28 against 25 us, 40 against 34) and
+  still serves more.
+- **`stream` is the gap that is known and still open.** Garuda 2 is 28%
+  behind, at 142 us a request against 92. That is where it stood when
+  phase 4 closed, and why streamed responses cost more CPU a request was
+  left open then.
+- **`download` is 14% behind**, at 1,494 us of CPU a request against 1,390.
+  Its p50 is 33 ms against 29.
+- **`db` is 6% behind**, at 102 us of CPU against 93 and a p99 of 5.2 ms
+  against 3.3. Garuda 2's HTTP handling is ahead on `user`, so the
+  difference is most likely in vega-db's PostgreSQL driver and pool. That
+  has not been profiled.
+- **`skew` and `spike` are behind, but each server had one outlier round on
+  them.** Garuda 2 read 116k on `skew` in one round and 78-81k in the other
+  three. Garuda 1 read 95k on `spike` in one round and 130-133k in the rest.
+  The medians put Garuda 1 ahead by 10-14%. The outliers show that a single
+  round of either row is not a result. The slow side is a trade: Garuda 2
+  serves 8% fewer of the 2 ms requests, but their p99 is 20 ms against 36.
+- **`churn` most likely measures oha, not the server.** Both servers read
+  25.1k to 25.3k in every round, which points to oha's rate of new
+  connections as the ceiling. The difference shows in CPU instead: a new
+  connection costs Garuda 2 130 us against Garuda 1's 61.
+
+#### HTTP/3
+
+These are the first HTTP/3 figures for either version. The client for all
+three protocols is oha 1.16.0, built with `--features http3` (quinn), so only
+the protocol changes between rows. The route is `GET /user/12345` over HTTPS
+with a self-signed P-256 certificate and `--http3`. The load is 64
+connections with a 1 s warm-up and a 5 s run, under the same pinning and
+clock. There are four rounds: the servers alternate and the order of the
+protocols rotates. Each cell is the median requests a second, followed by
+(p99 ms; CPU microseconds a request):
+
+| protocol | Garuda 1.1 | Garuda 2.0 | 2.0 against 1.1 |
+|---|---|---|---:|
+| HTTPS/1.1 | 107,454 (1.15; 33) | **108,209** (0.74; 36) | +0.7% |
+| HTTP/2, a stream a connection | 70,342 (1.25; 44) | **72,263** (1.09; 51) | +2.7% |
+| HTTP/3, a stream a connection | 47,920 (1.98; 82) | **50,662** (1.80; 77) | +5.7% |
+| HTTP/2, 8 streams a connection | 127,748 (7.0; 31) | **138,596** (5.06; 28) | +8.5% |
+| HTTP/3, 8 streams a connection | 76,893 (9.6; 52) | **137,451** (6.06; 26) | **+78.8%** |
+
+The rounds are tight. Garuda 2's HTTP/3 rows span 50.4-51.7k and
+137.1-139.2k, and Garuda 1's span 47.7-48.7k and 76.5-77.1k.
+
+- **With 8 streams a connection, Garuda 2's HTTP/3 is level with its
+  HTTP/2**: 137k against 139k, at 26 microseconds a request against 28.
+- **With one stream a connection, HTTP/3 serves 70% of what HTTP/2 does**,
+  at 77 us a request against 51. Each request is then a datagram in each
+  direction, so nothing shares the cost of a packet.
+- **Garuda 1's HTTP/3 gains much less from more streams.** It goes from 48k
+  to 77k between one stream a connection and 8, while Garuda 2 goes from
+  51k to 137k. Over the same step Garuda 1's CPU a request falls from 82 us
+  to 52, and Garuda 2's falls from 77 to 26.
+- **oha's own `requestsPerSec` is wrong over HTTP/3, so these figures do not
+  use it.** After the deadline, oha waits 5-10 s for its QUIC connections
+  to close and counts that time too. For a run that served 253,000 requests
+  in 5 s it printed 17k. The table divides requests by the 5 s instead.
+  [drivers/h3.sh](benchmarks/results/2.0.0/drivers/h3.sh) also prints how
+  long the load was busy: requests times mean latency, divided by the number
+  of concurrent requests. That comes to 4.9 s in every row, so the load
+  filled the run.
+
+#### Against axum, hello world
+
+This is `vs-axum.sh` as it stands, with the clock capped and nothing pinned
+except in its own `pinned` pass. axum is the suite's entry, built at
+`~/garuda/benchmarks/axum`. There are eight rounds, four with Garuda first and
+four with axum first. frameworks.sh loops over `FRAMEWORKS` before `SERVERS`,
+so reversing `SERVERS` alone does not change the order, and the axum-first
+rounds reverse both. Garuda 1 got two rounds, one in each order. Each cell is
+the median requests a second, followed by p99:
+
+| pass | Garuda 2.0 | axum 0.8.9 | Garuda 1.1 |
+|---|---|---|---|
+| ramp | 122,293 (4.7-6.9 s) | **137,622** (4.5-4.7 s) | 207,107 (3.1-3.3 s) |
+| closed | 107,280 (4.0 ms) | **121,666** (1.37 ms) | 141,462 (0.66 ms) |
+| pinned | **83,064** (0.94 ms) | 74,880 (1.04 ms) | 94,265 (0.85 ms) |
+
+The order made no difference to either server. Garuda 2 read 120.6-124.4k on
+the ramp and 106.1-108.4k closed, in both orders.
+
+- **In the pinned pass, one thread against one thread, Garuda 2 leads axum
+  by 11% and trails Garuda 1 by 12%** on the empty `GET /`. That is a gap in
+  the cost of each request, and it is larger than on `user` above, where
+  Garuda 2 leads.
+- **In the unpinned passes Garuda 2 trails axum, and most of that comes from
+  what `--workers 4` means to it.** vs-axum.sh passes `--workers 4`, which
+  Garuda 2 reads as `--shards 4`. Each shard then sizes its threads from the
+  machine, at two each. Garuda 2 so runs eight worker threads where Garuda 1
+  ran four single-threaded processes, and oha and zrk use those same CPUs.
+  Given `--workers 4 --threads 1`, the shape Garuda 1 has, the same binary
+  does **153k closed**, ahead of Garuda 1's 141k and axum's 122k. On the
+  ramp it does 147-151k, ahead of axum's 138k
+  ([workers-layout.log](benchmarks/results/2.0.0/vs-axum/workers-layout.log)).
+  One shard of eight threads reads 104k. That points to the cost being more
+  threads than the load generator leaves CPUs for, not shards as such.
+- **Garuda 1 is still well ahead on the ramp**: 205k against 147-151k, even
+  with Garuda 2 at four shards of one thread. That pass is zrk's open-loop
+  ramp to 500,000 requests a second, so it measures how a server behaves when
+  it is far behind the offered load.
+
+The runs below are Garuda 1's. They were measured before any of the method
+above existed, and where they say Garuda, they mean Garuda 1.
+
+### Garuda 1, 2026-09-20
+
+Every Garuda 1 figure below was taken on **2026-09-20**, on one machine, from the tree
 at `b1cbbb0`. Nothing here is carried over from an earlier session: a number
 that is not in this file was not measured today.
 
@@ -252,13 +426,13 @@ oha 1.16.0 share the machine with the server, which is what the caveat above
 about the load generator means: these are figures from one box, not from a
 pair.
 
-**The servers.** Garuda at `b1cbbb0` with 8 workers; axum 0.8.9 and actix-web
+**The servers.** Garuda 1 at `b1cbbb0` with 8 workers; axum 0.8.9 and actix-web
 4.15.0 on Tokio 1.53.1; Vert.x 5.1.7 on Netty's epoll transport; Hummingbird
 2.26.0 and Vapor 4.122.1 on SwiftNIO 2.102.0. Every one but Garuda sizes its
 threads from the CPU count, which here is 8, so Garuda was given 8 workers to
 match.
 
-### Hello world: six servers
+#### Hello world: six servers (Garuda 1)
 
 `GET /`, status 200, empty body. The suite's ramp from 1,000 to 500,000
 requests a second, the mean of three 15-second runs at each level. Requests a
@@ -298,7 +472,7 @@ Latency at 256 connections, p50 / p99 in milliseconds:
   these 8 CPUs, Garuda read 166,490 / 144,825 / 140,511 and placed fourth. The
   other five size themselves and cannot be got wrong this way.
 
-### Hello world again, with the measurement order taken out
+#### Hello world again, with the measurement order taken out (Garuda 1)
 
 The run above measures every server inside one invocation, in a fixed order,
 and whichever goes later reads lower. This one does not: each server is
@@ -343,7 +517,7 @@ What this says, and what it does not:
   226k, ntex 231k and axum 184k. Every one of those is wrong, Garuda's by 29%.
   Short single runs are not a cheap version of this table.
 
-### Requests that do work, against axum
+#### Requests that do work, against axum (Garuda 1)
 
 `bash benchmarks/workloads.sh` with `skew` and `spike` added: 8 Garuda workers
 against Tokio's 8 threads, 64 connections, a 1 s warm-up and a 5 s run,
@@ -390,7 +564,7 @@ Garuda is ahead on eleven of the fourteen and behind on three: `db` by 2%,
 - A worker is a process, so memory starts higher -- 13 MiB against axum's 6 --
   and grows more slowly: 39 against 42 by the end.
 
-### The same over HTTPS
+#### The same over HTTPS (Garuda 1)
 
 > **The figures below replace an earlier table that was measured wrong.**
 > `workloads.sh` runs one server through every workload and then the next,
@@ -492,7 +666,7 @@ than an A/B, so they carry whatever else moved between them, and a later A/B
 (below) puts the BIO's worth at about 1%. One saved `read` a request cannot
 be worth nine points.
 
-### What HTTP/2's 3% is not
+#### What HTTP/2's 3% is not (Garuda 1)
 
 `h2` is the one workload still behind OpenSSL. Each of these was checked
 rather than assumed, and each came back negative:
@@ -625,7 +799,7 @@ box was steady. This machine has no NIC TLS offload, so software kTLS buys a
 copy and pays to set it up. It is unavailable now in any case: `--ktls` is
 accepted and ignored.
 
-### What the TLS library itself costs
+#### What the TLS library itself costs (Garuda 1)
 
 The profile above says the HTTPS gap is OpenSSL's bookkeeping rather than
 Garuda's integration. That is a claim about a library, so it can be measured

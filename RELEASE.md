@@ -91,7 +91,9 @@ It needs Swift 6.2 or newer, and runs on Linux and on macOS 26.4 or newer
 (Vega's floor; Garuda 1 ran on macOS 15). Windows is experimental. It depends
 on Vega 0.4.6 and vega-db 0.2.3, and no longer on aviancore.
 
-Benchmarks: see BENCHMARKS.md (to be measured for 2.0.0)
+Benchmarks ([BENCHMARKS.md](BENCHMARKS.md#garuda-200), 4 alternating rounds on a clock-capped box), against
+Garuda 1.1: `user` +2%, `json` +6%, `h2` +3%, `upload` +7%; `stream` -28%, `download` -14%, `skew`/`spike`
+-10%/-14%, `db` -6%. HTTP/3 does 137k req/s at 8 streams a connection, level with HTTP/2 and 1.8x Garuda 1.
 
 ### Process model
 
