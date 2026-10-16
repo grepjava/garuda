@@ -1,3 +1,8 @@
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 import Testing
 @testable import Garuda
 import GarudaTesting
@@ -179,20 +184,52 @@ private func refused(_ flags: [String]) -> Bool {
         #expect(response.header("connection") == "close")
     }
 
-    @Test func blockingQueueRefusesPastThreadsAndQueue() {
-        let admission = OffloadAdmission()
-        #expect(admission.enter() && admission.enter())
-        admission.leave()
-        admission.leave()
-        var config = ServerConfig()
-        config.blockingQueue = 1
-        admission.configure(config, threads: 1)
-        #expect(admission.enter())
-        #expect(admission.enter())
-        #expect(!admission.enter())
-        admission.leave()
-        #expect(admission.enter())
+    #if !os(Windows)
+    /// --blocking-queue bounds the shard's pool: with its one thread busy
+    /// and no room to wait, an offloaded route is answered 503 at once.
+    @Test func blockingQueueRefusesPastThreadsAndQueue() throws {
+        let app = Application()
+        app.offload.get("/sleep") { () -> String in
+            usleep(400_000)
+            return "slept"
+        }
+        let compiled = app.compile()
+        let rt = Runtime(workers: 2, blockingThreads: 1, blockingQueue: 0)
+        defer { rt.shutdown() }
+        let limits = ConnectionLimits(ServerConfig())
+        let replies = try rt.block { () async throws(IOError) -> [String] in
+            var replies: [String] = []
+            var first: Task<String, Never>? = nil
+            for delay in [0, 100] {
+                try? await Runtime.sleep(for: .milliseconds(delay))
+                let pair = try UnixStream.pair()
+                rt.spawn(with: pair.second) { stream in
+                    _ = await serveHTTP1(stream, app: compiled, limits: limits, peer: .none)
+                }
+                var out = IOBuffer(capacity: 128)
+                _ = out.append("GET /sleep HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+                try await pair.first.write(out)
+                if delay == 0 {
+                    // The first holds the pool's thread while the second asks.
+                    first = rt.spawn(with: pair.first) { client in
+                        var buffer = IOBuffer(capacity: 4096)
+                        while (try? await client.read(into: &buffer)) ?? 0 > 0 {}
+                        return buffer.string
+                    }
+                    continue
+                }
+                var buffer = IOBuffer(capacity: 4096)
+                while try await pair.first.read(into: &buffer) > 0 {}
+                replies.append(buffer.string)
+            }
+            if let first { replies.insert(await first.value, at: 0) }
+            return replies
+        }
+        #expect(replies.count == 2 && replies[0].hasPrefix("HTTP/1.1 200") && replies[1].hasPrefix("HTTP/1.1 503"),
+                "\(replies)")
+        #expect(BlockingQueueFull().status == .serviceUnavailable)
     }
+    #endif
 
     #if !os(Windows)
     /// A head that arrives in pieces is parsed again whole once the rest is

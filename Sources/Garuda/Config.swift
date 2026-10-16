@@ -47,8 +47,9 @@ public struct ServerConfig: Sendable {
     /// Threads per shard that `app.offload` routes run on; nil for Vega's
     /// default. A thread is started when work arrives and none is free.
     public var blockingThreads: Int? = nil
-    /// Offloaded work per shard that may wait for one of those threads
-    /// before more is refused with 503; nil waits for as long as it takes.
+    /// Blocking work per shard (`app.offload`, `Runtime.blocking`) that may
+    /// wait for one of those threads before more is refused with 503; nil
+    /// waits for as long as it takes.
     public var blockingQueue: Int? = nil
 
     // --- limits ---
