@@ -422,7 +422,8 @@ extension ServerConfig {
                                wait in the backlog (default: no limit)
           --keep-alive MS      idle keep-alive timeout (default 5000)
           --request-timeout MS how long a request may stall mid-message,
-                               head or body (default 30000)
+                               head or body, or its answer go unread
+                               (default 30000)
           --sse-keep-alive SECS
                                a comment to an event stream quiet this long
                                (default 15; 0 for none)
@@ -595,12 +596,14 @@ extension ServerConfig {
                 config.maxHeadSize = n
             case "--request-timeout":
                 // Garuda 1's: one bound on a client that stops part-way
-                // through a request, head or body.
+                // through a request, head or body, or stops reading the
+                // answer.
                 guard let n = value().flatMap({ Int($0) }), n > 0 else {
                     return fail("--request-timeout must be milliseconds")
                 }
                 config.requestHeadTimeout = .milliseconds(n)
                 config.bodyTimeout = .milliseconds(n)
+                config.writeTimeout = .milliseconds(n)
             case "--request-start-header":
                 config.requestStartHeader = true
             case "--blocking-threads":

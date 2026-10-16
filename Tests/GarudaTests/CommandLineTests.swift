@@ -32,9 +32,10 @@ private func refused(_ flags: [String]) -> Bool {
         }
         #expect(config.keepAliveTimeout == .milliseconds(1500))
         #expect(config.gracefulShutdown == .milliseconds(1000))
-        // A stall mid-request, in the head or in the body.
+        // A stall mid-request, in the head or in the body, or in the answer.
         #expect(config.requestHeadTimeout == .milliseconds(2000))
         #expect(config.bodyTimeout == .milliseconds(2000))
+        #expect(config.writeTimeout == .milliseconds(2000))
         #expect(config.drainDelay == .milliseconds(250))
         #expect(config.eventKeepAlive == .seconds(7))
         #expect(config.websocketPingInterval == .milliseconds(3000))

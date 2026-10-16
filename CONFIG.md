@@ -144,7 +144,7 @@ that may change in between.
 | `--max-body BYTES` | 16 MiB | largest request body; larger gets 413 |
 | `--max-header-size BYTES` | 32 KiB | largest request head; larger gets 431; minimum 1024 |
 | `--keep-alive MS` | `5000` | idle time allowed on a connection between requests |
-| `--request-timeout MS` | `30000` | how long a request may stall part-way through |
+| `--request-timeout MS` | `30000` | how long a request may stall part-way through, or its answer go unread |
 | `--graceful-timeout MS` | `10000` | time requests, streams and WebSockets in progress get at shutdown |
 | `--drain-delay MS` | `0` | on `SIGTERM`, keep serving this long with the health check failing |
 | `--blocking-threads N` | `16` | threads per shard that blocking work (`app.offload`) runs on |
@@ -162,7 +162,8 @@ that may change in between.
   header list size and the HTTP/3 field section size.
 - **`--keep-alive`** is the HTTP/1.1 idle time between requests. It also closes
   an idle HTTP/2 connection and is the QUIC idle timeout.
-- **`--request-timeout`** covers a request head or body that stops arriving.
+- **`--request-timeout`** covers a request head or body that stops arriving,
+  and an answer, whole or streamed, that the client stops reading.
 - **`--sse-keep-alive`** is kept by the server whatever the handler is waiting
   on, so a proxy that closes idle connections sees traffic and a client that
   has gone is found when the write fails. `EventStream(keepAlive:)` sets it
@@ -788,7 +789,7 @@ Most fields share the flag's name. These do not:
 | `--max-body` | `maxBodySize` |
 | `--max-header-size` | `maxHeadSize` |
 | `--keep-alive` | `keepAliveTimeout` |
-| `--request-timeout` | `requestHeadTimeout` |
+| `--request-timeout` | `requestHeadTimeout`, `bodyTimeout` and `writeTimeout` |
 | `--sse-keep-alive` | `eventKeepAlive` |
 | `--graceful-timeout` | `gracefulShutdown` |
 | `--drain-delay` | `drainDelay` |

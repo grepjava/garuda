@@ -366,8 +366,10 @@ struct HTTP1Connection: ~Copyable {
                 let count = largeBody
                 largeBody = 0
                 try await flush(stream)
-                try await stream.write(UnsafeRawBufferPointer(start: x.pointee.responseBody.readPointer,
-                                                              count: count))
+                let body = UnsafeRawBufferPointer(start: x.pointee.responseBody.readPointer, count: count)
+                try await Runtime.withWriteStallTimeout(limits.writeTimeout) { () async throws(IOError) in
+                    try await stream.write(body)
+                }
             }
         }
         start &+= head.headEnd &+ x.pointee.consumedBody
@@ -622,7 +624,13 @@ struct HTTP1Connection: ~Copyable {
         let pending = parts.pointee.output.readableBytes
         guard pending > 0 else { return }
         let bytes = UnsafeRawBufferPointer(start: parts.pointee.output.readPointer, count: pending)
-        try await stream.write(bytes)
+        // A client that stops taking the answer is given up on once none of
+        // it has gone for the write timeout, as Garuda 1 closed a connection
+        // stuck writing. Free until the socket is full: only then does the
+        // wait get a timer.
+        try await Runtime.withWriteStallTimeout(limits.writeTimeout) { () async throws(IOError) in
+            try await stream.write(bytes)
+        }
         parts.pointee.output.clear()
     }
 
