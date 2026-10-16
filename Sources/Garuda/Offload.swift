@@ -36,7 +36,6 @@
 //===----------------------------------------------------------------------===//
 
 import GarudaWire
-import Synchronization
 import Vega
 
 /// The routes of a builder whose handlers run on the blocking pool:
@@ -106,51 +105,20 @@ func offloading<each E: Sendable, R: Sendable>(
     _ handler: @escaping @Sendable (repeat each E) throws -> R
 ) -> @concurrent @Sendable (repeat each E) async throws -> R {
     { (values: repeat each E) async throws -> R in
-        guard OffloadAdmission.shared.enter() else { throw HTTPError.serviceUnavailable }
-        defer { OffloadAdmission.shared.leave() }
-        return try await Runtime.blocking { try handler(repeat each values) }
+        try await Runtime.blocking { try handler(repeat each values) }
     }
 }
 
-/// --blocking-queue: how much offloaded work a shard takes on at once. Past
-/// the pool's threads and the queue behind them, more is refused with 503
-/// rather than left to wait for longer than any client will: a pool that
-/// cannot keep up only gets further behind, and a refusal says so at once.
-///
-/// A shard is a process, so this process's count is the shard's. With no
-/// --blocking-queue nothing is counted.
-@usableFromInline
-final class OffloadAdmission: Sendable {
-    @usableFromInline static let shared = OffloadAdmission()
-
-    /// Threads plus queue, or Int.max for no limit.
-    private let limit = Atomic<Int>(.max)
-    private let inFlight = Atomic<Int>(0)
-
-    /// The limit `config` sets, for a shard with `threads` blocking threads.
-    func configure(_ config: ServerConfig, threads: Int) {
-        guard let queue = config.blockingQueue else { return }
-        limit.store(threads &+ queue, ordering: .relaxed)
-    }
-
-    /// Whether one more piece of work may go to the pool; if so, `leave`
-    /// must follow.
-    @usableFromInline
-    func enter() -> Bool {
-        let most = limit.load(ordering: .relaxed)
-        guard most != .max else { return true }
-        if inFlight.add(1, ordering: .relaxed).newValue > most {
-            inFlight.subtract(1, ordering: .relaxed)
-            return false
-        }
-        return true
-    }
-
-    @usableFromInline
-    func leave() {
-        guard limit.load(ordering: .relaxed) != .max else { return }
-        inFlight.subtract(1, ordering: .relaxed)
-    }
+/// --blocking-queue: the shard's blocking pool lets that much work wait for
+/// a thread (ShardOptions.blockingQueue), and refuses more with
+/// `BlockingQueueFull`, which answers 503 -- for `app.offload` routes and
+/// for any handler's own `Runtime.blocking`, as Garuda 1's pool refused
+/// whatever was handed to it. Work left to wait longer than any client
+/// will is worse than none: a pool that cannot keep up only gets further
+/// behind, and a refusal says so at once.
+extension BlockingQueueFull: ResponseError {
+    public var status: HTTPStatus { .serviceUnavailable }
+    public var reason: String? { "the blocking pool is full" }
 }
 
 extension RouteBuilder {

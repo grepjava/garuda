@@ -76,6 +76,7 @@ extension Application {
                                    workersPerShard: config.threads)
         options.pinThreads = config.pinThreads
         if let threads = config.blockingThreads { options.blockingThreads = threads }
+        options.blockingQueue = config.blockingQueue
         switch config.balance {
         case .reusePort?: options.listenerMode = .perShard
         case .shared?: options.listenerMode = .shared
@@ -134,7 +135,8 @@ extension Application {
         if config.reload {
             Log.warning("--reload is ignored: restarting on a rebuilt executable needs the shard supervisor")
         }
-        let runtime = Runtime(workers: config.threads, blockingThreads: config.blockingThreads ?? 512)
+        let runtime = Runtime(workers: config.threads, blockingThreads: config.blockingThreads ?? 512,
+                              blockingQueue: config.blockingQueue)
         let info = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
         let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
             try TCPListener.bind(host: config.host, port: config.port, backlog: config.backlog)
@@ -230,8 +232,6 @@ extension Application {
         app.connections.metrics = listening.shared.metrics
         app.healthPath = config.healthCheckPath.map { Array($0.utf8) }
         app.rootPath = config.rootPath.isEmpty ? nil : Array(config.rootPath.utf8)
-        // 512 is Vega's pool when --blocking-threads does not say.
-        OffloadAdmission.shared.configure(config, threads: config.blockingThreads ?? 512)
         app.screened = app.rateLimiter != nil || app.healthPath != nil
         var certificates: CertificateStore? = nil
         if !config.tlsCertificates.isEmpty {
@@ -277,7 +277,16 @@ extension Application {
                 let accepting = config.serverConfiguration(acceptors: acceptors)
                 var servers: [TCPServer] = []
                 for _ in 0..<acceptors {
-                    servers.append(try TCPServer.serve(try listening.main(), configuration: accepting) { stream in
+                    let listener = try listening.main()
+                    if limits.requestStart && tls == nil {
+                        // The kernel stamps what arrives, and the connections
+                        // accepted inherit it, so the read that begins a
+                        // request can say when it arrived (HTTP1.swift's
+                        // readArrival). Over TLS the reads are of decrypted
+                        // bytes, which carry no stamp.
+                        try? listener.setOption(.receiveTimestamps, to: true)
+                    }
+                    servers.append(try TCPServer.serve(listener, configuration: accepting) { stream in
                         guard let tls else {
                             return await serveTCP(stream, app: app, limits: limits, http2: http2)
                         }
@@ -405,7 +414,7 @@ extension ServerConfig {
           --no-heavy-lane      let every route use every thread
           --blocking-threads N threads per shard app.offload routes run on
                                (default: Vega's, 512)
-          --blocking-queue N   offloaded work per shard that may wait for a
+          --blocking-queue N   blocking work per shard that may wait for a
                                thread, past which it is refused with 503
                                (default: no limit)
           --acceptors N        accept loops per shard (default: one a thread)
@@ -417,7 +426,8 @@ extension ServerConfig {
                                wait in the backlog (default: no limit)
           --keep-alive MS      idle keep-alive timeout (default 5000)
           --request-timeout MS how long a request may stall mid-message,
-                               head or body (default 30000)
+                               head or body, or its answer go unread
+                               (default 30000)
           --sse-keep-alive SECS
                                a comment to an event stream quiet this long
                                (default 15; 0 for none)
@@ -590,12 +600,14 @@ extension ServerConfig {
                 config.maxHeadSize = n
             case "--request-timeout":
                 // Garuda 1's: one bound on a client that stops part-way
-                // through a request, head or body.
+                // through a request, head or body, or stops reading the
+                // answer.
                 guard let n = value().flatMap({ Int($0) }), n > 0 else {
                     return fail("--request-timeout must be milliseconds")
                 }
                 config.requestHeadTimeout = .milliseconds(n)
                 config.bodyTimeout = .milliseconds(n)
+                config.writeTimeout = .milliseconds(n)
             case "--request-start-header":
                 config.requestStartHeader = true
             case "--blocking-threads":

@@ -125,7 +125,7 @@ What this means for application code:
 | a synchronous and an async overload of each typed route | one async overload; a closure that never awaits converts to it and runs inline |
 | `response.sleep(milliseconds:)`, `response.after(milliseconds:then:)` | `try await Runtime.sleep(for:)` (`import Vega`) or `Task.sleep`; `EventSink` and `ResponseBodyWriter` have `sleep(for:)` |
 | `response.isCancelled`, `response.isActive`, `response.cancellable { }`, the `Cancellation` extractor | Swift task cancellation |
-| `blocking { … }`, `BlockingPoolError` | `app.offload.get(…)` for a whole route, or `Runtime.blocking { … }` |
+| `blocking { … }`, `BlockingPoolError` | `app.offload.get(…)` for a whole route, or `Runtime.blocking { … }`; past `--blocking-queue` it throws Vega's `BlockingQueueFull`, a 503 |
 | `request.client` | `HTTPClient()`, a `Sendable` value made anywhere |
 | `request.scheme` | `request.arrivedOverHTTPS` |
 | `request.requestStart: UInt64?` | `request.requestStart: Int?`, microseconds since the epoch, with `--request-start-header` |

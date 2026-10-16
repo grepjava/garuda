@@ -252,8 +252,15 @@ func opening<S: AsyncReader & AsyncWriter & ~Copyable>(
         }
         let timeout = count == 0 ? limits.keepAliveTimeout : limits.requestHeadTimeout
         do {
-            let n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
-                try await stream.read(into: &parts.pointee.input)
+            // The connection's first bytes are its first request's, should
+            // it be HTTP/1: --request-start-header has them stamped.
+            let n: Int
+            if count == 0 && limits.requestStart {
+                n = try await readArrival(stream, parts, timeout: timeout)
+            } else {
+                n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+                    try await stream.read(into: &parts.pointee.input)
+                }
             }
             if n == 0 { return .closed }
         } catch {

@@ -47,8 +47,9 @@ public struct ServerConfig: Sendable {
     /// Threads per shard that `app.offload` routes run on; nil for Vega's
     /// default. A thread is started when work arrives and none is free.
     public var blockingThreads: Int? = nil
-    /// Offloaded work per shard that may wait for one of those threads
-    /// before more is refused with 503; nil waits for as long as it takes.
+    /// Blocking work per shard (`app.offload`, `Runtime.blocking`) that may
+    /// wait for one of those threads before more is refused with 503; nil
+    /// waits for as long as it takes.
     public var blockingQueue: Int? = nil
 
     // --- limits ---
@@ -72,8 +73,9 @@ public struct ServerConfig: Sendable {
     public var requestHeadTimeout: Duration = .seconds(30)
     /// How long a request body may take to arrive.
     public var bodyTimeout: Duration = .seconds(30)
-    /// How long one write of a streamed body may wait on a client that is
-    /// not reading: the connection is closed on it after that.
+    /// How long a write may wait on a client that is not reading -- one of
+    /// a streamed body, or of a whole answer while the client takes none
+    /// of it: the connection is closed on it after that.
     public var writeTimeout: Duration = .seconds(30)
     /// A streamed body's writes wait once this much of it is still on its
     /// way to the client (StreamingResponse.swift)...
