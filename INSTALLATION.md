@@ -66,8 +66,8 @@ export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"
 ### Windows
 
 Windows support is being worked on and is experimental. It serves in one
-process only: `--shards` has no effect, no signal is handled, and response
-compression is not available yet. Linux and macOS are the supported
+process only: `--shards` above 0 is refused, Ctrl-C, Ctrl-Break and closing
+the console stop it, and response compression is not available yet. Linux and macOS are the supported
 platforms.
 
 ---

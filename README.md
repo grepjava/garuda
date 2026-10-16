@@ -779,7 +779,7 @@ Flags keep Garuda 1's names and units: `--keep-alive`, `--request-timeout`,
 | `SIGINT`, `SIGQUIT` | The same without the drain delay; one sent during a drain delay cuts it short. |
 | `SIGHUP` | Restart the shards one at a time, rereading certificates. With shards only. |
 
-On Windows no signal is handled. [DEPLOYMENT.md](DEPLOYMENT.md#signals) has
+On Windows, Ctrl-C and Ctrl-Break stop it as `SIGINT` does, and closing the console as `SIGTERM` does. [DEPLOYMENT.md](DEPLOYMENT.md#signals) has
 the details.
 
 ## Tests
@@ -855,7 +855,7 @@ covers.
 - `multipart/byteranges`: a request for several ranges at once is answered
   with the whole file.
 - QUIC session resumption and 0-RTT.
-- Windows beyond one process: it is experimental, with no shards, no signals
+- Windows beyond one process: it is experimental, with no shards, no `SIGHUP`
   and no response compression yet.
 
 ## Documentation

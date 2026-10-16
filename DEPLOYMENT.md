@@ -100,7 +100,7 @@ supervisor a second time does not wait: the shards are killed at once.
 
 **With `--shards 0`** the one process handles `SIGTERM`, `SIGINT` and `SIGQUIT`
 the same way. `SIGHUP` is not handled, so the system's default for it ends the
-process. **On Windows** no signal is handled.
+process. **On Windows**, Ctrl-C and Ctrl-Break stop it as `SIGINT` does, and closing the console as `SIGTERM` does.
 
 ---
 

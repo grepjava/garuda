@@ -723,7 +723,7 @@ HTTP/2 connections a GOAWAY, and gives what is in progress
 `--graceful-timeout` milliseconds. The supervisor kills any shard still running
 after `--drain-delay` + `--graceful-timeout` + 5 seconds.
 [DEPLOYMENT.md](DEPLOYMENT.md) covers signals, draining behind a load
-balancer, and reloads. On Windows no signal is handled.
+balancer, and reloads. On Windows, Ctrl-C and Ctrl-Break stop it as `SIGINT` does, and closing the console as `SIGTERM` does.
 
 | flag | default | what it does |
 |---|---|---|
