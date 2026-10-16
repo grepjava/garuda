@@ -75,6 +75,7 @@ extension Application {
         var options = ShardOptions(shards: config.shards ?? Application.defaultShards,
                                    workersPerShard: config.threads)
         options.pinThreads = config.pinThreads
+        options.idleSpin = Application.idleSpin
         if let threads = config.blockingThreads { options.blockingThreads = threads }
         options.blockingQueue = config.blockingQueue
         switch config.balance {
@@ -136,7 +137,7 @@ extension Application {
             Log.warning("--reload is ignored: restarting on a rebuilt executable needs the shard supervisor")
         }
         let runtime = Runtime(workers: config.threads, blockingThreads: config.blockingThreads ?? 512,
-                              blockingQueue: config.blockingQueue)
+                              blockingQueue: config.blockingQueue, idleSpin: Application.idleSpin)
         let info = ShardInfo(index: 0, count: 1, threads: runtime.workerCount)
         let main: @Sendable () throws(IOError) -> TCPListener = { () throws(IOError) -> TCPListener in
             try TCPListener.bind(host: config.host, port: config.port, backlog: config.backlog)
@@ -184,6 +185,15 @@ extension Application {
 
     /// The protocols offered by ALPN, most wanted first.
     static let alpn = ["h2", "http/1.1"]
+
+    /// How long an idle worker spins before it sleeps: not at all, as Garuda
+    /// 1's workers slept in epoll at once. On the bench box a spin bought
+    /// no throughput on any workload with the load on cores of its own, and
+    /// cost CPU on every one: 121 us a request against 91 on churn, 94
+    /// against 86 on stream. Where the load shares the cores it cost the
+    /// load's own CPU: vs-axum's ramp, 4 workers unpinned, did 146-150k
+    /// with the spin and 192-196k without. `VEGA_SPIN_NS` still sets one.
+    static let idleSpin: Duration = .zero
 
     /// What `config` offers: no "h2" without HTTP/2, nothing else with
     /// --http2-only.

@@ -139,6 +139,11 @@ func runHandler(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication,
             answerFailure(x)
         }
     }
+    // A large array answered is sent from where it is over HTTP/1 alone
+    // (HTTP1.swift): every other protocol frames it from the buffer.
+    if x.pointee.heldBody != nil {
+        if case .http1 = x.pointee.link {} else { x.pointee.settleHeldBody() }
+    }
     // A handler that suspended gave its thread up; its time says nothing.
     if sampled && Runtime.currentJobStamp == stamp {
         costs.record(index, nanos: monotonicNanos() &- start)

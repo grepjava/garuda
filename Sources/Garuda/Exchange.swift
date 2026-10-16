@@ -94,6 +94,12 @@ struct Exchange: ~Copyable {
     @usableFromInline var headerKinds: ResponseHeaderKind = []
     @usableFromInline var hasContentType = false
     @usableFromInline var responseBody = ByteBuffer()
+    /// A large answer still in the application's own array, as Garuda 1
+    /// held one: a plain HTTP/1 answer is written from it, and anything
+    /// else that reads the body has it copied into `responseBody` first
+    /// (`settleHeldBody`). A megabyte copied costs more than the answer's
+    /// every other step together.
+    @usableFromInline var heldBody: [UInt8]?
     @usableFromInline var answered = false
     /// The head has gone to the connection: nothing in it can change. Until
     /// then middleware may add headers and set the status after the handler
@@ -227,6 +233,7 @@ struct Exchange: ~Copyable {
         headerKinds = []
         hasContentType = false
         responseBody.clear()
+        if heldBody != nil { heldBody = nil }
         answered = false
         committed = false
         if !context.isEmpty { context.clear() }
@@ -331,6 +338,36 @@ struct Exchange: ~Copyable {
         if count > 0, let bytes { responseBody.write(bytes, count) }
     }
 
+    /// Answers with `body`, kept rather than copied when it is large
+    /// (`heldBody`). Only the first answer counts.
+    @usableFromInline
+    mutating func answer(_ code: Int, _ body: [UInt8]) {
+        guard body.count >= heldBodyMinimum else {
+            body.withUnsafeBufferPointer { answer(code, $0.baseAddress, $0.count) }
+            return
+        }
+        guard !answered else { return }
+        answered = true
+        status = code
+        heldBody = body
+    }
+
+    /// The body's length, held or not.
+    @inline(__always)
+    var responseBodyCount: Int { heldBody?.count ?? responseBody.readableBytes }
+
+    /// Copies a held body into `responseBody`, for whatever reads it there.
+    @inline(__always)
+    mutating func settleHeldBody() {
+        if heldBody != nil { settleHeldBodyNow() }
+    }
+
+    @inline(never)
+    mutating func settleHeldBodyNow() {
+        guard let held = heldBody.take() else { return }
+        held.withUnsafeBufferPointer { responseBody.write($0.baseAddress!, $0.count) }
+    }
+
     /// Calls `body` with each response header record.
     @inlinable
     func forEachResponseHeader(_ body: (ByteSpan, ByteSpan) -> Void) {
@@ -370,7 +407,7 @@ struct WholeFraming {
 @inline(__always)
 func wholeFraming(_ x: UnsafeMutablePointer<Exchange>, omitBody: Bool) -> WholeFraming {
     let forbids = HTTPResponseWriter.statusForbidsBody(x.pointee.status)
-    let count = forbids ? 0 : x.pointee.responseBody.readableBytes
+    let count = forbids ? 0 : x.pointee.responseBodyCount
     // Most answers declare nothing, and are spared looking through their
     // headers for a length.
     if !x.pointee.headerKinds.contains(.contentLength) {
@@ -672,8 +709,7 @@ public struct Response: ~Copyable {
     }
 
     public func send(status: HTTPStatus? = nil, _ body: [UInt8]) {
-        let code = (status ?? self.status).code
-        body.withUnsafeBufferPointer { answer(code, $0.baseAddress, $0.count) }
+        exchange.pointee.answer((status ?? self.status).code, body)
     }
 
     /// Writes the body straight into the response's buffer, for a writer --

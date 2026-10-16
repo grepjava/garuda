@@ -151,6 +151,9 @@ let outputFlushThreshold = 64 * 1024
 /// A body this large is written from the response's own buffer rather than
 /// copied behind the head.
 let separateBodyThreshold = 16 * 1024
+/// An answer this large, given as an array, is held rather than copied
+/// (`Exchange.heldBody`): it is sent apart from its head either way.
+let heldBodyMinimum = outputFlushThreshold
 
 /// Serves HTTP/1.1 on `stream` until the client closes it, a request asks
 /// for the connection to close, or it idles out. `secure`: the stream is TLS.
@@ -366,7 +369,11 @@ struct HTTP1Connection: ~Copyable {
                 let count = largeBody
                 largeBody = 0
                 try await flush(stream)
-                let body = UnsafeRawBufferPointer(start: x.pointee.responseBody.readPointer, count: count)
+                // A held array stays the exchange's, unchanged, until the
+                // next request's reset: its storage is where it was.
+                let base = x.pointee.heldBody.map { held in held.withUnsafeBytes { $0.baseAddress! } }
+                    ?? UnsafeRawPointer(x.pointee.responseBody.readPointer)
+                let body = UnsafeRawBufferPointer(start: base, count: count)
                 try await Runtime.withWriteStallTimeout(limits.writeTimeout) { () async throws(IOError) in
                     try await stream.write(body)
                 }
@@ -613,6 +620,7 @@ struct HTTP1Connection: ~Copyable {
             if count >= outputFlushThreshold {
                 largeBody = count
             } else {
+                x.pointee.settleHeldBody()
                 parts.pointee.output.write(x.pointee.responseBody.readPointer, count)
             }
         }
@@ -631,7 +639,16 @@ struct HTTP1Connection: ~Copyable {
         try await Runtime.withWriteStallTimeout(limits.writeTimeout) { () async throws(IOError) in
             try await stream.write(bytes)
         }
-        parts.pointee.output.clear()
+        if parts.pointee.output.allocatedCapacity > limits.readBufferSize * 4 {
+            // One large answer -- a streamed body goes out of this buffer --
+            // does not keep an oversized buffer on the connection, as Garuda
+            // 1's did not: kept on each of many connections, it is memory the
+            // cache has lost by the next answer, where one freed is handed
+            // out again by the allocator while it is still in cache.
+            parts.pointee.output.destroy()
+        } else {
+            parts.pointee.output.clear()
+        }
     }
 
     /// Answers `status` to a request that cannot be read, and closes.

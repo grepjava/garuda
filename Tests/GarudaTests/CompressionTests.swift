@@ -25,6 +25,8 @@ private let text: [UInt8] = {
     return Array(s.utf8)
 }()
 
+private let largeText: [UInt8] = Array([[UInt8]](repeating: text, count: 8).joined())
+
 private let gzipOnly = [("accept-encoding", "gzip")]
 
 /// Whether this process has gzip: Vega builds no codec on Windows, having no
@@ -41,6 +43,8 @@ struct ResponseCompressionTests {
         }
         app.get("/small") { _, response in response.send(text: "tiny") }
         app.get("/png") { _, response in response.send(bytes: text, contentType: "image/png") }
+        // Large enough to be held rather than copied (Exchange.heldBody).
+        app.get("/large") { _, response in response.send(bytes: largeText, contentType: "text/plain") }
         app.get("/pieces") { () async -> StreamingBody in
             StreamingBody(contentType: "text/plain") { body in
                 for i in stride(from: 0, to: text.count, by: 4000) {
@@ -62,6 +66,13 @@ struct ResponseCompressionTests {
         #expect(gunzip(response.body) == text)
         // The bytes the tag named are not the ones sent.
         #expect(response.header("etag") == "W/\"v1\"")
+    }
+
+    @Test func aLargeBodyIsCompressed() throws {
+        let response = try client().get("/large", headers: gzipOnly)
+        #expect(response.header("content-encoding") == "gzip")
+        #expect(response.body.count < largeText.count)
+        #expect(gunzip(response.body) == largeText)
     }
 
     @Test func whatIsNotWorthItIsLeftAlone() throws {
