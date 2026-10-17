@@ -4,14 +4,16 @@
 //   TOKEN=$(curl -s localhost:8080/login -d '{"username":"ada","password":"correct horse"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
 //   curl -s localhost:8080/me -H "authorization: Bearer $TOKEN"
 //
-// AUTH_DATABASE sets the file; every worker opens the same one.
+// AUTH_DATABASE sets the file; every shard opens the same one.
 
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import AuthExample
 
 let path = getenv("AUTH_DATABASE").map { String(cString: $0) } ?? "auth.db"
-exit(authApp(databasePath: path).run())
+authApp(databasePath: path).run()

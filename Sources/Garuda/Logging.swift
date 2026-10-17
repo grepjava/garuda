@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// The application's log: lines a handler writes, carrying the request.
+// The application's log, and the access log.
 //
 //     app.post("/orders") { request, response in
 //         request.log.info("order placed", ["order": "\(id)", "cents": 1250])
@@ -11,24 +11,26 @@
 // one leads to the other. Outside a request, `AppLog` writes the same lines
 // without them.
 //
-// The output is the server's own: standard error, one line at a time, held to
-// --log-level, as text or, with --log-format json, as one JSON object per
-// line. A line is written with a single write of at most 4096 bytes. That is
-// what keeps workers sharing one pipe from splicing lines into each other, so
-// a longer line is cut, and says so.
+// The output is the server's own (Log.swift): standard error, one line at a
+// time, held to --log-level, as text or, with --log-format json, as one JSON
+// object per line. A line is written with a single write of at most 4096
+// bytes. That is what keeps shards sharing one pipe from splicing lines into
+// each other, so a longer line is cut, and says so.
 //
 // Text follows the access log's shape: the message, then `key=value` pairs,
 // with a value quoted when it holds a space, a quote, an equals sign or a
 // control character. A message or value cannot start a new line. Both formats
 // escape what would, since a message often holds something a client sent.
+//
+// The access log (--access-log) is one line per answer the connection gives,
+// written when its head is: `GET /orders/7?full=1 200 153us id=... trace=...
+// span=...` behind the server log's prefix, or with --access-log-format json a
+// bare object a collector reads without being told where the JSON starts. It
+// is built on what the response observers see (ResponseObservers.swift), and
+// a server without it, or with --log-level above info, does no work for it.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import AvianHTTP
-
-/// debug, info, warning, error or silent, as --log-level takes them.
-public typealias LogLevel = AvianCore.LogLevel
+import GarudaWire
 
 /// One field's value: text, a whole number, a fraction or a truth value.
 /// Written as a literal, or as an interpolated string.
@@ -108,18 +110,15 @@ extension Request {
     public var log: RequestLogger {
         // Nothing is copied for a line that will not be written.
         guard Log.enabled(.error) else { return RequestLogger(context: []) }
-        let c = connection
+        let x = exchange
         var context: [(String, LogValue)] = [
-            ("method", .string(c.pointee.head.methodSlice.span(in: c.pointee.headBase()).string)),
+            ("method", .string(x.pointee.slice(x.pointee.head.methodSlice).string)),
             ("path", .string(pathBytes.string)),
         ]
-        if let id = requestIDBytes { context.append(("request_id", .string(id.string))) }
-        let trace = c.pointee.traceContext
-        if trace.readableBytes == TraceContext.traceIDLength + TraceContext.parentIDLength {
-            let p = UnsafePointer(trace.readPointer)
-            context.append(("trace_id", .string(ByteSpan(p, TraceContext.traceIDLength).string)))
-            context.append(("parent_id", .string(ByteSpan(p + TraceContext.traceIDLength,
-                                                          TraceContext.parentIDLength).string)))
+        if let id = x.pointee.requestIDBytes { context.append(("request_id", .string(id.string))) }
+        if let trace = x.pointee.traceIDs {
+            context.append(("trace_id", .string(trace.trace.string)))
+            context.append(("parent_id", .string(trace.parent.string)))
         }
         return RequestLogger(context: context)
     }
@@ -127,24 +126,26 @@ extension Request {
 
 /// Formats and writes application log lines.
 enum AppLogOutput {
-    /// --log-format json. Set before any worker starts.
+    /// --log-format json. Set before anything is served.
     nonisolated(unsafe) static var json = false
-    /// Where lines go instead of standard error, for tests.
+    /// Where application and access log lines go instead of standard error,
+    /// without their newline, for tests.
     nonisolated(unsafe) static var capture: ((String) -> Void)? = nil
 
     /// The most a line may take, newline included: one atomic write to a pipe.
-    static let capacity = 4096
+    static let capacity = Log.lineCapacity
 
     static func emit(_ level: LogLevel, _ message: String,
                      _ context: [(String, LogValue)], _ fields: LogFields) {
         var line = LineBuilder(capacity: capacity - 1)
+        let pid = Log.pid
         if json {
             line.raw("{\"level\":\"")
             line.raw(levelName(level))
             line.raw("\"")
-            if Log.pid != 0 {
+            if pid != 0 {
                 line.raw(",\"pid\":")
-                line.raw(String(Log.pid))
+                line.raw(String(pid))
             }
             line.raw(",\"msg\":")
             line.jsonString(message)
@@ -156,9 +157,9 @@ enum AppLogOutput {
             line.raw(levelName(level))
             line.raw("]")
             line.raw(level == .debug || level == .error ? " " : "  ")
-            if Log.pid != 0 {
+            if pid != 0 {
                 line.raw("pid=")
-                line.raw(String(Log.pid))
+                line.raw(String(pid))
                 line.raw(" ")
             }
             line.textMessage(message)
@@ -171,7 +172,7 @@ enum AppLogOutput {
             return
         }
         line.bytes.append(cLF)
-        line.bytes.withUnsafeBufferPointer { _ = av_write(2, $0.baseAddress!, $0.count) }
+        line.bytes.withUnsafeBytes { Log.writeLine($0) }
     }
 
     static func levelName(_ level: LogLevel) -> String {
@@ -379,5 +380,225 @@ extension String {
             out.append(digits[Int((value >> UInt32(shift)) & 0xF)])
         }
         self = String(decoding: out, as: UTF8.self)
+    }
+}
+
+// MARK: - The access log
+
+/// One line for the answer just written, with --access-log. `headParsed`:
+/// false for a request refused before its head could be read, which has
+/// no method or target to show.
+func logAccess(_ x: UnsafeMutablePointer<Exchange>, limits: ConnectionLimits, status: Int, micros: Int,
+               headParsed: Bool) {
+    guard Log.enabled(.info) else { return }
+    let head = x.pointee.head
+    let id = x.pointee.requestIDBytes
+    let trace = x.pointee.traceIDs
+    var line = AccessLine()
+
+    if !limits.accessLogJSON {
+        line.str("garuda info: ")
+        line.reserveTail()
+        if headParsed && head.methodSlice.count > 0 {
+            line.text(x.pointee.slice(head.methodSlice))
+        } else {
+            line.str("-")
+        }
+        line.str(" ")
+        if headParsed && head.target.count > 0 {
+            line.text(x.pointee.slice(head.target))
+        } else {
+            line.str("-")
+        }
+        line.releaseTail()
+        line.str(" ")
+        line.int(status)
+        line.str(" ")
+        line.int(micros)
+        line.str("us")
+        // Which shard answered, as on a JSON line: what tells shards
+        // sharing one output apart.
+        let pid = Log.pid
+        if pid != 0 {
+            line.str(" pid=")
+            line.int(Int(pid))
+        }
+        if let id {
+            line.str(" id=")
+            line.raw(id)
+        }
+        if let trace {
+            line.str(" trace=")
+            line.raw(trace.trace)
+            line.str(" span=")
+            line.raw(trace.parent)
+        }
+        if line.truncated { line.str(" truncated=true") }
+    } else {
+        // Bare: the whole line is the object, so a collector can read it
+        // without being told where the JSON starts.
+        line.str("{\"level\":\"info\"")
+        let pid = Log.pid
+        if pid != 0 {
+            line.str(",\"pid\":")
+            line.int(Int(pid))
+        }
+        // The method and the target are both as long as the peer cares to
+        // make them, up to the head limit. Everything after them is short
+        // and bounded, so room for it is kept before either goes in: a
+        // long one is cut and says so, rather than eating the fields that
+        // close the object.
+        line.reserveTail()
+        line.str(",\"method\":")
+        if headParsed { line.json(x.pointee.slice(head.methodSlice)) } else { line.str("\"\"") }
+        line.str(",\"target\":")
+        if headParsed { line.json(x.pointee.slice(head.target)) } else { line.str("\"\"") }
+        line.releaseTail()
+        line.str(",\"status\":")
+        line.int(status)
+        line.str(",\"duration_us\":")
+        line.int(micros)
+        if headParsed && head.httpMajor == 2 {
+            line.str(",\"proto\":\"HTTP/2\"")
+        } else if headParsed && head.httpMajor == 3 {
+            line.str(",\"proto\":\"HTTP/3\"")
+        } else {
+            line.str(headParsed && head.httpMinor == 0 ? ",\"proto\":\"HTTP/1.0\"" : ",\"proto\":\"HTTP/1.1\"")
+        }
+        // An ID was checked when it was assigned, and a trace when it was
+        // read: neither holds anything a JSON string must escape.
+        if let id {
+            line.str(",\"request_id\":\"")
+            line.raw(id)
+            line.str("\"")
+        }
+        if let trace {
+            line.str(",\"trace_id\":\"")
+            line.raw(trace.trace)
+            line.str("\",\"parent_id\":\"")
+            line.raw(trace.parent)
+            line.str("\"")
+        }
+        if line.truncated { line.str(",\"truncated\":true") }
+        line.str("}")
+    }
+    if let capture = AppLogOutput.capture {
+        capture(String(decoding: line.bytes, as: UTF8.self))
+        return
+    }
+    line.bytes.append(cLF)
+    line.bytes.withUnsafeBytes { Log.writeLine($0) }
+}
+
+/// An access log line, held to one write. Only the method and the target can
+/// be long; they go in while room is kept for everything after them.
+struct AccessLine {
+    var bytes: [UInt8] = []
+    var truncated = false
+    /// What the method and target may not take: room for the status, the
+    /// duration, the protocol, an ID of up to `RequestID.maxLength`, a trace,
+    /// and the punctuation that closes the line. Generous on purpose.
+    static let tail = 128 + 16 + RequestID.maxLength + 32
+        + TraceContext.traceIDLength + TraceContext.parentIDLength
+    private var limit = Log.lineCapacity - 1
+
+    init() {
+        bytes.reserveCapacity(160)
+    }
+
+    mutating func reserveTail() { limit = Log.lineCapacity - 1 - AccessLine.tail }
+    mutating func releaseTail() { limit = Log.lineCapacity - 1 }
+
+    mutating func str(_ s: StaticString) {
+        bytes.append(contentsOf: UnsafeBufferPointer(start: s.utf8Start, count: s.utf8CodeUnitCount))
+    }
+
+    mutating func raw(_ s: ByteSpan) {
+        bytes.append(contentsOf: UnsafeBufferPointer(start: s.base, count: s.count))
+    }
+
+    mutating func int(_ value: Int) {
+        if value < 0 { bytes.append(0x2D) }
+        var v = value.magnitude
+        let start = bytes.count
+        repeat {
+            bytes.append(UInt8(truncatingIfNeeded: 0x30 &+ v % 10))
+            v /= 10
+        } while v > 0
+        bytes[start...].reverse()
+    }
+
+    /// Peer bytes for the text line: a control character or a backslash is
+    /// written as `\xNN`, so nothing a client sent can end the line or fool a
+    /// terminal.
+    mutating func text(_ s: ByteSpan) {
+        let hex: StaticString = "0123456789abcdef"
+        var i = 0
+        while i < s.count {
+            let c = s.base[i]
+            let escaped = c < 0x20 || c == 0x7F || c == 0x5C
+            if bytes.count + (escaped ? 4 : 1) > limit {
+                truncated = true
+                return
+            }
+            if escaped {
+                bytes.append(0x5C)
+                bytes.append(0x78)
+                bytes.append(hex.utf8Start[Int(c >> 4)])
+                bytes.append(hex.utf8Start[Int(c & 0xF)])
+            } else {
+                bytes.append(c)
+            }
+            i &+= 1
+        }
+    }
+
+    /// Peer bytes as a JSON string. Bytes that are not well-formed UTF-8 --
+    /// a target need not be -- are each written as `\u00NN`, which keeps the
+    /// line valid JSON; a cut never splits a character.
+    mutating func json(_ s: ByteSpan) {
+        let hex: StaticString = "0123456789abcdef"
+        let asciiOnly = !AccessLine.isUTF8(s)
+        bytes.append(0x22)
+        var i = 0
+        while i < s.count {
+            let c = s.base[i]
+            // A character's bytes go in together or not at all.
+            var length = 1
+            if !asciiOnly && c >= 0xC0 {
+                length = c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : 2)
+            }
+            let escaped = c < 0x20 || c == 0x7F || (asciiOnly && c >= 0x80)
+            let needed = escaped ? 6 : (c == 0x22 || c == 0x5C ? 2 : length)
+            // One more for the closing quote.
+            if bytes.count + needed + 1 > limit {
+                truncated = true
+                break
+            }
+            if escaped {
+                bytes.append(contentsOf: [0x5C, 0x75, 0x30, 0x30])
+                bytes.append(hex.utf8Start[Int(c >> 4)])
+                bytes.append(hex.utf8Start[Int(c & 0xF)])
+            } else if c == 0x22 || c == 0x5C {
+                bytes.append(0x5C)
+                bytes.append(c)
+            } else {
+                bytes.append(contentsOf: UnsafeBufferPointer(start: s.base + i, count: length))
+            }
+            i &+= length
+        }
+        bytes.append(0x22)
+    }
+
+    static func isUTF8(_ s: ByteSpan) -> Bool {
+        var iterator = UnsafeBufferPointer(start: s.base, count: s.count).makeIterator()
+        var decoder = UTF8()
+        while true {
+            switch decoder.decode(&iterator) {
+            case .scalarValue: continue
+            case .emptyInput: return true
+            case .error: return false
+            }
+        }
     }
 }

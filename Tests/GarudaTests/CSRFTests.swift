@@ -1,6 +1,6 @@
 import Testing
-@testable import Garuda
-import AvianHTTP
+import Garuda
+import GarudaTesting
 
 // Cross-site request forgery protection from Sec-Fetch-Site and Origin.
 
@@ -10,13 +10,13 @@ struct CSRFTests {
         let app = Application()
         app.group("/form") {
             app.csrfProtection(trustedOrigins: ["https://Admin.example.com"])
-            app.get("/") { "read" }
-            app.post("/") { "posted" }
-            app.put("/") { "put" }
-            app.delete("/") { "deleted" }
-            app.patch("/") { "patched" }
+            app.get("/") { () in "read" }
+            app.post("/") { () in "posted" }
+            app.put("/") { () in "put" }
+            app.delete("/") { () in "deleted" }
+            app.patch("/") { () in "patched" }
         }
-        app.post("/open") { "open" }
+        app.post("/open") { () in "open" }
         return app
     }
 

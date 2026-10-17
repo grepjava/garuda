@@ -1,33 +1,29 @@
 import Testing
 import Synchronization
-#if canImport(Glibc)
-import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 @testable import Garuda
-import AvianCore
+import GarudaTesting
 
 // request.log and AppLog: the request's fields, both formats, escaping, and
-// the 4096-byte line.
+// the 4096-byte line. Then the access log, and the flags that turn them on.
 
 private final class Captured: Sendable {
     let lines = Mutex<[String]>([])
     func take() -> [String] { lines.withLock { let out = $0; $0.removeAll(); return out } }
 }
 
-/// Runs `body` with application log lines captured, in `json` or text.
+/// Runs `body` with application and access log lines captured, the
+/// application's in `json` or text.
 private func capturing(json: Bool, _ body: (Captured) throws -> Void) rethrows {
     let captured = Captured()
     let savedJSON = AppLogOutput.json
-    let savedPID = Log.pid
+    let savedPID = Log.fixedPID
     AppLogOutput.json = json
-    Log.pid = 0
+    Log.fixedPID = 0
     AppLogOutput.capture = { line in captured.lines.withLock { $0.append(line) } }
     defer {
         AppLogOutput.capture = nil
         AppLogOutput.json = savedJSON
-        Log.pid = savedPID
+        Log.fixedPID = savedPID
     }
     try body(captured)
 }
@@ -43,20 +39,22 @@ struct LoggingTests {
             request.log.info("order looked up", ["order": "\(request.parameter(0))", "cents": 1250, "paid": true])
             response.send("ok")
         }
-        app.onAsync(.get, "/later") { request, response in
+        app.get("/later") { request, response in
             let log = request.log.with(["user": "ada"])
-            await loopYield()
+            await Task.yield()
             log.warning("after an await")
             response.send("ok")
         }
+        app.get("/quiet") { _, response in response.send("ok") }
         return app
     }
 
-    private func client(_ app: Application) -> TestClient {
+    private func client(_ app: Application, accessLog: Bool = false, json: Bool = false) -> TestClient {
         var config = ServerConfig()
-        config.maxConnections = 16
         config.requestID = true
         config.traceContext = true
+        config.accessLog = accessLog
+        config.accessLogJSON = json
         return app.testClient(configuration: config)
     }
 
@@ -138,16 +136,106 @@ struct LoggingTests {
         }
     }
 
-    @Test func theFlagChoosesTheFormatAndTheAccessLogFollows() throws {
-        // The parser keeps pointers into argv, so the strings are never freed.
-        func parsed(_ arguments: [String]) -> GarudaCLI.Parsed {
-            let argv = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: arguments.count + 2)
-            for (i, argument) in (["garuda"] + arguments).enumerated() { argv[i] = strdup(argument) }
-            argv[arguments.count + 1] = nil
-            return GarudaCLI.parse(argc: arguments.count + 1, argv: argv)
+    @Test func aRequestLogCarriesNoIDWithoutTheFlags() throws {
+        try capturing(json: false) { captured in
+            let response = try app().test.get("/orders/5", headers: [("traceparent", traceparent)])
+            #expect(response.header("x-request-id") == nil)
+            #expect(captured.take() == [
+                "[info]  order looked up order=5 cents=1250 paid=true method=GET path=/orders/5",
+            ])
         }
+    }
+
+    // MARK: The access log
+
+    @Test func theAccessLogWritesALinePerRequest() throws {
+        try capturing(json: false) { captured in
+            let client = client(app(), accessLog: true)
+            let response = try client.get("/quiet?full=1", headers: [("traceparent", traceparent)])
+            let id = try #require(response.header("x-request-id"))
+            let line = try #require(captured.take().first)
+            #expect(line.hasPrefix("garuda info: GET /quiet?full=1 200 "))
+            #expect(line.hasSuffix("us id=\(id) trace=4bf92f3577b34da6a3ce929d0e0e4736 span=00f067aa0ba902b7"))
+
+            // A miss is logged too, with no ID or trace it did not carry...
+            #expect(try client.get("/nowhere").status == 404)
+            let miss = try #require(captured.take().first)
+            #expect(miss.hasPrefix("garuda info: GET /nowhere 404 "))
+            #expect(!miss.contains("trace="))
+        }
+    }
+
+    @Test func theJSONAccessLogIsABareObject() throws {
+        try capturing(json: false) { captured in
+            let response = try client(app(), accessLog: true, json: true).get("/quiet")
+            let id = try #require(response.header("x-request-id"))
+            let line = try #require(captured.take().first)
+            #expect(line.hasPrefix(#"{"level":"info","method":"GET","target":"/quiet","status":200,"duration_us":"#))
+            #expect(line.hasSuffix(#","proto":"HTTP/1.1","request_id":"\#(id)"}"#))
+        }
+    }
+
+    @Test func aLongTargetIsCutAndTheLineStillCloses() throws {
+        let long = "/quiet?" + String(repeating: "q", count: 6000)
+        try capturing(json: false) { captured in
+            _ = try client(app(), accessLog: true, json: true).get(long)
+            let line = try #require(captured.take().first)
+            #expect(line.utf8.count <= 4095)
+            #expect(line.contains(#""status":200"#))
+            #expect(line.hasSuffix(#","truncated":true}"#))
+        }
+        try capturing(json: false) { captured in
+            _ = try client(app(), accessLog: true).get(long)
+            let line = try #require(captured.take().first)
+            #expect(line.utf8.count <= 4095)
+            #expect(line.contains(" 200 "))
+            #expect(line.hasSuffix(" truncated=true"))
+        }
+    }
+
+    @Test func peerBytesCannotBreakALine() throws {
+        // A target is the client's bytes, and need not be UTF-8. The parser
+        // has already refused control characters and spaces in it.
+        let raw = Array("GET /quiet?a=\"\\".utf8) + [0xFF, 0xFE]
+            + Array(" HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n".utf8)
+        try capturing(json: false) { captured in
+            let response = try client(app(), accessLog: true, json: true).send(raw: raw)
+            #expect(response.status == 200)
+            let line = try #require(captured.take().first)
+            #expect(line.contains(#""target":"/quiet?a=\"\\\u00ff\u00fe""#))
+        }
+        try capturing(json: false) { captured in
+            let response = try client(app(), accessLog: true).send(raw: raw)
+            #expect(response.status == 200)
+            let line = try #require(captured.take().first)
+            #expect(line.contains(#"/quiet?a="\x5c"#))
+        }
+    }
+
+    @Test func aHeadThatCannotBeReadIsLoggedWithoutOne() throws {
+        try capturing(json: false) { captured in
+            let response = try client(app(), accessLog: true).send(raw: Array("NOT A REQUEST\r\n\r\n".utf8))
+            #expect(response.status == 505)
+            let line = try #require(captured.take().first)
+            #expect(line == "garuda info: - - 505 0us")
+        }
+    }
+
+    @Test func theAccessLogIsQuietAboveInfo() throws {
+        let saved = Log.level
+        Log.level = .warning
+        defer { Log.level = saved }
+        try capturing(json: false) { captured in
+            _ = try client(app(), accessLog: true).get("/quiet")
+            #expect(captured.take().isEmpty)
+        }
+    }
+
+    // MARK: Flags
+
+    @Test func theFlagChoosesTheFormatAndTheAccessLogFollows() throws {
         func parse(_ arguments: [String]) -> ServerConfig? {
-            if case .run(let config) = parsed(arguments) { return config }
+            if case .run(let config) = ServerConfig.parse(["garuda"] + arguments) { return config }
             return nil
         }
         let json = try #require(parse(["--log-format", "json"]))
@@ -155,11 +243,27 @@ struct LoggingTests {
         let text = try #require(parse(["--log-format", "json", "--access-log-format", "text"]))
         #expect(text.logJSON && !text.accessLogJSON && text.accessLog)
         let plain = try #require(parse([]))
-        #expect(!plain.logJSON && !plain.accessLogJSON)
-        if case .exit(let status) = parsed(["--log-format", "xml"]) {
+        #expect(!plain.logJSON && !plain.accessLogJSON && !plain.accessLog)
+        if case .exit(let status) = ServerConfig.parse(["garuda", "--log-format", "xml"]) {
             #expect(status == 2)
         } else {
             Issue.record("an unknown format was accepted")
+        }
+    }
+
+    @Test func theRequestFlagsAreRead() throws {
+        func parse(_ arguments: [String]) -> ServerConfig? {
+            if case .run(let config) = ServerConfig.parse(["garuda"] + arguments) { return config }
+            return nil
+        }
+        let all = try #require(parse(["--request-id", "--trace-context", "--access-log",
+                                      "--forwarded-allow-ips", "10.0.0.0/8, unix"]))
+        #expect(all.requestID && all.traceContext && all.accessLog)
+        #expect(all.trust.trustUnix && all.trust.nets.count == 1)
+        if case .exit(let status) = ServerConfig.parse(["garuda", "--forwarded-allow-ips", "not-an-address"]) {
+            #expect(status == 2)
+        } else {
+            Issue.record("a list that is not addresses was accepted")
         }
     }
 }

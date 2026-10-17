@@ -4,14 +4,13 @@
 //     let id = UUID.random()
 //     try await db.execute("insert into orders (id, placed) values ($1, $2)", id, Timestamp.now)
 //
-// Sixteen bytes. It binds to PostgreSQL as a uuid in binary, reads back from
-// a uuid column in either format, and is a string in JSON. Written as
-// `Garuda.UUID` wherever Foundation's is also in scope.
+// Sixteen bytes, and a string in JSON. GarudaPostgres binds it as a uuid and
+// reads it back from one in either format; GarudaSQLite stores it as text.
+// Written as `Garuda.UUID` wherever Foundation's is also in scope.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import GarudaPostgres
+import GarudaWire
+import VegaCrypto
 
 public struct UUID: Hashable, Comparable, Sendable {
     /// The first eight bytes, big-endian.
@@ -37,13 +36,10 @@ public struct UUID: Hashable, Comparable, Sendable {
         self.init(bytes: bytes)
     }
 
-    /// A version 4 UUID: 122 random bits from the system's generator.
+    /// A version 4 UUID: 122 random bits from the system's generator, which
+    /// stops the program rather than hand out bytes that might repeat.
     public static func random() -> UUID {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        let filled = bytes.withUnsafeMutableBytes { av_random_bytes($0.baseAddress, 16) }
-        // An identifier that might repeat is worse than none: a system that
-        // cannot hand out random bytes is not one to keep running on.
-        precondition(filled == 0, "the system's random generator failed")
+        var bytes = SecureRandom.bytes(16)
         bytes[6] = bytes[6] & 0x0F | 0x40
         bytes[8] = bytes[8] & 0x3F | 0x80
         return UUID(bytes: bytes)!
@@ -84,8 +80,4 @@ extension UUID: Codable {
     public func encode(to encoder: any Encoder) throws {
         try description.encode(to: encoder)
     }
-}
-
-extension UUID: PostgresBindable {
-    public var postgresValue: PostgresValue { .binary(bytes, type: PostgresType.uuid) }
 }

@@ -1,6 +1,6 @@
 import Testing
 @testable import Garuda
-import AvianHTTP
+import GarudaTesting
 
 // Reading cookies, Set-Cookie, and signed and encrypted cookies.
 
@@ -36,7 +36,7 @@ struct CookiesTests {
             response.setCookie(session)
             response.setCookie(Cookie("embed", "1", httpOnly: false, sameSite: Cookie.SameSite.none))
             var old = Cookie("legacy", "v", path: nil, sameSite: nil)
-            old.expires = Timestamp(secondsSinceEpoch: 784_111_777)
+            old.expires = 784_111_777
             old.partitioned = true
             response.setCookie(old)
             response.removeCookie("gone")
@@ -67,19 +67,18 @@ struct CookiesTests {
         #expect(try client.get("/bad").headers(named: "set-cookie").isEmpty)
     }
 
-    @Test func aCookieIsSecureOverHTTPSFromATrustedProxy() throws {
+    @Test func aCookieIsNotSecureOverPlainHTTPUnlessItSaysSo() throws {
         let app = Application()
         app.get("/") { _, response in
             response.setCookie(Cookie("a", "1"))
-            response.setCookie(Cookie("b", "2", secure: false))
+            response.setCookie(Cookie("b", "2", secure: true))
             response.send("ok")
         }
-        var config = ServerConfig()
-        config.maxConnections = 16
-        #expect("127.0.0.1".withCString { config.trust.parse($0) })
-        let headers = try app.testClient(configuration: config)
-            .get("/", headers: [("x-forwarded-proto", "https")]).headers(named: "set-cookie")
-        #expect(headers == ["a=1; Path=/; Secure; HttpOnly; SameSite=Lax", "b=2; Path=/; HttpOnly; SameSite=Lax"])
+        let headers = try app.test.get("/").headers(named: "set-cookie")
+        #expect(headers == ["a=1; Path=/; HttpOnly; SameSite=Lax", "b=2; Path=/; Secure; HttpOnly; SameSite=Lax"])
+        #expect(setCookieHeader(Cookie("a", "1"), value: "1", https: true) == "a=1; Path=/; Secure; HttpOnly; SameSite=Lax")
+        #expect(setCookieHeader(Cookie("b", "2", secure: false), value: "2", https: true)
+            == "b=2; Path=/; HttpOnly; SameSite=Lax")
     }
 
     private func protectedApp(_ key: CookieKey) -> Application {
@@ -150,5 +149,28 @@ struct CookiesTests {
         #expect(CookieKey(base64: "c2hvcnQ=") == nil)
         #expect(CookieKey(base64: "not base64!") == nil)
         #expect(CookieKey(base64: text, previous: ["c2hvcnQ="]) == nil)
+    }
+
+    @Test func base64RoundTripsInEitherAlphabet() {
+        for count in 0..<40 {
+            let bytes = (0..<count).map { UInt8(truncatingIfNeeded: $0 &* 37 &+ 250) }
+            let text = base64URLEncode(bytes)
+            #expect(!text.contains("=") && !text.contains("+") && !text.contains("/"))
+            #expect(base64Decode(text) == bytes)
+        }
+        #expect(base64URLEncode(Array("hello?>".utf8)) == "aGVsbG8_Pg")
+        #expect(base64Decode("aGVsbG8/Pg==") == Array("hello?>".utf8))
+        #expect(base64Decode("aGVsbG8_Pg") == Array("hello?>".utf8))
+        #expect(base64Decode("a") == nil)
+        #expect(base64Decode("aG=Vs") == nil)
+        #expect(base64Decode("aGVs bG8") == nil)
+    }
+
+    @Test func anEmptyProtectedValueRoundTrips() {
+        let key = CookieKey(secret: secret)
+        for kind in [CookieProtection.signed, .encrypted] {
+            let value = protectCookie(name: "e", value: "", key: key, kind)
+            #expect(unprotectCookie(name: "e", value: value, key: key, kind) == "")
+        }
     }
 }

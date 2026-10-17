@@ -1,0 +1,2 @@
+db        garuda               30227 req/s   p50    1.997   p95    3.137   p99     3.370 ms   cpu    92 us/req   mem    21 MiB   errors 0
+7 s

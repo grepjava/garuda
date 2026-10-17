@@ -26,11 +26,21 @@ app.get("/person/:id") { (id: Path<Int>) async in
 }
 ```
 
-The key difference is where the handler runs. axum makes every handler a future and runs it on Tokio, a work-stealing scheduler: an idle thread takes a waiting task from a busy one. SwiftNIO is that design in Swift. An event loop owns the socket, and the handler is a task the runtime resumes.
+This is Garuda 2. It runs on [Vega](https://github.com/grepjava/vega), a
+work-stealing runtime for Swift in the shape of Tokio and an alternative to
+SwiftNIO ([how they compare](https://github.com/grepjava/vega#vega-swiftnio-and-tokio)): an idle thread takes a
+waiting task from a busy one, at any `await`. Every handler is async, and a
+handler that does not suspend runs inline in the task that read its request,
+with no hop onto another executor and nothing allocated. The engine parses
+HTTP/1.1, HTTP/2 and HTTP/3 itself, the last on Garuda's own QUIC.
 
-Garuda does not use either. The worker thread that read the request runs the handler, and a response that can be sent at once is written on that thread. There is no hop onto a scheduler before those bytes go out, which is what SwiftNIO would insert between the read and the write. The engine parses HTTP/1.1, HTTP/2 and HTTP/3 itself.
-
-A worker is one process and one thread. Nothing is shared across workers, so nothing is locked, and a crash takes only that worker's connections. That boundary matters more in Swift than in Rust: a force-unwrapped `nil` ends the process, where Tokio catches a panic inside the task that raised it. Processes cannot steal tasks from each other. A worker that is ahead leaves new connections to the others, and can hand idle HTTP/1 keep-alive connections to a worker where they would not wait (`--balance`). [One process per worker](#one-process-per-worker) has the rest.
+A supervisor starts **shards**. A shard is a process with its own Vega runtime
+over several threads, so work is stolen between the threads of a shard and
+never between shards. That boundary matters more in Swift than in Rust: a
+force-unwrapped `nil` ends the process, where Tokio catches a panic inside the
+task that raised it. Here a crash takes only that shard's connections, and the
+supervisor starts the shard again. [Shards are processes](#shards-are-processes)
+has the rest, and [ARCHITECTURE.md](ARCHITECTURE.md) the design.
 
 Swift 6.2 or newer. No Foundation, no SwiftNIO.
 
@@ -40,54 +50,52 @@ This project is an independent effort. It is not an IBM product, and it is not a
   <a href="https://github.com/grepjava/garuda/blob/main/LICENSE"><img src="https://img.shields.io/github/license/grepjava/garuda" alt="MIT license"></a>
 </p>
 
-**Released: 1.0.** The surface below is implemented and tested. [COMPATIBILITY.md](COMPATIBILITY.md) says what a release may change, and [Status](#status) below lists what is missing.
+**Garuda 2.0.0 is released** (2026-10-16; [RELEASE.md](RELEASE.md) has what
+changed). Garuda 1 (1.1) stays on the `release/1.x` branch.
+[COMPATIBILITY.md](COMPATIBILITY.md) is the guide to moving from Garuda 1 to
+Garuda 2, and [Status](#status) below lists what Garuda 2 does not have yet.
 
 ## Features
 
 | Area | What Garuda provides |
 | --- | --- |
 | HTTP | HTTP/1.1 with a parser strict where that prevents request smuggling, HTTP/2 over TLS and in cleartext, and HTTP/3 over QUIC |
-| TLS and certificates | TLS 1.2 and 1.3, several certificates chosen by SNI, and ACME renewal with tls-alpn-01 on the port already served |
-| Handlers | Routes, groups, and middleware. A synchronous handler is a direct call on the worker thread. An async handler runs on a task reused from that worker's pool |
+| TLS and certificates | TLS 1.2 and 1.3 on BoringSSL (the default) or the system's OpenSSL 3, several certificates chosen by SNI, and certificates reloaded from disk without a restart |
+| Handlers | Routes, groups, and middleware that wraps the handler. One async handler API on Vega's work-stealing shards; a route that holds its thread for long runs in the heavy lane, and a blocking one can be offloaded |
 | Typed API | Extractors for path, query, JSON body, form, and multipart. Answers as JSON, HTML, text, bytes, or a redirect. A type can validate its values; every broken rule is returned together as 422 |
 | OpenAPI | An OpenAPI 3.1 document generated from the routes, and Swagger UI |
 | Application middleware | Deadlines, CORS, bearer and basic authentication, authorization policies, CSRF protection, security headers, signed and encrypted cookies, and sessions in memory, Redis, or SQLite |
 | Identity | JWT (HS, RS, PS, ES, and EdDSA), JWKS verification, rotating refresh tokens, and PBKDF2-HMAC-SHA256 password hashing |
-| HTTP client | HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed bodies, and server-sent events |
-| Data | PostgreSQL and Redis on the worker's poller, including Redis Cluster and Sentinel, and SQLite through the system's libsqlite3 |
-| Streaming | Streamed responses and request bodies, server-sent events, broadcast across worker processes, and interim 1xx responses such as 103 Early Hints |
+| HTTP client | HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed response bodies, and server-sent events |
+| Data | PostgreSQL, Redis (including Redis Cluster and Sentinel) and SQLite, from [vega-db](https://github.com/grepjava/vega-db) through `GarudaPostgres`, `GarudaRedis` and `GarudaSQLite` |
+| Streaming | Streamed responses, request bodies read as they arrive, server-sent events, broadcast across shards, and interim 1xx responses such as 103 Early Hints |
+| Uploads | Resumable uploads (draft-ietf-httpbis-resumable-upload) through `GarudaUploads`: the body goes to disk as it arrives, and a client whose connection drops asks how much arrived and sends the rest |
 | WebSockets | WebSockets over HTTP/1.1, HTTP/2, and HTTP/3. The engine joins fragments, checks UTF-8, answers pings, and supports permessage-deflate |
 | WebTransport | WebTransport over HTTP/3 on the same port and routes, with bidirectional and unidirectional streams and datagrams |
-| IETF Resumable Uploads | The IETF resumable upload protocol (draft-ietf-httpbis-resumable-upload, interop version 9). A client cut off mid-upload resumes on any worker and over any of the three HTTP protocols |
-| Files and compression | Static files with sendfile, ETag, and byte ranges, including precompressed copies. Response and request compression with brotli, zstd, and gzip |
-| Request limits | A body limit and a concurrency limit on a group of routes. Rate limiting counted across workers |
+| Files and compression | Static files with ETag and byte ranges, including precompressed copies. Response and request compression with brotli, zstd, and gzip |
+| Request limits | A body limit and a concurrency limit on a group of routes. Rate limiting counted across shards |
 | Edge policy | HTTPS redirect, HSTS, trusted proxy headers, allowed hosts, and client address allow and deny lists |
-| Operations | Prometheus metrics, health checks, request IDs, W3C trace context, an access log, a shared response cache, graceful shutdown, and reload on SIGHUP. Unix sockets and more than one worker |
+| Operations | Prometheus metrics, health checks, request IDs, W3C trace context, an access log, a response cache shared by the shards, graceful shutdown with a drain delay, and a rolling restart on SIGHUP. Unix sockets and more than one shard |
 | Tracing | Spans through swift-distributed-tracing for the request, outbound HTTP, PostgreSQL, and Redis |
-| Tests | `app.test` runs the real engine in the test process, over a socket pair |
-| Process model | A supervisor accepts connections and forks one process per worker. In-memory state is per worker |
-| Platforms | Linux and macOS 15, on Swift 6.2 or newer |
+| Tests | `app.test`, from `GarudaTesting`, runs requests through the real HTTP/1 connection over an in-memory stream, and has an HTTP/2 client too. The parsers that read the network are fuzzed (`pgfuzz`) |
+| Process model | A supervisor starts shard processes, each a work-stealing runtime over several threads. In-memory state is per shard |
+| Platforms | Linux, and macOS 26.4 or newer, on Swift 6.2 or newer. Windows is experimental, and serves in one process only |
 
-Outside this release: QUIC 0-RTT and QUIC session resumption, kernel TLS, `multipart/byteranges`, reads from Redis replicas, and Windows other than through WSL 2.
+Not in Garuda 2: a built-in ACME client, QUIC 0-RTT and session resumption,
+kernel TLS, `multipart/byteranges`, and reads from Redis replicas.
+[What Garuda 2 does not have](COMPATIBILITY.md#what-garuda-2-does-not-have)
+lists what Garuda 1 had.
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/grepjava/garuda/main/assets/benchmark-256.png" alt="Requests per second at 256 connections: ntex 181,303, axum 176,794, Garuda 174,575, Elysia on Bun 167,754, Hummingbird 62,068, Vapor 48,359" width="900">
-</p>
-
-Every server runs the same three-route application and the same load command,
-each in an invocation of its own, and the six rotate so that no server is
-always measured last. **Garuda's range and axum's overlap, so these rounds do
-not separate them**; ntex is ahead of both, and Garuda is 2.8x Hummingbird and
-3.6x Vapor. [BENCHMARKS.md](BENCHMARKS.md) has the method, the rounds behind
-each bar, and the runs where Garuda is slower.
-
-External benchmark: [the-benchmarker](https://web-frameworks-benchmark.netlify.app/result?l=swift&f=garuda) measures Garuda on its own hardware and load command. The chart above is a separate run on our hardware.
+[BENCHMARKS.md](BENCHMARKS.md) has the benchmark method and
+[Garuda 2 against Garuda 1 and axum](BENCHMARKS.md#garuda-2-against-garuda-1-and-axum),
+measured on the same clock-capped machine, with links to the code each server
+runs.
 
 ## Quick start
 
 ```bash
 swift build -c release
-.build/release/garuda --port 8000 --workers 0
+.build/release/garuda --port 8000
 curl -i http://127.0.0.1:8000/user/42
 ```
 
@@ -96,13 +104,13 @@ depends on the `Garuda` library:
 
 ```swift
 // Package.swift
-dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "1.1.0")],
+platforms: [.macOS("26.4")],
+dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "2.0.0")],
 targets: [.executableTarget(name: "app", dependencies: [.product(name: "Garuda", package: "garuda")])]
 ```
 
 ```swift
 // Sources/app/main.swift
-import Glibc   // Darwin on macOS
 import Garuda
 
 struct Person: Codable { let id: Int; let name: String }
@@ -111,19 +119,22 @@ let app = Application()
 app.get("/person/:id") { (id: Path<Int>) async in
     JSON(Person(id: id.value, name: "Ada"))
 }
-exit(app.run())
+app.run()
 ```
 
-`app.run()` reads the same command-line flags as the `garuda` binary. Swift 6.2
-or newer, on Linux or macOS 15 -- 6.2 because a borrowed body is a `Span`. [INSTALLATION.md](INSTALLATION.md) lists the
-system packages, certificates and running as a service.
+`app.run()` reads the same command-line flags as the `garuda` binary, and does
+not return. Swift 6.2 or newer, on Linux or macOS 26.4 -- 6.2 because a
+borrowed body is a `Span`, macOS 26.4 because Vega's executor needs that
+release's runtime. [INSTALLATION.md](INSTALLATION.md) lists the system
+packages, the TLS library traits and certificates.
 
-[Examples/](Examples/README.md) has complete applications to run and copy
-from: a CRUD API on SQLite, accounts with hashed passwords and sessions,
-streaming both ways, chat rooms over WebSockets across workers, a file service
-with resumable uploads and ranged downloads, per-user photo uploads that are
-authenticated and resumable, a network probe over WebTransport, and a whole
-starter application on PostgreSQL.
+The databases, resumable uploads and the test client are products of their
+own: `GarudaPostgres`, `GarudaRedis`, `GarudaSQLite`, `GarudaUploads` and
+`GarudaTesting`.
+
+[Examples/](Examples/README.md) has eight complete applications to run and
+copy from, all on Garuda 2: a todo API, sign-in, streaming, chat,
+WebTransport, a file service, per-user uploads, and a starter.
 
 ## Writing handlers
 
@@ -141,11 +152,10 @@ app.post("/login") { (form: Form<Credentials>) async in Redirect(to: "/") }
 
 - **Extractors:** `Path<T>` (the next path parameter, percent-decoded),
   `Query<T>`, `Body<T>` (JSON), `Form<T>`, `Multipart`, `State<T>`,
-  `Context<Key>`, or your own `RequestExtractor`. An `AsyncRequestExtractor`
-  may await, to load the signed-in user from a database, for an async handler.
-  `E?` is nil where `E` would refuse, and `Result<E, any Error>` hands the
-  handler the refusal. A value that will not decode is a 400 that says what
-  was wrong.
+  `Context<Key>`, or your own `RequestExtractor`, whose `extract` may await --
+  to load the signed-in user from a database, say. `E?` is nil where `E`
+  would refuse, and `Result<E, any Error>` hands the handler the refusal. A
+  value that will not decode is a 400 that says what was wrong.
 - **Answers:** `JSON`, `HTML`, `Text`, `Bytes`, `Redirect`, a `String`, an
   `HTTPStatus`, or an Optional whose `nil` is a 404.
 - **Errors:** a thrown `ResponseError` is the response.
@@ -167,6 +177,9 @@ struct NewOrder: Decodable, Validated {
 
 Every broken rule is answered at once, as 422 with the fields named: `{"error":"quantity must be at least 1","fields":[{"field":"quantity","message":"must be at least 1"}]}`. A decoding failure fills `fields` the same way, from the path it already reports, so one answer tells a form where each message goes whichever of the two refused the request.
 
+Handler closures are `@Sendable`: the threads of a shard run them at once, so
+what they capture must be safe to share.
+
 JSON goes through Garuda's own coder over `Encodable` and `Decodable`, which
 reads only the keys a type asks for, straight from the request bytes. `@JSON`
 takes a type off `Codable` altogether:
@@ -184,19 +197,18 @@ import GarudaJSON
 Nothing at the call site changes -- the same `Body<Order>`, the same
 `JSON(order)` -- and the type keeps `Codable` for everything else.
 `@PostgresRow`, from `GarudaSQL`, does the same for a database row: a
-property is read from the column of its own name, and `first(Item.self, ...)`
-is written the same way either way. The macro
-writes the reading and the writing out longhand; the bytes are the same ones
-Codable sent, and the `json` workload's request went from 15.6 microseconds to
-13.2 on one worker. It lives in its own module because it is the only part of
-Garuda that needs swift-syntax.
+property is read from the column of its own name. The macro writes the
+reading and the writing out longhand, and the bytes are the same ones Codable
+sent; on the JSON workload it takes about a fifth off the time a request
+takes. It lives in its own module because it is the only part of Garuda that
+needs swift-syntax.
 
 ### The raw layer
 
 Under the typed API, a handler can take the request and response directly:
 
 ```swift
-app.onAsync(.get, "/user/:id") { request, response in
+app.get("/user/:id") { request, response in
     request.withParameter(0) { response.send($0) }   // lent bytes, no copy
 }
 ```
@@ -206,41 +218,38 @@ closure as a `Span`, which the compiler keeps from escaping (`withPath`,
 `withHeader`, `withBody` and others). `path`, `header(_:)`, `body` and the rest
 return owned copies.
 
-### Async handlers, deadlines and the HTTP client
-
-A closure that awaits is an async handler. It runs on a task reused from the
-worker's pool, on the worker's own thread, and allocates nothing per request
-once warm.
+### Deadlines and the HTTP client
 
 ```swift
-app.deadline(milliseconds: 500) {
-    app.onAsync(.get, "/weather/:city") { request, response in
-        let client = request.client              // read before the first await
+app.deadline(.milliseconds(500)) {
+    app.get("/weather/:city") { request, response in
         let city = request.parameter(0)
-        let answer = try await client.get("https://api.example.com/\(city)")
+        let answer = try await HTTPClient().get("https://api.example.com/\(city)")
         response.send(bytes: answer.body, contentType: "application/json")
     }
 }
 ```
 
-A request still unanswered at its deadline is answered 504. A closed connection
-or reset stream cancels a handler waiting on the engine. `request.client`
-speaks HTTP/1.1, and HTTP/2 over TLS when the server offers it. It resolves
-names on the worker's poller and keeps connections for reuse. It asks for
-gzip, deflate, brotli and zstd and decodes what comes back, and it follows
-redirects only when `client.redirects` says to: `.sameOrigin()`, `.any()` or
-`.matching { url in … }`. `client.timeoutMilliseconds` bounds each wait;
-`client.totalTimeoutMilliseconds` bounds the whole exchange, redirects included,
-for work no route deadline covers.
+A request still unanswered at its deadline is answered 504. A deadline bounds
+waits on I/O -- sockets, pipes, databases -- and not computing, a
+`Runtime.sleep` or a child task's wait. On HTTP/2 and HTTP/3 a reset stream
+cancels its handler's task, and `Task.isCancelled` sees it.
+
+`HTTPClient` is a value, made wherever it is needed. It speaks HTTP/1.1, and
+HTTP/2 over TLS when the server offers it, and keeps connections for reuse in
+the shard. It asks for gzip, deflate, brotli and zstd and decodes what comes
+back, and it follows redirects only when `client.redirects` says to:
+`.sameOrigin()`, `.any()` or `.matching { url in … }`. `client.timeout` bounds
+each wait; `client.totalTimeout` bounds the whole exchange, redirects
+included.
 
 `client.stream` returns once the response head is in, and the body is read as
 it arrives -- a large file relayed on, an upstream's server-sent events, a
 model's tokens -- rather than held whole:
 
 ```swift
-app.onAsync(.get, "/relay") { request, response in
-    let client = request.client                  // read before the first await
-    let upstream = try await client.stream(.get, "https://llm.example/v1/stream")
+app.get("/relay") { request, response in
+    let upstream = try await HTTPClient().stream(.get, "https://llm.example/v1/stream")
     let body = response.stream(contentType: "text/event-stream")
     while let event = try await upstream.nextEvent() {
         try await body.write("data: \(event.data)\n\n")
@@ -248,21 +257,28 @@ app.onAsync(.get, "/relay") { request, response in
 }
 ```
 
-A streamed body is not held to `maxBodyBytes`. A caller that stops reading
+A streamed response is not held to `maxBodyBytes`. A caller that stops reading
 stops the upstream: over HTTP/1.1 by TCP's window, over HTTP/2 because the
-stream's window opens only as the caller reads. `cancel()` gives up the rest.
+stream's window opens only as the caller reads.
 
 ### State, groups and middleware
 
 ```swift
+import GarudaPostgres
+
+struct User: Codable, Sendable { let id: Int; let name: String }
+enum CurrentUser: RequestContextKey { typealias Value = User }
+
 app.state { _ in PostgresPool(PostgresConfiguration(host: "db", user: "app", password: secret)) }
 
 app.group("/api") {
     app.cors(CORSPolicy(origins: ["https://app.example.com"], allowCredentials: true))
-    app.authenticate(bearer: CurrentUser.self) { token in try await sessions.user(token) }
-    app.use { request, response async throws -> (any ResponseConvertible)? in
-        response.onSend { outgoing in outgoing.addHeader("cache-control", "no-store") }
-        return nil
+    app.authenticate(bearer: CurrentUser.self, state: PostgresPool.self) { token, db in
+        try await db.first(User.self, "select id, name from users where token = $1", token)
+    }
+    app.use { request, response, next in
+        try await next()
+        response.addHeader("cache-control", "no-store")
     }
     app.get("/user/:id") { (id: Path<Int>, db: State<PostgresPool>) async throws in
         try await db.value.first(User.self, "select id, name from users where id = $1", id.value).map { JSON($0) }
@@ -270,15 +286,18 @@ app.group("/api") {
 }
 ```
 
-- `app.state` builds a value once in each worker process, after the fork. One
-  value per type; registering a type twice is refused.
+- `app.state` builds a value once in each shard, before it accepts a
+  connection, and every thread of the shard shares it, so it is `Sendable`.
+  One value per type; registering a type twice is refused. `onShardStart` and
+  `onShardStop` run hooks as a shard starts and stops.
 - `app.problems()` is what the routes cannot do, found before serving: a
   handler taking more `Path` extractors than its pattern has parameters, or
-  asking for a `State<T>` nothing registered. `run()` prints them and exits 2
+  asking for a `State<T>` nothing registered. `run()` logs them and exits 2
   instead of starting, and a test can assert `app.problems().isEmpty`.
-- `app.use` runs before every route in its scope, whether it is called before
-  or after the routes. It returns `nil` to carry on or an answer to send
-  instead, and can be async. `response.onSend` sees and changes the final
+- `app.use` wraps every route in its scope, whether it is called before or
+  after the routes. It calls `next()` to run the rest of the chain, or answers
+  without calling it; after `next()` it can change the status and headers, or
+  catch what the handler threw. `response.onSend` sees and changes the final
   response, whoever answered.
 - `request[context: Key.self]` carries values from middleware to the handler,
   which reads them with `Context<Key>`.
@@ -307,7 +326,7 @@ app.group("/api") {
   `JWKSVerifier` checks tokens from an identity provider against its JWK Set.
   `TokenIssuer` pairs short-lived access tokens with refresh tokens that rotate
   on every use and revoke their whole chain when a spent one is reused.
-- `Passwords.hash` and `Passwords.verify` use PBKDF2-HMAC-SHA256 on the
+- `Passwords.hash` and `Passwords.verify` use PBKDF2-HMAC-SHA256 on Vega's
   blocking pool. `Tokens.random()` makes a session token and `Tokens.digest`
   what to store in its place.
 - `request.log.info("order placed", ["order": "\(id)"])` writes to the
@@ -320,7 +339,7 @@ app.group("/api") {
 - `app.maxBodySize(64 << 20) { … }` gives a scope's routes a body limit of
   their own in place of `--max-body`, applied before the body is read.
   `app.concurrencyLimit(8) { … }` lets that many of a scope's handlers run at
-  once in each worker, and answers the next 503.
+  once in each shard, and answers the next 503.
 - `request.cookie("theme")` and `response.setCookie(Cookie("theme", "dark"))`
   read and set cookies. A cookie is `Path=/`, `HttpOnly` and `SameSite=Lax`
   unless it says otherwise, and `Secure` over HTTPS. With a `CookieKey`, a
@@ -330,7 +349,7 @@ app.group("/api") {
   kept in memory, Redis or SQLite, found by a random ID in a cookie.
   `try await session.set("user", id)` writes it to the store before it returns.
   `session.renew()` moves it to a new ID at login, and `session.destroy()`
-  deletes it and its cookie.
+  deletes it and its cookie. A `MemorySessionStore` belongs to one shard.
 - `app.csrfProtection()` refuses, with 403, a POST, PUT, PATCH or DELETE that
   the browser says another site's page started, from Sec-Fetch-Site or else
   Origin against Host. It needs no tokens in forms. `trustedOrigins` lets a
@@ -348,6 +367,33 @@ app.group("/api") {
   for any other Host, and `app.addressFilter(allow: ["10.0.0.0/8"])` answers
   403 to a client address outside the list or on a `deny` list.
 
+[MIDDLEWARE.md](MIDDLEWARE.md) has every piece in detail, and how to write
+your own.
+
+### Slow and blocking handlers
+
+A route whose handler holds its thread for longer than `--heavy-threshold`
+(500 microseconds by default) on average, without suspending, becomes
+**heavy**: it runs only once it holds one of the shard's heavy-lane permits,
+of which there are half as many as threads. Quick requests always have
+threads left. A route that computes between awaits, which the average does
+not see, is registered heavy from the start:
+
+```swift
+app.heavy.get("/report/:id") { (id: Path<Int>) in render(report: id.value) }
+```
+
+A handler that blocks its thread without computing -- a synchronous file read,
+a C library that waits -- is offloaded instead. Its synchronous handler runs
+on Vega's blocking pool, and the answer is written back on the shard's
+threads:
+
+```swift
+app.offload.get("/thumbnail/:name") { (name: Path<String>) -> Bytes in
+    Bytes(try makeThumbnail(name.value), contentType: "image/png")
+}
+```
+
 ### Tracing
 
 `app.tracing()` traces through
@@ -358,7 +404,7 @@ among them:
 ```swift
 import Tracing
 
-app.onWorkerStart { _ in
+app.onShardStart { _ in
     InstrumentationSystem.bootstrap(makeTracer())   // any Tracer
 }
 app.tracing()
@@ -366,16 +412,16 @@ app.tracing()
 
 Each request is a server span named for its route, `GET /users/:id`,
 continuing the trace its headers carry. Under it are child spans for every
-call `request.client` makes, which passes the trace on in its headers, and for
+call `HTTPClient` makes, which passes the trace on in its headers, and for
 every PostgreSQL statement and Redis round trip. Spans a handler starts with
 `withSpan` go under it too. The attributes follow OpenTelemetry's HTTP and
 database conventions. SQL is recorded as written; bound values, Redis keys and
 values, and query-string values in URLs are not. A streamed response's span
 ends with its last byte, not its head.
 
-Workers are processes, and an exporter's threads do not survive the fork, so
-the tracer is made in each worker: bootstrap it in `onWorkerStart`, or pass
-`app.tracing { worker in … }` a closure that returns one. With tracing off,
+Shards are processes, and an exporter's threads do not survive the fork, so
+the tracer is made in each shard: bootstrap it in `onShardStart`, or pass
+`app.tracing { shard in … }` a closure that returns one. With tracing off,
 each request pays one check.
 
 ### OpenAPI
@@ -394,25 +440,31 @@ app.get("/orders/:id") { (id: Path<Int>) async throws in JSON(try await order(id
     .response(.notFound, "No order has that number")
 ```
 
-### PostgreSQL
+### Databases
 
-A native driver runs on the worker's poller. It supports SCRAM-SHA-256, TLS
-(required by default) and a pool per worker with an acquire timeout. Rows decode
-into `Decodable` types by column name. `db.transaction { tx in … }` commits or
-rolls back. Statements stay prepared on each connection, and values are read in
-binary after the first run. `UUID`, `Timestamp`, `PostgresDate`,
-`PostgresTime`, `PostgresInterval`, `PostgresNumeric` (exact, kept as its
-digits) and `PostgresJSON<T>` come without Foundation. An array column is a
-Swift list -- `[String]` for `text[]` -- and a list binds as one. `app.listen`
-hears `NOTIFY` in each worker, on a connection of its own, reconnecting with
-its channels when the server restarts. `copyIn` and `copyOut` are `COPY` in
-both directions, a chunk at a time; a composite type is a `PostgresRecord` and
-an enum is a Swift enum; and a server on this machine is reached over its unix
-socket.
+The drivers are vega-db's, on Vega's sockets and TLS, so a query is an await
+like any other on the shard's threads. Each product re-exports its driver
+with `Garuda`, and joins it to Garuda's `UUID`, `Timestamp` and JSON coder. A
+pool is made in `app.state`, so each shard has its own: a pool of 8
+connections is 8 per shard.
 
-### Redis
+**PostgreSQL** (`GarudaPostgres`) supports SCRAM-SHA-256, TLS (required by
+default) and a pool with an acquire timeout. Rows decode into `Decodable`
+types by column name. `db.transaction { tx in … }` commits or rolls back.
+Statements stay prepared on each connection, and values are read in binary.
+`UUID`, `Timestamp`, `PostgresDate`, `PostgresTime`, `PostgresInterval`,
+`PostgresNumeric` (exact, kept as its digits) and `PostgresJSON<T>` come
+without Foundation. An array column is a Swift list, and a list binds as one.
+`app.listen` hears `NOTIFY` in each shard, on a connection of its own,
+reconnecting with its channels when the server restarts. `copyIn` and
+`copyOut` are `COPY` in both directions, and `pool.migrate` brings a schema up
+to date.
+
+**Redis** (`GarudaRedis`):
 
 ```swift
+import GarudaRedis
+
 app.state { _ in RedisPool(RedisConfiguration(host: "cache", password: secret)) }
 
 app.get("/visits/:page") { (page: Path<String>, redis: State<RedisPool>) async throws in
@@ -420,27 +472,23 @@ app.get("/visits/:page") { (page: Path<String>, redis: State<RedisPool>) async t
 }
 ```
 
-A native driver runs on the worker's poller, speaking RESP3 through HELLO and
-RESP2 to servers older than Redis 6; Valkey works the same. TLS is required by
-default, and ACL users, databases and unix sockets are supported. Commands come
-with typed replies (`get`, `set` with expiry and NX/XX, hashes, lists, sets,
-`getJSON`), and `send` takes any other. `pipeline` and `transaction` go in one
-round trip, `session` holds one connection for WATCH, and `subscribe` listens
-to channels and patterns on a connection of its own.
+RESP3 through HELLO, and RESP2 for servers older than Redis 6; Valkey works
+the same. TLS is required by default, and ACL users, databases and unix
+sockets are supported. Commands come with typed replies, and `send` takes any
+other. `pipeline` and `transaction` go in one round trip, `session` holds one
+connection for WATCH, and `subscribe` listens to channels and patterns on a
+connection of its own. `RedisCluster` is the same API across a cluster,
+following `MOVED` and `ASK`, and `RedisSentinelPool` finds the master through
+a set of sentinels. Garuda's session and refresh-token stores work on either.
 
-`RedisCluster` is the same API across a cluster: a pool per node, a slot map
-learned from the cluster, and every command aimed at the node that owns its
-key -- following `MOVED` and `ASK` when the map is behind. `RedisSentinelPool`
-asks a set of sentinels where the master is, checks what they name with `ROLE`,
-and asks again when a failover takes it away. Garuda's session and
-refresh-token stores work on either.
-
-### SQLite
+**SQLite** (`GarudaSQLite`):
 
 ```swift
+import GarudaSQLite
+
 app.state { _ in
     let db = try SQLiteDatabase(SQLiteConfiguration(path: "/var/lib/app/app.db"))
-    try db.migrate(["create table notes (id integer primary key, text text not null)"])
+    try await db.migrate(["create table notes (id integer primary key, text text not null)"])
     return db
 }
 
@@ -449,26 +497,27 @@ app.get("/note/:id") { (id: Path<Int>, db: State<SQLiteDatabase>) async throws i
 }
 ```
 
-The system's libsqlite3 is loaded at run time, and every statement runs on the
-worker's blocking pool, so a worker keeps serving while SQLite reads the disk
-or waits for another process's lock. Each worker has one connection that
-writes and up to four that read, in write-ahead-log mode; a statement moves to
-a reader once SQLite has said it cannot write. Rows decode into `Decodable`
-types, `transaction` begins IMMEDIATE, and `migrate` brings the schema up to
-date by `user_version` when each worker starts.
+The system's libsqlite3 is loaded at run time, and every statement runs on
+Vega's blocking pool, so the shard keeps serving while SQLite reads the disk
+or waits for another process's lock. Each database has one connection that
+writes and up to four that read, in write-ahead-log mode. Transactions begin
+IMMEDIATE, and `migrate` brings the schema up to date by `user_version`.
+
+[CONNECTORS.md](CONNECTORS.md) has the HTTP client and every driver in detail,
+with their limits.
 
 ### Streaming, server-sent events, WebSockets and WebTransport
 
 ```swift
-app.get("/export") { () async in
+app.get("/export") { () async -> StreamingBody in
     StreamingBody(contentType: "text/csv") { body in
         for row in rows { try await body.write(row.csv) }   // waits while the client is behind
     }
 }
 
-app.get("/ticks") { () async in
+app.get("/ticks") { () async -> EventStream in
     EventStream { events in
-        for i in 0... { try await events.send("tick \(i)"); try await events.sleep(milliseconds: 1000) }
+        for i in 0... { try await events.send("tick \(i)"); try await events.sleep(for: .seconds(1)) }
     }
 }
 
@@ -478,11 +527,11 @@ app.webSocket("/chat/:room") { (ws: WebSocket, room: Path<String>) async throws 
 
 struct Said: Codable { var text: String }
 let lobby = Topic("lobby")
-app.post("/say") { (said: Body<Said>) async in
-    try lobby.publish(said.value.text, event: "said")   // heard by subscribers on every worker
+app.post("/say") { (said: Body<Said>) async throws in
+    try lobby.publish(said.value.text, event: "said")   // heard by subscribers on every shard
     return HTTPStatus.noContent
 }
-app.get("/lobby") { (last: LastEventID) async in
+app.get("/lobby") { (last: LastEventID) async -> EventStream in
     EventStream { events in try await events.forward(lobby, after: last) }   // replays what a reconnect missed
 }
 
@@ -492,96 +541,96 @@ app.webTransport("/room/:id") { (session: WebTransportSession, id: Path<Int>) as
 ```
 
 A streamed body is chunked on HTTP/1.1 and DATA frames on HTTP/2 and HTTP/3.
-A write waits while more than 512 KiB is queued (`writeHighWaterMark`), and a throw part-way resets the
-stream rather than ending it cleanly. A WebSocket handler sees whole messages:
-the engine joins fragments, checks UTF-8, answers pings, sends keepalive pings,
-runs the close handshake and, with `--ws-compress`, permessage-deflate. Messages
-the handler has not read wait in a bounded queue, and past it the socket is not
-read, so a fast sender is slowed. A send on a socket whose connection has
-ended throws `WebSocketError.closed`, so a room holding sockets learns who has
-gone rather than writing to them. The same route serves WebSockets over
-HTTP/1.1, HTTP/2 and HTTP/3; on the last two, flow control slows just that
-stream. WebTransport runs over HTTP/3 on the same
-port and routes, with bidirectional and unidirectional streams, datagrams and
-close codes. The [webtransport example](Examples/Sources/WebTransportExample/WebTransportApp.swift)
-uses all of them, with a page that runs it from a browser.
+A write waits while more than 512 KiB is queued (`writeHighWaterMark`), and a
+throw part-way resets the stream rather than ending it cleanly. A WebSocket
+handler sees whole messages: the engine joins fragments, checks UTF-8, answers
+pings, sends keepalive pings, runs the close handshake and, with
+`--ws-compress`, permessage-deflate. Messages the handler has not read wait in
+a bounded queue, and past it the socket is not read, so a fast sender is
+slowed. A send on a socket whose connection has ended throws
+`WebSocketError.closed`, so a room holding sockets learns who has gone rather
+than writing to them. The same route serves WebSockets over HTTP/1.1, HTTP/2
+and HTTP/3; on the last two, flow control slows just that stream. WebTransport
+runs over HTTP/3 on the same port and routes, with bidirectional and
+unidirectional streams, datagrams and close codes.
 
-### Streamed request bodies and resumable uploads
+A `Topic`'s messages cross shards through a ring in shared memory
+(`--broadcast-size`), which also keeps recent messages for `Last-Event-ID`.
+`response.sendInterim` sends 1xx responses such as 103 Early Hints.
+
+A route's request body is collected whole before the handler runs, held to
+`--max-body` or the scope's `maxBodySize`, unless the route reads it as it
+arrives:
 
 ```swift
-app.onStreamingBody(.put, "/files/:name", maxBodySize: 10 << 30) { request, response, body in
-    while let bytes = try await body.read() { try file.write(bytes) }   // as it arrives
+app.onStreamingBody(.put, "/uploads/:name", maxBodySize: 10 << 30) { request, response, body in
+    var buffer = IOBuffer(capacity: 256 * 1024)   // Vega's
+    while try await body.read(into: &buffer) > 0 {
+        try await file.write(buffer)              // a VegaFS File
+        buffer.clear()
+    }
     response.send(status: .created)
 }
-
-import GarudaUploads
-
-app.resumableUploads("/uploads", store: try FileUploadStore(directory: "/var/lib/app/uploads"),
-                     limits: UploadLimits(maxSize: 10 << 30)) { upload in
-    try moveIntoPlace(upload.path)
-    try upload.remove()
-    return HTTPStatus.created
-}
 ```
 
-A route registered with `onStreamingBody` runs as soon as the request's head
-arrives, and reads the body as it comes, with its own size limit. Reading is
-flow control: bytes the handler has not read hold back the client over
-HTTP/1.1, HTTP/2 and HTTP/3, so a slow disk slows only its own upload. If the
-client goes away part-way, the handler still reads everything that arrived and
-then gets `RequestBodyError.incomplete`.
+This works over HTTP/1.1, HTTP/2 and HTTP/3. Reading is what lets more in: the
+HTTP/2 or HTTP/3 window is given back as the handler reads, so a slow disk
+slows its own upload and nothing else. `body.read(maxBytes:)` and
+`body.readAll(maxBytes:)` hand over `[UInt8]`; `bytesRead`, `expectedLength`
+and `cancel()` are there too. A body that passes `maxBodySize` throws
+`RequestBodyError.tooLarge`, answered 413. A request that ends before its body
+did hands over every byte that arrived and then throws `.incomplete`, answered
+400; a reset HTTP/2 or HTTP/3 stream ends a streaming handler this way rather
+than cancelling it. [HANDLER-API.md](HANDLER-API.md#request-bodies-read-as-they-arrive)
+has the details.
 
-`GarudaUploads` implements the IETF resumable upload protocol
-(draft-ietf-httpbis-resumable-upload, interop version 9). A client cut off
-mid-upload asks how much arrived and sends the rest, over any protocol and on
-any worker. `response.sendInterim` sends 1xx responses such as 103 Early Hints.
-
-The request that creates an upload and the request that completes it are
-different requests -- often minutes apart, and on any worker -- so `onCreate`
-is given the creating one, already through whatever middleware guards the
-routes, and what it returns is kept on the upload for the completion handler:
+### Resumable uploads
 
 ```swift
-app.authenticate(jwt: Claims.self)
-app.resumableUploads("/photos", store: store, onCreate: { request in
-    var parameter = 0
-    let jwt = try JWT<Claims>.extract(from: request, parameter: &parameter)
-    return ["user": jwt.claims.sub]                    // server-set metadata
-}) { upload in
-    try record(upload.path, owner: upload.metadata["user"])
-    return HTTPStatus.created
+import GarudaUploads
+
+let store = try FileUploadStore(directory: "/var/lib/app/uploads")
+app.resumableUploads("/files", store: store,
+                     limits: UploadLimits(maxSize: 10 << 30)) { upload in
+    try await FileSystem.rename(upload.path, to: "/srv/files/\(upload.info.id)")   // VegaFS
+    return JSON(["size": upload.length], status: .created)
 }
 ```
 
-The server writes that metadata and no client can reach it, which is what makes
-it the place for whose upload this is -- `Content-Type` and
-`Content-Disposition` come from the client and are not. A throw from `onCreate`
-refuses the upload before anything is written, so a request turned away leaves
-nothing behind to expire.
+`GarudaUploads` implements the IETF's resumable uploads
+(draft-ietf-httpbis-resumable-upload, interop version 9) over HTTP/1.1,
+HTTP/2 and HTTP/3. A client that speaks it learns where its upload lives (in
+a 104 before a byte of the body is read, when it sends interop version 9),
+and if the connection drops, it asks that URL how much arrived (`HEAD`) and
+sends the rest (`PATCH`) as many times as it takes. A client that does not
+speak it sends an ordinary `POST`. Either way the handler is called once,
+with the whole file on disk, and its answer is the response to the request
+that finished the upload. A `GET` of the upload's URL
+replays that answer to a client that lost it.
 
-`uploads` is relative to wherever the routes are mounted, so a group carries
-them whole: inside `group("/api")` the uploads live at `/api/uploads/:id` and
-that is what the `Location` says, and inside `group("/users/:user")` each
-upload's URL sits under the user whose request created it.
+`UploadLimits` sets the largest and smallest upload and append, and how long
+an upload is kept. `onCreate` records what the application knows on the
+request that creates an upload, such as whose it is, for the completion
+handler to read as `upload.metadata`. A client's `Repr-Digest` is checked
+before the handler runs, and `await upload.digest()` gives the SHA-256.
 
-The answer to the request that completes an upload is kept, `Location`
-included, and a GET of the upload's URL gives it again until `maxAge`: a
-client whose connection died as the upload finished still learns what became
-of it. An answer whose body is streamed is not kept, since its bytes are
-written after it has gone; return one whole if it should survive. The
-[uploads example](Examples/Sources/UploadsExample/UploadsApp.swift) puts
-this together: per-user photos, owned through `onCreate`, checked before
-they are kept, and resumable under a group.
+A client that comes back while its old request is still appending supersedes
+it: on the same shard the old request is ended and what it received kept; on
+another shard the new request waits a moment, then is answered 409 with
+`Retry-After`. Over HTTP/1.1, ending the old request closes its connection,
+and bytes it had read from the socket but not yet stored are dropped. The
+client resumes from the offset that was stored, so nothing is lost but those
+bytes' transfer.
 
-A 104 is an interim response, and an intermediary is free to drop one: a CDN or
-a reverse proxy in front of the server may give the client only the final 201.
-A client should read the upload's URL from the 104 when it arrives and from the
-`Location` of the 201 when it does not, which is what a client creating an
-upload with an empty body does anyway.
+The [files and uploads examples](Examples/README.md) are whole applications
+built on it.
 
 ### Testing
 
 ```swift
+import GarudaTesting
+import Testing
+
 @Test func personIsFound() throws {
     let response = try app.test.get("/person/1")
     #expect(response.status == .ok)
@@ -589,8 +638,9 @@ upload with an empty body does anyway.
 }
 ```
 
-`app.test` runs the real engine in the test process over a socket pair, with no
-port: parsing, routing, middleware, handlers, timers and the response path.
+`app.test` runs requests through the real HTTP/1 connection over an
+in-memory stream, with no port: parsing, routing, middleware, handlers and the
+response path. `app.test.http2()` does the same over HTTP/2.
 
 ## Garuda and axum
 
@@ -600,112 +650,85 @@ it, area by area.
 
 | Area | axum (Tokio) | Garuda |
 |---|---|---|
-| Route dispatch | Every handler is a future the runtime polls | A synchronous handler is a direct call on the worker thread |
-| Async handlers | `async fn` on a work-stealing pool | Reused tasks on the worker's own executor, no allocation per request |
-| Spreading load over cores | Idle threads steal tasks from busy ones | A worker ahead of the others leaves new connections to them; quick connections stuck behind slow requests move to a worker where they would not wait ([differs](#one-process-per-worker)) |
+| Async handlers | `async fn` on a work-stealing pool | async closures on Vega's work-stealing threads; a handler that does not suspend runs inline in the task that read the request, allocating nothing |
+| Spreading load over cores | Idle threads steal tasks from busy ones | The same inside a shard. Shards are processes and do not steal from each other; the kernel spreads connections across them ([differs](#shards-are-processes)) |
+| Slow handlers | Share the pool with everything else | A route that holds its thread for long runs in the heavy lane, on at most half a shard's threads |
 | Typed extraction | `Path`, `Query`, `Json`, `Form`, `Multipart` | `Path`, `Query`, `Body`, `Form`, `Multipart` |
-| Custom extractors | `FromRequestParts`, `FromRequest`, `Option<T>`, `Result<T, E>` | `RequestExtractor`, `AsyncRequestExtractor`, `E?`, `Result<E, any Error>` |
+| Custom extractors | `FromRequestParts`, `FromRequest`, `Option<T>`, `Result<T, E>` | `RequestExtractor`, whose `extract` may await; `E?`, `Result<E, any Error>` |
 | OpenAPI | utoipa or aide, with derive macros | `app.openAPI`, `app.swaggerUI`; schemas read from `Decodable` types |
-| State | `State<T>`, one `Arc` shared by every thread | `State<T>`, built in each worker process ([differs](#one-process-per-worker)) |
+| State | `State<T>`, one `Arc` shared by every thread | `State<T>`, built in each shard and shared by its threads ([differs](#shards-are-processes)) |
 | Request-scoped values | `Extension<T>` | `request[context:]`, `Context<Key>` |
 | Errors as responses | `IntoResponse` | `ResponseError`, `HTTPError` |
 | Protocols | HTTP/1.1 and HTTP/2 through hyper | HTTP/1.1, HTTP/2 and HTTP/3 |
-| TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, with ACME |
+| TLS | rustls or OpenSSL via `axum-server`; ACME from another crate | Built in, on BoringSSL or OpenSSL; certificates from an outside ACME client, reloaded without a restart |
 | Nesting and 405 | `nest`, `merge`, `fallback`, 405 with `Allow` | `group`, `Router` with `nest` and `merge`, `fallback` per scope, 405 with `Allow` |
-| Middleware | Tower layers that wrap the handler | `use` before the handler; `onSend` on the response ([differs](#middleware-does-not-wrap-the-handler)) |
+| Middleware | Tower layers that wrap the handler | `use { request, response, next in … }`, which wraps the handler; `onSend` on the final response |
 | Ready-made middleware | tower-http, tower-sessions, axum-extra | Server flags for compression, rate limits, request IDs, trace context, access log; `app.deadline`, `app.cors`, `app.authenticate`, `JWT<Claims>`, `request.log`, `app.onResponse`, `app.maxBodySize`, `app.concurrencyLimit`, cookies, `app.sessions`, `app.csrfProtection`, `app.securityHeaders`, `app.trailingSlash`, `app.requestDecompression`, `app.allowedHosts`, `app.addressFilter` |
 | Streaming responses | `Body::from_stream` | `response.stream()`, `StreamingBody`, with backpressure |
 | Server-sent events | `Sse`, with keep-alive | `EventStream`, with keep-alive comments and `Last-Event-ID` |
-| Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across worker processes, to event streams, WebSockets and long polls, with replay |
-| Streaming request bodies | `Body::into_data_stream` | `onStreamingBody`, with a limit per route and flow control back to the client |
-| Resumable uploads | None built in; tus through other crates | `GarudaUploads`: the IETF resumable upload protocol |
+| Broadcast | `tokio::sync::broadcast`, within one process | `Topic`, across shard processes, to event streams, WebSockets and long polls, with replay |
+| Streaming request bodies | `Body::into_data_stream` | `app.onStreamingBody`, read with flow control over HTTP/1.1, HTTP/2 and HTTP/3 |
+| Resumable uploads | None built in; tus through other crates | `app.resumableUploads` (`GarudaUploads`), the IETF draft over every protocol |
 | Interim responses | None: hyper sends only 100 Continue | `response.sendInterim`, such as 103 Early Hints |
 | WebSockets | `WebSocketUpgrade` | `app.webSocket`, whole messages, pings and permessage-deflate by the engine (over HTTP/1.1, HTTP/2 and HTTP/3) |
 | WebTransport | None in hyper | `app.webTransport` |
-| HTTP client | reqwest | `request.client`, HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed responses and server-sent events, a whole-exchange budget |
-| PostgreSQL | sqlx, tokio-postgres | Native driver on the poller |
-| Redis | redis-rs, fred | Native driver on the poller: RESP3 and RESP2, TLS, ACL, pipelines, transactions, pub/sub |
-| SQLite | sqlx, rusqlite | The system's libsqlite3 on the blocking pool: a writer and readers per worker, WAL, migrations |
-| Blocking work | `spawn_blocking` | `blocking { … }` on a bounded pool of threads per worker, or a whole route with `app.offload` |
-| Testing | `tower::ServiceExt::oneshot` | `app.test`, the real engine |
+| HTTP client | reqwest | `HTTPClient`, HTTP/1.1 and HTTP/2, redirects by policy, decompression, streamed responses and server-sent events, a whole-exchange budget |
+| PostgreSQL | sqlx, tokio-postgres | vega-db's driver on Vega's I/O |
+| Redis | redis-rs, fred | vega-db's driver on Vega's I/O: RESP3 and RESP2, TLS, ACL, pipelines, transactions, pub/sub, Cluster and Sentinel |
+| SQLite | sqlx, rusqlite | The system's libsqlite3 on Vega's blocking pool: a writer and readers per shard, WAL, migrations |
+| Blocking work | `spawn_blocking` | a whole route with `app.offload`, or `Runtime.blocking { … }` from Vega |
+| Testing | `tower::ServiceExt::oneshot` | `app.test`, the real HTTP/1 connection; `app.test.http2()` |
 
 Every row is implemented and tested.
 
-For performance, [BENCHMARKS.md](BENCHMARKS.md) has the method and every run,
-including hello-world comparisons with axum that measure what the server adds to
-a request.
+[BENCHMARKS.md](BENCHMARKS.md) has the benchmark method, including
+hello-world comparisons with axum that measure what the server adds to a
+request.
 
 ### Where Garuda differs, and why
-
-#### Middleware does not wrap the handler
-
-A Tower layer awaits the handler and gets its response back as a value. A
-Garuda handler writes its answer straight into the connection's buffer, so
-there is no response value to hand back without building and copying one on
-every request. Middleware runs **before** the handler, and `response.onSend`
-lets it see and change the response just before the head is written. The hook
-runs for every way a request is answered: the handler, a thrown error, a
-middleware's refusal and a deadline's 504. Hooks run last-added first, so they
-nest the way layers do.
-
-What that rules out: retrying the handler from middleware, or holding a scope
-open around its run. Retry inside the handler or around `pool.transaction`, and
-use `app.deadline` for timeouts. Hooks do not run for static files, cache hits,
-or the 404 before any route matches.
 
 #### Middleware covers its whole scope
 
 An axum `layer` applies only to routes added before it. Garuda's `use` covers
 every route in its group or application wherever the call is, so moving a line
-cannot leave a route unguarded. A route that must skip a middleware goes outside
-the group.
+cannot leave a route unguarded. A route that must skip a middleware goes
+outside the group. Global middleware is outermost, then each group's, from
+the outside in.
 
-#### One process per worker
+#### Shards are processes
 
-A worker is a process with one thread. Nothing is shared, so nothing is locked,
-a crash takes only that worker's connections, and `SIGHUP` replaces workers one
-at a time. The cost: in-memory state is per worker, and a pool of 8 database
-connections is 8 per worker. Keep shared state in a database, and size pools as
-the total divided by `--workers`.
+A shard is a process with several threads, and work is stolen between them,
+not across shards. A crash takes only that shard's connections, and `SIGHUP`
+restarts the shards one at a time. The cost: in-memory state is per shard,
+and a pool of 8 database connections is 8 per shard. Keep state every shard
+must see in a database, and size pools as the total divided by the number of
+shards. The rate limiter, the metrics, the response cache and `Topic` are
+shared by the shards through shared memory.
 
-A crash staying in one worker matters more in Swift than in Rust: a
+A crash staying in one shard matters more in Swift than in Rust: a
 force-unwrapped `nil` or an index out of range ends a Swift process on the
 spot, where Tokio catches a Rust panic in the task that raised it.
 
-Processes cannot steal work from each other the way Tokio's threads do.
-Instead a worker ahead of the others leaves new connections to them, and a
-worker where quick requests would wait behind slow ones hands idle HTTP/1
-keep-alive connections to one where they would not (`--balance`). When every
-worker holds a slow client, the slow ones are gathered onto fewer workers to
-free the rest. With 8 slow connections among 64 on 8 workers, starting a
-second in, the quick requests' p99 was 2.4–2.8 ms and axum's 3.0–3.1 ms, where
-the kernel's hash alone let it reach 7.6 ms. HTTPS connections do not move:
-the record layer is BoringSSL and encrypts in the process, so the session
-cannot travel with the descriptor. HTTP/2 connections, WebSockets and requests
-in progress stay on the worker that has them.
+With `--shards 0`, the default on macOS, the server is one process with no
+supervisor. On Linux the default, `--shards auto`, is one shard per
+last-level cache domain. Shards are forked on Linux; on macOS each runs the
+executable again, so `main` must register the same routes every time. With
+shards, no thread may be started before `app.run()`: start runtimes and
+tracers in `app.state` or `onShardStart`. [DEPLOYMENT.md](DEPLOYMENT.md) has
+the details.
 
-#### A handler that computes without awaiting holds its worker
+#### A handler that computes without awaiting holds its thread
 
-A worker is one thread, and staying on it is what removes the scheduling hop. A
-loop that never awaits holds the worker until it ends. A deadline bounds
-waiting, not computing. Run more workers than busy cores, and hand a call that
-blocks or computes for long to `try await blocking { … }`, which runs it on the
-worker's blocking pool while the worker serves other requests. Waiting on an
-external program is such a call; a route whose handler only computes can be
-registered with `app.offload.get(…)` to run all of it there. A handler that
-holds its worker for
-`--slow-handler-ms` (100 by default) is warned about with its route, so such a
-loop shows up in the log rather than only in the latency of its neighbours:
-an async handler always, a synchronous one with `--metrics-port`.
+Nothing preempts a handler between awaits. A loop that never awaits holds its
+thread until it ends, and a deadline bounds waiting, not computing. The heavy
+lane keeps such routes to half a shard's threads, so quick requests still run;
+hand a call that blocks to `app.offload` or `Runtime.blocking`.
 
-#### On macOS 15, `Task.yield()` leaves the worker
+#### Cancellation on HTTP/1.1
 
-Swift 6.1's concurrency runtime, the one macOS 15 has, sends a task that calls
-`Task.yield()` to the global executor whatever executor it prefers. The
-handler still resumes on its worker, but only once a thread of the global
-pool is free to hand it back. Linux, and the runtime in newer macOS, keep it
-on the worker. A handler that wants to let others run is better served by an
-await on the engine, such as `response.sleep(milliseconds:)`.
+A reset HTTP/2 or HTTP/3 stream cancels its handler's task. On HTTP/1.1
+nothing interrupts a handler whose client has gone; a streamed write to it
+throws `HandlerWaitError.cancelled`, and any other answer goes nowhere.
 
 #### No Foundation
 
@@ -723,133 +746,135 @@ These work without any handler code, set by flags:
 
 - **HTTP/1.1** with a parser strict where it prevents request smuggling,
   **HTTP/2** over TLS and cleartext, and **HTTP/3** over QUIC (`--http3`).
-  QUIC, TLS 1.3 key schedule and QPACK are Swift, over OpenSSL's crypto
-  primitives.
-- **TLS** on a vendored BoringSSL, with several certificates chosen by SNI on
-  both TCP and QUIC. OpenSSL is still linked for cryptography, ACME and QUIC.
-  There is no kernel TLS, so `--ktls` is accepted and ignored.
-- **ACME** certificates (`--acme-domain`), obtained and renewed with tls-alpn-01
-  on the port already served.
-- **Static files** (`--static-dir`) with `sendfile`, `ETag` and byte ranges,
+  QUIC and QPACK are Swift, from Vega (`VegaQUIC`, `VegaHTTP3`), over
+  the same TLS library as the rest.
+- **TLS** through Vega's `VegaTLS`, on BoringSSL by default or the system's
+  OpenSSL 3, with several certificates chosen by SNI on both TCP and QUIC, and
+  certificates reloaded from disk (`--tls-reload`, or `SIGHUP`). There is no
+  kernel TLS: `--ktls` is accepted with a warning that it has no effect.
+- **Certificates from an ACME client** such as certbot: `--redirect-http 80
+  --acme-webroot DIR` answers its HTTP-01 challenges. There is no built-in
+  ACME client.
+- **Static files** (`--static-dir`) with `ETag` and byte ranges,
   pre-compressed copies (`--compress-static`), and directories answered by
   their `index.html` (`--static-index`) or listed (`--static-listing`).
-- **Rate limiting** (`--rate-limit`) counted across workers.
+- **Rate limiting** (`--rate-limit`) counted across shards.
 - **HTTPS redirects** (`--redirect-http`), **HSTS**, **request IDs**, **W3C
   trace context**, an **access log**, **Prometheus metrics** and a **health
   check**.
-- **Graceful shutdown** with `--drain-delay`, and **zero-downtime reload** on
-  `SIGHUP` or when the executable is rebuilt (`--reload`).
-- **Unix sockets**, multiple **workers**, and **trusted proxy headers**
-  (`--forwarded-allow-ips`).
+- **Graceful shutdown** with `--drain-delay` and `--graceful-timeout`, a
+  **rolling restart** on `SIGHUP`, and in development a restart when the
+  executable is rebuilt (`--reload`).
+- **Unix sockets** (`--unix`), several **shards** (`--shards`), and **trusted
+  proxy headers** (`--forwarded-allow-ips`).
 - **Compression** of handler responses (`--compress`) and a **response cache**
-  shared by the workers (`--cache-size`).
+  shared by the shards (`--cache-size`).
 
 `garuda --help` lists every flag, and [CONFIG.md](CONFIG.md) explains them.
+Flags keep Garuda 1's names and units: `--keep-alive`, `--request-timeout`,
+`--graceful-timeout` and `--drain-delay` are milliseconds.
 
 ### Signals
 
 | Signal | Effect |
 |---|---|
-| `SIGTERM` | Stop accepting, finish in-flight requests within `--graceful-timeout`. With `--drain-delay`, keep serving first while the health check answers 503. |
-| `SIGINT`, `SIGQUIT` | Shut down without the drain delay. |
-| `SIGHUP` | Replace every worker one at a time, rereading certificates, without refusing a connection. |
+| `SIGTERM` | Fail the health check for `--drain-delay`, then stop accepting and finish what is in progress within `--graceful-timeout`. |
+| `SIGINT`, `SIGQUIT` | The same without the drain delay; one sent during a drain delay cuts it short. |
+| `SIGHUP` | Restart the shards one at a time, rereading certificates. With shards only. |
+
+On Windows, Ctrl-C and Ctrl-Break stop it as `SIGINT` does, and closing the console as `SIGTERM` does. [DEPLOYMENT.md](DEPLOYMENT.md#signals) has
+the details.
 
 ## Tests
 
 ```bash
-swift test                                   # 1132 unit tests, and the fuzz corpus
-(cd Examples && swift test)                  # 41  the examples, through app.test
-bash scripts/compile-fail-test.sh            # 18  handler code that must not compile
+swift test                                   # unit tests
+bash scripts/compile-fail-test.sh            # handler code that must not compile
 ```
 
-The end-to-end suites run against a release build. Each takes a binary path as
-its first argument. Most use `.build/release/garuda`; `handler-test.py`,
-`websocket-test.py`, `webtransport-test.py`, `upload-test.py` and `broadcast-test.py` use
-`.build/release/garuda-conformance`, whose routes exist only for the tests.
+The database tests skip themselves unless a database is reachable. The
+end-to-end suites run against a release build. Each takes a binary path as
+its first argument. Most use `.build/release/garuda`; the handler, WebSocket,
+WebTransport, broadcast and upload suites use `.build/release/garuda-conformance`,
+whose routes exist only for the tests.
 
 ```bash
-bash scripts/integration-test.sh             # 36  HTTP/1.1 framing and smuggling defences
-bash scripts/static-test.sh                  # 105 --static-dir
-bash scripts/compress-test.sh                # 76  --compress, --compress-static
-bash scripts/cache-test.sh                   # 85  --cache-size
-bash scripts/ratelimit-test.sh               # 18  --rate-limit
-bash scripts/redirect-test.sh                # 22  --redirect-http, --hsts
-bash scripts/sni-test.sh                     # 11  certificates by SNI
-bash scripts/resumption-test.sh              #  7  session tickets resume, TLS 1.3 and 1.2
-bash scripts/acme-test.sh                    # 12  --acme-domain, needs Pebble
-bash scripts/request-id-test.sh              # 12  --request-id
-bash scripts/trace-context-test.sh           # 17  --trace-context
-bash scripts/drain-test.sh                   # 14  --drain-delay
-bash scripts/reload-test.sh                  #  7  SIGHUP under load
-python3 scripts/feature-test.py              # 62  shutdown, supervision, unix sockets, slow clients
-python3 scripts/http2-test.py                # 62  against the h2 library
-python3 scripts/http3-test.py                # 76  against aioquic
-python3 scripts/router-streams-test.py       # 41  routes over HTTP/2 and HTTP/3
-python3 scripts/handler-test.py              # 143 the handler API over all three protocols
-python3 scripts/websocket-test.py            # 104 handshake, framing violations, closing, pings, deflate
-python3 scripts/websocket-streams-test.py    # 94  WebSocket over HTTP/2 and HTTP/3
-python3 scripts/webtransport-test.py         # 46  sessions, streams, datagrams
-python3 scripts/upload-test.py               # 35  streamed request bodies, 1xx, resumable uploads
-python3 scripts/broadcast-test.py            # 36  topics across workers, Last-Event-ID, keep-alive
+bash scripts/integration-test.sh             # HTTP/1.1 framing and smuggling defences
+bash scripts/static-test.sh                  # --static-dir
+bash scripts/compress-test.sh                # --compress, --compress-static
+bash scripts/cache-test.sh                   # --cache-size
+bash scripts/ratelimit-test.sh               # --rate-limit
+bash scripts/redirect-test.sh                # --redirect-http, --hsts
+bash scripts/sni-test.sh                     # certificates by SNI
+bash scripts/resumption-test.sh              # session tickets resume, TLS 1.3 and 1.2
+bash scripts/request-id-test.sh              # --request-id
+bash scripts/trace-context-test.sh           # --trace-context
+bash scripts/drain-test.sh                   # --drain-delay
+bash scripts/reload-test.sh                  # SIGHUP under load
+python3 scripts/feature-test.py              # shutdown, supervision, unix sockets, slow clients
+python3 scripts/http2-test.py                # against the h2 library
+python3 scripts/http3-test.py                # against aioquic
+python3 scripts/router-streams-test.py       # routes over HTTP/2 and HTTP/3
+python3 scripts/handler-test.py              # the handler API over all three protocols
+python3 scripts/websocket-test.py            # handshake, framing violations, closing, pings, deflate
+python3 scripts/websocket-streams-test.py    # WebSocket over HTTP/2 and HTTP/3
+python3 scripts/webtransport-test.py         # sessions, streams, datagrams
+python3 scripts/broadcast-test.py            # topics across shards, Last-Event-ID, keep-alive
+python3 scripts/upload-test.py               # streamed request bodies, resumable uploads
 ```
 
 The shell suites need `curl` and `openssl`. The Python suites are clients only,
-using `h2` and `aioquic`, which share no code with the server. Two unit tests
-want a second loopback address, which Linux has and macOS has to be asked for
-(`sudo ifconfig lo0 alias 127.0.0.2 up`); without it they say so and skip,
-rather than failing as though something were wrong. Every parser that
-reads network bytes is fuzzed with `swift run -c release pgfuzz`
-([fuzz/README.md](fuzz/README.md)). CI (`.github/workflows/ci.yml`) runs on
-every push and pull request: the build and unit tests on Ubuntu 24.04 and
-macOS 15, the handler code that must not compile, the connectors against a
-real PostgreSQL and Redis, and the end-to-end suites. The protocol suites and
-a sanitizer fuzz run on every push to `main`, nightly and on demand, but not
-on a pull request: they are slow and want a QUIC stack.
+using `h2` and `aioquic`, which share no code with the server.
+
+The parsers that read bytes from the network, and whole HTTP/2, HTTP/3 and
+QUIC connections, are fuzzed with `pgfuzz`, a mutation fuzzer in the package,
+against 14 targets (`GarudaFuzzTargets`). `swift test` replays every seed and
+everything in `fuzz/corpus` through them (`GarudaFuzzTests`).
+
+```bash
+swift run -c release pgfuzz                  # every target, 5 seconds each
+swift run -c release pgfuzz h2 --seconds 300
+```
+
+[fuzz/README.md](fuzz/README.md) lists the targets, the invariants each
+checks, and how to run them under AddressSanitizer.
 
 ## Status
 
-Garuda is past 1.0, so a breaking change to the public API needs a major
-version. 1.1.0 made one exception, one word long: `CompletedUpload.digest()`
-must now be awaited, and [RELEASE.md](RELEASE.md#110--2026-09-30) says why.
-[COMPATIBILITY.md](COMPATIBILITY.md) says what that covers and how much notice
-a change gets. Pin with `from: "1.1.0"`.
+Garuda 2.0.0 is the current release. Garuda 1 stays on `release/1.x`; an
+application not ready to move pins `from: "1.1.0"`. From 2.0 on, Garuda
+follows semantic versioning, and
+[COMPATIBILITY.md](COMPATIBILITY.md#versions-from-20-on) says what that
+covers.
 
-### Known limits
+### Not supported yet
 
-A handler waiting on something other than the engine -- its own continuation,
-say -- is not unwound when its request is cancelled. It resumes to find
-`response.isCancelled` set, and anything it sends is dropped. Wrap the wait in
-`response.cancellable { … }` and it is given up on when the request ends. What
-that cannot do is stop work which ignores cancellation; the worker counts such
-work and reports it on the health check instead.
-
-### Not supported
-
+- A built-in ACME client. Use certbot or another client with
+  `--acme-webroot`.
+- Kernel TLS: `--ktls` is accepted and has no effect.
 - Reads from Redis replicas: every command goes to the master, or to the node
   that owns the slot. [CONNECTORS.md](CONNECTORS.md) has the rest of the
-  driver's limits.
+  drivers' limits.
 - `multipart/byteranges`: a request for several ranges at once is answered
   with the whole file.
 - QUIC session resumption and 0-RTT.
-- TLS over TCP in Swift: the record layer is BoringSSL.
-- Kernel TLS: BoringSSL has none, so `--ktls` is accepted and ignored.
-- Windows, except through WSL 2.
+- Windows beyond one process: it is experimental, with no shards, no `SIGHUP`
+  and no response compression yet.
 
 ## Documentation
 
 | File | What it covers |
 |---|---|
-| [HANDLER-API.md](HANDLER-API.md) | The handler API's design, decisions and roadmap |
-| [INSTALLATION.md](INSTALLATION.md) | Building, dependencies, certificates, deployment |
-| [CONFIG.md](CONFIG.md) | Every command-line flag |
+| [INSTALLATION.md](INSTALLATION.md) | Requirements, the TLS library traits, building, using Garuda in an application, certificates |
+| [CONFIG.md](CONFIG.md) | Every command-line flag, with its unit and default, and `ServerConfig` |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Running in production: the supervisor and shards, signals, draining, reloads, systemd, proxies |
+| [HANDLER-API.md](HANDLER-API.md) | The handler API's design and the decisions behind it |
 | [MIDDLEWARE.md](MIDDLEWARE.md) | How middleware runs, every piece Garuda ships, and writing your own |
-| [EXAMPLES.md](EXAMPLES.md) | The runnable applications, and recipes: the per-worker model, settings, common tasks |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine is built |
+| [CONNECTORS.md](CONNECTORS.md) | The HTTP client, and PostgreSQL, Redis and SQLite from vega-db: limits and future work |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How Garuda 2 is built: shards, the work-stealing runtime, the protocols, the heavy lane, shared memory |
 | [TRANSPORT.md](TRANSPORT.md) | What each protocol implementation does |
-| [Examples/README.md](Examples/README.md) | Eight runnable applications and how they are laid out |
-| [Examples/STARTER.md](Examples/STARTER.md) | The starter application: layout, configuration, migrations, deployment |
-| [CONNECTORS.md](CONNECTORS.md) | The HTTP client and database drivers: limits and future work |
+| [COMPATIBILITY.md](COMPATIBILITY.md) | Moving from Garuda 1 to Garuda 2, and what a release may change |
+| [EXAMPLES.md](EXAMPLES.md) | The eight runnable applications, and recipes (still being ported from Garuda 1) |
+| [Examples/README.md](Examples/README.md) | The example applications and how they are laid out |
 | [BENCHMARKS.md](BENCHMARKS.md) | Benchmark method and results |
-| [COMPATIBILITY.md](COMPATIBILITY.md) | What an application may depend on, and what a release may change |
-| [DEPLOYMENT.md](DEPLOYMENT.md) | Publishing: the Swift Package Index listing, and the release checklist |
 | [RELEASE.md](RELEASE.md) | Changes |

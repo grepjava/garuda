@@ -19,8 +19,6 @@
 // what it read. Such a type conforms to `OpenAPISchemaDescribing` and says.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
-
 /// A JSON value in an OpenAPI document, its object keys kept in order.
 public indirect enum OpenAPIValue: Sendable, Equatable {
     case string(String)
@@ -199,8 +197,6 @@ private func primitiveSchema(_ type: Any.Type) -> OpenAPIValue? {
         return ["type": "integer", "format": "int32"]
     case is Double.Type: return ["type": "number", "format": "double"]
     case is Float.Type: return ["type": "number", "format": "float"]
-    case is UUID.Type: return ["type": "string", "format": "uuid"]
-    case is Timestamp.Type: return ["type": "string", "format": "date-time"]
     default: return nil
     }
 }
@@ -221,8 +217,6 @@ private func primitivePlaceholder<T>(_ type: T.Type) -> T? {
     case is UInt8.Type: return UInt8(0) as? T
     case is Double.Type: return 0.0 as? T
     case is Float.Type: return Float(0) as? T
-    case is UUID.Type: return UUID(high: 0, low: 0) as? T
-    case is Timestamp.Type: return Timestamp(microsecondsSinceEpoch: 0) as? T
     default: return nil
     }
 }

@@ -1,15 +1,17 @@
 import Testing
 @testable import Garuda
-import AvianHTTP
+import GarudaTesting
+import Vega
 
-// Extractors of your own: synchronous, awaiting, optional and with their
-// failure in hand.
+// Extractors of your own: plain, awaiting, optional and with their failure in
+// hand. There is one extractor protocol, and it may await; these are the
+// cases Garuda 1 split between `RequestExtractor` and `AsyncRequestExtractor`.
 
 /// A tenant named by a header, refused 400 without one.
 private struct Tenant: RequestExtractor {
     let name: String
 
-    static func extract(from request: borrowing Request, parameter: inout Int) throws -> Tenant {
+    static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Tenant {
         guard let name = request.header("x-tenant"), !name.isEmpty else {
             throw HTTPError(.badRequest, "no tenant")
         }
@@ -17,15 +19,15 @@ private struct Tenant: RequestExtractor {
     }
 }
 
-/// Users by token, in the worker's state.
+/// Users by token, in the shard's state.
 private final class Directory: @unchecked Sendable {
     var users = ["t1": "ada", "t2": "grace"]
     var lookups = 0
 }
 
-/// The user a bearer token belongs to, found after a wait on the engine, as a
-/// database lookup would be.
-private struct SignedIn: AsyncRequestExtractor {
+/// The user a bearer token belongs to, found after a wait, as a database
+/// lookup would be.
+private struct SignedIn: RequestExtractor {
     let name: String
 
     static func extract(from request: borrowing Request, parameter: inout Int) async throws -> SignedIn {
@@ -34,7 +36,7 @@ private struct SignedIn: AsyncRequestExtractor {
         }
         let token = String(header.dropFirst(7))
         let directory = try request.state(Directory.self)
-        _ = await Worker.waitTimed(currentWorker!, milliseconds: 2) { _ in }
+        try await Runtime.sleep(for: .milliseconds(2))
         directory.lookups += 1
         guard let name = directory.users[token] else { throw HTTPError.unauthorized }
         return SignedIn(name: name)
@@ -47,8 +49,8 @@ struct CustomExtractorTests {
         let app = Application()
         app.state { _ in Directory() }
         app.get("/tenant/:id") { (tenant: Tenant, id: Path<Int>) in "\(tenant.name) \(id.value)" }
-        app.get("/me") { (me: SignedIn, tenant: Tenant) async in "\(me.name) at \(tenant.name)" }
-        app.get("/hello") { (me: SignedIn?) async in "hello \(me?.name ?? "stranger")" }
+        app.get("/me") { (me: SignedIn, tenant: Tenant) in "\(me.name) at \(tenant.name)" }
+        app.get("/hello") { (me: SignedIn?) in "hello \(me?.name ?? "stranger")" }
         app.get("/maybe/:n/:m") { (n: Path<Int>?, raw: Path<String>) in "\(n.map { "\($0.value)" } ?? "nil") \(raw.value)" }
         app.get("/result") { (tenant: Result<Tenant, any Error>) -> String in
             switch tenant {
@@ -60,7 +62,7 @@ struct CustomExtractorTests {
         return app
     }
 
-    @Test func aSynchronousExtractorOfYourOwn() throws {
+    @Test func anExtractorOfYourOwn() throws {
         let client = app().test
         #expect(try client.get("/tenant/7", headers: [("x-tenant", "acme")]).text == "acme 7")
         let refused = try client.get("/tenant/7")

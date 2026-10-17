@@ -1,5 +1,6 @@
 import Testing
 @testable import Garuda
+import GarudaTesting
 
 // CORS policies: preflights, the headers on answers, and scopes.
 
@@ -12,8 +13,13 @@ private func preflight(_ method: String = "POST", origin: String = site,
     return list
 }
 
-private func requireToken() -> Middleware {
-    { request, _ in request.header("authorization") == nil ? HTTPStatus.unauthorized : nil }
+/// Refuses, 401, a request without Authorization.
+private struct NeedsAuthorization: Middleware {
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
+        guard request.header("authorization") != nil else { return response.send(status: .unauthorized) }
+        try await next()
+    }
 }
 
 @Suite("CORS", .serialized)
@@ -43,7 +49,7 @@ struct CORSTests {
 
     @Test func aPreflightDoesNotMeetTheScopesMiddleware() throws {
         let app = Application()
-        app.use(requireToken())
+        app.use(NeedsAuthorization())
         app.cors(CORSPolicy(origins: [site]))
         app.get("/me") { _, response in response.send("me") }
         app.options("/me") { _, response in response.send("options") }
@@ -58,7 +64,7 @@ struct CORSTests {
     @Test func answersToAnAllowedOriginCarryTheHeaders() throws {
         let app = Application()
         app.cors(CORSPolicy(origins: [site], exposedHeaders: ["x-total", "etag"], allowCredentials: true))
-        app.use(requireToken())
+        app.use(NeedsAuthorization())
         app.get("/me") { _, response in response.send("me") }
         app.get("/boom") { _, _ in throw HTTPError(.conflict, "no") }
         let client = app.test
@@ -167,5 +173,28 @@ struct CORSTests {
         let client = app.test
         #expect(try client.request("OPTIONS", "/plain", headers: preflight("GET")).status == 405)
         #expect(try client.request("OPTIONS", "/api/x", headers: preflight("GET")).status == 204)
+    }
+
+    @Test func aPolicyAfterTheMiddlewareAndTheRoutesStillRunsFirst() throws {
+        let app = Application()
+        app.group("/api") {
+            app.use(NeedsAuthorization())
+            app.get("/me") { () in "me" }
+            app.cors(CORSPolicy(origins: [site]))
+        }
+        let client = app.test
+        let refused = try client.get("/api/me", headers: [("origin", site)])
+        #expect(refused.status == 401)
+        #expect(refused.header("access-control-allow-origin") == site)
+        #expect(try client.request("OPTIONS", "/api/me", headers: preflight("GET")).status == 204)
+    }
+
+    @Test func anApplicationWithoutAPolicyAnswersAPreflight405() throws {
+        let app = Application()
+        app.get("/x") { () in "x" }
+        let answer = try app.test.request("OPTIONS", "/x", headers: preflight("GET"))
+        #expect(answer.status == 405)
+        #expect(answer.header("allow") == "GET, HEAD")
+        #expect(answer.header("access-control-allow-origin") == nil)
     }
 }

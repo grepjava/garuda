@@ -1,10 +1,6 @@
 import Testing
-import CAvian
-#if canImport(Glibc)
-import Glibc
-#endif
 @testable import Garuda
-import AvianHTTP
+import GarudaTesting
 
 // The OpenAPI document: schemas from Decodable types, operations from typed
 // routes and what they are told, and the document and Swagger UI served.
@@ -33,8 +29,6 @@ private struct Order: Codable {
     var lines: [Line]
     var tags: Set<String>
     var attributes: [String: String]
-    var reference: Garuda.UUID
-    var placedAt: Timestamp
     var shipping: Line?
 }
 
@@ -73,6 +67,14 @@ private struct Money: Decodable, OpenAPISchemaDescribing {
     }
 }
 
+/// A body with rules of its own, so its route can answer 422.
+private struct Signup: Decodable, Validated {
+    var email: String
+    func validate(_ check: inout Validation) {
+        check.require(!email.isEmpty, "email", "is empty")
+    }
+}
+
 /// The value at a path of object keys and array indices.
 private func at(_ value: OpenAPIValue?, _ path: Any...) -> OpenAPIValue? {
     var current = value
@@ -102,9 +104,9 @@ struct OpenAPISchemaTests {
         #expect(schemas.components.map(\.0) == ["Line", "Order"])
         let order = schemas.resolved(Order.self)
         #expect(keys(order["properties"]) == ["id", "number", "total", "paid", "note", "status", "priority",
-                                               "lines", "tags", "attributes", "reference", "placedAt", "shipping"])
+                                               "lines", "tags", "attributes", "shipping"])
         #expect(order["required"] == ["id", "number", "total", "paid", "status", "priority", "lines", "tags",
-                                      "attributes", "reference", "placedAt"])
+                                      "attributes"])
         #expect(at(order, "properties", "id") == ["type": "integer", "format": "int64"])
         #expect(at(order, "properties", "total") == ["type": "number", "format": "double"])
         #expect(at(order, "properties", "paid") == ["type": "boolean"])
@@ -114,8 +116,6 @@ struct OpenAPISchemaTests {
         #expect(at(order, "properties", "lines") == ["type": "array", "items": ["$ref": "#/components/schemas/Line"]])
         #expect(at(order, "properties", "tags") == ["type": "array", "items": ["type": "string"], "uniqueItems": true])
         #expect(at(order, "properties", "attributes") == ["type": "object", "additionalProperties": ["type": "string"]])
-        #expect(at(order, "properties", "reference") == ["type": "string", "format": "uuid"])
-        #expect(at(order, "properties", "placedAt") == ["type": "string", "format": "date-time"])
         #expect(at(order, "properties", "shipping") == ["$ref": "#/components/schemas/Line"])
         #expect(schemas.resolved(Line.self) == [
             "type": "object",
@@ -149,6 +149,10 @@ struct OpenAPISchemaTests {
         let value: OpenAPIValue = ["a": "x\"y\n\u{1}", "b": [1, 2.5, true, .null], "c": [:], "d": []]
         #expect(writeOpenAPIJSON(value, indent: false) == #"{"a":"x\"y\n\u0001","b":[1,2.5,true,null],"c":{},"d":[]}"#)
         #expect(writeOpenAPIJSON(["k": [1]], indent: true) == "{\n  \"k\": [\n    1\n  ]\n}\n")
+        // Through the writer every JSON answer uses, compact.
+        var output = JSONOutput()
+        output.write(["k": [1, "two"]] as OpenAPIValue)
+        #expect(String(decoding: output.bytes, as: UTF8.self) == #"{"k":[1,"two"]}"#)
     }
 }
 
@@ -173,14 +177,14 @@ struct OpenAPIDocumentTests {
                 .response(.notFound, "No such order")
                 .deprecated()
         }
-        app.get("/files/*path") { request, response in response.send("file") }
+        app.get("/files/*path") { request, response in response.send(text: "file") }
             .description("A file, by its path")
-        app.get("/secret") { "hidden" }.hidden()
+        app.get("/secret") { () in "hidden" }.hidden()
         app.post("/login") { (form: Form<NewOrder>) in HTTPStatus.noContent }
             .security(.apiKey(name: "X-Key", in: .header))
-        app.get("/plain") { "text" }
+        app.get("/plain") { () in "text" }
         let router = Router()
-        router.get("/status") { JSON(["ok": true]) }.summary("Health")
+        router.get("/status") { () in JSON(["ok": true]) }.summary("Health")
         app.nest("/v2", router)
         return app
     }
@@ -254,11 +258,6 @@ struct OpenAPIDocumentTests {
         #expect(served.status == 200)
         #expect(served.header("content-type") == "application/json")
         #expect(served.text == app.openAPIJSON(info))
-        // GARUDA_OPENAPI_OUT=path writes the document out, for a validator.
-        if let out = av_getenv("GARUDA_OPENAPI_OUT"), let file = fopen(out, "w") {
-            _ = served.body.withUnsafeBufferPointer { fwrite($0.baseAddress, 1, $0.count, file) }
-            fclose(file)
-        }
         #expect(served.text.hasPrefix("{\n  \"openapi\": \"3.1.0\",\n"))
 
         let page = try client.get("/docs")
@@ -272,5 +271,113 @@ struct OpenAPIDocumentTests {
     @Test func patternsBecomePaths() {
         #expect(openAPIPath("/") == ("/", []))
         #expect(openAPIPath("/a/:b/c/*d") == ("/a/{b}/c/{d}", ["b", "d"]))
+    }
+
+    @Test func theServedDocumentHasRoutesRegisteredAfterIt() throws {
+        // `openAPI` comes first and the routes after: the document is written
+        // when the application compiles, from every route there is by then.
+        let app = Application()
+        app.openAPI(info, path: "/spec.json")
+        app.get("/late") { () in "late" }.summary("Registered last")
+        let served = try app.test.get("/spec.json")
+        #expect(served.status == 200)
+        #expect(served.text.contains("\"/late\""))
+        #expect(served.text.contains("Registered last"))
+        // The document's own route is not in it.
+        #expect(!served.text.contains("spec.json"))
+    }
+
+    @Test func formsMultipartAndRules() {
+        let app = Application()
+        app.post("/upload") { (parts: Multipart) in HTTPStatus.noContent }
+        app.post("/signup") { (body: Body<Signup>) in HTTPStatus.created }
+        app.get("/search") { (query: Query<Signup>, state: State<Int>) in Text("x") }
+        app.heavy.get("/report") { () in HTML("<p>report</p>") }.summary("Heavy, still documented")
+        let document = app.openAPIDocument(info)
+        #expect(at(document, "paths", "/upload", "post", "requestBody")
+            == ["required": true, "content": ["multipart/form-data": ["schema": ["type": "object"]]]])
+        let signup = at(document, "paths", "/signup", "post", "responses")
+        #expect(keys(signup) == ["400", "422"])
+        #expect(at(signup, "422", "content", "application/json", "schema")
+            == ["$ref": "#/components/schemas/ErrorBody"])
+        // State takes nothing from the request, so the query's field is all.
+        let search = at(document, "paths", "/search", "get")
+        #expect(search?["parameters"] == [["name": "email", "in": "query", "required": true,
+                                           "schema": ["type": "string"]]])
+        #expect(keys(search?["responses"]) == ["200", "422"])
+        #expect(at(document, "paths", "/report", "get", "summary") == "Heavy, still documented")
+        #expect(at(document, "paths", "/report", "get", "responses", "200", "content", "text/html")
+            == ["schema": ["type": "string"]])
+    }
+}
+
+// MARK: - What the document cannot promise
+
+/// A type whose decoder reads a string and parses it, so recording what it
+/// decodes shows a string and not the fields it really has. The kind of type
+/// `OpenAPISchemaDescribing` exists for -- and this one does not conform, so
+/// the audit should name it.
+private struct Coordinate: Codable, Sendable {
+    let latitude: Double
+    let longitude: Double
+
+    init(from decoder: any Decoder) throws {
+        let text = try decoder.singleValueContainer().decode(String.self)
+        let parts = text.split(separator: ",")
+        guard parts.count == 2, let latitude = Double(parts[0]), let longitude = Double(parts[1]) else {
+            throw JSONError.invalidValue(path: "", reason: "not a coordinate")
+        }
+        self.latitude = latitude
+        self.longitude = longitude
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode("\(latitude),\(longitude)")
+    }
+}
+
+private struct Plain: Codable, Sendable {
+    let name: String
+    let count: Int
+    let tags: [String]
+    let inner: Inner?
+
+    struct Inner: Codable, Sendable { let id: Int }
+}
+
+@Suite("OpenAPI document checks")
+struct DocumentChecksTests {
+    private let info = OpenAPIInfo(title: "Things", version: "1")
+
+    @Test func adocumentThatSaysEverythingHasNothingToReport() throws {
+        let app = Application()
+        app.get("/things") { () in JSON([Plain]()) }.operationID("listThings")
+        app.post("/things") { (body: Body<Plain>) in JSON(body.value) }.operationID("addThing")
+        app.get("/things/:id") { (id: Path<Int>) in JSON(Plain?.none) }.operationID("getThing")
+        #expect(app.documentProblems(info).isEmpty, "\(app.documentProblems(info))")
+    }
+
+    @Test func aSchemaReadFromATypeThatStoppedEarly() throws {
+        let app = Application()
+        app.post("/places") { (body: Body<Coordinate>) in "ok" }
+        let problems = app.documentProblems(info)
+        #expect(problems.count == 1, "\(problems)")
+        #expect(problems.first?.contains("Coordinate") == true, "\(problems)")
+        #expect(problems.first?.contains("may be incomplete") == true, "\(problems)")
+    }
+
+    @Test func twoRoutesThatShareAnOperationID() throws {
+        let app = Application()
+        app.get("/a") { () in "a" }.operationID("thing")
+        app.get("/b") { () in "b" }.operationID("thing")
+        #expect(app.documentProblems(info)
+                    == [#"GET /b and GET /a share the operationID "thing""#])
+    }
+
+    @Test func aHiddenRouteIsNotAuditedEither() throws {
+        let app = Application()
+        app.post("/places") { (body: Body<Coordinate>) in "ok" }.hidden()
+        #expect(app.documentProblems(info).isEmpty, "\(app.documentProblems(info))")
     }
 }

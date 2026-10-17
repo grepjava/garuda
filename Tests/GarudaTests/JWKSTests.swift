@@ -1,12 +1,11 @@
-import Testing
-import CAvian
-import AvianCore
 @testable import Garuda
-import AvianHTTP
+import GarudaTesting
+import Synchronization
+import Testing
 
 // Verifying with keys fetched from a JWK Set: caching, rotation, a provider
 // that is down, which keys are trusted, one fetch for requests that arrive
-// together, and a fetch over a real connection.
+// together, and a route that waits for the keys.
 
 private struct Claims: Codable, Sendable {
     let sub: String
@@ -16,8 +15,19 @@ private struct Claims: Codable, Sendable {
 private let farFuture = 4_102_444_800
 
 /// A clock the tests move, safe to read from the verifier.
-private final class TestClock: @unchecked Sendable {
-    var seconds: Int64 = 1_000
+private final class TestClock: Sendable {
+    private let now = Atomic<Int64>(1_000)
+    var seconds: Int64 {
+        get { now.load(ordering: .relaxed) }
+        set { now.store(newValue, ordering: .relaxed) }
+    }
+}
+
+/// What a fake provider serves, which a test may change.
+private final class Served: @unchecked Sendable {
+    private let body = Mutex<@Sendable () throws -> [UInt8]>({ [] })
+    func set(_ make: @escaping @Sendable () throws -> [UInt8]) { body.withLock { $0 = make } }
+    func bytes() throws -> [UInt8] { try body.withLock { $0 }() }
 }
 
 private func set(_ keys: [JWTKey]) throws -> [UInt8] {
@@ -30,18 +40,25 @@ private func token(_ key: JWTKey, _ subject: String = "ada") throws -> String {
 
 @Suite("JWKS verifier", .serialized)
 struct JWKSTests {
-    /// A verifier over `served`, which a test may change, with its clock.
-    private func verifier(_ served: @escaping () throws -> [UInt8]) -> (JWKSVerifier, TestClock) {
+    /// A verifier over what `served` serves, with its clock.
+    private func verifier(_ served: Served) -> (JWKSVerifier, TestClock) {
         let clock = TestClock()
-        let verifier = JWKSVerifier(url: "https://idp.example/jwks", maxAgeSeconds: 3600, minimumRefetchSeconds: 60)
+        let verifier = JWKSVerifier(url: "https://idp.example/jwks", maxAgeSeconds: 3600, minimumRefetchSeconds: 60,
+                                    fetch: { _ in try served.bytes() })
         verifier.clock = { clock.seconds }
-        verifier.fetcher = { _ in try served() }
         return (verifier, clock)
+    }
+
+    private func verifier(_ body: @escaping @Sendable () throws -> [UInt8]) -> (JWKSVerifier, TestClock, Served) {
+        let served = Served()
+        served.set(body)
+        let (verifier, clock) = verifier(served)
+        return (verifier, clock, served)
     }
 
     @Test func keysAreFetchedOnceAndKeptUntilTheyAge() async throws {
         let first = try JWTKey.generate(.ES256, keyID: "a")
-        let (verifier, clock) = verifier { try set([first]) }
+        let (verifier, clock, _) = verifier { try set([first]) }
         #expect(try await verifier.verify(try token(first), as: Claims.self).sub == "ada")
         #expect(try await verifier.verify(try token(first, "grace"), as: Claims.self).sub == "grace")
         #expect(verifier.fetches == 1)
@@ -56,10 +73,9 @@ struct JWKSTests {
     @Test func aNewKeyIDFetchesAgainButNotTooOften() async throws {
         let old = try JWTKey.generate(.RS256, keyID: "old")
         let rotated = try JWTKey.generate(.RS256, keyID: "new")
-        var published = [old]
-        let (verifier, clock) = verifier { try set(published) }
+        let (verifier, clock, served) = verifier { try set([old]) }
         _ = try await verifier.verify(try token(old), as: Claims.self)
-        published = [old, rotated]
+        served.set { try set([old, rotated]) }
 
         // Too soon after the last fetch: refused without asking.
         await #expect(throws: JWTError.unknownKey) { try await verifier.verify(try token(rotated), as: Claims.self) }
@@ -78,21 +94,18 @@ struct JWKSTests {
 
     @Test func aProviderThatIsDown() async throws {
         let key = try JWTKey.generate(.EdDSA, keyID: "k")
-        var up = false
-        let (verifier, clock) = verifier {
-            guard up else { throw JWTError.keySetUnavailable }
-            return try set([key])
-        }
+        let down: @Sendable () throws -> [UInt8] = { throw JWTError.keySetUnavailable }
+        let (verifier, clock, served) = verifier(down)
         await #expect(throws: JWTError.keySetUnavailable) { try await verifier.verify(try token(key), as: Claims.self) }
         await #expect(throws: JWTError.keySetUnavailable) { try await verifier.verify(try token(key), as: Claims.self) }
         #expect(verifier.fetches == 1)
-        up = true
+        served.set { try set([key]) }
         clock.seconds += 60
         _ = try await verifier.verify(try token(key), as: Claims.self)
         #expect(verifier.fetches == 2)
 
         // Down again once the keys age: the ones in hand keep working.
-        up = false
+        served.set(down)
         clock.seconds += 7200
         #expect(try await verifier.verify(try token(key), as: Claims.self).sub == "ada")
         #expect(try await verifier.verify(try token(key), as: Claims.self).sub == "ada")
@@ -106,16 +119,15 @@ struct JWKSTests {
         // strength of it would verify tokens for as long as the process lived,
         // making the withdrawal mean nothing.
         let key = try JWTKey.generate(.ES256, keyID: "k")
-        var empty = false
-        let (verifier, clock) = verifier {
-            try JSONCoder.encode(JWKSet(keys: empty ? [] : [key.publicJWK!]))
-        }
+        let full: @Sendable () throws -> [UInt8] = { try JSONCoder.encode(JWKSet(keys: [key.publicJWK!])) }
+        let empty: @Sendable () throws -> [UInt8] = { try JSONCoder.encode(JWKSet(keys: [])) }
+        let (verifier, clock, served) = verifier(full)
         #expect(try await verifier.verify(try token(key), as: Claims.self).sub == "ada")
 
         // Still inside their age, so they stand: this fetch is one any client
         // can prompt with a `kid` nobody has, and a provider blinking should
         // not cost the keys the operator said to trust for an hour.
-        empty = true
+        served.set(empty)
         clock.seconds += 60
         await #expect(throws: JWTError.unknownKey) {
             try await verifier.verify(try token(try JWTKey.generate(.ES256, keyID: "other")),
@@ -129,14 +141,14 @@ struct JWKSTests {
             try await verifier.verify(try token(key), as: Claims.self)
         }
         // And back once the provider publishes again.
-        empty = false
+        served.set(full)
         clock.seconds += 60
         #expect(try await verifier.verify(try token(key), as: Claims.self).sub == "ada")
     }
 
     @Test func anEmptySetFromTheFirstFetchIsRefused() async throws {
         let key = try JWTKey.generate(.ES256, keyID: "k")
-        let (verifier, _) = verifier { try JSONCoder.encode(JWKSet(keys: [])) }
+        let (verifier, _, _) = verifier { try JSONCoder.encode(JWKSet(keys: [])) }
         await #expect(throws: JWTError.keySetUnavailable) {
             try await verifier.verify(try token(key), as: Claims.self)
         }
@@ -152,7 +164,7 @@ struct JWKSTests {
         var secret = JWK(kty: "oct", kid: "hs", alg: "HS256")
         secret.k = base64URLEncode([UInt8](repeating: 1, count: 32))
         let body = try JSONCoder.encode(JWKSet(keys: [rsaWithoutAlg, encryption, secret]))
-        let (verifier, _) = verifier { body }
+        let (verifier, _, _) = verifier { body }
 
         #expect(try await verifier.verify(try token(rsa), as: Claims.self).sub == "ada")
         await #expect(throws: JWTError.unknownKey) { try await verifier.verify(try token(ec), as: Claims.self) }
@@ -161,15 +173,15 @@ struct JWKSTests {
         await #expect(throws: JWTError.unsupported("HS256")) { try await verifier.verify(try token(hmac), as: Claims.self) }
 
         // Algorithms can be narrowed further.
-        let narrow = JWKSVerifier(url: "https://idp.example/jwks", algorithms: [.ES384])
-        narrow.fetcher = { _ in try set([rsa, ec]) }
+        let both = try set([rsa, ec])
+        let narrow = JWKSVerifier(url: "https://idp.example/jwks", algorithms: [.ES384], fetch: { _ in both })
         await #expect(throws: JWTError.unsupported("RS256")) { try await narrow.verify(try token(rsa), as: Claims.self) }
         #expect(try await narrow.verify(try token(ec), as: Claims.self).sub == "ada")
     }
 
     @Test func verifyNowAnswersOnlyWhatItCanWithoutFetching() async throws {
         let key = try JWTKey.generate(.ES256, keyID: "k")
-        let (verifier, clock) = verifier { try set([key]) }
+        let (verifier, clock, _) = verifier { try set([key]) }
         // Nothing fetched yet: that is verify's to do.
         #expect(try verifier.verifyNow(try token(key), as: Claims.self)?.sub == nil)
         #expect(verifier.fetches == 0)
@@ -191,135 +203,85 @@ struct JWKSTests {
         #expect(verifier.fetches == 1)
     }
 
-    @Test func aSynchronousRouteAnswers503UntilTheKeysAreIn() throws {
+    @Test func aRouteWaitsForTheFirstFetch() throws {
+        // Garuda 1 answered a synchronous route 503 until the keys were in;
+        // every route can await now, so the first request waits for them.
         let key = try JWTKey.generate(.ES256, keyID: "k")
         let body = try set([key])
-        let verifier = JWKSVerifier(url: "https://idp.example/jwks")
-        verifier.fetcher = { _ in body }
+        let fetched = Counter()
         let app = Application()
-        app.jwtVerifier { _ in verifier }
+        app.jwtVerifier { _ in
+            JWKSVerifier(url: "https://idp.example/jwks", fetch: { _ in
+                fetched.increment()
+                await Task.yield()
+                return body
+            })
+        }
         app.get("/me") { (jwt: JWT<Claims>) in jwt.claims.sub }
+        app.group("/guarded") {
+            app.authenticate(jwt: Claims.self)
+            app.get("/me") { (jwt: JWT<Claims>) in "guarded \(jwt.claims.sub)" }
+        }
         let client = app.test
         let bearer = [("authorization", "Bearer \(try token(key))")]
-        #expect(try client.get("/me", headers: bearer).status == 503)
-        // The fetch that request started finishes on the worker's loop.
-        var answered = try client.get("/me", headers: bearer)
-        for _ in 0..<50 where answered.status != 200 {
-            client.turn()
-            answered = try client.get("/me", headers: bearer)
+        #expect(try client.get("/me", headers: bearer).text == "ada")
+        #expect(try client.get("/guarded/me", headers: bearer).text == "guarded ada")
+        #expect(fetched.value == 1)
+        // A provider that cannot be reached is 503, not 401: the token may be
+        // fine.
+        let down = Application()
+        down.jwtVerifier { _ in
+            JWKSVerifier(url: "https://idp.example/jwks", fetch: { _ in throw JWTError.keySetUnavailable })
         }
-        #expect(answered.text == "ada")
-        #expect(verifier.fetches == 1)
+        down.get("/me") { (jwt: JWT<Claims>) in jwt.claims.sub }
+        #expect(try down.test.get("/me", headers: bearer).status == 503)
     }
 
-    @Test func requestsThatArriveTogetherShareOneFetch() throws {
+    @Test func requestsThatArriveTogetherShareOneFetch() async throws {
         let key = try JWTKey.generate(.ES256, keyID: "k")
         let body = try set([key])
-        let verifier = JWKSVerifier(url: "https://idp.example/jwks")
-        verifier.fetcher = { _ in
-            _ = await Worker.waitTimed(currentWorker!, milliseconds: 20) { _ in }
+        let verifier = JWKSVerifier(url: "https://idp.example/jwks", fetch: { _ in
+            try await Task.sleep(for: .milliseconds(20))
             return body
-        }
+        })
         let signed = try token(key)
-        let app = Application()
-        app.get("/together") { () async -> String in
-            let subjects = await withTaskGroup(of: String.self) { group in
-                for _ in 0..<5 {
-                    group.addTask { (try? await verifier.verify(signed, as: Claims.self).sub) ?? "refused" }
-                }
-                var all: [String] = []
-                for await subject in group { all.append(subject) }
-                return all
+        let subjects = await withTaskGroup(of: String.self) { group in
+            for _ in 0..<5 {
+                group.addTask { (try? await verifier.verify(signed, as: Claims.self).sub) ?? "refused" }
             }
-            return "\(subjects.filter { $0 == "ada" }.count) \(verifier.fetches)"
+            var all: [String] = []
+            for await subject in group { all.append(subject) }
+            return all
         }
-        let client = app.test
-        client.timeoutMillis = 10_000
-        let together = try client.get("/together")
-        #expect(together.text == "5 1", "\(together.status) \(together.text)")
-    }
-
-    /// GARUDA_JWKS_URL=https://... fetches a real provider's set over HTTPS
-    /// and checks that its keys load.
-    @Test(.enabled(if: av_getenv("GARUDA_JWKS_URL") != nil, "set GARUDA_JWKS_URL to run"))
-    func aRealProvidersSetLoads() throws {
-        let url = String(cString: av_getenv("GARUDA_JWKS_URL")!)
-        let verifier = JWKSVerifier(url: url)
-        let app = Application()
-        app.get("/load") { () async -> String in
-            // A token naming no key makes the verifier fetch the set.
-            let stranger = (try? JWTKey.generate(.RS256, keyID: "not-theirs")).flatMap { try? token($0) } ?? ""
-            _ = try? await verifier.verify(stranger, as: Claims.self)
-            let keys = verifier.keys?.keys ?? []
-            return "\(keys.count) \(keys.map { "\($0.algorithm):\($0.keyID ?? "-")" }.joined(separator: ","))"
-        }
-        let client = app.test
-        client.timeoutMillis = 20_000
-        let loaded = try client.get("/load").text
-        #expect(!loaded.hasPrefix("0"), "\(loaded)")
-        print("JWKS from \(url): \(loaded)")
-    }
-
-    @Test func theSetIsFetchedOverTheNetwork() throws {
-        let key = try JWTKey.generate(.PS256, keyID: "net")
-        let body = try set([key])
-        let origin = try #require(JWKSOrigin())
-        origin.response = Array("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n".utf8) + body
-
-        let verifier = JWKSVerifier(url: origin.url + "/.well-known/jwks.json")
-        let app = Application()
-        app.jwtVerifier { _ in verifier }
-        app.get("/me") { (jwt: JWT<Claims>) async in jwt.claims.sub }
-        let client = app.test
-        let wire = try TestWire(client)
-        wire.send("GET /me HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer \(try token(key))\r\n\r\n")
-        var answer: String? = nil
-        _ = wire.turn(until: {
-            origin.pump()
-            answer = wire.receive(turns: 1)
-            return answer != nil
-        }, turns: 20_000)
-        #expect(answer?.hasSuffix("ada") == true)
-        #expect(origin.requests.first?.hasPrefix("GET /.well-known/jwks.json HTTP/1.1") == true)
+        #expect(subjects == Array(repeating: "ada", count: 5))
+        #expect(verifier.fetches == 1)
     }
 }
 
-/// An origin that answers every request with `response`, pumped on the
-/// worker's thread.
-private final class JWKSOrigin {
-    let fd: Int32
-    let port: UInt16
-    var response: [UInt8] = []
-    private(set) var requests: [String] = []
-    private var open: [Int32] = []
-
-    init?() {
-        let opened = "127.0.0.1".withCString { av_listen_tcp($0, 0, 16, 0, 0) }
-        guard opened >= 0 else { return nil }
-        let got = av_local_port(opened)
-        guard got != 0 else { _ = av_close(opened); return nil }
-        fd = opened
-        port = got
-    }
-
-    deinit {
-        for peer in open { _ = av_close(peer) }
-        _ = av_close(fd)
-    }
-
-    var url: String { "http://127.0.0.1:\(port)" }
-
-    func pump() {
-        var address = [CChar](repeating: 0, count: 64)
-        var peerPort: UInt16 = 0
-        let peer = av_accept(fd, &address, 64, &peerPort)
-        if peer >= 0 { open.append(peer) }
-        for peer in open {
-            var buffer = [UInt8](repeating: 0, count: 65536)
-            let got = buffer.withUnsafeMutableBytes { av_read(peer, $0.baseAddress, $0.count) }
-            guard got > 0 else { continue }
-            requests.append(String(decoding: buffer.prefix(got), as: UTF8.self))
-            _ = response.withUnsafeBytes { av_write(peer, $0.baseAddress, $0.count) }
+@Suite("JWKS over HTTP")
+struct JWKSOverHTTPTests {
+    @Test func theSetIsFetchedWithTheHTTPClientAndARefusalIsNoKeys() throws {
+        let key = try JWTKey.generate(.ES256, keyID: "k")
+        let body = try set([key])
+        let signed = try token(key)
+        let (subject, refused) = try onRuntime {
+            let provider = Application()
+            provider.get("/jwks") { _, response in response.send(bytes: body, contentType: "application/json") }
+            let server = try LoopbackServer.start(provider)
+            defer { Task { await server.stop() } }
+            let verifier = JWKSVerifier(url: server.url + "/jwks")
+            let subject = try await verifier.verify(signed, as: Claims.self).sub
+            let missing = JWKSVerifier(url: server.url + "/nowhere")
+            let refused: JWTError?
+            do {
+                _ = try await missing.verify(signed, as: Claims.self)
+                refused = nil
+            } catch let error as JWTError {
+                refused = error
+            }
+            return (subject, refused)
         }
+        #expect(subject == "ada")
+        #expect(refused == .keySetUnavailable)
     }
 }

@@ -6,14 +6,15 @@
 //         ...
 //     }
 //
-// The body has already been read whole by the engine, up to `--max-body`, so
-// this is a parse over bytes it holds rather than a stream: the parts are cut
-// out of the buffer and copied, because a handler keeps them past its request.
-// Streaming uploads are a later step; until then the body limit is what bounds
-// the work here, along with a cap on how many parts one body may have.
+// The whole body has arrived before the handler is called, up to the body
+// limit (`--max-body`), so this is a parse over bytes the connection holds
+// rather than a stream: the parts are cut out of the buffer and copied,
+// because a handler keeps them past its request. Streaming uploads are a
+// later step; until then the body limit is what bounds the work here, along
+// with a cap on how many parts one body may have.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
+import GarudaWire
 
 /// One part of a multipart body.
 public struct MultipartPart: Equatable, Sendable {
@@ -65,7 +66,7 @@ public struct Multipart: RequestExtractor, Sendable {
     }
 
     public static func extract(from request: borrowing Request,
-                               parameter: inout Int) throws -> Self {
+                               parameter: inout Int) async throws -> Self {
         let contentType = request.header("content-type") ?? ""
         guard mediaType(of: contentType) == "multipart/form-data" else {
             throw MultipartError.wrongContentType(contentType)

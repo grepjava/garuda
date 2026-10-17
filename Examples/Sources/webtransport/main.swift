@@ -18,6 +18,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 
 import Garuda
@@ -30,7 +32,11 @@ if arguments.first == "--" { arguments.removeFirst() }
 /// Writes a line to standard error.
 func complain(_ text: String) {
     let bytes = Array((text + "\n").utf8)
+    #if os(Windows)
+    _ = bytes.withUnsafeBytes { _write(2, $0.baseAddress, UInt32($0.count)) }
+    #else
     _ = bytes.withUnsafeBytes { write(2, $0.baseAddress, $0.count) }
+    #endif
 }
 
 guard let flag = arguments.firstIndex(of: "--tls-cert"), flag + 1 < arguments.count else {
@@ -58,4 +64,5 @@ let hash = contents(of: arguments[flag + 1]).flatMap { certificateHash(pem: $0) 
 if hash == nil {
     complain("could not read a certificate from \(arguments[flag + 1]); the page will not find its hash")
 }
-exit(webTransportApp(certificateHash: hash).run(arguments: arguments))
+// `run` reads the arguments after the program's name, as it does CommandLine.arguments.
+webTransportApp(certificateHash: hash).run(arguments: [CommandLine.arguments[0]] + arguments)

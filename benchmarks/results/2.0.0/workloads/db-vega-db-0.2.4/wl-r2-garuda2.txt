@@ -1,0 +1,2 @@
+db        garuda2              29293 req/s   p50    2.067   p95    4.091   p99     5.122 ms   cpu    95 us/req   mem    20 MiB   errors 0
+6 s

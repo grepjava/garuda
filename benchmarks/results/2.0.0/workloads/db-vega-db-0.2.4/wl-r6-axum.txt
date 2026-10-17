@@ -1,0 +1,2 @@
+db        axum                 32704 req/s   p50    1.941   p95    2.693   p99     3.011 ms   cpu    78 us/req   mem     7 MiB   errors 0
+7 s

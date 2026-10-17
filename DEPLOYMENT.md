@@ -1,265 +1,253 @@
-# Publishing
+# Running Garuda in production
 
-How Garuda is published, and what has to be true before a release is listed.
-This is about distribution. For running a server in production -- system
-packages, certificates, services -- see
-[INSTALLATION.md](INSTALLATION.md#running-as-a-systemd-service).
+How a Garuda 2 server behaves as a set of processes, what each signal does,
+how to take it out of a load balancer without refusing traffic, and how to
+reload it. Building and certificates are in [INSTALLATION.md](INSTALLATION.md);
+every flag is in [CONFIG.md](CONFIG.md).
 
-## Swift Package Index
+---
 
-[swiftpackageindex.com](https://swiftpackageindex.com) is where Swift packages
-are found. It reads the repository directly: there is nothing to upload and no
-account to keep. It renders the README as the package page, so the README *is*
-the listing.
+## The supervisor and its shards
 
-### What it needs
+On Linux, by default, the process you start is a **supervisor**. It binds the
+listening ports, maps the memory the shards share, and starts the
+**shards**: one process per last-level cache domain, each with its own
+work-stealing runtime pinned to that domain's CPUs. The supervisor serves
+nothing itself. `--shards N` sets the count; `--shards 0` serves in the one
+process you started, with no supervisor.
 
-| | |
-|---|---|
-| A public repository | [github.com/grepjava/garuda](https://github.com/grepjava/garuda) |
-| A parseable `Package.swift` at the root | yes |
-| At least one library product | `Garuda`, `GarudaUploads`, `GarudaJSON`, `GarudaSQL` |
-| At least one semantic-version tag | `1.0.0` |
-| A recognised licence | MIT, in `LICENSE` |
+| platform | default | how shards start |
+|---|---|---|
+| Linux | `--shards auto` | forked from the supervisor |
+| macOS | `--shards 0` | a new run of the same executable with the same arguments |
+| Windows | one process, always | -- |
 
-### Submitting
+What the supervisor does:
 
-Open a pull request against
-[SwiftPackageIndex/PackageList](https://github.com/SwiftPackageIndex/PackageList)
-adding the repository to `packages.json`, or use the form at
-[swiftpackageindex.com/add-a-package](https://swiftpackageindex.com/add-a-package),
-which opens the same pull request. The list is sorted case-insensitively and
-the URL is lowercased with a `.git` suffix:
+- **A shard that crashes** -- killed by a signal, or exiting non-zero -- is
+  started again at once. One that keeps crashing within a second of starting
+  is restarted after 100 ms, then after waits doubling up to 5 seconds. Only
+  that shard's connections are lost; the others keep serving. A shard whose
+  `app.state` factory or `onShardStart` hook throws exits with status 1 and is
+  restarted the same way, so a database that is down at start-up is retried
+  rather than served without.
+- **Signals** to the supervisor are passed on to the shards (below).
+- **If the supervisor dies**, each shard is sent `SIGTERM`.
+- **It exits** when every shard has gone: 0 after a stop signal.
 
-```
-https://github.com/grepjava/garuda.git
-```
+The shards share some state through memory the supervisor maps before they
+start, and keeps across shard restarts: the TLS session-ticket key, the
+`--rate-limit` table, the `--metrics-port` counters, the `--cache-size`
+cache and the `--broadcast-size` ring. Everything else -- `app.state`, the
+database pools, in-memory session and token stores -- belongs to one shard.
+An in-memory store under more than one shard is warned about at start-up;
+use a database or Redis for state every shard must see.
 
-The index then polls the repository. **New tags appear on their own**; a
-release is never submitted twice.
+**Nothing may start a thread before `app.run()`.** With shards, the
+supervisor forks, and a fork copies only the calling thread, so Vega stops the
+program if another thread exists by then: a Vega `Runtime` made in `main`, a
+tracer's exporter, a library that starts a background thread. Make such
+things in `app.state`, `onShardStart` or `app.tracing { shard in … }`, which run
+in each shard.
 
-### `.spi.yml`
+The process names make the shards easy to find: shard *i*'s threads are named
+`garuda-s<i>`.
 
-`.spi.yml` in the repository root asks the index to build and host DocC for
-the four library targets. Garuda has about 5,400 documentation comments over
-1,900 public declarations, so this is worth having. The executables are left
-out: they are the benchmark application and the conformance server, not API
-anyone imports.
+### Containers and CPU limits
 
-Validate it against the current schema before relying on it -- the index's own
-`spi-manifest` package can check the file, and a manifest it cannot parse is
-ignored rather than reported.
-
-### What the compatibility matrix will show, and why
-
-The index builds every package across Swift versions and platforms and prints
-a grid. **Garuda will not be green everywhere, and neither gap is a fault in
-the package: one platform is out of scope, the other needs a flag the index's
-builders cannot pass.**
-
-- **iOS, tvOS, watchOS, visionOS: will fail.** Garuda is a server. It forks
-  worker processes, binds listening sockets and uses epoll or kqueue. It
-  declares `platforms: [.macOS(.v15)]` and nothing else. These builds are
-  attempted anyway and their failure is correct information.
-- **macOS: builds, with two flags the index's builders cannot pass.** The row
-  will be red, and it reports a gap in the manifest rather than in the port:
-  CI builds Garuda and runs the unit tests on a `macos-15` runner on every
-  push. What the index cannot supply is a header search path. aviancore links
-  `libssl` and `libcrypto` but declares no path to them; on Linux the headers
-  are where the compiler already looks, and on macOS they are in Homebrew's
-  prefix, which is why [INSTALLATION.md](INSTALLATION.md#macos) has a
-  developer pass them:
-
-  ```bash
-  swift build -Xcc -I"$(brew --prefix openssl@3)/include" \
-              -Xlinker -L"$(brew --prefix openssl@3)/lib"
-  ```
-
-  The index's builders run a plain `swift build`, so theirs fails to find
-  `openssl/ssl.h`. A developer who followed INSTALLATION.md does not hit this.
-- **Linux: expected to pass.** The official Swift container images carry
-  `zlib1g-dev`, and `libssl-dev` arrives with the toolchain's own
-  dependencies. This has not been verified against the index's builder image;
-  the Linux CI job here is the closest evidence.
-
-### Teaching the manifest where OpenSSL is
-
-Two flags in an installation guide are a workaround for a manifest that does
-not describe its own dependency. Removing the need for them would spare every
-macOS developer the flags, and it is the only route to a green macOS row.
-
-The change is a `systemLibrary` target in **aviancore** with a `pkgConfig`
-name, which makes pkg-config supply the include and link paths on every
-platform:
-
-```swift
-.systemLibrary(
-    name: "COpenSSL",
-    pkgConfig: "openssl",
-    providers: [.brew(["openssl@3"]), .apt(["libssl-dev"])]
-)
-```
-
-`CAvian` then depends on it instead of naming `.linkedLibrary("ssl")` and
-`.linkedLibrary("crypto")` directly.
-
-**This would help a macOS developer. It probably will not turn the index's
-macOS row green**, and the reason is worth knowing before anyone spends a day
-on it. Homebrew's `openssl@3` is keg-only: its `.pc` files are not on
-pkg-config's default search path, which is why CI sets
-
-```yaml
-PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig
-```
-
-before building. The index's builders set no such variable, and there is no
-reason to think they have Homebrew's OpenSSL installed at all. `pkgConfig`
-finds a library that is discoverable; it does not install one.
-
-Two other things to check:
-
-- **`pkgConfig` must not introduce unsafe flags.** A package consumed by
-  version is refused if any target sets them, and CI has a job that builds
-  Garuda as a versioned dependency precisely to catch that. `pkgConfig` is not
-  an unsafe flag, but the change should be proved against that job.
-- **Where pkg-config is missing entirely**, the `providers` list is advice
-  printed in an error, not an install.
-
-The only change that would make the macOS row green unconditionally is for
-aviancore to stop needing OpenSSL -- BoringSSL now covers the record layer and
-the handshake, leaving `avian_crypto.c`, ACME and QUIC's primitives on
-OpenSSL. That is a project, not a manifest edit, and it is not on the roadmap.
-
-So the macOS row stays red. The honest reading of the matrix is that Garuda
-is a Linux server package which also builds and tests on macOS, given two
-flags that CI passes on every push and the index's builders have no way to
-pass.
-
-### Is a Mac needed for any of this?
-
-No, and nothing below needs one either.
-
-- **Listing the package** needs no build anywhere. The index reads the
-  repository and builds on its own machines; submission is a pull request
-  against a JSON file.
-- **macOS builds are already proved on every push.** CI runs the release build
-  and the unit tests on a GitHub-hosted `macos-15` runner. Nobody here owns
-  the Mac that does it.
-- **A macOS fix could be written and verified the same way**, through CI,
-  without local hardware.
-
-A Mac would buy faster iteration on a macOS-only problem -- minutes instead of
-a CI round trip -- and nothing else. There is one open macOS-only question it
-would help with: four unit tests fail on macOS and nowhere else, three of
-which pass when run serially, so they interfere through something the suites
-share. CI keeps both runs to tell those apart, and that job does not fail the
-build.
-
-### Badges
-
-Once the package is indexed, these render the Swift versions and platforms the
-index measured, and they update themselves:
-
-```markdown
-[![Swift](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fgrepjava%2Fgaruda%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/grepjava/garuda)
-[![Platforms](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fgrepjava%2Fgaruda%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/grepjava/garuda)
-```
-
-They are deliberately not in the README yet: a badge added before the first
-build reports nothing, and a platforms badge is worth adding only once the
-matrix says what it should.
-
-### Repository metadata
-
-The index shows GitHub's own description and topics, so they are part of the
-listing rather than decoration. Keep the description matching the README's
-opening line, and the topics on what someone would search for.
-
-## the-benchmarker
-
-[the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks)
-compares several hundred frameworks on one contract. **The pull request goes
-there, not to `the-benchmarker/website`**, which only renders the results.
-
-### The contract
-
-| HTTP | Route | Status | Body |
-|---|---|---|---|
-| `GET` | `/` | 200 | empty |
-| `GET` | `/user/:id` | 200 | the id |
-| `POST` | `/user` | 200 | empty |
-
-The server listens on `0.0.0.0:3000`. Their CI builds each framework and
-checks those three routes; **it never benchmarks**, so no measurement is
-needed to open a pull request.
-
-### The entry
-
-`swift/` already exists with a shared `Dockerfile` and `config.yaml`, so
-Garuda is a directory beside the other five entries, not a new language.
-[benchmarks/web-frameworks/swift/garuda](benchmarks/web-frameworks/swift/garuda)
-holds what that directory contains:
-
-- `config.yaml` -- the GitHub repository, the version the results table
-  prints, and `SERVER_HOSTNAME`/`SERVER_PORT` in the environment.
-- `Package.swift` -- a package named `server` with one executable target of
-  the same name, which is what the image runs. It depends on a published
-  Garuda tag, not on a branch.
-- `Sources/server/main.swift` -- the three routes, and the environment read
-  into the same parser the `garuda` command line uses, because the image
-  starts the binary with no arguments.
-
-`.Dockerfile.default` and `.Makefile` in each entry are generated by the
-repository's rake tasks from `config.yaml`. Do not write them by hand.
-
-**Their shared Swift build stage already installs `libssl-dev` and
-`zlib1g-dev`**, which are Garuda's only system dependencies, so the
-language-level image needs no change. The runtime stage is `swift:6.3-slim`
-plus curl, and it carries `libssl.so.3`, `libcrypto.so.3` and `libz.so.1`
-(Ubuntu 24.04, checked with `ldconfig -p` in the image). That is worth
-checking rather than assuming: the other Swift entries reach TLS through a
-vendored BoringSSL and would run whether or not OpenSSL were there.
-
-Built through their template, the image answers all three routes and is 442 MB
-against a 403 MB base -- 39 MB added, which is the binary and curl.
-
-### Checking an entry before opening the pull request
-
-Build it the way their Dockerfile does, against a published tag, and drive the
-three routes:
+Vega sizes the shards from the CPUs the process may run on: its affinity mask,
+which `taskset` or a cpuset sets. A CPU quota without a cpuset (a Kubernetes
+CPU limit, `docker run --cpus`) is not seen, so in a container with a quota,
+set the count yourself:
 
 ```bash
-swift build -c release -Xswiftc -enforce-exclusivity=unchecked
-SERVER_HOSTNAME=127.0.0.1 SERVER_PORT=3555 ./.build/release/server &
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3555/
-curl -s http://127.0.0.1:3555/user/42
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:3555/user
+garuda --shards 1 --threads 4        # a pod limited to four CPUs
 ```
 
-The entry is about 28 MB built, against Hummingbird's 39 MB and Vapor's 106 MB
-on the same machine. Roughly ten of those megabytes are the BoringSSL aviancore
-vendors, which every binary carries.
+The environment variable `VEGA_SHARDS` overrides `--shards`, which is handy
+where the command line is fixed.
 
-### Measuring it here
+---
 
-Not required, and not comparable with the figures that site publishes --
-[BENCHMARKS.md](BENCHMARKS.md) lists every difference.
-[benchmarks/frameworks.sh](benchmarks/frameworks.sh) runs their load command
-flag for flag; [benchmarks/fw-arms.sh](benchmarks/fw-arms.sh) wraps it so each
-server is measured in an invocation of its own and the arms rotate, because
-whichever server goes later in a sweep reads lower and the difference is
-charged to it otherwise.
+## Signals
 
-## Checklist for a release
+| signal | effect |
+|---|---|
+| `SIGTERM` | fail the health check for `--drain-delay`, then stop accepting and drain within `--graceful-timeout` |
+| `SIGINT`, `SIGQUIT` | drain at once; one sent during a `--drain-delay` cuts it short |
+| `SIGHUP` | restart the shards one at a time (with shards only) |
 
-Tagging is what publishes. Before a tag:
+The supervisor passes `SIGTERM` on as `SIGTERM`, and `SIGINT` or `SIGQUIT` as
+`SIGINT`. Each shard applies `--drain-delay` itself, so an init system that
+signals the whole process group behaves the same as one that signals only the
+supervisor.
 
-1. Run everything under "Before cutting a version" in
-   [RELEASE.md](RELEASE.md) against
-   a release build.
-2. Move the `Unreleased` section to the new version with its date.
-3. Check the version policy in [COMPATIBILITY.md](COMPATIBILITY.md): a
-   breaking change to anything covered needs a major version.
-4. Confirm the aviancore dependency names a released tag, not a branch or a
-   local path, and that a clean checkout resolves it.
-5. Tag and push. The index picks the tag up on its own.
+**Draining.** A shard that drains:
+
+1. answers the health check with 503 from then on;
+2. stops accepting connections;
+3. sends each WebSocket a 1001 close, and each HTTP/2 connection a GOAWAY once
+   its WebSockets have closed;
+4. lets HTTP/1.1 connections finish the request in hand, HTTP/2 and HTTP/3
+   connections finish their streams, all within `--graceful-timeout`
+   milliseconds (10000 by default);
+5. stops its `app.every` jobs, runs its `onShardStop` hooks and shuts its
+   state down, newest first.
+
+The supervisor kills any shard still running `--drain-delay` +
+`--graceful-timeout` + 5 seconds after the signal. The same signal sent to the
+supervisor a second time does not wait: the shards are killed at once.
+
+**With `--shards 0`** the one process handles `SIGTERM`, `SIGINT` and `SIGQUIT`
+the same way. `SIGHUP` is not handled, so the system's default for it ends the
+process. **On Windows**, Ctrl-C and Ctrl-Break stop it as `SIGINT` does, and closing the console as `SIGTERM` does.
+
+---
+
+## Draining behind a load balancer
+
+```bash
+garuda --health-check-path /healthz --drain-delay 10000 --graceful-timeout 30000
+```
+
+A load balancer or Kubernetes Service keeps routing to a server for a few
+seconds after it is told to stop: taking an endpoint out of rotation has to
+propagate. A server that stops accepting the moment `SIGTERM` arrives refuses
+that traffic. With `--drain-delay`, on `SIGTERM` the server:
+
+- keeps serving for the delay, in milliseconds;
+- answers `--health-check-path` with `503`, so the balancer marks it down;
+- closes each HTTP/1.1 connection after its response, so clients reconnect
+  to a server that is staying;
+
+and only then starts draining. Both flags are milliseconds.
+
+- Make the delay longer than the readiness probe takes to fail: its period
+  times its failure threshold.
+- Kubernetes' `terminationGracePeriodSeconds` must cover the delay plus
+  `--graceful-timeout` and a margin.
+- Only `SIGTERM` waits. `SIGINT`, `SIGQUIT` and a reload do not.
+
+```yaml
+readinessProbe:
+  httpGet: { path: /healthz, port: 8000 }
+  periodSeconds: 2
+  failureThreshold: 2
+terminationGracePeriodSeconds: 45     # 10 s delay + 30 s grace + margin
+```
+
+The health check is answered before rate limiting, static files and routes,
+and says nothing about the application's own dependencies. A deeper check is
+a route of the application's.
+
+---
+
+## Reloads
+
+`SIGHUP` to the supervisor restarts the shards one at a time. For each shard
+in turn, the supervisor sends it `SIGINT`; it drains (no `--drain-delay`) and
+exits; its replacement starts; then the next shard. The log says
+`reloading workers` when a reload begins and `workers reloaded` when every
+shard has started again. A `SIGHUP` during a reload is ignored.
+
+- **What a reload picks up:** each replacement shard loads the
+  certificate and key files again, rebuilds its `app.state` and runs its start
+  hooks. It is how a renewed certificate is taken into use without
+  `--tls-reload`.
+- **What it does not:** the command line, which the supervisor read once.
+  The executable either: on Linux the replacement is forked from the
+  supervisor, so a new build needs a restart (or, in development,
+  `--reload`).
+- **The response cache** is emptied when a replacement starts.
+- **Capacity.** One shard is out of service at a time while it drains and
+  restarts. The others keep accepting. With `--balance shared` they take
+  every new connection. With `reuseport` (the default on Linux) the kernel
+  hashes new connections only across the sockets still open; connections
+  already queued on the stopping shard's socket when it closes are reset,
+  unless `net.ipv4.tcp_migrate_req=1` lets the kernel move them to another
+  shard's socket.
+
+Certificate renewal with certbot:
+
+```bash
+certbot renew --deploy-hook 'systemctl reload garuda'
+```
+
+or run with `--tls-reload 3600` and let the server notice the files change,
+with no restart at all ([CONFIG.md](CONFIG.md#renewing-certificates)).
+
+---
+
+## Running as a systemd service
+
+```ini
+[Unit]
+Description=garuda
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/garuda --host 0.0.0.0 --port 443 \
+    --tls-cert /etc/garuda/cert.pem --tls-key /etc/garuda/key.pem \
+    --redirect-http 80 \
+    --health-check-path /healthz --drain-delay 5000 --graceful-timeout 10000
+ExecReload=/bin/kill -HUP $MAINPID
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=on-failure
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- `systemctl stop` sends `SIGTERM`, which drains. Keep `TimeoutStopSec` above
+  `--drain-delay` + `--graceful-timeout` + 5 seconds.
+- `systemctl reload` sends `SIGHUP` to the supervisor, which restarts the
+  shards one at a time.
+- `AmbientCapabilities=CAP_NET_BIND_SERVICE` lets a non-root user bind ports
+  below 1024.
+- `Restart=on-failure` covers the supervisor itself. Crashed shards are the
+  supervisor's to restart.
+
+Exit status: 0 after a stop signal; 2 for a command line, route table or
+certificate that is wrong; 1 for a port that cannot be bound, or for a server
+in one process whose state could not be built.
+
+To upgrade, rebuild, copy the binary into place and restart. Garuda keeps no
+state on disk.
+
+---
+
+## Behind a reverse proxy
+
+Bind to loopback or a unix socket, and trust the proxy's forwarded headers:
+
+```bash
+garuda --unix /run/garuda.sock --forwarded-allow-ips unix
+garuda --host 127.0.0.1 --port 8000 --forwarded-allow-ips 127.0.0.1
+```
+
+- Without `--forwarded-allow-ips`, `X-Forwarded-For`, `X-Forwarded-Proto` and
+  `Forwarded` are ignored. Handlers and the rate limiter then see the proxy's
+  address.
+- A proxy that talks h2c upstream, such as Envoy or Caddy, needs
+  `--http2-only`.
+- If the proxy mounts the application under a prefix and does not strip it,
+  use `--root-path`.
+- A proxy that terminates TLS and sends no forwarded headers needs
+  `--scheme https`.
+
+---
+
+## Logs and metrics
+
+- Everything Garuda writes goes to standard error, one line per write of at
+  most 4096 bytes, so shards sharing the stream never interleave lines.
+  `--log-format json` and `--access-log-format json` give a collector one JSON
+  object per line, with a `pid` to tell shards apart.
+- `--metrics-port` serves Prometheus metrics summed over every shard, on a
+  port of its own. Bind it privately with `--metrics-host 127.0.0.1`.
+- `--request-id` puts one ID on the response, the access log and
+  `request.log` lines.
+
+[CONFIG.md](CONFIG.md#observability) has the formats and the metric names.

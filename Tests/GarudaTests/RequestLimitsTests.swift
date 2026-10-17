@@ -1,101 +1,103 @@
 import Testing
+import Synchronization
+import Vega
 @testable import Garuda
-import CAvian
+import GarudaTesting
 
-// maxBodySize and concurrencyLimit.
+// maxBodySize and concurrencyLimit, and the server's own body limit.
 
-/// A request sent on a connection of its own, answered while other
-/// connections wait.
-private final class Pending {
-    let client: TestClient
-    let fd: Int32
-    private var received: [UInt8] = []
-    private var closed = false
+private let count: Handler = { request, response in response.send("\(request.body.count)") }
 
-    init(_ client: TestClient, _ request: String) throws {
-        self.client = client
-        fd = try client.connect().client
-        var request = request
-        request.withUTF8 { _ = av_write(fd, $0.baseAddress!, $0.count) }
-    }
-
-    deinit { close() }
-
-    func close() {
-        guard !closed else { return }
-        closed = true
-        _ = av_close(fd)
-    }
-
-    /// The response once it is whole, turning the worker up to `turns` times.
-    func response(turns: Int = 3_000) throws -> TestResponse? {
-        var chunk = [UInt8](repeating: 0, count: 16384)
-        for _ in 0..<turns {
-            client.turn()
-            while true {
-                let n = chunk.withUnsafeMutableBufferPointer { av_read(fd, $0.baseAddress!, $0.count) }
-                if n <= 0 { break }
-                received.append(contentsOf: chunk[0..<n])
-            }
-            if let response = try TestResponse.parse(received, bodyless: false, closed: false) { return response }
+private func bodyApp() -> Application {
+    let app = Application()
+    app.post("/default", count)
+    app.maxBodySize(64) {
+        app.post("/big", count)
+        app.maxBodySize(8) {
+            app.post("/tiny", count)
+            app.post("/tiny/:id", count)
         }
-        return nil
+        app.group("/under") {
+            app.fallback(count)
+        }
     }
+    let router = Router()
+    router.maxBodySize(4) {
+        router.post("/routed", count)
+    }
+    app.merge(router)
+    return app
 }
 
-private func post(_ path: String, _ body: String) -> String {
-    "POST \(path) HTTP/1.1\r\nHost: x\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+private func bodyClient(_ app: Application = bodyApp()) -> TestClient {
+    var config = ServerConfig()
+    config.maxBodySize = 16
+    return app.testClient(configuration: config)
+}
+
+/// Holds the handlers that pass it until it is opened, and counts them in.
+private final class Gate: Sendable {
+    private let inside = Atomic<Int>(0)
+    private let opened = Atomic<Bool>(false)
+
+    func pass() async throws {
+        inside.add(1, ordering: .relaxed)
+        while !opened.load(ordering: .acquiring) { try await Runtime.sleep(for: .milliseconds(1)) }
+    }
+
+    /// Waits until `n` handlers are being held.
+    func waitFor(_ n: Int) async throws {
+        while inside.load(ordering: .relaxed) < n { try await Task.sleep(for: .milliseconds(1)) }
+    }
+
+    func open() { opened.store(true, ordering: .releasing) }
+}
+
+private let authorized = [("authorization", "yes")]
+
+private func concurrencyApp(_ gate: Gate) -> Application {
+    let app = Application()
+    app.get("/free") { () in "free" }
+    app.group("/limited") {
+        app.use { request, response, next in
+            guard request.header("authorization") != nil else { return response.send(status: .unauthorized) }
+            try await next()
+        }
+        app.concurrencyLimit(1) {
+            app.get("/slow") { () async throws in
+                try await gate.pass()
+                return "done"
+            }
+            app.get("/quick") { () in "quick" }
+            app.get("/fails") { () throws -> String in throw HTTPError.conflict("no") }
+        }
+    }
+    return app
 }
 
 @Suite("Request limits")
 struct RequestLimitsTests {
 
-    private func bodyApp() -> Application {
-        let app = Application()
-        let count: Handler = { request, response in response.send("\(request.body.count)") }
-        app.post("/default", count)
-        app.maxBodySize(64) {
-            app.post("/big", count)
-            app.maxBodySize(8) {
-                app.post("/tiny", count)
-            }
-            app.onStreamingBody(.post, "/stream", maxBodySize: 100) { _, response, body in
-                let all = try await body.readAll(maxBytes: 1000)
-                response.send("\(all.count)")
-            }
-        }
-        let router = Router()
-        router.maxBodySize(4) {
-            router.post("/routed", count)
-        }
-        app.merge(router)
-        return app
-    }
+    // MARK: Body size
 
-    private func bodyClient() -> TestClient {
-        var config = ServerConfig()
-        config.maxConnections = 16
-        config.maxBodySize = 16
-        return bodyApp().testClient(configuration: config)
+    @Test func aBodyPastMaxBodySizeIs413() throws {
+        let client = bodyClient()
+        #expect(try client.post("/default", body: String(repeating: "x", count: 40)).status == 413)
+        #expect(try client.post("/default", body: "0123456789").text == "10")
+        #expect(try client.post("/default", body: String(repeating: "x", count: 16)).text == "16")
+        #expect(try client.post("/default", body: String(repeating: "x", count: 17)).status == 413)
     }
 
     @Test func aScopesLimitReplacesMaxBodyEitherWay() throws {
         let client = bodyClient()
         let forty = String(repeating: "x", count: 40)
-        #expect(try client.post("/default", body: forty).status == 413)
-        #expect(try client.post("/default", body: "0123456789").text == "10")
         #expect(try client.post("/big", body: forty).text == "40")
         #expect(try client.post("/big", body: forty + forty).status == 413)
         #expect(try client.post("/tiny", body: "01234567").text == "8")
         #expect(try client.post("/tiny", body: "012345678").status == 413)
+        #expect(try client.post("/tiny/3", body: "012345678").status == 413)
         #expect(try client.post("/routed", body: "01234").status == 413)
         #expect(try client.post("/routed", body: "0123").text == "4")
-    }
-
-    @Test func aStreamingRouteKeepsItsOwnLimit() throws {
-        let client = bodyClient()
-        #expect(try client.post("/stream", body: String(repeating: "y", count: 90)).text == "90")
-        #expect(try client.post("/stream", body: String(repeating: "y", count: 120)).status == 413)
     }
 
     @Test func aChunkedBodyIsRefusedWhenItGrowsPastTheLimit() throws {
@@ -105,112 +107,138 @@ struct RequestLimitsTests {
         #expect(within.text == "8")
         let past = try client.send(raw: Array((chunked + "5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n").utf8))
         #expect(past.status == 413)
+        // And under the server's limit, in an application with scoped ones.
+        let server = "POST /default HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+        let large = try client.send(raw: Array((server + "9\r\nhello wor\r\n9\r\nld, again\r\n0\r\n\r\n").utf8))
+        #expect(large.status == 413)
     }
 
-    private func concurrencyApp() -> Application {
-        let app = Application()
-        app.get("/free") { _, response in response.send("free") }
-        app.group("/limited") {
-            app.use { request, _ in request.header("authorization") == nil ? HTTPStatus.unauthorized : nil }
-            app.concurrencyLimit(1) {
-                app.onAsync(.get, "/slow") { _, response in
-                    try await response.sleep(milliseconds: 150)
-                    response.send("done")
-                }
-                app.get("/quick") { _, response in response.send("quick") }
-            }
-        }
-        return app
+    @Test func aFallbackHasItsScopesLimit() throws {
+        let client = bodyClient()
+        let forty = String(repeating: "x", count: 40)
+        #expect(try client.post("/under/anything", body: forty).text == "40")
+        #expect(try client.post("/under/anything", body: forty + forty).status == 413)
+        // A miss with no fallback is held to the server's limit.
+        #expect(try client.post("/nowhere", body: forty).status == 413)
+        #expect(try client.post("/nowhere", body: "0123").status == 404)
     }
 
-    @Test func onePastTheLimitIsAnswered503AndThePlaceComesBack() throws {
-        let client = concurrencyApp().test
-        let auth = "Authorization: yes\r\n"
-        let first = try Pending(client, "GET /limited/slow HTTP/1.1\r\nHost: x\r\n\(auth)\r\n")
-        for _ in 0..<20 { client.turn() }
+    @Test func anIgnoredTrailingSlashKeepsTheRoutesLimit() throws {
+        let app = bodyApp()
+        app.trailingSlash(.ignore)
+        let client = bodyClient(app)
+        #expect(try client.post("/big/", body: String(repeating: "x", count: 40)).text == "40")
+        #expect(try client.post("/tiny/", body: "012345678").status == 413)
+    }
 
-        #expect(try client.get("/limited/slow", headers: [("authorization", "yes")]).status == 503)
-        #expect(try client.get("/limited/quick", headers: [("authorization", "yes")]).status == 503)
+    @Test func aRefusedBodyIsReportedWithNoRoute() throws {
+        let seen = Mutex<[CompletedRequest]>([])
+        let app = bodyApp()
+        app.onResponse { completed in seen.withLock { $0.append(completed) } }
+        let client = bodyClient(app)
+        #expect(try client.post("/tiny", body: "012345678").status == 413)
+        #expect(try client.post("/tiny", body: "0").text == "1")
+        let reports = seen.withLock { $0.map { "\($0.status) \($0.route ?? "-")" } }
+        #expect(reports == ["413 -", "200 /tiny"])
+    }
+
+    @Test func pipelinedRequestsUnderScopedLimits() throws {
+        // The route matched before the body is the one that answers, with its
+        // parameters, request after request on one connection.
+        let raw = "POST /tiny/1 HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nab"
+            + "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 20\r\n\r\n" + String(repeating: "y", count: 20)
+            + "POST /tiny/2 HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc"
+        let responses = try bodyClient().sendPipelined(raw: Array(raw.utf8))
+        #expect(responses.map(\.text) == ["2", "20", "3"])
+    }
+
+    // MARK: Concurrency
+
+    @Test func onePastTheLimitIsAnswered503AndThePlaceComesBack() async throws {
+        let gate = Gate()
+        let client = concurrencyApp(gate).test
+        let first = Task.detached { try client.get("/limited/slow", headers: authorized).text }
+        try await gate.waitFor(1)
+
+        #expect(try client.get("/limited/slow", headers: authorized).status == 503)
+        #expect(try client.get("/limited/quick", headers: authorized).status == 503)
         // Middleware runs before the count: a refused request takes no place
         // and is refused as it would be anyway.
         #expect(try client.get("/limited/quick").status == 401)
         #expect(try client.get("/free").text == "free")
 
-        #expect(try first.response()?.text == "done")
-        #expect(try client.get("/limited/quick", headers: [("authorization", "yes")]).text == "quick")
-        #expect(try client.get("/limited/slow", headers: [("authorization", "yes")]).text == "done")
+        gate.open()
+        #expect(try await first.value == "done")
+        #expect(try client.get("/limited/quick", headers: authorized).text == "quick")
+        #expect(try client.get("/limited/slow", headers: authorized).text == "done")
     }
 
-    @Test func aRequestThatGoesAwayGivesItsPlaceBack() throws {
-        let client = concurrencyApp().test
-        try client.abandon(Array("GET /limited/slow HTTP/1.1\r\nHost: x\r\nAuthorization: yes\r\n\r\n".utf8), turns: 20)
-        for _ in 0..<20 { client.turn() }
-        #expect(try client.get("/limited/quick", headers: [("authorization", "yes")]).text == "quick")
+    @Test func aHandlerThatThrowsGivesItsPlaceBack() throws {
+        let client = concurrencyApp(Gate()).test
+        #expect(try client.get("/limited/fails", headers: authorized).status == 409)
+        #expect(try client.get("/limited/quick", headers: authorized).text == "quick")
     }
 
-    /// A limit of one over two ways of streaming: a body returned from a typed
-    /// handler, whose producer runs after the handler is done, and one written
-    /// inline, which runs while it is still running.
-    private func streamingLimitApp() -> Application {
+    @Test func aRouterMergedTwiceHasALimitInEachPlace() async throws {
+        let gate = Gate()
+        let router = Router()
+        router.concurrencyLimit(1) {
+            router.get("/slow") { () async throws in
+                try await gate.pass()
+                return "done"
+            }
+            router.get("/quick") { () in "quick" }
+        }
         let app = Application()
-        app.concurrencyLimit(1) {
-            app.get("/returned") { () async -> StreamingBody in
-                StreamingBody(contentType: "text/plain") { body in
-                    try await body.write("a")
-                    try await body.sleep(milliseconds: 150)
-                    try await body.write("b")
+        app.nest("/a", router)
+        app.nest("/b", router)
+        let client = app.test
+        let first = Task.detached { try client.get("/a/slow").text }
+        try await gate.waitFor(1)
+        #expect(try client.get("/a/quick").status == 503)
+        #expect(try client.get("/b/quick").text == "quick")
+        gate.open()
+        #expect(try await first.value == "done")
+    }
+
+    @Test func nestedLimitsAllApply() async throws {
+        let gate = Gate()
+        let app = Application()
+        app.concurrencyLimit(2) {
+            app.get("/outer") { () async throws in
+                try await gate.pass()
+                return "outer"
+            }
+            app.concurrencyLimit(1) {
+                app.get("/inner") { () async throws in
+                    try await gate.pass()
+                    return "inner"
                 }
             }
-            app.onAsync(.get, "/inline") { _, response in
-                let body = response.stream()
-                try await body.write("a")
-                try await response.sleep(milliseconds: 150)
-                try await body.write("b")
-            }
-            app.get("/quick") { _, response in response.send("quick") }
         }
-        return app
+        let client = app.test
+        let inner = Task.detached { try client.get("/inner").text }
+        try await gate.waitFor(1)
+        let outer = Task.detached { try client.get("/outer").text }
+        try await gate.waitFor(2)
+        // The outer scope is full with one of each; the inner, with one.
+        #expect(try client.get("/outer").status == 503)
+        #expect(try client.get("/inner").status == 503)
+        gate.open()
+        #expect(try await inner.value == "inner")
+        #expect(try await outer.value == "outer")
     }
 
-    @Test func aReturnedStreamingBodyKeepsItsPlaceUntilItHasWritten() throws {
-        // The handler returns as soon as it has described the body; the
-        // producer writes it afterwards, on the same task. Giving the place
-        // back when the handler returned let the next request in while this one
-        // was still writing -- and a streamed body is exactly the long-running
-        // work a limit of one is meant to bound.
-        let client = streamingLimitApp().test
-        let first = try Pending(client, "GET /returned HTTP/1.1\r\nHost: x\r\n\r\n")
-        for _ in 0..<20 { client.turn() }
-        #expect(try client.get("/quick").status == 503)
-        #expect(try first.response()?.text == "ab")
-        // And back once the writing has ended.
-        #expect(try client.get("/quick").text == "quick")
-    }
-
-    @Test func anInlineStreamedBodyKeepsItsPlaceToo() throws {
-        // This one always did -- the writing happens inside the handler -- and
-        // is here so that the two ways of streaming are held to one rule.
-        let client = streamingLimitApp().test
-        let first = try Pending(client, "GET /inline HTTP/1.1\r\nHost: x\r\n\r\n")
-        for _ in 0..<20 { client.turn() }
-        #expect(try client.get("/quick").status == 503)
-        #expect(try first.response()?.text == "ab")
-        #expect(try client.get("/quick").text == "quick")
-    }
-
-    @Test func permitsUnderNestedLimitsAreAllOrNothing() {
-        let outer = ConcurrencyLimiter(max: 2)
-        let inner = ConcurrencyLimiter(max: 1)
-        let a = ConcurrencyLimiter.acquire([outer, inner])
-        #expect(a != nil)
-        #expect(ConcurrencyLimiter.acquire([outer, inner]) == nil)
-        #expect(outer.running.load(ordering: .relaxed) == 1)
-        let b = ConcurrencyLimiter.acquire([outer])
-        #expect(b != nil)
-        #expect(ConcurrencyLimiter.acquire([outer]) == nil)
-        a?.release()
-        a?.release()
-        #expect(outer.running.load(ordering: .relaxed) == 1 && inner.running.load(ordering: .relaxed) == 0)
-        _ = b
+    @Test func placesUnderNestedLimitsAreAllOrNothing() {
+        let outer = Vega.Semaphore(permits: 2)
+        let inner = Vega.Semaphore(permits: 1)
+        #expect(acquirePlaces([outer, inner]))
+        #expect(!acquirePlaces([outer, inner]))
+        #expect(outer.availablePermits == 1)
+        #expect(acquirePlaces([outer]))
+        #expect(!acquirePlaces([outer]))
+        outer.release()
+        inner.release()
+        #expect(outer.availablePermits == 1 && inner.availablePermits == 1)
     }
 }

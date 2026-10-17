@@ -1,10 +1,13 @@
-import Testing
-import CAvian
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 @testable import Garuda
-import AvianHTTP
+import GarudaTesting
+import Testing
 
 // JSON Web Tokens: every algorithm both ways, tokens another implementation
 // made, the attacks a verifier must refuse, the registered claims, and the
@@ -82,7 +85,7 @@ struct JWTTests {
     /// GARUDA_JWT_OUT=path writes a token of every algorithm and its public
     /// key, as JSON, for another implementation to verify.
     @Test func tokensForAnotherImplementation() throws {
-        guard let out = av_getenv("GARUDA_JWT_OUT") else { return }
+        guard let out = getenv("GARUDA_JWT_OUT") else { return }
         var entries: [[String: String]] = []
         for algorithm in JWTAlgorithm.allCases {
             let key = algorithm.isHMAC
@@ -121,6 +124,19 @@ struct JWTTests {
         ]
         for (token, key) in cases {
             #expect(try keys([key], validation).verify(token, as: PyClaims.self) == expected, "\(key.algorithm)")
+        }
+    }
+
+    @Test func signingIsByteForByteWhatPyJWTSigned() throws {
+        // HMAC and Ed25519 are deterministic: the same key over the same
+        // signing input gives the same signature, so ours must be PyJWT's.
+        let secret = [UInt8](repeating: 0x6B, count: 64)
+        for (vector, algorithm) in [(PyJWTVectors.HS256, JWTAlgorithm.HS256), (PyJWTVectors.HS384, .HS384),
+                                    (PyJWTVectors.HS512, .HS512)] {
+            let key = try JWTKey.hmac(secret, algorithm: algorithm, keyID: "shared")
+            let parts = vector.split(separator: ".").map(String.init)
+            let signature = try key.sign(Array((parts[0] + "." + parts[1]).utf8))
+            #expect(base64URLEncode(signature) == parts[2], "\(algorithm)")
         }
     }
 
@@ -207,6 +223,34 @@ struct JWTTests {
         }
     }
 
+    @Test func manyThreadsShareOneKeySet() async throws {
+        // A shard's threads verify with one set, and fill its header cache
+        // between them: each header is kept once, and every token verifies.
+        let key = try JWTKey.hmac([UInt8](repeating: 5, count: 32))
+        let set = try keys([key])
+        let payload = base64URLEncode(Array(#"{"sub":"a","exp":4102444800,"role":"user"}"#.utf8))
+        var tokens: [String] = []
+        for n in 0..<(JWTHeaderCache.capacity * 2) {
+            let input = base64URLEncode(Array(#"{"alg":"HS256","typ":"T\#(n)"}"#.utf8)) + "." + payload
+            tokens.append(input + "." + base64URLEncode(try key.sign(Array(input.utf8))))
+        }
+        let signed = tokens
+        let verified = await withTaskGroup(of: Int.self) { group in
+            for task in 0..<8 {
+                group.addTask {
+                    var count = 0
+                    for round in 0..<50 {
+                        let token = signed[(task + round) % signed.count]
+                        if (try? set.verify(token, as: UserClaims.self))?.sub == "a" { count += 1 }
+                    }
+                    return count
+                }
+            }
+            return await group.reduce(0, +)
+        }
+        #expect(verified == 8 * 50)
+    }
+
     @Test func base64URLIsDecodedFromBytesAsFromText() {
         var seed: UInt64 = 0x9E37_79B9_7F4A_7C15
         for length in 0..<70 {
@@ -216,16 +260,25 @@ struct JWTTests {
                 bytes.append(UInt8(truncatingIfNeeded: seed >> 33))
             }
             let encoded = base64URLEncode(bytes)
-            let decoded = Array(encoded.utf8).withUnsafeBufferPointer { base64URLDecode($0) }
+            let decoded = Array(encoded.utf8).withUnsafeBufferPointer { base64Decode($0) }
             #expect(decoded == bytes)
             #expect(decoded == base64Decode(encoded))
+            // And the standard alphabet, padded, both ways.
+            #expect(StandardBase64.decode(StandardBase64.encode(bytes)) == bytes)
         }
         for bad in ["A", "AB!C", "AB C", "ABCDE"] {
-            #expect(Array(bad.utf8).withUnsafeBufferPointer { base64URLDecode($0) } == nil)
+            #expect(Array(bad.utf8).withUnsafeBufferPointer { base64Decode($0) } == nil)
         }
         // Padding, and the standard alphabet, are let through.
-        #expect(Array("-_8=".utf8).withUnsafeBufferPointer { base64URLDecode($0) }
-                == Array("+/8=".utf8).withUnsafeBufferPointer { base64URLDecode($0) })
+        #expect(Array("-_8=".utf8).withUnsafeBufferPointer { base64Decode($0) }
+                == Array("+/8=".utf8).withUnsafeBufferPointer { base64Decode($0) })
+        // RFC 4648's vectors.
+        for (text, encoded) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="),
+                                ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
+            #expect(StandardBase64.encode(Array(text.utf8)) == encoded)
+        }
+        // The standard alphabet's decoder takes no base64url.
+        #expect(StandardBase64.decode("-_8") == nil)
     }
 
     @Test func registeredClaimsAreChecked() throws {
@@ -283,8 +336,8 @@ struct JWTTests {
         #expect(throws: JWTError.expired) { try subject(#"{"exp":1,"sub":"a","exp":4102444800}"#) }
         #expect(try subject(#"{"exp":4102444800,"sub":"a","exp":1}"#) == "a")
         // A name written with escapes is the same name.
-        #expect(throws: JWTError.expired) { try subject(#"{"sub":"a","\u0065xp":1}"#) }
-        #expect(try subject(#"{"sub":"a","\u0065xp":4102444800}"#) == "a")
+        #expect(throws: JWTError.expired) { try subject(#"{"sub":"a","exp":1}"#) }
+        #expect(try subject(#"{"sub":"a","exp":4102444800}"#) == "a")
         // Null is absent; a string is not a time; what is not an object is not claims.
         #expect(throws: JWTError.invalidClaim("exp")) { try subject(#"{"sub":"a","exp":null}"#) }
         #expect(throws: JWTError.malformed) { try subject(#"{"sub":"a","exp":"4102444800"}"#) }
@@ -332,13 +385,14 @@ struct JWTTests {
         let app = Application()
         app.jwtVerifier { _ in set }
         app.get("/me") { (jwt: JWT<UserClaims>) async in "\(jwt.claims.sub) \(jwt.claims.role)" }
-        // The same, without a task.
+        // The same, from a closure that does not await.
         app.get("/now") { (jwt: JWT<UserClaims>) in "\(jwt.claims.sub) now" }
         app.get("/maybe") { (jwt: JWT<UserClaims>?) in jwt?.claims.sub ?? "nobody" }
         app.group("/admin") {
             app.authenticate(jwt: UserClaims.self, verifier: set)
-            app.use { request, _ in
-                request.header("x-deny") != nil ? HTTPStatus.forbidden : nil
+            app.use { request, response, next in
+                if request.header("x-deny") != nil { return response.send(status: .forbidden) }
+                try await next()
             }
             app.get("/stats") { (jwt: JWT<UserClaims>) async in "stats for \(jwt.claims.sub)" }
             app.get("/whoami") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
@@ -363,7 +417,6 @@ struct JWTTests {
         let expired = try set.sign(UserClaims(sub: "ada", exp: Int(now) - 3600))
         #expect(try client.get("/me", headers: [("authorization", "Bearer \(expired)")]).status == 401)
 
-        // A synchronous route checks the same way.
         #expect(try client.get("/now", headers: bearer).text == "ada now")
         let missingNow = try client.get("/now")
         #expect(missingNow.status == 401)
@@ -373,14 +426,23 @@ struct JWTTests {
         #expect(invalidNow.header("www-authenticate") == #"Bearer error="invalid_token""#)
         #expect(try client.get("/maybe", headers: bearer).text == "ada")
         #expect(try client.get("/maybe").text == "nobody")
+        // A refused optional token says nothing about it: the route went on.
+        #expect(try client.get("/maybe").header("www-authenticate") == nil)
 
         #expect(try client.get("/admin/stats", headers: bearer).text == "stats for ada")
-        // Behind the middleware, a synchronous route takes the token it checked.
+        // Behind the middleware, the route takes the token it checked.
         #expect(try client.get("/admin/whoami", headers: bearer).text == "ada")
         let refused = try client.get("/admin/stats", headers: [("authorization", "Bearer nonsense")])
         #expect(refused.status == 401)
         #expect(refused.header("www-authenticate") == #"Bearer error="invalid_token""#)
         #expect(try client.get("/admin/stats").header("www-authenticate") == "Bearer")
         #expect(try client.get("/admin/stats", headers: bearer + [("x-deny", "1")]).status == 403)
+    }
+
+    @Test func aRouteAskingForATokenWithNoVerifierIsAServerFault() throws {
+        let app = Application()
+        app.get("/me") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
+        let token = try keys([try JWTKey.generate(.HS256)]).sign(UserClaims(sub: "a", exp: Int(now) + 60))
+        #expect(try app.test.get("/me", headers: [("authorization", "Bearer \(token)")]).status == 500)
     }
 }

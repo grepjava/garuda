@@ -2,20 +2,21 @@
 // Refresh tokens: short-lived access tokens, and a long-lived way to get new
 // ones that is rotated on every use and caught when stolen.
 //
-//     let issuer = TokenIssuer(keys: keys, store: RedisRefreshTokenStore(pool)) { subject, lifetime in
-//         let user = try await users.find(subject)
-//         return UserClaims(sub: subject, exp: lifetime.expiresAt, role: user.role)
+//     app.state { _ in
+//         TokenIssuer(keys: keys, store: MemoryRefreshTokenStore()) { subject, lifetime in
+//             UserClaims(sub: subject, exp: lifetime.expiresAt, role: try await users.role(of: subject))
+//         }
 //     }
 //
-//     app.post("/login") { (login: Body<Login>) async throws in
-//         JSON(try await issuer.issue(subject: try await users.check(login.value)))
+//     app.post("/login") { (login: Body<Login>, issuer: State<TokenIssuer<UserClaims>>) in
+//         JSON(try await issuer.value.issue(subject: try await users.check(login.value)))
 //     }
-//     app.post("/token/refresh") { (body: Body<RefreshRequest>) async throws in
-//         JSON(try await issuer.refresh(body.value.refreshToken))
+//     app.post("/token/refresh") { (body: Body<RefreshRequest>, issuer: State<TokenIssuer<UserClaims>>) in
+//         JSON(try await issuer.value.refresh(body.value.refreshToken))
 //     }
-//     app.post("/logout") { (body: Body<RefreshRequest>) async throws -> HTTPStatus in
-//         try await issuer.revoke(body.value.refreshToken)
-//         return .noContent
+//     app.post("/logout") { (body: Body<RefreshRequest>, issuer: State<TokenIssuer<UserClaims>>) in
+//         try await issuer.value.revoke(body.value.refreshToken)
+//         return HTTPStatus.noContent
 //     }
 //
 // An access token is a JWT that lives `accessTokenSeconds` (15 minutes): every
@@ -47,14 +48,14 @@
 // A refused refresh throws `RefreshTokenError`, answered 400 with
 // `{"error":"invalid_grant"}` as RFC 6749 section 5.2 has it.
 //
-// Stores: `MemoryRefreshTokenStore` for --workers 1 and tests, and Redis,
-// PostgreSQL and SQLite for the rest. Spending a token is atomic in each, so two workers
-// refreshing the same token at once cannot both succeed.
+// Stores: a `RefreshTokenStore` is where tokens are kept, and spending one must
+// be atomic in it, so two requests refreshing the same token at once cannot
+// both succeed. `MemoryRefreshTokenStore` keeps them in the shard's memory:
+// built with `app.state`, it is one shard's, so it suits a server of one shard
+// and tests. A server of several needs a store they all reach -- a database --
+// since a refresh may land on any shard.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import GarudaRedis
 import Synchronization
 
 /// The times an access token is issued for.
@@ -152,8 +153,9 @@ public final class TokenIssuer<Claims: Encodable & Sendable>: @unchecked Sendabl
     public let maximumSessionSeconds: Int
     public let reuseGraceSeconds: Int
     let claims: @Sendable (_ subject: String, _ lifetime: TokenLifetime) async throws -> Claims
-    /// Seconds since the epoch; tests set their own.
-    var clock: @Sendable () -> Int64 = { Timestamp.now.secondsSinceEpoch }
+    /// Seconds since the epoch; tests set their own, before the issuer is
+    /// shared.
+    var clock: @Sendable () -> Int64 = { epochSeconds() }
 
     public init(keys: JWTKeys, store: any RefreshTokenStore,
                 accessTokenSeconds: Int = 15 * 60,
@@ -245,25 +247,30 @@ public final class TokenIssuer<Claims: Encodable & Sendable>: @unchecked Sendabl
 
 // MARK: - Stores
 
-/// Refresh tokens in the worker's memory: for --workers 1 and tests.
+/// Refresh tokens in the shard's memory: for a server of one shard, and tests.
 ///
-/// A worker runs its handlers on its one thread, so in the ordinary case
-/// nothing here is reached from two threads. A store is a public type though,
-/// and user code can reach one from the blocking pool or a thread of its own,
-/// and what it holds decides whether a session is still valid -- so the state
-/// is behind a lock. A login or a refresh takes a handful of these calls, so
-/// the lock costs nothing that can be measured.
+/// The shard's threads share it, and what it holds decides whether a session
+/// is still valid, so its state is behind a lock. A login or a refresh takes a
+/// handful of these calls, against one signature each, so the lock costs
+/// nothing that can be measured; no request that only checks an access token
+/// comes here at all.
 ///
 /// A family, and every token of it, is let go once the family has expired:
 /// until then a spent token is kept, because presenting it again is how a
-/// stolen one is noticed. Without that the store held every login and every
-/// refresh the worker had ever issued. There is no clock of its own: "now" is
-/// the latest time the issuer has written, so an issuer's own clock is the
-/// one that counts.
+/// stolen one is noticed. Without that the store would hold every login and
+/// every refresh the shard had ever issued. There is no clock of its own:
+/// "now" is the latest time the issuer has written, so an issuer's own clock
+/// is the one that counts.
 public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
+    private struct Family {
+        var subject: String
+        var expiresAt: Int64
+        var revoked: Bool
+    }
+
     private struct State {
         var tokens: [String: RefreshTokenRecord] = [:]
-        var families: [String: (subject: String, expiresAt: Int64, revoked: Bool)] = [:]
+        var families: [String: Family] = [:]
         /// The latest time written by the issuer, in seconds since the epoch.
         var now: Int64 = .min
         var writesSinceSweep = 0
@@ -284,7 +291,9 @@ public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
 
     private let state = Mutex(State())
 
-    public init() {}
+    public init() {
+        MemoryStores.made("MemoryRefreshTokenStore")
+    }
 
     /// How many families and tokens are held, ended ones not yet swept
     /// included.
@@ -293,7 +302,7 @@ public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
     }
 
     public func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
-        state.withLock { $0.families[family] = (subject, expiresAt, false) }
+        state.withLock { $0.families[family] = Family(subject: subject, expiresAt: expiresAt, revoked: false) }
     }
 
     public func insert(_ record: RefreshTokenRecord) async throws {
@@ -331,285 +340,5 @@ public final class MemoryRefreshTokenStore: RefreshTokenStore, Sendable {
                 $0.families[family]?.revoked = true
             }
         }
-    }
-}
-
-/// Refresh tokens in Redis, each key expiring with what it describes:
-/// `t:` a token's record, `u:` when it was spent (set with NX, so only one
-/// request spends it), `f:` a family's state, and `s:` a subject's families.
-public struct RedisRefreshTokenStore: RefreshTokenStore {
-    public let redis: any RedisCommandSender
-    public let prefix: String
-
-    public init(_ redis: any RedisCommandSender, prefix: String = "refresh:") {
-        self.redis = redis
-        self.prefix = prefix
-    }
-
-    private func ttl(_ until: Int64) -> Int {
-        max(1, Int(until - Timestamp.now.secondsSinceEpoch)) * 1000
-    }
-
-    public func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
-        let replies = try await redis.pipeline([
-            RedisCommand("SET", prefix + "f:" + family, "active", "PX", ttl(expiresAt)),
-            RedisCommand("SADD", prefix + "s:" + subject, family),
-            // The index must outlive the family that ends last, so its expiry
-            // only ever grows: two logins can reach Redis in either order, and
-            // an index that went first would lose `revokeSubject` a family
-            // that is still good. `PEXPIRE GT` says this in one word, but that
-            // is Redis 7; this works on 6 as well, and is atomic either way.
-            RedisCommand("EVAL", "local left = redis.call('PTTL', KEYS[1]) "
-                + "local want = tonumber(ARGV[1]) "
-                + "if left < want then redis.call('PEXPIRE', KEYS[1], want) end "
-                + "return redis.call('PTTL', KEYS[1])",
-                         1, prefix + "s:" + subject, ttl(expiresAt)),
-        ])
-        // A pipeline answers each command on its own, so one the server
-        // refuses -- NOPERM on the index, OOM, WRONGTYPE -- comes back as a
-        // value beside the ones that worked, and nothing is thrown. Ignoring
-        // it would leave the family set and the subject's index without it,
-        // and that index is what `revokeSubject` walks: a logout everywhere
-        // that answers success and leaves the session running. The login is
-        // failed instead, before a token is handed out against the family.
-        for reply in replies {
-            if case .error(let error) = reply { throw RedisClientError.server(error) }
-        }
-        // The script answers with the index's own TTL, so a non-positive one
-        // says the key is not there and the `SADD` added nothing -- the same
-        // unreachable family, without the server having called anything an
-        // error. A sender answering something other than an integer is left
-        // alone: what is read here is the script's own answer.
-        if replies.count > 2, case .integer(let indexTTL) = replies[2], indexTTL <= 0 {
-            throw RedisClientError.server(RedisServerError(
-                "ERR the subject index did not take refresh family \(family)"))
-        }
-    }
-
-    public func insert(_ record: RefreshTokenRecord) async throws {
-        // Kept until the family ends, so a spent token is still recognised
-        // when it is presented again.
-        try await redis.set(prefix + "t:" + record.digest, try JSONCoder.encode(record),
-                            expireMilliseconds: ttl(record.familyExpiresAt))
-    }
-
-    public func find(digest: String) async throws -> RefreshTokenRecord? {
-        let replies = try await redis.pipeline([
-            RedisCommand("GET", prefix + "t:" + digest),
-            RedisCommand("GET", prefix + "u:" + digest),
-        ])
-        guard let bytes = replies[0].bytes, var record = try? JSONCoder.decode(RefreshTokenRecord.self, from: bytes)
-        else { return nil }
-        record.usedAt = replies[1].string.flatMap { Int64($0) }
-        record.revoked = try await redis.get(prefix + "f:" + record.family) != "active"
-        return record
-    }
-
-    public func markUsed(digest: String, at: Int64) async throws -> Bool {
-        guard let bytes = try await redis.getBytes(prefix + "t:" + digest),
-              let record = try? JSONCoder.decode(RefreshTokenRecord.self, from: bytes) else { return false }
-        return try await redis.set(prefix + "u:" + digest, Int(at), expireMilliseconds: ttl(record.familyExpiresAt),
-                                   condition: .ifAbsent)
-    }
-
-    public func revokeFamily(_ family: String) async throws {
-        try await redis.send("SET", prefix + "f:" + family, "revoked", "XX", "KEEPTTL")
-    }
-
-    public func revokeSubject(_ subject: String) async throws {
-        for family in try await redis.smembers(prefix + "s:" + subject) {
-            try await revokeFamily(family)
-        }
-    }
-}
-
-/// Refresh tokens in two PostgreSQL tables: families, and tokens by digest.
-/// Make them with `createTables`, or with `schema` as a migration of your own
-/// (`try await pool.migrate([PostgresRefreshTokenStore.schema()] + mine)`), and
-/// clear ended families now and then with `deleteExpired`.
-public struct PostgresRefreshTokenStore: RefreshTokenStore {
-    public let pool: PostgresPool
-    public let table: String
-
-    public init(_ pool: PostgresPool, table: String = "garuda_refresh_tokens") {
-        precondition(!table.isEmpty && table.utf8.allSatisfy { c in
-            (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F
-        } && !(table.utf8.first! >= 0x30 && table.utf8.first! <= 0x39),
-                     "a refresh token table's name is letters, digits and underscores: \(table)")
-        self.pool = pool
-        self.table = table
-    }
-
-    /// The statements that make the tables, as one migration.
-    public static func schema(table: String = "garuda_refresh_tokens") -> [String] {
-        [
-            "create table if not exists \(table)_families (family text primary key, subject text not null, "
-                + "expires_at bigint not null, revoked boolean not null default false)",
-            "create index if not exists \(table)_families_subject on \(table)_families (subject)",
-            "create table if not exists \(table) (digest text primary key, family text not null, "
-                + "subject text not null, issued_at bigint not null, expires_at bigint not null, "
-                + "family_expires_at bigint not null, used_at bigint)",
-            "create index if not exists \(table)_family on \(table) (family)",
-        ]
-    }
-
-    public func createTables() async throws {
-        for statement in Self.schema(table: table) { try await pool.execute(statement) }
-    }
-
-    /// Deletes families that have ended, and their tokens. Returns how many
-    /// tokens went.
-    @discardableResult
-    public func deleteExpired() async throws -> Int {
-        let now = Timestamp.now.secondsSinceEpoch
-        let tokens = try await pool.execute("delete from \(table) where family_expires_at <= $1", now)
-        try await pool.execute("delete from \(table)_families where expires_at <= $1", now)
-        return tokens
-    }
-
-    public func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
-        try await pool.execute("insert into \(table)_families (family, subject, expires_at) values ($1, $2, $3)",
-                               family, subject, expiresAt)
-    }
-
-    public func insert(_ record: RefreshTokenRecord) async throws {
-        try await pool.execute(
-            "insert into \(table) (digest, family, subject, issued_at, expires_at, family_expires_at, used_at) "
-                + "values ($1, $2, $3, $4, $5, $6, null)",
-            record.digest, record.family, record.subject, record.issuedAt, record.expiresAt, record.familyExpiresAt)
-    }
-
-    private struct Row: Decodable {
-        var digest: String
-        var family: String
-        var subject: String
-        var issuedAt: Int64
-        var expiresAt: Int64
-        var familyExpiresAt: Int64
-        var usedAt: Int64?
-        var revoked: Bool?
-    }
-
-    public func find(digest: String) async throws -> RefreshTokenRecord? {
-        // Quoted aliases: PostgreSQL lowercases a bare one, and the row is
-        // decoded by name.
-        guard let row = try await pool.first(
-            Row.self,
-            "select t.digest, t.family, t.subject, t.issued_at as \"issuedAt\", t.expires_at as \"expiresAt\", "
-                + "t.family_expires_at as \"familyExpiresAt\", t.used_at as \"usedAt\", f.revoked "
-                + "from \(table) t left join \(table)_families f on f.family = t.family where t.digest = $1",
-            digest) else { return nil }
-        return RefreshTokenRecord(digest: row.digest, family: row.family, subject: row.subject,
-                                  issuedAt: row.issuedAt, expiresAt: row.expiresAt,
-                                  familyExpiresAt: row.familyExpiresAt, usedAt: row.usedAt,
-                                  revoked: row.revoked ?? true)
-    }
-
-    public func markUsed(digest: String, at: Int64) async throws -> Bool {
-        // One conditional UPDATE, so two workers spending the same token at
-        // once cannot both win: the second finds used_at already set.
-        try await pool.execute("update \(table) set used_at = $1 where digest = $2 and used_at is null",
-                               at, digest) == 1
-    }
-
-    public func revokeFamily(_ family: String) async throws {
-        try await pool.execute("update \(table)_families set revoked = true where family = $1", family)
-    }
-
-    public func revokeSubject(_ subject: String) async throws {
-        try await pool.execute("update \(table)_families set revoked = true where subject = $1", subject)
-    }
-}
-
-/// Refresh tokens in two SQLite tables: families, and tokens by digest. Make
-/// them with `createTables`, or with `schema` in a migration, and clear ended
-/// families now and then with `deleteExpired`.
-public struct SQLiteRefreshTokenStore: RefreshTokenStore {
-    public let database: SQLiteDatabase
-    public let table: String
-
-    public init(_ database: SQLiteDatabase, table: String = "garuda_refresh_tokens") {
-        precondition(!table.isEmpty && table.utf8.allSatisfy { c in
-            (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F
-        } && !(table.utf8.first! >= 0x30 && table.utf8.first! <= 0x39),
-                     "a refresh token table's name is letters, digits and underscores: \(table)")
-        self.database = database
-        self.table = table
-    }
-
-    /// The statements that make the tables.
-    public static func schema(table: String = "garuda_refresh_tokens") -> [String] {
-        [
-            "CREATE TABLE IF NOT EXISTS \(table)_families (family TEXT PRIMARY KEY NOT NULL, subject TEXT NOT NULL, "
-                + "expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID",
-            "CREATE INDEX IF NOT EXISTS \(table)_families_subject ON \(table)_families (subject)",
-            "CREATE TABLE IF NOT EXISTS \(table) (digest TEXT PRIMARY KEY NOT NULL, family TEXT NOT NULL, "
-                + "subject TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, "
-                + "family_expires_at INTEGER NOT NULL, used_at INTEGER) WITHOUT ROWID",
-            "CREATE INDEX IF NOT EXISTS \(table)_family ON \(table) (family)",
-        ]
-    }
-
-    public func createTables() async throws {
-        for statement in Self.schema(table: table) { try await database.execute(statement) }
-    }
-
-    /// Deletes families that have ended, and their tokens. Returns how many
-    /// tokens went.
-    @discardableResult
-    public func deleteExpired() async throws -> Int {
-        let now = Timestamp.now.secondsSinceEpoch
-        let tokens = try await database.execute("DELETE FROM \(table) WHERE family_expires_at <= ?", now)
-        try await database.execute("DELETE FROM \(table)_families WHERE expires_at <= ?", now)
-        return tokens
-    }
-
-    public func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
-        try await database.execute("INSERT INTO \(table)_families (family, subject, expires_at) VALUES (?, ?, ?)",
-                                   family, subject, expiresAt)
-    }
-
-    public func insert(_ record: RefreshTokenRecord) async throws {
-        try await database.execute(
-            "INSERT INTO \(table) (digest, family, subject, issued_at, expires_at, family_expires_at, used_at) "
-                + "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-            record.digest, record.family, record.subject, record.issuedAt, record.expiresAt, record.familyExpiresAt)
-    }
-
-    private struct Row: Decodable {
-        var digest: String
-        var family: String
-        var subject: String
-        var issuedAt: Int64
-        var expiresAt: Int64
-        var familyExpiresAt: Int64
-        var usedAt: Int64?
-        var revoked: Int64?
-    }
-
-    public func find(digest: String) async throws -> RefreshTokenRecord? {
-        guard let row = try await database.first(
-            Row.self,
-            "SELECT t.digest, t.family, t.subject, t.issued_at AS issuedAt, t.expires_at AS expiresAt, "
-                + "t.family_expires_at AS familyExpiresAt, t.used_at AS usedAt, f.revoked "
-                + "FROM \(table) t LEFT JOIN \(table)_families f ON f.family = t.family WHERE t.digest = ?",
-            digest) else { return nil }
-        return RefreshTokenRecord(digest: row.digest, family: row.family, subject: row.subject,
-                                  issuedAt: row.issuedAt, expiresAt: row.expiresAt,
-                                  familyExpiresAt: row.familyExpiresAt, usedAt: row.usedAt,
-                                  revoked: (row.revoked ?? 1) != 0)
-    }
-
-    public func markUsed(digest: String, at: Int64) async throws -> Bool {
-        try await database.execute("UPDATE \(table) SET used_at = ? WHERE digest = ? AND used_at IS NULL",
-                                   at, digest) == 1
-    }
-
-    public func revokeFamily(_ family: String) async throws {
-        try await database.execute("UPDATE \(table)_families SET revoked = 1 WHERE family = ?", family)
-    }
-
-    public func revokeSubject(_ subject: String) async throws {
-        try await database.execute("UPDATE \(table)_families SET revoked = 1 WHERE subject = ?", subject)
     }
 }

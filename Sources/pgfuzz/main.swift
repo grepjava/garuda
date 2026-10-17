@@ -14,7 +14,9 @@
 //
 // The design is deliberately small. Every run is reproducible from its seed,
 // which is printed at the start and repeatable with --seed, so a failure found
-// in CI can be reproduced exactly. There is no coverage feedback: that is what
+// in CI can be reproduced exactly -- for the targets that run a whole
+// connection (h2, h3, quic-frames), up to what the scheduler and the
+// connection's own random IDs decide. There is no coverage feedback: that is what
 // libFuzzer is for, and pointing it at `Fuzz.run` is a two-line target when it
 // is wanted. What this buys instead is that it builds and runs anywhere the
 // server does, with no extra toolchain, which is what makes it something CI
@@ -25,13 +27,14 @@
 // replays it on every `swift test`, and a fixed crash stays fixed.
 //===----------------------------------------------------------------------===//
 
-import CAvian
 import GarudaFuzzTargets
 
 #if canImport(Glibc)
 import Glibc
-#else
+#elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 
 // MARK: - Reproducible randomness
@@ -58,23 +61,6 @@ struct Rng {
     mutating func byte() -> UInt8 { UInt8(truncatingIfNeeded: next()) }
 }
 
-// MARK: - Writing a failing input out (reading is FuzzCorpus's job)
-
-func writeFile(_ path: String, _ bytes: [UInt8]) -> Bool {
-    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-    if fd < 0 { return false }
-    defer { close(fd) }
-    var written = 0
-    while written < bytes.count {
-        let n = bytes.withUnsafeBytes { raw -> Int in
-            write(fd, raw.baseAddress! + written, raw.count - written)
-        }
-        if n <= 0 { return false }
-        written += n
-    }
-    return true
-}
-
 // MARK: - Mutation
 
 /// Byte sequences that mean something to at least one of these parsers, so a
@@ -88,6 +74,13 @@ let tokens: [[UInt8]] = [
     Array("HTTP/1.1".utf8), Array("HTTP/1.0".utf8), Array("Host: x\r\n".utf8),
     Array("18446744073709551616".utf8), Array("-1".utf8), Array("FFFFFFFFFFFFFFFF".utf8),
     [0x00], [0xFF], [0x80], [0x7F],
+    // QUIC and HTTP/3 varints at each length's edge, and the largest.
+    [0x3F], [0x40, 0x00], [0x7F, 0xFF], [0x80, 0x00, 0x00, 0x00], [0xBF, 0xFF, 0xFF, 0xFF],
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+    // An HTTP/2 frame header: an empty SETTINGS; a PostgreSQL length.
+    [0, 0, 0, 4, 0, 0, 0, 0, 0], [0x7F, 0xFF, 0xFF, 0xFF],
+    // Huffman's all-ones padding, and a QPACK prefix.
+    [0xFF, 0xFF, 0xFF, 0xFF], [0x00, 0x00],
 ]
 
 func mutate(_ input: [UInt8], _ rng: inout Rng, corpus: [[UInt8]], maxLength: Int) -> [UInt8] {
@@ -156,7 +149,7 @@ func hexDump(_ bytes: [UInt8], limit: Int = 256) -> String {
 
 func fail(_ target: FuzzTarget, _ reason: String, _ input: [UInt8], seed: UInt64) -> Never {
     let path = "pgfuzz-\(target.rawValue)-\(seed).bin"
-    let saved = writeFile(path, input)
+    let saved = FuzzCorpus.write(path, input)
     print("")
     print("FAIL \(target.rawValue): \(reason)")
     print("  input: \(hexDump(input))")
@@ -172,7 +165,7 @@ func fail(_ target: FuzzTarget, _ reason: String, _ input: [UInt8], seed: UInt64
 
 var targets: [FuzzTarget] = []
 var seconds = 5.0
-var seed = UInt64(av_monotonic_ms())
+var seed = UInt64.random(in: 0...UInt64(UInt32.max))
 var corpusRoot = "fuzz/corpus"
 var maxLength = 4096
 var corpusOnly = false
@@ -240,11 +233,14 @@ for target in targets {
 
     if !corpusOnly {
         var rng = Rng(seed: seed &+ UInt64(target.rawValue.utf8.reduce(0) { $0 &* 31 &+ UInt64($1) }))
-        let deadline = av_monotonic_ms() &+ UInt64(seconds * 1000)
-        while av_monotonic_ms() < deadline {
-            // Time is checked every so often rather than every run: the check
-            // is a syscall on some platforms and the parses are microseconds.
-            for _ in 0..<512 {
+        let deadline = ContinuousClock.now + .milliseconds(Int(seconds * 1000))
+        // Time is checked every so often rather than every run: the check is
+        // a syscall on some platforms and the parses are microseconds. The
+        // targets that run a connection take milliseconds, so they check
+        // every time.
+        let batch = target.isConnection ? 1 : 512
+        while ContinuousClock.now < deadline {
+            for _ in 0..<batch {
                 let base = corpus[rng.below(corpus.count)]
                 let input = mutate(base, &rng, corpus: corpus, maxLength: maxLength)
                 if let reason = Fuzz.run(target, input) {
@@ -257,7 +253,7 @@ for target in targets {
 
     totalRuns += runs
     print("  ok   \(target.rawValue): \(runs) inputs "
-          + "(\(corpus.count) seeds, \(fromDisk) from \(corpusRoot))")
+          + "(\(corpus.count - fromDisk) seeds, \(fromDisk) from \(corpusRoot))")
 }
 
 print("pgfuzz: \(totalRuns) inputs, no invariant broken")

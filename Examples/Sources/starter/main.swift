@@ -20,6 +20,8 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Garuda
 import StarterExample
@@ -36,14 +38,14 @@ do {
 
 switch CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "serve" {
 case "migrate":
-    // The schema, without serving anything. Workers migrate for themselves
+    // The schema, without serving anything. Shards migrate for themselves
     // too, so this is for a deployment that migrates before it rolls out.
     do {
-        try starterApp(configuration).runOnce { start in
-            let applied = try await start.state(Services.self).pool.migrate(starterMigrations)
-            print(applied == 0 ? "starter: the schema is already up to date"
-                               : "starter: applied \(applied) migration\(applied == 1 ? "" : "s")")
+        let applied = try withServices(configuration) { services in
+            try await services.pool.migrate(starterMigrations)
         }
+        print(applied == 0 ? "starter: the schema is already up to date"
+                           : "starter: applied \(applied) migration\(applied == 1 ? "" : "s")")
         exit(0)
     } catch {
         StandardError.put("starter: migrations failed: \(error)\n")
@@ -57,12 +59,26 @@ case "env":
     exit(0)
 
 case "serve":
-    // Everything after `serve` is Garuda's own: --port, --workers, --tls-*,
+    // A development key, made up for this run when none was given, goes into
+    // the environment as well. On Linux each shard is a fork of this process
+    // and has the key already; on macOS a shard is this program started
+    // again, and reads the key from the environment like any other setting.
+    // Either way every shard signs with the same key.
+    let serving = configuration.withDevelopmentKey()
+    if configuration.signingKeyPEM == nil, let pem = serving.signingKeyPEM {
+        #if os(Windows)
+        _putenv_s("JWT_PRIVATE_KEY", pem)
+        #else
+        setenv("JWT_PRIVATE_KEY", pem, 1)
+        #endif
+    }
+    // Everything after `serve` is Garuda's own: --port, --shards, --tls-*,
     // --rate-limit, --access-log (CONFIG.md). A leading `--` is what
-    // `swift run starter serve -- --port 8080` leaves behind.
+    // `swift run starter serve -- --port 8080` leaves behind. `run` reads
+    // the flags after the program's name, as it does CommandLine.arguments.
     var flags = Array(CommandLine.arguments.dropFirst(2))
     if flags.first == "--" { flags.removeFirst() }
-    exit(starterApp(configuration).run(arguments: flags))
+    starterApp(serving).run(arguments: [CommandLine.arguments[0]] + flags)
 
 case let unknown:
     StandardError.put("starter: unknown command \"\(unknown)\"; try serve, migrate or env\n")
@@ -72,9 +88,13 @@ case let unknown:
 /// Standard error, without Foundation.
 enum StandardError {
     static func put(_ text: String) {
-        var bytes = Array(text.utf8)
+        let bytes = Array(text.utf8)
         _ = bytes.withUnsafeBytes { raw in
+            #if os(Windows)
+            raw.baseAddress.map { Int(_write(2, $0, UInt32(raw.count))) } ?? 0
+            #else
             raw.baseAddress.map { write(2, $0, raw.count) } ?? 0
+            #endif
         }
     }
 }

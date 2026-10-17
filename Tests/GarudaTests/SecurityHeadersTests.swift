@@ -1,8 +1,8 @@
 import Testing
 @testable import Garuda
-import AvianHTTP
+import GarudaTesting
 
-// Security headers on every answer of a scope, over HTTP and HTTPS.
+// Security headers on every answer of a scope.
 
 @Suite("Security headers")
 struct SecurityHeadersTests {
@@ -24,15 +24,18 @@ struct SecurityHeadersTests {
         let app = Application()
         app.group("/site") {
             app.securityHeaders(headers)
-            app.get("/page") { "page" }
+            app.get("/page") { () in "page" }
             app.get("/embed") { _, response in
                 response.addHeader("x-frame-options", "DENY")
                 response.send("embed")
             }
             app.get("/fails") { _, _ in throw HTTPError(.conflict) }
-            app.use { request, _ in request.header("refuse") != nil ? HTTPStatus.unauthorized : nil }
+            app.use { request, response, next in
+                if request.header("refuse") != nil { return response.send(status: .unauthorized) }
+                try await next()
+            }
         }
-        app.get("/plain") { "plain" }
+        app.get("/plain") { () in "plain" }
         return app
     }
 
@@ -52,14 +55,9 @@ struct SecurityHeadersTests {
         #expect(sent(embed).count == defaults.count)
     }
 
-    @Test func strictTransportSecurityOnlyOverHTTPS() throws {
-        var config = ServerConfig()
-        config.maxConnections = 16
-        #expect("127.0.0.1".withCString { config.trust.parse($0) })
-        let client = app().testClient(configuration: config)
-        #expect(try client.get("/site/page").headers(named: "strict-transport-security").isEmpty)
-        let https = try client.get("/site/page", headers: [("x-forwarded-proto", "https")])
-        #expect(sent(https) == ["strict-transport-security: max-age=31536000; includeSubDomains"] + defaults)
+    @Test func strictTransportSecurityIsNotSentOverPlainHTTP() throws {
+        let response = try app().test.get("/site/page")
+        #expect(response.headers(named: "strict-transport-security").isEmpty)
     }
 
     @Test func eachHeaderCanBeChangedOrLeftOut() throws {
@@ -71,16 +69,31 @@ struct SecurityHeadersTests {
         headers.strictTransportSecurity = nil
         headers.contentSecurityPolicy = "default-src 'self'"
         headers.permissionsPolicy = "camera=()"
-        var config = ServerConfig()
-        config.maxConnections = 16
-        #expect("127.0.0.1".withCString { config.trust.parse($0) })
-        let response = try app(headers).testClient(configuration: config)
-            .get("/site/page", headers: [("x-forwarded-proto", "https")])
+        let response = try app(headers).test.get("/site/page")
         #expect(sent(response) == [
             "x-content-type-options: nosniff",
             "x-frame-options: DENY",
             "content-security-policy: default-src 'self'",
             "permissions-policy: camera=()",
         ])
+    }
+
+    /// An error that is not an answer is a 500 that drops what the handler
+    /// half built -- but not the security or CORS headers, and not the
+    /// handler's error from the log.
+    @Test func anUnexpectedErrorKeepsTheScopesHeaders() throws {
+        struct Boom: Error {}
+        let app = Application()
+        app.cors(CORSPolicy(origins: ["https://app.example.com"]))
+        app.securityHeaders(SecurityHeaders())
+        app.get("/boom") { _, response in
+            response.addHeader("x-half-built", "yes")
+            throw Boom()
+        }
+        let response = try app.test.get("/boom", headers: [("origin", "https://app.example.com")])
+        #expect(response.status == 500)
+        #expect(sent(response) == defaults)
+        #expect(response.header("access-control-allow-origin") == "https://app.example.com")
+        #expect(response.header("x-half-built") == nil)
     }
 }

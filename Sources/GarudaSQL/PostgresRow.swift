@@ -14,7 +14,7 @@
 // The pool asks once per result whether the type reads itself, and a type
 // without the attribute is decoded exactly as before.
 
-@_exported import Garuda
+@_exported import GarudaPostgres
 
 /// Writes the conformance that lets this type read itself out of a result row
 /// instead of going through `Codable`.

@@ -1,383 +1,433 @@
 //===----------------------------------------------------------------------===//
-// WebTransport over HTTP/3 (draft-ietf-webtrans-http3): the engine side.
+// WebTransport handlers.
 //
-// A WebTransport session is an extended CONNECT request that never finishes.
-// The client sends CONNECT with `:protocol: webtransport`, the server answers
-// 200, and from then on the request stream is not a request at all: it carries
-// capsules (RFC 9297), and the session's real traffic arrives on other QUIC
-// streams and in QUIC datagrams that name the session by the identifier of the
-// CONNECT stream they belong to.
+//     app.webTransport("/echo") { (session: WebTransportSession) async throws in
+//         try await withThrowingTaskGroup(of: Void.self) { group in
+//             group.addTask {
+//                 while let datagram = try await session.receiveDatagram() {
+//                     session.sendDatagram(datagram)
+//                 }
+//             }
+//             while let stream = try await session.acceptStream() {
+//                 group.addTask {
+//                     while let bytes = try await stream.read() { try await stream.write(bytes) }
+//                     stream.finish()
+//                 }
+//             }
+//         }
+//     }
 //
-// So a session is a router, not a connection:
+// A session arrives as an HTTP/3 extended CONNECT, and is a route like any
+// other until it is accepted: middleware runs in front of it, and extractors
+// run before it, so a request refused by either is answered with an ordinary
+// status and no session is ever made. Once every extractor has what it needs,
+// the session is accepted, and once the route has returned, the handler runs
+// for as long as the session lasts. When the handler returns, a session it
+// did not close is closed for it.
 //
-//   * a peer unidirectional stream whose type is 0x54, followed by a session
-//     identifier, belongs to that session;
-//   * a peer bidirectional stream whose first varint is 0x41, followed by a
-//     session identifier, likewise -- and because a request stream begins with
-//     a frame type instead, the two are told apart by the first varint alone;
-//   * a datagram begins with the session's *quarter* stream identifier, which
-//     is how RFC 9297 fits a 62-bit stream id into as few bytes as possible.
-//
-// Session streams do not get slots in the connection table. A slot carries a
-// request head, a body buffer and a parser, and a WebTransport stream wants
-// none of that: it is a byte pipe. Its bytes stay in the QUIC receive buffer
-// until the handler reads them, which is what makes a slow reader
-// backpressure -- the stream's window does not reopen -- rather than an
-// unbounded buffer, and what keeps one unread stream from stalling the rest.
-//
-// The handler waits on the worker for what it asks for: a stream, bytes, room
-// to write, a datagram. Each wait is a continuation on the session or stream,
-// resumed from here when the frame loop delivers what it was waiting for, or
-// when the session ends. The handler's API is in WebTransportAPI.swift.
-//
-// scripts/webtransport-test.py checks the routing, capsules and closing
-// against aioquic.
+// A session and its streams may be shared with child tasks, and with any
+// other task: everything they share with the endpoint is under its lock
+// (HTTP3WebTransport.swift).
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import AvianHTTP
-import AvianQUIC
+import VegaQUIC
+import GarudaWire
+import Synchronization
+import Vega
 
-/// One stream belonging to a session.
-final class WTStream {
-    let id: UInt64
-    let bidirectional: Bool
-    /// The handler may still write: false for a peer's unidirectional stream,
-    /// and once finished, reset, or stopped by the peer.
-    var writable: Bool
-    var finSent = false
-    /// The peer reset its direction or asked us to stop sending.
-    var aborted = false
-    /// The handler has been told the stream's read side ended.
-    var readEnded: Bool
-    var readWaiter: UnsafeContinuation<Void, Never>? = nil
-    var writeWaiter: UnsafeContinuation<Void, Never>? = nil
-
-    init(id: UInt64, bidirectional: Bool, writable: Bool, readable: Bool) {
-        self.id = id
-        self.bidirectional = bidirectional
-        self.writable = writable
-        readEnded = !readable
-    }
-
-    func wake() {
-        readWaiter.take()?.resume()
-        writeWaiter.take()?.resume()
-    }
+/// Why a WebTransport operation did not complete.
+public enum WebTransportError: Error, Equatable, Sendable {
+    /// The session has ended: closed by either side, or its connection lost.
+    case closed
+    /// The stream cannot be written to: the peer's unidirectional stream, or
+    /// one already finished, reset, or stopped by the peer.
+    case notWritable
+    /// Another task is already waiting for the same thing. One reader per
+    /// stream, one writer per stream, one task accepting streams and one
+    /// receiving datagrams.
+    case busy
+    /// The peer will not accept another stream from us yet.
+    case streamLimit
 }
 
-/// A WebTransport session, on the slot its CONNECT stream owns.
-final class WTSession {
-    /// The identifier of the CONNECT stream, which is also the session's.
-    let sessionID: UInt64
-    /// The session has ended, by either side or with the connection. Every
-    /// wait on it ends, and nothing more is sent.
-    var gone = false
-    var closeSent = false
-    var closeCode: UInt32 = 0
-    var closeReason: [UInt8] = []
+/// A WebTransport session, for as long as its handler runs.
+public final class WebTransportSession: Sendable {
+    let state: WTSession
 
-    var streams: [UInt64: WTStream] = [:]
-    /// Streams the peer opened that the handler has not accepted yet.
-    var incoming: [UInt64] = []
-    var acceptWaiter: UnsafeContinuation<Void, Never>? = nil
-    /// Datagrams are unreliable by definition, so the queue is bounded and
-    /// drops the oldest rather than growing or applying backpressure.
-    var datagrams: [[UInt8]] = []
-    var datagramBytes = 0
-    var datagramWaiter: UnsafeContinuation<Void, Never>? = nil
-
-    init(sessionID: UInt64) {
-        self.sessionID = sessionID
+    init(state: WTSession) {
+        self.state = state
     }
 
-    func wakeAll() {
-        acceptWaiter.take()?.resume()
-        datagramWaiter.take()?.resume()
-        for stream in streams.values { stream.wake() }
-    }
-}
-
-/// The most datagrams one session will hold for a handler that is not
-/// reading them, and the most bytes those may total.
-let wtMaxQueuedDatagrams = 64
-let wtMaxQueuedDatagramBytes = 256 * 1024
-/// Streams that named a session we have not seen yet, held while the CONNECT
-/// they belong to catches up. Reordering across QUIC streams is ordinary.
-let wtMaxOrphanStreams = 32
-/// The longest close reason the draft allows.
-let wtMaxCloseReason = 1024
-
-extension Worker {
-
-    // MARK: - Establishing a session
-
-    /// Whether the request on `slot` asks for a WebTransport session.
-    func isWebTransportRequest(_ slot: Int) -> Bool {
-        let c = table[slot]
-        let p = c.pointee.connectProtocol
-        return c.pointee.isH3Stream && p.readableBytes == 12
-            && equalsExact(UnsafePointer(p.readPointer), 12, "webtransport")
+    /// `body` under the endpoint's lock.
+    @inline(__always)
+    private func locked<R, E: Error>(_ body: () throws(E) -> R) throws(E) -> R {
+        try state.endpoint.lock.withLock { _ throws(E) -> R in try body() }
     }
 
-    /// Answers the CONNECT on `slot` with 200, which is what establishes the
-    /// session, and returns it. Nil, with the request already answered or
-    /// gone, when there is no connection left or it has no room for another.
-    mutating func acceptWebTransport(_ slot: Int) -> WTSession? {
-        let c = table[slot]
-        let parent = Int(c.pointee.parentSlot)
-        guard c.pointee.state == .dispatching, !c.pointee.flags.contains(.responseStarted),
-              parent >= 0, let h3 = table[parent].pointee.h3 else { return nil }
-        if h3.sessions.count >= wtMaxSessions {
-            respond(slot, status: 503, nil, 0)
-            return nil
-        }
+    /// The session's identifier: the QUIC stream its CONNECT arrived on.
+    public var id: UInt64 { state.sessionID }
 
-        dates.refresh()
-        var block = ByteBuffer()
-        defer { block.destroy() }
-        h3.encoder.begin(into: &block)
-        h3.encoder.encodeStatus(200, into: &block)
-        encodeStaticH3(h3, "date", UnsafePointer(dates.bytes), dates.count, into: &block)
-        encodeStaticH3(h3, "server", "garuda", into: &block)
-        // What middleware added -- a request ID, a header of the application's
-        // -- goes out with the answer, as it would on any other response.
-        forEachHeaderRecord(c.pointee.responseHeaders) { name, value in
-            let kind = HTTPResponseWriter.classify(name)
-            if kind == .contentLength || kind == .transferEncoding || kind == .connection { return }
-            h3.encoder.encode(name: name.base, nameLength: name.count,
-                              value: value.count > 0 ? value.base : emptyH3Byte,
-                              valueLength: value.count, into: &block)
-        }
-        writeH3HeaderBlock(slot, h3, block: &block)
-        c.pointee.flags.insert(.responseStarted)
-        c.pointee.flags.insert(.webtransportMode)
-        logAccess(slot, status: 200)
+    /// Whether the session has ended, by either side.
+    public var isClosed: Bool { locked { state.gone } }
 
-        let session = WTSession(sessionID: c.pointee.qstreamID)
-        c.pointee.wt = session
-        h3.sessions[session.sessionID] = Int32(slot)
-        if let waiting = h3.wtOrphans.removeValue(forKey: session.sessionID) {
-            for (streamID, bidirectional) in waiting where h3.quic.stream(streamID) != nil {
-                addPeerStream(slot, h3, session, streamID, bidirectional: bidirectional)
-            }
-        }
-        flushQUIC(parent)
-        return session
+    /// The code the session was closed with, by the peer or by `close`.
+    public var closeCode: UInt32 { locked { state.closeCode } }
+
+    public var closeReason: String {
+        String(decoding: locked { state.closeReason }, as: UTF8.self)
     }
 
-    private func addPeerStream(_ sessionSlot: Int, _ h3: H3Connection, _ session: WTSession,
-                               _ streamID: UInt64, bidirectional: Bool) {
-        session.streams[streamID] = WTStream(id: streamID, bidirectional: bidirectional,
-                                             writable: bidirectional, readable: true)
-        h3.wtStreams[streamID] = Int32(sessionSlot)
-        session.incoming.append(streamID)
-        session.acceptWaiter.take()?.resume()
-    }
+    /// The largest datagram the peer will take, or 0 when it takes none.
+    public var maxDatagramSize: Int { state.datagramLimit }
 
-    // MARK: - Routing streams into a session
-
-    /// Claims a peer stream whose WebTransport prefix has just been read.
-    @discardableResult
-    mutating func adoptWebTransportStream(_ connectionSlot: Int, _ h3: H3Connection,
-                                          _ streamID: UInt64, sessionID: UInt64,
-                                          bidirectional: Bool) -> Int {
-        if let sessionSlot = h3.sessions[sessionID].map(Int.init),
-           let session = table[sessionSlot].pointee.wt, !session.gone {
-            addPeerStream(sessionSlot, h3, session, streamID, bidirectional: bidirectional)
-            return sessionSlot
-        }
-
-        // The CONNECT has not been accepted yet, or the session is over.
-        // Holding a bounded number of streams covers reordering; past that the
-        // peer is told to give up on them rather than left waiting.
-        let total = h3.wtOrphans.values.reduce(0) { $0 + $1.count }
-        if total >= wtMaxOrphanStreams {
-            h3.quic.resetStream(streamID, code: HTTP3Error.webTransportBufferedStreamRejected)
-            h3.quic.stopSending(streamID, code: HTTP3Error.webTransportBufferedStreamRejected)
-            h3.quic.releaseStream(streamID)
-            return -1
-        }
-        h3.wtOrphans[sessionID, default: []].append((streamID, bidirectional))
-        return -1
-    }
-
-    /// New bytes, or an ending, on a stream belonging to a session.
-    mutating func wtStreamReadable(_ sessionSlot: Int, _ h3: H3Connection, _ streamID: UInt64) {
-        table[sessionSlot].pointee.wt?.streams[streamID]?.readWaiter.take()?.resume()
-    }
-
-    /// The peer reset a session stream, or asked us to stop sending on one.
-    mutating func wtStreamAborted(_ sessionSlot: Int, _ h3: H3Connection, _ streamID: UInt64) {
-        guard let stream = table[sessionSlot].pointee.wt?.streams[streamID] else { return }
-        stream.aborted = true
-        stream.writable = false
-        stream.wake()
-    }
-
-    /// Something a session stream sent was acknowledged, which may give a
-    /// writer waiting for room its room.
-    mutating func wtStreamWritable(_ sessionSlot: Int) {
-        guard let session = table[sessionSlot].pointee.wt else { return }
-        for stream in session.streams.values { stream.writeWaiter.take()?.resume() }
-    }
-
-    /// Routes one datagram to the session named by its quarter stream id.
-    mutating func wtDatagram(_ connectionSlot: Int, _ h3: H3Connection, _ payload: [UInt8]) {
-        var sessionID: UInt64 = 0
-        var offset = 0
-        payload.withUnsafeBufferPointer { buffer in
-            guard let base = buffer.baseAddress else { return }
-            var r = QUICReader(base, buffer.count)
-            guard let quarter = r.varint() else { return }
-            sessionID = quarter &* 4
-            offset = r.offset
-        }
-        if offset == 0 { return }
-        guard let sessionSlot = h3.sessions[sessionID].map(Int.init),
-              let session = table[sessionSlot].pointee.wt, !session.gone else { return }
-
-        session.datagrams.append([UInt8](payload[offset...]))
-        session.datagramBytes += payload.count - offset
-        while session.datagrams.count > wtMaxQueuedDatagrams
-                || session.datagramBytes > wtMaxQueuedDatagramBytes {
-            // Unreliable in, unreliable out: a handler too slow to read its
-            // datagrams loses the oldest, not the newest.
-            session.datagramBytes -= session.datagrams.removeFirst().count
-        }
-        session.datagramWaiter.take()?.resume()
-    }
-
-    // MARK: - Capsules on the CONNECT stream
-
-    /// Reads whatever capsules have arrived on a session's CONNECT stream.
-    mutating func readWTCapsules(_ sessionSlot: Int, _ h3: H3Connection, _ stream: QUICStream) {
-        guard let session = table[sessionSlot].pointee.wt else { return }
+    /// The next stream the peer opens, or nil once the session has ended.
+    public func acceptStream() async throws -> WebTransportStream? {
         while true {
-            let available = stream.receive.ready.readableBytes
-            if available == 0 { break }
-            let base = UnsafePointer(stream.receive.ready.readPointer)
-            var r = QUICReader(base, available)
-            guard let type = r.varint(), let length = r.varintAsInt() else { break }
-            if r.remaining < length { break }
-            let header = r.offset
+            let next = try locked { () throws(WebTransportError) -> WTStream?? in
+                if !state.incoming.isEmpty { return .some(state.incoming.removeFirst()) }
+                if state.gone { return .some(nil) }
+                guard !state.accepting else { throw .busy }
+                state.accepting = true
+                return .none
+            }
+            if let next {
+                guard let next else { return nil }
+                return WebTransportStream(session: self, state: next)
+            }
+            defer { locked { state.accepting = false } }
+            try await waitFor(state.arrivals)
+        }
+    }
 
-            if type == HTTP3Capsule.closeWebTransportSession {
-                // A 32-bit application code and a UTF-8 reason.
-                if length >= 4 {
-                    let p = base + header
-                    session.closeCode = UInt32(p[0]) << 24 | UInt32(p[1]) << 16
-                        | UInt32(p[2]) << 8 | UInt32(p[3])
-                    session.closeReason = [UInt8](UnsafeBufferPointer(start: p + 4, count: length - 4))
+    /// Opens a stream to the peer. A unidirectional one can only be written.
+    public func openStream(bidirectional: Bool = true) throws -> WebTransportStream {
+        let opened = try locked { () throws(WebTransportError) -> WTStream in
+            guard !state.gone else { throw .closed }
+            let connection = state.connection
+            let index = bidirectional ? connection.nextLocalBidi : connection.nextLocalUni
+            let limit = bidirectional ? connection.localLimitBidi : connection.localLimitUni
+            guard index < limit else { throw .streamLimit }
+            if bidirectional { connection.nextLocalBidi &+= 1 } else { connection.nextLocalUni &+= 1 }
+            let id = QUICStreamKind.id(index: index, serverInitiated: true, unidirectional: !bidirectional)
+            let st = WTStream(id: id, bidirectional: bidirectional, local: true, session: state)
+            // Our streams carry the same prefix the peer's do: a
+            // unidirectional stream is typed 0x54, a bidirectional one starts
+            // with the frame that says it is not a request.
+            st.staged.writeVarint(bidirectional ? HTTP3FrameType.webTransportStream : HTTP3StreamType.webTransport)
+            st.staged.writeVarint(state.sessionID)
+            state.streams[id] = st
+            connection.opening.append(st)
+            state.mark(st)
+            return st
+        }
+        return WebTransportStream(session: self, state: opened)
+    }
+
+    /// The next datagram from the peer, or nil once the session has ended.
+    /// Datagrams a handler is too slow to read are dropped, oldest first.
+    public func receiveDatagram() async throws -> [UInt8]? {
+        while true {
+            let next = try locked { () throws(WebTransportError) -> [UInt8]?? in
+                if !state.datagrams.isEmpty {
+                    let payload = state.datagrams.removeFirst()
+                    state.datagramBytes &-= payload.count
+                    return .some(payload)
                 }
-                stream.receive.ready.consume(header + length)
-                endWebTransportSession(sessionSlot, clean: true)
-                return
+                if state.gone { return .some(nil) }
+                guard !state.receiving else { throw .busy }
+                state.receiving = true
+                return .none
             }
-            // DRAIN and anything unknown are advisory: a capsule nobody
-            // understands is skipped, which is what makes them extensible.
-            stream.receive.ready.consume(header + length)
-        }
-        if stream.receive.finished && !session.gone {
-            endWebTransportSession(sessionSlot, clean: false)
+            if let next { return next }
+            defer { locked { state.receiving = false } }
+            try await waitFor(state.datagramArrived)
         }
     }
 
-    // MARK: - Ending a session
-
-    /// Sends the close capsule and finishes the CONNECT stream.
-    mutating func closeWebTransportSession(_ slot: Int, _ session: WTSession) {
-        let parent = Int(table[slot].pointee.parentSlot)
-        guard !session.gone, parent >= 0, let h3 = table[parent].pointee.h3 else {
-            endWebTransportSession(slot, clean: false)
-            return
+    /// Sends a datagram. Returns false, having sent nothing, when the session
+    /// has ended or the datagram is larger than the peer will take: that is
+    /// what unreliable means, and there is no waiting for room.
+    @discardableResult
+    public func sendDatagram(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count <= state.datagramLimit else { return false }
+        var out = ByteBuffer(capacity: bytes.count &+ 8)
+        defer { out.destroy() }
+        out.writeVarint(state.sessionID / 4)
+        bytes.withUnsafeBufferPointer { if let base = $0.baseAddress, $0.count > 0 { out.write(base, $0.count) } }
+        let datagram = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
+        return locked { () -> Bool in
+            guard !state.gone else { return false }
+            state.outgoing.append(datagram)
+            state.endpoint.post(state.stream)
+            return true
         }
-        if !session.closeSent {
-            session.closeSent = true
-            var capsule = ByteBuffer(capacity: session.closeReason.count + 16)
-            defer { capsule.destroy() }
-            capsule.writeVarint(HTTP3Capsule.closeWebTransportSession)
-            capsule.writeVarint(UInt64(4 + session.closeReason.count))
-            let code = session.closeCode
-            capsule.writeByte(UInt8(truncatingIfNeeded: code >> 24))
-            capsule.writeByte(UInt8(truncatingIfNeeded: code >> 16))
-            capsule.writeByte(UInt8(truncatingIfNeeded: code >> 8))
-            capsule.writeByte(UInt8(truncatingIfNeeded: code))
-            session.closeReason.withUnsafeBufferPointer { p in
-                if let base = p.baseAddress, p.count > 0 { capsule.write(base, p.count) }
-            }
-            h3.quic.send(session.sessionID, UnsafePointer(capsule.readPointer),
-                         capsule.readableBytes, fin: true)
-            table[slot].pointee.flags.insert(.endStreamSent)
-            flushQUIC(parent)
-        }
-        endWebTransportSession(slot, clean: true)
     }
 
-    /// Tears the session down: every stream it owned goes with it, every wait
-    /// on it ends, and the CONNECT stream's slot is closed.
+    /// Ends the session with `code` and `reason`, which the peer receives.
+    /// Every stream still open is abandoned. Closing twice does nothing.
+    public func close(code: UInt32 = 0, reason: String = "") {
+        let reason = Array(reason.utf8.prefix(wtMaxCloseReason))
+        locked { state.closeLocked(code: code, reason: reason) }
+    }
+}
+
+/// One stream of a WebTransport session.
+public final class WebTransportStream: Sendable {
+    public let session: WebTransportSession
+    let state: WTStream
+
+    init(session: WebTransportSession, state: WTStream) {
+        self.session = session
+        self.state = state
+    }
+
+    /// `body` under the endpoint's lock.
+    @inline(__always)
+    private func locked<R, E: Error>(_ body: () throws(E) -> R) throws(E) -> R {
+        try session.state.endpoint.lock.withLock { _ throws(E) -> R in try body() }
+    }
+
+    public var id: UInt64 { state.id }
+    public var isBidirectional: Bool { state.bidirectional }
+    /// Opened by this side rather than the peer.
+    public var isLocal: Bool { state.local }
+    /// The peer reset its side, or asked this side to stop sending.
+    public var wasAborted: Bool { locked { state.aborted } }
+
+    /// Up to `maxBytes` of what the peer sent, waiting for some when none has
+    /// arrived. Nil once the stream has ended -- finished or reset by the
+    /// peer, or its session gone -- and at once for a stream this side opened
+    /// unidirectional. Bytes that arrived before a reset are still read.
     ///
-    /// The handler may still be running. It is not stopped -- nothing can
-    /// stop a task -- but everything it asks of the session from here on
-    /// finds it gone: a wait returns nil, a write throws.
-    mutating func endWebTransportSession(_ slot: Int, clean: Bool) {
-        let c = table[slot]
-        guard let session = c.pointee.wt, !session.gone else { return }
-        session.gone = true
-
-        let parent = Int(c.pointee.parentSlot)
-        if parent >= 0, let h3 = table[parent].pointee.h3 {
-            // Streams of a session that has ended are not finished, they are
-            // abandoned, and the peer is told which it was.
-            for (id, stream) in session.streams {
-                h3.wtStreams.removeValue(forKey: id)
-                if stream.writable { h3.quic.resetStream(id, code: HTTP3Error.webTransportSessionGone) }
-                if !stream.readEnded { h3.quic.stopSending(id, code: HTTP3Error.webTransportSessionGone) }
-                h3.quic.releaseStream(id)
+    /// The peer is given no more room than the handler has read, so a stream
+    /// nobody reads slows its sender and nothing else.
+    public func read(maxBytes: Int = 64 * 1024) async throws -> [UInt8]? {
+        let st = state
+        let session = st.session
+        let creditAt = max(1, session.connection.settings.streamWindow / 4)
+        while true {
+            let got = try locked { () throws(WebTransportError) -> [UInt8]?? in
+                if st.readDone { return .some(nil) }
+                let available = st.inbound.readableBytes
+                if available > 0 {
+                    let take = min(available, max(1, maxBytes))
+                    let bytes = Array(UnsafeBufferPointer(start: st.inbound.readPointer, count: take))
+                    st.inbound.consume(take)
+                    st.taken &+= UInt64(take)
+                    st.owed &+= take
+                    // Reading is what opens the window again.
+                    if st.owed >= creditAt && !session.gone {
+                        st.owed = 0
+                        session.mark(st)
+                    }
+                    return .some(bytes)
+                }
+                if st.peerEnded || session.gone {
+                    st.readDone = true
+                    st.inbound.clear()
+                    if !session.gone { session.mark(st) }
+                    return .some(nil)
+                }
+                guard !st.reading else { throw .busy }
+                st.reading = true
+                return .none
             }
-            h3.sessions.removeValue(forKey: session.sessionID)
-            h3.wtOrphans.removeValue(forKey: session.sessionID)
-            if !clean && !c.pointee.flags.contains(.endStreamSent) {
-                c.pointee.flags.insert(.endStreamSent)
-                h3.quic.send(session.sessionID, emptyH3Byte, 0, fin: true)
-            }
-            flushQUIC(parent)
+            if let got { return got }
+            defer { locked { st.reading = false } }
+            try await waitFor(st.readable)
         }
-        // Closing the slot releases the session, which ends every wait on it.
-        closeH3Stream(slot)
     }
 
-    /// The handler returned or threw. A session it left open is closed
-    /// cleanly for it.
-    mutating func webTransportHandlerFinished(_ slot: Int, generation: UInt32, requestId: UInt32,
-                                              _ session: WTSession) {
-        let c = table[slot]
-        guard c.pointee.state != .free, c.pointee.generation == generation,
-              c.pointee.requestId == requestId, c.pointee.wt === session else { return }
-        closeWebTransportSession(slot, session)
-    }
-
-    /// Releases everything a session holds. Called from `closeConnection`,
-    /// where the slot is going away whatever state the session is in.
-    mutating func releaseWebTransport(_ slot: Int) {
-        let c = table[slot]
-        guard let session = c.pointee.wt else { return }
-        c.pointee.wt = nil
-        let parent = Int(c.pointee.parentSlot)
-        if !session.gone, parent >= 0, let h3 = table[parent].pointee.h3 {
-            for (id, _) in session.streams {
-                h3.wtStreams.removeValue(forKey: id)
-                h3.quic.resetStream(id, code: HTTP3Error.webTransportSessionGone)
-                h3.quic.releaseStream(id)
-            }
-            h3.sessions.removeValue(forKey: session.sessionID)
-            h3.wtOrphans.removeValue(forKey: session.sessionID)
+    /// Everything the peer sends until it finishes the stream, refusing more
+    /// than `maxBytes`.
+    public func readAll(maxBytes: Int = 1 << 20) async throws -> [UInt8] {
+        var all: [UInt8] = []
+        while let bytes = try await read() {
+            all += bytes
+            if all.count > maxBytes { throw WebTransportError.closed }
         }
-        session.gone = true
-        session.wakeAll()
-        session.streams.removeAll()
-        session.incoming.removeAll()
-        session.datagrams.removeAll()
+        return all
     }
+
+    /// Writes `bytes`, and waits while more than the server's write high-water
+    /// mark is queued on this stream and not yet sent.
+    public func write(_ bytes: [UInt8]) async throws {
+        let st = state
+        let session = st.session
+        let high = session.connection.settings.high
+        try locked { () throws(WebTransportError) in
+            guard !session.gone else { throw .closed }
+            guard st.writable, !st.finRequested else { throw .notWritable }
+            bytes.withUnsafeBufferPointer { if let base = $0.baseAddress, $0.count > 0 { st.staged.write(base, $0.count) } }
+            session.mark(st)
+        }
+        while true {
+            let wait = try locked { () throws(WebTransportError) -> Bool in
+                guard !session.gone else { throw .closed }
+                if st.staged.readableBytes <= high { return false }
+                guard st.writable else { throw .notWritable }
+                guard !st.writing else { throw .busy }
+                st.writing = true
+                return true
+            }
+            if !wait { return }
+            defer { locked { st.writing = false } }
+            try await waitFor(st.drained)
+        }
+    }
+
+    /// Finishes this side of the stream: the peer reads to the end of what was
+    /// written. Does nothing on a stream that cannot be written.
+    public func finish() {
+        let st = state
+        locked {
+            guard !st.session.gone, st.writable, !st.finRequested else { return }
+            st.finRequested = true
+            st.writable = false
+            st.session.mark(st)
+        }
+    }
+
+    /// Abandons the stream in both directions with an application error code.
+    public func reset(code: UInt32 = 0) {
+        let st = state
+        let wire = WebTransportStream.http3Code(code)
+        locked {
+            guard !st.session.gone else { return }
+            if st.writable {
+                st.resetCode = wire
+                st.staged.clear()
+            }
+            if !st.readDone {
+                st.stopCode = wire
+                st.readDone = true
+                st.inbound.clear()
+            }
+            st.writable = false
+            st.wake()
+            st.session.mark(st)
+        }
+    }
+
+    /// WebTransport's application codes live in a reserved stretch of the
+    /// HTTP/3 error space, skipping every value HTTP/3 keeps for greasing
+    /// (draft-ietf-webtrans-http3, section 4.3).
+    static func http3Code(_ code: UInt32) -> UInt64 {
+        0x52e4_a40f_a8db + UInt64(code) + UInt64(code) / 0x1e
+    }
+}
+
+/// Waits for the endpoint to signal `event`, which it does once what the
+/// caller found missing under the lock may be there: the caller looks again.
+/// A cancelled task's wait throws `CancellationError`; one under an I/O
+/// deadline (`Runtime.withIODeadline`) throws `IOError.timedOut` when it
+/// passes.
+private func waitFor(_ event: IOEvent) async throws {
+    do {
+        try await event.wait()
+    } catch {
+        if error == .cancelled || Task.isCancelled { throw CancellationError() }
+        throw error
+    }
+}
+
+// MARK: - Registration
+
+/// A WebTransport handler over the raw request.
+public typealias WebTransportHandler = (borrowing Request, WebTransportSession) async throws -> Void
+
+/// A handler, carried from its route to the stream's task, which runs it.
+struct CarriedWebTransportHandler: @unchecked Sendable {
+    let call: (borrowing Request, WebTransportSession) async throws -> Void
+
+    /// Runs the handler, reporting what it threw unless it was the session
+    /// ending under it.
+    func run(_ request: borrowing Request, _ session: WebTransportSession) async {
+        do {
+            try await call(request, session)
+        } catch let error as WebTransportError where error == .closed {
+            // The session ended under the handler; nothing went wrong.
+        } catch is CancellationError {
+        } catch {
+            Log.error("webtransport handler threw: \(error)")
+        }
+    }
+}
+
+/// A handler taking extracted values, in a struct: a function with a
+/// parameter pack cannot be held as a generic value on its own.
+struct VariadicWebTransportHandler<each E>: @unchecked Sendable {
+    let call: (WebTransportSession, repeat each E) async throws -> Void
+}
+
+extension RouteBuilder {
+    /// Serves WebTransport sessions on `pattern`: an HTTP/3 extended CONNECT
+    /// with `:protocol: webtransport`. Middleware runs in front, as for any
+    /// route; the session is accepted when the handler is called.
+    public func onWebTransport(_ pattern: String, _ handler: sending @escaping WebTransportHandler) {
+        let carried = CarriedWebTransportHandler(call: handler)
+        on(.connect, pattern) { request, response in
+            try refuseUnlessWebTransport(request)
+            acceptWebTransport(request.exchange, run: carried)
+        }
+    }
+
+    /// Serves WebTransport sessions on `pattern`, with extractors. Every
+    /// extractor runs before the session is accepted, so one that refuses the
+    /// request refuses the session with an ordinary status.
+    ///
+    ///     app.webTransport("/room/:id") { (session: WebTransportSession, room: Path<Int>,
+    ///                                      user: Context<User>) async throws in … }
+    ///
+    /// The session comes first: Swift will not pass further arguments after
+    /// a variable number of extractors.
+    public func webTransport<each E: RequestExtractor>(
+        _ pattern: String,
+        _ handler: sending @escaping (WebTransportSession, repeat each E) async throws -> Void
+    ) {
+        let handler = VariadicWebTransportHandler<repeat each E>(call: handler)
+        on(.connect, pattern) { request, response in
+            try refuseUnlessWebTransport(request)
+            var parameter = 0
+            let run = bindWebTransportHandler(handler,
+                                              repeat try await (each E).extract(from: request, parameter: &parameter))
+            acceptWebTransport(request.exchange, run: run)
+        }
+        var claims = 0
+        var states: [Any.Type] = []
+        repeat claims += pathClaims((each E).self)
+        repeat states += requiredState((each E).self)
+        noteRoute(.connect, pattern, pathParameters: claims, states: states)
+    }
+}
+
+/// The handler with its extracted values applied. A closure rather than the
+/// values themselves, because the task that runs it cannot capture a
+/// parameter pack.
+func bindWebTransportHandler<each E>(_ handler: VariadicWebTransportHandler<repeat each E>,
+                                     _ values: repeat each E) -> CarriedWebTransportHandler {
+    CarriedWebTransportHandler { _, session in try await handler.call(session, repeat each values) }
+}
+
+/// A CONNECT that is not a WebTransport session is a mistake at a session's
+/// route.
+func refuseUnlessWebTransport(_ request: borrowing Request) throws {
+    let x = request.exchange
+    var overHTTP3 = false
+    if case .http3 = x.pointee.link { overHTTP3 = true }
+    guard overHTTP3, x.pointee.connectProtocol == .webtransport else {
+        throw HTTPError(.badRequest, "a WebTransport session starts with an HTTP/3 extended CONNECT")
+    }
+}
+
+/// Accepts the session: the 200 is staged by the stream's task once the
+/// route has returned, and the handler runs there (HTTP3WebTransport.swift).
+func acceptWebTransport(_ x: UnsafeMutablePointer<Exchange>, run: CarriedWebTransportHandler) {
+    guard case .http3(let link) = x.pointee.link else { return }
+    let s = link.takeUnretainedValue()
+    x.pointee.status = 200
+    x.pointee.noCompress = true
+    x.pointee.answered = true
+    x.pointee.touchedStream = true
+    x.pointee.webTransport = WTAcceptance(session: WTSession(stream: s), run: run)
 }

@@ -1,314 +1,295 @@
+import Garuda
+import GarudaTesting
+import Synchronization
 import Testing
-import CAvian
-import AvianCore
-@testable import Garuda
 
-// Groups and middleware. A middleware runs before a route's handler: it can
-// answer instead of it, or add headers that stay on whatever the handler sends.
-
-nonisolated(unsafe) private var handlerRan = 0
-
-/// Answers 401 unless the request carries the right token.
-nonisolated(unsafe) private let requireToken: Middleware = { request, _ in
-    request.header("authorization") == "Bearer letmein" ? nil : HTTPStatus.unauthorized
+/// How many times something ran, from any thread.
+final class Counter: Sendable {
+    private let count = Atomic<Int>(0)
+    func increment() { count.add(1, ordering: .relaxed) }
+    var value: Int { count.load(ordering: .relaxed) }
 }
 
-private enum Caller: RequestContextKey { typealias Value = String }
+/// Adds `x-trace: name` on the way in and `x-trace: name-out` on the way out,
+/// so the order layers ran in shows in the response.
+struct Trace: Middleware {
+    let name: String
 
-/// Waits on the worker's timers, then answers 401 unless the request carries
-/// the right token -- the shape of a session looked up in a database.
-nonisolated(unsafe) private let lookUpToken: AsyncMiddleware = { request, response in
-    asyncMiddlewareRan += 1
-    try await response.sleep(milliseconds: 1)
-    guard request.header("authorization") == "Bearer letmein" else { return HTTPStatus.unauthorized }
-    request[context: Caller.self] = "ada"
-    return nil
-}
-
-nonisolated(unsafe) private var asyncMiddlewareRan = 0
-
-/// Leaves a mark, so a test can see which middleware ran and in what order.
-private func mark(_ name: StaticString) -> Middleware {
-    { _, response in
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
         response.addHeader("x-trace", name)
-        return nil
+        try await next()
+        response.addHeader("x-trace", name + "-out")
     }
 }
 
-@Suite("Groups and middleware", .serialized)
-struct MiddlewareTests {
-
-    // MARK: Groups
-
-    @Test func aGroupMountsItsRoutesUnderItsPrefix() throws {
-        let app = Application()
-        app.group("/api") {
-            app.get("/users/:id") { request, response in request.withParameter(0) { response.send($0) } }
+struct RequireToken: Middleware {
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
+        guard request.header("authorization") == "Bearer good" else {
+            return response.send(status: .unauthorized, "no")
         }
-        let client = app.test
-        #expect(try client.get("/api/users/7").text == "7")
-        #expect(try client.get("/users/7").status == 404)
+        try await next()
+    }
+}
+
+@Suite struct MiddlewareTests {
+    @Test func runsAroundTheHandler() throws {
+        let app = Application()
+        app.use(Trace(name: "a"))
+        app.get("/") { () in "hi" }
+        let response = try app.test.get("/")
+        #expect(response.text == "hi")
+        #expect(response.headers(named: "x-trace") == ["a", "a-out"])
     }
 
-    @Test func nestedGroupsJoinTheirPrefixes() throws {
+    @Test func globalThenGroupsFromTheOutsideIn() throws {
         let app = Application()
+        app.use(Trace(name: "global"))
         app.group("/api") {
-            app.group("/admin/") {
-                app.get("/ping") { _, response in response.send("pong") }
-            }
-        }
-        #expect(try app.test.get("/api/admin/ping").text == "pong")
-    }
-
-    @Test func aGroupsOwnRootIsItsPrefix() throws {
-        // Not /api/ -- the route a group registers at "/" is the prefix itself.
-        let app = Application()
-        app.group("/api") {
-            app.get("/") { _, response in response.send("root") }
-        }
-        #expect(try app.test.get("/api").text == "root")
-    }
-
-    @Test func aWrongMethodUnderAGroupIsStill405() throws {
-        let app = Application()
-        app.group("/api") {
-            app.get("/users/:id") { _, response in response.send(status: 200) }
-        }
-        let response = try app.test.request("POST", "/api/users/7")
-        #expect(response.status == 405)
-        #expect(response.header("allow") == "GET, HEAD")
-    }
-
-    // MARK: Middleware
-
-    @Test func middlewareAnswersInsteadOfTheHandler() throws {
-        handlerRan = 0
-        let app = Application()
-        app.group("/api") {
-            app.use(requireToken)
-            app.get("/secret") { _, response in
-                handlerRan += 1
-                response.send("s3cret")
-            }
-        }
-        let client = app.test
-        let refused = try client.get("/api/secret")
-        #expect(refused.status == 401)
-        #expect(handlerRan == 0)
-        let allowed = try client.get("/api/secret", headers: [("Authorization", "Bearer letmein")])
-        #expect(allowed.status == 200)
-        #expect(allowed.text == "s3cret")
-        #expect(handlerRan == 1)
-    }
-
-    @Test func middlewareAppliesWhetherUsedBeforeOrAfterTheRoutes() throws {
-        // A layer that covers only the routes registered before it is a
-        // well-known way to leave a route unprotected by moving one line. Here
-        // `use` covers its whole scope, wherever in it it is called.
-        let app = Application()
-        app.group("/api") {
-            app.get("/secret") { _, response in response.send("s3cret") }
-            app.use(requireToken)
-        }
-        #expect(try app.test.get("/api/secret").status == 401)
-    }
-
-    @Test func middlewareStaysInsideItsGroup() throws {
-        let app = Application()
-        app.group("/api") {
-            app.use(requireToken)
-            app.get("/secret") { _, response in response.send("s3cret") }
-        }
-        app.get("/public") { _, response in response.send("hello") }
-        let client = app.test
-        #expect(try client.get("/public").text == "hello")
-        #expect(try client.get("/api/secret").status == 401)
-    }
-
-    @Test func middlewareRunsGlobalFirstThenGroupsFromTheOutsideIn() throws {
-        let app = Application()
-        app.group("/api") {
+            app.use(Trace(name: "api"))
             app.group("/admin") {
-                app.use(mark("inner"))
-                app.get("/x") { _, response in response.send("x") }
+                app.use(Trace(name: "admin"))
+                app.get("/x") { () in "x" }
             }
-            app.use(mark("outer"))
         }
-        app.use(mark("global"))
         let response = try app.test.get("/api/admin/x")
-        #expect(response.headers(named: "x-trace") == ["global", "outer", "inner"])
+        #expect(response.text == "x")
+        #expect(response.headers(named: "x-trace")
+                == ["global", "api", "admin", "admin-out", "api-out", "global-out"])
     }
 
-    @Test func aHeaderAMiddlewareAddsStaysOnTheHandlersResponse() throws {
+    @Test func useAfterTheRoutesStillCoversThem() throws {
         let app = Application()
-        app.use { _, response in
-            response.addHeader("x-frame-options", "DENY")
-            return nil
+        app.get("/early") { () in "early" }
+        app.use(Trace(name: "late"))
+        #expect(try app.test.get("/early").headers(named: "x-trace") == ["late", "late-out"])
+    }
+
+    @Test func orderWithinAScopeIsTheOrderOfUse() throws {
+        let app = Application()
+        app.use(Trace(name: "1"))
+        app.use(Trace(name: "2"))
+        app.get("/") { () in "" }
+        #expect(try app.test.get("/").headers(named: "x-trace") == ["1", "2", "2-out", "1-out"])
+    }
+
+    @Test func aGroupsMiddlewareStaysInTheGroup() throws {
+        let app = Application()
+        app.group("/private") {
+            app.use(RequireToken())
+            app.get("/data") { () in "secret" }
         }
-        app.get("/page") { () -> JSON<[String: String]> in JSON(["page": "home"]) }
-        let response = try app.test.get("/page")
-        #expect(response.status == 200)
-        #expect(response.text == #"{"page":"home"}"#)
-        #expect(response.header("x-frame-options") == "DENY")
+        app.get("/public") { () in "open" }
+        let client = app.test
+        #expect(try client.get("/public").text == "open")
+        #expect(try client.get("/private/data").status == 401)
+        #expect(try client.get("/private/data", headers: [("authorization", "Bearer good")]).text == "secret")
     }
 
-    @Test func aResponseErrorThrownByMiddlewareIsTheAnswer() throws {
+    @Test func answeringWithoutNextSkipsTheHandler() throws {
         let app = Application()
-        app.use { _, _ in throw HTTPError(.forbidden, "not today") }
-        app.get("/x") { _, response in response.send("x") }
-        let response = try app.test.get("/x")
+        let ran = Counter()
+        app.use(RequireToken())
+        app.get("/") { () in
+            ran.increment()
+            return "ran"
+        }
+        let response = try app.test.get("/")
+        #expect(response.status == 401)
+        #expect(response.text == "no")
+        #expect(ran.value == 0)
+    }
+
+    @Test func changesTheResponseAfterTheHandler() throws {
+        let app = Application()
+        app.use { _, response, next in
+            try await next()
+            response.status = .accepted
+            response.addHeader("x-after", "yes")
+        }
+        app.get("/") { () in "body" }
+        let response = try app.test.get("/")
+        #expect(response.status == 202)
+        #expect(response.header("x-after") == "yes")
+        #expect(response.text == "body")
+    }
+
+    @Test func catchesWhatTheHandlerThrew() throws {
+        let app = Application()
+        app.use { _, response, next in
+            do {
+                try await next()
+            } catch {
+                response.send(status: .serviceUnavailable, "caught")
+            }
+        }
+        app.get("/fails") { () throws -> String in throw HTTPError.conflict("taken") }
+        let response = try app.test.get("/fails")
+        #expect(response.status == 503)
+        #expect(response.text == "caught")
+    }
+
+    @Test func aThrowingMiddlewareIsAnsweredLikeAThrowingHandler() throws {
+        let app = Application()
+        app.use { _, _, _ in throw HTTPError.forbidden("not you") }
+        app.get("/") { () in "unreached" }
+        let response = try app.test.get("/")
         #expect(response.status == 403)
-        #expect(response.text == #"{"error":"not today"}"#)
     }
 
-    @Test func middlewareGuardsAsyncRoutesBeforeTheirTaskStarts() throws {
-        // An async route is a handler that starts a task. The chain runs in
-        // front of that, so a refused request never costs a task at all.
-        handlerRan = 0
+    @Test func awaitsBeforeAndAfterNext() throws {
         let app = Application()
-        app.use(requireToken)
-        app.get("/slow") { () async throws -> String in
-            handlerRan += 1
-            return "done"
+        app.use { _, response, next in
+            await Task.yield()
+            try await next()
+            await Task.yield()
+            response.addHeader("x-yielded", "twice")
+        }
+        app.get("/") { () async in
+            await Task.yield()
+            return "ok"
+        }
+        let response = try app.test.get("/")
+        #expect(response.text == "ok")
+        #expect(response.header("x-yielded") == "twice")
+    }
+
+    @Test func unmatchedRequestsSkipMiddleware() throws {
+        let app = Application()
+        app.use(Trace(name: "a"))
+        app.get("/") { () in "" }
+        let response = try app.test.get("/nowhere")
+        #expect(response.status == 404)
+        #expect(response.headers(named: "x-trace").isEmpty)
+    }
+
+    @Test func rawHandlersAreWrappedToo() throws {
+        let app = Application()
+        app.use(Trace(name: "a"))
+        app.get("/raw") { _, response in response.send("raw") }
+        let response = try app.test.get("/raw")
+        #expect(response.text == "raw")
+        #expect(response.headers(named: "x-trace") == ["a", "a-out"])
+    }
+
+    @Test func middlewareSeesTheRequest() throws {
+        let app = Application()
+        app.use { request, response, next in
+            response.addHeader("x-seen", "\(request.method.name) \(request.path)")
+            try await next()
+        }
+        app.post("/items/:id") { (id: Path<Int>) in "\(id.value)" }
+        let response = try app.test.post("/items/7", body: "x")
+        #expect(response.text == "7")
+        #expect(response.header("x-seen") == "POST /items/7")
+    }
+}
+
+@Suite struct GroupTests {
+    @Test func prefixesJoin() throws {
+        let app = Application()
+        app.group("/api") {
+            app.get("/users/:id") { (id: Path<Int>) in "user \(id.value)" }
+            app.group("/v2") {
+                app.get("/users/:id") { (id: Path<Int>) in "v2 user \(id.value)" }
+            }
         }
         let client = app.test
-        #expect(try client.get("/slow").status == 401)
-        #expect(handlerRan == 0)
-        let allowed = try client.get("/slow", headers: [("Authorization", "Bearer letmein")])
-        #expect(allowed.text == "done")
-        #expect(handlerRan == 1)
+        #expect(try client.get("/api/users/3").text == "user 3")
+        #expect(try client.get("/api/v2/users/4").text == "v2 user 4")
+        #expect(try client.get("/users/3").status == 404)
     }
 
-    // MARK: Async middleware
-
-    @Test func asyncMiddlewareRefusesAfterAwaiting() throws {
-        handlerRan = 0
+    @Test func aGroupsRootIsItsPrefix() throws {
         let app = Application()
-        app.use(lookUpToken)
-        app.get("/secret") { _, response in
-            handlerRan += 1
-            response.send("s3cret")
+        app.group("/api/") {
+            app.get("/") { () in "api root" }
         }
         let client = app.test
-        #expect(try client.get("/secret").status == 401)
-        #expect(handlerRan == 0)
-        let allowed = try client.get("/secret", headers: [("Authorization", "Bearer letmein")])
-        #expect(allowed.text == "s3cret")
-        #expect(handlerRan == 1)
+        #expect(try client.get("/api").text == "api root")
     }
 
-    @Test func whatAsyncMiddlewareStoresReachesATypedHandler() throws {
+    @Test func aSlashPrefixAddsNothing() throws {
         let app = Application()
-        app.use(lookUpToken)
-        app.get("/me") { (caller: Context<Caller>) in caller.value }
-        let response = try app.test.get("/me", headers: [("Authorization", "Bearer letmein")])
-        #expect(response.status == 200)
-        #expect(response.text == "ada")
-    }
-
-    @Test func anAsyncRouteBehindAsyncMiddlewareRunsOnTheSameTask() throws {
-        // The chain is already on a task, so the route's async handler is
-        // awaited there rather than handed to a second one: one request at a
-        // time never needs more than one task.
-        let app = Application()
-        app.use(lookUpToken)
-        app.get("/me") { (caller: Context<Caller>) async throws -> String in
-            "hello " + caller.value
+        app.group("/") {
+            app.use(Trace(name: "g"))
+            app.get("/x") { () in "x" }
         }
-        let client = app.test
-        let response = try client.get("/me", headers: [("Authorization", "Bearer letmein")])
-        #expect(response.status == 200)
-        #expect(response.text == "hello ada")
-        let tasks = client.worker.pointee.handlerTasks
-        let pool = try #require(tasks)
-        #expect(pool.count == 1)
-    }
-
-    @Test func aClosureThatAwaitsIsAsyncMiddleware() throws {
-        let app = Application()
-        app.use { _, response in
-            try await response.sleep(milliseconds: 1)
-            response.addHeader("x-waited", "yes")
-            return nil
-        }
-        app.get("/x") { _, response in response.send("x") }
         let response = try app.test.get("/x")
         #expect(response.text == "x")
-        #expect(response.header("x-waited") == "yes")
+        #expect(response.headers(named: "x-trace") == ["g", "g-out"])
     }
 
-    @Test func syncAndAsyncMiddlewareRunInTheOrderUsed() throws {
+    @Test func problemsSeeTypedRoutesInsideGroups() {
         let app = Application()
-        app.use(mark("first"))
-        app.use { _, response in
-            try await response.sleep(milliseconds: 1)
-            response.addHeader("x-trace", "second")
-            return nil
-        }
-        app.use(mark("third"))
         app.group("/api") {
-            app.use(mark("fourth"))
-            app.get("/x") { _, response in response.send("x") }
+            app.get("/one/:id") { (a: Path<Int>, b: Path<Int>) in "\(a.value)\(b.value)" }
         }
-        let response = try app.test.get("/api/x")
-        #expect(response.headers(named: "x-trace") == ["first", "second", "third", "fourth"])
+        #expect(app.problems() == ["GET /api/one/:id takes 2 Path parameters, and its pattern has 1"])
+    }
+}
+
+@Suite struct RouterTests {
+    func usersRouter() -> Router {
+        let users = Router()
+        users.use(Trace(name: "users"))
+        users.get("/:id") { (id: Path<Int>) in "user \(id.value)" }
+        users.group("/admin") {
+            users.use(RequireToken())
+            users.delete("/:id") { (id: Path<Int>) in "deleted \(id.value)" }
+        }
+        return users
     }
 
-    @Test func syncMiddlewareInFrontRefusesBeforeTheAsyncOneRuns() throws {
-        asyncMiddlewareRan = 0
+    @Test func nestsUnderAPrefix() throws {
         let app = Application()
-        app.use(requireToken)
-        app.use(lookUpToken)
-        app.get("/secret") { _, response in response.send("s3cret") }
+        app.nest("/users", usersRouter())
         let client = app.test
-        #expect(try client.get("/secret").status == 401)
-        #expect(asyncMiddlewareRan == 0)
-        // Refused on the worker: no task was ever needed.
-        #expect(client.worker.pointee.handlerTasks == nil)
-        #expect(try client.get("/secret", headers: [("Authorization", "Bearer letmein")]).text == "s3cret")
-        #expect(asyncMiddlewareRan == 1)
+        let response = try client.get("/users/9")
+        #expect(response.text == "user 9")
+        #expect(response.headers(named: "x-trace") == ["users", "users-out"])
+        #expect(try client.delete("/users/admin/9").status == 401)
+        #expect(try client.delete("/users/admin/9", headers: [("authorization", "Bearer good")]).text
+                == "deleted 9")
     }
 
-    @Test func aResponseErrorThrownByAsyncMiddlewareIsTheAnswer() throws {
+    @Test func oneRouterMountsTwice() throws {
         let app = Application()
-        app.use { _, response in
-            try await response.sleep(milliseconds: 1)
-            throw HTTPError(.forbidden, "not today")
+        let users = usersRouter()
+        app.nest("/v1/users", users)
+        app.nest("/v2/users", users)
+        let client = app.test
+        #expect(try client.get("/v1/users/1").text == "user 1")
+        #expect(try client.get("/v2/users/2").text == "user 2")
+    }
+
+    @Test func mergesIntoTheOpenGroup() throws {
+        let app = Application()
+        app.group("/api") {
+            app.use(Trace(name: "api"))
+            app.merge(usersRouter())
         }
-        app.get("/x") { _, response in response.send("x") }
-        let response = try app.test.get("/x")
-        #expect(response.status == 403)
-        #expect(response.text == #"{"error":"not today"}"#)
+        let response = try app.test.get("/api/5")
+        #expect(response.text == "user 5")
+        #expect(response.headers(named: "x-trace") == ["api", "users", "users-out", "api-out"])
     }
 
-    @Test func aHandlerThatWaitsOnATimerStillWorksBehindAsyncMiddleware() throws {
-        // `after` parks the request for the worker to resume, which takes it
-        // off the task the chain ran on.
+    @Test func aRoutersMiddlewareStaysInsideIt() throws {
         let app = Application()
-        app.use(lookUpToken)
-        app.get("/later") { _, response in
-            response.after(milliseconds: 1) { _, later in later.send("later") }
-        }
-        let response = try app.test.get("/later", headers: [("Authorization", "Bearer letmein")])
-        #expect(response.status == 200)
-        #expect(response.text == "later")
+        app.nest("/users", usersRouter())
+        app.get("/other") { () in "other" }
+        #expect(try app.test.get("/other").headers(named: "x-trace").isEmpty)
     }
 
-    @Test func aDeadlineCoversAsyncMiddleware() throws {
+    @Test func routersNestInRouters() throws {
+        let outer = Router()
+        outer.use(Trace(name: "outer"))
+        outer.nest("/users", usersRouter())
         let app = Application()
-        app.deadline(milliseconds: 20) {
-            app.use { _, response in
-                try await response.sleep(milliseconds: 5_000)
-                return nil
-            }
-            app.get("/x") { _, response in response.send("x") }
-        }
-        #expect(try app.test.get("/x").status == 504)
-    }
-
-    @Test func aMissingContextValueIsTheProgramsFault() throws {
-        let app = Application()
-        app.get("/me") { (caller: Context<Caller>) in caller.value }
-        #expect(try app.test.get("/me").status == 500)
+        app.nest("/api", outer)
+        let response = try app.test.get("/api/users/8")
+        #expect(response.text == "user 8")
+        #expect(response.headers(named: "x-trace") == ["outer", "users", "users-out", "outer-out"])
     }
 }

@@ -4,8 +4,8 @@
 //     let store = try FileUploadStore(directory: "/var/lib/app/uploads")
 //     app.resumableUploads("/files", store: store,
 //                          limits: UploadLimits(maxSize: 10 << 30)) { upload in
-//         try moveIntoPlace(upload.path, named: upload.info.contentDisposition)
-//         try upload.remove()
+//         try await moveIntoPlace(upload.path, named: upload.info.contentDisposition)
+//         try await upload.remove()
 //         return JSON(["size": upload.length], status: .created)
 //     }
 //
@@ -31,6 +31,11 @@
 //   PATCH   <uploads>/:id        append at the offset the client names
 //   DELETE  <uploads>/:id        cancel
 //
+// The bodies are read as they arrive (RequestBody.swift), over HTTP/1.1,
+// HTTP/2 and HTTP/3 alike, and written to the store through VegaFS as they
+// are read: an upload holds a window of its client's bytes and a buffer of
+// its own, whatever its size, and a slow disk slows that upload alone.
+//
 // The draft is not an RFC yet, and a client says which iteration it speaks
 // with `Upload-Draft-Interop-Version`. Only one that sends 9 is sent a 104:
 // the draft forbids it otherwise, so that the RFC's clients and the draft's
@@ -41,11 +46,11 @@
 //   * A request for an upload another request is still appending to. The
 //     draft asks that the older request be ended first -- it is usually a
 //     connection that died without either side noticing, and the client has
-//     come back on a new one. When the older request is on the same worker
-//     it is ended, what it received is stored, and the new request goes on.
-//     When it is on another worker, the new request waits a moment for it,
-//     and is answered 409 with Retry-After if it is still going; it ends by
-//     itself once its connection has been silent for --request-timeout.
+//     come back on a new one. When the older request is in the same shard it
+//     is cancelled, what it received is stored, and the new request goes on.
+//     When it is in another shard, the new request waits a moment for it, and
+//     is answered 409 with Retry-After if it is still going; it ends by
+//     itself once its connection has been silent for the body timeout.
 //   * A request that completes the upload and whose handler throws. The
 //     upload stays complete, and the client is answered 500.
 //   * An answer that never arrived. The answer to the request that completed
@@ -73,14 +78,10 @@
 //     bytes to where they belong.
 //===----------------------------------------------------------------------===//
 
-#if canImport(Glibc)
-import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
-
 import Garuda
-import AvianHTTP
+import GarudaWire
+import Synchronization
+import Vega
 
 /// The limits a server advertises and enforces, as `Upload-Limit`.
 public struct UploadLimits: Sendable {
@@ -154,8 +155,8 @@ public struct CompletedUpload: Sendable {
     ///
     /// The file is read and hashed on the blocking pool, so the worker goes on
     /// serving other requests meanwhile: hashed there, 15 MB takes about 30 ms
-    /// on a CPU without SHA instructions, and every request on the worker
-    /// would wait for it.
+    /// on a CPU without SHA instructions, and every request waiting on that
+    /// worker thread would wait for it.
     public func digest() async -> [UInt8]? {
         if let sha256 { return sha256 }
         return await fileSHA256(path)
@@ -170,22 +171,19 @@ public struct CompletedUpload: Sendable {
     }
 
     /// Removes the upload and its bytes, once they have been moved or used.
-    public func remove() throws { try store.delete(info.id) }
+    public func remove() async throws { try await store.delete(info.id) }
 }
 
-public typealias UploadCompletion = (CompletedUpload) async throws -> any ResponseConvertible
+/// What an application does with an upload once it has all of its bytes: its
+/// answer is the response to the request that completed the upload.
+public typealias UploadCompletion = @Sendable (CompletedUpload) async throws -> any ResponseConvertible
 
 /// The SHA-256 of a whole file, read on the blocking pool. Hashing a large
-/// upload on the worker held every other request on it: two clients sending
-/// 15 MB files back to back took a worker from 2,000 answers a second to 500,
-/// with the rest waiting seconds. A pool too busy to take it has the file
-/// hashed here instead, which is slow for everyone but fails nobody.
+/// upload on a worker thread holds every request waiting for that thread:
+/// two clients sending 15 MB files back to back took a Garuda 1 worker from
+/// 2,000 answers a second to 500, with the rest waiting seconds.
 func fileSHA256(_ path: String) async -> [UInt8]? {
-    do {
-        return try await blocking { Digest.sha256(contentsOfFile: path) }
-    } catch {
-        return Digest.sha256(contentsOfFile: path)
-    }
+    await Runtime.blocking { Digest.sha256(contentsOfFile: path) }
 }
 
 /// What an application records on an upload as it is created, from the request
@@ -194,10 +192,10 @@ func fileSHA256(_ path: String) async -> [UInt8]? {
 ///     app.authenticate(jwt: Claims.self)
 ///     app.resumableUploads("/photos", store: store, onCreate: { request in
 ///         var parameter = 0
-///         let jwt = try JWT<Claims>.extract(from: request, parameter: &parameter)
+///         let jwt = try await JWT<Claims>.extract(from: request, parameter: &parameter)
 ///         return ["user": jwt.claims.sub]
 ///     }) { upload in
-///         try file(upload, for: upload.metadata["user"])
+///         try await file(upload, for: upload.metadata["user"])
 ///         return JSON(["id": upload.info.id], status: .created)
 ///     }
 ///
@@ -206,7 +204,7 @@ func fileSHA256(_ path: String) async -> [UInt8]? {
 /// that finishes the upload is a later one, and finds it as
 /// `CompletedUpload.metadata`. Throwing refuses the upload before a byte of it
 /// is written -- an `HTTPError` with the status it names.
-public typealias UploadCreation = (borrowing Request) throws -> [String: String]
+public typealias UploadCreation = @Sendable (borrowing Request) async throws -> [String: String]
 
 /// The draft iteration this implements (Appendix B).
 public let uploadDraftInteropVersion = 9
@@ -224,8 +222,8 @@ extension RouteBuilder {
                                  uploads: String = "/uploads",
                                  store: FileUploadStore, limits: UploadLimits = UploadLimits(),
                                  progressInterval: Int = 8 << 20,
-                                 onCreate: sending UploadCreation? = nil,
-                                 onComplete: sending @escaping UploadCompletion) {
+                                 onCreate: UploadCreation? = nil,
+                                 onComplete: @escaping UploadCompletion) {
         var prefix = uploads
         while prefix.count > 1 && prefix.hasSuffix("/") { prefix.removeLast() }
         // An upload's URL is the creating request's path with this pattern's
@@ -236,27 +234,27 @@ extension RouteBuilder {
         let service = UploadService(store: store, limits: limits, uploads: prefix,
                                     pattern: pattern, progressInterval: progressInterval,
                                     onCreate: onCreate, onComplete: onComplete)
-        // The limits are enforced here rather than by the engine, so that a
-        // 413 says what they are.
+        // Read as they arrive, with no limit of the route's own: the limits
+        // are enforced by the service, so that a 413 says what they are.
         for method in methods {
             onStreamingBody(method, pattern) { request, response, body in
-                try await service.create(request, &response, body)
+                try await service.create(request, response, body)
             }
         }
-        onAsync(.options, pattern) { request, response in
-            service.options(request, &response)
+        options(pattern) { request, response in
+            service.options(request, response)
         }
-        onAsync(.head, "\(prefix)/:id") { request, response in
-            try await service.offset(request, &response)
+        head("\(prefix)/:id") { request, response in
+            try await service.offset(request, response)
         }
-        onAsync(.get, "\(prefix)/:id") { request, response in
-            try await service.offset(request, &response, replaying: true)
+        get("\(prefix)/:id") { request, response in
+            try await service.offset(request, response, replaying: true)
         }
         onStreamingBody(.patch, "\(prefix)/:id") { request, response, body in
-            try await service.append(request, &response, body)
+            try await service.append(request, response, body)
         }
-        onAsync(.delete, "\(prefix)/:id") { request, response in
-            try await service.cancel(request, &response)
+        delete("\(prefix)/:id") { request, response in
+            try await service.cancel(request, response)
         }
     }
 }
@@ -274,9 +272,17 @@ enum UploadDigestError: Error {
     case unreadable
 }
 
-/// Shared by an application's upload routes. A worker is one thread, and
-/// each process has its own copy, so nothing here needs a lock.
-final class UploadService: @unchecked Sendable {
+/// What one appending request is, for a later request to supersede it: a
+/// number of its own, since two requests' bodies are not comparable.
+struct Appending: Sendable {
+    let token: UInt64
+    let body: RequestBody
+}
+
+/// Shared by an application's upload routes, in each shard -- each process
+/// has its own copy -- and by every thread of it, so what changes is under a
+/// lock.
+final class UploadService: Sendable {
     let store: FileUploadStore
     let limits: UploadLimits
     let uploads: String
@@ -288,9 +294,15 @@ final class UploadService: @unchecked Sendable {
     /// Called on each request that creates an upload, for whatever the
     /// application wants kept with it.
     let onCreate: UploadCreation?
-    private var lastExpiry = 0
-    /// The request appending to each upload on this worker, by upload id.
-    private var appending: [String: RequestBodyStream] = [:]
+
+    private struct State {
+        var lastExpiry = 0
+        var nextToken: UInt64 = 0
+        /// The request appending to each upload in this shard, by upload id.
+        var appending: [String: Appending] = [:]
+    }
+
+    private let state = Mutex(State())
 
     init(store: FileUploadStore, limits: UploadLimits, uploads: String, pattern: String,
          progressInterval: Int, onCreate: UploadCreation? = nil,
@@ -309,11 +321,11 @@ final class UploadService: @unchecked Sendable {
     /// registered with, and then `uploads` and the id.
     ///
     /// Read from the request rather than assumed to be `uploads`, because the
-    /// engine mounts these routes under the prefix of every group they were
-    /// registered in and this module is never told what that is -- a `Router`
-    /// does not know it either until it is merged, and a group's prefix can
-    /// carry parameters of its own. A URL that left the prefix out was a URL
-    /// the client could not resume from.
+    /// routes are mounted under the prefix of every group they were registered
+    /// in and this module is never told what that is -- a `Router` does not
+    /// know it either until it is merged, and a group's prefix can carry
+    /// parameters of its own. A URL that left the prefix out was a URL the
+    /// client could not resume from.
     func location(_ id: String, for request: borrowing Request) -> String {
         "\(mounted(request))/\(id)"
     }
@@ -354,55 +366,76 @@ final class UploadService: @unchecked Sendable {
 
     /// Whether the client speaks the iteration of the draft this does.
     func speaksDraft(_ request: borrowing Request) -> Bool {
-        request.header("upload-draft-interop-version").flatMap(StructuredField.integer)
+        (request.withHeader("upload-draft-interop-version") { StructuredField.integer($0) } ?? nil)
             == uploadDraftInteropVersion
     }
 
-    /// Ends a request on this worker still appending to `id`, and waits for
+    // MARK: Who is appending
+
+    /// Notes that `body`'s request is appending to `id`.
+    private func register(_ id: String, _ body: RequestBody) -> UInt64 {
+        state.withLock { state in
+            state.nextToken &+= 1
+            state.appending[id] = Appending(token: state.nextToken, body: body)
+            return state.nextToken
+        }
+    }
+
+    /// The request `token` names is done with `id`, unless a later one has
+    /// taken its place.
+    private func unregister(_ id: String, _ token: UInt64) {
+        state.withLock { state in
+            if state.appending[id]?.token == token { state.appending[id] = nil }
+        }
+    }
+
+    /// Ends a request in this shard still appending to `id`, and waits for
     /// it to have stored what it received and let go.
-    func supersede(_ id: String, _ response: borrowing Response) async throws {
-        guard let older = appending[id] else { return }
-        older.cancel()
+    func supersede(_ id: String) async throws {
+        guard let older = state.withLock({ $0.appending[id] }) else { return }
+        older.body.cancel()
         var waited = 0
-        while appending[id] === older && waited < 1000 {
-            try await response.sleep(milliseconds: 5)
+        while state.withLock({ $0.appending[id]?.token == older.token }) && waited < 1000 {
+            try await Runtime.sleep(for: .milliseconds(5))
             waited += 5
         }
     }
 
-    /// Takes `id` for appending, superseding an older request on this worker
-    /// and waiting a moment for one on another. Nil if it is still held.
-    func acquire(_ id: String, _ response: borrowing Response) async throws -> UploadHandle? {
-        try await supersede(id, response)
+    /// Takes `id` for appending, superseding an older request in this shard
+    /// and waiting a moment for one in another. Nil if it is still held.
+    func acquire(_ id: String) async throws -> UploadHandle? {
+        try await supersede(id)
         for attempt in 0..<20 {
-            if let handle = try store.acquire(id) { return handle }
-            if attempt < 19 { try await response.sleep(milliseconds: 25) }
+            if let handle = try await store.acquire(id) { return handle }
+            if attempt < 19 { try await Runtime.sleep(for: .milliseconds(25)) }
         }
         return nil
     }
 
     // MARK: Creation
 
-    func create(_ request: borrowing Request, _ response: inout Response,
-                _ body: RequestBodyStream) async throws {
+    func create(_ request: borrowing Request, _ response: borrowing Response,
+                _ body: RequestBody) async throws {
         // Without the field the client does not know the protocol, and this
         // is an ordinary upload: complete in one request, and never resumed.
         let resumable: Bool
         var complete = true
-        if let text = request.header("upload-complete") {
-            guard let value = StructuredField.boolean(text) else {
-                return response.send(status: .badRequest, "Upload-Complete is not a Boolean")
-            }
+        switch request.withHeader("upload-complete", { StructuredField.boolean($0) }) {
+        case .none:
+            resumable = false
+        case .some(.none):
+            return response.send(status: .badRequest, "Upload-Complete is not a Boolean")
+        case .some(.some(let value)):
             resumable = true
             complete = value
-        } else {
-            resumable = false
         }
         var length: Int? = nil
-        if let text = request.header("upload-length") {
-            guard let value = StructuredField.integer(text) else {
-                return response.send(status: .badRequest, "Upload-Length is not an Integer")
-            }
+        switch request.withHeader("upload-length", { StructuredField.integer($0) }) {
+        case .none:
+            break
+        case .some(.none):
+            return response.send(status: .badRequest, "Upload-Length is not an Integer")
+        case .some(.some(let value)):
             length = value
         }
         if complete, let declared = body.expectedLength {
@@ -432,11 +465,6 @@ final class UploadService: @unchecked Sendable {
             return response.send(status: .badRequest,
                                  "Content-Digest names no digest this server checks")
         }
-        let now = store.clock()
-        if now - lastExpiry >= 60 {
-            lastExpiry = now
-            store.removeExpired(olderThan: limits.maxAge)
-        }
         // What the client says the whole upload will be, kept for when the
         // last byte is in, however many requests that takes.
         let reprDigest = request.header("repr-digest")
@@ -444,50 +472,55 @@ final class UploadService: @unchecked Sendable {
             return response.send(status: .badRequest,
                                  "Repr-Digest names no digest this server checks")
         }
+        let now = store.now()
+        let sweep = state.withLock { state -> Bool in
+            guard now - state.lastExpiry >= 60 else { return false }
+            state.lastExpiry = now
+            return true
+        }
+        if sweep { await store.removeExpired(olderThan: limits.maxAge) }
         // Before anything is on disk: a hook that refuses this request --
         // because of who sent it, or what it asked for -- leaves nothing
         // behind to wait out `maxAge`.
         var metadata: [String: String] = [:]
-        if let onCreate { metadata = try onCreate(request) }
-        let info = try store.create(length: length, contentType: request.header("content-type"),
-                                    contentDisposition: request.header("content-disposition"),
-                                    reprDigest: reprDigest, metadata: metadata)
-        guard let handle = try store.acquire(info.id) else {
+        if let onCreate { metadata = try await onCreate(request) }
+        let info = try await store.create(length: length, contentType: request.header("content-type"),
+                                          contentDisposition: request.header("content-disposition"),
+                                          reprDigest: reprDigest, metadata: metadata)
+        guard let handle = try await store.acquire(info.id) else {
             return response.send(status: .serviceUnavailable)
         }
         let interim = resumable && speaksDraft(request)
         let url = location(info.id, for: request)
         if interim {
-            response.sendInterim(status: HTTPStatus(104), headers: [
+            await response.sendInterim(status: HTTPStatus(104), headers: [
                 ("Upload-Draft-Interop-Version", "\(uploadDraftInteropVersion)"),
                 ("Location", url),
                 ("Upload-Limit", limits.field(remaining: limits.maxAge)),
             ])
         }
-        try await transfer(handle, body, &response, complete: complete, length: length,
+        try await transfer(handle, body, response, complete: complete, length: length,
                            resumable: resumable, interim: interim, creating: true, at: url,
                            contentDigest: contentDigest, wantsDigest: wantsSHA256(request))
     }
 
     // MARK: Appending
 
-    func append(_ request: borrowing Request, _ response: inout Response,
-                _ body: RequestBodyStream) async throws {
+    func append(_ request: borrowing Request, _ response: borrowing Response,
+                _ body: RequestBody) async throws {
         let id = id(of: request)
         guard let type = request.header("content-type"),
               type.split(separator: ";").first?.lowercased().filter({ $0 != " " }) == "application/partial-upload"
         else {
             return response.send(status: .unsupportedMediaType, "an append is application/partial-upload")
         }
-        guard let offsetText = request.header("upload-offset"),
-              let offset = StructuredField.integer(offsetText) else {
+        guard let offset = request.withHeader("upload-offset", { StructuredField.integer($0) }) ?? nil else {
             return response.send(status: .badRequest, "Upload-Offset is missing or not an Integer")
         }
-        guard let completeText = request.header("upload-complete"),
-              let complete = StructuredField.boolean(completeText) else {
+        guard let complete = request.withHeader("upload-complete", { StructuredField.boolean($0) }) ?? nil else {
             return response.send(status: .badRequest, "Upload-Complete is missing or not a Boolean")
         }
-        guard let info = try live(id) else {
+        guard let info = try await live(id) else {
             return response.send(status: .notFound)
         }
         if info.complete {
@@ -498,10 +531,12 @@ final class UploadService: @unchecked Sendable {
                            [("expected-offset", info.offset), ("provided-offset", offset)])
         }
         var length = info.length
-        if let text = request.header("upload-length") {
-            guard let value = StructuredField.integer(text) else {
-                return response.send(status: .badRequest, "Upload-Length is not an Integer")
-            }
+        switch request.withHeader("upload-length", { StructuredField.integer($0) }) {
+        case .none:
+            break
+        case .some(.none):
+            return response.send(status: .badRequest, "Upload-Length is not an Integer")
+        case .some(.some(let value)):
             if let length, length != value {
                 return problem(response, .badRequest, UploadProblem.inconsistentLength,
                                "the upload's length changed", [])
@@ -541,7 +576,7 @@ final class UploadService: @unchecked Sendable {
         let interim = speaksDraft(request)
         let handle: UploadHandle
         do {
-            guard let held = try await acquire(id, response) else {
+            guard let held = try await acquire(id) else {
                 response.addHeader("Retry-After", "1")
                 return response.send(status: .conflict, "another request is appending to this upload")
             }
@@ -553,7 +588,7 @@ final class UploadService: @unchecked Sendable {
         // what that request did is not in the `info` read before the wait: it
         // may have completed the upload, or declared its length. Reading it
         // again under the lock is what makes the checks above hold now.
-        guard let current = try store.info(id) else {
+        guard let current = try await store.info(id) else {
             handle.release()
             return response.send(status: .notFound)
         }
@@ -584,30 +619,30 @@ final class UploadService: @unchecked Sendable {
             }
             length = declared
         } else if let length {
-            try store.update(id, length: length, complete: false)
+            try await store.update(id, length: length, complete: false)
         }
-        try await transfer(handle, body, &response, complete: complete, length: length,
+        try await transfer(handle, body, response, complete: complete, length: length,
                            resumable: true, interim: interim, creating: false,
                            contentDigest: contentDigest, wantsDigest: wantsSHA256(request))
     }
 
     /// Stores the body as it arrives, and answers once it has all come.
-    func transfer(_ handle: UploadHandle, _ body: RequestBodyStream, _ response: inout Response,
+    func transfer(_ handle: UploadHandle, _ body: RequestBody, _ response: borrowing Response,
                   complete: Bool, length: Int?, resumable: Bool, interim: Bool,
                   creating: Bool, at url: String? = nil,
                   contentDigest: [UInt8]?, wantsDigest: Bool) async throws {
         let id = handle.id
-        appending[id] = body
+        let token = register(id, body)
         defer {
             handle.release()
-            if appending[id] === body { appending[id] = nil }
+            unregister(id, token)
         }
         var sinceProgress = 0
         let start = handle.offset
         // The Repr-Digest the upload was created with, checked once it has all
         // come -- which it has only if this request says so.
         let declared = complete
-            ? (try? store.info(id))?.reprDigest.flatMap({ Digest.sha256(field: $0) }) : nil
+            ? (try? await store.info(id))?.reprDigest.flatMap({ Digest.sha256(field: $0) }) : nil
         // A request that carries the whole upload -- most do, a photo sent in
         // one go -- hashes it as it arrives, so the digest is ready when the
         // last byte is, rather than the file being read back to make it.
@@ -616,35 +651,37 @@ final class UploadService: @unchecked Sendable {
         // Otherwise only when the client said what these bytes should be:
         // hashing what nobody will check is a pass over every byte for nothing.
         let running = contentDigest != nil || (whole && wantsWhole) ? SHA256Digest() : nil
-        do {
-            while let bytes = try await body.read(maxBytes: 256 * 1024) {
-                if let length, handle.offset + bytes.count > length {
-                    return problem(response, .badRequest, UploadProblem.inconsistentLength,
-                                   "the upload is longer than its length", [])
-                }
-                if let maxSize = limits.maxSize, handle.offset + bytes.count > maxSize {
-                    return tooLarge(response)
-                }
-                if let maxAppendSize = limits.maxAppendSize,
-                   handle.offset - start + bytes.count > maxAppendSize {
-                    return tooLarge(response)
-                }
-                try handle.append(bytes)
-                running?.update(bytes)
-                sinceProgress += bytes.count
-                if interim && progressInterval > 0 && sinceProgress >= progressInterval {
-                    sinceProgress = 0
-                    response.sendInterim(status: HTTPStatus(104), headers: [
-                        ("Upload-Draft-Interop-Version", "\(uploadDraftInteropVersion)"),
-                        ("Upload-Offset", "\(handle.offset)"),
-                    ])
-                }
+        // One buffer for the whole request: what is read goes to the disk
+        // before the next read.
+        var buffer = IOBuffer(capacity: 256 * 1024)
+        while true {
+            buffer.clear()
+            // A request that ends part-way -- the client gone, or superseded
+            // -- throws from here once what arrived has been read and stored:
+            // that is where the upload resumes from, and there is nobody to
+            // answer.
+            let n = try await body.read(into: &buffer)
+            if n == 0 { break }
+            if let length, handle.offset + n > length {
+                return problem(response, .badRequest, UploadProblem.inconsistentLength,
+                               "the upload is longer than its length", [])
             }
-        } catch is RequestBodyError {
-            // The client went away, or sent more than a request may. What
-            // arrived is stored, and is where it resumes from; there is
-            // nobody to answer, or the engine already has.
-            return
+            if let maxSize = limits.maxSize, handle.offset + n > maxSize {
+                return tooLarge(response)
+            }
+            if let maxAppendSize = limits.maxAppendSize, handle.offset - start + n > maxAppendSize {
+                return tooLarge(response)
+            }
+            try await handle.append(buffer)
+            if let running { buffer.withUnsafeBytes { running.update($0) } }
+            sinceProgress += n
+            if interim && progressInterval > 0 && sinceProgress >= progressInterval {
+                sinceProgress = 0
+                await response.sendInterim(status: HTTPStatus(104), headers: [
+                    ("Upload-Draft-Interop-Version", "\(uploadDraftInteropVersion)"),
+                    ("Upload-Offset", "\(handle.offset)"),
+                ])
+            }
         }
 
         // What this request carried, before anything else is decided about
@@ -652,7 +689,7 @@ final class UploadService: @unchecked Sendable {
         // on the way, so they are dropped and the upload stays where it began
         // this request -- the client sends them again from there.
         if let contentDigest, let running, !Digest.equal(running.digest(), contentDigest) {
-            try? handle.truncate(to: start)
+            try? await handle.truncate(to: start)
             response.addHeader("Upload-Offset", "\(start)")
             return problem(response, .badRequest, UploadProblem.mismatchingDigest,
                            "the bytes are not what Content-Digest says", [])
@@ -705,22 +742,22 @@ final class UploadService: @unchecked Sendable {
                 // the client starts again rather than holding a name for
                 // bytes nobody will accept.
                 handle.release()
-                try? store.delete(id)
+                try? await store.delete(id)
                 return problem(response, .badRequest, UploadProblem.mismatchingDigest,
                                "the upload is not what Repr-Digest says", [])
             }
         }
-        try store.update(id, length: offset, complete: true)
+        try await store.update(id, length: offset, complete: true)
         handle.release()
-        guard let info = try store.info(id) else { return response.send(status: .notFound) }
+        guard let info = try await store.info(id) else { return response.send(status: .notFound) }
         if wantsDigest, let sha256 { response.addHeader("Repr-Digest", Digest.field(sha256)) }
         let answer = try await onComplete(CompletedUpload(info: info, store: store, sha256: sha256))
         if resumable { response.addHeader("Upload-Complete", "?1") }
         // What the handler answers is remembered on its way out, whatever kind
-        // of answer it is, so a client whose connection dies before it arrives
-        // can ask for it again with GET. It is kept even after the handler
-        // removes the upload: the bytes have gone somewhere, and the answer is
-        // what says where.
+        // of answer it is and whatever middleware made of it, so a client
+        // whose connection dies before it arrives can ask for it again with
+        // GET. It is kept even after the handler removes the upload: the bytes
+        // have gone somewhere, and the answer is what says where.
         let store = self.store
         let created = info.createdAt
         response.onSend { outgoing in
@@ -734,34 +771,26 @@ final class UploadService: @unchecked Sendable {
                                ["upload": .string(id)])
                 return
             }
-            let status = outgoing.status.code
-            let type = outgoing.header("content-type")
-            let body = outgoing.withBody { span in
-                var bytes = [UInt8]()
-                bytes.reserveCapacity(span.count)
-                for i in 0..<span.count { bytes.append(span[i]) }
-                return bytes
-            }
-            try? store.remember(id, status: status, contentType: type,
-                                location: outgoing.header("location"), body: body,
-                                createdAt: created)
+            let body = outgoing.withBody { span in span.withUnsafeBufferPointer { Array($0) } }
+            try? store.remember(id, status: outgoing.status.code, contentType: outgoing.header("content-type"),
+                                location: outgoing.header("location"), body: body, createdAt: created)
         }
         try answer.write(to: response)
     }
 
     // MARK: Offset, limits, cancellation
 
-    func offset(_ request: borrowing Request, _ response: inout Response,
+    func offset(_ request: borrowing Request, _ response: borrowing Response,
                 replaying: Bool = false) async throws {
         response.addHeader("Cache-Control", "no-store")
         let id = id(of: request)
         // An offset is only worth giving once nothing is still adding to it.
-        try await supersede(id, response)
+        try await supersede(id)
         // A GET for an upload that finished is the client asking for the
         // answer it did not get. HEAD is left as the draft describes it, so a
         // client following the draft sees exactly what the draft says.
-        if replaying, let answer = try? store.answer(id),
-           store.clock() - answer.createdAt <= limits.maxAge {
+        if replaying, let answer = try? await store.answer(id),
+           store.now() - answer.createdAt <= limits.maxAge {
             if let type = answer.contentType { response.addHeader("Content-Type", type) }
             // A handler that answered with a redirect said where the upload
             // went. Without the field the status alone says nothing.
@@ -769,31 +798,31 @@ final class UploadService: @unchecked Sendable {
             response.addHeader("Upload-Complete", "?1")
             return response.send(status: HTTPStatus(answer.status), answer.body)
         }
-        guard let info = try? live(id) else {
+        guard let info = try? await live(id) else {
             return response.send(status: .notFound)
         }
         response.addHeader("Upload-Offset", "\(info.offset)")
         response.addHeader("Upload-Complete", info.complete ? "?1" : "?0")
         if let length = info.length { response.addHeader("Upload-Length", "\(length)") }
-        let remaining = info.createdAt + limits.maxAge - store.clock()
+        let remaining = info.createdAt + limits.maxAge - store.now()
         response.addHeader("Upload-Limit", limits.field(remaining: remaining))
         response.send(status: .noContent)
     }
 
-    func options(_ request: borrowing Request, _ response: inout Response) {
-        if request.header("upload-complete") == nil {
+    func options(_ request: borrowing Request, _ response: borrowing Response) {
+        if request.withHeader("upload-complete", { _ in true }) == nil {
             response.addHeader("Upload-Limit", limits.field(remaining: limits.maxAge))
         }
         response.send(status: .noContent)
     }
 
-    func cancel(_ request: borrowing Request, _ response: inout Response) async throws {
+    func cancel(_ request: borrowing Request, _ response: borrowing Response) async throws {
         let id = id(of: request)
-        try await supersede(id, response)
+        try await supersede(id)
         do {
             // Everything, the answer included: the client asked for this
             // upload to be gone.
-            try store.forget(id)
+            try await store.forget(id)
             response.send(status: .noContent)
         } catch {
             response.send(status: .notFound)
@@ -817,18 +846,25 @@ final class UploadService: @unchecked Sendable {
         guard let field = request.header("want-repr-digest") else { return false }
         for member in field.split(separator: ",") {
             let parts = member.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            guard String(parts[0]).trimmingWhitespace().lowercased() == "sha-256" else { continue }
-            if parts.count == 2, String(parts[1]).trimmingWhitespace() == "0" { return false }
+            guard trimmed(parts[0]).lowercased() == "sha-256" else { continue }
+            if parts.count == 2, trimmed(parts[1]) == "0" { return false }
             return true
         }
         return false
     }
 
+    private func trimmed(_ text: Substring) -> Substring {
+        var s = text
+        while s.first == " " || s.first == "\t" { s.removeFirst() }
+        while s.last == " " || s.last == "\t" { s.removeLast() }
+        return s
+    }
+
     /// The upload, unless it does not exist or has outlived `maxAge`.
-    func live(_ id: String) throws -> UploadInfo? {
-        guard let info = try store.info(id) else { return nil }
-        if store.clock() - info.createdAt > limits.maxAge {
-            try? store.forget(id)
+    func live(_ id: String) async throws -> UploadInfo? {
+        guard let info = try await store.info(id) else { return nil }
+        if store.now() - info.createdAt > limits.maxAge {
+            try? await store.forget(id)
             return nil
         }
         return info

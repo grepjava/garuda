@@ -4,58 +4,97 @@ Garuda is built from source with SwiftPM. There are no prebuilt binaries. You
 either build the `garuda` executable from this repository, or add the `Garuda`
 library to your own package and build your application.
 
+Garuda 2 runs on [Vega](https://github.com/grepjava/vega), a work-stealing
+runtime for Swift, and takes its database drivers from
+[vega-db](https://github.com/grepjava/vega-db). SwiftPM fetches both. Garuda 1
+stays on the `release/1.x` branch; [COMPATIBILITY.md](COMPATIBILITY.md) covers
+moving from it.
+
 ---
 
 ## Requirements
 
 | | |
 |---|---|
-| **Swift** | 6.2 or newer (`swift-tools-version: 6.2`). CI uses 6.3.3. |
-| **OS** | Linux, or macOS 15 or newer. Linux is the primary platform. Windows is not supported; WSL 2 works. |
-| **OpenSSL** | Development files. The package links `libssl` and `libcrypto` for cryptography, ACME and QUIC. The TLS record layer is a vendored BoringSSL and needs nothing installed. |
-| **zlib** | Development files. The package links `libz`. |
-| **CA certificates** | The system trust store, for ACME and outbound HTTPS, unless you pass `--acme-ca-bundle`. |
+| **Swift** | 6.2 or newer (`swift-tools-version: 6.2`). |
+| **OS** | Linux, or macOS 26.4 or newer. Windows is experimental, single-process only (below). |
+| **zlib** | Development files on Linux (`zlib1g-dev`). Vega links `libz` for gzip and deflate. macOS has it. |
+| **A TLS library** | Nothing to install by default: TLS uses a BoringSSL vendored in Vega. With the `OpenSSL` trait, the system's OpenSSL 3 development files. |
 
-Nothing else is linked. The PostgreSQL and Redis drivers are written in Swift
-and need no client libraries. SQLite is the system's `libsqlite3`, loaded when
-the first database opens, so it needs no headers to build: install
-`libsqlite3-0` (below) where an application uses it. macOS has it.
+Nothing else is linked:
+
+- **Databases.** The PostgreSQL and Redis drivers are written in Swift and
+  need no client libraries. SQLite is the system's `libsqlite3`, loaded when
+  the first database opens, so it needs no headers to build: install
+  `libsqlite3-0` where an application uses it. macOS has it.
+- **brotli and zstd.** `--compress` loads `libbrotlienc` and `libzstd` at run
+  time where they are installed, and offers only gzip where they are not.
+- **io_uring.** Used on Linux 6.7 or later, with no library. An older kernel
+  gets epoll.
+
+macOS 26.4 is Vega's floor: its executor needs the custom-executor hooks that
+release added to the Swift runtime.
 
 ### Ubuntu and Debian
 
-These are the packages CI installs on Ubuntu 24.04, including the Swift
-toolchain's own runtime dependencies:
+Install a Swift toolchain from [swift.org/install](https://swift.org/install)
+with the packages it lists, then the rest:
 
 ```bash
 sudo apt-get install -y --no-install-recommends \
     binutils gcc libc6-dev libcurl4 libedit2 libncurses6 \
-    libsqlite3-0 libssl-dev libxml2 pkg-config tzdata zlib1g-dev ca-certificates
-```
-
-Install a Swift toolchain from [swift.org/install](https://swift.org/install),
-then check it:
-
-```bash
+    libsqlite3-0 libxml2 pkg-config tzdata zlib1g-dev ca-certificates
 swift --version
 ```
+
+Add `libssl-dev` to build with the `OpenSSL` trait.
 
 ### macOS
 
 ```bash
 xcode-select --install
-brew install pkg-config openssl@3
 ```
 
-Homebrew's OpenSSL is not on the default search path. Pass it to every
-`swift build` and `swift test`:
+That is all the default build needs. For the `OpenSSL` trait, install
+`brew install pkg-config openssl@3` and put Homebrew's OpenSSL where
+pkg-config finds it:
 
 ```bash
-OPENSSL_PREFIX=$(brew --prefix openssl@3)
-swift build -c release \
-    -Xcc -I"$OPENSSL_PREFIX/include" -Xlinker -L"$OPENSSL_PREFIX/lib"
+export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"
 ```
 
-Linux-only features, such as kernel TLS, are not available on macOS.
+### Windows
+
+Windows support is being worked on and is experimental. It serves in one
+process only: `--shards` above 0 is refused, Ctrl-C, Ctrl-Break and closing
+the console stop it, and response compression is not available yet. Linux and macOS are the supported
+platforms.
+
+---
+
+## The TLS library
+
+TLS, and every cryptographic primitive Garuda uses (signed cookies, JWT,
+password hashing, QUIC's packet protection), comes from Vega's `VegaTLS` and
+`VegaCrypto`, over one of two libraries chosen by a package trait:
+
+| trait | library | |
+|---|---|---|
+| `BoringSSL` | BoringSSL, vendored in Vega and built with it | the default; no system library needed |
+| `OpenSSL` | the system's OpenSSL 3 | needs its development files; BoringSSL wins if both are on |
+
+```bash
+swift build -c release                      # BoringSSL
+swift build -c release --traits OpenSSL     # the system's OpenSSL
+```
+
+A dependent picks the trait on its dependency:
+
+```swift
+.package(url: "https://github.com/grepjava/garuda", from: "2.0.0", traits: ["OpenSSL"]),
+```
+
+There is no kernel TLS in either build.
 
 ---
 
@@ -69,13 +108,14 @@ swift build -c release
 
 | product | path | what it is |
 |---|---|---|
-| `garuda` | `.build/release/garuda` | the server with a small benchmark application |
+| `garuda` | `.build/release/garuda` | the server with the benchmark application |
 | `garuda-conformance` | `.build/release/garuda-conformance` | routes used by the end-to-end test suites |
+| `pgfuzz` | `.build/release/pgfuzz` | the fuzzer ([fuzz/README.md](fuzz/README.md)) |
 
 Build one with `swift build -c release --product garuda`.
 
-The binaries link OpenSSL, zlib and the Swift runtime dynamically. A machine
-that runs them needs those shared libraries.
+The binaries link the Swift runtime and zlib dynamically, and OpenSSL with the
+`OpenSSL` trait. A machine that runs them needs those shared libraries.
 
 If the checkout is on a slow file system, such as a Windows drive under WSL,
 build somewhere else:
@@ -94,12 +134,24 @@ curl http://127.0.0.1:8000/user/42        # 42
 curl -i http://127.0.0.1:8000/nope        # 404
 ```
 
+### Local checkouts of Vega and vega-db
+
+To work on Garuda together with a Vega or vega-db change that is not released
+yet, point the build at local checkouts:
+
+```bash
+GARUDA_VEGA_PATH=~/src/vega GARUDA_VEGA_DB_PATH=~/src/vega-db VEGA_PATH=~/src/vega \
+    swift build
+```
+
+`VEGA_PATH` is what vega-db reads to find its own Vega; set it to the same
+checkout as `GARUDA_VEGA_PATH`.
+
 ---
 
 ## Using Garuda in your application
 
-Add the package and depend on the `Garuda` product. It includes the handler
-API, the HTTP client and the PostgreSQL driver.
+Add the package and depend on the products you use:
 
 ```swift
 // swift-tools-version: 6.2
@@ -107,9 +159,9 @@ import PackageDescription
 
 let package = Package(
     name: "app",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS("26.4")],
     dependencies: [
-        .package(url: "https://github.com/grepjava/garuda", from: "1.1.0"),
+        .package(url: "https://github.com/grepjava/garuda", from: "2.0.0"),
     ],
     targets: [
         .executableTarget(name: "app", dependencies: [
@@ -119,49 +171,75 @@ let package = Package(
 )
 ```
 
-Two more products are there when you want them: `GarudaUploads` for the IETF
-resumable upload protocol, and `GarudaJSON` for `@JSON`, which writes a type's
-JSON reading and writing out instead of leaving it to `Codable`. `GarudaSQL`
-carries `@PostgresRow`, which does the same for a result row, from the same
-plugin. Those two are separate because they are the only part of Garuda that
-needs swift-syntax: a
-target that does not depend on it never builds the macro plugin, although the
-package is still fetched when Garuda's dependencies are resolved.
+| product | what it adds |
+|---|---|
+| `Garuda` | the handler API, the server, the HTTP client, sessions, JWT and the rest of the middleware |
+| `GarudaTesting` | `app.test`: requests through the real HTTP/1 connection over an in-memory stream |
+| `GarudaJSON` | `@JSON`, which writes a type's JSON reading and writing out instead of leaving it to `Codable` |
+| `GarudaPostgres` | vega-db's PostgreSQL driver, joined to Garuda |
+| `GarudaRedis` | vega-db's Redis driver |
+| `GarudaSQLite` | vega-db's SQLite driver |
+| `GarudaSQL` | `@PostgresRow`, which does for a result row what `@JSON` does for JSON |
+| `GarudaUploads` | resumable uploads (draft-ietf-httpbis-resumable-upload): `app.resumableUploads` and a file store |
+
+`GarudaJSON` and `GarudaSQL` are separate because they are the only parts of
+Garuda that need swift-syntax: a target that does not depend on them never
+builds the macro plugin, although the package is still fetched when Garuda's
+dependencies are resolved. The database products are separate so that an
+application builds only the drivers it imports.
+[CONNECTORS.md](CONNECTORS.md) covers them.
+[README.md](README.md#resumable-uploads) shows `GarudaUploads`.
 
 `Application.run()` reads the flags in [CONFIG.md](CONFIG.md), so your binary is
 started the same way as `garuda`. [README.md](README.md) has a first
-application, and [HANDLER-API.md](HANDLER-API.md) the API's roadmap.
-
-The system requirements above apply to your application's build too,
-including the OpenSSL flags on macOS.
-
----
+application, and [HANDLER-API.md](HANDLER-API.md) the design of the API.
 
 ### An application with commands of its own
 
 `app.run()` reads the process's command line. An application that has commands
 of its own -- a `migrate` before it serves -- hands Garuda only the arguments
-that are Garuda's:
+that are Garuda's. `app.run(arguments:)` takes an `argv`, program name first:
 
 ```swift
-switch CommandLine.arguments.dropFirst().first ?? "serve" {
+#if canImport(Glibc)
+import Glibc
+#else
+import Darwin
+#endif
+import Garuda
+import GarudaPostgres
+import Vega
+
+let app = Application()
+// … routes …
+let databaseURL = "postgres://app@localhost/app?sslmode=disable"
+let migrations: [[String]] = [
+    ["create table orders (id bigserial primary key, total_cents bigint not null)"],
+]
+
+let arguments = CommandLine.arguments
+switch arguments.dropFirst().first ?? "serve" {
 case "migrate":
-    try app.runOnce { start in
-        try await start.state(PostgresPool.self).migrate(migrations)
+    // One-off work, on a runtime of its own, with no server.
+    let runtime = Runtime(workers: 1)
+    try runtime.block {
+        let pool = PostgresPool(try PostgresConfiguration(url: databaseURL))
+        _ = try await pool.migrate(migrations)
+        pool.close()
     }
+    exit(0)
 case "serve":
-    var flags = Array(CommandLine.arguments.dropFirst(2))
+    var flags = Array(arguments.dropFirst(2))
     if flags.first == "--" { flags.removeFirst() }
-    exit(app.run(arguments: flags))
+    app.run(arguments: [arguments[0]] + flags)
 default:
     exit(64)
 }
 ```
 
-`app.runOnce` builds a worker with no listening socket, runs the work on it and
-tears the state down, so a command can migrate or backfill without serving.
-[Examples/STARTER.md](Examples/STARTER.md) is a whole application built this
-way.
+Garuda 2 has no `app.runOnce`. On macOS, a sharded server starts each shard as
+a new run of the executable with the same arguments, so `main` must reach
+`app.run` the same way each time.
 
 ---
 
@@ -169,8 +247,6 @@ way.
 
 HTTP/2 over TLS and HTTP/3 need a certificate. `--http3` without one is refused
 at start-up.
-
-### Certificate files
 
 For local work:
 
@@ -190,104 +266,15 @@ Browsers do not use HTTP/3 with an untrusted certificate. For browser testing,
 [`mkcert`](https://github.com/FiloSottile/mkcert) installs a local CA the
 browser trusts.
 
-**Several names.** Repeat `--tls-cert` and `--tls-key` in pairs. The first
-pair is the default. The others are chosen by SNI, using the names in each
-certificate.
+**Several names.** Repeat `--tls-cert` and `--tls-key` in pairs. The client's
+SNI picks the first certificate that covers the name it asks for, and the
+first answers a client that names none.
 
-### ACME
-
-Garuda can get and renew its own certificate. It answers the `tls-alpn-01`
-challenge on the port it serves, so a public CA must reach it on port 443:
-
-```bash
-garuda --host 0.0.0.0 --port 443 \
-    --acme-domain example.com --acme-domain www.example.com \
-    --acme-email ops@example.com --acme-cache /var/lib/garuda/acme \
-    --http3 --redirect-http 80
-```
-
-Use `--acme-staging` while testing. Keep `--acme-cache` on persistent storage;
-it holds the account key and the certificate. [CONFIG.md](CONFIG.md#acme) has
-the details.
-
----
-
-## Running as a systemd service
-
-```ini
-[Unit]
-Description=garuda
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/garuda --host 0.0.0.0 --port 443 --workers 0 \
-    --tls-cert /etc/garuda/cert.pem --tls-key /etc/garuda/key.pem \
-    --health-check-path /healthz --drain-delay 5000
-ExecReload=/bin/kill -HUP $MAINPID
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-- `systemctl stop` sends `SIGTERM`, which drains. Keep `TimeoutStopSec` above
-  `--drain-delay` plus `--graceful-timeout` (10 s by default).
-- `systemctl reload` sends `SIGHUP`. The workers are replaced one at a time and
-  read the certificate files again, without dropping a connection. Use it as
-  the certbot deploy hook:
-
-  ```bash
-  certbot renew --deploy-hook 'systemctl reload garuda'
-  ```
-
-- `AmbientCapabilities=CAP_NET_BIND_SERVICE` lets a non-root user bind ports
-  below 1024.
-- With `--acme-domain`, make the `--acme-cache` directory writable by the
-  service user.
-
-To upgrade, `git pull`, rebuild, copy the binary into place and restart. The
-only state Garuda keeps is the `--acme-cache` directory.
-
----
-
-## Behind a reverse proxy
-
-Bind to loopback or a unix socket, and trust the proxy's forwarded headers:
-
-```bash
-garuda --unix /run/garuda.sock --workers 0 --forwarded-allow-ips unix
-garuda --host 127.0.0.1 --port 8000 --workers 0 --forwarded-allow-ips 127.0.0.1
-```
-
-- Without `--forwarded-allow-ips`, `X-Forwarded-For`, `X-Forwarded-Proto` and
-  `Forwarded` are ignored. Handlers and the rate limiter then see the proxy's
-  address.
-- A proxy that talks h2c upstream, such as Envoy or Caddy, needs
-  `--http2-only`.
-- If the proxy mounts the application under a prefix and does not strip it,
-  use `--root-path`.
-- A proxy that terminates TLS stops ACME's `tls-alpn-01` challenge from
-  reaching Garuda. Get the certificate at the proxy instead.
-
----
-
-## Kernel TLS
-
-`--ktls` lets `--static-dir` files go out with `sendfile` over HTTPS/1.1, and
-lets `--balance adaptive` move idle HTTPS connections between workers. It
-needs Linux, the `tls` kernel module, and an OpenSSL built with kernel TLS
-support. Without a NIC that offloads TLS it is slower for large responses
-(TRANSPORT.md has the numbers), which is why it is off by default.
-
-```bash
-sudo modprobe tls
-echo tls | sudo tee /etc/modules-load.d/tls.conf    # load it at boot
-```
-
-If either is missing, the server logs a warning at start-up that says which,
-and OpenSSL encrypts as usual.
+**Public certificates.** Garuda 2 has no built-in ACME client. Get the
+certificate with certbot or another ACME client, and let the server pick up
+renewals with `--tls-reload` or a `SIGHUP`. `--redirect-http 80
+--acme-webroot DIR` answers certbot's HTTP-01 challenges on port 80.
+[CONFIG.md](CONFIG.md#renewing-certificates) has the details.
 
 ---
 
@@ -299,10 +286,18 @@ swift build -c release
 swift build -c release --product garuda-conformance
 ```
 
-The end-to-end suites in `scripts/` run those binaries. The shell suites need
-`curl`, and some need `openssl` or `nc`. The HTTP/2, HTTP/3 and handler suites
-are Python test clients that need `h2` and `aioquic`.
-[README.md](README.md#tests) lists them.
+The database tests skip themselves unless a database is reachable. The
+end-to-end suites in `scripts/` run the release binaries. The shell suites
+need `curl`, and some need `openssl` or `nc`. The HTTP/2, HTTP/3, handler and
+upload suites are Python test clients that need `h2` and `aioquic`.
+
+`swift test` also replays the fuzz corpus (`GarudaFuzzTests`). The fuzzer
+itself runs longer, and is most useful under AddressSanitizer:
+
+```bash
+swift build -c release --product pgfuzz -Xswiftc -sanitize=address
+.build/release/pgfuzz --seconds 60
+```
 
 ---
 
@@ -310,12 +305,15 @@ are Python test clients that need `h2` and `aioquic`.
 
 | symptom | cause |
 |---|---|
-| Linker errors naming `ssl`, `crypto` or `z` | OpenSSL or zlib development files are missing; on macOS, pass the Homebrew prefix |
+| Linker errors naming `z` | zlib development files are missing |
+| Linker errors naming `ssl` or `crypto` | built with the `OpenSSL` trait without OpenSSL's development files, or pkg-config cannot find them |
+| `requires minimum platform version` on macOS | the package or the machine is below macOS 26.4 |
 | HTTP/3 is never used | UDP is closed on the QUIC port, or the client does not trust the certificate |
-| ACME never issues | the CA cannot reach port 443, or the cache directory is not writable |
+| `--compress` only ever sends gzip | `libbrotlienc` and `libzstd` are not installed |
 
 ---
 
-Next: [CONFIG.md](CONFIG.md) covers every flag. [README.md](README.md)
+Next: [CONFIG.md](CONFIG.md) covers every flag, and
+[DEPLOYMENT.md](DEPLOYMENT.md) running in production. [README.md](README.md)
 describes the handler API and current status.
 [ARCHITECTURE.md](ARCHITECTURE.md) explains how Garuda is built.

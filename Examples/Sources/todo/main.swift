@@ -4,14 +4,16 @@
 //   curl -s localhost:8080/todos
 //   curl -s -X PATCH localhost:8080/todos/1 -d '{"done":true}'
 //
-// TODO_DATABASE sets the file; every worker opens the same one.
+// TODO_DATABASE sets the file; every shard opens the same one.
 
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import TodoExample
 
 let path = getenv("TODO_DATABASE").map { String(cString: $0) } ?? "todos.db"
-exit(todoApp(databasePath: path).run())
+todoApp(databasePath: path).run()

@@ -1,5 +1,4 @@
 import Testing
-import CAvian
 @testable import Garuda
 
 private func text(_ value: some Encodable) throws -> String {
@@ -347,12 +346,13 @@ struct JSONDecodingTests {
         struct Plain: Decodable, Equatable { let v: Int }
         let count = 20_000
         let text = "{" + (0..<count).map { "\"k\($0)\":{\"v\":\($0)}" }.joined(separator: ",") + "}"
-        let start = av_monotonic_us()
+        let clock = ContinuousClock()
+        let start = clock.now
         let value = try decode([String: Plain].self, text)
-        let elapsed = av_monotonic_us() - start
+        let elapsed = clock.now - start
         #expect(value.count == count)
         #expect(value["k0"] == Plain(v: 0) && value["k19999"] == Plain(v: 19_999))
-        #expect(elapsed < 5_000_000, "took \(elapsed) us")
+        #expect(elapsed < .seconds(5), "took \(elapsed)")
     }
 
     @Test func aListedObjectReadsLikeAWalkedOne() throws {

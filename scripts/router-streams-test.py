@@ -3,11 +3,16 @@
 
     <venv>/bin/python scripts/router-streams-test.py [path-to-garuda]
 
-The router answers at the dispatch seam whatever the protocol. What this checks
+The routes answer at the dispatch seam whatever the protocol. What this checks
 is that a stream gets the answers a connection does -- a body where the route
 has one, a delay that waits on its timer -- and that a stream abandoned while
-it waits leaves nothing behind: no late response, no slot, no timer. The
-clients are the `h2` library and aioquic, which share no code with the server.
+it waits leaves nothing behind: no late response, no stuck task. The clients
+are the `h2` library and aioquic, which share no code with the server. The
+server is Garuda 2's `garuda` binary (Sources/garuda-server), which serves GET
+/, GET /user/:id, POST /user and GET /delay/:ms.
+
+Garuda 1's copy also limited the server with --max-connections, which Garuda 2
+does not have.
 
 Needs `h2` and `aioquic` in the interpreter running it:  pip install h2 aioquic
 """
@@ -112,7 +117,7 @@ class Server:
     def __init__(self, *args):
         self.port = free_port()
         cert, key = make_certs()
-        cmd = [BIN, "--port", str(self.port), "--log-level", "error", "--http3",
+        cmd = [BIN, "--port", str(self.port), "--log-level", "error", "--shards", "0", "--http3",
                "--tls-cert", cert, "--tls-key", key] + list(args)
         self.proc = subprocess.Popen(cmd)
         deadline = time.monotonic() + 15
@@ -308,10 +313,11 @@ def h2_cancellation():
 
 def h2_abandoned():
     print("\nHTTP/2: abandoned delays")
-    # The connection and each stream take a slot, and each delay an op, from
-    # pools of 64. Twelve rounds of forty would exhaust a leaking server many
-    # times over. Half the rounds hang up just as their timers fire.
-    with Server("--max-connections", "64") as server:
+    # Twelve rounds of forty delays would exhaust a server that leaked its
+    # streams' tasks or memory. Half the rounds hang up just as their timers
+    # fire. (Garuda 1 ran this under --max-connections 64, which Garuda 2
+    # does not have.)
+    with Server() as server:
         for round_ in range(12):
             client = H2Client(server)
             delay = 3000 if round_ % 2 else 150
@@ -474,6 +480,27 @@ async def h3_cancellation():
             is_("nor does its timer disturb the connection", client.status.get(again), 200)
 
 
+async def h3_abandoned():
+    print("\nHTTP/3: abandoned delays")
+    # Twelve rounds of forty delays, half of them hung up on as their timers
+    # fire, would exhaust a server that leaked its requests' tasks or streams.
+    with Server() as server:
+        for round_ in range(12):
+            delay = 3000 if round_ % 2 else 150
+            async with h3_connect(server) as client:
+                for _ in range(40):
+                    client.request("GET", "/delay/%d" % delay)
+                await asyncio.sleep(0.15)
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)
+        async with h3_connect(server) as client:
+            streams = [client.request("GET", "/delay/100") for _ in range(40)]
+            await client.collect(streams)
+            is_("a fresh connection's delays all answer 200",
+                [client.status.get(s) for s in streams], [200] * 40)
+        check("the server is still running", server.alive())
+
+
 async def h3_extended_connect():
     print("\nHTTP/3: extended CONNECT")
     # WebTransport goes to the routes, and this binary has none for it; any
@@ -491,25 +518,6 @@ async def h3_extended_connect():
             is_("and the connection serves on", client.body.get(after), b"5")
 
 
-async def h3_abandoned():
-    print("\nHTTP/3: abandoned delays")
-    with Server("--max-connections", "64") as server:
-        for round_ in range(12):
-            delay = 3000 if round_ % 2 else 150
-            async with h3_connect(server) as client:
-                for _ in range(40):
-                    client.request("GET", "/delay/%d" % delay)
-                await asyncio.sleep(0.15)
-            await asyncio.sleep(0.2)
-        await asyncio.sleep(0.5)
-        async with h3_connect(server) as client:
-            streams = [client.request("GET", "/delay/100") for _ in range(40)]
-            await client.collect(streams)
-            is_("a fresh connection's delays all answer 200",
-                [client.status.get(s) for s in streams], [200] * 40)
-        check("the server is still running", server.alive())
-
-
 def run(coro):
     asyncio.run(asyncio.wait_for(coro, timeout=120))
 
@@ -524,8 +532,8 @@ def main():
     run(h3_routes())
     run(h3_delays())
     run(h3_cancellation())
-    run(h3_extended_connect())
     run(h3_abandoned())
+    run(h3_extended_connect())
     print("\n%d passed, %d failed" % (PASS, FAIL))
     raise SystemExit(1 if FAIL else 0)
 

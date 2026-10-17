@@ -1,6 +1,6 @@
 import Testing
 @testable import Garuda
-import AvianHTTP
+import GarudaTesting
 
 // A host allow-list and a client address filter.
 
@@ -24,7 +24,7 @@ struct HostAndAddressFilterTests {
     func onlyAllowedHostsAreAnswered(host: String, status: Int) throws {
         let app = Application()
         app.allowedHosts(["example.com", "*.example.com", "[::1]", "10.1.2.3"])
-        app.get("/") { "hello" }
+        app.get("/") { () in "hello" }
         #expect(try app.test.get("/", headers: [("host", host)]).status.code == status)
     }
 
@@ -32,9 +32,9 @@ struct HostAndAddressFilterTests {
         let app = Application()
         app.group("/tenant") {
             app.allowedHosts(["*.example.com"])
-            app.get("/") { "tenant" }
+            app.get("/") { () in "tenant" }
         }
-        app.get("/open") { "open" }
+        app.get("/open") { () in "open" }
         let client = app.test
         #expect(try client.get("/tenant", headers: [("host", "a.example.com")]).text == "tenant")
         #expect(try client.get("/tenant", headers: [("host", "example.com")]).status == 400)
@@ -47,16 +47,16 @@ struct HostAndAddressFilterTests {
             app.addressFilter(allow: allow, deny: deny)
             app.get("/") { request, response in response.send(request.remoteAddress) }
         }
-        app.get("/open") { "open" }
+        app.get("/open") { () in "open" }
         return app
     }
 
+    /// The status of a request from `address`; nil for the test client's own,
+    /// 127.0.0.1.
     private func status(_ app: Application, from address: String?) throws -> Int {
-        var config = ServerConfig()
-        config.maxConnections = 16
-        #expect("127.0.0.1".withCString { config.trust.parse($0) })
-        let headers = address.map { [("x-forwarded-for", $0)] } ?? []
-        return try app.testClient(configuration: config).get("/admin", headers: headers).status.code
+        let client = app.test
+        if let address { client.remoteAddress = address }
+        return try client.get("/admin").status.code
     }
 
     @Test func anAllowListLetsOnlyItsAddressesIn() throws {
@@ -66,7 +66,6 @@ struct HostAndAddressFilterTests {
         #expect(try status(app, from: "2001:db8::7") == 200)
         #expect(try status(app, from: "11.0.0.1") == 403)
         #expect(try status(app, from: "2001:db9::1") == 403)
-        // The peer itself, with nothing forwarded.
         #expect(try status(app, from: nil) == 403)
         #expect(try app.test.get("/open").text == "open")
     }
@@ -82,6 +81,12 @@ struct HostAndAddressFilterTests {
         let everyone = addressApp(allow: ["*"], deny: ["192.0.2.0/24"])
         #expect(try status(everyone, from: "198.51.100.1") == 200)
         #expect(try status(everyone, from: "192.0.2.9") == 403)
+    }
+
+    @Test func aUnixSocketClientIsMatchedAsUnix() throws {
+        let app = addressApp(allow: ["unix"], deny: [])
+        #expect(try status(app, from: "") == 200)
+        #expect(try status(app, from: "10.0.0.1") == 403)
     }
 
     @Test func addressesAreMatchedAsTheyArePrinted() {

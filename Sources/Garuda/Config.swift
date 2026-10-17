@@ -1,373 +1,333 @@
 //===----------------------------------------------------------------------===//
-// Server configuration.
-//
-// Every string here points into `argv`, which the kernel keeps alive for the
-// life of the process. Configuration therefore owns no memory and copies no
-// strings.
+// How the server runs: where it listens, how many processes and threads
+// serve, and the limits every connection is held to.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import AvianHTTP
+import GarudaWire
 
-public struct ServerConfig {
+public struct ServerConfig: Sendable {
     // --- listening ---
-    public var host: UnsafePointer<CChar> = staticCString("127.0.0.1")
-    public var port: UInt16 = 8000
-    public var unixPath: UnsafePointer<CChar>? = nil
-    public var backlog: Int32 = 2048
-    public var tcpNoDelay = true
-    public var ipv6Only = false
+    public var host = "127.0.0.1"
+    public var port = 8000
+    public var backlog = 2048
+    /// A Unix socket to listen on in place of `host` and `port`, for a proxy
+    /// on the same machine; nil listens on TCP. Every shard accepts on the
+    /// one socket, and it is removed when the server exits.
+    public var unixPath: String? = nil
 
-    // --- concurrency ---
-    /// Worker processes. Each gets its own poller and its own connection slab,
-    /// and shares nothing with the others while it serves. 0 means "one per
-    /// CPU".
-    public var workers = 1
-    /// How connections are shared among the workers (--balance). See
-    /// `BalanceMode` and ARCHITECTURE.md.
-    public var balance: BalanceMode = .adaptive
-    /// The scheduler time slice each worker asks the kernel for, in
-    /// microseconds (--sched-slice): 100 to 100,000, or 0 for the kernel's
-    /// own. A worker that loses its CPU keeps every connection it owns
-    /// waiting until it gets it back, for up to a whole slice -- 2.8 ms by
-    /// default on an 8-CPU machine. Linux 6.12 and later; elsewhere it
-    /// changes nothing.
-    public var schedulerSliceMicroseconds = 300
-    /// `workers` with 0 resolved to the CPU count, which is what every part of
-    /// start-up actually wants.
-    public var resolvedWorkers: Int { workers > 0 ? workers : Int(av_cpu_count()) }
-    public var maxConnections = 4096
+    // --- processes and threads ---
+    /// Shard processes. Each is a whole runtime with its own threads and its
+    /// own listening socket; a crash takes one shard's connections down, and
+    /// the supervisor starts it again. `nil` lets Vega choose from the
+    /// machine's cache domains. 0 serves in this process, with no supervisor
+    /// -- what tests and development want.
+    public var shards: Int? = nil
+    /// How shards share the listening port: each its own SO_REUSEPORT
+    /// socket, hashed by the kernel, or one socket all of them accept on.
+    /// Nil for Vega's choice: the first on Linux, the second elsewhere.
+    public var balance: ConnectionBalance? = nil
+    /// Worker threads per shard; nil divides the CPUs among the shards.
+    public var threads: Int? = nil
+    /// Accept loops per shard; nil: one per thread.
+    public var acceptors: Int? = nil
+    /// Pin each shard's threads to its CPUs.
+    public var pinThreads = true
+    /// The I/O driver: `uring` or `epoll`; nil for io_uring where the kernel
+    /// has it, else epoll.
+    public var io: String? = nil
+    /// The lowest level the server logs; nil keeps info.
+    public var logLevel: LogLevel? = nil
+
+    /// A route whose handler holds a thread longer than this, on average,
+    /// runs in the heavy lane: no more than half of a shard's threads at
+    /// once (HeavyLane.swift).
+    public var heavyThreshold: Duration = .microseconds(500)
+    /// Turns the heavy lane off: every route runs on every thread.
+    public var heavyLane = true
+    /// Threads per shard that `app.offload` routes run on; nil for Vega's
+    /// default. A thread is started when work arrives and none is free.
+    public var blockingThreads: Int? = nil
+    /// Blocking work per shard (`app.offload`, `Runtime.blocking`) that may
+    /// wait for one of those threads before more is refused with 503; nil
+    /// waits for as long as it takes.
+    public var blockingQueue: Int? = nil
 
     // --- limits ---
     public var readBufferSize = 16 * 1024
     public var maxHeadSize = 32 * 1024
     public var maxHeaders = 100
     public var maxBodySize = 16 * 1024 * 1024
-    /// Response bytes buffered before the worker starts applying backpressure.
+    /// Requests per connection before a polite close; 0 is unlimited.
+    public var maxRequestsPerConnection = 0
+    /// Responses written as one batch when a client pipelines requests.
+    public var pipelineDepth = 16
+    /// Connections a shard has open at once; past it, new ones wait in the
+    /// listen backlog until one closes. Nil for no limit.
+    public var maxConnections: Int? = nil
+
+    // --- timeouts ---
+    /// How long an idle keep-alive connection is kept.
+    public var keepAliveTimeout: Duration = .seconds(5)
+    /// How long a client has to send a whole request head once it has
+    /// started one -- the slowloris bound.
+    public var requestHeadTimeout: Duration = .seconds(30)
+    /// How long a request body may take to arrive.
+    public var bodyTimeout: Duration = .seconds(30)
+    /// How long a write may wait on a client that is not reading -- one of
+    /// a streamed body, or of a whole answer while the client takes none
+    /// of it: the connection is closed on it after that.
+    public var writeTimeout: Duration = .seconds(30)
+    /// A streamed body's writes wait once this much of it is still on its
+    /// way to the client (StreamingResponse.swift)...
     public var writeHighWaterMark = 512 * 1024
-    /// Buffered bytes a producer held at the high water mark must fall back to
-    /// before it is resumed. Resuming at the high water mark would wake the
-    /// producer for every single socket write; a gap gives it a whole batch to
-    /// refill.
+    /// ...until it is down to this much.
     public var writeLowWaterMark = 128 * 1024
-    /// How much work outliving its request a worker carries before it stops
-    /// taking new ones (`response.cancellable`, Cancellation.swift). A body
-    /// the handler gave up on keeps running until it finishes; this is where
-    /// a worker full of them says 503 rather than looking healthy. 0 for no
-    /// limit.
-    public var maxAbandonedWaits = 256
-    /// Request bytes buffered ahead of the application before the worker stops
-    /// reading the socket. An upload that arrives faster than it is taken
-    /// should cost TCP window, not memory.
-    public var bodyHighWaterMark = 256 * 1024
-    /// Requests per connection before a polite close, to bound memory growth
-    /// from long-lived keep-alive clients.
-    public var maxRequestsPerConnection: UInt32 = 0    // 0 = unlimited
-
-    // --- timeouts (milliseconds) ---
-    public var keepAliveTimeoutMs: UInt64 = 5_000
-    public var requestHeadTimeoutMs: UInt64 = 30_000
-    public var gracefulShutdownMs: UInt64 = 10_000
-    /// How long SIGTERM leaves the server serving normally, with only the
-    /// health check failing, before the drain starts.
-    ///
-    /// A load balancer or a Kubernetes Service keeps sending a pod traffic for
-    /// a few seconds after it is told to stop, because taking an endpoint out
-    /// of rotation has to propagate. A server that stops accepting the moment
-    /// SIGTERM arrives refuses that traffic. This is the gap that closes it:
-    /// the probe says 503, the balancer stops routing, and only then does the
-    /// server stop taking connections. SIGINT and SIGQUIT do not wait, and a
-    /// reload does not either.
-    public var drainDelayMs: UInt64 = 0
-
-    // --- the blocking pool ---
-    /// The most threads each worker runs `blocking` work on. They start as
-    /// work arrives, not before.
-    public var blockingThreads = 16
-    /// Work waiting for a busy pool's threads, per worker, past which
-    /// `blocking` throws `BlockingPoolError.full`.
-    public var blockingQueue = 1024
-
-    // --- broadcast and event streams ---
-    /// The ring every worker's published messages go through, in MiB, and
-    /// what a reconnecting client can be sent again from. 0 turns `Topic`
-    /// off.
+    /// An event stream quiet this long is sent a comment, so a proxy that
+    /// closes idle connections sees traffic and a client that has gone is
+    /// noticed (EventStream.swift). Zero sends none.
+    public var eventKeepAlive: Duration = .seconds(15)
+    /// The ring, in MiB, that messages a `Topic` publishes cross shards in
+    /// (Broadcast.swift); 0 turns topics off. A message may be a quarter of it.
     public var broadcastSizeMiB = 4
-    /// Messages a subscriber may fall behind by before it is told it missed
-    /// some.
+    /// Messages a subscriber may fall behind by before it is handed
+    /// `.missed` in place of the rest.
     public var broadcastQueue = 1024
-    /// How long an event stream may go without a write before a comment is
-    /// sent to keep proxies from closing it. 0 sends none.
-    public var eventKeepAliveMs: UInt64 = 15_000
-
-    public var rootPath: UnsafePointer<CChar> = staticCString("")
-    public var scheme: UnsafePointer<CChar> = staticCString("http")
-    public var serverName: UnsafePointer<CChar> = staticCString("localhost")
-    public var serverPortString: UnsafePointer<CChar> = staticCString("8000")
-
-    // --- reverse proxy ---
-    /// Peers whose forwarded headers are believed. Empty means "trust nobody",
-    /// which is the only safe default: an untrusted X-Forwarded-For is a client
-    /// address spoof and an untrusted X-Forwarded-Proto is a scheme spoof.
-    public var trust = ForwardedTrust()
-
-    // --- tls ---
-    /// PEM certificate chain and private key. Both or neither.
+    /// How long shutting down waits for requests in progress.
+    public var gracefulShutdown: Duration = .seconds(10)
+    /// --reload: restart on the executable when it is rebuilt, and replace
+    /// the shards when a --tls-cert or --tls-key file changes. A development
+    /// convenience; the supervisor watches, and no shard does any work for it.
+    public var reload = false
+    /// How often --reload looks at the files, where the kernel sends no
+    /// notification of a change.
+    public var reloadInterval: Duration = .milliseconds(500)
+    /// How long SIGTERM leaves the server serving, with only the health
+    /// check failing, before it stops accepting and drains.
     ///
-    /// This is the default pair: what a client that sends no SNI, or asks for
-    /// a name no certificate claims, is served.
-    public var tlsCertPath: UnsafePointer<CChar>? = nil
-    public var tlsKeyPath: UnsafePointer<CChar>? = nil
-    /// Further certificate/key pairs, chosen per connection by SNI.
-    ///
-    /// Which names each one covers is read out of the certificate itself --
-    /// its subject alternative names, or its common name if it has none --
-    /// rather than configured alongside it. The certificate already carries
-    /// that list, and a second copy of it in a command line is a second copy
-    /// to get wrong.
-    ///
-    /// Both transports. TCP has OpenSSL's SNI callback choosing, and the QUIC
-    /// handshake -- written from the primitives rather than driven by OpenSSL
-    /// -- chooses with the same rule over the same names.
-    public var tlsExtraCerts: [(cert: UnsafePointer<CChar>, key: UnsafePointer<CChar>)] = []
-    /// OpenSSL cipher list for TLS 1.2. TLS 1.3 suites are not configurable
-    /// here and do not need to be.
-    public var tlsCiphers: UnsafePointer<CChar>? = nil
-    public var tlsEnabled: Bool { tlsCertPath != nil && tlsKeyPath != nil }
-    /// A plain-HTTP port that answers everything with a redirect to https on
-    /// `port`, or 0 for none. Bound by every worker with SO_REUSEPORT, like
-    /// the metrics port, and never handed to the application.
-    public var redirectHTTPPort: UInt16 = 0
-    /// The `Strict-Transport-Security` value for every TLS response, or nil.
-    /// Built once at start-up, like `altSvc`.
-    public var hsts: UnsafePointer<UInt8>? = nil
-    public var hstsLength = 0
+    /// A load balancer or a Kubernetes Service goes on sending traffic for
+    /// a few seconds after it is told to stop: taking an endpoint out of
+    /// rotation has to propagate. A server that stops accepting the moment
+    /// SIGTERM arrives refuses that traffic. In this gap the probe says
+    /// 503, the balancer stops routing, and only then does the server stop
+    /// taking connections. SIGINT and SIGQUIT do not wait, and neither does
+    /// a reload.
+    public var drainDelay: Duration = .zero
 
-    // --- http/2 ---
-    /// Serve HTTP/2 to clients that ask for it. Over cleartext that means the
-    /// connection preface; over TLS it means ALPN.
-    /// HTTP/3, which is HTTP over QUIC over UDP. It needs a certificate: QUIC
-    /// has no cleartext form at all.
-    public var http3Enabled = false
-    /// The UDP port, when it differs from the TCP one. Zero means the same.
-    public var quicPort: UInt16 = 0
-    /// The `Alt-Svc` value telling a client that reached us over TCP where
-    /// HTTP/3 lives, or nil when there is nothing to advertise.
-    ///
-    /// Built once at start-up rather than per response: it goes on every
-    /// response served over TCP and never changes.
-    public var altSvc: UnsafePointer<UInt8>? = nil
-    public var altSvcLength = 0
-    public var http2Enabled = true
-    /// Speak only HTTP/2 on this port, with no HTTP/1.1 fallback. What a
-    /// proxy that talks h2c upstream (Envoy, Caddy) and a gRPC client expect,
-    /// and the only way an invalid preface can be answered in HTTP/2 rather
-    /// than mistaken for a malformed HTTP/1 request line.
-    public var http2Only = false
-    /// Streams one connection may have in flight. Each costs a connection slot.
-    public var h2MaxConcurrentStreams = 128
-    /// The largest frame we will accept. 16 KiB is the floor every
-    /// implementation must support, and larger frames only add latency.
-    public var h2MaxFrameSize = 16 * 1024
-
-    // --- websockets ---
-    public var websocketsEnabled = true
-    /// --websocket-protocols: which protocols carry WebSockets. Over HTTP/1.1
-    /// an upgrade; over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) an extended
-    /// CONNECT on one stream of a connection the client already has.
-    public var websocketOverHTTP1 = true
-    public var websocketOverHTTP2 = true
-    public var websocketOverHTTP3 = true
-    public var maxWebsocketMessageSize = 16 * 1024 * 1024
-    /// Idle time before the server sends a ping. 0 disables keepalive pings.
-    public var websocketPingIntervalMs: UInt64 = 20_000
-    /// How long an unanswered ping may go before the connection is dropped.
-    public var websocketPingTimeoutMs: UInt64 = 20_000
-    /// Decoded messages held for an application that has not asked for them
-    /// yet. Frames are decoded on arrival so that control frames are answered
-    /// promptly, so data messages need somewhere to wait; when the queue fills,
-    /// the read side is switched off and the peer feels it as TCP backpressure.
-    public var maxWebsocketQueue = 32
-    /// Negotiate permessage-deflate (RFC 7692) with clients that offer it.
-    /// Off by default: it costs memory per connection and CPU per message,
-    /// and like any compression over TLS it can leak a secret that shares a
-    /// message with something the peer controls.
-    public var wsCompress = false
-    public var maxWebsocketQueueBytes = 4 * 1024 * 1024
-
-    // --- compression ---
-    /// Compress application responses for clients that accept it.
-    ///
-    /// Off by default, and not only because it costs CPU. A response over TLS
-    /// that reflects something the client sent next to a secret -- a CSRF
-    /// token on a page that echoes a search term -- leaks the secret a byte at
-    /// a time to anyone who can watch the compressed length (BREACH). Whether
-    /// an application has such a page is its own knowledge, so turning this
-    /// on is its decision. See CONFIG.md.
+    // --- compression (Compression.swift) ---
+    /// Compress responses for clients that accept it: text and its kin, and
+    /// only those worth it. Off by default: a page that reflects a secret
+    /// and something an attacker controls leaks the secret a byte at a time
+    /// to anyone who can watch the compressed length (BREACH), and whether an
+    /// application has such a page is its own knowledge.
     public var compress = false
     /// Serve `file.br`, `file.zst` or `file.gz` next to a `--static-dir` file
-    /// to a client that accepts it. A static file reflects nothing, so this is
-    /// safe wherever the files themselves are.
+    /// to a client that accepts it. A static file reflects nothing, so this
+    /// is safe wherever the files themselves are.
     public var compressStatic = false
-    /// Answer a request for a `--static-dir` directory with its `index.html`.
-    /// Off by default, because a directory that is not served falls through
-    /// to the application, and taking that path away is the operator's
-    /// decision rather than a default.
-    public var staticIndex = false
-    /// Answer a request for a `--static-dir` directory that has no index with
-    /// a listing of what is in it. Implies `staticIndex`: a directory with an
-    /// index file is served that, since it is the page somebody wrote.
-    ///
-    /// Off by default, and deliberately: a listing tells whoever asks every
-    /// name in the directory, which is a different decision from serving the
-    /// files themselves.
-    public var staticListing = false
-    /// The most entries a listing shows; 0 for no limit. A listing is built
-    /// on the worker's thread, with a `stat` for every entry, so without a
-    /// limit a directory of a million files holds every other request on
-    /// the worker while it is read, and answers with a page of tens of
-    /// megabytes. Past the limit the directory is not read further, and the
-    /// page says that more are not listed.
-    public var staticListingLimit = 10_000
-    /// A response declaring fewer bytes than this is sent as it is. Below
-    /// about a kilobyte the saving is smaller than the framing.
+    /// A body declaring fewer bytes than this is sent as it is. Below about
+    /// a kilobyte the saving is smaller than the framing.
     public var compressMinimumLength = 1024
 
-    // --- acme ---
-    /// Names to get a certificate for from an ACME CA, or empty for none.
-    ///
-    /// With any name here the server gets its own certificate: a helper
-    /// process registers an account, answers tls-alpn-01 on the port being
-    /// served, installs what the CA issues in `acmeCacheDir`, and reloads the
-    /// workers onto it -- then renews it a month before it expires, the same
-    /// way. `tlsCertPath` and `tlsKeyPath` point into the cache.
-    public var acmeDomains: [UnsafePointer<CChar>] = []
-    public var acmeEmail: UnsafePointer<CChar>? = nil
-    public var acmeDirectory: UnsafePointer<CChar> =
-        staticCString("https://acme-v02.api.letsencrypt.org/directory")
-    public var acmeCacheDir: UnsafePointer<CChar>? = nil
-    /// Trusted roots for the CA's own HTTPS, for a private or test CA. nil
-    /// uses the system's.
-    public var acmeCABundle: UnsafePointer<CChar>? = nil
-    public var acmeEnabled: Bool { !acmeDomains.isEmpty }
-
-    // --- rate limiting ---
+    // --- before the application (RateLimit.swift, Metrics.swift) ---
     /// Requests each client may make per `rateLimitPeriodMs`, or 0 for no
-    /// limit. Counted across every worker, not per worker; see
-    /// avian_ratelimit.h.
+    /// limit. Counted across every shard and thread, not per one.
     public var rateLimitCount = 0
     public var rateLimitPeriodMs: UInt64 = 1000
     /// Requests a client may make at once before the rate applies. 0 means
     /// one period's worth, the count itself.
     public var rateLimitBurst = 0
-    /// --cache-size: mebibytes of memory, shared by every worker, for
-    /// responses the application marks fresh; 0 for no cache.
+    /// A path answered 200 before routing and before --rate-limit, for a
+    /// load balancer's or an orchestrator's probe; nil for none.
+    public var healthCheckPath: String? = nil
+    /// The port the Prometheus page is served on, at /metrics; nil for none.
+    public var metricsPort: Int? = nil
+    /// The interface it listens on; nil for `host`'s.
+    public var metricsHost: String? = nil
+
+    // --- the response cache (ResponseCache.swift) ---
+    /// Mebibytes of memory, shared by every shard, for responses the
+    /// application marks fresh; 0 for no cache.
     public var cacheSizeMiB = 0
     /// The largest response body the cache keeps, in bytes.
     public var cacheMaxObject = 1024 * 1024
     /// The longest a response is kept, whatever it says, in seconds.
     public var cacheTTLMaxSeconds = 300
 
-    // --- development ---
-    /// Restart on the executable when it is rebuilt, and replace the workers
-    /// when a certificate or key file changes.
-    public var reload = false
-    public var reloadIntervalMs: UInt64 = 500
-
-    // --- diagnostics ---
-    /// URL prefixes served from disk by the server, longest prefix first.
-    ///
-    /// `--static-dir /static=/var/www/static`. A request whose path starts with
-    /// the prefix is answered from the directory without the application being
-    /// called; anything else, including a path that matches but has no file
-    /// behind it, goes to the application as usual. A miss falling through
-    /// rather than 404ing is what lets a route be added in front of an
-    /// application that already serves the same prefix.
-    ///
-    /// Kept longest-first so that a more specific prefix wins over a shorter
-    /// one covering the same paths.
-    public var staticRoutes: [(prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>)] = []
-
+    // --- static files (StaticFiles.swift) ---
+    /// URL prefixes answered from directories, `--static-dir /static=/srv/www`:
+    /// a GET or HEAD under a prefix is served the file it names, and one
+    /// naming no file falls through to the routes.
+    public var staticDirectories: [(prefix: String, directory: String)] = []
     /// A single-page application's page, served for browser navigations no
     /// route answers: `--spa-fallback /app=/srv/app/index.html`. `file` is
-    /// the file's name under `directory`, with a leading `/`. Longest prefix
-    /// first.
-    public var spaFallbacks: [(prefix: UnsafePointer<CChar>, directory: UnsafePointer<CChar>,
-                               file: UnsafePointer<CChar>)] = []
+    /// its name under `directory`.
+    public var spaFallbacks: [(prefix: String, directory: String, file: String)] = []
+    /// Answer a request for a `--static-dir` directory with its `index.html`.
+    /// Off by default: a directory that is not served falls through to the
+    /// application, and taking that path away is the operator's decision.
+    public var staticIndex = false
+    /// Answer a request for a directory that has no index with a listing of
+    /// what is in it. Implies `staticIndex`. Off by default, and deliberately:
+    /// a listing tells whoever asks every name in the directory.
+    public var staticListing = false
+    /// The most entries a listing shows; 0 for no limit. Past it the
+    /// directory is not read further, and the page says there are more.
+    public var staticListingLimit = 10_000
 
-    /// A path the server answers itself, with 200 and an empty body, or nil.
-    ///
-    /// For an orchestrator's liveness probe. It is answered in the worker
-    /// before the request reaches a handler, which is the point: a probe that runs
-    /// through the application measures the application, so it goes unanswered
-    /// exactly when every worker is busy -- and an orchestrator reads an
-    /// unanswered liveness probe as a process to kill. This one says the
-    /// accept loop is running, which is what liveness is.
-    ///
-    /// Off unless asked for. Answering a path the application also serves would
-    /// shadow it, and the server has no business guessing that /healthz is free.
-    public var healthPath: UnsafePointer<CChar>? = nil
-    /// Hand the application `X-Request-Start: t=<microseconds since the
-    /// epoch>` for when the request's first byte arrived, unless a proxy in
-    /// front already sent one.
-    ///
-    /// It is the header APM agents -- New Relic, Datadog, Scout -- read to
-    /// report queue time, and queue time is the one part of a request's
-    /// latency no middleware can measure: it is everything that happened
-    /// before the application was called. A worker busy with the requests
-    /// ahead of it, a connection waiting in the accept queue -- all of it
-    /// shows up here and nowhere else.
-    public var requestStartHeader = false
+    // --- TLS (TLS.swift) ---
+    /// The certificates served, each with its key; none serves plain HTTP.
+    /// The client's SNI picks the first that covers the name it asks for,
+    /// and the first answers a client that names none.
+    public var tlsCertificates: [TLSCertificateFiles] = []
+    /// A plain-HTTP port that answers everything with a redirect to the same
+    /// URL on https, or nil for none.
+    public var redirectHTTPPort: Int? = nil
+    /// A directory an outside ACME client (certbot --webroot) writes its
+    /// HTTP-01 challenges under, served at /.well-known/acme-challenge/ on
+    /// the redirectHTTPPort, or nil for none.
+    public var acmeWebroot: String? = nil
+    /// How often to look at the certificate files and serve them again when
+    /// they have changed; nil never looks.
+    public var tlsReloadInterval: Duration? = nil
+    /// How long a client has to finish the TLS handshake.
+    public var tlsHandshakeTimeout: Duration = .seconds(10)
+    /// The TLS 1.2 cipher suites, as an OpenSSL cipher list; nil for the
+    /// library's. TLS 1.3's suites are fixed.
+    public var tlsCiphers: String? = nil
+
+    // --- HTTP/2 (HTTP2.swift) ---
+    /// Serve HTTP/2: to a TLS client that asks for "h2" by ALPN, and to a
+    /// cleartext client that opens with the HTTP/2 preface (prior knowledge).
+    public var http2Enabled = true
+    /// Serve only HTTP/2 in cleartext (h2c), with no HTTP/1 fallback: what a
+    /// proxy that talks h2c upstream (Envoy, Caddy) and a gRPC client expect.
+    public var http2Only = false
+
+    // --- WebSockets (WebSocket.swift) ---
+    /// --no-websockets: upgrades are refused with 501.
+    public var websocketsEnabled = true
+    /// The largest message taken from a peer, after inflating.
+    public var maxWebsocketMessageSize = 16 * 1024 * 1024
+    /// How long a WebSocket may be quiet before it is pinged; zero for never.
+    public var websocketPingInterval: Duration = .seconds(20)
+    /// How long a ping, or a close the server sent, may go unanswered.
+    public var websocketPingTimeout: Duration = .seconds(20)
+    /// Messages, and bytes, held for a handler that is not reading before
+    /// the socket stops being read.
+    public var maxWebsocketQueue = 32
+    public var maxWebsocketQueueBytes = 4 * 1024 * 1024
+    /// --ws-compress: permessage-deflate with clients that offer it.
+    public var websocketCompress = false
+    /// --websocket-protocols: which protocols carry WebSockets. HTTP/1.1's
+    /// upgrade, HTTP/2's extended CONNECT (RFC 8441), and HTTP/3's (RFC
+    /// 9220); a WebSocket over one left out is refused with 501, and over
+    /// HTTP/2 extended CONNECT is not offered at all.
+    public var websocketProtocols: WebSocketProtocols = .all
+    /// Streams a client may have open at once on one connection.
+    public var h2MaxConcurrentStreams = 128
+    /// The largest frame payload a client may send.
+    public var h2MaxFrameSize = 16 * 1024
+    /// How much request body a client may send on a stream, and on the
+    /// connection, before the server gives the window back. The body is
+    /// held whole until dispatch, and the body limit bounds it, so a large
+    /// window costs nothing but lets an upload use the link.
+    public var h2InitialWindowSize = 256 * 1024
+
+    // --- HTTP/3 (HTTP3.swift) ---
+    /// Serve HTTP/3 over QUIC as well, on UDP. It needs a certificate: QUIC
+    /// has no cleartext form. Clients learn of it from the Alt-Svc header
+    /// every TCP response then carries.
+    public var http3Enabled = false
+    /// The UDP port HTTP/3 is served on; nil for the TCP port.
+    public var quicPort: Int? = nil
+    /// QUIC connections one UDP socket serves at once; a new one past this
+    /// is not answered. A shard has a socket per thread.
+    public var maxQUICConnections = 4096
+
+    // --- Strict-Transport-Security ---
+    /// --hsts: `strict-transport-security: max-age=N` on every answer over
+    /// TLS that does not set its own; nil for none.
+    public var hstsMaxAge: Int? = nil
+
+    // --- request IDs and logging (RequestID.swift, Logging.swift) ---
+    /// Peers whose forwarded headers are believed (--forwarded-allow-ips).
+    /// Empty means "trust nobody", which is the only safe default: a header
+    /// any client can set is not one anybody else can rely on.
+    public var trust = ForwardedTrust()
     /// Give every request an `X-Request-ID`: hand it to the application, echo
     /// it on the response and put it in the access log, so that a line in the
     /// application's own log, a line in the access log and what the client
     /// was told can be matched up. One a trusted proxy sent is kept; any other
     /// is replaced, since a client can put anything it likes in a header.
     public var requestID = false
+    /// A mount prefix a proxy in front leaves on the path: taken off before
+    /// routing, so `/app/users` reaches the `/users` route under
+    /// `--root-path /app`. A path outside it is routed as it came, as from a
+    /// proxy that took the prefix off itself. Empty for none.
+    public var rootPath = ""
+    /// Take every request that arrived without TLS, and without a trusted
+    /// proxy saying otherwise, as HTTPS (`--scheme https`): for a proxy that
+    /// terminates TLS and says nothing about it. `Request.arrivedOverHTTPS`,
+    /// and what follows it, then say so.
+    public var assumeHTTPS = false
+    /// Give handlers `Request.requestStart`: when the request arrived, in
+    /// microseconds since the epoch, for an APM agent that reports the time
+    /// a request waited before the application saw it.
+    public var requestStartHeader = false
     /// Record the W3C `traceparent` a request carries -- the trace it belongs
-    /// to and the span that sent it -- in the access log. Never generated, and
-    /// never changed on its way to the application.
+    /// to and the span that sent it -- in the logs and for response
+    /// observers. Never generated, and never changed on its way to the
+    /// application.
     public var traceContext = false
-    /// Kernel TLS (--ktls): have the Linux kernel encrypt and decrypt once
-    /// OpenSSL has done the handshake. A --static-dir file then goes out with
-    /// sendfile over HTTPS as it does in the clear, and an idle HTTPS
-    /// connection can be handed to another worker. Off unless asked for: with
-    /// the kernel encrypting in software, large HTTPS responses measured a
-    /// quarter slower than with OpenSSL doing it (BENCHMARKS.md). `.auto`
-    /// uses it wherever OpenSSL and the kernel both can, and says nothing
-    /// where not; `.on` warns.
-    public var ktls: KernelTLS = .off
-    public var logLevel: LogLevel = .info
-    /// --slow-handler-ms: a handler that runs this long on its worker without
-    /// waiting is warned about, and counted against its route on the metrics
-    /// page. Every other request on the worker waits while it runs. Async
-    /// handlers are always timed, synchronous ones only with --metrics-port
-    /// (SlowHandlers.swift). 0 turns the timing off.
-    public var slowHandlerMs = 100
+    /// One line per request, on standard error, at info.
     public var accessLog = false
-    /// Emit the access log as one JSON object per line, for a collector that
+    /// Write the access log as one JSON object per line, for a collector that
     /// would otherwise be handed a regex.
     public var accessLogJSON = false
     /// Write the application log -- `request.log` and `AppLog` -- as one JSON
     /// object per line. The command line has the access log follow it unless
     /// --access-log-format says otherwise.
     public var logJSON = false
-    /// Port for the Prometheus scrape listener, or 0 for none. A port of its
-    /// own rather than a path on the service port: the application owns its
-    /// own routes, and monitoring must not be reachable through them.
-    public var metricsPort: UInt16 = 0
-    /// What the scrape listener binds. nil follows --host; see CONFIG.md for
-    /// why that is usually not what you want on a public interface.
-    public var metricsHost: UnsafePointer<CChar>? = nil
+
+    /// Garuda 1 flags that mean nothing here, given on the command line:
+    /// warned about once at start-up, so an old command line still starts.
+    var ignoredFlags: [String] = []
 
     public init() {}
+
 }
 
-/// Turns a Swift string literal into a pointer with static storage duration.
-/// Literals are already NUL-terminated constants in the binary, so this is a
-/// pointer cast, not an allocation.
-@inlinable
-public func staticCString(_ s: StaticString) -> UnsafePointer<CChar> {
-    UnsafeRawPointer(s.utf8Start).assumingMemoryBound(to: CChar.self)
+/// How shards share the listening port (`--balance`).
+public enum ConnectionBalance: Sendable, Hashable {
+    /// Each shard binds its own SO_REUSEPORT socket and the kernel hashes
+    /// connections across them.
+    case reusePort
+    /// One socket every shard accepts on: a connection goes to a shard
+    /// waiting in accept.
+    case shared
+}
+
+/// The protocols WebSockets are served over (--websocket-protocols).
+public struct WebSocketProtocols: OptionSet, Sendable {
+    public let rawValue: UInt8
+    public init(rawValue: UInt8) { self.rawValue = rawValue }
+
+    public static let http1 = WebSocketProtocols(rawValue: 1)
+    public static let http2 = WebSocketProtocols(rawValue: 2)
+    public static let http3 = WebSocketProtocols(rawValue: 4)
+    public static let all: WebSocketProtocols = [.http1, .http2, .http3]
+
+    /// "http1,http2", as the flag takes it; nil for a name it does not know.
+    public init?(parsing list: String) {
+        var set: WebSocketProtocols = []
+        for name in list.split(separator: ",") {
+            switch String(name).trimmingSpaces {
+            case "http1", "http1.1", "h1": set.insert(.http1)
+            case "http2", "h2": set.insert(.http2)
+            case "http3", "h3": set.insert(.http3)
+            default: return nil
+            }
+        }
+        self = set
+    }
 }

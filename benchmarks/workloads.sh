@@ -19,15 +19,19 @@
 #   skew      GET  /user/12345   on 56 connections while 8 more ask for /spin, which
 #             holds the CPU for about 2 ms a request: what the quick requests
 #             pay for sharing a server with slow ones (cpu counts both)
+#   h2skew    skew with both the quick and the slow requests over HTTP/2
 #   spike     the same, but the slow requests start a second into the run, on
 #             workers that already hold quick connections
 #
-# SERVERS names what runs: garuda, axum, and garuda:MODE for Garuda under
-# --balance MODE (garuda:adaptive, garuda:accept, garuda:reuseport).
+# SERVERS names what runs: garuda, axum, and garuda:MODE for Garuda 1 under
+# --balance MODE (garuda:adaptive, garuda:accept, garuda:reuseport), and
+# garuda2:SxT for Garuda 2 (GARUDA2_APP, the garuda executable) with S shards
+# of T threads each (garuda2:1x8, garuda2:2x4), or plain garuda2 for Garuda 2
+# as it sizes itself, with no --shards or --threads.
 #
 # TLS=1 runs both over HTTPS with the same self-signed P-256 certificate:
-# Garuda with OpenSSL, axum with rustls through axum-server. The relay's
-# origin stays in the clear.
+# Garuda 1 and Garuda 2 with BoringSSL (each one's default build), axum with
+# rustls through axum-server. The relay's origin stays in the clear.
 #
 # benchmarks/workloads/garuda-app is the Garuda side and
 # benchmarks/workloads/axum the axum side. Garuda runs WORKERS workers, one
@@ -55,6 +59,7 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GARUDA_APP=${GARUDA_APP:-$ROOT/benchmarks/workloads/garuda-app/.build/release/workloads}
 AXUM_APP=${AXUM_APP:-$ROOT/benchmarks/workloads/axum/target/release/workloads}
+GARUDA2_APP=${GARUDA2_APP:-$ROOT/.build/release/garuda}
 CARGO=${CARGO:-$(command -v cargo || echo "$HOME/.cargo/bin/cargo")}
 OHA=${OHA:-oha}
 PSQL=${PSQL:-psql}
@@ -154,6 +159,14 @@ start() {
             server_start "${PIN_SERVER[@]}" "$GARUDA_APP" \
             --log-level error --host 127.0.0.1 --port "$PORT" --workers "$WORKERS" "${balance[@]}" \
             "${GARUDA_TLS[@]}" ${GARUDA_FLAGS:-} ;;
+    garuda2|garuda2:*)
+        local layout=() shape=${1#garuda2:}
+        [ "$1" != garuda2 ] && layout=(--shards "${shape%x*}" --threads "${shape#*x}")
+        DATABASE_URL=$DATABASE_URL POOL_SIZE=$((WORKERS * POOL_SIZE)) \
+            ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT/stream" \
+            server_start "${PIN_SERVER[@]}" "$GARUDA2_APP" \
+            --log-level error --host 127.0.0.1 --port "$PORT" \
+            "${layout[@]}" "${GARUDA_TLS[@]}" ${GARUDA2_FLAGS:-} ;;
     axum)
         if [ ! -x "$AXUM_APP" ]; then
             (cd "$ROOT/benchmarks/workloads/axum" && "$CARGO" build --release) > "$OUT/cargo.log" 2>&1 \
@@ -197,7 +210,7 @@ request() {
     download) printf '%s\n' "$BASE/download" ;;
     relay) printf '%s\n' "$BASE/relay" ;;
     churn) printf '%s\n' --disable-keepalive "$BASE/user/12345" ;;
-    h2) printf '%s\n' --http2 "$BASE/user/12345" ;;
+    h2|h2skew) printf '%s\n' --http2 "$BASE/user/12345" ;;
     esac
 }
 
@@ -218,6 +231,7 @@ check() {
     download) body=$(curl -sk --max-time 5 "$BASE/download" | wc -c); [ "$body" -eq 1048576 ] ;;
     relay) body=$(curl -sk --max-time 5 "$BASE/relay" | wc -c); [ "$body" -eq 65536 ] ;;
     h2) body=$(curl -sk --max-time 2 "$H2_CURL" "$BASE/user/12345"); [ "$body" = 12345 ] ;;
+    h2skew) body=$(curl -sk --max-time 2 "$H2_CURL" "$BASE/spin/1000"); [ "$body" = 10097022301462541763 ] ;;
     esac || { echo "$body" | head -c 200; echo; return 1; }
 }
 
@@ -315,18 +329,35 @@ for server in $SERVERS; do
             measure user "$DURATION" "$CONNS" | report recovery "$server"
             continue
         fi
-        if [ "$workload" = skew ]; then
-            "${PIN_LOAD[@]}" "$OHA" -z 60s -c "$SKEW_CONNS" --no-tui "$BASE/spin/$SPIN" \
-                > /dev/null 2>&1 &
+        if [ "$workload" = skew ] || [ "$workload" = h2skew ]; then
+            # The slow requests run for the whole measurement and a little
+            # past it, and how many were served is reported too: a server
+            # can buy quick-request throughput by starving them.
+            spin_json="$OUT/spin.json"
+            spin_http2=()
+            [ "$workload" = h2skew ] && spin_http2=(--http2)
+            rm -f "$spin_json"
+            "${PIN_LOAD[@]}" "$OHA" -z "$(( ${WARMUP%s} + ${DURATION%s} + 1 ))s" -c "$SKEW_CONNS" \
+                --no-tui --insecure --output-format json -o "$spin_json" "${spin_http2[@]}" \
+                "$BASE/spin/$SPIN" > /dev/null 2>&1 &
             spinner=$!
-            measure skew "$WARMUP" $((CONNS - SKEW_CONNS)) > /dev/null
-            measure skew "$DURATION" $((CONNS - SKEW_CONNS)) | report skew "$server"
-            kill "$spinner" 2>/dev/null
+            measure "$workload" "$WARMUP" $((CONNS - SKEW_CONNS)) > /dev/null
+            measure "$workload" "$DURATION" $((CONNS - SKEW_CONNS)) | report "$workload" "$server"
             wait "$spinner" 2>/dev/null
+            python3 - "$spin_json" "$server" "$workload-slow" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    s, p = d["summary"], d["latencyPercentiles"]
+    print("%-9s %-16s %9d req/s   p50 %8.3f   p99 %9.3f ms" % (sys.argv[3], sys.argv[2],
+          s["requestsPerSec"], p["p50"] * 1000, p["p99"] * 1000))
+except Exception as e:
+    print("%-9s %-16s no result (%s)" % (sys.argv[3], sys.argv[2], e))
+PY
             continue
         fi
         if [ "$workload" = spike ]; then
-            ( sleep 1; exec "${PIN_LOAD[@]}" "$OHA" -z 60s -c "$SKEW_CONNS" --no-tui \
+            ( sleep 1; exec "${PIN_LOAD[@]}" "$OHA" -z 60s -c "$SKEW_CONNS" --no-tui --insecure \
                   "$BASE/spin/$SPIN" > /dev/null 2>&1 ) &
             spinner=$!
             measure spike "$DURATION" $((CONNS - SKEW_CONNS)) | report spike "$server"

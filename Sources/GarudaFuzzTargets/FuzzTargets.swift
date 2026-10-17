@@ -2,9 +2,12 @@
 // What a fuzzer feeds, and what has to remain true afterwards.
 //
 // Every parser here reads bytes chosen by whoever is on the other end of a
-// socket, which is the definition of untrusted input: the request head, the
-// chunked framing under it, an HPACK block, a WebSocket frame header, a QUIC
-// packet header -- or, from a database the server connects to, a Redis reply. A crash in any of them is reachable from the network.
+// socket, which is the definition of untrusted input: the request head and
+// the chunked framing under it, an HPACK or QPACK block, a WebSocket frame
+// header, a QUIC packet and the frames and ClientHello inside one, a whole
+// HTTP/2 connection -- or, from a server Garuda connects to, a response head,
+// a Redis reply or a PostgreSQL backend message. A crash in any of them is
+// reachable from the network.
 //
 // "Does not crash" is the weakest thing a fuzzer can check and the easiest to
 // pass by accident, so each target also states an invariant that a corrupted
@@ -18,7 +21,9 @@
 //     split, because on a socket the splits are the peer's choice;
 //   * a parse that succeeds from a longer buffer succeeds the same way from
 //     exactly the bytes it claimed to consume, which is what makes a
-//     pipelined stream separable at all.
+//     pipelined stream separable at all;
+//   * whatever a connection sends back, however it was provoked, is legible
+//     to a client, and the connection still ends when the client goes.
 //
 // The targets are a library rather than part of the driver so that the same
 // code runs two ways: `pgfuzz` mutates inputs against it, and the test suite
@@ -27,18 +32,35 @@
 //===----------------------------------------------------------------------===//
 
 import Garuda
-import AvianCore
-import AvianHTTP
-import AvianQUIC
+import GarudaWire
+import VegaQUIC
+import VegaPostgres
+import VegaRedis
 
 public enum FuzzTarget: String, CaseIterable, Sendable {
     case httpHead = "http-head"
+    case httpResponse = "http-response"
     case chunked = "chunked"
     case hpack = "hpack"
+    case qpack = "qpack"
     case websocket = "websocket"
     case quicPacket = "quic-packet"
+    case quicFrames = "quic-frames"
+    case tlsHello = "tls-hello"
+    case h2 = "h2"
+    case h3 = "h3"
     case json = "json"
     case resp = "resp"
+    case postgres = "postgres"
+
+    /// Whether an input runs a connection, which takes milliseconds where a
+    /// parse takes microseconds.
+    public var isConnection: Bool {
+        switch self {
+        case .quicFrames, .tlsHello, .h2, .h3: return true
+        default: return false
+        }
+    }
 }
 
 public enum Fuzz {
@@ -52,12 +74,19 @@ public enum Fuzz {
                            _ input: UnsafePointer<UInt8>, _ count: Int) -> String? {
         switch target {
         case .httpHead: return httpHead(input, count)
+        case .httpResponse: return httpResponse(input, count)
         case .chunked: return chunked(input, count)
         case .hpack: return hpack(input, count)
+        case .qpack: return qpack(input, count)
         case .websocket: return websocket(input, count)
         case .quicPacket: return quicPacket(input, count)
+        case .quicFrames: return quicFrames(input, count)
+        case .tlsHello: return tlsHello(input, count)
+        case .h2: return h2(input, count)
+        case .h3: return h3(input, count)
         case .json: return json(input, count)
         case .resp: return resp(input, count)
+        case .postgres: return postgres(input, count)
         }
     }
 
@@ -136,6 +165,113 @@ public enum Fuzz {
             var again = RedisParser(limits: respLimits)
             guard let (exact, used) = try? again.parse(base, consumed), exact == .value(value), used == consumed else {
                 return "a reply of \(consumed) bytes does not read the same from its own bytes"
+            }
+        }
+        return nil
+    }
+
+    // MARK: - PostgreSQL backend messages
+
+    /// A stream of backend messages, as a connection reads them: framed one
+    /// after another, each body handed to the reader its type byte names.
+    private static func postgres(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
+        // A limit derived from the length, so short inputs land on both sides
+        // of it, and the same on every run of the same input.
+        let maxLength = 16 &+ (n & 511)
+        var columns: [PostgresColumn] = []
+        var values: [Range<Int>?] = []
+        var offset = 0
+        while offset < n {
+            let framed = PostgresBackend.frame(base + offset, n - offset, maxLength: maxLength)
+            guard case .frame(let frame) = framed else { break }
+            if frame.bodyOffset != 5 || frame.bodyLength < 0 || frame.total > n - offset {
+                return "a frame of \(frame.bodyOffset)+\(frame.bodyLength) at \(offset) of \(n) bytes"
+            }
+            // The connection frames whatever its buffer holds, so the same
+            // message must frame the same from exactly its own bytes, and not
+            // at all from one byte fewer.
+            if PostgresBackend.frame(base + offset, frame.total, maxLength: maxLength) != framed {
+                return "a message of \(frame.total) bytes frames differently from its own bytes"
+            }
+            if PostgresBackend.frame(base + offset, frame.total - 1, maxLength: maxLength) != .incomplete {
+                return "a message of \(frame.total) bytes frames from \(frame.total - 1)"
+            }
+            let body = base + offset + frame.bodyOffset
+            if let bad = postgresMessage(frame.type, body, frame.bodyLength, &columns, &values) {
+                return bad
+            }
+            offset += frame.total
+        }
+        return nil
+    }
+
+    private static func postgresMessage(_ type: UInt8, _ body: UnsafePointer<UInt8>, _ length: Int,
+                                        _ columns: inout [PostgresColumn],
+                                        _ values: inout [Range<Int>?]) -> String? {
+        let reader = PostgresReader(body, length)
+        switch type {
+        case UInt8(ascii: "R"): _ = try? PostgresBackend.authentication(reader)
+        case UInt8(ascii: "S"): _ = try? PostgresBackend.parameterStatus(reader)
+        case UInt8(ascii: "K"): _ = try? PostgresBackend.backendKeyData(reader)
+        case UInt8(ascii: "A"): _ = try? PostgresBackend.notification(reader)
+        case UInt8(ascii: "Z"): _ = try? PostgresBackend.readyForQuery(reader)
+        case UInt8(ascii: "C"): _ = try? PostgresBackend.commandComplete(reader)
+        case UInt8(ascii: "E"), UInt8(ascii: "N"): _ = try? PostgresBackend.errorFields(reader)
+        case UInt8(ascii: "t"): _ = try? PostgresBackend.parameterDescription(reader)
+        case UInt8(ascii: "T"):
+            if let described = try? PostgresBackend.rowDescription(reader) { columns = described }
+        case UInt8(ascii: "D"):
+            guard (try? PostgresBackend.dataRow(reader, into: &values)) != nil else { return nil }
+            let bytes = Array(UnsafeBufferPointer(start: body, count: length))
+            for (i, range) in values.enumerated() {
+                guard let range else { continue }
+                // A value is read through its range, so one outside the body
+                // is a read of whatever follows the message in the buffer.
+                if range.lowerBound < 0 || range.upperBound > length {
+                    return "column \(i) is \(range) of a \(length)-byte row"
+                }
+                let column = i < columns.count ? columns[i] : nil
+                if let bad = postgresValue(bytes[range], column) { return "column \(i): \(bad)" }
+            }
+        case UInt8(ascii: "d"):
+            // COPY data, in the text format.
+            let bytes = Array(UnsafeBufferPointer(start: body, count: length))
+            for row in PostgresCopyText.rows(bytes[...]) {
+                // A row read from the server is written back unchanged by
+                // a client that copies between tables, so the encoding has to
+                // invert the decoding.
+                var line = PostgresCopyText.encode(row)
+                line.removeLast()
+                let again = PostgresCopyText.decode(line[...])
+                if again != row { return "the COPY row \(row) reads back as \(again)" }
+            }
+        default:
+            break
+        }
+        return nil
+    }
+
+    /// A column's value, through every decoder that could be handed it.
+    private static func postgresValue(_ bytes: ArraySlice<UInt8>, _ column: PostgresColumn?) -> String? {
+        if column?.binary ?? true {
+            _ = PostgresBinary.integer(bytes)
+            _ = PostgresBinary.float8(bytes)
+            _ = PostgresBinary.float4(bytes)
+            _ = PostgresBinary.bool(bytes)
+            _ = PostgresBinary.text(bytes, type: column?.typeOID ?? 25)
+            _ = PostgresBinary.dateDays(bytes)
+            _ = PostgresBinary.timeMicroseconds(bytes)
+            _ = PostgresBinary.interval(bytes)
+            _ = PostgresBinary.numeric(bytes)
+            _ = PostgresBinary.timestampMicroseconds(bytes)
+        }
+        // An array in the text format. What parses must survive being
+        // written back as a parameter: that is how a client sends an array.
+        let text = String(decoding: bytes, as: UTF8.self)
+        if let elements = PostgresArrayText.parse(text) {
+            let formatted = PostgresArrayText.format(elements)
+            guard let again = PostgresArrayText.parse(formatted), again == elements else {
+                return "the array \(elements) does not read back from \(formatted)"
             }
         }
         return nil
@@ -267,12 +403,7 @@ public enum Fuzz {
                               ("path", head.path), ("query", head.query)] {
             if let bad = outside(slice, head.headEnd, what) { return bad }
         }
-        var i = 0
-        while i < head.headerCount {
-            if let bad = outside(headers[i].name, head.headEnd, "header \(i) name") { return bad }
-            if let bad = outside(headers[i].value, head.headEnd, "header \(i) value") { return bad }
-            i &+= 1
-        }
+        if let bad = headerSlices(headers, head.headerCount, head.headEnd) { return bad }
 
         // The parser is re-run from the start of the buffer on every read, so
         // a head that is complete inside a longer buffer must still be
@@ -290,6 +421,55 @@ public enum Fuzz {
                 return "the head ends at \(head.headEnd) in \(n) bytes and at "
                     + "\(again.headEnd) on its own"
             }
+        }
+        return nil
+    }
+
+    // MARK: - HTTP/1 response head
+
+    /// What the client reads from a server it connected to: the same checks
+    /// as a request head, on the parser that reads the other direction.
+    private static func httpResponse(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
+        let headers = UnsafeMutablePointer<HTTPHeaderRef>.allocate(capacity: maxHeaders)
+        defer { headers.deallocate() }
+        var head = HTTPResponseHead()
+        let result = HTTPResponseParser.parse(base, n, maxHeadSize: maxHeadSize,
+                                              maxHeaders: maxHeaders, headers: headers, head: &head)
+        guard case .complete = result else { return nil }
+        if head.headEnd < 0 || head.headEnd > n {
+            return "headEnd \(head.headEnd) is outside the \(n) bytes parsed"
+        }
+        if head.headerCount < 0 || head.headerCount > maxHeaders {
+            return "headerCount \(head.headerCount) is outside 0...\(maxHeaders)"
+        }
+        if head.status < 100 || head.status > 999 {
+            return "a status of \(head.status)"
+        }
+        if let bad = outside(head.reason, head.headEnd, "reason") { return bad }
+        if let bad = headerSlices(headers, head.headerCount, head.headEnd) { return bad }
+        if head.headEnd < n {
+            var again = HTTPResponseHead()
+            let repeated = HTTPResponseParser.parse(base, head.headEnd, maxHeadSize: maxHeadSize,
+                                                    maxHeaders: maxHeaders, headers: headers, head: &again)
+            guard case .complete = repeated, again.headEnd == head.headEnd else {
+                return "a response head of \(head.headEnd) bytes does not parse the same on its own"
+            }
+            // What follows the head is read by the framing it chose, so a
+            // longer buffer must not change that choice.
+            if again.framing(method: .get) != head.framing(method: .get) {
+                return "the body framing depends on bytes after the head"
+            }
+        }
+        return nil
+    }
+
+    private static func headerSlices(_ headers: UnsafeMutablePointer<HTTPHeaderRef>, _ count: Int,
+                                     _ limit: Int) -> String? {
+        var i = 0
+        while i < count {
+            if let bad = outside(headers[i].name, limit, "header \(i) name") { return bad }
+            if let bad = outside(headers[i].value, limit, "header \(i) value") { return bad }
+            i &+= 1
         }
         return nil
     }
@@ -411,13 +591,17 @@ public enum Fuzz {
         } catch {
             return "the same block decoded once and then threw"
         }
-        if fields.count != again.count {
-            return "the same block decoded to \(fields.count) fields and then \(again.count)"
+        return compare(fields, again, "two decoders")
+    }
+
+    private static func compare(_ a: [([UInt8], [UInt8])], _ b: [([UInt8], [UInt8])], _ what: String) -> String? {
+        if a.count != b.count {
+            return "the same block decoded to \(a.count) fields and \(b.count), in \(what)"
         }
         var i = 0
-        while i < fields.count {
-            if fields[i].0 != again[i].0 || fields[i].1 != again[i].1 {
-                return "field \(i) differs between two decodes of the same block"
+        while i < a.count {
+            if a[i].0 != b[i].0 || a[i].1 != b[i].1 {
+                return "field \(i) differs between \(what)"
             }
             i &+= 1
         }
@@ -428,13 +612,66 @@ public enum Fuzz {
         Array(UnsafeBufferPointer(start: p, count: n))
     }
 
+    // MARK: - QPACK
+
+    /// An HTTP/3 field section. With no dynamic table the decoder holds no
+    /// state between sections, so the same section must decode the same way
+    /// twice in one decoder -- which is also what catches a span left
+    /// pointing into scratch space the second decode reused.
+    private static func qpack(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
+        var decoder = QPACKDecoder()
+        defer { decoder.destroy() }
+        // A cap derived from the length, so short inputs reach it.
+        decoder.maximumFieldSectionSize = 64 &+ (n & 1023)
+        func decode() -> Result<[([UInt8], [UInt8])], Bad> {
+            var fields: [([UInt8], [UInt8])] = []
+            var size = 0
+            do {
+                try decoder.decode(base, n) { span in
+                    if span.nameLength < 0 || span.valueLength < 0 {
+                        throw Bad("a decoded field had lengths \(span.nameLength)/\(span.valueLength)")
+                    }
+                    size += span.nameLength + span.valueLength + 32
+                    fields.append((copy(span.name, span.nameLength), copy(span.value, span.valueLength)))
+                }
+            } catch let bad as Bad {
+                return .failure(bad)
+            } catch {
+                return .success([])
+            }
+            // The cap is what keeps a peer from making the server hold more
+            // than it agreed to, so a section past it must not get through.
+            if size > decoder.maximumFieldSectionSize {
+                return .failure(Bad("a section of \(size) bytes passed a cap of \(decoder.maximumFieldSectionSize)"))
+            }
+            return .success(fields)
+        }
+        let first: [([UInt8], [UInt8])]
+        switch decode() {
+        case .failure(let bad): return bad.reason
+        case .success(let fields): first = fields
+        }
+        switch decode() {
+        case .failure(let bad): return bad.reason
+        case .success(let again): return compare(first, again, "two decodes in one decoder")
+        }
+    }
+
+    struct Bad: Error {
+        let reason: String
+        init(_ reason: String) { self.reason = reason }
+    }
+
     // MARK: - WebSocket frame header
 
     private static let maxPayload = 1 << 20
 
     private static func websocket(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
-        guard case .header(let h) = WebSocketCodec.parseHeader(base, n,
-                                                               maxPayload: maxPayload) else {
+        // RSV1 is permessage-deflate's, allowed only when it was agreed, so
+        // both ways are fuzzed; which one follows from the input.
+        let allowRSV1 = n & 1 == 1
+        guard case .header(let h) = WebSocketCodec.parseHeader(base, n, maxPayload: maxPayload,
+                                                               allowRSV1: allowRSV1) else {
             return nil
         }
         if h.headerLength <= 0 || h.headerLength > n {
@@ -446,11 +683,14 @@ public enum Fuzz {
         if h.totalLength < h.headerLength {
             return "totalLength \(h.totalLength) is below the header alone"
         }
+        if h.rsv1 && !allowRSV1 {
+            return "RSV1 was accepted with no extension agreed"
+        }
         // The header is exactly as long as it says, so it must parse the same
         // way from exactly that much: the caller uses headerLength to find
         // where the payload starts.
-        guard case .header(let again) = WebSocketCodec.parseHeader(base, h.headerLength,
-                                                                   maxPayload: maxPayload) else {
+        guard case .header(let again) = WebSocketCodec.parseHeader(base, h.headerLength, maxPayload: maxPayload,
+                                                                   allowRSV1: allowRSV1) else {
             return "a header of \(h.headerLength) bytes does not parse from its own bytes"
         }
         if again.headerLength != h.headerLength || again.payloadLength != h.payloadLength
@@ -463,8 +703,7 @@ public enum Fuzz {
     // MARK: - QUIC packet header
 
     private static func quicPacket(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
-        let localCIDLength = 8
-        let h = QUICPacket.parseHeader(base, n, localCIDLength: localCIDLength)
+        let h = QUICPacket.parseHeader(base, n, localCIDLength: quicLocalCIDLength)
         guard h.isValid else { return nil }
         if h.end < 0 || h.end > n {
             return "the packet ends at \(h.end) of \(n) bytes"
@@ -473,10 +712,16 @@ public enum Fuzz {
             return "the packet number starts at \(h.pnOffset), outside a packet ending at \(h.end)"
         }
         if h.isLong {
-            let tokenEnd = h.token.count
-            if tokenEnd < 0 || tokenEnd > n {
-                return "a token of \(tokenEnd) bytes came out of \(n)"
+            let tokenStart = h.token.base - base
+            if h.token.count < 0 || (h.token.count > 0 && (tokenStart < 0 || tokenStart + h.token.count > h.pnOffset)) {
+                return "a token of \(h.token.count) bytes at \(tokenStart), past the header's \(h.pnOffset)"
             }
+        }
+        // A datagram holds packets end to end, and the next is found where
+        // this one ends, so this one must read the same from its own bytes.
+        let again = QUICPacket.parseHeader(base, h.end, localCIDLength: quicLocalCIDLength)
+        if !again.isValid || again.end != h.end || again.pnOffset != h.pnOffset || again.type != h.type {
+            return "a packet of \(h.end) bytes does not parse the same from its own bytes"
         }
         return nil
     }

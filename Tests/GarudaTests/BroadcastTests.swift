@@ -1,15 +1,27 @@
 import Testing
-import CAvian
+import CGarudaShared
+import GarudaTesting
+import Synchronization
+import Vega
 @testable import Garuda
 
-// Topics and subscriptions within one worker: delivery, reading back after a
-// Last-Event-ID, a subscriber that falls behind, publishing from a blocking
-// thread, WebSockets, and an event stream's keep-alive. Every worker hearing
-// every other is scripts/broadcast-test.py's, against a server with several.
+// Topics and subscriptions within one process: delivery, reading back after
+// a Last-Event-ID, a subscriber that falls behind, publishing from a thread
+// that is not the runtime's, and a writer that died holding the ring. Every
+// shard hearing every other is scripts/broadcast-test.py's, against a server
+// with several.
 
 /// A topic of its own for each test: the ring is one for the whole process.
 private func topic(_ name: String) -> Topic {
-    Topic("test/\(name)/\(av_monotonic_us())")
+    Topic("test/\(name)/\(monotonicNanos())")
+}
+
+/// A ring of its own, for a test that needs settings the process's lacks.
+private func ownBus(queue: Int) -> TopicBus {
+    let size = gb_bus_region_size(1 << 16, 4)
+    let memory = UnsafeMutableRawBufferPointer.allocate(byteCount: size, alignment: 64)
+    memory.initializeMemory(as: UInt8.self, repeating: 0)
+    return TopicBus(region: memory, ringBytes: 1 << 16, slots: 4, queueLimit: queue)!
 }
 
 @Suite("Broadcast")
@@ -17,7 +29,7 @@ struct BroadcastTests {
     @Test func aSubscriberHearsWhatIsPublishedAfterItSubscribed() throws {
         let room = topic("hear")
         let app = Application()
-        app.get("/listen") { () async in
+        app.get("/listen") { () async -> EventStream in
             EventStream { events in
                 try room.publish("before")
                 let messages = try events.subscribe(room)
@@ -41,12 +53,12 @@ struct BroadcastTests {
     @Test func lastEventIDSendsWhatWasMissedFirst() throws {
         let room = topic("replay")
         let app = Application()
-        app.post("/publish") { () in
+        app.post("/publish") { () throws -> String in
             var ids: [String] = []
             for i in 1...4 { ids.append(try room.publish("m\(i)").description) }
             return ids.joined(separator: " ")
         }
-        app.get("/listen") { (last: LastEventID) async in
+        app.get("/listen") { (last: LastEventID) async -> EventStream in
             EventStream { events in
                 let messages = try events.subscribe(room, after: last)
                 try room.publish("live")
@@ -58,7 +70,7 @@ struct BroadcastTests {
             }
         }
         let client = app.test
-        let ids = try client.post("/publish", body: []).text.split(separator: " ").map(String.init)
+        let ids = try client.post("/publish", body: "").text.split(separator: " ").map(String.init)
         #expect(ids.count == 4)
         let resumed = try client.get("/listen", headers: [("last-event-id", ids[1])])
         #expect(resumed.text == "data: m3\n\ndata: m4\n\ndata: live\n\n")
@@ -69,9 +81,9 @@ struct BroadcastTests {
     @Test func anIDOlderThanTheRingIsAGap() throws {
         let room = topic("old")
         let app = Application()
-        app.get("/listen") { () async in
+        app.get("/listen") { () async -> EventStream in
             EventStream { events in
-                // A number from before this ring was mapped: long gone.
+                // A number from before this ring was laid out: long gone.
                 let messages = try events.subscribe(room, after: LastEventID("5"))
                 try room.publish("live")
                 #expect(try await messages.next() == .missed)
@@ -83,49 +95,44 @@ struct BroadcastTests {
         #expect(try app.test.get("/listen").text == "data: live\n\n")
     }
 
-    @Test func aSubscriberThatFallsBehindIsToldItMissedSome() throws {
-        let room = topic("behind")
-        let app = Application()
-        app.get("/listen") { () async in
-            EventStream { events in
-                let messages = try events.subscribe(room)
-                for i in 1...5 { try room.publish("m\(i)") }
-                var seen: [String] = []
-                for _ in 0..<3 {
-                    switch try await messages.next() {
-                    case .message(let message): seen.append(message.text)
-                    case .missed: seen.append("missed")
-                    }
-                }
-                try room.publish("after")
-                if case .message(let message) = try await messages.next() { seen.append(message.text) }
-                try await events.send(seen.joined(separator: ","))
+    @Test func aSubscriberThatFallsBehindIsToldItMissedSome() async throws {
+        let bus = ownBus(queue: 2)
+        let room = Topic("behind")
+        let messages = try bus.subscribe([room], after: nil) { true }
+        var seen: [String] = []
+        for i in 1...5 { _ = try bus.publish(room.name, event: nil, Array("m\(i)".utf8)) }
+        // Delivered by the listener thread: all five, before any is taken.
+        try await Task.sleep(for: .milliseconds(50))
+        for _ in 0..<3 {
+            switch try await messages.next() {
+            case .message(let message): seen.append(message.text)
+            case .missed: seen.append("missed")
             }
         }
-        var config = ServerConfig()
-        config.maxConnections = 16
-        config.broadcastQueue = 2
-        let response = try app.testClient(configuration: config).get("/listen")
-        #expect(response.text == "data: m1,m2,missed,after\n\n")
+        _ = try bus.publish(room.name, event: nil, Array("after".utf8))
+        if case .message(let message) = try await messages.next() { seen.append(message.text) }
+        #expect(seen == ["m1", "m2", "missed", "after"])
     }
 
     @Test func aWaitWithATimeoutEndsEmpty() throws {
         let room = topic("timeout")
         let app = Application()
-        app.onAsync(.get, "/poll") { _, response in
+        app.get("/poll") { _, response in
             let messages = try response.subscribe(room)
-            let event = try await messages.next(timeoutMilliseconds: 20)
-            response.send(event == nil ? "nothing" : "something")
+            let started = monotonicNanos()
+            let event = try await messages.next(timeoutMilliseconds: 40)
+            let waited = (monotonicNanos() - started) / 1_000_000
+            response.send(event == nil && waited >= 40 && waited < 1000 ? "nothing" : "something \(waited)")
         }
         #expect(try app.test.get("/poll").text == "nothing")
     }
 
-    @Test func aMessagePublishedOffTheWorkerIsHeard() throws {
+    @Test func aMessagePublishedOffTheRuntimeIsHeard() throws {
         let room = topic("blocking")
         let app = Application()
-        app.onAsync(.get, "/poll") { _, response in
+        app.get("/poll") { _, response in
             let messages = try response.subscribe(room)
-            try await blocking { try room.publish("from a pool thread") }
+            try await Runtime.blocking { try room.publish("from a pool thread") }
             if case .message(let message) = try await messages.next() {
                 response.send(message.text)
             }
@@ -136,62 +143,62 @@ struct BroadcastTests {
     @Test func aCancelledSubscriptionHearsNothingMore() throws {
         let room = topic("cancel")
         let app = Application()
-        app.onAsync(.get, "/poll") { _, response in
+        app.get("/poll") { _, response in
             let messages = try response.subscribe(room)
             messages.cancel()
             try room.publish("unheard")
             do {
                 _ = try await messages.next()
                 response.send("heard")
-            } catch is CancellationError {
+            } catch {
                 response.send("cancelled")
             }
         }
         #expect(try app.test.get("/poll").text == "cancelled")
     }
 
-    @Test func aWebSocketSubscribes() throws {
-        let room = topic("ws")
-        let app = Application()
-        app.webSocket("/chat") { (ws: WebSocket) async throws in
-            let messages = try ws.subscribe(room)
-            while let incoming = try await ws.receive() {
-                guard case .text(let text) = incoming else { continue }
-                try room.publish(text, event: "said")
-                guard case .message(let message) = try await messages.next() else { continue }
-                try await ws.send("\(message.event ?? "") \(message.text)")
-            }
+    @Test func aSubscriptionLetGoOfIsForgotten() async throws {
+        let bus = ownBus(queue: 8)
+        do {
+            let messages = try bus.subscribe([Topic("gone")], after: nil) { true }
+            #expect(!messages.isCancelled)
         }
-        let ws = try app.test.webSocket("/chat")
-        try ws.send("hello")
-        #expect(try ws.receive() == .text("said hello"))
-        try ws.send("again")
-        #expect(try ws.receive() == .text("said again"))
-        try ws.close()
+        // Nothing holds it now: a publish finds nobody to queue for.
+        _ = try bus.publish("gone", event: nil, Array("x".utf8))
+        let again = try bus.subscribe([Topic("gone")], after: nil) { true }
+        #expect(try await again.next(timeoutMilliseconds: 20) == nil)
     }
 
-    @Test func aQuietEventStreamIsSentKeepAliveComments() throws {
-        let app = Application()
-        app.get("/quiet") { () async in
-            EventStream(keepAlive: 1) { events in
-                try await events.sleep(milliseconds: 2300)
-                try await events.send("done")
+    @Test func aStreamThatEndsEndsItsWait() async throws {
+        let bus = ownBus(queue: 8)
+        let open = Mutex(true)
+        let messages = try bus.subscribe([Topic("ends")], after: nil) { open.withLock { $0 } }
+        let waiting = Task { () -> Bool in
+            do {
+                _ = try await messages.next()
+                return false
+            } catch {
+                return true
             }
         }
-        let text = try app.test.get("/quiet").text
-        #expect(text.hasPrefix(":\n\n"))
-        #expect(text.hasSuffix("data: done\n\n"))
+        try await Task.sleep(for: .milliseconds(20))
+        open.withLock { $0 = false }
+        // The listener looks at least every quarter of a second.
+        #expect(await waiting.value)
     }
 
-    @Test func keepAliveCanBeTurnedOff() throws {
-        let app = Application()
-        app.get("/quiet") { () async in
-            EventStream(keepAlive: 0) { events in
-                try await events.sleep(milliseconds: 1300)
-                try await events.send("done")
-            }
+    @Test func aWriterThatDiedHoldingTheRingIsTakenOver() async throws {
+        let bus = ownBus(queue: 8)
+        let messages = try bus.subscribe([Topic("dead")], after: nil) { true }
+        // A process ID nothing has: past Linux's and Darwin's limits.
+        gb_bus_test_abandon(bus.handle, 0x3FFF_FFF0)
+        let id = try bus.publish("dead", event: nil, Array("after".utf8))
+        guard case .message(let message) = try await messages.next() else {
+            Issue.record("expected a message")
+            return
         }
-        #expect(try app.test.get("/quiet").text == "data: done\n\n")
+        #expect(message.id == id)
+        #expect(message.text == "after")
     }
 
     @Test func broadcastIDsAreDecimalDigitsOnly() {
@@ -207,9 +214,9 @@ struct BroadcastTests {
 
     @Test func aMessageTooLargeIsRefused() throws {
         let room = topic("large")
+        let max = try TopicBus.current().maxMessage
         #expect(throws: BroadcastError.tooLarge) {
-            _ = TestClient.broadcastRing
-            try room.publish([UInt8](repeating: 0, count: Int(av_bus_max_message()) + 1))
+            try room.publish([UInt8](repeating: 0, count: max + 1))
         }
     }
 }

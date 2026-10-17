@@ -1,6 +1,7 @@
 import Testing
-import AvianCore
 @testable import Garuda
+import GarudaTesting
+import GarudaWire
 
 private struct Credentials: Codable, Equatable {
     var user: String

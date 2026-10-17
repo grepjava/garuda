@@ -1,11 +1,13 @@
 //===----------------------------------------------------------------------===//
-// One HTTP/1.1 exchange over a connection this worker made.
+// The HTTP client: one exchange over a connection it made or kept.
 //
-// The three pieces next door -- the URL splitter, the request writer and the
-// response parser -- each do one thing and none of them touches a socket. This
-// is what puts them together: parse a URL, open or reuse a connection, write a
-// request, read a response, and decide whether what is left is fit to hand to
-// the next caller.
+//     let answer = try await HTTPClient().get("https://example.com/status")
+//
+// The three pieces in GarudaWire -- the URL splitter, the request writer and
+// the response parser -- each do one thing and none of them touches a socket.
+// This is what puts them together: parse a URL, open or reuse a connection,
+// write a request, read a response, and decide whether what is left is fit
+// to hand to the next caller.
 //
 // That last decision is the one that matters. A connection goes back to the
 // pool only when the response was read whole and both ends still mean to keep
@@ -24,24 +26,25 @@
 //     decoded before it is returned, unless `decompress` is off.
 //   * Over TLS, ALPN offers h2 and http/1.1, and an HTTP/2 connection is
 //     shared by every request to the same origin (HTTP2Client.swift).
+//
+// A client is a value, made where it is needed; what it shares -- the kept
+// connections -- belongs to the process (HTTPClientConnections.swift).
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import AvianHTTP
+import GarudaWire
+import Vega
 
 /// Why an exchange did not finish.
 public enum ClientError: Error, Equatable {
     /// The URL could not be read. Carries what was wrong with it.
     case url(HTTPURLError)
-    /// The connection could not be made, or did not survive. Carries the
-    /// reason from the layer that owns connections.
+    /// The connection could not be made.
     case connect(OutboundError)
     /// A header this client owns, or one that could split the request. The
     /// writer refused it and nothing was sent.
     case refusedHeader
-    /// The peer went away part way through. Distinct from `connect(.failed)`:
-    /// the connection was fine and then stopped, which usually means the far
+    /// The peer went away part way through. Distinct from `connect`: the
+    /// connection was fine and then stopped, which usually means the far
     /// end decided something about this request.
     case closed
     /// What came back was not a response this can frame. Carries the parser's
@@ -51,7 +54,7 @@ public enum ClientError: Error, Equatable {
     /// The response head was larger than `maxHeadBytes`.
     case headTooLarge
     /// The response body was larger than `maxBodyBytes`. The connection is
-    /// closed rather than pooled: what is left on it is the rest of a body
+    /// closed rather than kept: what is left on it is the rest of a body
     /// nobody is going to read.
     case bodyTooLarge
     /// It did not finish inside the time allowed.
@@ -61,7 +64,7 @@ public enum ClientError: Error, Equatable {
     case undecodableBody
     /// More redirects in a row than `redirects` allows.
     case tooManyRedirects
-    /// The request that wanted it ended, or the worker is shutting down.
+    /// The task that made the request was cancelled.
     case cancelled
     /// The peer broke HTTP/2 framing: a frame longer than was agreed, a header
     /// block interleaved with another frame, a stream identifier for a stream
@@ -70,18 +73,38 @@ public enum ClientError: Error, Equatable {
     /// The peer reset this stream, or went away without answering it. Carries
     /// its error code, which is the only thing it said about why.
     case streamReset(UInt32)
+
+    /// A wait that failed: out of time, cancelled, or the connection gone.
+    init(_ error: IOError) {
+        if error == .timedOut { self = .timedOut }
+        else if error == .cancelled { self = .cancelled }
+        else { self = .closed }
+    }
+
+    /// The case alone, without what it carries: `error.type` on a span is
+    /// meant to be one of a few values, not a message.
+    var kind: String {
+        String(String(describing: self).prefix { $0 != "(" })
+    }
 }
 
 public struct ClientHeader: Sendable, Equatable {
     public let name: String
     public let value: String
+
+    public init(name: String, value: String) {
+        self.name = name
+        self.value = value
+    }
 }
 
-/// A response, owned. Every byte is copied out of the connection buffer before
-/// this is returned, because the buffer is reused and the caller keeps this.
+/// A response, owned. Every byte is copied out of the connection's buffer
+/// before this is returned, because the buffer is reused and the caller
+/// keeps this.
 public struct ClientResponse: Sendable {
     public let status: Int
-    /// The reason phrase, which a server may legitimately leave empty.
+    /// The reason phrase, which a server may legitimately leave empty, and
+    /// HTTP/2 does not have.
     public let reason: String
     public let headers: [ClientHeader]
     public let body: [UInt8]
@@ -96,53 +119,41 @@ public struct ClientResponse: Sendable {
 
     /// The first value of `name`, compared without regard to case.
     public func header(_ name: String) -> String? {
-        for field in headers where field.name.count == name.count {
-            if field.name.lowercased() == name.lowercased() { return field.value }
-        }
-        return nil
+        headers.first { named($0.name, name) }?.value
     }
 }
 
-/// Makes requests on the worker that owns this handler.
+/// Makes HTTP requests, from a handler or anywhere else on a Vega runtime.
 ///
-/// Taken from a request *before* the first `await`: a `Request` is a view of a
-/// connection slot and does not outlive a suspension, while the worker pointer
-/// does.
-///
-///     let client = request.client
-///     let answer = try await client.get("https://example.com/status")
-public struct HTTPClient {
-    let worker: UnsafeMutablePointer<Worker>
-
+///     var client = HTTPClient()
+///     client.timeout = .seconds(2)
+///     let answer = try await client.get("https://api.example.com/v1/rates")
+public struct HTTPClient: Sendable {
     /// How long any one wait may take: connecting, writing, or waiting for
     /// more of a response. A peer that answers slowly but steadily is never
-    /// cut off by this; `totalTimeoutMilliseconds` is what bounds the whole.
-    public var timeoutMilliseconds: UInt64 = 10_000
+    /// cut off by this; `totalTimeout` is what bounds the whole.
+    public var timeout: Duration = .seconds(10)
     /// How long the whole exchange may take, redirects included: the lookup,
     /// connecting, writing the request and reading the response to its end.
     /// For `stream`, everything up to the response head, after which each
-    /// read of the body is bounded by `timeoutMilliseconds` alone -- a stream
-    /// may rightly run for as long as the caller keeps reading it. Nil, the
-    /// default, sets no budget beyond the per-wait one.
+    /// read of the body is bounded by `timeout` alone -- a stream may rightly
+    /// run for as long as the caller keeps reading it. Nil, the default,
+    /// sets no budget beyond the per-wait one.
     ///
-    /// For work that is not a route's, whose deadline would otherwise bound
-    /// it: a background job, a call made at startup, a retry loop.
-    public var totalTimeoutMilliseconds: UInt64? = nil
+    /// A route's deadline (`app.deadline`) bounds a call made in its handler
+    /// whatever this says.
+    public var totalTimeout: Duration? = nil
     public var maxHeadBytes: Int = 32 * 1024
     public var maxBodyBytes: Int = 8 * 1024 * 1024
     public var maxHeaders: Int = 100
-    /// A trust store for https. Empty means the system's.
+    /// A trust store for https, as a PEM file. Empty means the system's.
     public var caFile: String = ""
     /// What to offer over ALPN on an encrypted connection, most preferred
     /// first. The server chooses, and the client speaks whichever it chose.
-    ///
-    /// HTTP/2 first now that a connection is kept and shared. Before that it
-    /// would have been slower than HTTP/1.1, not faster: a pooled HTTP/1.1
-    /// connection is reused, while an HTTP/2 one used once and closed costs a
-    /// TLS handshake per request. Plaintext is always HTTP/1.1 -- there is no
-    /// ALPN without TLS, and sending the HTTP/2 preface to a server that
-    /// never agreed to it reads there as a malformed request.
-    var alpn: String = "h2,http/1.1"
+    /// Plaintext is always HTTP/1.1 -- there is no ALPN without TLS, and
+    /// sending the HTTP/2 preface to a server that never agreed to it reads
+    /// there as a malformed request.
+    var alpn: [String] = ["h2", "http/1.1"]
     /// Sent unless the caller sets its own.
     public var userAgent: String = "garuda"
     /// Asks for compressed responses with the codings this process can
@@ -155,51 +166,45 @@ public struct HTTPClient {
     public var redirects: RedirectPolicy = .none
     /// Speak HTTP/2 whatever ALPN said, including on a plaintext connection.
     ///
-    /// Internal, and only for tests. ALPN is what chooses in production, and
-    /// ALPN needs TLS -- so without this every test of the frame loop would
-    /// also be a test of OpenSSL, and a framing bug would be indistinguishable
-    /// from a handshake one. This is not RFC 9113's prior-knowledge mode:
-    /// nothing negotiates, and pointing it at an ordinary HTTP/1.1 server
-    /// sends a preface that server will read as a malformed request.
+    /// Internal, and only for tests: without it every test of the frame loop
+    /// would also be a test of TLS. This is not RFC 9113's prior-knowledge
+    /// mode: nothing negotiates, and pointing it at an ordinary HTTP/1.1
+    /// server sends a preface that server will read as a malformed request.
     var forceHTTP2 = false
-    /// When the exchange under way must be over, on the monotonic clock, or 0
-    /// for no deadline beyond each wait's own. Set from
-    /// `totalTimeoutMilliseconds` when an exchange starts.
-    var deadline: UInt64 = 0
+    /// When the exchange under way must be over, or nil for no deadline
+    /// beyond each wait's own. Set from `totalTimeout` when an exchange
+    /// starts.
+    var deadline: ContinuousClock.Instant? = nil
 
-    init(worker: UnsafeMutablePointer<Worker>) {
-        self.worker = worker
-    }
+    public init() {}
 
     /// This client with the deadline for one exchange set, if it has a total.
     func startingExchange() -> HTTPClient {
-        guard let total = totalTimeoutMilliseconds else { return self }
+        guard let totalTimeout else { return self }
         var started = self
-        started.deadline = av_monotonic_ms() &+ max(1, total)
+        started.deadline = .now + max(totalTimeout, .milliseconds(1))
         return started
     }
 
-    /// How long the next wait may take: `timeoutMilliseconds`, or what is
-    /// left of the exchange's deadline if that is sooner. `timedOut` once the
-    /// deadline has passed.
-    func waitBudget() throws(ClientError) -> UInt64 {
-        guard deadline != 0 else { return timeoutMilliseconds }
-        let now = av_monotonic_ms()
+    /// When the next wait gives up: `timeout` from now, or the exchange's
+    /// deadline if that is sooner. `timedOut` once the deadline has passed.
+    func waitDeadline() throws(ClientError) -> ContinuousClock.Instant {
+        let now = ContinuousClock.now
+        let own = now + timeout
+        guard let deadline else { return own }
         guard now < deadline else { throw .timedOut }
-        return min(timeoutMilliseconds, deadline &- now)
+        return min(own, deadline)
     }
 
-    /// When a wait starting `now` gives up: `timeoutMilliseconds` on, or the
-    /// exchange's deadline if that is sooner.
-    func waitDeadline(from now: UInt64) -> UInt64 {
-        let own = now &+ timeoutMilliseconds
-        return deadline == 0 ? own : min(own, deadline)
+    /// One wait on a connection, bounded as `waitDeadline` says.
+    func waiting<T>(_ body: () async throws(IOError) -> T) async throws(ClientError) -> T {
+        let until = try waitDeadline()
+        do {
+            return try await Runtime.withIODeadline(until: until, body)
+        } catch {
+            throw ClientError(error)
+        }
     }
-}
-
-extension Request {
-    /// A client on this request's worker. Read it before the first `await`.
-    public var client: HTTPClient { HTTPClient(worker: worker) }
 }
 
 extension HTTPClient {
@@ -237,156 +242,111 @@ extension HTTPClient {
     /// Where a response's body is to be read from, once its head is in.
     enum Started {
         case h1(ClientHead, H1Body)
-        case h2(H2Shared, H2Stream)
+        case h2(H2Shared, ClientH2Stream)
     }
 
     /// Writes the request and reads up to the final response's head.
     /// `streaming` is for a body the caller reads as it arrives: over HTTP/2
     /// its window is then opened only as the caller takes what came.
+    ///
+    /// A stream refused -- a shared connection that filled or was told to go
+    /// away while this waited for it, or REFUSED_STREAM, which RFC 9113
+    /// section 8.7 promises was never looked at -- is tried again, twice.
     func start(_ method: HTTPMethod, _ url: String,
                headers: [(String, String)],
                body: [UInt8], streaming: Bool) async throws(ClientError) -> Started {
-
-        // The head is built first and entirely, while the URL's bytes are
-        // still alive: everything the parser produced is a slice into them.
-        // Nothing here waits, so the borrow never crosses a suspension.
-        var request = ByteBuffer(capacity: 512)
-        let plan: Plan
-        switch buildHead(method, url, headers: headers, body: body, into: &request) {
-        case .failure(let error):
-            request.destroy()
-            throw error
-        case .success(let made):
-            plan = made
+        var tries = 0
+        while true {
+            do {
+                return try await startOnce(method, url, headers: headers, body: body, streaming: streaming)
+            } catch .streamReset(H2Error.refusedStream.rawValue) where tries < 2 {
+                tries += 1
+            }
         }
-        defer { request.destroy() }
+    }
 
-        // An HTTP/2 connection already open to this place takes the request as
-        // one more stream, before a lookup or a connect is paid for.
-        let mayUseHTTP2 = forceHTTP2 || (plan.secure && offersHTTP2)
-        let key = sharedKey(plan)
+    private func startOnce(_ method: HTTPMethod, _ url: String,
+                           headers: [(String, String)],
+                           body: [UInt8], streaming: Bool) async throws(ClientError) -> Started {
+        var request = ByteBuffer(capacity: 512)
+        defer { request.destroy() }
+        let plan = try buildHead(method, url, headers: headers, body: body, into: &request)
+
+        let mayUseHTTP2 = forceHTTP2 || (plan.secure && alpn.contains("h2"))
+        let key = OriginKey(host: plan.host, port: plan.port,
+                            tls: plan.secure ? caFile + "\u{0}" + alpn.joined(separator: ",")
+                                 : forceHTTP2 ? "\u{0}h2c" : "")
+        // An HTTP/2 connection open to this place takes the request as one
+        // more stream, before a lookup or a connect is paid for; one being
+        // opened is waited for rather than opened twice.
         var connecting = false
         if mayUseHTTP2 {
-            // Waiting on somebody else's connect is one of this request's waits,
-            // and gets one wait's budget as reading a socket would. Taken once,
-            // so that being woken and finding the connect still going cannot
-            // renew it.
-            let joinUntil = waitDeadline(from: av_monotonic_ms())
-            while true {
-                if let shared = reusableShared(key) {
-                    let block = try encodeRequestBlock(plan, method: method, headers: headers,
-                                                       hasBody: !body.isEmpty)
-                    return .h2(shared, try await openShared(shared, block: block, method: method,
-                                                            body: body, streaming: streaming))
-                }
-                // Somebody is already opening one. Wait to see whether it comes
-                // up as a connection this can join, rather than opening a second
-                // alongside it.
-                guard worker.pointee.outboundH2Connecting[key] != nil else { break }
-                // Its patience is not this request's. A connect outlasting this
-                // budget is this request timing out, not this request waiting on
-                // for as long as whoever started it is prepared to.
-                guard av_monotonic_ms() < joinUntil else { throw ClientError.timedOut }
-                let worker = self.worker
-                await withUnsafeContinuation { k in
-                    worker.pointee.outboundH2Connecting[key]?
-                        .append(H2ConnectWaiter(resume: k, deadline: joinUntil))
-                }
+            switch try await H2Registry.shared.find(key, client: self) {
+            case .shared(let shared):
+                let block = try encodeRequestBlock(plan, method: method, headers: headers, hasBody: !body.isEmpty)
+                return .h2(shared, try await openShared(shared, block: block, method: method,
+                                                        body: body, streaming: streaming))
+            case .connect:
+                // This request opens it, and the others to the same place
+                // wait to see what it comes up as.
+                connecting = true
+            case .http1:
+                break
             }
-            worker.pointee.outboundH2Connecting[key] = []
-            connecting = true
-        }
-        // Lets the requests that waited on this connect try again. Called the
-        // moment the outcome is known -- registered, failed, or HTTP/1.1 after
-        // all -- and not when this request finishes, which could be long after.
-        let worker = self.worker
-        func doneConnecting() {
-            guard connecting else { return }
-            connecting = false
-            let waiting = worker.pointee.outboundH2Connecting.removeValue(forKey: key) ?? []
-            for waiter in waiting { waiter.resume.resume() }
         }
 
-        // Forced HTTP/2 knows its protocol before connecting, so a field it
-        // cannot send is refused before anything is opened.
-        var early: [UInt8]? = nil
-        if forceHTTP2 {
+        // A kept HTTP/1.1 connection, or a new one.
+        let connection: ClientConnection
+        if let kept = ClientConnections.shared.take(key) {
+            if connecting { H2Registry.shared.speaksHTTP1(key) }
+            connection = kept
+        } else {
+            let connected: Connected
+            let until: ContinuousClock.Instant
             do {
-                early = try encodeRequestBlock(plan, method: method, headers: headers,
-                                               hasBody: !body.isEmpty)
+                until = try waitDeadline()
             } catch {
-                doneConnecting()
+                if connecting { H2Registry.shared.connectFailed(key) }
                 throw error
             }
-        }
-
-        let socket: OutboundSocket
-        let budget: UInt64
-        do {
-            budget = try waitBudget()
-        } catch {
-            doneConnecting()
-            throw error
-        }
-        do {
-            if plan.secure {
-                socket = try await Worker.connectTLS(worker, name: plan.host, port: plan.port,
-                                                     caFile: caFile, alpn: alpn,
-                                                     milliseconds: budget)
-            } else {
-                // A forced HTTP/2 connection is keyed apart from plaintext
-                // HTTP/1.1, so the pool can never hand one to the other.
-                socket = try await Worker.connect(worker, name: plan.host, port: plan.port,
-                                                  tls: forceHTTP2 ? "\u{0}h2c" : "",
-                                                  milliseconds: budget)
-            }
-        } catch {
-            doneConnecting()
-            // The deadline passing during the connect is the exchange timing
-            // out, not the connection failing.
-            if deadline != 0, av_monotonic_ms() >= deadline { throw .timedOut }
-            throw .connect(error)
-        }
-
-        // What was agreed, not what was asked for. A request line written into
-        // a connection the peer believes is carrying frames desynchronises it
-        // immediately, so the agreement decides which of the two this is.
-        if socket.isHTTP2 || forceHTTP2 {
-            // Kept from here on, for every request to the same place. Kept
-            // before this request's fields are checked, too: a field that
-            // cannot be sent is this request's problem, not the connection's.
-            let shared: H2Shared
-            do {
-                shared = try await startShared(socket, key)
+            do throws(OutboundError) {
+                connected = try await ClientConnections.shared.connect(
+                    host: plan.host, port: plan.port, secure: plan.secure, caFile: caFile,
+                    alpn: alpn, forceHTTP2: forceHTTP2, key: key, deadline: until)
             } catch {
-                doneConnecting()
-                throw error
+                if connecting { H2Registry.shared.connectFailed(key) }
+                // The deadline passing during the connect is the exchange
+                // timing out, not the connection failing.
+                if let deadline, ContinuousClock.now >= deadline { throw .timedOut }
+                throw .connect(error)
             }
-            doneConnecting()
-            let block: [UInt8]
-            if let early {
-                block = early
-            } else {
-                block = try encodeRequestBlock(plan, method: method, headers: headers,
-                                               hasBody: !body.isEmpty)
+            switch connected {
+            case .http1(let made):
+                // HTTP/1.1 after all: what ALPN said is remembered, and anyone
+                // who waited connects for themselves.
+                if connecting { H2Registry.shared.speaksHTTP1(key) }
+                connection = made
+            case .http2(let reader, let writer):
+                // What was agreed, not what was asked for. Kept from here on,
+                // for every request to the same place, before this request's
+                // fields are checked: a field that cannot be sent is this
+                // request's problem, not the connection's.
+                let shared = try await startShared(reader, writer, key)
+                let block = try encodeRequestBlock(plan, method: method, headers: headers, hasBody: !body.isEmpty)
+                return .h2(shared, try await openShared(shared, block: block, method: method,
+                                                        body: body, streaming: streaming))
             }
-            return .h2(shared, try await openShared(shared, block: block, method: method,
-                                                    body: body, streaming: streaming))
         }
-        // HTTP/1.1 after all. Anyone who waited connects for themselves.
-        doneConnecting()
 
-        do {
-            try await writeAll(socket, request.readPointer, request.readableBytes)
-            if !body.isEmpty { try await writeAll(socket, body) }
-            let (head, rest) = try await readHead(socket, method: method)
-            return .h1(head, rest)
-        } catch {
-            // Nothing about a failed exchange says the connection is clean, and
-            // a connection that is not clean must not be offered to anyone.
-            socket.close()
-            throw error
+        // The body goes behind the head, in one write. Dropped on failure:
+        // nothing about a failed exchange says the connection is clean, and
+        // one that is not must not be kept.
+        if !body.isEmpty {
+            body.withUnsafeBufferPointer { request.write($0.baseAddress!, $0.count) }
         }
+        try await writeAll(connection, UnsafeRawBufferPointer(start: request.readPointer, count: request.readableBytes))
+        let head = try await readHead(connection, method: method)
+        return .h1(head.head, H1Body(connection, framing: head.framing, keepAlive: head.keepAlive))
     }
 
     /// What the head, once built, says about where it goes.
@@ -407,37 +367,32 @@ extension HTTPClient {
 
     private func buildHead(_ method: HTTPMethod, _ url: String,
                            headers: [(String, String)], body: [UInt8],
-                           into request: inout ByteBuffer) -> Result<Plan, ClientError> {
-        let urlBytes = Array(url.utf8)
-        let storage = urlBytes.isEmpty ? [UInt8(0)] : urlBytes
+                           into head: inout ByteBuffer) throws(ClientError) -> Plan {
+        var urlBytes = Array(url.utf8)
+        if urlBytes.isEmpty { throw .url(.scheme) }
         let count = urlBytes.count
-
-        // Built into locals and copied out: the closure may not escape the
-        // borrow, and `inout` cannot cross it either.
-        var head = ByteBuffer(capacity: 512)
-        let outcome: Result<Plan, ClientError> = storage.withUnsafeBufferPointer { buffer in
+        urlBytes.append(0)
+        // Everything the parser produces is a slice into the URL's bytes, so
+        // the head is built while they are held, and what is kept is copied.
+        let outcome: Result<Plan, ClientError> = urlBytes.withUnsafeBufferPointer { buffer in
             let base = buffer.baseAddress!
             let parsed: HTTPURL
-            do {
+            do throws(HTTPURLError) {
                 parsed = try HTTPURL.parse(base, count)
             } catch {
-                // withUnsafeBufferPointer erases the typed throw, so what
-                // arrives here is `any Error` and has to be put back.
-                return .failure(.url((error as? HTTPURLError) ?? .illegalByte))
+                return .failure(.url(error))
             }
 
             // The request-target. A URL with no path asks for the root, and
             // that slash is not in the caller's bytes to point at.
-            var target: [UInt8] = parsed.needsLeadingSlash ? [cSlash] : []
+            var target: [UInt8] = parsed.needsLeadingSlash ? [UInt8(ascii: "/")] : []
             target.append(contentsOf: UnsafeBufferPointer(
                 start: base + Int(parsed.target.offset), count: parsed.target.count))
 
             let wrote = target.withUnsafeBufferPointer { t in
-                HTTPRequestWriter.writeRequestLine(
-                    &head, method: method, target: ByteSpan(t.baseAddress!, t.count))
+                HTTPRequestWriter.writeRequestLine(&head, method: method, target: ByteSpan(t.baseAddress!, t.count))
             }
             guard wrote else { return .failure(.refusedHeader) }
-
             guard HTTPRequestWriter.writeHost(&head, parsed.hostForField.span(in: base)) else {
                 return .failure(.refusedHeader)
             }
@@ -448,7 +403,7 @@ extension HTTPClient {
                 let valueBytes = Array(value.utf8)
                 let allowed = nameBytes.withUnsafeBufferPointer { n -> Bool in
                     valueBytes.withUnsafeBufferPointer { v -> Bool in
-                        guard let np = n.baseAddress, let vp = v.baseAddress else { return false }
+                        guard let np = n.baseAddress else { return false }
                         let field = ByteSpan(np, n.count)
                         let kind = HTTPRequestWriter.classify(field)
                         // Two this client refuses beyond the ones the writer
@@ -460,35 +415,21 @@ extension HTTPClient {
                             return false
                         }
                         if kind.contains(.userAgent) { sawUserAgent = true }
-                        return HTTPRequestWriter.writeUserHeader(&head, name: field,
-                                                                 value: ByteSpan(vp, v.count))
+                        let empty: StaticString = ""
+                        let vp = v.baseAddress ?? empty.utf8Start
+                        return HTTPRequestWriter.writeUserHeader(&head, name: field, value: ByteSpan(vp, v.count))
                     }
                 }
                 guard allowed else { return .failure(.refusedHeader) }
             }
 
             if decompress {
-                let offered = Array(ContentDecoder.acceptEncoding.utf8)
-                let wrote = offered.withUnsafeBufferPointer { a -> Bool in
-                    let name: StaticString = "Accept-Encoding"
-                    return HTTPRequestWriter.writeHeader(
-                        &head,
-                        name: ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
-                        value: ByteSpan(a.baseAddress!, a.count))
+                guard writeField(&head, "Accept-Encoding", RequestDecoder.acceptEncoding) else {
+                    return .failure(.refusedHeader)
                 }
-                guard wrote else { return .failure(.refusedHeader) }
             }
-
             if !sawUserAgent, !userAgent.isEmpty {
-                let agent = Array(userAgent.utf8)
-                let wrote = agent.withUnsafeBufferPointer { a -> Bool in
-                    let name: StaticString = "User-Agent"
-                    return HTTPRequestWriter.writeHeader(
-                        &head,
-                        name: ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
-                        value: ByteSpan(a.baseAddress!, a.count))
-                }
-                guard wrote else { return .failure(.refusedHeader) }
+                guard writeField(&head, "User-Agent", userAgent) else { return .failure(.refusedHeader) }
             }
 
             // Always stated, even at zero. A POST with no Content-Length and
@@ -500,92 +441,39 @@ extension HTTPClient {
             HTTPRequestWriter.writeConnection(&head, keepAlive: true)
             HTTPRequestWriter.endHead(&head)
 
-            // Copied out inside the borrow, while the URL's bytes are still
-            // alive: everything the parser produced is a slice into them, and
-            // HTTP/2 needs the same three values in a different shape.
             let host = String(decoding: UnsafeBufferPointer(
                 start: base + Int(parsed.host.offset), count: parsed.host.count), as: UTF8.self)
             let authority = String(decoding: UnsafeBufferPointer(
-                start: base + Int(parsed.hostForField.offset),
-                count: parsed.hostForField.count), as: UTF8.self)
-            return .success(Plan(host: host, port: parsed.port,
-                                 secure: parsed.scheme.isSecure,
-                                 authority: authority,
-                                 target: String(decoding: target, as: UTF8.self),
+                start: base + Int(parsed.hostForField.offset), count: parsed.hostForField.count), as: UTF8.self)
+            return .success(Plan(host: host, port: parsed.port, secure: parsed.scheme.isSecure,
+                                 authority: authority, target: String(decoding: target, as: UTF8.self),
                                  bodyLength: body.count))
         }
+        return try outcome.get()
+    }
 
-        switch outcome {
-        case .failure(let error):
-            head.destroy()
-            return .failure(error)
-        case .success(let plan):
-            request.reserve(head.readableBytes)
-            request.write(head.readPointer, head.readableBytes)
-            head.destroy()
-            return .success(plan)
+    private func writeField(_ head: inout ByteBuffer, _ name: StaticString, _ value: String) -> Bool {
+        var value = value
+        return value.withUTF8 { v in
+            HTTPRequestWriter.writeHeader(&head, name: ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
+                                          value: ByteSpan(v.baseAddress ?? name.utf8Start, v.count))
         }
     }
 
-    // MARK: Writing
+    // MARK: Writing and reading
 
-    /// The same for bytes the caller owns.
-    ///
-    /// The pointer is taken afresh inside each attempt rather than once around
-    /// the loop: a borrow of the array cannot cross the `await` that waits for
-    /// the socket to drain, and an array is free to move while nothing holds
-    /// it.
-    func writeAll(_ socket: OutboundSocket, _ bytes: [UInt8]) async throws(ClientError) {
-        var sent = 0
-        while sent < bytes.count {
-            let n: Int
-            do {
-                n = try bytes.withUnsafeBufferPointer { buffer in
-                    try socket.write(UnsafeRawBufferPointer(start: buffer.baseAddress! + sent,
-                                                            count: buffer.count - sent))
-                }
-            } catch {
-                // withUnsafeBufferPointer erases the typed throw, so what
-                // arrives here is `any Error` and has to be put back.
-                throw (error as? OutboundError) == .cancelled ? .cancelled : .closed
-            }
-            sent &+= n
-            if sent < bytes.count {
-                let budget = try waitBudget()
-                do {
-                    try await socket.writable(milliseconds: budget)
-                } catch {
-                    throw error == .timedOut ? .timedOut
-                        : error == .cancelled ? .cancelled : .closed
-                }
-            }
-        }
+    func writeAll(_ connection: ClientConnection, _ bytes: UnsafeRawBufferPointer) async throws(ClientError) {
+        guard bytes.count > 0 else { return }
+        try await waiting { () async throws(IOError) in try await connection.transport.write(bytes) }
     }
 
-    func writeAll(_ socket: OutboundSocket,
-                  _ base: UnsafePointer<UInt8>, _ count: Int) async throws(ClientError) {
-        var sent = 0
-        while sent < count {
-            let n: Int
-            do {
-                n = try socket.write(UnsafeRawBufferPointer(start: base + sent, count: count - sent))
-            } catch {
-                throw error == .cancelled ? .cancelled : .closed
-            }
-            sent &+= n
-            if sent < count {
-                let budget = try waitBudget()
-                do {
-                    try await socket.writable(milliseconds: budget)
-                } catch {
-                    throw error == .timedOut ? .timedOut
-                        : error == .cancelled ? .cancelled : .closed
-                }
-            }
-        }
+    /// Waits for more on `connection` and takes it. A peer that closes is
+    /// `.closed`, which the close-delimited path treats as the end of the
+    /// body and every other path as the peer giving up part way through.
+    func readMore(_ connection: ClientConnection) async throws(ClientError) {
+        let n = try await waiting { () async throws(IOError) -> Int in try await connection.readMore() }
+        if n == 0 { throw .closed }
     }
-
-    // MARK: Reading
 
     /// The rest of the response, read whole and held to `maxBodyBytes`.
     private func readWhole(_ head: ClientHead, _ body: H1Body) async throws(ClientError) -> ClientResponse {
@@ -606,108 +494,58 @@ extension HTTPClient {
                               body: bytes, reusedConnection: body.reused)
     }
 
-    /// Reads up to the end of the final response's head, and hands back the
-    /// body still to come on the connection.
-    func readHead(_ socket: OutboundSocket,
-                  method: HTTPMethod) async throws(ClientError) -> (ClientHead, H1Body) {
-        var buffer = ByteBuffer(capacity: 8192)
-        let fields = UnsafeMutablePointer<HTTPHeaderRef>.allocate(capacity: max(1, maxHeaders))
-        defer { fields.deallocate() }
-
-        var head = HTTPResponseHead()
-        var headers: [ClientHeader] = []
-        var reason = ""
-
-        do throws(ClientError) {
-            // An informational response is a response, and then the real one
-            // follows on the same connection. Reading one as final would leave
-            // its successor sitting in the buffer to be read as a body.
-            while true {
-                let outcome = HTTPResponseParser.parse(buffer.readPointer, buffer.readableBytes,
-                                                       maxHeadSize: maxHeadBytes,
-                                                       maxHeaders: maxHeaders,
-                                                       headers: fields, head: &head)
-                switch outcome {
-                case .incomplete:
-                    try await readMore(socket, into: &buffer)
-                    continue
-                case .failure(let error):
-                    throw error == .headTooLarge ? .headTooLarge : .malformedResponse(error)
-                case .complete:
-                    break
-                }
-
-                if head.status >= 100 && head.status < 200 && head.status != 101 {
-                    buffer.consume(head.headEnd)
-                    head = HTTPResponseHead()
-                    continue
-                }
-
-                let base = buffer.readPointer
-                reason = String(decoding: UnsafeBufferPointer(start: base + Int(head.reason.offset),
-                                                              count: head.reason.count), as: UTF8.self)
-                headers.reserveCapacity(head.headerCount)
-                for i in 0..<head.headerCount {
-                    headers.append(ClientHeader(
-                        name: String(decoding: UnsafeBufferPointer(
-                            start: base + Int(fields[i].name.offset),
-                            count: fields[i].name.count), as: UTF8.self),
-                        value: String(decoding: UnsafeBufferPointer(
-                            start: base + Int(fields[i].value.offset),
-                            count: fields[i].value.count), as: UTF8.self)))
-                }
-                buffer.consume(head.headEnd)
-                break
-            }
-        } catch {
-            buffer.destroy()
-            throw error
-        }
-        let body = H1Body(socket: socket, buffer: buffer, framing: head.framing(method: method),
-                          keepAlive: head.keepAlive)
-        return (ClientHead(status: head.status, reason: reason, headers: headers), body)
+    /// A final response's head, as `readHead` read it.
+    struct ReadHead {
+        var head: ClientHead
+        var framing: HTTPBodyFraming
+        var keepAlive: Bool
     }
 
-    /// Waits for more and takes it. A peer that closes is `.closed`, which the
-    /// close-delimited path treats as the end of the body and every other path
-    /// treats as the peer giving up part way through.
-    func readMore(_ socket: OutboundSocket,
-                  into buffer: inout ByteBuffer) async throws(ClientError) {
+    /// Reads up to the end of the final response's head, leaving whatever of
+    /// the body came with it in the connection's input.
+    func readHead(_ connection: ClientConnection, method: HTTPMethod) async throws(ClientError) -> ReadHead {
+        let fields = UnsafeMutablePointer<HTTPHeaderRef>.allocate(capacity: max(1, maxHeaders))
+        defer { fields.deallocate() }
+        // An informational response is a response, and then the real one
+        // follows on the same connection. Reading one as final would leave
+        // its successor sitting in the buffer to be read as a body.
         while true {
-            // OpenSSL may be holding decrypted bytes the socket has already
-            // given up, and no poll will ever mention those again.
-            if !socket.hasBufferedInput {
-                let budget = try waitBudget()
-                do {
-                    try await socket.readable(milliseconds: budget)
-                } catch {
-                    throw error == .timedOut ? .timedOut
-                        : error == .cancelled ? .cancelled : .closed
+            var head = HTTPResponseHead()
+            let outcome = connection.input.withUnsafeBytes { raw -> HTTPParseResult in
+                guard raw.count > 0 else { return .incomplete }
+                return HTTPResponseParser.parse(raw.baseAddress!.assumingMemoryBound(to: UInt8.self), raw.count,
+                                                maxHeadSize: maxHeadBytes, maxHeaders: maxHeaders,
+                                                headers: fields, head: &head)
+            }
+            switch outcome {
+            case .incomplete:
+                // The parser takes a head that never ends to `maxHeadBytes`
+                // and no further.
+                try await readMore(connection)
+                continue
+            case .failure(let error):
+                throw error == .headTooLarge ? .headTooLarge : .malformedResponse(error)
+            case .complete:
+                break
+            }
+            if head.status >= 100 && head.status < 200 && head.status != 101 {
+                connection.input.consume(head.headEnd)
+                continue
+            }
+            let read = connection.input.withUnsafeBytes { raw -> ClientHead in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                func text(_ slice: HTTPSlice) -> String {
+                    String(decoding: UnsafeBufferPointer(start: base + Int(slice.offset), count: slice.count), as: UTF8.self)
                 }
+                var headers: [ClientHeader] = []
+                headers.reserveCapacity(head.headerCount)
+                for i in 0..<head.headerCount {
+                    headers.append(ClientHeader(name: text(fields[i].name), value: text(fields[i].value)))
+                }
+                return ClientHead(status: head.status, reason: text(head.reason), headers: headers)
             }
-            buffer.reserve(8192)
-            let n: Int
-            do {
-                n = try socket.read(into: UnsafeMutableRawBufferPointer(
-                    start: buffer.writePointer, count: buffer.writableBytes))
-            } catch {
-                // The peer closing arrives here, as `failed(0)`, and nowhere
-                // else.
-                throw error == .cancelled ? .cancelled : .closed
-            }
-            if n > 0 {
-                buffer.advanceWriter(n)
-                return
-            }
-            // Readable, and nothing to hand over. That is not the peer going
-            // away -- the read above throws for that. Over TLS it is routine:
-            // a TLS 1.3 server sends a session ticket straight after the
-            // handshake, the socket wakes, OpenSSL consumes the ticket, and
-            // there is no application data yet. This once read that as a
-            // close, and every HTTPS/1.1 request to a server whose ticket
-            // arrived first failed as `closed`; plaintext tests never showed
-            // it, because a readable plaintext socket always has data or a
-            // real end. The ticket is consumed now, so the next wait blocks.
+            connection.input.consume(head.headEnd)
+            return ReadHead(head: read, framing: head.framing(method: method), keepAlive: head.keepAlive)
         }
     }
 }
@@ -722,31 +560,24 @@ struct ClientHead {
 /// A response body on an HTTP/1.1 connection, read as it arrives.
 ///
 /// The connection is this body's until it ends: once the last byte is read it
-/// goes back to the pool if both ends mean to keep it and nothing is left on
+/// goes back to be kept if both ends mean to keep it and nothing is left on
 /// it, and is closed otherwise. A body given up on part way is closed, since
 /// what is left on the connection is the rest of it.
-final class H1Body {
-    let socket: OutboundSocket
-    private var buffer: ByteBuffer
+final class H1Body: @unchecked Sendable {
+    private var connection: ClientConnection?
     let framing: HTTPBodyFraming
     private var remaining = 0
     private var decoder = ChunkedDecoder()
     private var keepAlive: Bool
     private var finished = false
-    private var settled = false
-    /// Whether the connection went back to the pool.
+    /// Whether the connection went back to be kept.
     private(set) var reused = false
 
-    init(socket: OutboundSocket, buffer: ByteBuffer, framing: HTTPBodyFraming, keepAlive: Bool) {
-        self.socket = socket
-        self.buffer = buffer
+    init(_ connection: ClientConnection, framing: HTTPBodyFraming, keepAlive: Bool) {
+        self.connection = connection
         self.framing = framing
         self.keepAlive = keepAlive
         if case .length(let wanted) = framing { remaining = wanted }
-    }
-
-    deinit {
-        buffer.destroy()
     }
 
     /// The next piece of the body, never empty, or nil once it has ended.
@@ -760,6 +591,7 @@ final class H1Body {
     }
 
     private func read(_ client: HTTPClient) async throws(ClientError) -> [UInt8]? {
+        guard let connection else { return nil }
         while !finished {
             switch framing {
             case .none:
@@ -770,13 +602,13 @@ final class H1Body {
                     finished = true
                     continue
                 }
-                if buffer.readableBytes == 0 { try await client.readMore(socket, into: &buffer) }
-                let take = min(remaining, buffer.readableBytes)
-                let piece = Array(UnsafeBufferPointer(start: buffer.readPointer, count: take))
-                buffer.consume(take)
+                if connection.input.count == 0 { try await client.readMore(connection) }
+                let take = min(remaining, connection.input.count)
+                let piece = connection.input.withUnsafeBytes { Array($0[0..<take]) }
+                connection.input.consume(take)
                 remaining -= take
                 // Settled as soon as the last byte is in, so the connection
-                // is back in the pool whether or not the caller asks again.
+                // is kept whether or not the caller asks again.
                 if remaining == 0 {
                     finished = true
                     settle()
@@ -784,17 +616,21 @@ final class H1Body {
                 return piece
 
             case .chunked:
-                if buffer.readableBytes == 0 { try await client.readMore(socket, into: &buffer) }
+                if connection.input.count == 0 { try await client.readMore(connection) }
                 var consumed = 0
                 var piece: [UInt8] = []
-                let outcome = decoder.decode(buffer.readPointer, buffer.readableBytes,
-                                             consumed: &consumed) { p, n in
-                    piece.append(contentsOf: UnsafeBufferPointer(start: p, count: n))
+                let outcome = connection.input.withUnsafeBytes { raw in
+                    decoder.decode(raw.baseAddress!.assumingMemoryBound(to: UInt8.self), raw.count,
+                                   consumed: &consumed) { p, n in
+                        piece.append(contentsOf: UnsafeBufferPointer(start: p, count: n))
+                    }
                 }
-                buffer.consume(consumed)
+                connection.input.consume(consumed)
                 switch outcome {
                 case .needMore:
-                    break
+                    // A chunk's size line split across reads is left whole
+                    // for the next one.
+                    if consumed == 0 && piece.isEmpty { try await client.readMore(connection) }
                 case .finished:
                     finished = true
                     settle()
@@ -807,18 +643,14 @@ final class H1Body {
                 // The body ends when the connection does, so reading it to the
                 // end is the same act as making the connection unusable.
                 keepAlive = false
-                // Drained before waiting, not after. The start of the body
-                // arrives in the same read as the head, and a peer that sent
-                // everything and closed has no readability left to offer.
-                if buffer.readableBytes > 0 {
-                    let piece = Array(UnsafeBufferPointer(start: buffer.readPointer,
-                                                          count: buffer.readableBytes))
-                    buffer.consume(buffer.readableBytes)
+                if connection.input.count > 0 {
+                    let piece = connection.input.withUnsafeBytes { Array($0) }
+                    connection.input.consume(piece.count)
                     return piece
                 }
                 do {
-                    try await client.readMore(socket, into: &buffer)
-                } catch ClientError.closed {
+                    try await client.readMore(connection)
+                } catch .closed {
                     finished = true
                 }
             }
@@ -827,22 +659,25 @@ final class H1Body {
         return nil
     }
 
-    /// Hands the connection back, or closes it. Once.
+    /// Keeps the connection, or closes it. Once.
     private func settle() {
-        guard !settled else { return }
-        settled = true
+        guard let connection else { return }
+        self.connection = nil
         // Anything still in the buffer belongs to a message this exchange did
-        // not ask for. Handing the connection on with that on it is what makes
+        // not ask for. Keeping the connection with that on it is what makes
         // the next caller read somebody else's answer.
-        reused = finished && keepAlive && buffer.readableBytes == 0
-        if reused { socket.release() } else { socket.close() }
+        reused = finished && keepAlive && connection.input.count == 0
+        if reused { ClientConnections.shared.give(connection) }
     }
 
     /// Gives up on the rest: the connection is closed, with the rest of the
     /// body on it.
     func close() {
-        guard !settled else { return }
-        settled = true
-        socket.close()
+        connection = nil
     }
+}
+
+/// Whether `name` is `wanted`, without regard to case.
+func named(_ name: String, _ wanted: String) -> Bool {
+    name.utf8.count == wanted.utf8.count && name.lowercased() == wanted.lowercased()
 }

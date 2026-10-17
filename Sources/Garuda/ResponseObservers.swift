@@ -11,10 +11,10 @@
 //
 // What a tracing layer does around a handler, from outside it: per-route
 // metrics, an access log of the application's own design, errors reported to
-// a service. An observer sees every answer the server gives -- a route's, a
-// 404, a 429, a static file, a cached copy, a WebSocket's 101 -- once its head
-// is settled, which is where the access log's line is written and its
-// duration measured. The body of a streamed response is still to come.
+// a service. An observer sees every answer the connection gives -- a route's,
+// a 404, a 405, a 413 for a body too large, a 400 for a head that would not
+// parse -- once its head is written into the connection's output, which is
+// where the access log's line is written and its duration measured.
 //
 // `route` is the pattern that matched, not the path, so it is safe to use as
 // a metric label: there are as many as there are routes. It is nil when no
@@ -22,32 +22,33 @@
 //
 // `failure` says why a route answered 5xx on its own account: a handler threw
 // something that is not a `ResponseError`, returned without answering, or ran
-// past its deadline. A failure after the response has started -- a throw
-// part-way through a streamed body -- comes after this call, and is not in it.
+// past its deadline.
 //
-// Observers run on the worker, in the order added, while the response is
-// being written. One that blocks holds up every connection on the worker; a
-// slow export belongs on a task or in a buffer that something else drains.
+// Observers run in the connection's task, in the order added, before the
+// connection reads its next request. One that blocks holds that connection
+// and the thread under it; a slow export belongs on a task or in a buffer
+// that something else drains. An application with none pays one check of a
+// flag the connection works out once.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import AvianHTTP
+import GarudaWire
 
 /// A request as it was answered, for `Application.onResponse`.
 public struct CompletedRequest: Sendable {
+    /// Empty for a request whose head could not be read.
     public let method: String
-    /// The path as the client sent it, still percent-encoded, without the query.
+    /// The path as the client sent it, still percent-encoded, without the
+    /// query. Empty for a request whose head could not be read.
     public let path: String
     /// The pattern of the route that matched, as registered with its group
     /// prefixes (`/api/users/:id`). Nil when no route answered.
     public let route: String?
     public let status: Int
-    /// From the request's dispatch to its response head being settled.
+    /// From the request's dispatch to its response head being written.
     public let microseconds: Int
     /// "HTTP/1.1", "HTTP/1.0", "HTTP/2" or "HTTP/3".
     public let protocolName: String
-    /// The client's address, or the one a trusted proxy forwarded for it.
+    /// The client's address.
     public let remoteAddress: String
     /// With --request-id.
     public let requestID: String?
@@ -58,65 +59,70 @@ public struct CompletedRequest: Sendable {
     public let failure: String?
 }
 
+/// What `onResponse` registers.
+public typealias ResponseObserver = @Sendable (CompletedRequest) -> Void
+
 extension Application {
     /// Calls `observer` with every request once it is answered. See
     /// ResponseObservers.swift for what it sees and when.
-    public func onResponse(_ observer: @escaping (CompletedRequest) -> Void) {
-        precondition(compiled == nil, "response observer added after the application was compiled")
+    public func onResponse(_ observer: @escaping ResponseObserver) {
+        precondition(compiledApplication == nil, "response observer added after the application was compiled")
         responseObservers.append(observer)
     }
 }
 
-extension Worker {
-    /// Whether anything is watching responses, which is what makes a request
-    /// worth timing when neither the access log nor metrics are on.
-    var observesResponses: Bool { application?.pointee.onResponse != nil }
-
-    /// Notes why a route failed, for the observers to see with its answer.
-    mutating func noteHandlerFailure(_ slot: Int, _ description: @autoclosure () -> String) {
-        if tracer != nil { requestSpanFailed(slot, nil, description()) }
-        guard observesResponses else { return }
-        let c = table[slot]
-        handlerFailures[slot] = (c.pointee.generation, c.pointee.requestId, description())
+extension HTTP1Connection {
+    /// Tells the observers and the access log how the request was answered.
+    /// `headParsed`: false for a request refused before its head could be
+    /// read, which has no method or path to report.
+    mutating func report(status: Int, headParsed: Bool = true) {
+        reportAnswer(x, limits: limits, status: status, headParsed: headParsed)
     }
+}
 
-    mutating func reportResponse(_ slot: Int, status: Int, _ observe: (CompletedRequest) -> Void) {
-        let c = table[slot]
-        let base = c.pointee.headBase()
-        var failure: String? = nil
-        if let noted = handlerFailures.removeValue(forKey: slot),
-           noted.generation == c.pointee.generation, noted.requestId == c.pointee.requestId {
-            failure = noted.description
+/// Tells the observers and the access log how the request in `x` was
+/// answered: an HTTP/1 connection's, or an HTTP/2 stream's.
+func reportAnswer(_ x: UnsafeMutablePointer<Exchange>, limits: ConnectionLimits, status: Int,
+                  headParsed: Bool = true) {
+    let started = x.pointee.started
+    let micros = started == 0 ? 0 : Int((monotonicNanos() &- started) / 1000)
+    if let app = x.pointee.application {
+        app._withUnsafeGuaranteedRef { app in
+            app.metrics?.requestFinished(status: status, micros: started == 0 ? nil : UInt64(micros))
+            if x.pointee.span != nil { endRequestSpan(x, app, status: status) }
+            guard !app.observers.isEmpty else { return }
+            let completed = completedRequest(x, app, status: status, micros: micros, headParsed: headParsed)
+            for observe in app.observers { observe(completed) }
         }
-        var route: String? = nil
-        let index = Int(c.pointee.routeIndex)
-        if index >= 0, let patterns = application?.pointee.routePatterns, index < patterns.count {
-            route = patterns[index]
-        }
-        let hasTrace = c.pointee.traceContext.readableBytes
-            == TraceContext.traceIDLength + TraceContext.parentIDLength
-        // An empty buffer may never have been given storage to point into.
-        var traceID: String? = nil
-        var parentID: String? = nil
-        if hasTrace {
-            let trace = UnsafePointer(c.pointee.traceContext.readPointer)
-            traceID = ByteSpan(trace, TraceContext.traceIDLength).string
-            parentID = ByteSpan(trace + TraceContext.traceIDLength, TraceContext.parentIDLength).string
-        }
-        let idLength = c.pointee.requestID.readableBytes
-        let completed = CompletedRequest(
-            method: c.pointee.head.methodSlice.span(in: base).string,
-            path: c.pointee.head.path.span(in: base).string,
-            route: route,
-            status: status,
-            microseconds: c.pointee.requestStartUs == 0
-                ? 0 : Int(av_monotonic_us() &- c.pointee.requestStartUs),
-            protocolName: String(describing: protocolName(slot)),
-            remoteAddress: requestClient(slot).address.string,
-            requestID: idLength > 0 ? c.pointee.requestID.readableSpan.string : nil,
-            traceID: traceID,
-            parentID: parentID,
-            failure: failure)
-        observe(completed)
     }
+    if limits.accessLog { logAccess(x, limits: limits, status: status, micros: micros, headParsed: headParsed) }
+}
+
+func completedRequest(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication, status: Int, micros: Int,
+                      headParsed: Bool) -> CompletedRequest {
+    let head = x.pointee.head
+    let index = Int(x.pointee.route)
+    let trace = x.pointee.traceIDs
+    return CompletedRequest(
+        method: headParsed ? x.pointee.slice(head.methodSlice).string : "",
+        path: headParsed ? x.pointee.slice(head.path).string : "",
+        route: index >= 0 && index < app.patterns.count ? app.patterns[index] : nil,
+        status: status,
+        microseconds: micros,
+        protocolName: protocolName(head, headParsed: headParsed),
+        // The client a trusted proxy names, once the head is there to say.
+        remoteAddress: headParsed ? Request(x).remoteAddress : x.pointee.remote.address,
+        requestID: x.pointee.requestIDBytes?.string,
+        traceID: trace?.trace.string,
+        parentID: trace?.parent.string,
+        failure: x.pointee.failure)
+}
+
+/// "HTTP/3", "HTTP/2", "HTTP/1.0", or "HTTP/1.1" -- which a head that could
+/// not be read is taken to be.
+func protocolName(_ head: HTTPRequestHead, headParsed: Bool) -> String {
+    guard headParsed else { return "HTTP/1.1" }
+    if head.httpMajor == 3 { return "HTTP/3" }
+    if head.httpMajor == 2 { return "HTTP/2" }
+    return head.httpMinor == 0 ? "HTTP/1.0" : "HTTP/1.1"
 }

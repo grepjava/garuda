@@ -37,14 +37,20 @@
 // Nothing here is Garuda-specific and nothing is magic: it is a struct that
 // collects strings. `summary()` prints what was read, with secrets held back,
 // for a `myapp env` command.
+//
+// Read it in `main`, before `app.run()`. Every shard is started with the
+// supervisor's environment, and under an exec launch runs `main` again up to
+// `run`, so each reads the same settings, and a `check()` that throws there
+// stops the program before anything is served.
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
-import CAvian
 
 /// What was wrong with the environment, all of it at once.
 public struct AppEnvironmentError: Error, CustomStringConvertible, Equatable, Sendable {
@@ -100,7 +106,7 @@ public struct AppEnvironment {
 
     /// One variable from the process, or nil when it is unset.
     public static func processEnvironment(_ name: String) -> String? {
-        guard let raw = av_getenv(name) else { return nil }
+        guard let raw = getenv(name) else { return nil }
         let value = String(cString: raw)
         return value.isEmpty ? nil : value
     }

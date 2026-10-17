@@ -1,6 +1,6 @@
 import Testing
-import AvianCore
 @testable import Garuda
+import GarudaTesting
 
 private struct User: Codable, Equatable {
     var id: Int
@@ -60,8 +60,7 @@ private func typedApp() -> Application {
     return app
 }
 
-/// Serialized: each test client turns a worker on the test's own thread.
-@Suite("Typed responses and errors", .serialized)
+@Suite("Typed responses and errors")
 struct ResponseTests {
     @Test func jsonAnswersCarryTheirTypeAndValue() throws {
         let client = typedApp().test

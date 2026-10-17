@@ -1,0 +1,35 @@
+# frameworks.sh LOAD=closed WORKERS=4, garuda2 alone: --shards 1 (one shard of 8 threads) against --workers 4 as given (4 shards of 2)
+== round 1 extra='--shards 1'
+swift	garuda	4	64	104383 0.328 0.587 1.264 3.762 0	[104383 ]
+== round 1 extra=''
+swift	garuda	4	64	106351 0.301 0.442 1.287 3.998 0	[106351 ]
+== round 2 extra='--shards 1'
+swift	garuda	4	64	103947 0.334 0.600 1.260 3.739 0	[103947 ]
+== round 2 extra=''
+swift	garuda	4	64	107099 0.300 0.453 1.276 3.968 0	[107099 ]
+
+# shard layout under --workers 4
+workers4 shard 964412 threads 4 aff 0-7
+workers4 shard 964413 threads 4 aff 0-7
+workers4 shard 964414 threads 4 aff 0-7
+workers4 shard 964415 threads 4 aff 0-7
+
+# frameworks.sh WORKERS=4, closed then ramp: G2 --threads 1 (4 shards of 1 thread), G1, G2 as given
+== round 1 garuda2 extra='--threads 1'
+closed swift	garuda	4	64	152657 0.448 0.468 0.482 0.518 0	[152657 ]
+ramp swift	garuda	4	64	146618 433.792 1461.760 2184.192 3122.176 0	[146618 ]
+== round 1 garuda1-server extra=''
+closed swift	garuda	4	64	143490 0.454 0.507 0.531 0.617 0	[143490 ]
+ramp swift	garuda	4	64	204902 298.624 1013.504 1542.656 2072.064 0	[204902 ]
+== round 1 garuda2 extra=''
+closed swift	garuda	4	64	108096 0.323 0.527 1.162 3.841 0	[108096 ]
+ramp swift	garuda	4	64	120534 809.728 2011.648 2771.968 3359.744 0	[120534 ]
+== round 2 garuda2 extra='--threads 1'
+closed swift	garuda	4	64	153330 0.441 0.457 0.471 0.515 0	[153330 ]
+ramp swift	garuda	4	64	151345 333.952 1303.040 2037.248 2565.120 0	[151345 ]
+== round 2 garuda1-server extra=''
+closed swift	garuda	4	64	140950 0.435 0.518 0.552 0.619 0	[140950 ]
+ramp swift	garuda	4	64	204464 366.976 1186.304 1673.728 2225.152 0	[204464 ]
+== round 2 garuda2 extra=''
+closed swift	garuda	4	64	108320 0.291 0.411 1.252 4.021 0	[108320 ]
+ramp swift	garuda	4	64	122965 849.152 1995.264 2765.824 3298.304 0	[122965 ]

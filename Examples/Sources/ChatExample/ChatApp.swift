@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Chat rooms, heard on every worker.
+// Chat rooms, heard on every shard.
 //
 //   GET  /                                   a page to chat from
 //   GET  /rooms/:room/ws?name=ada            a WebSocket: text sent is said in
@@ -9,8 +9,8 @@
 //                                            resumed with Last-Event-ID
 //   POST /rooms/:room/messages {"name", "text"}   says something, 202
 //
-// What it shows: `Topic` carries what is said to subscribers on every worker
-// process, so two people connected to different workers are in the same
+// What it shows: `Topic` carries what is said to subscribers on every shard
+// process, so two people connected to different shards are in the same
 // room. A WebSocket handler reads what its client sends while forwarding what
 // the room says, in a task group. An event stream replays what a reconnecting
 // client missed, from the id it last saw.
@@ -59,7 +59,7 @@ private func validText(_ text: String) -> Bool {
     (1...2000).contains(text.utf8.count)
 }
 
-/// Says `text` in `room`, to every subscriber on every worker.
+/// Says `text` in `room`, to every subscriber on every shard.
 @discardableResult
 private func say(_ room: Topic, name: String, text: String, event: String = "message") throws -> BroadcastID {
     let message = ChatMessage(kind: event, name: name, text: text, at: .now)
@@ -115,7 +115,9 @@ public func chatApp() -> Application {
 
     app.get("/rooms/:room/events") { (room: Path<String>, last: LastEventID) async throws in
         let room = try topic(room.value)
-        return EventStream(keepAlive: 15_000) { events in
+        // Kept alive with a comment whenever it is quiet for
+        // `--sse-keep-alive`, so a proxy does not close it as idle.
+        return EventStream { events in
             try await events.forward(room, after: last)
         }
     }

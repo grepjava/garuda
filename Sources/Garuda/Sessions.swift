@@ -4,7 +4,7 @@
 //
 //     app.sessions(store: MemorySessionStore())
 //
-//     app.post("/login") { (session: Session, login: Form<Login>) async throws in
+//     app.post("/login") { (session: Session, login: Form<Login>) in
 //         let user = try await users.check(login.value)
 //         try await session.renew()
 //         try await session.set("user", user.id)
@@ -37,16 +37,16 @@
 // ended it. The store checks and writes in one step, and the request that
 // lost is answered 409 with its session emptied.
 //
-// Each worker is a process, so a `MemorySessionStore` holds the sessions of
-// one worker: with --workers above 1 a client's next request can reach a
-// worker that never saw its session. It is for --workers 1 and tests; use
-// Redis or SQLite for the rest.
+// Each shard is a process, so a `MemorySessionStore` holds the sessions of
+// one shard: with --shards above 1 a client's next request can reach a shard
+// that never saw its session, which the server warns of as it starts. It is
+// for one shard and tests; GarudaRedis and GarudaSQLite have stores for the
+// rest.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
-import CAvian
-import GarudaRedis
+import GarudaWire
 import Synchronization
+import VegaCrypto
 
 /// Where sessions are kept. The data is a map of strings; an ID is 43
 /// characters of base64url.
@@ -246,7 +246,7 @@ enum SessionKey: RequestContextKey {
 
 /// 32 random bytes, as 43 characters of base64url.
 func newSessionID() -> String {
-    base64URLEncode(randomBytes(32))
+    base64URLEncode(SecureRandom.bytes(32))
 }
 
 /// Whether `text` could be an ID `newSessionID` made.
@@ -266,44 +266,42 @@ extension RouteBuilder {
 
     /// Gives every route in the current scope a `Session`, kept in the store
     /// `store` returns for the request: one over what `app.state` built in the
-    /// worker, as a pool must be made after the fork.
+    /// shard, as a pool must be made in the shard that uses it.
     ///
     ///     app.state { _ in RedisPool(configuration) }
     ///     app.sessions { request in RedisSessionStore(try request.state(RedisPool.self)) }
     public func sessions(_ configuration: SessionConfiguration = SessionConfiguration(),
-                         store: @escaping (borrowing Request) throws -> any SessionStore) {
+                         store: @escaping @Sendable (borrowing Request) throws -> any SessionStore) {
         let template = configuration.cookie
         let ttl = configuration.idleTimeoutSeconds * 1000
-        let carried = Unsafely(store)
-        use { request, response async throws -> (any ResponseConvertible)? in
+        use { request, response, next in
             // Everything the request and response are asked for is asked
             // before the store is awaited.
-            let session = Session(store: try carried.value(request), ttlMilliseconds: ttl)
+            let session = Session(store: try store(request), ttlMilliseconds: ttl)
             request[context: SessionKey.self] = session
-            let https = String(describing: request.scheme) == "https"
+            let https = request.arrivedOverHTTPS
             response.onSend { outgoing in
                 switch session.cookieChange {
                 case .none:
                     return
                 case .send:
-                    var cookie = template
-                    guard let id = session.id else { return }
-                    cookie.value = id
-                    if let header = setCookieHeader(cookie, value: id, https: https) {
-                        outgoing.addHeader("set-cookie", header)
-                    }
+                    guard let id = session.id,
+                          let header = setCookieHeader(template, value: id, https: https) else { return }
+                    _ = outgoing.addHeader("set-cookie", header)
                 case .remove:
                     var cookie = template
                     cookie.maxAge = 0
-                    cookie.expires = Timestamp(secondsSinceEpoch: 0)
+                    cookie.expires = 0
                     if let header = setCookieHeader(cookie, value: "", https: https) {
-                        outgoing.addHeader("set-cookie", header)
+                        _ = outgoing.addHeader("set-cookie", header)
                     }
                 }
             }
             var candidates: [String] = []
-            request.forEachCookie { name, value in
-                if name == template.name { candidates.append(value) }
+            let name = template.name
+            request.exchange.pointee.forEachCookie { cookieName, value in
+                if cookieName.string == name { candidates.append(value.string) }
+                return true
             }
             for id in candidates where isSessionID(id) {
                 session.cookieSent = true
@@ -314,20 +312,15 @@ extension RouteBuilder {
                     break
                 }
             }
-            return nil
+            try await next()
         }
     }
 }
 
-// MARK: - Stores
+// MARK: - The memory store
 
-/// Sessions in the worker's memory. Each worker process has its own, so this
-/// is for --workers 1 and tests.
-///
-/// A worker runs its handlers on its one thread, but a store is a public,
-/// `Sendable` type, and user code can reach one from the blocking pool or a
-/// thread of its own; two threads in one `Dictionary` corrupt it. So the
-/// sessions are behind a lock, as `MemoryRefreshTokenStore`'s are.
+/// Sessions in the shard's memory. Each shard process has its own, so this is
+/// for one shard and tests.
 public final class MemorySessionStore: SessionStore, @unchecked Sendable {
     private struct State {
         var sessions: [String: (data: [String: String], expires: UInt64)] = [:]
@@ -337,9 +330,11 @@ public final class MemorySessionStore: SessionStore, @unchecked Sendable {
     private let state = Mutex(State())
     /// Microseconds on a clock that only moves forward; tests set their own,
     /// before the store is used. The one thing here not behind the lock.
-    var clock: () -> UInt64 = { av_monotonic_us() }
+    var clock: @Sendable () -> UInt64 = { monotonicNanos() / 1000 }
 
-    public init() {}
+    public init() {
+        MemoryStores.made("MemorySessionStore")
+    }
 
     /// How many sessions are held, expired ones not yet swept included.
     public var count: Int { state.withLock { $0.sessions.count } }
@@ -391,120 +386,25 @@ public final class MemorySessionStore: SessionStore, @unchecked Sendable {
     }
 }
 
-/// Sessions in Redis, each a JSON string under `prefix` and its ID, expiring
-/// with the server's own PX. Loading pushes the expiry out with GETEX, which
-/// needs Redis 6.2 or Valkey.
-public struct RedisSessionStore: SessionStore {
-    public let redis: any RedisCommandSender
-    public let prefix: String
+/// The stores that keep what they hold in one shard's memory, by name, as an
+/// application makes them: with more than one shard, the server says so as it
+/// starts (`problems()` would refuse to start, and one shard is a fine way to
+/// run them).
+enum MemoryStores {
+    private static let names = Mutex<Set<String>>([])
 
-    public init(_ redis: any RedisCommandSender, prefix: String = "session:") {
-        self.redis = redis
-        self.prefix = prefix
+    static func made(_ name: String) {
+        names.withLock { _ = $0.insert(name) }
     }
 
-    public func load(id: String, ttlMilliseconds: Int) async throws -> [String: String]? {
-        let reply = try await redis.send("GETEX", prefix + id, "PX", ttlMilliseconds)
-        guard let bytes = reply.bytes else { return nil }
-        return try? JSONCoder.decode([String: String].self, from: bytes)
-    }
-
-    public func save(id: String, data: [String: String], ttlMilliseconds: Int) async throws {
-        try await redis.set(prefix + id, try JSONCoder.encode(data), expireMilliseconds: ttlMilliseconds)
-    }
-
-    public func delete(id: String) async throws {
-        _ = try await redis.del(prefix + id)
-    }
-
-    public func replace(id: String, data: [String: String], ttlMilliseconds: Int) async throws -> Bool {
-        try await redis.set(prefix + id, try JSONCoder.encode(data), expireMilliseconds: ttlMilliseconds,
-                            condition: .ifPresent)
-    }
-
-    public func remove(id: String) async throws -> Bool {
-        try await redis.del(prefix + id) > 0
-    }
-}
-
-/// Sessions in an SQLite table of `id`, `data` (JSON) and `expires`
-/// (milliseconds since the epoch). A load moves the expiry only once half of
-/// the timeout has gone, so reading a session rarely writes. Make the table
-/// with `createTable`, or with `schema` in a migration, and clear expired rows
-/// now and then with `deleteExpired`.
-public struct SQLiteSessionStore: SessionStore {
-    public let database: SQLiteDatabase
-    public let table: String
-
-    public init(_ database: SQLiteDatabase, table: String = "garuda_sessions") {
-        precondition(!table.isEmpty && table.utf8.allSatisfy { c in
-            (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F
-        } && !(table.utf8.first! >= 0x30 && table.utf8.first! <= 0x39),
-                     "a session table's name is letters, digits and underscores: \(table)")
-        self.database = database
-        self.table = table
-    }
-
-    /// The statement that makes the table.
-    public static func schema(table: String = "garuda_sessions") -> String {
-        "CREATE TABLE IF NOT EXISTS \(table) (id TEXT PRIMARY KEY NOT NULL, data TEXT NOT NULL, "
-            + "expires INTEGER NOT NULL) WITHOUT ROWID"
-    }
-
-    public func createTable() async throws {
-        try await database.execute(Self.schema(table: table))
-    }
-
-    /// Deletes every expired session, and returns how many.
-    @discardableResult
-    public func deleteExpired() async throws -> Int {
-        try await database.execute("DELETE FROM \(table) WHERE expires <= ?", nowMilliseconds())
-    }
-
-    private struct Row: Decodable {
-        var data: String
-        var expires: Int64
-    }
-
-    public func load(id: String, ttlMilliseconds: Int) async throws -> [String: String]? {
-        let now = nowMilliseconds()
-        guard let row = try await database.first(Row.self, "SELECT data, expires FROM \(table) WHERE id = ?", id),
-              row.expires > now else { return nil }
-        guard let data = try? JSONCoder.decode([String: String].self, from: Array(row.data.utf8)) else {
-            return nil
+    /// Warns, once per server, about each store made, when there is more than
+    /// one shard to keep apart.
+    static func warnIfSharded(_ shard: ShardInfo) {
+        guard shard.count > 1, shard.index == 0 else { return }
+        for name in names.withLock({ $0 }).sorted() {
+            Log.warning("\(name) keeps what it holds in each shard's own memory: with \(shard.count) shards, "
+                        + "a client's next request may reach a shard that never saw it. Use a store in "
+                        + "Redis or SQLite, or --shards 1.")
         }
-        if row.expires - now < Int64(ttlMilliseconds) / 2 {
-            try await database.execute("UPDATE \(table) SET expires = ? WHERE id = ?",
-                                       now + Int64(ttlMilliseconds), id)
-        }
-        return data
-    }
-
-    public func save(id: String, data: [String: String], ttlMilliseconds: Int) async throws {
-        let text = String(decoding: try JSONCoder.encode(data), as: UTF8.self)
-        try await database.execute(
-            "INSERT INTO \(table) (id, data, expires) VALUES (?, ?, ?) "
-                + "ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires = excluded.expires",
-            id, text, nowMilliseconds() + Int64(ttlMilliseconds))
-    }
-
-    public func delete(id: String) async throws {
-        try await database.execute("DELETE FROM \(table) WHERE id = ?", id)
-    }
-
-    public func replace(id: String, data: [String: String], ttlMilliseconds: Int) async throws -> Bool {
-        let text = String(decoding: try JSONCoder.encode(data), as: UTF8.self)
-        let now = nowMilliseconds()
-        return try await database.execute(
-            "UPDATE \(table) SET data = ?, expires = ? WHERE id = ? AND expires > ?",
-            text, now + Int64(ttlMilliseconds), id, now) > 0
-    }
-
-    public func remove(id: String) async throws -> Bool {
-        try await database.execute("DELETE FROM \(table) WHERE id = ? AND expires > ?", id, nowMilliseconds()) > 0
-    }
-
-    private func nowMilliseconds() -> Int64 {
-        Timestamp.now.microsecondsSinceEpoch / 1000
     }
 }

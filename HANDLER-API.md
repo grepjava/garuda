@@ -1,7 +1,6 @@
 # Handler API
 
-The design of Garuda's handler API, the decisions behind it, and what is left
-to build.
+The design of Garuda's handler API, and the decisions behind it.
 
 **The goal:** an application developer can build and test an authenticated JSON
 CRUD API backed by a database, without touching pointers, engine internals or
@@ -12,192 +11,266 @@ chosen on its merits: correct under every protocol it speaks, safe by
 construction, pleasant to write in, and fast. The README compares it with axum
 feature by feature, and [BENCHMARKS.md](BENCHMARKS.md) has the measurements.
 
+Garuda 2 runs on [Vega](https://github.com/grepjava/vega)'s work-stealing
+runtime. The application API is largely Garuda 1's; the engine underneath, the
+process model and some of the decisions below are not.
+
 ## Principles
 
-- **A handler that can finish synchronously is a plain call.** No allocation,
-  no `Task`, no scheduling hop for `GET /`.
-- **One worker, one thread.** Each worker is a forked process with one poller.
-  Suspended work resumes on that thread.
-- **Identity checks on every resume.** A resume checks the connection's
-  `(slot, generation)` and the `requestId`, so a stale resume never reaches a
-  reused slot.
+- **One handler API, and it is async.** A handler that never awaits converts
+  to it, and runs inline in the task that read the request: no task is made
+  for it and nothing is allocated. A unit test holds a plain route, a typed
+  `Path` route and a middleware chain to zero allocations per request.
+- **Shards of threads.** A shard is a process running a work-stealing runtime
+  over several threads. A suspended handler may resume on any thread of its
+  shard, and never on another shard. A crash takes down one shard's
+  connections, and the supervisor starts the shard again.
 - **Borrowed bytes cannot escape.** What the request lends, the compiler keeps
   inside the closure it was lent to.
-- **The engine owns the response path.** Handlers write into it rather than
-  returning response values, which is what keeps a response from being built
-  and copied.
+- **The connection owns the response path.** A handler, or the value it
+  returns, writes the status, headers and body into the connection's exchange.
+  Nothing is written to the wire until the handler and its middleware have
+  returned, or a streamed body starts. So middleware can still change the
+  response after `next`, and no response is built as a value and copied out.
+- **Slow handlers get at most half the threads.** A route that holds its
+  thread for long runs in the heavy lane, so quick requests always have
+  threads left to run on.
 
 ## How a request runs
 
-1. **The engine parses and routes.** Routes compile into one byte trie with a
-   handler slot per method at each node: literal before parameter before rest,
-   with backtracking.
-2. **Middleware runs**, compiled into each route's handler when the application
-   starts. A route with none keeps its own handler. Synchronous middleware
-   runs on the worker. From the first async middleware on, the rest of the
-   chain and the handler share one task.
-3. **Extractors run** in the order declared, reading lent bytes and producing
-   owned values. A failure is a `ResponseError`, answered 400 or 415.
-4. **A synchronous handler is called inline.**
-5. **An async handler runs on a reused task.** Each worker keeps a pool of
-   long-lived tasks (up to 1,024, then a queue) on a `TaskExecutor` that runs
-   jobs only on the worker's thread. The loop drains the executor in the same
-   turn that hands a request to a task or wakes one. A handler resumed from
-   another thread -- which is where the runtime resumes a wait the engine does
-   not own -- has its job handed to the executor under a lock, and the worker
-   woken through a pipe; the handler's code still runs on the worker's
-   thread.
-6. **The answer goes through the response sink**, which runs `onSend` hooks,
-   merges server headers, frames the body and enforces `Content-Length`.
-7. **Cancellation.** A reset stream or closed connection resumes a handler
-   waiting on the engine, such as `response.sleep` or a streamed write, so that
-   it throws and unwinds. A handler waiting on anything else finds
-   `response.isCancelled` set when it resumes, and whatever it sends is
-   dropped. `response.cancellable { … }` runs such a wait in a task of its own
-   and races it against the request ending, so the handler is given back at
-   once; the task is a fresh one, which is why it can be cancelled when the
-   pooled handler task cannot.
-
-What an async handler costs, from probes on Swift 6.3.3 under WSL2, one million
-requests each (single figures move by up to 2× there):
-
-| How the async handler runs | ns per request | Allocations per request |
-|---|---:|---:|
-| A new `Task` per request, loop outside the executor | 1,200–2,250 | 5 |
-| `Task.immediate`, loop running as a job on its executor | ~500 | 4 |
-| **A reused task from the pool**, no wait | **~360** | **0** |
-| A reused task, one wait resumed by the loop | ~660 | 0 |
-| A reused task, 4 KiB of locals held across the wait | ~850 | 0 |
-| A reused task, five nested async calls | ~1,050 | 0 |
-
-An async route costs about 0.4–1 µs and no allocation. A request's own CPU
-time is about 6 µs, and a database round trip 100 µs or more. A new `Task` per
-request is 3–6× slower, and allocates. The probes are in
-[benchmarks/async-probes/](benchmarks/async-probes/).
+1. **The connection reads and parses.** HTTP/1.1 runs one task per
+   connection, which reuses one exchange for every request on it. HTTP/2 and
+   HTTP/3 decode each stream's request into an exchange of the stream's own,
+   so routing, middleware and extractors see the same request either way. The
+   body is collected whole before dispatch and held to the body limit.
+2. **Some requests are answered before routing**, when the server is
+   configured for it: the health check, the rate limit, static files and the
+   response cache.
+3. **The route table matches.** Routes compile into one flat table. At each
+   segment a literal is tried before a parameter, and a parameter before a
+   trailing `*rest`, with backtracking. No route means the scope's fallback
+   if there is one, then 404. A path routed only for other methods is 405
+   with `Allow`, or a CORS preflight answer.
+4. **A heavy route waits for a heavy-lane permit.**
+5. **Middleware runs**, composed into each route's handler when the
+   application compiles. A route with none keeps its own handler.
+6. **Extractors run** in the order declared, reading lent bytes and producing
+   owned values. A failure is a `ResponseError`: 400 for a path parameter,
+   query or JSON body that will not decode, 415 for a form or multipart body
+   sent as something else, and 422 for a value that breaks its type's rules.
+7. **The handler is called.** On HTTP/1 it runs in the connection's task. On
+   HTTP/2 and HTTP/3 it runs in a task from the shard's pool, so a handler
+   that waits holds up no other stream. There is one exception: a route that
+   has run many times without suspending, and is not heavy, is answered where
+   its request was read. On HTTP/2 that is the connection's reader, when the
+   stream is the connection's only one; on HTTP/3 it is the endpoint. A typed
+   handler's return value writes itself into the response.
+8. **The connection writes the answer.** It runs the `onSend` hooks and adds
+   the server's headers (Date, Server, and Alt-Svc, Strict-Transport-Security
+   and X-Request-ID where configured). It sets Content-Length from the body
+   and frames it. A Transfer-Encoding or Connection header the handler set
+   is dropped, since the server owns framing and the connection. A
+   Content-Length the handler set is kept and held to, on a whole body and a
+   streamed one: a longer body is cut to it, and a shorter one is never ended
+   as if it were whole (the HTTP/1.1 connection is closed, the HTTP/2 or
+   HTTP/3 stream reset). A 304 keeps it, a HEAD states it, and a 204 states
+   none. A handler that returns without answering is answered 500, with a
+   line in the log.
+9. **Cancellation.** On HTTP/2 and HTTP/3, a stream the client resets has its
+   task cancelled, so a handler waiting on I/O or a sleep stops waiting, and
+   whatever it answers is dropped. A cancelled task is not reused. On
+   HTTP/1, nothing interrupts a handler whose client has gone. A streamed
+   write throws `HandlerWaitError.cancelled` once the client is gone, and
+   any other answer goes nowhere. A streaming-body route is not cancelled by
+   a reset: its body throws `RequestBodyError.incomplete` instead (see
+   [Request bodies read as they arrive](#request-bodies-read-as-they-arrive)).
 
 ## Decisions
 
 ### Two layers: raw and typed
 
-The raw `(borrowing Request, inout Response)` handler is public and zero-copy,
-for proxies, streaming and hot paths. The typed API is built on it. Both
-register through the same names, and a closure with no `await` takes the
-synchronous overload. Registration is generic over a parameter pack of
-extractors.
+The raw handler, `(borrowing Request, borrowing Response) async throws`, is
+public and zero-copy, for proxies, streaming and hot paths. The typed API is
+built on it. Both register through the same names, and they never compete: a
+closure taking a request and a response is not a pack of extractors returning
+a response. Typed registration is generic over a parameter pack of
+extractors, so a handler may take none, one or several.
+
+```swift
+import Garuda
+
+let app = Application()
+
+// Raw: the request's bytes lent, the answer written into the response.
+app.get("/echo/:word") { request, response in
+    request.withParameter(0) { response.send($0) }
+}
+
+// Typed: values extracted in, a value returned.
+app.get("/pair/:a/:b") { (a: Path<String>, b: Path<Int>) in
+    "\(a.value)-\(b.value)"
+}
+
+app.run()
+```
+
+There are no synchronous overloads. Garuda 1 needed them to keep a handler
+that does not wait off its task pool. Here a handler that does not suspend
+already runs inline, so one async signature costs it nothing.
 
 ### Ownership
 
-`Request` and `Response` are `~Copyable`. Bytes are lent as `Span<UInt8>` to a
-closure (`withBody`, `withPath`, `withHeader`). A span that would escape does
-not compile, with no experimental feature needed. Owned copies (`String`,
-`[UInt8]`, decoded types) are made only when asked for.
-`scripts/compile-fail-test.sh` checks six ways borrowed data could escape,
-compiled through SIL diagnostics, since `-typecheck` does not run the lifetime
-checks. Request context is keyed by type and tagged with the request's
-identity.
+`Request` and `Response` are `~Copyable` views of the connection's exchange,
+and a handler cannot keep either past its return. Bytes are lent as
+`Span<UInt8>` to a closure (`withBody`, `withPath`, `withQuery`,
+`withParameter`, `withHeader`). A span that would escape does not compile,
+with no experimental feature needed. Owned copies (`path`, `query`,
+`parameter(_:)`, `header(_:)`, `body`, decoded types) are made only when asked
+for. Holding the request across an `await` is safe: the task that owns the
+connection's buffer is the one suspended in the handler, so nothing moves
+underneath it, whichever thread it resumes on.
+
+`scripts/compile-fail-test.sh` compiles code that tries to keep request data
+past where it is lent, and expects each attempt to fail. It compiles through
+`-emit-sil`, since `-typecheck` does not run the lifetime checks.
+
+Request context (`request[context: Key.self]`, `Context<Key>`) is keyed by a
+`RequestContextKey` type. The first four values live in the exchange itself,
+and the context is cleared before the next request on the connection, so a
+value never reaches another request.
 
 ### Errors
 
-A thrown error conforming to `ResponseError` is the answer, and is not logged as
-a fault. `throws(HTTPError)` allocates nothing. An untyped `throws` costs one
-allocation for an error without a payload and three for one carrying a
-`String`, and only when thrown. Anything that is not a `ResponseError` is a 500
-and a log line.
+A thrown error conforming to `ResponseError` is the answer, and is not logged
+as a fault. Its body is `{"error":"…"}`, or no body when its `reason` is nil.
+`HTTPError` is the ordinary one: a status and an optional reason. Anything
+that is not a `ResponseError` is a 500 and a log line, with nothing about it
+told to the client.
 
 An error that knows which field is at fault says so, and the body carries
 `fields` beside `error`. The alternative was a message per error and a client
-that parses English; naming the field costs one array that is usually empty and
-lets a form mark the input that was refused.
+that parses English. Naming the field costs one array that is usually empty,
+and lets a form mark the input that was refused. JSON decoding errors and
+validation both fill it.
 
 ### Validation is a conformance, not a call at the route
 
-Rules beyond a type's shape live on the type, as `Validated`, and extraction
-holds whatever it decodes to them. The conformance is the opt-in: there is no
-`validate` at each route to forget, and no annotation to scan for. What it costs
-a type that has no rules is one cast that fails, on a path that has just parsed
-JSON.
+Rules beyond a type's shape live on the type, as `Validated`, and `Body`,
+`Query` and `Form` hold whatever they decode to them. The conformance is the
+opt-in: there is no `validate` at each route to forget, and no annotation to
+scan for. A type with no rules pays one failed cast per extraction.
 
 Every broken rule is answered, not the first, because a form with three wrong
-fields should not be filled in three times. The status is 422 rather than 400 to
-keep two different failures apart: a body that is not the type means the client
-is building its request wrongly, and a body that is the type with a value this
-application will not take means the client is fine and the value is wrong.
+fields should not be filled in three times. The status is 422 rather than 400
+to keep two different failures apart. A body that is not the type means the
+client is building its request wrongly. A body that is the type, with a value
+this application will not take, means the client is fine and the value is
+wrong.
 
 ### A route that cannot work is found before serving
 
-`Path` takes path parameters by position, and `State<T>` takes what `app.state`
-built. Both can be asked for and not be there, and both used to answer 500 to
-whoever sent the request that found out. Neither is a runtime condition: the
-handler's parameter types and the route's pattern are known when the route is
-registered, and the state factories are known before the first fork.
+`Path` takes path parameters by position, and `State<T>` takes what
+`app.state` built. Both can be asked for and not be there, and both would
+answer 500 to whoever sent the request that found out. Neither is a runtime
+condition. The handler's parameter types and the route's pattern are known
+when the route is registered, and the state factories are known before any
+shard starts.
 
-`app.problems()` compares them and `run()` refuses to serve, printing every
-problem at once rather than one per restart. It is a list rather than a throw
-so that a test can assert on it, and it is on `Application` rather than inside
-`compile()` so that asking costs nothing and answers the same thing twice.
+`app.problems()` compares them, and `run()` logs every problem at once and
+exits with status 2 rather than serve. It is a list rather than a throw so
+that a test can assert on it.
 
-What it will not find is what is not declared: a middleware calling
-`request.state(T.self)` is a call in a closure, and an optional extractor is a
-route saying it can do without. Both keep the answer they had.
+What it will not find is what is not declared. A middleware calling
+`request.state(T.self)` makes a call in a closure, and an optional extractor
+is a route saying it can do without. Both keep the answer they had: a missing
+state is a 500 naming the type, and `State<T>?` is nil.
 
 ### Authorization is a rule with a name
 
-A `Policy` is `(Value) -> Bool` and a name for what it requires, and `authorize`
-is middleware that applies one to a scope. Two things follow from the name: the
-403 says what would have been enough, and the OpenAPI document can say it too.
-Two follow from it being a plain function: a rule is tested without a server,
-and rules combine (`and`, `or`, `about`) with their names combining as well.
+A `Policy` is `(Value) -> Bool` and a name for what it requires, and
+`authorize` is middleware that applies one to a scope. Two things follow from
+the name: the 403 says what would have been enough, and the OpenAPI document
+can say it too. Two follow from it being a plain function: a rule is tested
+without a server, and rules combine (`and`, `or`, `about`) with their names
+combining as well.
 
-A policy cannot await, because a rule that has to ask something is a different
-thing: `authorize` has a closure form for that, and a rule about the row a
-handler is about belongs in the handler, which has already loaded the row. The
-split keeps the common rule -- a role, a scope, a flag on the account -- free of
-I/O on every request in the scope.
+A policy cannot await, because a rule that has to ask something is a
+different thing. `authorize` has a closure form for that. A rule about the row
+a handler works on belongs in the handler, which has already loaded the row,
+and throws `AuthorizationError(needs:)` to answer the same way. The split
+keeps the common rule (a role, a scope, a flag on the account) free of I/O on
+every request in the scope.
 
 `authenticate` and `authorize` describe their scope's routes through
-`describeRoutes`, which adds to the OpenAPI entry of every route in a scope. It
-is applied as the document is written rather than at registration, so a rule
-covers the routes registered before it as well, the way `use` does.
+`describeRoutes`, which adds to the OpenAPI entry of every route in a scope.
+It is applied as the document is written rather than at registration, so a
+rule covers the routes registered before it as well, the way `use` does.
 
-### State and fork semantics
+### State and shards
 
-`app.state` runs a factory in each worker after the fork. What it builds belongs
-to that worker, and an object captured before the fork is copied into each
-worker rather than shared. State every worker must see lives outside the
-process. A factory that throws stops that worker's start-up. Asking for state
-nobody registered is a 500 naming the type.
+`app.state` runs a factory in each shard, after the shard starts and before
+it accepts a connection. What it builds belongs to that shard, and every
+thread of the shard shares it, which is why it must be `Sendable`. Factories
+run in the order registered, so a later one can read an earlier one's value
+through `start.state(T.self)`. `onShardStart` hooks run after them, and
+`onShardStop` hooks and each state's `shutdown` run when the shard has
+stopped serving. A factory or start hook that throws stops that shard's
+start-up, and the supervisor tries again.
 
-### Middleware sees the response through a hook
+On Linux shards are forked; on macOS each shard runs the executable again.
+Either way, an object made before `run` is a separate copy in each shard,
+not shared. State every shard must see lives outside the processes, in a
+database or in one of the shared regions the server maps for its own use
+(the rate limit, the response cache, metrics and topics). With `--shards 0`,
+the default on macOS and Windows, there is one shard, in the process itself.
 
-Tower's model, `next(request)` returning a response value, would mean building
-every response as a value and copying it out later, because handlers answer
-into the sink and async ones answer later. Instead, middleware runs before the
-handler and registers `response.onSend`, which the sink runs before the head is
-written, whoever answered. `use` covers its whole scope regardless of where it
-is called. The cost: middleware cannot retry a handler or hold a scope around
-its run.
+Under the exec launch every shard runs `main` again up to `run`, so the
+routes an application registers must come out the same every time.
+
+### Middleware is an onion, and keeps a send hook
+
+A layer is `handle(request, response, next:)`. It runs before the layers
+inside it and gets the response back after them. It can answer and not call
+`next`, change the status or headers after `next`, or catch what the handler
+threw: a retry, a transaction rolled back. Garuda 1 could not do this,
+because its handlers answered into the connection whenever they finished.
+Here the head is not written until the chain returns, so a layer can change
+the response on the way out. `next` cannot escape the call, so the chain
+allocates nothing. `use` covers its whole scope wherever in the scope it is
+called. Global middleware is outermost, then each group's, from the outside
+in.
+
+`response.onSend` stays, for what a layer cannot see after `next`: an answer
+made once it has unwound, such as the 500 for a handler that threw past it,
+or the answer to a handler that never answered. Hooks run once, when the
+status, headers and body are final and before the head is written. The hook
+registered last runs first.
 
 ### Sessions write when they change
 
 A session change is written to the store when the handler makes it:
-`try await session.set(…)` returns once the store holds it. Saving once at the
-end, as tower-sessions does after the inner service returns, needs a point
-after the handler where the server can wait before sending, and a handler
-answers by writing, whenever it is done. A save after the response instead
-could land after the client's next request had read the old data. So a handler
-that changes several keys uses `session.update { … }` for one write, and the
-cookie for a new ID is added by a send hook, which is why the session changes
-before the answer.
+`try await session.set(…)` returns once the store holds it. Saving once at
+the end would leave a gap: a save after the response could land after the
+client's next request had read the old data, and a streamed response's head
+goes out before the handler returns. So a handler that changes several keys
+uses `session.update { … }` for one write. The cookie for a new ID is added
+by a send hook as the head is made, which is why the session changes before
+the answer.
+
+A `MemorySessionStore` belongs to one shard. With more than one shard, a
+client's next request can reach a shard that never saw its session, and the
+server warns of this as it starts. GarudaRedis and GarudaSQLite have stores
+for that case.
 
 ### CSRF protection reads Fetch Metadata, not tokens
 
-`app.csrfProtection` decides from Sec-Fetch-Site, and from Origin against Host
-when a browser sends no Sec-Fetch-Site. Every current browser sends one or the
-other on a request that changes something. A synchronizer token needs a
-session and a field in every form; a double-submit cookie needs both. Either
-way the server does work to check what the browser already says. A request
-with neither header was not made by a browser page and passes: the attack is
-a page using the browser's cookies, not a client that has them.
+`app.csrfProtection` decides from Sec-Fetch-Site, and from Origin against
+Host when a browser sends no Sec-Fetch-Site. Every current browser sends one
+or the other on a request that changes something. A synchronizer token needs
+a session and a field in every form; a double-submit cookie needs both.
+Either way the server does work to check what the browser already says. A
+request with neither header was not made by a browser page, and passes: the
+attack is a page using the browser's cookies, not a client that has them.
 
 ### OpenAPI schemas are read by decoding, not by macros
 
@@ -205,10 +278,11 @@ utoipa and aide derive schemas with macros on each type. Garuda gets them from
 the `Decodable` conformance the route already needs: a recording decoder
 decodes the type once with placeholders and writes down which keys it asked
 for, of which types, and which with `decodeIfPresent`. Nothing is annotated,
-and the schema cannot drift from what the route actually decodes. What decoding
-cannot show -- a custom `init(from:)` that parses a string -- a type states
-with `OpenAPISchemaDescribing`. Route methods return an `OpenAPIOperation`
-for the rest, so a summary sits beside the route it describes.
+and the schema cannot drift from what the route actually decodes. What
+decoding cannot show (a custom `init(from:)` that parses a string) a type
+states with `OpenAPISchemaDescribing`. Route methods return an
+`OpenAPIOperation` for the rest, so a summary sits beside the route it
+describes.
 
 ### `@JSON` is a macro, where schemas are not
 
@@ -218,13 +292,12 @@ writing JSON is the one place that argument does not hold, and the difference
 is what the compiler can be asked for. A schema is a description, and decoding
 a type once with a recording decoder produces it exactly. Speed is not a
 description: `Codable` decides at run time what a macro can decide at compile
-time -- which member comes next, what type it is, where it goes -- and no
-amount of reading the conformance recovers that. Measured on a small body, the
-deciding is 3.8 microseconds to decode and 2.5 to encode, on a request that is
-otherwise 8.
+time (which member comes next, what type it is, where it goes), and no amount
+of reading the conformance recovers that. On the JSON workload, generated
+conformances take about a fifth off the time a request takes.
 
 So `@JSON` writes the `JSONReadable` and `JSONWritable` conformances out, and
-is opt-in twice over: a type without it is decoded and encoded exactly as
+is opt-in twice over. A type without it is decoded and encoded exactly as
 before, and an application that does not import `GarudaJSON` never builds a
 macro plugin at all. That is why it is a separate module rather than part of
 `Garuda`.
@@ -232,182 +305,270 @@ macro plugin at all. That is why it is a separate module rather than part of
 It refuses rather than guesses. A dictionary or a set member, whose order
 nothing fixes; a generic struct, whose conformance would need constraints; an
 initializer in the body, which replaces the memberwise initializer the
-generated reader delegates to -- each stops the build with a message naming
+generated reader delegates to: each stops the build with a message naming
 what to write instead. The alternative, falling back to `Codable` for the
 shapes it cannot do, would be the worst of both: the type looks opted in and
 is not, and nothing says so.
 
-A `CodingKeys` that renames or omits a member, and an `encode(to:)` of the
-type's own, are refused for a sharper reason: they are not shapes the macro
-cannot manage but instructions it would silently overrule. The generated code
-takes precedence over `Codable`, so a type whose `CodingKeys` sent
-`display_name` would go on sending `display_name` through `JSONDecoder` and
-start sending `name` through a route -- and a member the keys left out would
-start being published. Adding an attribute for speed must not change what a
-type sends, so both stop the build. Name the members what the JSON calls them,
-or leave `Codable` to do it alone. The same applies to `@PostgresRow`, which
-reads each property from the column of its own name: with a `CodingKeys` in
-the way, which column that is would depend on which path ran.
+A `CodingKeys` and an `encode(to:)` of the type's own are refused for a
+sharper reason. They are not shapes the macro cannot manage, but instructions
+it would silently overrule. The generated code takes precedence over
+`Codable`, so a type whose `CodingKeys` sent `display_name` would go on
+sending `display_name` through `JSONDecoder` and start sending `name` through
+a route, and a member the keys left out would start being published. Adding
+an attribute for speed must not change what a type sends, so both stop the
+build. Name the members what the JSON calls them, or leave `Codable` to do it
+alone. The same applies to `@PostgresRow` (in `GarudaSQL`), which reads each
+property from the column of its own name: with a `CodingKeys` in the way,
+which column that is would depend on which path ran.
 
 Both branches of a `#if` count. A macro is expanded before the branches are
 chosen, so it cannot know which one this build takes, and a `CodingKeys` that
-only a debug build compiles is refused along with the rest -- a type whose JSON
+only a debug build compiles is refused along with the rest. A type whose JSON
 depended on the configuration is worse than one that will not build. What
 cannot be caught is a declaration outside the type's body: an extension is
-invisible to any macro, which is the reason not to pair either attribute with a
-`Codable` form written by hand.
+invisible to any macro, which is the reason not to pair either attribute with
+a `Codable` form written by hand.
 
 ### CORS is a policy of a scope, not a middleware in order
 
 `app.cors` does not take a place among the `use` calls. The innermost scope's
 policy runs in front of all of a route's middleware. A browser's preflight
 carries no credentials, so authentication in front of it would refuse every
-preflight. And a 401 from that authentication needs Access-Control-Allow-Origin,
-or the page cannot read it. A preflight to a path routed only for other methods
-is answered from the 405 branch of dispatch, using the policy of one of the
-routes the path does have, so a CORS route needs no OPTIONS route of its own.
+preflight. And a 401 from that authentication needs
+Access-Control-Allow-Origin, or the page cannot read it. A preflight to a
+path routed only for other methods is answered from the 405 branch of
+dispatch, using the policy of one of the routes the path does have, so a CORS
+route needs no OPTIONS route of its own.
 
 ### Deadlines return 504
 
-`app.deadline` answers 504, not 503. Garuda already uses 503 for "this worker is
-out of capacity" (drain, health probes, pool exhaustion), and a slow route is
-not that. A deadline bounds waiting, not computing: nothing preempts a handler
-that loops without awaiting.
+`app.deadline` answers 504, not 503. Garuda uses 503 for "this server cannot
+take this now": a scope's `concurrencyLimit` reached, and the health check
+while the server drains. A slow route is not that.
 
-### Blocking work on threads of each worker's own
+The routes inside `app.deadline(limit) { … }` run under Vega's I/O deadline
+(`Runtime.withIODeadline`). A socket, pipe or database wait still pending when
+the time is up gives up with `IOError.timedOut`, and so does any that would
+start after it. If that reaches the deadline unanswered, the request is
+answered 504. A deadline bounds I/O waits, not computing: nothing preempts a
+handler that loops without awaiting, and a `Runtime.sleep`, a channel or a
+child task's wait is not cut short either. An offloaded handler is not cut
+short.
 
-`blocking { … }` runs its closure on a pool of threads that belongs to the
-worker process, started when first used, and brings the result back through a
-pipe on the worker's poller. The waiting task resumes on its worker, so the rest
-of the handler keeps every guarantee a handler has. The pool is per worker
-because workers are processes. Threads are bounded by `--blocking-threads` and
-waiting work by `--blocking-queue`, past which the work is refused 503 rather
-than queued without limit. The closure is `@Sendable`: it runs concurrently with
-the worker's other requests, so the compiler checks what it captures. Work
-cannot be interrupted, so a cancelled request learns of it only when its work
-returns.
+### The heavy lane
 
-Garuda does not run external programs for a handler. Waiting on one is
-blocking work like any other, so it goes in `blocking { … }`, with no lock
-around it: the pool's bound is the limit on how many run at once. Where Garuda
-itself would otherwise block a handler, the blocking path is not the default:
-`CompletedUpload.digest()` hashes on the pool and must be awaited, and the
-overload that hashes on the calling thread is `noasync`, so a handler cannot
-choose it by accident.
+Work stealing alone lets a burst of requests that each hold the CPU for
+milliseconds take every thread, and then a quick request waits behind them.
+So each route keeps an average of how long its handler holds a thread. A
+route whose average passes `--heavy-threshold` (500 µs by default), or one
+registered through `app.heavy`, is heavy. Its handler runs only once it holds
+one of the shard's heavy-lane permits, of which there are half as many as
+threads, rounded up. The other threads are left to everything else.
 
-### Outbound I/O on the worker's poller
+"Holds a thread" is not wall time. A handler that awaits a database or a
+timer gives its thread up while it waits, and is not heavy for waiting. Only
+a run that finished without suspending counts as a sample. A handler that
+computes between awaits is not seen this way, so it is registered with
+`app.heavy.get(…)` and the rest. `--no-heavy-lane` turns the lane off.
 
-Outbound connections, the DNS resolver, TLS, the HTTP client, PostgreSQL and Redis all
-run on the worker's own poller. `getaddrinfo` blocks, so names are resolved by
-Garuda's resolver. Outbound connections live in their own table, so a pooled
-idle connection does not keep a draining worker from finishing. An HTTP/2 client
-connection's read is a baton passed between waiting requests rather than a task
-of its own, because a task living as long as the connection would outlive a
-drain.
+### Blocking work goes to the blocking pool
+
+A shard has a few worker threads, and every connection of the shard is served
+on them. A handler that blocks its thread (a synchronous file read, a C
+library that waits on a lock or the network) takes that thread from every
+other request until it returns. `app.offload.get(…)` and its siblings register
+a route whose extractors run as usual, whose synchronous handler runs on
+Vega's blocking pool (`Runtime.blocking`), and whose answer is written back on
+the worker. The handler is not async: the work that awaits belongs in an
+ordinary route. What it takes and returns crosses threads, so it must be
+`Sendable`. A pool thread cannot be stopped: neither a deadline nor a client
+that goes away cuts an offloaded handler short. Work that finds every thread
+busy and `--blocking-queue` pieces already waiting is refused: the route, or
+a handler's own `Runtime.blocking`, answers 503.
+
+The heavy lane is for work that computes; offloading is for work that blocks
+without computing.
+
+### Outbound I/O on the runtime
+
+The HTTP client, PostgreSQL and Redis run on Vega's sockets and TLS, on the
+same threads as the server, so a handler's outbound call is an await like any
+other. An HTTP client connection goes back to the pool only when its
+response was read whole and both ends mean to keep it, and redirects are
+followed only when asked for. Over TLS the client offers h2, and one HTTP/2
+connection is shared by every request to the same origin. Each such
+connection has a reader task of its own. Garuda 1 passed the read between
+waiting requests instead, because its workers could not spare a task.
 
 ### Databases
 
-- Drivers are protocol state machines over bytes (`GarudaPostgres`, `GarudaRedis`), with no
-  sockets or threads inside, so they are tested against recorded exchanges and
-  fuzzed like the HTTP parsers. The socket layer and pool are in `Garuda`.
-- PostgreSQL first, native on the poller, then Redis the same way. A Redis
-  reply parser resumes from a stack rather than re-reading, because a large
-  reply arrives over many reads. A pooled connection is closed rather than
-  reused whenever a command may have changed its session, which is simpler to
-  get right than restoring it.
-- SQLite through a bounded blocking pool, since it is a library doing disk I/O.
-  The system's libsqlite3 is loaded with dlopen, as brotli and zstd are, rather
-  than vendoring its source. A statement runs whole on a pool thread and its
-  rows are copied out, so the worker decodes them without touching SQLite, and a
-  connection is used by one thread at a time. One writer and several readers
-  per worker, because SQLite has one writer per file; transactions begin
-  IMMEDIATE because the lock upgrade a deferred one needs fails at once instead
-  of waiting.
-- Any other database through an async bridge to an existing Swift driver, at a
-  thread hop per call.
-- Not postgres-nio: it brings SwiftNIO's threads into every worker and a thread
-  hop into every query.
+- The drivers are vega-db's, re-exported by `GarudaPostgres`, `GarudaRedis`
+  and `GarudaSQLite`, with what joins them to Garuda: `UUID` and `Timestamp`
+  as columns, JSON through Garuda's coder, and for PostgreSQL, spans on the
+  application's tracer. `@PostgresRow` is in `GarudaSQL`, apart from the driver, because it
+  needs swift-syntax.
+- The PostgreSQL and Redis protocols are state machines over bytes in
+  vega-db, with no sockets inside. The connections and pools run on Vega's
+  I/O. A pool is made with `app.state`, so each shard has its own.
+- SQLite runs every statement on Vega's blocking pool, since it is a library
+  doing disk I/O and waiting on file locks. One connection writes and several
+  read. Transactions begin IMMEDIATE, because the lock upgrade a deferred one
+  needs fails at once instead of waiting. Each shard opens the file for
+  itself, and SQLite's own locks order the writers.
+- Not postgres-nio: it brings SwiftNIO's event loops into every shard and a
+  thread hop into every query.
 
 ### Streaming
 
-`response.stream()` sends the head through the ordinary sink with a flag that
-leaves the response open, and returns a `ResponseBodyWriter`. A typed handler
-returns `StreamingBody`, whose producer the handler's task runs after the
-handler returns. A write waits on a continuation in the slot above
-`writeHighWaterMark` (512 KiB), and every flush and QUIC acknowledgement checks whether to
-wake it. The wake is queued on the executor, never run inside the flush.
-Concurrent producers each wait, and the drain wakes all of them to read the
-backlog again for themselves. A stalled reader is closed after
-`--request-timeout`.
-`EventStream` is built on the writer.
+`response.stream()` makes the head the way every other answer's is made
+(middleware's headers, `onSend` hooks, the server's own) and returns a
+`ResponseBodyWriter`. A typed handler returns `StreamingBody`, whose producer
+runs once the handler and the middleware around it have returned. The body is
+framed as it is written: chunked on HTTP/1.1, DATA frames on HTTP/2 and
+HTTP/3. Throwing part-way cuts it off (the connection closed, the stream
+reset), so no client takes half a body for all of it.
 
-A `Topic` has to reach clients held by every worker process, so a message goes
-into a ring mapped before the fork (`avian_bus.c`) and every worker, the
-publisher included, reads it back from there. No lock is held across processes:
-one writer claims the ring by compare-and-swap for the copy of one message, and
-a claim whose process has died is taken over. Readers take no claim; they copy
-a message and then check the writer has not come round to it. The ring keeps
-what it has room for, not only what is unread, and that is what serves
-`Last-Event-ID` from any worker. A worker with subscribers arms a wake before
-it sleeps; a publisher writes to the eventfd of each armed worker and disarms
-it, so a burst costs one wake per worker. A subscriber waits the way a sleeping
-handler does, on its request's slot or its WebSocket's timed waits, so the
-connection closing ends the wait. A subscriber's queue is bounded, and what
-does not fit becomes a single `.missed`.
+A write queues its bytes and returns. When the backlog has passed
+`ServerConfig.writeHighWaterMark` (512 KiB), it waits until the backlog falls
+to `writeLowWaterMark` (128 KiB). So a client that reads slowly slows the
+handler writing to it, and nothing else. Writers in child tasks of the
+handler may write at once, and each waits. A client that goes away, or takes
+nothing for `ServerConfig.writeTimeout` (30 seconds), ends every write with
+`HandlerWaitError.cancelled`. `EventStream` is built on the writer, and sends
+a keep-alive comment after `--sse-keep-alive` of silence.
 
-A route registered with `onStreamingBody` has its own body limit, kept beside
-the routes, and is dispatched when its head arrives instead of after its body.
-The body stays in the connection's buffer until the handler reads it. Reading
-is what lets more in: on HTTP/1.1 it restores read interest, on HTTP/2 it
-returns window, and on HTTP/3 the stream window grows only by what was read, so
-one window bounds what a slow handler leaves unread. The reader's state lives
-apart from the connection slot, so when a connection closes, what arrived is
-handed to the reader before it throws `incomplete`. That is what makes an
-interrupted upload resumable.
+### Topics across shards
 
-Resumable uploads are a separate target, `GarudaUploads`, like `GarudaPostgres`:
-a file store locked with `flock`, the draft's routes, and limits enforced in the
-handler rather than by the engine, so a 413 can carry `Upload-Limit`.
+A `Topic` has to reach clients held by every shard, so a message goes into a
+ring in a region every shard maps (`garuda_bus.c`, `--broadcast-size`). Every
+shard, the publisher's included, reads it back from there. No lock is held
+across processes. One writer claims the ring by compare-and-swap for the copy
+of one message, and a claim whose process has died is taken over. Readers
+take no claim: they copy a message and then check that the writer has not
+come round to it.
 
-WebTransport sessions and streams use the same shape: waits are continuations
-on the session and stream, resumed from the frame loop. The session comes first
-in a WebTransport handler because Swift will not pass arguments after a
-parameter pack.
+The ring keeps what it has room for, not only what is unread, and that is
+what serves `Last-Event-ID` from any shard. Each shard has one thread that
+sleeps on the ring and hands messages to its subscribers. A publisher wakes
+each sleeping shard once (a futex on Linux), so a burst costs one wake per
+shard. A subscriber's queue is bounded (`--broadcast-queue`), and what does
+not fit, or what the ring no longer holds, arrives as a single `.missed`.
+
+### WebSockets and WebTransport
+
+A WebSocket route is an ordinary route until it is accepted: middleware and
+extractors run in front of it, and a request either refuses is answered with
+an ordinary status. WebSockets run over HTTP/1.1, and over HTTP/2 and HTTP/3
+through extended CONNECT. WebTransport sessions run over HTTP/3 the same way.
+In both handlers the session comes first (`webSocket(_:subprotocols:_:)`
+hands a `WebSocket`, `webTransport(_:_:)` a `WebTransportSession`), because
+Swift will not pass arguments after a parameter pack.
+
+### Request bodies read as they arrive
+
+Every route is given its body whole, read up to its limit before the handler
+runs, except one registered with `onStreamingBody`. That route is dispatched
+once the request's head has arrived, and its handler takes the body as it
+asks for it, through a `RequestBody`:
+
+```swift
+import Garuda
+import Vega      // IOBuffer
+import VegaFS    // File
+
+app.onStreamingBody(.put, "/uploads/:name", maxBodySize: 64 << 20) { request, response, body in
+    let file = try await File.create(uploadDirectory + "/" + request.parameter(0), permissions: 0o644)
+    var buffer = IOBuffer(capacity: 256 * 1024)
+    var bytes = 0
+    while try await body.read(into: &buffer) > 0 {
+        try await file.write(buffer)
+        bytes += buffer.count
+        buffer.clear()
+    }
+    response.send("\(bytes)")
+}
+```
+
+| `RequestBody` | |
+|---|---|
+| `read(into: &buffer)` | reads into the buffer's spare room, waiting when nothing has arrived; returns the count, 0 at the end |
+| `read(maxBytes:)` | up to `maxBytes` (64 KiB by default) as `[UInt8]`, or `nil` at the end |
+| `readAll(maxBytes:)` | the rest of the body, or `tooLarge` once it passes `maxBytes` |
+| `bytesRead` | how many bytes have been read so far |
+| `expectedLength` | the `Content-Length` the client declared, or `nil` |
+| `cancel()` | ends the request: an HTTP/1.1 connection is closed, an HTTP/2 or HTTP/3 stream reset; the reader throws `incomplete` |
+
+A read throws `RequestBodyError`, which answers for itself when the handler
+lets it go:
+
+- `.incomplete`, 400: the request ended before its body did. The client
+  closed the connection, reset the stream, or the request was cancelled.
+  Every byte that arrived is read first, and then the read throws. That is
+  what makes an upload resumable from where it stopped.
+- `.tooLarge`, 413: the body passed the route's `maxBodySize`, or
+  `readAll`'s limit. Nothing past the limit is handed over.
+
+**Limits.** `maxBodySize` is the route's own and takes the place of
+`--max-body`; left out, it is `Int.max`. A declared length past it is
+answered 413 before the handler runs. A chunked, HTTP/2 or HTTP/3 body is
+counted as it arrives.
+
+**Flow control.** Reading is what lets more in. On HTTP/1.1 the handler's
+read is the connection's read, through a 256 KiB buffer; on HTTP/2 the
+stream's window is given back as bytes are read, not as they arrive; on
+HTTP/3 QUIC's stream window grows the same way. A handler that stops reading
+holds its client to one window, and a slow disk slows its own upload and
+nothing else. `Expect: 100-continue` is answered on the first read, and not
+at all when the body has already arrived.
+
+**Resets.** A reset HTTP/2 or HTTP/3 stream does not cancel a streaming
+handler's task, as it does any other handler's. The body ending is how such
+a handler learns its request did, and a cancelled task could not store what
+it had been given. The body throws `incomplete` once what arrived has been
+read.
+
+A body the handler leaves unread costs an HTTP/1.1 connection nothing when
+all of it has arrived; otherwise the connection is closed rather than read
+for a body nobody wants. `RequestBody` may be read from the handler or from
+tasks it starts, one read at a time, and means nothing once the handler has
+returned.
+
+**Resumable uploads** (`GarudaUploads`) are built on this:
+`app.resumableUploads("/files", store: store) { upload in … }` serves
+draft-ietf-httpbis-resumable-upload over every protocol, keeps the bytes on
+disk as they arrive, and calls the handler once with the whole upload. See
+the [README](README.md#resumable-uploads) and the files and uploads examples
+in [Examples/](Examples/README.md).
 
 ## Where it lives
 
 - **`Sources/Garuda`** holds the public API beside the engine, so there is no
   module boundary on the request path. Engine types stay `internal` where the
   API does not need them.
-- **`Sources/garuda-server`** serves the-benchmarker's contract through the
-  public API, so the benchmark measures what applications use.
-- **`Sources/GarudaConformance`** holds routes that make engine behaviour
-  observable to the end-to-end suites. It is not an example to copy.
+- **`Sources/GarudaWire`** is the HTTP/1.1 protocol as a state machine over
+  bytes. HPACK, QPACK, the frames and QUIC are Vega's (`VegaWire`,
+  `VegaHTTP3`, `VegaQUIC`). None of them touches a socket.
+- **`Sources/garuda-server`** serves the-benchmarker's contract and the
+  workloads through the public API, so the benchmark measures what
+  applications use.
+- **`Sources/garuda-conformance`** holds routes that make engine behaviour
+  observable to the end-to-end suites under `scripts/`. It is not an example
+  to copy.
 
-## Performance gate
+## Performance checks
 
-A change does not land if it costs the benchmark contract more than 5% against
-the commit before it, measured in the same session (`benchmarks/frameworks.sh`,
-four workers, 64 connections). `benchmarks/vs-axum.sh` runs after each roadmap
-step. A unit test counts heap allocations across dispatch and requires zero per
-request after warm-up for synchronous routes, async routes and async routes that
-wait once.
+`AllocationTests` counts heap allocations across dispatch, and requires zero
+per request after warm-up for a plain route, a typed `Path` route and a
+middleware chain. [benchmarks/frameworks.sh](benchmarks/frameworks.sh)
+compares Garuda with other frameworks on the-benchmarker's contract, and
+[benchmarks/workloads.sh](benchmarks/workloads.sh) measures path parameters,
+JSON in and out, a database round trip, streaming, uploads, downloads, a
+relay, handshake churn, HTTP/2, overload, and quick requests sharing a server
+with slow ones. [BENCHMARKS.md](BENCHMARKS.md)
+records the results and the method.
 
-## Roadmap
+## Status
 
-| Step | Scope | State |
-|---|---|---|
-| 1 | Ownership, `Application`, test client, handler task pool, packaging | Done |
-| 2 | JSON, typed answers and errors, extraction, per-worker state, forms and multipart | Done |
-| 3 | Async handlers, cancellation and deadlines, outbound connections, HTTP client, databases, blocking pool | Done |
-| 4 | Groups, 405, middleware, response hooks, routers, fallbacks, shipped middleware | Done |
-| 5 | Streaming, server-sent events, WebSockets, WebTransport | Done |
-| 6 | Examples and realistic benchmarks | Done |
-
-All six steps are done and 1.0 is released.
-[benchmarks/workloads.sh](benchmarks/workloads.sh) measures the workloads step
-6 called for -- path parameters, JSON in and out, a database round trip and
-streaming, plus uploads, downloads, a relay, handshake churn, HTTP/2 and
-overload -- and [BENCHMARKS.md](BENCHMARKS.md) records the results and the
-method. What is still missing is listed under
-[Status](README.md#status) in the README, not here.
+What is still missing is listed under [Status](README.md#status) in the
+README, not here.

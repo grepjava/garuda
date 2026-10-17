@@ -5,29 +5,22 @@
 //
 //     app.get("/user/:id") { (id: Path<Int>) in JSON(user(id.value)) }
 //
-// Extractors run on the worker thread before the handler is called, straight
-// from the request's own bytes. A failure is thrown, and because these errors
+// Extractors run in the connection's task before the handler is called,
+// straight from the request's own bytes. A failure is thrown, and because these errors
 // conform to `ResponseError` it becomes one consistent 400 saying what was
 // wrong, rather than each handler inventing its own.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
+import GarudaWire
 
 /// Something a handler can ask for by declaring it as a parameter.
-public protocol RequestExtractor {
+///
+/// Extraction may await -- a session read from a store, a body still
+/// arriving -- and one that does not costs nothing for being able to.
+public protocol RequestExtractor: SendableMetatype {
     /// Takes this value from the request. `parameter` is the index of the next
     /// path parameter not yet claimed; an extractor that reads one advances it.
-    static func extract(from request: borrowing Request, parameter: inout Int) throws -> Self
-
-    /// Whether the extractor awaits: true for an `AsyncRequestExtractor`.
-    /// Not to be implemented; the defaults answer it, from the conformance,
-    /// where asking with `as?` on every request was a lookup in the runtime's
-    /// conformance tables every time.
-    static var awaitsExtraction: Bool { get }
-}
-
-extension RequestExtractor {
-    public static var awaitsExtraction: Bool { false }
+    static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Self
 }
 
 /// An extractor that claims a path parameter, so that a handler asking for
@@ -49,7 +42,7 @@ public struct Path<Value: LosslessStringConvertible>: RequestExtractor {
     }
 
     public static func extract(from request: borrowing Request,
-                               parameter: inout Int) throws -> Self {
+                               parameter: inout Int) async throws -> Self {
         let index = parameter
         parameter += 1
         guard index < request.parameterCount else {
@@ -78,7 +71,7 @@ public struct Query<Value: Decodable>: RequestExtractor {
     }
 
     public static func extract(from request: borrowing Request,
-                               parameter: inout Int) throws -> Self {
+                               parameter: inout Int) async throws -> Self {
         let items = request.withQuery { query in
             query.withUnsafeBufferPointer { bytes -> [(name: String, value: String)] in
                 guard let base = bytes.baseAddress, bytes.count > 0 else { return [] }
@@ -100,7 +93,7 @@ public struct Body<Value: Decodable>: RequestExtractor {
     }
 
     public static func extract(from request: borrowing Request,
-                               parameter: inout Int) throws -> Self {
+                               parameter: inout Int) async throws -> Self {
         try request.withBody { bytes in
             guard bytes.count > 0 else { throw ExtractionError.noBody }
             let value = try JSONCoder.decode(Value.self, from: bytes)
@@ -158,6 +151,35 @@ func percentDecoded(_ text: String) -> String {
 }
 
 extension Path: PathClaiming {}
+
+/// An extractor that may refuse, made optional: nil where it would have
+/// refused, so the handler decides what a missing value means. A path
+/// parameter it would have claimed is left for the next `Path`.
+extension Optional: RequestExtractor where Wrapped: RequestExtractor {
+    public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Wrapped? {
+        let start = parameter
+        do {
+            return try await Wrapped.extract(from: request, parameter: &parameter)
+        } catch {
+            parameter = start
+            return nil
+        }
+    }
+}
+
+/// An extractor that may refuse, with why: the error it would have answered
+/// with, for the handler to look at.
+extension Result: RequestExtractor where Success: RequestExtractor, Failure == any Error {
+    public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Result {
+        let start = parameter
+        do {
+            return .success(try await Success.extract(from: request, parameter: &parameter))
+        } catch {
+            parameter = start
+            return .failure(error)
+        }
+    }
+}
 
 extension Path: Sendable where Value: Sendable {}
 extension Query: Sendable where Value: Sendable {}

@@ -166,6 +166,9 @@ class Client(QuicConnectionProtocol):
         # Every byte each stream carried, before HTTP/3 reads it: a session's
         # CONNECT stream carries capsules, which aioquic does not report.
         self.raw = {}
+        # The streams whose FIN has arrived. aioquic forgets a stream once
+        # both its directions are done, so this is noted as it happens.
+        self.raw_ended = set()
         self._events = asyncio.Event()
 
     # -- session set-up ----------------------------------------------------
@@ -285,6 +288,8 @@ class Client(QuicConnectionProtocol):
     def quic_event_received(self, event):
         if isinstance(event, StreamDataReceived):
             self.raw[event.stream_id] = self.raw.get(event.stream_id, b"") + event.data
+            if event.end_stream:
+                self.raw_ended.add(event.stream_id)
         elif isinstance(event, StreamReset):
             self.resets[event.stream_id] = event.error_code
         for http_event in self._http.handle_event(event):
@@ -293,6 +298,9 @@ class Client(QuicConnectionProtocol):
                 self.headers[sid] = dict(http_event.headers)
                 if sid in self.connected and not self.connected[sid].done():
                     self.connected[sid].set_result(self.headers[sid])
+                # An empty body may come as the head and FIN, with no DATA.
+                if http_event.stream_ended:
+                    self.body_ended.add(sid)
             elif isinstance(http_event, DataReceived):
                 sid = http_event.stream_id
                 self.body[sid] = self.body.get(sid, b"") + http_event.data
@@ -547,9 +555,7 @@ async def closing():
             session = client.connect_session("/wt-close")
             headers = await client.await_session(session)
             is_("the session is accepted first", headers.get(b":status"), b"200")
-            reader = client._quic._streams.get(session)
-            got = await client.wait_for(
-                lambda: reader is not None and reader.receiver.is_finished, 10)
+            got = await client.wait_for(lambda: session in client.raw_ended, 10)
             check("the application close ends the CONNECT stream", got)
 
             # The client closes; the connection must survive it.

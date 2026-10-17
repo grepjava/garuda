@@ -4,7 +4,6 @@
 //
 //     app.group("/account") {
 //         app.csrfProtection(trustedOrigins: ["https://admin.example.com"])
-//         app.sessions { request in RedisSessionStore(try request.state(RedisPool.self)) }
 //         app.post("/email") { … }
 //     }
 //
@@ -26,13 +25,13 @@
 // too. It needs no token in forms, no cookie and no state, and it follows
 // the check Go's net/http gained in 1.25.
 //
+// A safe method is let through before any header is read, so the reads that
+// make up most traffic pay one comparison.
+//
 // What it does not do: protect a GET that changes something, which should be
 // a POST, or tell a subdomain an attacker controls from the site itself when
 // the browser sent only Origin -- Sec-Fetch-Site does tell them apart.
 //===----------------------------------------------------------------------===//
-
-import AvianCore
-import AvianHTTP
 
 extension RouteBuilder {
     /// Refuses, with 403, a request in the current scope that would change
@@ -41,7 +40,7 @@ extension RouteBuilder {
     /// pages may send them anyway.
     ///
     /// A middleware in the order of `use`: call it before middleware that
-    /// does work for the request, such as `sessions`.
+    /// does work for the request, such as sessions.
     public func csrfProtection(trustedOrigins: [String] = []) {
         let trusted = Set(trustedOrigins.map { origin -> String in
             let lowered = origin.lowercased()
@@ -49,14 +48,26 @@ extension RouteBuilder {
                          "a trusted origin is scheme://host[:port], with no path: \(origin)")
             return lowered
         })
-        use { request, _ in
+        use(CSRFMiddleware(trusted: trusted))
+    }
+}
+
+/// The middleware `csrfProtection` adds.
+struct CSRFMiddleware: Middleware {
+    let trusted: Set<String>
+
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
+        switch request.method {
+        case .get, .head, .options: break
+        default:
             if isCrossOriginRefused(method: request.method, fetchSite: request.header("sec-fetch-site"),
                                     origin: request.header("origin"), host: request.authority,
                                     trusted: trusted) {
                 throw HTTPError(.forbidden, "cross-origin request refused")
             }
-            return nil
         }
+        try await next()
     }
 }
 

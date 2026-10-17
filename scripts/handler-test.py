@@ -706,7 +706,9 @@ def request_ids():
 
 def request_start():
     print("\nRequest start")
-    with Server("--request-start-header", "--workers", "1", tls=False) as server:
+    # One process and one worker: a second shard would answer the queued
+    # request at once.
+    with Server("--request-start-header", "--workers", "1", "--shards", "0", tls=False) as server:
         before = time.time() * 1e6
         dump = get_json(server)
         check("the start is now, in microseconds",
@@ -733,7 +735,7 @@ def request_start():
 
         blocker = threading.Thread(target=block)
         blocker.start()
-        time.sleep(0.05)
+        time.sleep(0.1)
         sent = time.time() * 1e6
         dump = get_json(server)
         answered = time.time() * 1e6

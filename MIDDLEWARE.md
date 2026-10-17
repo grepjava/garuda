@@ -1,6 +1,6 @@
 # Middleware
 
-Middleware is code that runs for many routes: it refuses requests, adds
+Middleware is code that runs around many routes: it refuses requests, adds
 headers, loads a session, or times what happened. This page covers how it
 works in Garuda, every piece Garuda ships, and how to write your own.
 
@@ -13,60 +13,92 @@ works in Garuda, every piece Garuda ships, and how to write your own.
 ## How middleware runs
 
 `app.use` adds middleware to the current scope: the whole application, or the
-group or router it is called in.
+group or router it is called in. A middleware is a closure, or a type
+conforming to `Middleware`, that gets the request, the response and `next`,
+the rest of the chain:
 
 ```swift
-app.use { request, response in
-    guard request.header("x-api-key") == expectedKey else { return HTTPStatus.unauthorized }
-    return nil
+app.use { request, response, next in
+    guard request.header("x-api-key") == expectedKey else {
+        return response.send(status: .unauthorized)
+    }
+    try await next()
 }
 
 app.group("/admin") {
-    app.use { request, response async throws -> (any ResponseConvertible)? in
-        let allowed = try await audit.check(request.path)
-        return allowed ? nil : HTTPStatus.forbidden
+    app.use { request, response, next in
+        let started = Timestamp.now
+        try await next()
+        let ms = (Timestamp.now.microsecondsSinceEpoch - started.microsecondsSinceEpoch) / 1000
+        response.addHeader("server-timing", "app;dur=\(ms)")
     }
-    app.get("/stats") { "stats" }
+    app.get("/stats") { () in "stats" }
 }
 ```
 
-- A middleware returns `nil` to let the request through, or an answer (any
-  `ResponseConvertible`) to answer in the handler's place. Throwing answers as
-  a handler that throws does.
-- Middleware runs from the outside in: application first, then each group.
-  Within a scope, `use` calls run in the order they were made. Where the routes
-  are registered does not matter: a `use` after them still covers them.
-- A closure that awaits is async middleware. The synchronous middleware before
-  the first async one runs on the worker thread; the rest of the chain and the
-  handler run on one of the worker's handler tasks.
-- A route with no middleware pays nothing: the chain is assembled once, when
-  the application compiles.
+- A middleware calls `next` at most once to run the layers inside it and the
+  handler. To answer in the handler's place, it sends a response and returns
+  without calling `next`, or throws: a thrown error is answered as it would be
+  from a handler.
+- After `next` returns, the middleware can still change the status and add
+  headers: the response is written once the handler and every layer around
+  it have returned (unless the handler streamed it with `response.stream()`).
+  It can also catch what the handler threw, with `do`/`catch` around `next`.
+- Middleware runs from the outside in: application first, then each group,
+  and comes back out in the opposite order. Within a scope, `use` calls run in
+  the order they were made. Where the routes are registered does not matter:
+  a `use` after them still covers them.
+- Middleware runs for requests that match a route, and in front of a scope's
+  `fallback`. A request no route answers (a 404, a 405) does not run it.
+- A route with no middleware pays nothing: each route's chain is put together
+  once, when the application compiles, and costs one call per layer.
 
-### Seeing the response: `onSend`
-
-Middleware runs before the handler and cannot wrap it. To see or change the
-answer, it registers a hook that runs just before the response head is written,
-whoever answers: the handler, a later middleware, a thrown error, a deadline.
+The same thing as a type, for middleware you reuse or test on its own:
 
 ```swift
-app.use { request, response in
-    let started = Timestamp.now
-    response.onSend { outgoing in
-        let ms = (Timestamp.now.microsecondsSinceEpoch - started.microsecondsSinceEpoch) / 1000
-        outgoing.addHeader("server-timing", "app;dur=\(ms)")
+struct RequireToken: Middleware {
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
+        guard request.header("authorization") == "Bearer good" else {
+            return response.send(status: .unauthorized, "no")
+        }
+        try await next()
     }
-    return nil
+}
+
+app.use(RequireToken())
+```
+
+### Seeing the final response: `onSend`
+
+Some answers are made after every layer has unwound: the 500 for an error
+that is not a `ResponseError`, or for a handler that never answered. To see
+those as well, a middleware registers a hook that runs just before the
+response head is written, whoever answered: the handler, a middleware, a
+thrown error, a deadline.
+
+```swift
+app.use { request, response, next in
+    response.onSend { outgoing in
+        if outgoing.status.code >= 500 {
+            outgoing.replaceBody(#"{"error":"internal"}"#, contentType: "application/json")
+        }
+        outgoing.setHeader("cache-control", "no-store")
+    }
+    try await next()
 }
 ```
 
 Hooks run once, the last registered first, so the middleware that ran first
-sees the response last. A hook can read and change the status, headers and
-body. Static files, `--cache-size` hits and answers given before a route is
-chosen (a 404) do not run hooks.
+sees the response last. A hook can read and change the status, read, add,
+replace and remove headers, and read or replace the body. A hook added after
+the head is written never runs. Static files, `--cache-size` hits and answers
+given before a route is chosen (a 404, a 405) do not run hooks.
 
 ### Seeing every request: `onResponse`
 
-`app.onResponse` sees every request once it is answered, including 404s:
+`app.onResponse` sees every request once it is answered, including 404s,
+405s and requests refused before they were routed:
 
 ```swift
 app.onResponse { done in
@@ -76,8 +108,10 @@ app.onResponse { done in
 ```
 
 `CompletedRequest` holds the method, path, matched route pattern, status,
-duration, protocol, client address, request ID, trace IDs, and why a route
-answered 5xx on its own account.
+duration in microseconds, protocol, client address, request ID, trace and
+parent IDs, and why a route answered 5xx on its own account. Observers run in
+the connection's task, in the order added, before it reads the next request,
+so keep them quick.
 
 ### Handing values to handlers
 
@@ -87,22 +121,24 @@ it by key:
 ```swift
 enum CurrentUser: RequestContextKey { typealias Value = User }
 
-app.use { request, _ async throws -> (any ResponseConvertible)? in
+app.use { request, response, next in
     request[context: CurrentUser.self] = try await users.find(request)
-    return nil
+    try await next()
 }
 app.get("/me") { (user: Context<CurrentUser>) in JSON(user.value) }
 ```
 
-An [async extractor](#extractors-instead-of-middleware) is often simpler, when
-only some routes need the value.
+A route that takes `Context<Key>` when nothing stored a value under the key is
+answered 500: the middleware that should have run did not. An
+[extractor](#extractors-instead-of-middleware) is often simpler, when only
+some routes need the value.
 
 ## Order within a scope
 
 Most shipped middleware is added with `use`, so order matters. A good order:
 
 ```swift
-app.securityHeaders()                          // 1. first, so every refusal below carries them
+app.securityHeaders()                          // 1. outermost, so every refusal below carries them
 app.allowedHosts(["example.com"])              // 2. cheap refusals
 app.addressFilter(allow: ["10.0.0.0/8"])
 app.csrfProtection()                           // 3. before any work for a forged request
@@ -114,12 +150,14 @@ app.authenticate(bearer: CurrentUser.self) { token in try await users.find(token
 A few pieces are not in that order, because they belong to a scope rather than
 a position:
 
-- **`app.cors`** runs in front of all of a scope's middleware. A browser's
-  preflight carries no credentials and must not meet authentication, and a
-  401 needs CORS headers for the page to read it.
-- **`app.deadline`, `app.maxBodySize` and `app.concurrencyLimit`** wrap the
-  routes registered inside their closure.
-- **`app.trailingSlash`** is set once for the application, because it runs
+- **`app.cors`** runs in front of all of a scope's middleware, wherever it is
+  called. A browser's preflight carries no credentials and must not meet
+  authentication, and a 401 needs CORS headers for the page to read it.
+- **`app.deadline`, `app.maxBodySize` and `app.concurrencyLimit`** apply to
+  the routes registered inside their closure. A deadline is a layer inside the
+  surrounding scope's middleware, a concurrency limit wraps the handler inside
+  every layer, and a body limit is applied as the body is read.
+- **`app.trailingSlash`** is set once for the application, because it acts
   before a route is chosen.
 
 ## What Garuda ships
@@ -130,7 +168,7 @@ a position:
 | [`app.authenticate`](#authentication) | Bearer tokens and Basic credentials | 401 with a challenge |
 | [`app.authorize`](#authorization) | A named rule about who may reach a scope | 403 saying what it needs |
 | [`JWT<Claims>`, `authenticate(jwt:)`](#json-web-tokens) | Signed tokens checked without a lookup | 401 with `error="invalid_token"` |
-| [`app.sessions`](#sessions) | Server-side sessions in memory, Redis or SQLite | 500 if the store fails |
+| [`app.sessions`](#sessions) | Server-side sessions in memory, Redis or SQLite | 409 for a session another request ended, 500 if the store fails |
 | [`app.csrfProtection`](#csrf-protection) | Refuses cross-site request forgery | 403 |
 | [`app.securityHeaders`](#security-headers) | nosniff, framing, referrer, cross-origin policies, HSTS | nothing refused |
 | [`app.allowedHosts`](#allowed-hosts) | Only the Host names you serve | 400 |
@@ -138,31 +176,45 @@ a position:
 | [`app.requestDecompression`](#request-decompression) | Decodes gzip, deflate, br and zstd bodies | 400, 413, 415 |
 | [`app.maxBodySize`](#request-limits) | A body limit for some routes | 413 |
 | [`app.concurrencyLimit`](#request-limits) | A cap on handlers running at once | 503 |
-| [`app.deadline`](#deadlines) | A time limit on waiting | 504 |
+| [`app.deadline`](#deadlines) | A time limit on I/O waits | 504 |
 | [`app.trailingSlash`](#trailing-slashes) | `/users/` for a route `/users` | 308, or served |
 | [`request.log`](#logging) | Log lines carrying the request's IDs | |
 | [Cookies](#cookies) | Reading, setting, signing and encrypting cookies | |
+
+### Shards and shared state
+
+Under `--shards`, each shard is a process of its own, so what a middleware
+keeps in memory belongs to one shard: a `MemorySessionStore`, a
+`MemoryRefreshTokenStore`, a `JWKSVerifier`'s keys, and the count of
+`concurrencyLimit`. The server logs a warning at start-up when either memory
+store is used with more than one shard. What the server keeps for
+`--rate-limit`, `--metrics-port`, `--cache-size` and `--broadcast-size` lives
+in memory every shard shares, so a client's allowance, the counters and the
+cache are the server's, not one shard's.
 
 ### CORS
 
 ```swift
 app.group("/api") {
-    app.cors(CORSPolicy(origins: .list(["https://app.example.com"]), allowCredentials: true))
+    app.cors(CORSPolicy(origins: ["https://app.example.com"], allowCredentials: true))
     app.get("/me") { … }
 }
 ```
 
-`origins` is `.any`, `.list([...])` or `.matching { origin in … }`. `methods`
-defaults to the methods the path is routed for and `headers` to what the
-preflight asks for; `exposedHeaders`,
-`allowCredentials` and `maxAge` (600 seconds) are there to set. A preflight is
-answered 204 even when the path has no OPTIONS route. A request from an origin
-the policy does not allow is served without the headers, and the browser keeps
-the answer from the page. One policy per scope; the innermost wins.
+`origins` is a list of origins, or `.any`, `.list([...])` or
+`.matching { origin in … }`; `.any` with `allowCredentials` stops the program.
+`methods` defaults to the methods the path is routed for and `headers` to what
+the preflight asks for; `exposedHeaders`, `allowCredentials` and `maxAge`
+(600 seconds) are there to set. A preflight is answered 204 even when the path
+has no OPTIONS route. A request from an origin the policy does not allow is
+served without the headers, and the browser keeps the answer from the page.
+One policy per scope; the innermost wins.
 
 ### Authentication
 
 ```swift
+import GarudaSQLite
+
 enum CurrentUser: RequestContextKey { typealias Value = User }
 
 app.group("/account") {
@@ -174,16 +226,18 @@ app.group("/account") {
 ```
 
 - `authenticate(bearer:)` and `authenticate(basic:realm:)` read the
-  Authorization header and hand the token or the user name and password to
-  your closure, sync or async. The `state:` variants also pass what
-  `app.state` built.
+  Authorization header and hand the token, or the user name and password, to
+  your closure, which may await. The `state:` variants also pass what
+  `app.state` built in the shard.
 - The closure returns who the credentials belong to, kept under the key, or
   nil for a 401 with the `WWW-Authenticate` challenge RFC 9110 requires.
 - `BearerToken` and `BasicCredentials` are the same parsing as extractors.
 - `constantTimeEquals` compares secrets without leaking timing.
-- `Passwords.hash` and `Passwords.verify` store passwords as PBKDF2-SHA256 on
-  the blocking pool; `Tokens.random` and `Tokens.digest` make session tokens
-  worth storing only as digests.
+- `Passwords.hash` and `Passwords.verify(_:against:)` store passwords as
+  PBKDF2-SHA256 (600,000 iterations) on Vega's blocking pool, and
+  `Passwords.needsRehash` says when a stored hash is due for more.
+  `Tokens.random` and `Tokens.digest` make session tokens worth storing only
+  as digests.
 
 ### Authorization
 
@@ -198,8 +252,8 @@ extension Policy where Value == User {
 
 app.group("/invoices") {
     app.authenticate(bearer: CurrentUser.self, state: SQLiteDatabase.self) { token, db in … }
-    app.authorize(CurrentUser.self, .admin.or(.billing))
-    app.get("") { … }                       // and every other route in the group
+    app.authorize(CurrentUser.self, Policy.admin.or(.billing))
+    app.get("/") { … }                      // and every other route in the group
 }
 ```
 
@@ -241,7 +295,8 @@ app.jwtVerifier { _ in keys }
 
 app.post("/token") { (login: Body<Login>) async throws -> JSON<[String: String]> in
     let user = try await users.check(login.value)
-    let token = try keys.sign(UserClaims(sub: "\(user.id)", exp: Int(Timestamp.now.secondsSinceEpoch) + 900, role: user.role))
+    let exp = Int(Timestamp.now.secondsSinceEpoch) + 900
+    let token = try keys.sign(UserClaims(sub: "\(user.id)", exp: exp, role: user.role))
     return JSON(["access_token": token, "token_type": "Bearer"])
 }
 app.get("/me") { (jwt: JWT<UserClaims>) in "user \(jwt.claims.sub)" }
@@ -249,7 +304,7 @@ app.group("/admin") {
     app.authenticate(jwt: UserClaims.self, verifier: keys)
     app.get("/stats") { (jwt: JWT<UserClaims>) in "stats for \(jwt.claims.sub)" }
 }
-app.get("/.well-known/jwks.json") { JSON(keys.publicJWKS) }
+app.get("/.well-known/jwks.json") { () in JSON(keys.publicJWKS) }
 ```
 
 - **Algorithms:** HS256/384/512, RS256/384/512, PS256/384/512, ES256/384/512
@@ -260,28 +315,31 @@ app.get("/.well-known/jwks.json") { JSON(keys.publicJWKS) }
   refused unless `requireExpiration` is off.
 - **Refused outright:** `alg: none`, a `crit` header, tokens over 16 KiB, RSA
   keys under 2048 bits, and HMAC secrets shorter than the hash.
-- **Synchronous or async routes:** `JWT<Claims>` checks a token without
-  awaiting whenever the keys are in hand, which they always are with
-  `JWTKeys`. A synchronous route saves starting a task for every request;
-  an async route that takes one does not await either when it need not.
 - **Keys are bound to one algorithm.** A token is checked only with a key of
-  its `alg`, chosen by `kid` or as the only key of that algorithm. That rules
-  out signing with HS256 and an RSA public key as the secret.
-- **Failures are all a 401** with `WWW-Authenticate: Bearer error="invalid_token"`
-  and the same body, so a client learns nothing about which check failed.
+  its `alg`, chosen by `kid` or as the only key there is. That rules out
+  signing with HS256 and an RSA public key as the secret. With more than one
+  key in a `JWTKeys`, every key needs a `kid`.
+- **Failures are all a 401** with `WWW-Authenticate: Bearer error="invalid_token"`,
+  the same whichever check failed, so a client learns nothing about which.
 - `JWT<Claims>` verifies on its own with what `app.jwtVerifier` registered, or
-  uses the token `authenticate(jwt:)` already verified.
+  uses the token `authenticate(jwt:)` already verified. A token is checked
+  without suspending when the keys are in hand: always with `JWTKeys`, and
+  with a `JWKSVerifier` once it has fetched them.
 - `keys.publicJWKS` is the public half of every asymmetric key, to publish for
   other services. HMAC secrets are never included.
 
 #### Refresh tokens
 
 ```swift
+import GarudaSQLite
+
 struct RefreshRequest: Decodable { let refresh_token: String }
 
 app.state { _ in
     let db = try SQLiteDatabase(SQLiteConfiguration(path: "auth.db"))
-    return TokenIssuer(keys: keys, store: SQLiteRefreshTokenStore(db)) { subject, lifetime in
+    let store = SQLiteRefreshTokenStore(db)
+    try await store.createTables()
+    return TokenIssuer(keys: keys, store: store) { subject, lifetime in
         UserClaims(sub: subject, exp: lifetime.expiresAt, role: try await users.role(of: subject))
     }
 }
@@ -317,14 +375,16 @@ app.post("/logout") { (body: Body<RefreshRequest>, issuer: State<TokenIssuer<Use
   `revokeAll(subject:)` ends every family of a user, after a password change
   for example.
 - A refused refresh is 400 `{"error":"invalid_grant"}` whatever the reason.
-- **Stores:** `MemoryRefreshTokenStore` for `--workers 1` and tests, which
-  lets expired families go by itself (spent tokens of a live family are kept,
-  since presenting one again is how theft is noticed; `count` says how many
-  families and tokens it holds),
-  `RedisRefreshTokenStore`, and `PostgresRefreshTokenStore` and
-  `SQLiteRefreshTokenStore` (`createTables()` or `schema()`, and
-  `deleteExpired()` now and then). Spending a token is atomic in each, so two
-  workers refreshing one token at once cannot both succeed.
+- **Stores:** `MemoryRefreshTokenStore` keeps tokens in one shard's memory,
+  for a server of one shard and for tests. It lets ended families go by itself
+  (spent tokens of a live family are kept, since presenting one again is how
+  theft is noticed; `count` says how many families and tokens it holds). For
+  several shards, use `RedisRefreshTokenStore` (GarudaRedis),
+  `PostgresRefreshTokenStore` (GarudaPostgres) or `SQLiteRefreshTokenStore`
+  (GarudaSQLite); the SQL stores make their tables with `createTables()` or
+  `schema()` and want `deleteExpired()` now and then. Spending a token is
+  atomic in each, so two requests refreshing one token at once cannot both
+  succeed.
 
 #### Tokens from an identity provider
 
@@ -337,7 +397,8 @@ app.get("/me") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
 ```
 
 - `JWKSVerifier` fetches the provider's JWK Set on the first token, keeps it
-  for `maxAgeSeconds` (an hour), then fetches it again.
+  for `maxAgeSeconds` (an hour), then fetches it again. Each shard has its own
+  verifier and its own copy of the keys.
 - A token naming a `kid` the set lacks triggers a fetch, since that is how a
   key rotation shows.
 - It never fetches more than once per `minimumRefetchSeconds` (a minute), so
@@ -348,18 +409,19 @@ app.get("/me") { (jwt: JWT<UserClaims>) in jwt.claims.sub }
   a failure: it is how a provider withdraws a compromised key. Keys older
   than `maxAgeSeconds` are dropped then, and keys still within it are kept
   until they reach it.
-- A synchronous route cannot wait. One that finds the keys still to be
-  fetched, or due again, answers 503 and starts the fetch, and the requests
-  after it are checked with the keys it brings. Take `JWT` in an async route
-  instead if the first requests must wait rather than be refused.
 - Only asymmetric algorithms are trusted: `oct` keys and `use: enc` keys are
   ignored, and `algorithms` narrows the list further. An RSA key without `alg`
   counts as RS256.
-- Checked against Google's and Microsoft's published sets.
+- The fetch uses Garuda's HTTP client with a 10-second `timeout` and the
+  system's trust store unless `caFile` names another, and takes a 200 of at
+  most a megabyte. `fetch:` replaces it with a function of your own.
 
 ### Sessions
 
 ```swift
+import GarudaRedis
+
+app.state { _ in RedisPool(RedisConfiguration(host: "cache")) }
 app.sessions { request in RedisSessionStore(try request.state(RedisPool.self)) }
 
 app.post("/login") { (session: Session, login: Body<Login>) async throws -> HTTPStatus in
@@ -395,9 +457,9 @@ app.post("/logout") { (session: Session) async throws -> HTTPStatus in
 
 | Store | Use it for | Notes |
 |---|---|---|
-| `MemorySessionStore()` | `--workers 1`, tests | Each worker process has its own memory |
-| `RedisSessionStore(pool, prefix:)` | Several workers or servers | JSON with a PX expiry; needs Redis 6.2+ or Valkey for GETEX |
-| `SQLiteSessionStore(db, table:)` | One machine, several workers | `createTable()` or `schema(table:)` in a migration; `deleteExpired()` now and then |
+| `MemorySessionStore()` | One shard, tests | Each shard process has its own memory; the server warns at start-up with more than one shard |
+| `RedisSessionStore(redis, prefix:)` | Several shards or servers | GarudaRedis. JSON with a PX expiry; needs Redis 6.2+ or Valkey for GETEX |
+| `SQLiteSessionStore(db, table:)` | One machine, several shards | GarudaSQLite. `createTable()` or `schema(table:)` in a migration; `deleteExpired()` now and then |
 
 A store of your own implements `SessionStore`: `load`, `save` and `delete`,
 and `replace` (store only if the session is live) and `remove` (delete and say
@@ -444,8 +506,9 @@ app.securityHeaders(headers)
 | `Permissions-Policy` | not sent unless set |
 
 Set a field to nil to leave that header out. A header the response already has
-is kept, so a route can set its own. Headers go on every answer after the
-middleware ran, errors and refusals included, which is why it goes first.
+is kept, so a route can set its own. The headers are added on the way out to
+whatever the layers inside answered, errors and refusals included, which is
+why this goes first.
 
 ### Allowed hosts
 
@@ -487,8 +550,8 @@ too) is decoded before the handler and the middleware after it read it. The
 decoded size is held to the route's body limit as it grows, so a small
 compressed body that inflates to gigabytes stops with 413. Bytes that do not
 decode are 400, and a coding the server cannot decode is 415 with
-`Accept-Encoding`. A streaming route's body is left as it came. The
-`Content-Encoding` header stays as it arrived.
+`Accept-Encoding`. The `Content-Encoding` and `Content-Length` headers stay as
+they arrived.
 
 ### Request limits
 
@@ -502,29 +565,36 @@ app.concurrencyLimit(8) {
 ```
 
 - **`maxBodySize(bytes)`** replaces `--max-body` for the routes inside, larger
-  or smaller. A declared length past it is 413 before the body is read.
+  or smaller; nested, the innermost applies. A declared length past it is 413
+  before the body is read, and a chunked body is refused when it grows past it.
+  An `onStreamingBody` route is the exception: its own `maxBodySize:`
+  argument, `Int.max` when left out, takes the place of the scope's.
 - **`concurrencyLimit(max)`** lets `max` of those handlers run at once in each
-  worker process and answers the next one 503. With four workers, up to
-  `4 × max` run in total. Middleware is not counted, and a request that goes
-  away gives its place back. A handler that streams its body keeps its place
-  until the body has been written, whether it wrote inline with
-  `response.stream()` or returned a `StreamingBody` or an `EventStream` for the
-  task to write: the writing is the long part, and a limit that stopped
-  counting at the return would not bound it.
+  shard and answers the next one 503 at once, without queueing it. With four
+  shards, up to `4 × max` run in total. Middleware is not counted, so a
+  request the scope's authentication refuses takes no place. A handler holds
+  its place from when it starts until it returns or throws: a body it writes
+  with `response.stream()` is counted, while a `StreamingBody` or
+  `EventStream` it returns is written after it has given its place back.
+  Nested limits all apply.
 
-Both nest, and both work on a `Router`.
+Both work on a `Router` too.
 
 ### Deadlines
 
 ```swift
-app.deadline(milliseconds: 2_000) {
+app.deadline(.seconds(2)) {
     app.get("/search") { … }
 }
 ```
 
-A request still unanswered when its deadline passes is answered 504, and a
-handler waiting on the engine for it is unwound. A deadline limits waiting, not
-computing: nothing interrupts a loop that never awaits.
+The routes inside run under an I/O deadline: a socket, pipe or database wait
+still pending when the time is up fails with `IOError.timedOut`, and so does
+any that would start after it. If that error reaches the deadline's layer
+before anything has answered, the request is answered 504. A deadline limits waiting on I/O, not computing:
+nothing interrupts a loop that never awaits, and a `Runtime.sleep`, a channel
+or a child task's wait is not cut short. Inside another `deadline`, the inner
+one is in force.
 
 ### Trailing slashes
 
@@ -548,10 +618,10 @@ AppLog.warning("cache cold", ["entries": 0])
 ```
 
 `request.log` writes lines that carry the method, path, request ID and trace
-IDs. `.with(["tenant": "acme"])` adds fields to every line after it. `AppLog`
-writes the same format outside a request. `--log-format json` makes every line
-a JSON object, and the access log follows unless `--access-log-format` says
-otherwise.
+IDs. `.with(["tenant": "acme"])` returns a logger that adds fields to every
+line it writes. `AppLog` writes the same format outside a request.
+`--log-format json` makes every line a JSON object, and the access log follows
+unless `--access-log-format` says otherwise.
 
 ### Cookies
 
@@ -572,25 +642,28 @@ app.get("/theme") { request, response in
 - `.signed` uses HMAC-SHA256 and `.encrypted` uses AES-256-GCM, both bound to
   the cookie's name. `request.cookie(name, key: key, .signed)` returns nil for
   a cookie that was tampered with.
+- `CookieKey(base64:previous:)` reads secrets stored as base64 text, and
+  `CookieKey.randomSecret()` makes one.
 - `response.removeCookie(name)` expires one.
 
 ## Server flags that act as middleware
 
-These run in the engine, for every route, and are set on the command line
+These run in the server, for every request, and are set on the command line
 ([CONFIG.md](CONFIG.md)):
 
 | Flag | What it does |
 |---|---|
-| `--compress` | Compresses handler responses with brotli, zstd or gzip, as the client accepts |
-| `--rate-limit N/s` | 429 past a request rate per client address |
-| `--request-id` | Gives every request an `X-Request-ID`, kept from a trusted proxy |
-| `--trace-context` | Records a W3C `traceparent` in the access log and `request.log` |
-| `--access-log` | One line per request, text or JSON |
-| `--max-body BYTES` | The default body limit, 413 past it |
-| `--cache-size MIB` | A response cache shared by every worker |
-| `--static-dir P=DIR`, `--spa-fallback P=FILE` | Files from disk, and a single-page application's page for navigations nothing else answers |
-| `--health-check-path P` | Answers health probes without touching a route |
-| `--metrics-port PORT` | Prometheus metrics on a port of their own, server-wide and by route pattern |
+| `--compress` | Compresses text responses with gzip, br or zstd, as the client accepts |
+| `--rate-limit N/s\|m\|h`, `--rate-limit-burst N` | 429 past a request rate per client address, counted across every shard |
+| `--request-id` | Gives every request an `X-Request-ID`, echoed on the response and logged; one a trusted proxy sent is kept |
+| `--trace-context` | Records a W3C `traceparent`'s trace and parent IDs in the logs and `onResponse` |
+| `--access-log`, `--access-log-format F` | One line per request, text or JSON |
+| `--max-body BYTES` | The default body limit (16 MiB), 413 past it |
+| `--cache-size MIB` | A response cache in memory every shard shares |
+| `--hsts SECS` | `Strict-Transport-Security: max-age=SECS` on every answer over TLS |
+| `--static-dir PREFIX=DIR`, `--spa-fallback PREFIX=FILE` | Files from disk, and a single-page application's page for navigations nothing else answers |
+| `--health-check-path P` | Answers GET P with 200 before routing and before `--rate-limit` |
+| `--metrics-port PORT` | Prometheus metrics on a port of their own, summed over every shard |
 | `--forwarded-allow-ips LIST` | Which proxies' forwarded headers are believed |
 
 ## Writing your own
@@ -603,11 +676,13 @@ group and a `Router` alike:
 ```swift
 extension RouteBuilder {
     /// Answers 503 to every request in scope while `flag` is on.
-    func maintenanceMode(_ flag: @escaping () -> Bool) {
-        use { _, response in
-            guard flag() else { return nil }
-            response.addHeader("retry-after", "120")
-            return HTTPStatus.serviceUnavailable
+    func maintenanceMode(_ flag: @escaping @Sendable () -> Bool) {
+        use { _, response, next in
+            guard !flag() else {
+                response.addHeader("retry-after", "120")
+                return response.send(status: .serviceUnavailable)
+            }
+            try await next()
         }
     }
 }
@@ -615,10 +690,11 @@ extension RouteBuilder {
 
 Keep in mind:
 
-- **Read the request before the first `await`.** The request is a view of a
-  connection slot; after a wait the client may have gone.
-- **Register `onSend` hooks before the first `await`** too, and keep them fast:
-  they run on the worker thread for every response in scope.
+- **The request and response are borrowed.** They cannot be captured by an
+  `onSend` hook or a task; copy what you need out of them first, as a `String`
+  or a value.
+- **Keep `onSend` hooks fast.** They are synchronous and run for every
+  response in scope, just before its head is written.
 - **Refuse with an answer, or throw a `ResponseError`** such as `HTTPError`,
   when the refusal is expected. Any other error is logged as a failure, shows
   in `onResponse`, and is answered 500.
@@ -626,28 +702,23 @@ Keep in mind:
 ### Extractors instead of middleware
 
 When only some routes need a value, an extractor is often clearer than
-middleware plus a context key. An `AsyncRequestExtractor` can await:
+middleware plus a context key. Any `RequestExtractor` may await:
 
 ```swift
-struct SignedInUser: AsyncRequestExtractor {
+struct SignedInUser: RequestExtractor {
     let user: User
 
     static func extract(from request: borrowing Request, parameter: inout Int) async throws -> SignedInUser {
-        guard let token = try? BearerToken.extract(from: request, parameter: &parameter) else {
-            throw HTTPError.unauthorized
-        }
+        let token = try await BearerToken.extract(from: request, parameter: &parameter)
         let db = try request.state(SQLiteDatabase.self)
         guard let user = try await findUser(token: token.token, db) else { throw HTTPError.unauthorized }
         return SignedInUser(user: user)
     }
 }
 
-app.get("/me") { (me: SignedInUser) async in JSON(me.user) }
-app.get("/hello") { (me: SignedInUser?) async in "hello \(me?.user.username ?? "stranger")" }
+app.get("/me") { (me: SignedInUser) in JSON(me.user) }
+app.get("/hello") { (me: SignedInUser?) in "hello \(me?.user.username ?? "stranger")" }
 ```
 
 `E?` is nil where `E` would refuse, and `Result<E, any Error>` hands the
-refusal to the handler. A synchronous handler that takes an async extractor
-stops the program when the route is registered, unless the extractor can also
-answer without awaiting and says so with `static var extractsSynchronously:
-Bool { true }` and a synchronous `extract`, as `JWT` does.
+refusal to the handler.

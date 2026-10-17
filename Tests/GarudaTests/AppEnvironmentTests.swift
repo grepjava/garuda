@@ -2,10 +2,11 @@
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
+import Garuda
 import Testing
-import CAvian
-@testable import Garuda
 
 // `AppEnvironment`: reading an application's settings, collecting every
 // problem, and reporting what was read.
@@ -107,7 +108,7 @@ struct AppEnvironmentTests {
     }
 
     @Test func aSecretCanComeFromAFile() throws {
-        let path = "/tmp/garuda-env-\(av_getpid()).txt"
+        let path = "\(temporaryDirectory)/garuda-env-\(getpid()).txt"
         let wrote = "a long secret".withCString { text -> Bool in
             guard let file = fopen(path, "wb") else { return false }
             let written = fwrite(text, 1, strlen(text), file)
@@ -115,7 +116,7 @@ struct AppEnvironmentTests {
             return written > 0
         }
         try #require(wrote)
-        defer { _ = path.withCString { av_unlink($0) } }
+        defer { _ = path.withCString { unlink($0) } }
 
         var fromFile = AppEnvironment(reading(["JWT_KEY_FILE": path]))
         let read = fromFile.secretOrFile("JWT_KEY")
@@ -129,7 +130,7 @@ struct AppEnvironmentTests {
         let plain = inline.secretOrFile("JWT_KEY")
         #expect(plain == "inline")
 
-        var missing = AppEnvironment(reading(["JWT_KEY_FILE": "/tmp/garuda-nothing-here.txt"]))
+        var missing = AppEnvironment(reading(["JWT_KEY_FILE": "\(temporaryDirectory)/garuda-nothing-here.txt"]))
         let nothing = missing.secretOrFile("JWT_KEY")
         #expect(nothing == "")
         #expect(missing.problems.count == 1)
@@ -169,7 +170,11 @@ struct AppEnvironmentTests {
     }
 
     @Test func theProcessEnvironmentIsTheDefaultSource() throws {
+        #if os(Windows)
+        _putenv_s("GARUDA_ENV_TEST", "from the process")
+        #else
         setenv("GARUDA_ENV_TEST", "from the process", 1)
+        #endif
         var env = AppEnvironment()
         let set = env.string("GARUDA_ENV_TEST", default: "unset")
         let unset = env.string("GARUDA_ENV_TEST_UNSET", default: "unset")

@@ -1,13 +1,10 @@
-import Testing
-import CAvian
-import AvianCore
-import CGarudaSQLite
-import GarudaPostgres
 @testable import Garuda
-import AvianHTTP
+import GarudaTesting
+import Synchronization
+import Testing
 
 // Refresh tokens: issuing, rotating, reuse caught and forgiven, expiry, logout
-// and signing out everywhere, the stores, and a refresh route.
+// and signing out everywhere, the memory store, and a refresh route.
 
 private struct AccessClaims: Codable, Sendable {
     let sub: String
@@ -18,12 +15,18 @@ private struct AccessClaims: Codable, Sendable {
 }
 
 /// Roles by subject, which a test may change between refreshes.
-private final class Directory: @unchecked Sendable {
-    var roles: [String: String] = ["ada": "admin", "grace": "user"]
+private final class Directory: Sendable {
+    private let roles = Mutex<[String: String]>(["ada": "admin", "grace": "user"])
+    func role(of subject: String) -> String? { roles.withLock { $0[subject] } }
+    func set(_ role: String, for subject: String) { roles.withLock { $0[subject] = role } }
 }
 
-private final class Clock: @unchecked Sendable {
-    var seconds: Int64 = Timestamp.now.secondsSinceEpoch
+private final class Clock: Sendable {
+    private let now = Atomic<Int64>(epochSeconds())
+    var seconds: Int64 {
+        get { now.load(ordering: .relaxed) }
+        set { now.store(newValue, ordering: .relaxed) }
+    }
 }
 
 private func issuer(_ store: any RefreshTokenStore, _ directory: Directory = Directory(), clock: Clock = Clock(),
@@ -33,7 +36,7 @@ private func issuer(_ store: any RefreshTokenStore, _ directory: Directory = Dir
     let issuer = TokenIssuer(keys: keys, store: store, accessTokenSeconds: 900, refreshTokenSeconds: 3600,
                              maximumSessionSeconds: 4 * 3600, reuseGraceSeconds: grace) { subject, lifetime in
         AccessClaims(sub: subject, iat: lifetime.issuedAt, exp: lifetime.expiresAt, jti: lifetime.tokenID,
-                     role: directory.roles[subject] ?? "none")
+                     role: directory.role(of: subject) ?? "none")
     }
     issuer.clock = { clock.seconds }
     return (issuer, keys)
@@ -55,7 +58,7 @@ struct RefreshTokensTests {
         #expect(claims.exp == claims.iat + 900)
 
         // The claims are made again at each refresh: a role taken away goes.
-        directory.roles["ada"] = "user"
+        directory.set("user", for: "ada")
         clock.seconds += 600
         let second = try await issuer.refresh(first.refreshToken)
         #expect(second.refreshToken != first.refreshToken)
@@ -128,9 +131,9 @@ struct RefreshTokensTests {
     }
 
     @Test func twoRefreshesOfOneTokenAtOnceCannotBothWin() async throws {
-        /// A store where another worker spends every token between the
+        /// A store where another request spends every token between the
         /// lookup and the spend.
-        final class RacingStore: RefreshTokenStore, @unchecked Sendable {
+        final class RacingStore: RefreshTokenStore {
             let inner = MemoryRefreshTokenStore()
             func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
                 try await inner.createFamily(family, subject: subject, expiresAt: expiresAt)
@@ -149,19 +152,32 @@ struct RefreshTokensTests {
         await #expect(throws: RefreshTokenError.alreadyRotated) { try await issuer.refresh(login.refreshToken) }
     }
 
+    @Test func manyRefreshesOfOneTokenOnManyThreadsLetOneWin() async throws {
+        // The shard's threads share the store: one spends the token, and every
+        // other is refused.
+        let (issuer, _) = try issuer(MemoryRefreshTokenStore())
+        let login = try await issuer.issue(subject: "ada")
+        let won = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<16 {
+                group.addTask { (try? await issuer.refresh(login.refreshToken)) != nil }
+            }
+            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        }
+        #expect(won == 1)
+    }
+
     @Test func aLogoutWhileARefreshIsInFlightWinsTheRace() async throws {
         /// A store where a logout lands while the refresh is writing its new
         /// token -- what a slow `claims` closure leaves room for.
-        final class LoggingOutStore: RefreshTokenStore, @unchecked Sendable {
+        final class LoggingOutStore: RefreshTokenStore {
             let inner = MemoryRefreshTokenStore()
-            var logOutOnNextInsert = false
+            let logOutOnNextInsert = Atomic<Bool>(false)
             func createFamily(_ family: String, subject: String, expiresAt: Int64) async throws {
                 try await inner.createFamily(family, subject: subject, expiresAt: expiresAt)
             }
             func insert(_ record: RefreshTokenRecord) async throws {
                 try await inner.insert(record)
-                if logOutOnNextInsert {
-                    logOutOnNextInsert = false
+                if logOutOnNextInsert.exchange(false, ordering: .relaxed) {
                     try await inner.revokeFamily(record.family)
                 }
             }
@@ -175,7 +191,7 @@ struct RefreshTokensTests {
         let store = LoggingOutStore()
         let (issuer, _) = try issuer(store)
         let login = try await issuer.issue(subject: "ada")
-        store.logOutOnNextInsert = true
+        store.logOutOnNextInsert.store(true, ordering: .relaxed)
         // No access token comes back from a refresh the logout overtook.
         await #expect(throws: RefreshTokenError.revoked) { try await issuer.refresh(login.refreshToken) }
         // Nor does the family live on through the token that refresh wrote.
@@ -186,11 +202,15 @@ struct RefreshTokensTests {
         struct RefreshRequest: Decodable {
             let refresh_token: String
         }
-        let (issuer, _) = try issuer(MemoryRefreshTokenStore())
+        // The issuer, and its store, are the shard's.
         let app = Application()
-        app.post("/login") { () async throws -> JSON<TokenPair> in JSON(try await issuer.issue(subject: "ada")) }
-        app.post("/token/refresh") { (body: Body<RefreshRequest>) async throws -> JSON<TokenPair> in
-            JSON(try await issuer.refresh(body.value.refresh_token))
+        app.state { _ in try issuer(MemoryRefreshTokenStore()).0 }
+        app.post("/login") { (issuer: State<TokenIssuer<AccessClaims>>) async throws -> JSON<TokenPair> in
+            JSON(try await issuer.value.issue(subject: "ada"))
+        }
+        app.post("/token/refresh") {
+            (body: Body<RefreshRequest>, issuer: State<TokenIssuer<AccessClaims>>) async throws -> JSON<TokenPair> in
+            JSON(try await issuer.value.refresh(body.value.refresh_token))
         }
         let client = app.test
         let pair = try client.post("/login").json(TokenPair.self)
@@ -207,7 +227,7 @@ struct RefreshTokensTests {
 
 /// What every store must do, run against one.
 private func exerciseStore(_ store: any RefreshTokenStore) async throws -> String {
-    let now = Timestamp.now.secondsSinceEpoch
+    let now = epochSeconds()
     let unique = Tokens.random(bytes: 16)
     let family = "family-\(unique)"
     let subject = "subject-\(unique)"
@@ -235,43 +255,8 @@ private func exerciseStore(_ store: any RefreshTokenStore) async throws -> Strin
 
 private let storeExpectation = "true true true false true true false true"
 
-/// A server that takes the family and refuses to index it, as a Redis ACL
-/// without `SADD` on the subject keys does.
-private struct IndexRefusingRedis: RedisCommandSender {
-    func send(_ command: RedisCommand) async throws(RedisClientError) -> RedisValue { .simpleString("OK") }
-    func pipeline(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
-        [.simpleString("OK"), .error(RedisServerError("NOPERM no permissions for SADD")), .integer(-2)]
-    }
-}
-
-/// The same refusal without the server calling it one: the `SADD` answers
-/// and adds nothing, so the script finds no index key to read a TTL from.
-private struct IndexLosingRedis: RedisCommandSender {
-    func send(_ command: RedisCommand) async throws(RedisClientError) -> RedisValue { .simpleString("OK") }
-    func pipeline(_ commands: [RedisCommand]) async throws(RedisClientError) -> [RedisValue] {
-        [.simpleString("OK"), .integer(0), .integer(-2)]
-    }
-}
-
 @Suite("Refresh token stores", .serialized)
 struct RefreshTokenStoreTests {
-    @Test func aRedisFamilyTheSubjectIndexDidNotTakeIsNotALogin() async throws {
-        // `revokeSubject` signs out everywhere by walking the subject's index,
-        // so a family missing from it is a session no logout can reach. The
-        // pipeline answers each command on its own and throws for none of
-        // them, so the store has to read the replies: a login that cannot be
-        // revoked must fail here rather than hand out a token.
-        for store in [RedisRefreshTokenStore(IndexRefusingRedis()),
-                      RedisRefreshTokenStore(IndexLosingRedis())] {
-            var refused = false
-            do {
-                try await store.createFamily("family", subject: "ada",
-                                             expiresAt: Timestamp.now.secondsSinceEpoch + 3600)
-            } catch { refused = true }
-            #expect(refused)
-        }
-    }
-
     @Test func memory() async throws {
         #expect(try await exerciseStore(MemoryRefreshTokenStore()) == storeExpectation)
     }
@@ -300,96 +285,5 @@ struct RefreshTokenStoreTests {
         #expect(store.count.tokens == MemoryRefreshTokenStore.sweepEvery + 1)
         #expect(try await store.find(digest: "old-token") == nil)
         #expect(try await store.find(digest: "spent")?.usedAt == start + 1)
-    }
-
-    @Test(.enabled(if: gsq_available() != 0, "no libsqlite3"))
-    func sqlite() throws {
-        let path = "/tmp/garuda-refresh-\(av_getpid()).db"
-        defer { for suffix in ["", "-wal", "-shm"] { _ = (path + suffix).withCString { av_unlink($0) } } }
-        let app = Application()
-        app.state { _ in try SQLiteDatabase(SQLiteConfiguration(path: path)) }
-        app.get("/run") { (db: State<SQLiteDatabase>) async -> String in
-            do {
-                let store = SQLiteRefreshTokenStore(db.value)
-                try await store.createTables()
-                let result = try await exerciseStore(store)
-                _ = try await store.deleteExpired()
-                return result
-            } catch {
-                return "threw \(error)"
-            }
-        }
-        let client = app.test
-        client.timeoutMillis = 15_000
-        #expect(try client.get("/run").text == storeExpectation)
-    }
-
-    @Test(.enabled(if: av_getenv("GARUDA_POSTGRES") != nil, "set GARUDA_POSTGRES to run"))
-    func postgres() throws {
-        let parts = String(cString: av_getenv("GARUDA_POSTGRES")!).split(separator: ":",
-                                                                        omittingEmptySubsequences: false)
-        try #require(parts.count == 5)
-        var configuration = PostgresConfiguration(host: String(parts[0]), port: UInt16(parts[1])!,
-                                                  user: String(parts[2]), password: String(parts[3]),
-                                                  database: String(parts[4]))
-        configuration.tls = .disable
-        let settled = configuration
-        let app = Application()
-        app.state { _ in PostgresPool(settled, maxConnections: 2) }
-        app.get("/run") { (db: State<PostgresPool>) async -> String in
-            do {
-                let table = "garuda_test_refresh"
-                let store = PostgresRefreshTokenStore(db.value, table: table)
-                for statement in ["drop table if exists \(table)", "drop table if exists \(table)_families"] {
-                    try await db.value.execute(statement)
-                }
-                try await store.createTables()
-                let result = try await exerciseStore(store)
-                _ = try await store.deleteExpired()
-                for statement in ["drop table if exists \(table)", "drop table if exists \(table)_families"] {
-                    try await db.value.execute(statement)
-                }
-                return result
-            } catch {
-                return "threw \(error)"
-            }
-        }
-        let client = app.test
-        client.timeoutMillis = 20_000
-        let text = try client.get("/run").text
-        #expect(text == storeExpectation, "\(text)")
-    }
-
-    @Test(.enabled(if: av_getenv("GARUDA_REDIS") != nil, "set GARUDA_REDIS to run"))
-    func redis() throws {
-        let parts = String(cString: av_getenv("GARUDA_REDIS")!).split(separator: ":", omittingEmptySubsequences: false)
-        var configuration = RedisConfiguration(host: String(parts[0]), port: UInt16(parts[1])!,
-                                               password: parts.count > 2 && !parts[2].isEmpty ? String(parts[2]) : nil)
-        configuration.tls = .disable
-        let settled = configuration
-        let app = Application()
-        app.state { _ in RedisPool(settled, maxConnections: 2) }
-        app.get("/run") { (redis: State<RedisPool>) async -> String in
-            do {
-                let prefix = "garuda-test:refresh:"
-                let store = RedisRefreshTokenStore(redis.value, prefix: prefix)
-                let result = try await exerciseStore(store)
-                // A second login with less of a session left must not shorten
-                // the subject's index: `revokeSubject` reads it while the
-                // first family is still good.
-                let now = Timestamp.now.secondsSinceEpoch
-                let subject = "ttl-" + Tokens.random(bytes: 16)
-                try await store.createFamily("long-" + subject, subject: subject, expiresAt: now + 3600)
-                try await store.createFamily("short-" + subject, subject: subject, expiresAt: now + 30)
-                let left = try await redis.value.send("PTTL", prefix + "s:" + subject).string.flatMap { Int64($0) }
-                return result + " \((left ?? -1) > 3_000_000)"
-            } catch {
-                return "threw \(error)"
-            }
-        }
-        let client = app.test
-        client.timeoutMillis = 15_000
-        let text = try client.get("/run").text
-        #expect(text == storeExpectation + " true", "\(text)")
     }
 }

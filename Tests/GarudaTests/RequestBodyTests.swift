@@ -1,376 +1,300 @@
 import Testing
-import CAvian
-import AvianCore
-@testable import Garuda
-
+import Synchronization
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
+import GarudaTesting
+import GarudaWire
+import Vega
+import VegaIO
+@testable import Garuda
 
-// `onStreamingBody`: a request body read as it arrives. And `sendInterim`.
-
-nonisolated(unsafe) private var bodyEvents: [String] = []
-nonisolated(unsafe) private var bodyReceived: [UInt8] = []
-nonisolated(unsafe) private var largestBuffered = 0
-nonisolated(unsafe) private var bodyGate: UnsafeContinuation<Void, Never>? = nil
-
-private func pattern(_ count: Int) -> [UInt8] {
-    (0..<count).map { UInt8(truncatingIfNeeded: $0 &* 131 &+ 17) }
+private func pattern(_ count: Int, seed: Int = 0) -> [UInt8] {
+    (0..<count).map { UInt8(truncatingIfNeeded: ($0 &+ seed) &* 131 &+ 7) }
 }
 
-@Suite("Streaming request bodies", .serialized)
+/// FNV-1a and the count: what a handler that reads a body a piece at a time
+/// answers, to be compared with the same over what was sent.
+private func checksum(_ bytes: some Sequence<UInt8>) -> String {
+    var value: UInt64 = 0xcbf2_9ce4_8422_2325
+    var count = 0
+    for byte in bytes {
+        value = (value ^ UInt64(byte)) &* 0x100_0000_01b3
+        count += 1
+    }
+    return "\(count) \(value)"
+}
+
+/// What a handler saw of its body: how much it read, and how it ended.
+private final class Seen: Sendable {
+    let state = Mutex<(bytes: Int, ending: String?)>((0, nil))
+
+    func add(_ n: Int) { state.withLock { $0.bytes += n } }
+    func end(_ how: String) { state.withLock { $0.ending = how } }
+    var bytes: Int { state.withLock { $0.bytes } }
+    var ending: String? { state.withLock { $0.ending } }
+
+    /// Waits, up to a few seconds, for the handler to have got this far.
+    func wait(until done: (Int, String?) -> Bool) {
+        for _ in 0..<500 {
+            if state.withLock({ done($0.bytes, $0.ending) }) { return }
+            usleep(10_000)
+        }
+    }
+}
+
+/// An application whose `/sum` reads its body `piece` bytes at a time and
+/// answers its checksum, recording in `seen` what it read and how it ended.
+private func summingApp(_ seen: Seen = Seen(), piece: Int = 8 * 1024,
+                        maxBodySize: Int = .max) -> Application {
+    let app = Application()
+    app.onStreamingBody(.post, "/sum", maxBodySize: maxBodySize) { _, response, body in
+        var buffer = IOBuffer(capacity: piece)
+        var all: [UInt8] = []
+        do {
+            while try await body.read(into: &buffer) > 0 {
+                seen.add(buffer.count)
+                buffer.withUnsafeBytes { all += $0 }
+                buffer.clear()
+            }
+            seen.end("end")
+        } catch {
+            seen.end("\(error)")
+            throw error
+        }
+        #expect(body.bytesRead == all.count)
+        response.send(checksum(all))
+    }
+    return app
+}
+
+@Suite("Request bodies read as they arrive")
 struct RequestBodyTests {
 
-    @Test func aContentLengthBodyIsReadInPieces() throws {
-        bodyEvents = []
-        let app = Application()
-        app.onStreamingBody(.post, "/up") { _, response, body in
-            var total: [UInt8] = []
-            while let bytes = try await body.read(maxBytes: 7) {
-                #expect(bytes.count <= 7)
-                total += bytes
-            }
-            bodyEvents.append("read \(body.bytesRead) of \(body.expectedLength ?? -1)")
-            response.send(total)
+    @Test func aBodyIsReadAPieceAtATimeAsItArrives() throws {
+        let seen = Seen()
+        let body = pattern(300 * 1024)
+        let response = try summingApp(seen).test.post("/sum", body: body)
+        #expect(response.status == .ok)
+        #expect(response.text == checksum(body))
+        #expect(seen.ending == "end")
+    }
+
+    @Test func aChunkedBodyIsDecodedAsItIsRead() throws {
+        let body = pattern(70_000)
+        var raw = Array("POST /sum HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".utf8)
+        var at = 0
+        for size in [1, 10_000, 59_999] {
+            raw += Array("\(String(size, radix: 16))\r\n".utf8) + body[at..<(at + size)] + Array("\r\n".utf8)
+            at += size
         }
-        let response = try app.test.post("/up", body: "a body read in small pieces")
-        #expect(response.text == "a body read in small pieces")
-        #expect(bodyEvents == ["read 27 of 27"])
+        raw += Array("0\r\n\r\n".utf8)
+        let response = try summingApp().test.send(raw: raw)
+        #expect(response.text == checksum(body))
     }
 
-    @Test func aChunkedBodyIsReadWithoutItsFraming() throws {
+    @Test func theDeclaredLengthIsThere() throws {
         let app = Application()
-        app.onStreamingBody(.post, "/up") { _, response, body in
-            response.send(try await body.readAll(maxBytes: 1 << 20))
+        app.onStreamingBody(.post, "/length") { _, response, body in
+            response.send("\(body.expectedLength.map(String.init) ?? "none")")
         }
-        let raw = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
-            + "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
-        #expect(try app.test.send(raw: Array(raw.utf8)).text == "hello world")
+        #expect(try app.test.post("/length", body: pattern(12)).text == "12")
+        let chunked = "POST /length HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n"
+        #expect(try app.test.send(raw: Array(chunked.utf8)).text == "none")
     }
 
-    @Test func aRouteWithoutABodyReadsNothing() throws {
-        let app = Application()
-        app.onStreamingBody(.get, "/empty") { _, response, body in
-            let first = try await body.read()
-            response.send(first == nil ? "nil" : "bytes")
-        }
-        #expect(try app.test.get("/empty").text == "nil")
+    @Test func aDeclaredLengthPastTheRoutesLimitIsRefusedBeforeTheHandlerRuns() throws {
+        let seen = Seen()
+        let response = try summingApp(seen, maxBodySize: 100).test.post("/sum", body: pattern(101))
+        #expect(response.status == .contentTooLarge)
+        #expect(seen.ending == nil, "the handler never ran")
     }
 
-    @Test func otherRoutesStillGetTheirBodyWhole() throws {
-        let app = Application()
-        app.onStreamingBody(.post, "/stream") { _, response, _ in response.send("s") }
-        app.post("/whole") { request, response in request.withBody { response.send($0) } }
-        #expect(try app.test.post("/whole", body: "all of it").text == "all of it")
+    @Test func aChunkedBodyThatGrowsPastTheLimitIsTooLarge() throws {
+        let seen = Seen()
+        let raw = "POST /sum HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+            + "40\r\n\(String(repeating: "a", count: 64))\r\n"
+            + "40\r\n\(String(repeating: "b", count: 64))\r\n0\r\n\r\n"
+        let response = try summingApp(seen, maxBodySize: 100).test.send(raw: Array(raw.utf8))
+        #expect(response.status == .contentTooLarge)
+        #expect(seen.ending == "tooLarge")
+        #expect(seen.bytes <= 100, "nothing past the limit was handed over")
     }
 
-    @Test func aLargeBodyIsHeldToTheHighWaterMarkWhileTheHandlerIsSlow() throws {
-        largestBuffered = 0
-        bodyReceived = []
+    @Test func aRoutesOwnLimitTakesThePlaceOfMaxBody() throws {
         var config = ServerConfig()
-        config.bodyHighWaterMark = 64 * 1024
-        config.maxBodySize = 1024          // not what a streaming route is held to
+        config.maxBodySize = 1024
+        let body = pattern(64 * 1024)
+        let response = try summingApp().testClient(configuration: config).post("/sum", body: body)
+        #expect(response.status == .ok)
+        #expect(response.text == checksum(body))
+    }
+
+    @Test func aBodyCutShortIsHandedOverAndThenIncomplete() throws {
+        let seen = Seen()
+        let head = "POST /sum HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n"
+        // The client's side ends after 400 of the 1000 bytes.
+        _ = try? summingApp(seen).test.send(raw: Array(head.utf8) + pattern(400))
+        seen.wait { $1 != nil }
+        #expect(seen.bytes == 400, "everything that arrived was read")
+        #expect(seen.ending == "incomplete")
+    }
+
+    /// A cancelled body -- an upload another request superseded -- hands
+    /// over what had arrived before it throws, and the handler's task is not
+    /// cancelled with it: the handler can still store those bytes.
+    @Test func aCancelledBodyHandsOverWhatArrivedAndLeavesTheTaskRunning() throws {
+        let seen = Seen()
+        let stillRunning = Mutex<Bool?>(nil)
         let app = Application()
-        let total = 2 * 1024 * 1024
-        app.onStreamingBody(.put, "/big") { request, response, body in
-            while let bytes = try await body.read(maxBytes: 16 * 1024) {
-                bodyReceived += bytes
-                let c = body.worker.pointee.table[body.slot]
-                largestBuffered = max(largestBuffered, c.pointee.body.readableBytes)
-                if bodyReceived.count % (256 * 1024) == 0 { try await response.sleep(milliseconds: 1) }
+        app.onStreamingBody(.post, "/cancel") { request, response, body in
+            if request.query.contains("wait=1") {
+                // Cancelled from elsewhere while the read waits on the client.
+                Runtime.spawn {
+                    try? await Runtime.sleep(for: .milliseconds(100))
+                    body.cancel()
+                }
+            } else {
+                body.cancel()
             }
-            response.send(status: .created)
-        }
-        let client = app.testClient(configuration: config)
-        client.timeoutMillis = 30_000
-        let response = try client.put("/big", body: pattern(total))
-        #expect(response.status == 201)
-        #expect(bodyReceived == pattern(total))
-        #expect(largestBuffered <= 64 * 1024 + 64 * 1024)
-    }
-
-    @Test func aHandlerReadingItsBodyLetsTheLoopComeRound() throws {
-        // Each read refilled the body from the socket there and then, so a
-        // handler whose client kept sending read the lot without the loop
-        // turning once, and every other request on the worker waited. Now a
-        // turn gives it a few refills and no more.
-        bodyReceived = []
-        var config = ServerConfig()
-        config.bodyHighWaterMark = 16 * 1024
-        let app = Application()
-        let total = 1024 * 1024
-        app.onStreamingBody(.put, "/big") { _, response, body in
-            while let bytes = try await body.read(maxBytes: 16 * 1024) { bodyReceived += bytes }
-            response.send(status: .created)
-        }
-        let client = app.testClient(configuration: config)
-        let wire = try TestWire(client)
-        // A socket pair holds 8 KB on macOS, against hundreds on Linux: too
-        // little to have more waiting than a turn may read.
-        var room: Int32 = 1024 * 1024
-        for fd in [wire.fd, client.worker.pointee.table[wire.slot].pointee.fd] {
-            _ = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &room, socklen_t(MemoryLayout<Int32>.size))
-            _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &room, socklen_t(MemoryLayout<Int32>.size))
-        }
-        let body = pattern(total)
-        wire.send("PUT /big HTTP/1.1\r\nHost: test\r\nContent-Length: \(total)\r\n\r\n")
-        var sent = 0
-        func push(upTo end: Int) {
-            while sent < end {
-                let n = body.withUnsafeBufferPointer { av_write(wire.fd, $0.baseAddress! + sent, end - sent) }
-                if n <= 0 { break }
-                sent += n
-            }
-        }
-        push(upTo: 1024)
-        #expect(wire.turn(until: { bodyReceived.count == 1024 }))
-        // The rest, or as much as the socket holds, there before the loop
-        // turns again: all of it the handler's to read at once.
-        push(upTo: total)
-        let waiting = sent - bodyReceived.count
-        let allowed = (Int(Worker.readerFillsPerTurn) + 1) * config.bodyHighWaterMark
-        #expect(waiting > 2 * allowed, "the socket took only \(waiting) bytes")
-        let before = bodyReceived.count
-        client.turn()
-        #expect(bodyReceived.count - before <= allowed)
-        #expect(bodyReceived.count - before > 0)
-        // And it still gets the whole body, a few refills a turn.
-        for _ in 0..<10_000 where bodyReceived.count < total {
-            push(upTo: total)
-            client.turn()
-        }
-        #expect(bodyReceived == body)
-        #expect(wire.receive()?.hasPrefix("HTTP/1.1 201") == true)
-    }
-
-    @Test func aBodyPastTheRoutesLimitIs413() throws {
-        let app = Application()
-        app.onStreamingBody(.post, "/small", maxBodySize: 10) { _, response, body in
-            _ = try await body.readAll(maxBytes: 100)
-            response.send("read")
-        }
-        #expect(try app.test.post("/small", body: "far more than ten bytes").status == 413)
-        #expect(try app.test.post("/small", body: "ten bytes!").text == "read")
-    }
-
-    @Test func aChunkedBodyPastTheLimitStopsTheReader() throws {
-        bodyEvents = []
-        let app = Application()
-        app.onStreamingBody(.post, "/small", maxBodySize: 8) { _, response, body in
+            var buffer = IOBuffer(capacity: 64 * 1024)
             do {
-                _ = try await body.readAll(maxBytes: 100)
-                bodyEvents.append("whole")
+                while try await body.read(into: &buffer) > 0 {
+                    seen.add(buffer.count)
+                    buffer.clear()
+                }
+                seen.end("end")
             } catch {
-                bodyEvents.append("\(error)")
+                stillRunning.withLock { $0 = !Task.isCancelled }
+                seen.end("\(error)")
             }
+            response.send("\(seen.bytes)")
         }
-        let raw = "POST /small HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
-            + "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
-        #expect(try app.test.send(raw: Array(raw.utf8)).status == 413)
-        #expect(bodyEvents == ["tooLarge"])
+        for path in ["/cancel", "/cancel?wait=1"] {
+            seen.state.withLock { $0 = (0, nil) }
+            stillRunning.withLock { $0 = nil }
+            // 400 of the 1000 bytes, and the connection left open: the rest
+            // never comes.
+            let connection = try app.test.http2(handshake: false)
+            let head = "POST \(path) HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n"
+            try connection.send(raw: Array(head.utf8) + pattern(400))
+            seen.wait { $1 != nil }
+            #expect(seen.bytes == 400, "what arrived was handed over (\(path))")
+            #expect(seen.ending == "incomplete")
+            #expect(stillRunning.withLock { $0 } == true, "the handler's task was not cancelled (\(path))")
+            connection.close()
+        }
     }
 
-    @Test func aClientThatLeavesPartWayHandsOverWhatItSent() throws {
-        bodyEvents = []
-        bodyReceived = []
+    @Test func aBodyLeftUnreadDoesNotCostTheConnectionWhenItHasArrived() throws {
         let app = Application()
-        app.onStreamingBody(.post, "/partial") { _, response, body in
-            do {
-                while let bytes = try await body.read() { bodyReceived += bytes }
-                bodyEvents.append("complete")
-            } catch {
-                bodyEvents.append("\(error)")
-            }
+        app.onStreamingBody(.post, "/ignore") { _, response, _ in
+            response.send("ignored")
         }
-        let client = app.test
-        let head = "POST /partial HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n"
-        try client.abandon(Array(head.utf8) + pattern(300), turns: 10)
-        for _ in 0..<10 { client.turn() }
-        #expect(bodyReceived == pattern(300))
-        #expect(bodyEvents == ["incomplete"])
+        app.get("/next") { _, response in response.send("next") }
+        let raw = "POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+            + "GET /next HTTP/1.1\r\nHost: x\r\n\r\n"
+        let responses = try app.test.sendPipelined(raw: Array(raw.utf8))
+        #expect(responses.map(\.text) == ["ignored", "next"])
     }
 
-    @Test func whatArrivedBeforeACloseIsReadAfterIt() throws {
-        bodyEvents = []
-        bodyReceived = []
-        bodyGate = nil
-        let app = Application()
-        app.onStreamingBody(.post, "/late") { _, response, body in
-            do {
-                bodyReceived += try await body.read(maxBytes: 10) ?? []
-                // Not reading while the connection closes: what it held is
-                // handed over, and read from there.
-                await withUnsafeContinuation { bodyGate = $0 }
-                while let bytes = try await body.read() { bodyReceived += bytes }
-                bodyEvents.append("complete")
-            } catch {
-                bodyEvents.append("\(error)")
-            }
-        }
-        let client = app.test
-        let head = "POST /late HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n"
-        try client.abandon(Array(head.utf8) + pattern(300), turns: 10)
-        for _ in 0..<10 { client.turn() }
-        #expect(bodyGate != nil)
-        client.onWorker { bodyGate?.resume() }
-        for _ in 0..<10 { client.turn() }
-        #expect(bodyReceived == pattern(300))
-        #expect(bodyEvents == ["incomplete"])
+    @Test func aClientWaitingToBeToldToSendIsToldOnTheFirstRead() throws {
+        let body = pattern(5000)
+        // A connection left open, so the client can wait as it would.
+        let connection = try summingApp().test.http2(handshake: false)
+        let head = "POST /sum HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5000\r\n\r\n"
+        try connection.send(raw: Array(head.utf8))
+        usleep(100_000)
+        try connection.send(raw: body)
+        connection.close()
+        let answer = String(decoding: try connection.readUntilClose(), as: UTF8.self)
+        #expect(answer.hasPrefix("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200"))
+        #expect(answer.hasSuffix(checksum(body)))
     }
 
-    @Test func readAllStopsAtItsLimit() throws {
-        bodyEvents = []
+    @Test func noContinueIsOwedOnceTheBodyHasArrived() throws {
+        // The client did not wait: telling it to send what it sent is noise.
+        let body = pattern(5000)
+        let response = try summingApp().test.post("/sum", body: body, headers: [("Expect", "100-continue")])
+        #expect(response.interim.isEmpty)
+        #expect(response.text == checksum(body))
+    }
+
+    @Test func readAllHasALimitOfItsOwn() throws {
         let app = Application()
         app.onStreamingBody(.post, "/all") { _, response, body in
-            do {
-                _ = try await body.readAll(maxBytes: 4)
-                bodyEvents.append("whole")
-            } catch {
-                bodyEvents.append("\(error)")
-            }
-            response.send(status: .ok)
+            let bytes = try await body.readAll(maxBytes: 100)
+            response.send("\(bytes.count)")
         }
-        _ = try app.test.post("/all", body: "ten bytes!")
-        #expect(bodyEvents == ["tooLarge"])
+        #expect(try app.test.post("/all", body: pattern(100)).text == "100")
+        #expect(try app.test.post("/all", body: pattern(101)).status == .contentTooLarge)
     }
 
-    @Test func aCancelledBodyEndsIncompleteEvenWhenAllOfItArrived() throws {
-        bodyEvents = []
-        bodyReceived = []
+    @Test func aRequestWithoutABodyReadsAsEmpty() throws {
         let app = Application()
-        app.onStreamingBody(.post, "/cancel") { _, response, body in
-            body.cancel()
-            do {
-                while let bytes = try await body.read() { bodyReceived += bytes }
-                bodyEvents.append("complete")
-            } catch {
-                bodyEvents.append("\(error)")
-            }
+        app.onStreamingBody(.get, "/empty") { _, response, body in
+            response.send("\(try await body.read(maxBytes: 10)?.count ?? -1)")
         }
-        let client = app.test
-        let head = "POST /cancel HTTP/1.1\r\nHost: x\r\nContent-Length: 20\r\n\r\n"
-        try client.abandon(Array(head.utf8) + pattern(20), turns: 10)
-        for _ in 0..<10 { client.turn() }
-        #expect(bodyReceived == pattern(20))
-        #expect(bodyEvents == ["incomplete"])
+        #expect(try app.test.get("/empty").text == "-1")
     }
 
-    @Test func aClientThatStopsSendingEndsTheBodyIncomplete() throws {
-        bodyEvents = []
-        bodyReceived = []
-        let app = Application()
-        app.onStreamingBody(.post, "/half") { _, response, body in
-            do {
-                while let bytes = try await body.read() { bodyReceived += bytes }
-                bodyEvents.append("complete")
-            } catch {
-                bodyEvents.append("\(error)")
-            }
-        }
-        let client = app.test
-        let (socket, _, _) = try client.connect()
-        let bytes = Array("POST /half HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n".utf8) + pattern(100)
-        _ = bytes.withUnsafeBufferPointer { write(socket, $0.baseAddress!, $0.count) }
-        // Half-closed: the client will send nothing more, but is still there.
-        _ = shutdown(socket, Int32(SHUT_WR))
-        for _ in 0..<20 { client.turn() }
-        #expect(bodyReceived == pattern(100))
-        #expect(bodyEvents == ["incomplete"])
-        _ = close(socket)
+    // MARK: HTTP/2
+
+    @Test func overHTTP2ABodyLargerThanTheWindowIsReadAsItArrives() throws {
+        let seen = Seen()
+        let body = pattern(400 * 1024, seed: 3)
+        let response = try summingApp(seen).test.http2().post("/sum", body: body)
+        #expect(response.status == .ok)
+        #expect(response.text == checksum(body))
+        #expect(seen.ending == "end")
     }
 
-    @Test func twoReadsAtOnceAreRefused() throws {
-        bodyEvents = []
-        let app = Application()
-        app.onStreamingBody(.post, "/twice") { _, response, body in
-            @Sendable func attempt() async -> String? {
-                do { _ = try await body.read(); return nil } catch { return "\(error)" }
-            }
-            async let first = attempt()
-            async let second = attempt()
-            bodyEvents += [await first, await second].compactMap { $0 }
-            response.send(status: .ok)
-        }
-        let client = app.test
-        let (socket, _, _) = try client.connect()
-        let head = Array("POST /twice HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n".utf8)
-        _ = head.withUnsafeBufferPointer { write(socket, $0.baseAddress!, $0.count) }
-        for _ in 0..<10 { client.turn() }
-        let rest = Array("body".utf8)
-        _ = rest.withUnsafeBufferPointer { write(socket, $0.baseAddress!, $0.count) }
-        for _ in 0..<10 { client.turn() }
-        #expect(bodyEvents == ["concurrentRead"])
-        _ = close(socket)
+    @Test func overHTTP2TheRoutesLimitApplies() throws {
+        let seen = Seen()
+        let h2 = try summingApp(seen, maxBodySize: 100).test.http2()
+        #expect(try h2.post("/sum", body: pattern(101)).status == .contentTooLarge)
+        #expect(seen.ending == nil, "a declared length is refused before the handler runs")
+        // Undeclared, it is found out as it arrives.
+        let id = try h2.request("POST", "/sum", body: pattern(300))
+        #expect(try h2.response(id).status == .contentTooLarge)
+        #expect(seen.ending == "tooLarge")
     }
 
-    @Test func noInterimResponseOnceTheAnswerHasStarted() throws {
-        bodyEvents = []
-        let app = Application()
-        app.onAsync(.get, "/started") { _, response in
-            let body = response.stream(contentType: "text/plain")
-            bodyEvents.append("\(response.sendInterim(status: HTTPStatus(103)))")
-            try await body.write("done")
-        }
-        let answer = try app.test.get("/started")
-        #expect(answer.text == "done")
-        #expect(answer.interim.isEmpty)
-        #expect(bodyEvents == ["false"])
+    @Test func overHTTP2AResetStreamHandsOverWhatArrived() throws {
+        let seen = Seen()
+        let h2 = try summingApp(seen).test.http2()
+        let id = try h2.request("POST", "/sum", headers: [("content-length", "1000")], body: pattern(400),
+                                endStream: false)
+        seen.wait { bytes, _ in bytes == 400 }
+        try h2.reset(id)
+        seen.wait { $1 != nil }
+        #expect(seen.bytes == 400)
+        #expect(seen.ending == "incomplete")
     }
 
-    @Test func aClientSilentMidBodyIsClosedAfterTheRequestTimeout() throws {
-        bodyEvents = []
-        var config = ServerConfig()
-        config.requestHeadTimeoutMs = 200
+    @Test func overHTTP2AHandlerThatStopsReadingHoldsTheClientToTheWindow() throws {
+        let release = Mutex(false)
         let app = Application()
-        app.onStreamingBody(.post, "/stalled") { _, response, body in
-            do {
-                while try await body.read() != nil {}
-                bodyEvents.append("complete")
-            } catch {
-                bodyEvents.append("\(error)")
-            }
+        app.onStreamingBody(.post, "/later") { _, response, body in
+            while !release.withLock({ $0 }) { try await Runtime.sleep(for: .milliseconds(5)) }
+            response.send("\(try await body.readAll(maxBytes: 4 << 20).count)")
         }
-        let client = app.testClient(configuration: config)
-        let (socket, _, _) = try client.connect()
-        let bytes = Array("POST /stalled HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".utf8) + pattern(10)
-        _ = bytes.withUnsafeBufferPointer { write(socket, $0.baseAddress!, $0.count) }
-        let deadline = av_monotonic_ms() + 3000
-        while bodyEvents.isEmpty && av_monotonic_ms() < deadline { client.turn() }
-        #expect(bodyEvents == ["incomplete"])
-        _ = close(socket)
-    }
-
-    @Test func interimResponsesComeBeforeTheFinalOne() throws {
-        bodyEvents = []
-        let app = Application()
-        app.onAsync(.post, "/hints") { _, response in
-            let upload = response.sendInterim(status: HTTPStatus(104),
-                                              headers: [("Location", "/uploads/1"), ("Upload-Limit", "max-size=10")])
-            let hints = response.sendInterim(status: HTTPStatus(103), headers: [("Link", "</a.css>; rel=preload")])
-            let final = response.sendInterim(status: HTTPStatus(200))
-            let switching = response.sendInterim(status: HTTPStatus(101))
-            let badName = response.sendInterim(status: HTTPStatus(104), headers: [("bad name", "x")])
-            response.send(status: .created)
-            let late = response.sendInterim(status: HTTPStatus(104))
-            bodyEvents = [upload, hints, final, switching, badName, late].map { $0 ? "sent" : "refused" }
-        }
-        let response = try app.test.post("/hints")
-        #expect(response.status == 201)
-        #expect(bodyEvents == ["sent", "sent", "refused", "refused", "refused", "refused"])
-        #expect(response.interim.map { $0.status.code } == [104, 103])
-        #expect(response.interim.first?.headers.first { $0.name.lowercased() == "location" }?.value == "/uploads/1")
-    }
-
-    @Test func anHTTP10ClientGetsNoInterimResponse() throws {
-        let app = Application()
-        app.onAsync(.get, "/hints") { _, response in
-            let sent = response.sendInterim(status: HTTPStatus(103))
-            response.send(sent ? "sent" : "withheld")
-        }
-        let response = try app.test.send(raw: Array("GET /hints HTTP/1.0\r\nHost: x\r\n\r\n".utf8))
-        #expect(response.text == "withheld")
-        #expect(response.interim.isEmpty)
+        let h2 = try app.test.http2()
+        // As much as the stream's window allows goes, and then the client
+        // waits: the connection's window is given back as the bytes arrive.
+        let window = Int(h2.serverSettings[0x4] ?? 65535)
+        let body = pattern(window + 100 * 1024)
+        let id = try h2.request("POST", "/later", headers: [("content-length", "\(body.count)")], endStream: false)
+        try h2.sendData(stream: id, Array(body[..<window]), endStream: false)
+        h2.timeout = .milliseconds(300)
+        #expect(throws: TestClientError.timedOut) { try h2.sendData(stream: id, [0], endStream: false) }
+        h2.timeout = .seconds(5)
+        release.withLock { $0 = true }
+        try h2.sendData(stream: id, Array(body[window...]))
+        #expect(try h2.response(id).text == "\(body.count)")
     }
 }

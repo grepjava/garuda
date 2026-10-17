@@ -8,15 +8,20 @@
 // range of about 292,000 years either side. It carries no time zone because
 // an instant has none; a zone is how one is written, and this writes UTC.
 //
-// It binds to PostgreSQL as a timestamptz in binary. Keep instants in
-// timestamptz columns: a timestamp column without a zone stores the wall
-// clock the session's TimeZone makes of it, and reads back as that wall
-// clock taken as UTC, which is the same instant only when TimeZone is UTC.
+// GarudaPostgres binds it as a timestamptz. Keep instants in timestamptz
+// columns: a timestamp column without a zone stores the wall clock the
+// session's TimeZone makes of it, and reads back as that wall clock taken as
+// UTC, which is the same instant only when TimeZone is UTC.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import GarudaPostgres
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#elseif os(Windows)
+import ucrt
+#endif
+import GarudaWire
 
 public struct Timestamp: Hashable, Comparable, Sendable {
     public var microsecondsSinceEpoch: Int64
@@ -31,7 +36,10 @@ public struct Timestamp: Hashable, Comparable, Sendable {
 
     /// The system's wall clock, now.
     public static var now: Timestamp {
-        Timestamp(microsecondsSinceEpoch: Int64(av_realtime_us()))
+        var ts = timespec()
+        _ = timespec_get(&ts, TIME_UTC)
+        return Timestamp(microsecondsSinceEpoch: Int64(ts.tv_sec) * CivilTime.microsecondsPerSecond
+                                                 + Int64(ts.tv_nsec) / 1000)
     }
 
     /// From ISO 8601 or RFC 3339 text -- `2026-09-16T20:53:43.196Z`, any UTC
@@ -58,9 +66,6 @@ public struct Timestamp: Hashable, Comparable, Sendable {
     public static func < (a: Timestamp, b: Timestamp) -> Bool {
         a.microsecondsSinceEpoch < b.microsecondsSinceEpoch
     }
-
-    /// PostgreSQL counts from 2000-01-01, not 1970.
-    static let postgresEpochOffset: Int64 = 946_684_800_000_000
 }
 
 extension Timestamp: CustomStringConvertible, LosslessStringConvertible {
@@ -80,15 +85,5 @@ extension Timestamp: Codable {
 
     public func encode(to encoder: any Encoder) throws {
         try description.encode(to: encoder)
-    }
-}
-
-extension Timestamp: PostgresBindable {
-    public var postgresValue: PostgresValue {
-        let (since2000, overflow) = microsecondsSinceEpoch.subtractingReportingOverflow(Timestamp.postgresEpochOffset)
-        // Only within 32 years of Int64's floor, far outside what the server
-        // accepts anyway; as text it gets the server's own range error.
-        if overflow { return PostgresValue(CivilTime.format(microseconds: microsecondsSinceEpoch, .postgres)) }
-        return .binary(withUnsafeBytes(of: since2000.bigEndian) { Array($0) }, type: PostgresType.timestamptz)
     }
 }

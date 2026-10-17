@@ -1,0 +1,12 @@
+user      garuda              138866 req/s   p50    0.494   p95    0.532   p99     0.555 ms   cpu    25 us/req   mem    16 MiB   errors 0
+json      garuda              112959 req/s   p50    0.529   p95    0.966   p99     1.074 ms   cpu    35 us/req   mem    17 MiB   errors 0
+churn     garuda               25324 req/s   p50    2.549   p95    2.719   p99     2.814 ms   cpu    61 us/req   mem    17 MiB   errors 0
+skew      garuda               88290 req/s   p50    0.744   p95    0.874   p99     1.021 ms   cpu    41 us/req   mem    17 MiB   errors 0
+skew-slow garuda                 640 req/s   p50    7.302   p99    36.367 ms
+spike     garuda               88227 req/s   p50    0.658   p95    0.864   p99     1.225 ms   cpu    40 us/req   mem    17 MiB   errors 0
+h2        garuda               93331 req/s   p50    0.737   p95    0.792   p99     0.837 ms   cpu    34 us/req   mem    17 MiB   errors 0
+stream    garuda               37893 req/s   p50    1.661   p95    1.868   p99     2.265 ms   cpu    92 us/req   mem    18 MiB   errors 0
+download  garuda                2122 req/s   p50   31.277   p95   46.448   p99    55.765 ms   cpu  1616 us/req   mem    18 MiB   errors 0
+upload    garuda                2042 req/s   p50   24.098   p95   97.138   p99   112.381 ms   cpu  1972 us/req   mem    20 MiB   errors 0
+db        garuda               30254 req/s   p50    1.774   p95    3.701   p99     4.072 ms   cpu    93 us/req   mem    22 MiB   errors 0
+69 s

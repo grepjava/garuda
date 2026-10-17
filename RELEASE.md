@@ -6,22 +6,24 @@ have been deleted rather than left where they would be read as its history.
 Nothing below them was ever published as Garuda.
 
 **Keeping this file.** A change someone using Garuda would notice gets a line
-under [Unreleased](#unreleased) in the commit that makes it. When a version is
-cut, that section is renamed to the version and its date, and a new empty
-Unreleased section goes above it.
+under the version being prepared -- now [2.0.1](#201--unreleased) -- in the
+commit that makes it. When a version is cut, its heading gets the date, and a
+new section for the next version goes above it.
 
 **What CI runs.** `.github/workflows/ci.yml` runs on every push to `main` and
-every pull request:
+`vega` and every pull request:
 
-- the release build and `swift test` on Ubuntu 24.04 and macOS 15, and the
+- the release build and `swift test` on Ubuntu 24.04 and macOS 26, and the
   handler code that must not compile;
+- the build and `swift test` with the OpenSSL trait, on the system OpenSSL;
 - `swift test` again against a real PostgreSQL and a real Redis, which is what
   turns the opt-in connector suites on, and the example applications with
   them;
 - the end-to-end suites, which drive the release binary over a socket;
 - the protocol suites -- HTTP/2, HTTP/3, WebSocket, WebTransport, uploads --
   against clients built from h2 and aioquic, and `pgfuzz` under
-  AddressSanitizer.
+  AddressSanitizer;
+- the build and `swift test` on Windows Server 2025, which is experimental.
 
 The same runs nightly and on demand, with the fuzzer given ten minutes rather
 than one.
@@ -30,8 +32,9 @@ than one.
 
 ```bash
 swift build -c release
-swift test                             # 1138 unit tests; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
-bash scripts/compile-fail-test.sh      # 21
+swift test                             # 1117 unit tests on Linux; GARUDA_REDIS and GARUDA_POSTGRES run the database ones
+(cd Examples && swift test)            # 41, the example applications
+bash scripts/compile-fail-test.sh      # 20, handler code that must not compile
 bash scripts/integration-test.sh       # 36
 bash scripts/static-test.sh            # 105
 bash scripts/compress-test.sh          # 76, and garuda-conformance
@@ -40,7 +43,6 @@ bash scripts/ratelimit-test.sh         # 18
 bash scripts/redirect-test.sh          # 22
 bash scripts/sni-test.sh               # 11
 bash scripts/resumption-test.sh        # 7
-bash scripts/acme-test.sh              # 12, needs Pebble (PEBBLE_DIR)
 bash scripts/request-id-test.sh        # 12
 bash scripts/trace-context-test.sh     # 17
 bash scripts/drain-test.sh             # 14
@@ -71,7 +73,307 @@ nothing relevant.
 
 ---
 
-## Unreleased
+## 2.0.1 — unreleased
+
+Nothing yet.
+
+---
+
+## 2.0.0 — 2026-10-16
+
+Garuda 2 is a rewrite of the server on [Vega](https://github.com/grepjava/vega),
+a work-stealing runtime, under the same application API. Routes, typed
+extractors and answers move over with small edits; middleware, lifecycle
+hooks, custom extractors, time values and deployment scripts need more.
+[COMPATIBILITY.md](COMPATIBILITY.md) is the guide to moving, with every
+renamed type, flag and field; this section says what changed, not how to
+change each line.
+
+Garuda 1 stays on the `release/1.x` branch with its `1.x` tags. An
+application that is not ready to move pins `from: "1.1.0"`, which never
+resolves to 2.0.
+
+It needs Swift 6.2 or newer, and runs on Linux and on macOS 26.4 or newer
+(Vega's floor; Garuda 1 ran on macOS 15). Windows is experimental. It depends
+on Vega 0.5.0 and vega-db 0.2.5, and no longer on aviancore.
+
+Benchmarks ([BENCHMARKS.md](BENCHMARKS.md#garuda-200), six rotated rounds on a clock-capped box,
+Garuda 1.1 and axum 0.8 alongside). Against Garuda 1.1: `skew` +41%, `spike` +34%, `json` +9%,
+`upload` +7%, `h2` +3%, `user` +2%; `churn`, `stream` and `download` level (within 2%); `db` -3%.
+Against axum: ahead on every workload but `db` (-10%) and `download` (level). HTTP/3 does 138k req/s
+at 8 streams a connection, level with HTTP/2 and 1.8x Garuda 1. Hello world: +6% closed against
+Garuda 1, -2% on the ramp, -5% on one pinned thread; +17% to +45% against axum.
+
+### Process model
+
+- **Shards, not workers.** A shard is a process with its own Vega runtime
+  over several threads; a Garuda 1 worker was a process with one. Work is
+  stolen between a shard's threads, never between shards, so a crash takes
+  only that shard's connections. A supervisor binds the ports, maps the
+  memory the shards share, starts the shards, and starts again one that
+  crashes, after a back-off if it keeps crashing.
+- **`--shards N|auto`** sets the count. The default is `auto` on Linux, one
+  shard per last-level cache domain, and `0` on macOS. **`--shards 0` serves
+  in one process with no supervisor.** `--workers N` is accepted as
+  `--shards N`, so `--workers 0`, which was one worker per CPU, now means one
+  process. `--threads` sets the threads per shard and `--no-pin` leaves them
+  unpinned. On Linux shards are forked; on macOS each is a new run of the
+  executable, so route registration in `main` must come out the same each
+  time. With shards, no thread may exist before `app.run()`: Vega stops the
+  program when it forks if one does.
+- **`--balance`** is `auto` (the default: `reuseport` on Linux, `shared`
+  elsewhere), `reuseport` or `shared`. Garuda 1's `adaptive` and `accept` are
+  taken as `auto` and `shared`. Connections are not handed between shards as
+  Garuda 1's adaptive balancing did; work stealing inside a shard takes its
+  place.
+- **What is shared.** `app.state`, the database pools, the HTTP client's
+  connections and the in-memory session and token stores belong to one shard,
+  and an in-memory store under more than one shard is warned about at
+  start-up. The rate limiter, the metrics, the response cache, `Topic`
+  broadcast and the TLS session-ticket key are shared by every shard through
+  memory the supervisor maps.
+- **Signals.** `SIGTERM` fails the health check for `--drain-delay`
+  milliseconds, closing each HTTP/1.1 connection after its response, then
+  stops accepting and drains within `--graceful-timeout`. `SIGINT` and
+  `SIGQUIT` drain at once, and one sent during a drain delay cuts it short.
+  The supervisor passes them on, and kills a shard still running
+  `--drain-delay` + `--graceful-timeout` + 5 seconds after the signal (2
+  seconds in Garuda 1). The same signal sent to the supervisor twice kills the
+  shards at once.
+- **`SIGHUP`** restarts the shards one at a time, each stopped (as by
+  `SIGINT`) before its replacement starts; Garuda 1 started the replacement
+  first, so the server now runs one shard short during each step. A
+  replacement rereads the certificates and rebuilds its `app.state`, and the
+  response cache is emptied. With `--shards 0` `SIGHUP` is not handled and
+  ends the process.
+- **`--reload`**, for development, uses the supervisor's watch: a rebuilt
+  executable restarts the supervisor on it, and a changed `--tls-cert` or
+  `--tls-key` file replaces the shards. Unless `--balance` is given it serves
+  from one socket the supervisor holds, so a restart drops no queued
+  connection. Where the default would be one process it runs one shard;
+  with an explicit `--shards 0` it has no effect. `--reload-interval` sets how
+  often it looks.
+
+[DEPLOYMENT.md](DEPLOYMENT.md) covers the supervisor, signals, draining and
+reloads.
+
+### Handlers and the application API
+
+- **One async handler API.** A raw handler is
+  `@Sendable (borrowing Request, borrowing Response) async throws -> Void`,
+  registered with `app.on` or `app.get` and its siblings; `app.onAsync` and
+  the synchronous overloads are gone. A typed route has one async overload,
+  and a closure that never awaits converts to it and runs inline in the task
+  that read its request. `RequestExtractor.extract` is `async`, and
+  `AsyncRequestExtractor` is gone.
+- **`Sendable`.** A shard's threads run handlers concurrently, so handler
+  closures are `@Sendable` and `app.state` requires `Value: Sendable`. State
+  that was an ordinary class in Garuda 1 needs a lock or another design.
+- **Middleware wraps the handler** and calls `next()`:
+  `app.use { request, response, next in … }`. It can change the response
+  after `next()` returns and catch what the handler threw. `AsyncMiddleware`
+  is gone; the `Middleware` protocol has `handle(_:_:next:)`. The middleware
+  Garuda ships keeps its names.
+- **The heavy lane.** A route whose handler holds its thread for longer than
+  `--heavy-threshold` (500 µs by default) on average, without suspending,
+  runs only with one of the shard's heavy-lane permits, half as many as its
+  threads, so quick requests always have threads left; on Linux, heavy
+  handlers are spread over the shard's physical cores, one per core while
+  cores are free, rather than doubled up on a core's hyperthreads. `app.heavy.get(…)`
+  registers a route heavy from the start; `--no-heavy-lane` turns the lane
+  off. It replaces Garuda 1's `--sched-slice` and `--slow-handler-ms`.
+- **`app.offload`** registers a route whose synchronous handler runs on
+  Vega's blocking pool, its extractors and its answer on the shard's threads.
+  What it takes and returns must be `Sendable`. `--blocking-threads` and
+  `--blocking-queue` size the pool and its queue per shard. It replaces
+  `blocking { }`; Vega's `Runtime.blocking { }` is there for a piece of a
+  handler.
+- **`app.state { start in … }`** is `async` and is given a `ShardContext`;
+  its `shutdown:` is `async` too. **`app.onShardStart`** and
+  **`app.onShardStop`** (run in reverse order) replace `onWorkerStart`,
+  `prepare` and `onWorkerShutdown`. A factory or start hook that throws ends
+  the shard's start-up, and the supervisor starts it again.
+- **`Duration`** replaces milliseconds as integers and seconds as `Double`:
+  `app.deadline(.milliseconds(500))`, `app.every(.seconds(3600), onShard: 0)`,
+  the HTTP client's and the databases' timeouts. `app.deadline` bounds I/O
+  waits; a sleep, a channel or a child task's wait is not cut short.
+- **Cancellation is Swift's.** A reset HTTP/2 or HTTP/3 stream cancels its
+  handler's task. `response.sleep`, `response.after`, `response.cancellable`,
+  `response.isCancelled` and the `Cancellation` extractor are gone.
+- **`app.run()` returns `Never`**: `exit(app.run())` becomes `app.run()`.
+  `app.runOnce` and `GarudaCLI.main` are gone; one-off work runs on a Vega
+  `Runtime` of its own.
+- **Products.** `Garuda` no longer carries the databases or the test client:
+  `GarudaPostgres`, `GarudaRedis`, `GarudaSQLite` and `GarudaTesting` are
+  products of their own, and `GarudaSQL` re-exports `GarudaPostgres`.
+  `app.test` runs requests through the real HTTP/1.1 connection over an
+  in-memory stream, and `app.test.http2()` adds an HTTP/2 test client.
+- `ServerConfig` takes Swift `String`s and `Duration`s, and several fields
+  are renamed; COMPATIBILITY.md lists them.
+
+[HANDLER-API.md](HANDLER-API.md) and [MIDDLEWARE.md](MIDDLEWARE.md) describe
+the API.
+
+### Protocols
+
+- **HTTP/1.1**, with the parser strict where that prevents request
+  smuggling, and **HTTP/2** over TLS and in cleartext, both on Vega's
+  sockets.
+- **HTTP/3** (`--http3`) runs on Vega's `VegaQUIC`: Garuda 1's QUIC, ported onto
+  `VegaCrypto` and moved into Vega 0.5.0, with one UDP socket per thread,
+  over the same TLS library as the rest. A client that changes address must
+  pass path validation before the server follows it. There is no QUIC session
+  resumption or 0-RTT.
+- **WebSocket** over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220), on the
+  same routes, with permessage-deflate (`--ws-compress`).
+  `--websocket-protocols` chooses the protocols, and `--no-websockets` refuses
+  an upgrade with 501, as in Garuda 1.
+- **WebTransport** over HTTP/3, on the same port and routes, with
+  bidirectional and unidirectional streams and datagrams.
+
+[TRANSPORT.md](TRANSPORT.md) says what each implementation does.
+
+### TLS
+
+- TLS and every cryptographic primitive Garuda uses -- signed cookies, JWT,
+  password hashes, QUIC's packet protection -- come from Vega's `VegaTLS` and
+  `VegaCrypto`, over one library chosen by a package trait: **BoringSSL**,
+  vendored in Vega, by default, or the system's **OpenSSL 3** with the
+  `OpenSSL` trait. Garuda 1 used its vendored BoringSSL for TLS and the
+  system's `libcrypto` beside it, so the default build no longer needs the
+  OpenSSL development files.
+- Several certificates chosen by SNI, on TCP and QUIC; `--tls-reload` and
+  `SIGHUP` to pick up renewed files; `--tls-ciphers`. A handshake has 10
+  seconds, and session tickets resume across shards.
+- There is no kernel TLS (below).
+
+[INSTALLATION.md](INSTALLATION.md#the-tls-library) has the traits.
+
+### Databases and the HTTP client
+
+- PostgreSQL, Redis (with Cluster and Sentinel, and Valkey) and SQLite are
+  [vega-db](https://github.com/grepjava/vega-db)'s drivers, through
+  `GarudaPostgres`, `GarudaRedis` and `GarudaSQLite`. The type names are the
+  same. `caFile`, a path, is now `trustedCertificates`, the PEM text;
+  timeouts are `Duration`s; `SQLiteDatabase.migrate` is `async`; a pool
+  belongs to a shard and is shared by its threads. The session and
+  refresh-token stores moved to the product of their database.
+- `HTTPClient()` is a `Sendable` value made anywhere, and replaces
+  `request.client`. It speaks HTTP/1.1 and HTTP/2.
+
+[CONNECTORS.md](CONNECTORS.md) has the drivers' API and limits.
+
+### Request bodies and uploads
+
+- A route's request body is collected whole before the handler runs, on
+  every protocol, held to `--max-body` or the scope's `maxBodySize`.
+- **`app.onStreamingBody`** reads a body as it arrives, over HTTP/1.1,
+  HTTP/2 and HTTP/3. Its body is a `RequestBody`, a `Sendable` struct with
+  Garuda 1's `read(maxBytes:)`, `readAll(maxBytes:)`, `cancel()`,
+  `bytesRead` and `expectedLength`, and `read(into:)`, which fills an
+  `IOBuffer`. The HTTP/2 or HTTP/3 window is given back as the handler reads.
+  A body past its limit throws `.tooLarge` (413), and one cut short hands
+  over what arrived and then throws `.incomplete` (400); a reset stream ends
+  the handler this way rather than cancelling its task.
+- **`GarudaUploads`** brings Garuda 1's resumable uploads
+  (draft-ietf-httpbis-resumable-upload, interop version 9) onto streamed
+  bodies, with the same API, `app.resumableUploads`, over HTTP/1.1, HTTP/2
+  and HTTP/3.
+
+### Testing and fuzzing
+
+- **`pgfuzz`**, a mutation fuzzer in the package, drives the parsers that
+  read the network, and whole HTTP/2, HTTP/3 and QUIC connections, through 14
+  targets. `swift test` replays every seed and everything in `fuzz/corpus`.
+  CI runs it under AddressSanitizer for a minute on every push and ten
+  minutes nightly. [fuzz/README.md](fuzz/README.md) lists the targets.
+- The example applications are a package of their own with their own tests,
+  run in CI against a real PostgreSQL and Redis.
+
+### Windows
+
+Windows is experimental, and not covered by the versioning promise. It serves
+in one process: `--shards` above 0 is an error, `--balance`, `--io`,
+`--acceptors` and `--reload` are ignored with a warning, `--unix` is refused,
+and there is one accept loop and one UDP socket. There is no response
+compression, Vega having no zlib there. No POSIX signal is handled; Ctrl-C and
+Ctrl-Break stop the server at once, and closing the console is taken as
+`SIGTERM`. CI builds it and runs the unit tests on Windows Server 2025.
+
+### Command line
+
+Flags keep Garuda 1's names and units: `--keep-alive`, `--request-timeout`,
+`--graceful-timeout`, `--drain-delay` and the `--ws-ping-*` flags are
+milliseconds. Garuda 1's `--unix`, `--backlog`, `--root-path`,
+`--max-connections`, `--max-header-size`, `--request-timeout`,
+`--blocking-threads`, `--blocking-queue`, `--scheme`, `--request-start-header`,
+`--tls-ciphers` and `--reload` are all there. Most defaults are Garuda 1's;
+three are not:
+
+| flag | Garuda 1's default | Garuda 2's default |
+|---|---|---|
+| `--max-connections` | 4096 per worker | no limit |
+| `--blocking-threads` | 16 per worker | Vega's, 512 per shard |
+| `--blocking-queue` | 1024 per worker | no limit |
+
+A deployment that relied on Garuda 1's bounds passes them; the three are now
+per shard.
+
+- `--port 0` picks a free port.
+- `--ktls`, `--sched-slice` and `--slow-handler-ms` are accepted and warn
+  that they have no effect; `--no-ktls` is accepted silently.
+- New: `--shards`, `--threads`, `--no-pin`, `--io`, `--acceptors`,
+  `--heavy-threshold`, `--no-heavy-lane`, `--tls-reload`, `--acme-webroot`.
+  `SERVER_HOSTNAME` and `SERVER_PORT` in the environment set the host and
+  port.
+
+[CONFIG.md](CONFIG.md) has every flag.
+
+### Removed
+
+- **The built-in ACME client** and its flags (`--acme-domain`,
+  `--acme-email`, `--acme-cache`, `--acme-staging`, `--acme-directory`,
+  `--acme-ca-bundle`). Get the certificate with an outside client such as
+  certbot, answer its HTTP-01 challenges with
+  `--redirect-http 80 --acme-webroot DIR`, and pick up renewals with
+  `--tls-reload` or `SIGHUP`. `acme-test.sh` is gone with it.
+- **Kernel TLS.** `--ktls` is accepted and has no effect.
+- The scheduler slice and the slow-handler warnings, for the heavy lane.
+- The rolling restart that starts the replacement first, and adaptive
+  balancing.
+- `app.runOnce`, `app.prepare` with a timeout, `blocking { }`,
+  `request.client`, `Digest` and `SHA256Digest`.
+- The per-route metrics (`garuda_route_*`), `garuda_connection_slots`, and
+  the hand-off and deferred-accept counters.
+
+[What Garuda 2 does not have](COMPATIBILITY.md#what-garuda-2-does-not-have)
+is the full list. Also not in Garuda 2: `multipart/byteranges`, and reads
+from Redis replicas.
+
+### Behaviour changes
+
+- **Content-Length is enforced.** A `Content-Length` the handler sets is
+  held to, as in Garuda 1, on whole and streamed bodies alike. A longer body
+  is cut to it, and a shorter one is never ended as if it were whole:
+  HTTP/1.1 closes the connection after either mismatch, and HTTP/2 and HTTP/3
+  reset the stream of a short one. A HEAD states the declared length, a 304
+  keeps it, and a 204 states none.
+- **The HTTP client refuses a response status below 100.** `HTTP/1.1 001`
+  parsed as status 1 and was read as a final response; it is now a bad status
+  line. `pgfuzz` found it.
+- Server log lines read `garuda info: message` rather than
+  `[info]  pid=1234 message`. The access log's JSON and the application log
+  are unchanged.
+- `garuda_workers` counts shards.
+
+## 1.x, unreleased
+
+Garuda 1 changes made after 1.1.0. They are on the `release/1.x` branch
+(`cbad05b`), not yet in a tagged release, and are for the next 1.x
+release. They are not part of 2.0.0: Garuda 2 was written separately, and the
+2.0.0 section above says what it has. In particular `--slow-handler-ms` has no
+effect in Garuda 2, where the heavy lane does that work, and Garuda 2's
+`app.offload` is its own.
 
 - **`app.offload` runs a route's whole handler on the blocking pool.**
   `app.offload.post("/thumbnail") { (image: Body<Upload>) -> Bytes in … }`

@@ -1,280 +1,209 @@
 //===----------------------------------------------------------------------===//
-// Application: the routes and hooks a program serves, and how it is run.
+// The application: routes registered at start-up, compiled once, then served.
 //
-// An application is built up before it runs. Running it compiles the routes
-// into flat memory, before the first fork, so that every worker process reads
-// the same table without owning a copy; then it parses the command line, or
-// takes a configuration, and runs the supervisor. `test` serves the same
-// compiled routes from a worker in this process, with no socket bound, which
-// is what lets a test suite run an application, or several, without starting
-// a server.
+//     let app = Application()
+//     app.get("/user/:id") { (id: Path<Int>) in JSON(user(id.value)) }
+//     exit(app.run())
+//
+// Registration happens on one thread before anything is served. `run`
+// compiles the routes into flat memory that every thread of every shard only
+// reads, so serving never takes a lock or counts a reference to find a route.
 //===----------------------------------------------------------------------===//
 
-#if canImport(Glibc)
-import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
-
-import CAvian
-import AvianCore
-import AvianHTTP
+import GarudaWire
+import Synchronization
 import Tracing
+import Vega
 
-public final class Application: RouteBuilder {
-    var routes = Routes()
-    var startHooks: [(Int) -> Void] = []
-    var prepareHooks: [(timeout: UInt64, hook: @Sendable (WorkerStartup) async throws -> Void)] = []
-    var scheduledJobs: [ScheduledJob] = []
-    var shutdownHooks: [(Int) -> Void] = []
-    var responseObservers: [(CompletedRequest) -> Void] = []
-    /// What `tracing` asked for, made in each worker.
-    var makeTracer: ((Int) -> any Tracer)? = nil
+/// GET, POST and the rest, as routes are registered by them.
+public typealias HTTPMethod = GarudaWire.HTTPMethod
+
+/// A handler that writes its own response.
+public typealias Handler = @Sendable (borrowing Request, borrowing Response) async throws -> Void
+
+/// What routes can be registered on.
+public protocol RouteBuilder: AnyObject {
+    /// Registers `handler` for `method` and `pattern`.
+    func on(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping Handler)
+
+    /// Notes what a typed route's handler asks for, so `problems()` can find
+    /// a route that cannot work before anything is served: how many path
+    /// parameters it takes, and the `app.state` types it needs.
+    func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type])
+
+    /// Gives the route registered last its entry in the OpenAPI document
+    /// (OpenAPI.swift). The route methods call it, and return the entry.
+    func document(_ operation: OpenAPIOperation)
+
+    /// Adds what `note` says to the OpenAPI entry of every route in the
+    /// current scope, wherever in it the call is, as `use` applies to them
+    /// all. `authenticate` and `authorize` use it to say what they can
+    /// answer. A note leaves alone what a route has said about itself.
+    func describeRoutes(_ note: @escaping OperationNote)
+
+    /// Runs `middleware` around the handler of every route in the current
+    /// scope (Middleware.swift).
+    func use(_ middleware: some Middleware)
+
+    /// Mounts every route registered inside `register` under `prefix`, with
+    /// the middleware `use` adds inside it running after the scope's own:
+    ///
+    /// ```
+    /// app.group("/api") {
+    ///     app.use(RequireToken())
+    ///     app.get("/users/:id") { … }        // GET /api/users/:id
+    ///     app.group("/admin") {
+    ///         app.use(RequireAdmin())
+    ///         app.delete("/users/:id") { … } // DELETE /api/admin/users/:id,
+    ///     }                                   // RequireToken, then RequireAdmin
+    /// }
+    /// ```
+    func group(_ prefix: String, _ register: () -> Void)
+
+    /// Answers a request no route matches under the current scope's prefix,
+    /// for any method, in place of 404; the most specific scope's answers.
+    /// The scope's middleware runs in front of it. A path some other method
+    /// has a route for is still 405 (Fallbacks.swift).
+    func fallback(_ handler: @escaping Handler)
+}
+
+extension RouteBuilder {
+    public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type]) {}
+    public func document(_ operation: OpenAPIOperation) {}
+    public func describeRoutes(_ note: @escaping OperationNote) {}
+
+    // Each returns the route's OpenAPI entry, for `.summary(...)` and the
+    // rest (OpenAPI.swift).
+    @discardableResult
+    public func get(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.get, pattern, handler)
+    }
+    @discardableResult
+    public func head(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.head, pattern, handler)
+    }
+    @discardableResult
+    public func post(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.post, pattern, handler)
+    }
+    @discardableResult
+    public func put(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.put, pattern, handler)
+    }
+    @discardableResult
+    public func delete(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.delete, pattern, handler)
+    }
+    @discardableResult
+    public func patch(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.patch, pattern, handler)
+    }
+    @discardableResult
+    public func options(_ pattern: String, _ handler: @escaping Handler) -> OpenAPIOperation {
+        documentedRoute(.options, pattern, handler)
+    }
+}
+
+public final class Application: RouteBuilder, @unchecked Sendable {
+    var table = RouteTable()
+    var routes: [RouteEntry] = []
+    /// Middleware for every route, from `use` outside any group.
+    var global: [any Middleware] = []
+    /// Every group opened so far: the prefix it adds and the middleware `use`
+    /// gave it.
+    var groups: [(prefix: String, middleware: [any Middleware])] = []
+    /// The groups open right now, outermost first.
+    var openGroups: [Int] = []
+    /// `app.state` registrations, and the shard hooks (State.swift).
+    var stateFactories: [StateFactory] = []
+    var startHooks: [@Sendable (ShardContext) async throws -> Void] = []
+    var stopHooks: [@Sendable (ShardContext) async -> Void] = []
+    /// What a path with a trailing slash no route has is answered with
+    /// (TrailingSlash.swift).
     var trailingSlashPolicy = TrailingSlash.strict
-    /// The OpenAPI documents `openAPI` serves, written when the application compiles.
-    var openAPIDocuments: [OpenAPIDocumentBox] = []
-    /// What each worker builds for itself at start-up, by the type handlers
-    /// ask for it by, and how to tear it down (State.swift).
-    var stateFactories: [(ObjectIdentifier, (Int) throws -> Any)] = []
-    var stateShutdowns: [(ObjectIdentifier, (Any) -> Void)] = []
-    /// The routes and hooks as workers read them, made the first time the
+    /// `app.onResponse` registrations (ResponseObservers.swift).
+    var responseObservers: [ResponseObserver] = []
+    /// What `tracing` makes each shard's tracer with (Tracing.swift).
+    var makeTracer: (@Sendable (Int) -> any Tracer)?
+    /// `app.every` registrations (Scheduled.swift).
+    var scheduledJobs: [ScheduledJob] = []
+    /// Each route's OpenAPI entry, what scopes add to them, and the
+    /// documents `openAPI` serves (OpenAPI.swift).
+    var documentation = APIDocumentation()
+    /// Each scope's `fallback`, its pattern the scope's prefix
+    /// (Fallbacks.swift). Kept apart from `routes`: nothing in the route
+    /// table, the checks or the OpenAPI document is about them.
+    var fallbacks: [RouteEntry] = []
+    /// The routes as connections read them, made the first time the
     /// application runs or is tested. Nothing can be added after that.
-    var compiled: UnsafeMutablePointer<CompiledApplication>? = nil
+    var compiledApplication: CompiledApplication?
 
     public init() {}
-
-    deinit {
-        if let compiled {
-            compiled.pointee.destroy()
-            compiled.deinitialize(count: 1)
-            compiled.deallocate()
-        }
-    }
 
     // MARK: Routes
 
     /// Registers `handler` for `method` and `pattern`: literal segments,
-    /// `:param` segments and a trailing `*rest`. A pattern that cannot be
-    /// served, or a route added once the application has run or been tested,
-    /// is a mistake in the program and stops it.
+    /// `:param` segments and a trailing `*rest`, under the prefixes of the
+    /// groups open now. A pattern that cannot be served, or a route added
+    /// once the application has run or been tested, is a mistake in the
+    /// program and stops it.
     public func on(_ method: HTTPMethod, _ pattern: String, _ handler: @escaping Handler) {
-        precondition(compiled == nil, "route \(pattern) added after the application was compiled")
-        routes.on(method, pattern, handler)
+        precondition(compiledApplication == nil, "route \(pattern) added after the application was compiled")
+        let full = joinPattern(currentPrefix, pattern)
+        let parameters: Int
+        do {
+            parameters = try table.add(method, full, route: Int32(routes.count))
+        } catch {
+            preconditionFailure("route \(method) \(full): \(error)")
+        }
+        routes.append(RouteEntry(method: method, pattern: full, registeredPattern: pattern,
+                                 parameters: parameters, handler: handler, groups: openGroups))
     }
 
-    /// Registers an async handler, run on one of the worker's handler tasks.
-    /// An `await` resumes on the worker's own thread, so the handler sees the
-    /// same request and response a synchronous one does.
-    public func onAsync(_ method: HTTPMethod, _ pattern: String, _ handler: sending @escaping AsyncHandler) {
-        precondition(compiled == nil, "route \(pattern) added after the application was compiled")
-        routes.onAsync(method, pattern, handler)
+    public func noteRoute(_ method: HTTPMethod, _ pattern: String, pathParameters: Int, states: [Any.Type]) {
+        guard let last = routes.indices.last, routes[last].registeredPattern == pattern,
+              routes[last].method == method else { return }
+        routes[last].pathExtractors = pathParameters
+        routes[last].states = states
     }
 
-    /// Gives every route registered inside `register` a deadline: a request
-    /// still unanswered `milliseconds` after it was dispatched is answered
-    /// 504, and a handler waiting on the engine for it is unwound.
-    ///
-    ///     app.deadline(milliseconds: 500) {
-    ///         app.get("/report") { … }
-    ///     }
-    ///
-    /// A deadline bounds **waiting, not computing**. A worker is one thread,
-    /// so nothing can preempt a handler that loops without awaiting: that
-    /// handler still stops its worker, deadline or no. What this covers is a
-    /// handler waiting on something that never comes back.
-    ///
-    /// Nested calls apply the innermost deadline, and restore the outer one
-    /// afterwards.
-    public func deadline(milliseconds: UInt32, _ register: () -> Void) {
-        precondition(compiled == nil, "deadline added after the application was compiled")
-        let previous = routes.currentDeadline
-        routes.currentDeadline = milliseconds
-        defer { routes.currentDeadline = previous }
-        register()
-    }
+    // MARK: Scopes
 
-    // MARK: Groups and middleware
-
-    /// Mounts every route registered inside `register` under `prefix`, and
-    /// scopes any `use` called inside it to those routes.
-    ///
-    ///     app.group("/api") {
-    ///         app.use(requireToken)
-    ///         app.get("/users/:id") { … }        // GET /api/users/:id
-    ///         app.group("/admin") {
-    ///             app.use(requireAdmin)
-    ///             app.delete("/users/:id") { … } // DELETE /api/admin/users/:id,
-    ///         }                                   // requireToken, then requireAdmin
-    ///     }
-    ///
-    /// Groups nest; prefixes join and middleware runs from the outside in.
-    public func group(_ prefix: String, _ register: () -> Void) {
-        precondition(compiled == nil, "group added after the application was compiled")
-        precondition(prefix.hasPrefix("/"), "a group prefix starts with /: \(prefix)")
-        var trimmed = prefix
-        while trimmed.count > 1 && trimmed.hasSuffix("/") { trimmed.removeLast() }
-        routes.groups.append((prefix: trimmed == "/" ? "" : trimmed, middleware: []))
-        routes.openGroups.append(routes.groups.count - 1)
-        defer { routes.openGroups.removeLast() }
-        register()
-    }
-
-    /// Runs `middleware` before the handler of every route in the current
-    /// scope: every route, outside a group, or every route in the group this
-    /// is called inside.
-    ///
-    /// Order of registration does not matter: a `use` after the routes it
-    /// covers applies to them as surely as one before. What does matter is
-    /// the order of `use` calls within a scope, which is the order they run.
-    public func use(_ middleware: @escaping Middleware) {
-        use(step: .sync(middleware))
-    }
-
-    /// Runs an async `middleware` before the handler of every route in the
-    /// current scope, as `use` does. A closure that does not await is not
-    /// async, and takes the synchronous `use`.
-    ///
-    ///     app.use { request, _ async throws -> (any ResponseConvertible)? in
-    ///         guard let token = request.header("authorization"),
-    ///               let user = try await sessions.user(token) else {
-    ///             return HTTPStatus.unauthorized
-    ///         }
-    ///         request[context: CurrentUser.self] = user
-    ///         return nil
-    ///     }
-    public func use(_ middleware: sending @escaping AsyncMiddleware) {
-        use(step: .async(middleware))
-    }
-
-    private func use(step: MiddlewareStep) {
-        precondition(compiled == nil, "middleware added after the application was compiled")
-        if let group = routes.openGroups.last {
-            routes.groups[group].middleware.append(step)
+    public func use(_ middleware: some Middleware) {
+        precondition(compiledApplication == nil, "middleware added after the application was compiled")
+        if let group = openGroups.last {
+            groups[group].middleware.append(middleware)
         } else {
-            routes.global.append(step)
+            global.append(middleware)
         }
     }
 
-    // MARK: Worker hooks
-
-    /// Runs in each worker process before it accepts a connection -- a
-    /// replacement worker is not handed its slot until every hook has
-    /// returned -- with the worker's index. Hooks run in the order added.
-    public func onWorkerStart(_ hook: @escaping (_ worker: Int) -> Void) {
-        precondition(compiled == nil, "hook added after the application was compiled")
-        startHooks.append(hook)
+    public func group(_ prefix: String, _ register: () -> Void) {
+        precondition(compiledApplication == nil, "group added after the application was compiled")
+        groups.append((prefix: normalizedPrefix(prefix), middleware: []))
+        openGroups.append(groups.count - 1)
+        defer { openGroups.removeLast() }
+        register()
     }
 
-    /// Runs in each worker before it accepts anything, with the worker's
-    /// index, and may await: a schema to migrate, a cache to warm, a secret to
-    /// fetch. Hooks run in the order they were added.
-    ///
-    /// ```
-    /// app.state { _ in PostgresPool(configuration) }
-    /// app.prepare { start in
-    ///     try await start.state(PostgresPool.self).migrate(migrations)
-    /// }
-    /// ```
-    ///
-    /// The worker's state is built first, and its listening socket is
-    /// registered only once every hook has returned, so a connection that
-    /// arrives meanwhile waits in the backlog rather than reaching a worker
-    /// that is not ready. A hook that throws or outstays
-    /// `timeoutMilliseconds` stops the worker, which the supervisor reports as
-    /// a worker that would not start.
-    public func prepare(timeoutMilliseconds: UInt64 = 30_000,
-                        _ hook: @escaping @Sendable (_ start: WorkerStartup) async throws -> Void) {
-        precondition(compiled == nil, "a prepare hook added after the application was compiled")
-        precondition(timeoutMilliseconds > 0, "a prepare hook needs time to run in")
-        prepareHooks.append((timeoutMilliseconds, hook))
+    /// The prefix routes registered now are mounted under.
+    var currentPrefix: String {
+        openGroups.map { groups[$0].prefix }.joined()
     }
 
-    /// Runs in each worker process once its in-flight requests have finished
-    /// or --graceful-timeout has run out, with the worker's index.
-    public func onWorkerShutdown(_ hook: @escaping (_ worker: Int) -> Void) {
-        precondition(compiled == nil, "hook added after the application was compiled")
-        shutdownHooks.append(hook)
+    /// The middleware around route `index`, outermost first: global, then
+    /// its groups from the outside in, as they stand when this is asked.
+    func middleware(of route: RouteEntry) -> [any Middleware] {
+        // A CORS policy is not in the order of `use`: the innermost scope's
+        // runs in front of everything else (CORS.swift).
+        // The markers of `maxBodySize` and `concurrencyLimit` are read at
+        // compilation, not run (RequestLimits.swift).
+        placingCORSFirst([global] + route.groups.map { group in
+            groups[group].middleware.filter { !($0 is any ScopeLimitMarker) }
+        })
     }
 
-    // MARK: Running
-
-    /// Parses the process's command line as the `garuda` executable does,
-    /// then serves until shut down. Returns the process exit status.
-    public func run() -> Int32 {
-        switch GarudaCLI.parse(argc: Int(CommandLine.argc), argv: CommandLine.unsafeArgv) {
-        case .exit(let status):
-            return status
-        case .run(let config):
-            return serve(config)
-        }
-    }
-
-    /// Parses `arguments` as the `garuda` executable parses its command line,
-    /// then serves. For an application with commands of its own:
-    ///
-    /// ```
-    /// // starter serve -- --port 8080 --workers 4
-    /// case "serve":
-    ///     var mine = Array(CommandLine.arguments.dropFirst(2))
-    ///     if mine.first == "--" { mine.removeFirst() }
-    ///     exit(app.run(arguments: mine))
-    /// ```
-    ///
-    /// `arguments` holds the flags only, without the program name. An
-    /// unknown flag prints the usage and returns 2, as it does for `garuda`.
-    public func run(arguments: [String]) -> Int32 {
-        var storage = (["garuda"] + arguments).map { strdup($0) }
-        defer { for pointer in storage { free(pointer) } }
-        storage.append(nil)
-        return storage.withUnsafeMutableBufferPointer { argv -> Int32 in
-            switch GarudaCLI.parse(argc: argv.count - 1, argv: argv.baseAddress!) {
-            case .exit(let status):
-                return status
-            case .run(let config):
-                return serve(config)
-            }
-        }
-    }
-
-    /// Serves with `configuration` instead of the command line. It is checked
-    /// and completed the way the command line's is: certificate pairs, the
-    /// https scheme on a TLS listener, Alt-Svc for HTTP/3 and the port string
-    /// are derived from it, and a mistake is reported and returns status 2.
-    /// Strings in a `ServerConfig` must outlive the server; `ServerConfig.string`
-    /// makes one that does.
-    public func run(configuration: ServerConfig) -> Int32 {
-        var config = configuration
-        var inputs = GarudaCLI.ConfigurationInputs()
-        if let cert = config.tlsCertPath, let key = config.tlsKeyPath {
-            inputs.tlsCerts = [cert] + config.tlsExtraCerts.map { $0.cert }
-            inputs.tlsKeys = [key] + config.tlsExtraCerts.map { $0.key }
-        }
-        inputs.staticRoutes = config.staticRoutes
-        inputs.schemeGiven = strcmp(config.scheme, "http") != 0
-        if let status = GarudaCLI.finish(&config, inputs) {
-            return status
-        }
-        return serve(config)
-    }
-
-    func serve(_ config: ServerConfig) -> Int32 {
-        // Before a socket is opened: a route that cannot work is a mistake in
-        // the program, and the request that would have found it is a 500 for
-        // somebody who did nothing wrong.
-        let found = problems()
-        if !found.isEmpty {
-            for problem in found {
-                Log.error { line in
-                    line.str("the routes cannot work: ")
-                    problem.withCString { line.cstr($0) }
-                }
-            }
-            return 2
-        }
-        GarudaRuntime.application = compile()
-        defer { GarudaRuntime.application = nil }
-        return GarudaRuntime.run(config: config)
-    }
+    // MARK: Checks
 
     /// What is wrong with the routes, in the order they were registered, and
     /// empty when there is nothing. `run` prints these and exits 2 rather
@@ -284,225 +213,199 @@ public final class Application: RouteBuilder {
     /// #expect(app.problems().isEmpty)
     /// ```
     ///
-    /// What it finds:
-    ///
-    /// - A handler taking more `Path` extractors than its pattern has
-    ///   parameters. Those are taken by position, so the extra one has
-    ///   nothing to take and every request to that route is a 500.
-    /// - A handler asking for a `State<T>` no `app.state` registered, which
-    ///   is a 500 for the same reason.
-    ///
-    /// What it cannot find: a middleware's `request.state(T.self)`, which is
-    /// a call rather than a declaration, and an optional extractor, which is
-    /// a route saying it can do without.
-    /// What the OpenAPI document cannot promise, for a team generating
-    /// clients from it. Empty when it says everything it should.
-    ///
-    /// ```
-    /// #expect(app.documentProblems(info).isEmpty)
-    /// ```
-    ///
-    /// What it finds:
-    ///
-    /// - A schema read from a type whose decoding stopped early, which is a
-    ///   schema that may be missing whatever came after. Such a type either
-    ///   conforms to `OpenAPISchemaDescribing` and says what it is, or gets
-    ///   named here.
-    /// - Two routes with the same `operationID`, which generated clients turn
-    ///   into two functions of one name. (Two routes with the same method and
-    ///   path cannot get this far: the route table refuses them.)
-    ///
-    /// It does not serve anything, so the document it builds is thrown away.
-    public func documentProblems(_ info: OpenAPIInfo) -> [String] {
-        var found: [String] = []
-        let schemas = OpenAPISchemas()
-        var identifiers: [String: String] = [:]
-        for index in routes.handlers.indices {
-            guard let operation = routes.operations[index], !operation.isHidden,
-                  let pattern = routes.patterns[index], let method = routes.methods[index],
-                  let name = openAPIMethodName(method) else { continue }
-            let (path, _) = openAPIPath(pattern)
-            let route = name.uppercased() + " " + path
-            if let id = operation.identifier {
-                if let other = identifiers[id] {
-                    found.append("\(route) and \(other) share the operationID \"\(id)\"")
-                }
-                identifiers[id] = route
-            }
-        }
-        // Building the document is what reads the types, so the schemas only
-        // know what is uncertain afterwards.
-        _ = routes.openAPIDocument(info, into: schemas)
-        for (type, reason) in schemas.uncertain {
-            found.append("the schema for \(type) may be incomplete: \(reason)")
-        }
-        return found
-    }
-
+    /// It finds a handler taking more `Path` extractors than its pattern has
+    /// parameters -- those are taken by position, so the extra one has
+    /// nothing to take and every request to that route is a 500 -- and one
+    /// asking for `State` of a type no `app.state` builds.
     public func problems() -> [String] {
         var found: [String] = []
-        let registered = Set(stateFactories.map { $0.0 })
-        for index in routes.handlers.indices {
-            guard let operation = routes.operations[index],
-                  let pattern = routes.patterns[index],
-                  let method = routes.methods[index] else { continue }
-            let (_, names) = openAPIPath(pattern)
-            let route = (openAPIMethodName(method) ?? "?").uppercased() + " " + pattern
-            if operation.claimedPathParameters > names.count {
-                let takes = operation.claimedPathParameters
-                found.append("\(route) takes \(takes) Path extractor\(takes == 1 ? "" : "s") and its "
-                                 + "pattern has \(names.count) parameter\(names.count == 1 ? "" : "s")")
+        let built = Set(stateFactories.map(\.key))
+        for route in routes {
+            if route.pathExtractors > route.parameters {
+                found.append("\(route.method.name) \(route.pattern) takes \(route.pathExtractors) Path "
+                             + "parameters, and its pattern has \(route.parameters)")
             }
-            for type in operation.requiredState where !registered.contains(ObjectIdentifier(type)) {
-                found.append("\(route) asks for State<\(type)> and no app.state registered one")
+            for state in route.states where !built.contains(ObjectIdentifier(state)) {
+                found.append("\(route.method.name) \(route.pattern) asks for State<\(state)>, "
+                             + "and no app.state builds it")
             }
         }
         return found
-    }
-
-    // MARK: Testing
-
-    /// A client for this application's routes, served from a worker in this
-    /// process with a configuration for tests. Each use makes a new one.
-    public var test: TestClient {
-        var config = ServerConfig()
-        config.maxConnections = 16
-        return TestClient(application: self, configuration: config)
-    }
-
-    /// A client for this application's routes with `configuration`, for a
-    /// test of a server feature: --request-id, --root-path and the like.
-    public func testClient(configuration: ServerConfig) -> TestClient {
-        TestClient(application: self, configuration: configuration)
     }
 
     // MARK: Compiling
 
-    func compile() -> UnsafeMutablePointer<CompiledApplication> {
-        if let compiled { return compiled }
-        for box in openAPIDocuments {
-            box.json = Array(writeOpenAPIJSON(routes.openAPIDocument(box.info), indent: true).utf8)
+    /// The routes as every connection reads them. Made once.
+    func compile() -> CompiledApplication {
+        if let compiledApplication { return compiledApplication }
+        // The documents `openAPI` serves, written once from every route.
+        writeServedDocuments()
+        // Each route's middleware is put in front of it now, once: gathered
+        // from its scopes as they stand at the end, so a `use` after the
+        // routes it covers applies to them too. A route with none keeps its
+        // own handler and pays nothing.
+        // Fallbacks are served as routes after the real ones, which nothing
+        // in the table leads to (Fallbacks.swift). A scope's limits wrap the
+        // handler itself, inside every layer (RequestLimits.swift).
+        var serving = routes + fallbacks
+        var scopeLimits = ScopeLimits()
+        var bodyLimits: [Int] = []
+        var streamedBodies: [Bool] = []
+        for i in serving.indices {
+            let (bodyLimit, streamed, permits) = scopeLimits.limits(of: serving[i].groups, in: groups)
+            bodyLimits.append(bodyLimit)
+            streamedBodies.append(streamed)
+            serving[i].handler = limited(serving[i].handler, permits)
+            let layers = middleware(of: serving[i])
+            if !layers.isEmpty { serving[i].handler = compose(layers, around: serving[i].handler) }
+            serving[i].cors = (layers.first as? CORSMiddleware)?.policy
         }
-        let count = routes.handlers.count
-        let handlers = UnsafeMutablePointer<Handler>.allocate(capacity: max(1, count))
-        for (i, handler) in routes.handlersWithMiddleware().enumerated() {
-            (handlers + i).initialize(to: handler)
-        }
-        let deadlines = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, count))
-        for (i, allowed) in routes.deadlines.enumerated() {
-            (deadlines + i).initialize(to: allowed)
-        }
-        let bodyLimits = UnsafeMutablePointer<Int>.allocate(capacity: max(1, count))
-        for (i, limit) in routes.bodyLimits.enumerated() {
-            (bodyLimits + i).initialize(to: limit)
-        }
-        let wholeBodyLimits = UnsafeMutablePointer<Int>.allocate(capacity: max(1, count))
-        for (i, limit) in routes.wholeBodyLimits.enumerated() {
-            (wholeBodyLimits + i).initialize(to: limit)
-        }
-        let start = startHooks
-        let prepare = prepareHooks
-        let scheduled = scheduledJobs
-        let shutdown = shutdownHooks
-        let observers = responseObservers
-        let application = UnsafeMutablePointer<CompiledApplication>.allocate(capacity: 1)
-        application.initialize(to: CompiledApplication(
-            routes: routes.table.compile(),
-            handlers: handlers,
-            deadlines: deadlines,
-            bodyLimits: bodyLimits,
-            wholeBodyLimits: wholeBodyLimits,
-            streamsBodies: routes.bodyLimits.contains { $0 >= 0 }
-                || routes.wholeBodyLimits.contains { $0 >= 0 },
-            fallbacks: CompiledFallbacks(routes.fallbacks),
-            corsPolicies: (0..<count).map { routes.corsPolicy($0) },
-            hasCORS: routes.cors != nil || !routes.groupCORS.isEmpty,
-            handlerCount: count,
-            stateFactories: stateFactories,
-            stateShutdowns: stateShutdowns,
-            onPrepare: prepare.isEmpty ? nil : { @Sendable start in
-                for entry in prepare { try await entry.hook(start) }
-            },
-            prepareTimeoutMilliseconds: prepare.reduce(0) { $0 + $1.timeout },
-            scheduledJobs: scheduled,
-            onStart: start.isEmpty ? nil : { index in for hook in start { hook(index) } },
-            onShutdown: shutdown.isEmpty ? nil : { index in for hook in shutdown { hook(index) } },
-            routePatterns: routes.patterns,
-            routeMethods: routes.methods,
-            trailingSlash: trailingSlashPolicy,
-            onResponse: observers.isEmpty ? nil : { completed in for observe in observers { observe(completed) } },
-            makeTracer: makeTracer))
-        compiled = application
-        return application
+        let compiled = CompiledApplication(table: table.compile(), routes: serving,
+                                           stateFactories: stateFactories,
+                                           startHooks: startHooks, stopHooks: stopHooks,
+                                           trailingSlash: trailingSlashPolicy,
+                                           observers: responseObservers,
+                                           fallbacks: CompiledFallbacks(fallbacks.map(\.pattern),
+                                                                        first: routes.count),
+                                           bodyLimits: bodyLimits, streamedBodies: streamedBodies,
+                                           makeTracer: makeTracer,
+                                           scheduledJobs: scheduledJobs)
+        compiledApplication = compiled
+        return compiled
     }
 }
 
-/// An application as a worker reads it: flat routes, handlers by route
-/// number, and the hooks. Owned by its `Application`.
-struct CompiledApplication {
-    let routes: CompiledRoutes
+/// A route as it is registered.
+struct RouteEntry {
+    var method: HTTPMethod
+    /// With its groups' prefixes.
+    var pattern: String
+    /// As it was given to `on`, inside its groups.
+    var registeredPattern: String
+    /// How many parameters the pattern captures.
+    var parameters: Int
+    var handler: Handler
+    /// The groups it was registered inside, outermost first.
+    var groups: [Int] = []
+    /// How many `Path` extractors the handler takes, when it is typed.
+    var pathExtractors = 0
+    /// Registered through `app.heavy`.
+    var heavy = false
+    /// The `app.state` types its handler asks for, when it is typed.
+    var states: [Any.Type] = []
+    /// The CORS policy in front of it, for a preflight to its path that no
+    /// OPTIONS route takes (CORS.swift).
+    var cors: CORSPolicy? = nil
+}
+
+/// The routes, laid out for serving: a flat route table and the handlers by
+/// route index. Only ever read once made, from any thread.
+final class CompiledApplication: @unchecked Sendable {
+    let table: CompiledRoutes
     let handlers: UnsafeMutablePointer<Handler>
-    /// Milliseconds each route is allowed, by route number, 0 for none.
-    let deadlines: UnsafeMutablePointer<UInt32>
-    /// Each route's streamed body limit, -1 for a route given its body whole.
-    let bodyLimits: UnsafeMutablePointer<Int>
-    /// Each whole-body route's own limit, -1 for `--max-body`.
-    let wholeBodyLimits: UnsafeMutablePointer<Int>
-    /// Whether any route streams its body or has a limit of its own, so a
-    /// request with a body is matched at its head only when one might.
-    let streamsBodies: Bool
-    /// Each scope's fallback, for a request no route matches.
-    let fallbacks: CompiledFallbacks
-    /// Each route's CORS policy, by route number, for a preflight to a path
-    /// routed only for other methods.
+    let routeCount: Int
+    /// What each route's handler costs, and the heavy lane.
+    let costs: RouteCosts
+    /// Spare connection memory, by worker thread.
+    let connections = ConnectionCache()
+    /// Open WebSockets, closed with 1001 at shutdown (WebSocketSession.swift).
+    let webSockets = WebSocketRegistry()
+    /// The runtime serving it, for the work a request leaves running beside
+    /// its handler: an event stream's keep-alive. Set before it serves.
+    var runtime: Runtime?
+    /// What a shard shares with the others: --rate-limit's table and the
+    /// --metrics-port counters (SharedMemory.swift). Set before it serves.
+    var rateLimiter: RateLimiter?
+    var metrics: MetricsPage?
+    /// --cache-size's table.
+    var cache: ResponseCache?
+    /// --health-check-path.
+    var healthPath: [UInt8]?
+    /// --root-path, or nil for none (RootPath.swift).
+    var rootPath: [UInt8]?
+    /// SIGTERM has arrived: the health check answers 503 and HTTP/1
+    /// connections close after their response, through --drain-delay.
+    let unready = Atomic<Bool>(false)
+    /// What `app.tracing` makes each shard's tracer with, and the one this
+    /// shard made: set before it serves (Tracing.swift).
+    let makeTracer: (@Sendable (Int) -> any Tracer)?
+    var tracer: (any Tracer)?
+    /// `app.every`'s jobs, and the ones running in this shard (Scheduled.swift).
+    let scheduledJobs: [ScheduledJob]
+    let scheduled = ScheduledRun()
+    /// Any of the three is on: a request is looked at before routing.
+    var screened = false
+    /// This shard's state, and what builds it and stops it (State.swift).
+    let services: ServiceTable
+    /// How starting went, once a test client has started it.
+    let testStart = Mutex<Result<Void, any Error>?>(nil)
+    let stateFactories: [StateFactory]
+    let startHooks: [@Sendable (ShardContext) async throws -> Void]
+    let stopHooks: [@Sendable (ShardContext) async -> Void]
+    /// Each route's CORS policy, by route index, and whether any route has
+    /// one: a path with none never looks (CORS.swift).
     let corsPolicies: [CORSPolicy?]
     let hasCORS: Bool
-    let handlerCount: Int
-    let stateFactories: [(ObjectIdentifier, (Int) throws -> Any)]
-    let stateShutdowns: [(ObjectIdentifier, (Any) -> Void)]
-    /// Async start-up work, run before the worker accepts anything.
-    let onPrepare: (@Sendable (WorkerStartup) async throws -> Void)?
-    /// How long every prepare hook together may take.
-    let prepareTimeoutMilliseconds: UInt64
-    /// What `app.every` asked to have run on a timer.
-    let scheduledJobs: [ScheduledJob]
-    let onStart: ((Int) -> Void)?
-    let onShutdown: ((Int) -> Void)?
-    /// Each route's pattern, by route number, nil for a fallback.
-    let routePatterns: [String?]
-    /// Each route's method, nil for a fallback, for metrics by route.
-    let routeMethods: [HTTPMethod?]
-    /// What a path with a trailing slash no route has gets.
+    /// What a path with a trailing slash no route has is answered with.
     let trailingSlash: TrailingSlash
-    /// Every `onResponse` observer, in order, or nil for none.
-    let onResponse: ((CompletedRequest) -> Void)?
-    /// Makes the worker's tracer, when requests are traced.
-    let makeTracer: ((Int) -> any Tracer)?
+    /// What `app.onResponse` registered, and each route's pattern by index
+    /// for them to be told (ResponseObservers.swift).
+    let observers: [ResponseObserver]
+    let patterns: [String]
+    /// Each scope's fallback, by prefix, its handlers after the routes'
+    /// (Fallbacks.swift).
+    let fallbacks: CompiledFallbacks
+    /// Each handler's body limit, -1 for `--max-body`, and whether any has
+    /// one: a connection matches a request to its route before reading its
+    /// body only then (RequestLimits.swift).
+    let bodyLimits: [Int]
+    let hasBodyLimits: Bool
+    /// Whether each handler reads its body as it arrives, by route index
+    /// (RequestBody.swift). Such a route always has a body limit of its own,
+    /// so its requests are matched at the head.
+    let streamedBodies: [Bool]
 
-    func destroy() {
-        routes.destroy()
-        handlers.deinitialize(count: handlerCount)
-        handlers.deallocate()
-        deadlines.deinitialize(count: handlerCount)
-        deadlines.deallocate()
-        bodyLimits.deinitialize(count: handlerCount)
-        bodyLimits.deallocate()
-        wholeBodyLimits.deinitialize(count: handlerCount)
-        wholeBodyLimits.deallocate()
+    init(table: CompiledRoutes, routes: [RouteEntry], stateFactories: [StateFactory] = [],
+         startHooks: [@Sendable (ShardContext) async throws -> Void] = [],
+         stopHooks: [@Sendable (ShardContext) async -> Void] = [],
+         trailingSlash: TrailingSlash = .strict,
+         observers: [ResponseObserver] = [],
+         fallbacks: CompiledFallbacks = CompiledFallbacks(),
+         bodyLimits: [Int] = [],
+         streamedBodies: [Bool] = [],
+         makeTracer: (@Sendable (Int) -> any Tracer)? = nil,
+         scheduledJobs: [ScheduledJob] = []) {
+        self.table = table
+        self.makeTracer = makeTracer
+        self.scheduledJobs = scheduledJobs
+        self.trailingSlash = trailingSlash
+        self.observers = observers
+        self.fallbacks = fallbacks
+        self.bodyLimits = bodyLimits
+        hasBodyLimits = bodyLimits.contains { $0 >= 0 }
+        self.streamedBodies = streamedBodies.count == routes.count
+            ? streamedBodies : [Bool](repeating: false, count: routes.count)
+        // A fallback is never reported as a route.
+        let routed = routes.count - fallbacks.routes.count
+        patterns = routes[..<routed].map(\.pattern)
+        self.stateFactories = stateFactories
+        self.startHooks = startHooks
+        self.stopHooks = stopHooks
+        services = ServiceTable(capacity: stateFactories.count)
+        routeCount = routes.count
+        corsPolicies = routes.map(\.cors)
+        hasCORS = corsPolicies.contains { $0 != nil }
+        costs = RouteCosts(declared: routes.map(\.heavy), names: routes.enumerated().map { i, route in
+            i < routed ? "\(route.method.name) \(route.pattern)"
+                       : "the fallback for \(route.pattern.isEmpty ? "/" : route.pattern)"
+        })
+        handlers = .allocate(capacity: max(1, routes.count))
+        for (i, route) in routes.enumerated() { (handlers + i).initialize(to: route.handler) }
     }
-}
 
-extension GarudaRuntime {
-    /// The application this process serves, set by `Application.run` before
-    /// the supervisor starts, so that every worker forked from it serves the
-    /// same compiled routes. A test client does not use it.
-    nonisolated(unsafe) static var application: UnsafeMutablePointer<CompiledApplication>? = nil
-}
-
-extension ServerConfig {
-    /// A C string for a configuration field, kept for the life of the process
-    /// the way `argv` is.
-    public static func string(_ value: String) -> UnsafePointer<CChar> {
-        UnsafePointer(strdup(value)!)
+    deinit {
+        handlers.deinitialize(count: routeCount)
+        handlers.deallocate()
+        table.destroy()
     }
 }

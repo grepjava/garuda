@@ -1,5 +1,6 @@
 import Testing
 @testable import Garuda
+import GarudaTesting
 
 // Validation: the rules themselves, what they answer with, and that a type
 // with rules is checked wherever a request is decoded into it.
@@ -284,15 +285,6 @@ struct ValidationRequestTests {
         #expect(try client.get("/search?q=swift").status == .badRequest)
     }
 
-    @Test func aFormWithRulesIsCheckedTheSameWay() throws {
-        let app = Application()
-        app.post("/signup") { (form: Form<RuleSignup>) -> String in "reached" }
-        let response = try app.test.post("/signup", body: "email=ada&age=12",
-                                         headers: [("content-type", "application/x-www-form-urlencoded")])
-        #expect(response.status == .unprocessableContent)
-        #expect(try response.json(ErrorBody.self).fields?.map(\.field) == ["email", "age"])
-    }
-
     @Test func aTypeWithNoRulesIsUntouched() throws {
         let app = Application()
         app.post("/echo") { (body: Body<RuleUnchecked>) -> String in body.value.name }
@@ -318,31 +310,5 @@ struct ValidationRequestTests {
         let response = try app.test.get("/gone")
         #expect(response.status == .notFound)
         #expect(response.text == #"{"error":"no such note"}"#, "and no empty fields key")
-    }
-}
-
-@Suite("Validation in the OpenAPI document")
-struct ValidationOpenAPITests {
-    @Test func aRouteWhoseInputHasRulesDocumentsIts422() throws {
-        let app = Application()
-        app.post("/signup") { (body: Body<RuleSignup>) -> String in "reached" }
-        app.post("/echo") { (body: Body<RuleUnchecked>) -> String in "reached" }
-        app.get("/search") { (query: Query<RuleSearch>) -> String in "reached" }
-        let document = app.openAPIDocument(OpenAPIInfo(title: "Rules", version: "1"))
-
-        let checked = document["paths"]?["/signup"]?["post"]?["responses"]
-        #expect(checked?["422"]?["description"] == "A field breaks one of this route's rules")
-        #expect(checked?["400"] != nil, "and the 400 for a body that is not the type")
-        // The body it answers with, so a client knows to read `fields`.
-        #expect(checked?["422"]?["content"]?["application/json"]?["schema"]
-                    == ["$ref": "#/components/schemas/ErrorBody"])
-        // Which says `error` is always there and `fields` is not.
-        let shape = document["components"]?["schemas"]?["ErrorBody"]
-        #expect(shape?["required"] == ["error"])
-
-        // A route whose query has rules answers it too.
-        #expect(document["paths"]?["/search"]?["get"]?["responses"]?["422"] != nil)
-        // A route with no rules cannot answer 422, and does not claim to.
-        #expect(document["paths"]?["/echo"]?["post"]?["responses"]?["422"] == nil)
     }
 }

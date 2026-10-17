@@ -1,9 +1,8 @@
 //===----------------------------------------------------------------------===//
 // A response read as it arrives, rather than held whole.
 //
-//     app.onAsync(.get, "/relay") { request, response in
-//         let client = request.client
-//         let upstream = try await client.stream(.get, "https://files.example/big.iso")
+//     app.get("/relay") { request, response in
+//         let upstream = try await HTTPClient().stream(.get, "https://files.example/big.iso")
 //         let body = response.stream(contentType: "application/octet-stream")
 //         while let piece = try await upstream.next() {
 //             try await body.write(piece)
@@ -20,18 +19,14 @@
 // streaming APIs -- a model's tokens among them -- deliver what they produce.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import AvianHTTP
+import GarudaWire
 import Tracing
 
 /// A response whose body is read as it arrives. From `HTTPClient.stream`.
 ///
-/// It belongs to the handler that made it, on its worker, as a Redis
-/// subscription does: read it from that handler, or from a streamed response
-/// the handler returns, which runs on the same worker. Read to the end, the
-/// connection goes back to be used again; given up on with `cancel` -- or
-/// dropped unread -- it is closed, or its HTTP/2 stream reset.
+/// One task reads it at a time. Read to the end, the connection goes back to
+/// be used again; given up on with `cancel` -- or dropped unread -- it is
+/// closed, or its HTTP/2 stream reset.
 public final class ClientResponseStream: @unchecked Sendable {
     public let status: Int
     /// The reason phrase, which HTTP/2 does not have and HTTP/1.1 may leave
@@ -45,12 +40,12 @@ public final class ClientResponseStream: @unchecked Sendable {
     private var client: HTTPClient
     private var source: Source
     private var events = ServerSentEventParser()
-    /// The call's span, when the worker traces: ended with the body.
-    var span: (any Span)?
+    /// The call's span, when tracing: ended with the body.
+    var span: (any Tracing.Span)?
 
     enum Source {
         case h1(H1Body)
-        case h2(H2Shared, H2Stream)
+        case h2(H2Shared, ClientH2Stream)
         case ended
     }
 
@@ -72,22 +67,13 @@ public final class ClientResponseStream: @unchecked Sendable {
     }
 
     deinit {
-        // Given up on without a word. Only the worker's own thread may touch
-        // the connection; anywhere else, the worker closes it when it goes.
-        guard av_worker_current() == UnsafeMutableRawPointer(client.worker) else {
-            span?.end()
-            return
-        }
+        // Given up on without a word.
         cancel()
     }
 
     /// The first value of `name`, compared without regard to case.
     public func header(_ name: String) -> String? {
-        let wanted = name.lowercased()
-        for field in headers where field.name.count == name.count {
-            if field.name.lowercased() == wanted { return field.value }
-        }
-        return nil
+        headers.first { named($0.name, name) }?.value
     }
 
     /// The next piece of the body as it arrived, never empty, or nil once
@@ -166,11 +152,7 @@ public final class ClientResponseStream: @unchecked Sendable {
     /// The head is in: from here each read is bounded by the per-wait
     /// timeout alone, not the budget that got the stream this far.
     func startReading() {
-        client.deadline = 0
-        if case .h2(_, let stream) = source {
-            stream.exchangeDeadline = 0
-            stream.renew(at: av_monotonic_ms())
-        }
+        client.deadline = nil
     }
 }
 

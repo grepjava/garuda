@@ -14,23 +14,31 @@
 // A typed route already says most of what the document needs: its method and
 // pattern, and the types of what it takes and returns. `Path<Int>` is an
 // integer path parameter, `Query<Filter>` is a query parameter for each of
-// `Filter`'s fields, `Body<NewOrder>` is a JSON request body, `BearerToken` is
-// bearer authentication, and `JSON<Order>` is a JSON 200 -- each schema read
-// from the `Decodable` type (OpenAPISchema.swift). Every route method returns
-// the route's `OpenAPIOperation`, whose methods add what the types cannot
-// say: a summary, tags, the statuses a thrown error answers with.
+// `Filter`'s fields, `Body<NewOrder>` is a JSON request body, `Form` and
+// `Multipart` are form bodies, `BearerToken` is bearer authentication, and
+// `JSON<Order>` is a JSON 200 -- each schema read from the `Decodable` type
+// (OpenAPISchema.swift). `State` and `Context` take nothing from the request
+// and say nothing; an optional or `Result` extractor says what the one it
+// wraps says. Every route method returns the route's `OpenAPIOperation`,
+// whose methods add what the types cannot say: a summary, tags, the statuses
+// a thrown error answers with.
 //
-// A raw route, `(borrowing Request, inout Response)`, is listed with its path
-// parameters and whatever its operation is told. An extractor or response
-// type of your own describes itself by conforming to
+// A raw route, `(borrowing Request, borrowing Response)`, is listed with its
+// path parameters and whatever its operation is told. An extractor or
+// response type of your own describes itself by conforming to
 // `OpenAPIExtractorDescribing` or `OpenAPIResponseDescribing`.
 //
-// The document is built once, when the application is compiled, and served
-// as it is. `openAPIDocument` returns it for a build step that writes a file.
+// A scope can speak for every route in it: `authenticate` adds its security
+// scheme and 401, `authorize` its 403, through `describeRoutes`. A note is
+// kept with the scope, like its middleware, and applied when the document is
+// written, so it reaches routes registered before it as well.
+//
+// None of this costs a request anything. What a route says about itself is
+// gathered when it is registered, by casting its extractor and answer types
+// once; the document is built from that when it is asked for, and the one
+// `openAPI` serves is built once, when the application compiles, and sent as
+// the bytes it already is.
 //===----------------------------------------------------------------------===//
-
-import AvianCore
-import AvianHTTP
 
 // MARK: - Describing a route
 
@@ -70,16 +78,20 @@ public enum OpenAPISecurityScheme: Sendable {
     }
 }
 
-/// One route's entry in the OpenAPI document, which its registration returns.
-/// Each method adds to it and returns it, so they chain.
 /// What a scope adds to the OpenAPI entry of every route in it, through
 /// `describeRoutes`.
 public typealias OperationNote = (OpenAPIOperation) -> Void
 
+/// One route's entry in the OpenAPI document, which its registration returns.
+/// Each method adds to it and returns it, so they chain.
+///
+/// It is only ever touched while routes are registered and when a document
+/// is built, both on the thread that sets the application up.
 public final class OpenAPIOperation: @unchecked Sendable {
     typealias Make = (OpenAPISchemas) -> OpenAPIValue
 
     public let method: HTTPMethod
+    /// The pattern as it was registered, inside its groups.
     public let pattern: String
 
     var summaryText: String? = nil
@@ -96,19 +108,29 @@ public final class OpenAPIOperation: @unchecked Sendable {
     var responses: [(code: String, make: Make)] = []
     var security: [OpenAPISecurityScheme] = []
 
-    /// What the handler's extractors need of the application, for the check
-    /// `Application.problems()` runs before serving. Not in the document:
-    /// this is about the route being able to work at all, and the operation
-    /// is simply where a route's facts already gather.
-    ///
-    /// How many path parameters the handler claims by position, and the
-    /// `app.state` types it asks for.
-    var claimedPathParameters = 0
-    var requiredState: [Any.Type] = []
-
     public init(_ method: HTTPMethod, _ pattern: String) {
         self.method = method
         self.pattern = pattern
+    }
+
+    /// A copy for one document to apply its scopes' notes to, so the route's
+    /// own entry -- which a router mounted twice shares between both places
+    /// -- never carries what one scope said into another, or into the next
+    /// document.
+    func copy() -> OpenAPIOperation {
+        let copy = OpenAPIOperation(method, pattern)
+        copy.summaryText = summaryText
+        copy.descriptionText = descriptionText
+        copy.identifier = identifier
+        copy.tagList = tagList
+        copy.isDeprecated = isDeprecated
+        copy.isHidden = isHidden
+        copy.pathSchemas = pathSchemas
+        copy.parameters = parameters
+        copy.requestBodyMake = requestBodyMake
+        copy.responses = responses
+        copy.security = security
+        return copy
     }
 
     /// A line saying what the route does.
@@ -178,8 +200,7 @@ public final class OpenAPIOperation: @unchecked Sendable {
 
     /// A status the route's scope can answer with -- the 401 of an
     /// `authenticate`, the 403 of an `authorize` -- which leaves alone what
-    /// the route has said about that status itself, and says the same thing
-    /// again the second time it is called.
+    /// the route has said about that status itself.
     @discardableResult
     public func scopeResponse(_ status: HTTPStatus, _ description: String) -> Self {
         let code = String(status.code)
@@ -280,23 +301,17 @@ public final class OpenAPIOperation: @unchecked Sendable {
         return self
     }
 
-    /// Adds what `type` says about itself, when it says anything.
+    /// Adds what `type` says about itself, when it says anything. A typed
+    /// route calls this once per extractor, when it is registered.
+    @usableFromInline
     func describeExtractor<E: RequestExtractor>(_ type: E.Type) {
         (E.self as? any OpenAPIExtractorDescribing.Type)?.describe(self)
     }
 
-    /// Records what `type` needs from the application, for the start-up check.
-    func noteRequirements<E: RequestExtractor>(_ type: E.Type) {
-        if E.self is any PathClaiming.Type { claimedPathParameters += 1 }
-        if let state = E.self as? any StateRequiring.Type {
-            requiredState.append(state.requiredStateType)
-        }
-    }
-
+    /// Adds what the answer type `type` says about itself.
+    @usableFromInline
     func describeResponse<R: ResponseConvertible>(_ type: R.Type) {
-        if let described = R.self as? any OpenAPIResponseDescribing.Type {
-            described.describe(self)
-        }
+        (R.self as? any OpenAPIResponseDescribing.Type)?.describe(self)
     }
 }
 
@@ -367,10 +382,26 @@ extension BasicCredentials: OpenAPIExtractorDescribing {
     }
 }
 
-extension LastEventID: OpenAPIExtractorDescribing {
+/// A `JWT` reads a bearer token, as `authenticate(jwt:)` does, and is
+/// written the same way.
+extension JWT: OpenAPIExtractorDescribing {
     public static func describe(_ operation: OpenAPIOperation) {
-        operation.parameter("Last-Event-ID", in: .header, required: false,
-                            description: "The last event a reconnecting client saw")
+        operation.security(.bearer(format: "JWT"))
+        operation.response(.unauthorized, "No valid bearer token")
+    }
+}
+
+/// What an optional or `Result` extractor takes is what the one it wraps
+/// takes: it only changes what a refusal means.
+extension Optional: OpenAPIExtractorDescribing where Wrapped: RequestExtractor {
+    public static func describe(_ operation: OpenAPIOperation) {
+        operation.describeExtractor(Wrapped.self)
+    }
+}
+
+extension Result: OpenAPIExtractorDescribing where Success: RequestExtractor, Failure == any Error {
+    public static func describe(_ operation: OpenAPIOperation) {
+        operation.describeExtractor(Success.self)
     }
 }
 
@@ -406,16 +437,55 @@ extension Bytes: OpenAPIResponseDescribing {
     }
 }
 
-extension EventStream: OpenAPIResponseDescribing {
-    public static func describe(_ operation: OpenAPIOperation) {
-        operation.impliedResponse(.ok, "A stream of server-sent events", contentType: "text/event-stream")
-    }
-}
-
 extension Optional: OpenAPIResponseDescribing where Wrapped: ResponseConvertible {
     public static func describe(_ operation: OpenAPIOperation) {
         operation.describeResponse(Wrapped.self)
         operation.response(.notFound, "Not found")
+    }
+}
+
+// MARK: - Registration
+
+/// What an application keeps for its document: each route's operation, the
+/// notes of its scopes, and the documents it serves.
+struct APIDocumentation {
+    /// The operation of each route that has one, by route index. A route
+    /// registered through the protocol's `on` alone has none, and is listed
+    /// with what its pattern says.
+    var operations: [Int: OpenAPIOperation] = [:]
+    /// `describeRoutes` outside any group, and in groups, by group.
+    var notes: [OperationNote] = []
+    var groupNotes: [Int: [OperationNote]] = [:]
+    /// What `openAPI` serves, filled in when the application compiles.
+    var served: [OpenAPIDocumentBox] = []
+}
+
+extension RouteBuilder {
+    /// Registers a raw handler and gives it an operation to be told about.
+    func documentedRoute(_ method: HTTPMethod, _ pattern: String,
+                         _ handler: @escaping Handler) -> OpenAPIOperation {
+        on(method, pattern, handler)
+        let operation = OpenAPIOperation(method, pattern)
+        document(operation)
+        return operation
+    }
+}
+
+extension Application {
+    public func document(_ operation: OpenAPIOperation) {
+        precondition(compiledApplication == nil, "route documented after the application was compiled")
+        guard let last = routes.indices.last, routes[last].registeredPattern == operation.pattern,
+              routes[last].method == operation.method else { return }
+        documentation.operations[last] = operation
+    }
+
+    public func describeRoutes(_ note: @escaping OperationNote) {
+        precondition(compiledApplication == nil, "routes described after the application was compiled")
+        if let group = openGroups.last {
+            documentation.groupNotes[group, default: []].append(note)
+        } else {
+            documentation.notes.append(note)
+        }
     }
 }
 
@@ -440,7 +510,8 @@ public struct OpenAPIInfo: Sendable {
     }
 }
 
-/// A document the application fills in when it compiles.
+/// A document `openAPI` serves, written when the application compiles and
+/// only read after that.
 final class OpenAPIDocumentBox: @unchecked Sendable {
     let info: OpenAPIInfo
     var json: [UInt8] = []
@@ -451,11 +522,14 @@ final class OpenAPIDocumentBox: @unchecked Sendable {
 }
 
 extension Application {
-    /// Serves the OpenAPI document of every route at `path`, as JSON.
+    /// Serves the OpenAPI document of every route at `path`, as JSON. The
+    /// document is written once, when the application compiles, so it has
+    /// every route however late it was registered, and serving it is sending
+    /// bytes already made.
     public func openAPI(_ info: OpenAPIInfo, path: String = "/openapi.json") {
-        precondition(compiled == nil, "openAPI added after the application was compiled")
+        precondition(compiledApplication == nil, "openAPI added after the application was compiled")
         let box = OpenAPIDocumentBox(info)
-        openAPIDocuments.append(box)
+        documentation.served.append(box)
         get(path) { _, response in
             response.send(bytes: box.json, contentType: "application/json")
         }
@@ -475,34 +549,33 @@ extension Application {
 
     /// The OpenAPI document of the routes registered so far.
     public func openAPIDocument(_ info: OpenAPIInfo) -> OpenAPIValue {
-        routes.openAPIDocument(info)
+        buildOpenAPIDocument(info)
     }
 
-    /// The document as JSON text, indented.
+    /// The document as JSON text, indented: what `openAPI` serves.
     public func openAPIJSON(_ info: OpenAPIInfo) -> String {
-        writeOpenAPIJSON(openAPIDocument(info), indent: true)
+        String(decoding: openAPIBytes(openAPIDocument(info), indent: true), as: UTF8.self)
     }
-}
 
-extension Routes {
-    /// `schemas` is taken rather than made when a caller wants to see what
-    /// reading the types found: `Application.documentProblems`.
-    func openAPIDocument(_ info: OpenAPIInfo, into schemas: OpenAPISchemas = OpenAPISchemas()) -> OpenAPIValue {
+    /// Writes every document `openAPI` serves. `compile` calls it, once.
+    func writeServedDocuments() {
+        for box in documentation.served {
+            box.json = openAPIBytes(buildOpenAPIDocument(box.info), indent: true)
+        }
+    }
+
+    /// The document. `schemas` is taken rather than made when a caller
+    /// wants to see what reading the types found: `documentProblems`.
+    func buildOpenAPIDocument(_ info: OpenAPIInfo,
+                              into schemas: OpenAPISchemas = OpenAPISchemas()) -> OpenAPIValue {
         var paths: [(String, [(String, OpenAPIValue)])] = []
         var schemes: [(String, OpenAPIValue)] = []
 
-        for index in handlers.indices {
-            guard let full = patterns[index], let method = methods[index] else { continue }
-            let operation = operations[index] ?? OpenAPIOperation(method, full)
-            // What the route's scopes add: a rule of a group applies to every
-            // route in it, so it is added here rather than at registration,
-            // where a route registered before the rule would have missed it.
-            // Each note leaves alone what the route said for itself, and says
-            // the same thing again when a document is written twice.
-            for note in operationNotes(index) { note(operation) }
+        for (index, route) in routes.enumerated() {
+            let operation = documentedOperation(index)
             if operation.isHidden { continue }
-            let (path, names) = openAPIPath(full)
-            guard let methodName = openAPIMethodName(method) else { continue }
+            let (path, names) = openAPIPath(route.pattern)
+            guard let methodName = openAPIMethodName(route.method) else { continue }
 
             var members: [(String, OpenAPIValue)] = []
             if !operation.tagList.isEmpty { members.append(("tags", .array(operation.tagList.map { .string($0) }))) }
@@ -554,6 +627,67 @@ extension Routes {
         if !components.isEmpty { document.append(("components", .object(components))) }
         return .object(document)
     }
+
+    /// Route `index`'s operation with what its scopes add: a rule of a scope
+    /// applies to every route in it, so it is added here rather than at
+    /// registration, where a route registered before the rule would have
+    /// missed it. The notes are applied to a copy, so the route's own entry
+    /// is the same however many documents are written.
+    func documentedOperation(_ index: Int) -> OpenAPIOperation {
+        let route = routes[index]
+        let operation = documentation.operations[index]?.copy()
+            ?? OpenAPIOperation(route.method, route.registeredPattern)
+        for note in documentation.notes { note(operation) }
+        for group in route.groups {
+            for note in documentation.groupNotes[group] ?? [] { note(operation) }
+        }
+        return operation
+    }
+
+    // MARK: Checks
+
+    /// What the OpenAPI document cannot promise, for a team generating
+    /// clients from it. Empty when it says everything it should.
+    ///
+    /// ```
+    /// #expect(app.documentProblems(info).isEmpty)
+    /// ```
+    ///
+    /// What it finds:
+    ///
+    /// - A schema read from a type whose decoding stopped early, which is a
+    ///   schema that may be missing whatever came after. Such a type either
+    ///   conforms to `OpenAPISchemaDescribing` and says what it is, or gets
+    ///   named here.
+    /// - Two routes with the same `operationID`, which generated clients turn
+    ///   into two functions of one name. (Two routes with the same method and
+    ///   path cannot get this far: the route table refuses them.)
+    ///
+    /// It does not serve anything, so the document it builds is thrown away.
+    public func documentProblems(_ info: OpenAPIInfo) -> [String] {
+        var found: [String] = []
+        var identifiers: [String: String] = [:]
+        for (index, route) in routes.enumerated() {
+            guard let operation = documentation.operations[index], !operation.isHidden,
+                  let name = openAPIMethodName(route.method) else { continue }
+            let (path, _) = openAPIPath(route.pattern)
+            let described = name.uppercased() + " " + path
+            if let id = operation.identifier {
+                if let other = identifiers[id] {
+                    found.append("\(described) and \(other) share the operationID \"\(id)\"")
+                }
+                identifiers[id] = described
+            }
+        }
+        // Building the document is what reads the types, so the schemas only
+        // know what is uncertain afterwards.
+        let schemas = OpenAPISchemas()
+        _ = buildOpenAPIDocument(info, into: schemas)
+        for (type, reason) in schemas.uncertain {
+            found.append("the schema for \(type) may be incomplete: \(reason)")
+        }
+        return found
+    }
 }
 
 /// A Garuda pattern as an OpenAPI path, `:id` and `*rest` as `{id}` and
@@ -584,98 +718,76 @@ func openAPIMethodName(_ method: HTTPMethod) -> String? {
     }
 }
 
-// MARK: - Registration
-
-extension Application {
-    public func document(_ operation: OpenAPIOperation) {
-        precondition(compiled == nil, "route documented after the application was compiled")
-        guard !routes.operations.isEmpty else { return }
-        routes.operations[routes.operations.count - 1] = operation
-    }
-}
-
-extension Router {
-    public func document(_ operation: OpenAPIOperation) {
-        addDocumentation(operation)
-    }
-}
-
 // MARK: - Writing JSON
 
-func writeOpenAPIJSON(_ value: OpenAPIValue, indent: Bool) -> String {
-    var out = ""
-    write(value, into: &out, depth: 0, indent: indent)
-    if indent { out += "\n" }
-    return out
-}
-
-private func write(_ value: OpenAPIValue, into out: inout String, depth: Int, indent: Bool) {
-    func newline(_ depth: Int) {
-        guard indent else { return }
-        out += "\n"
-        out += String(repeating: "  ", count: depth)
+/// Compact, through the same writer as every JSON answer.
+extension OpenAPIValue: JSONWritable {
+    public func write(json output: inout JSONOutput) {
+        write(into: &output, depth: 0, indent: false)
     }
-    switch value {
-    case .string(let text):
-        writeJSONString(text, into: &out)
-    case .integer(let number):
-        out += String(number)
-    case .number(let number):
-        out += number == number.rounded() && abs(number) < 1e15 ? String(Int(number)) : "\(number)"
-    case .bool(let flag):
-        out += flag ? "true" : "false"
-    case .null:
-        out += "null"
-    case .array(let items):
-        guard !items.isEmpty else { out += "[]"; return }
-        out += "["
-        for (i, item) in items.enumerated() {
-            if i > 0 { out += "," }
-            newline(depth + 1)
-            write(item, into: &out, depth: depth + 1, indent: indent)
-        }
-        newline(depth)
-        out += "]"
-    case .object(let members):
-        guard !members.isEmpty else { out += "{}"; return }
-        out += "{"
-        for (i, member) in members.enumerated() {
-            if i > 0 { out += "," }
-            newline(depth + 1)
-            writeJSONString(member.0, into: &out)
-            out += indent ? ": " : ":"
-            write(member.1, into: &out, depth: depth + 1, indent: indent)
-        }
-        newline(depth)
-        out += "}"
-    }
-}
 
-private func writeJSONString(_ text: String, into out: inout String) {
-    out += "\""
-    for scalar in text.unicodeScalars {
-        switch scalar {
-        case "\"": out += "\\\""
-        case "\\": out += "\\\\"
-        case "\n": out += "\\n"
-        case "\r": out += "\\r"
-        case "\t": out += "\\t"
-        default:
-            if scalar.value < 0x20 || scalar.value == 0x2028 || scalar.value == 0x2029 {
-                let hex = String(scalar.value, radix: 16)
-                out += "\\u" + String(repeating: "0", count: 4 - hex.count) + hex
-            } else {
-                out.unicodeScalars.append(scalar)
+    /// Writes the value, its members on lines of their own indented by two
+    /// spaces a level when `indent` is set, for a document people read.
+    func write(into output: inout JSONOutput, depth: Int, indent: Bool) {
+        switch self {
+        case .string(let text):
+            output.write(text)
+        case .integer(let number):
+            output.write(number)
+        case .number(let number):
+            output.write(number)
+        case .bool(let flag):
+            output.write(flag)
+        case .null:
+            output.writeNull()
+        case .array(let items):
+            output.beginArray()
+            guard !items.isEmpty else { return output.endArray() }
+            for (i, item) in items.enumerated() {
+                if i > 0 { output.comma() }
+                newline(&output, depth + 1, indent)
+                item.write(into: &output, depth: depth + 1, indent: indent)
             }
+            newline(&output, depth, indent)
+            output.endArray()
+        case .object(let members):
+            output.beginObject()
+            guard !members.isEmpty else { return output.endObject() }
+            for (i, member) in members.enumerated() {
+                if i > 0 { output.comma() }
+                newline(&output, depth + 1, indent)
+                output.write(member.0)
+                if indent { output.append(": ") } else { output.colon() }
+                member.1.write(into: &output, depth: depth + 1, indent: indent)
+            }
+            newline(&output, depth, indent)
+            output.endObject()
         }
     }
-    out += "\""
+}
+
+private func newline(_ output: inout JSONOutput, _ depth: Int, _ indent: Bool) {
+    guard indent else { return }
+    output.append("\n")
+    for _ in 0..<depth { output.append("  ") }
+}
+
+/// The document's bytes, ending in a newline when indented.
+func openAPIBytes(_ value: OpenAPIValue, indent: Bool) -> [UInt8] {
+    var output = JSONOutput(capacity: 4096)
+    value.write(into: &output, depth: 0, indent: indent)
+    if indent { output.append("\n") }
+    return output.bytes
+}
+
+func writeOpenAPIJSON(_ value: OpenAPIValue, indent: Bool) -> String {
+    String(decoding: openAPIBytes(value, indent: indent), as: UTF8.self)
 }
 
 // MARK: - Swagger UI
 
 /// `target` as a URL relative to the page at `page`, so both still meet
-/// under --root-path or a proxy's prefix.
+/// under a proxy's prefix.
 func relativeURL(from page: String, to target: String) -> String {
     let depth = max(0, page.split(separator: "/", omittingEmptySubsequences: false).count - 2)
     let trimmed = target.hasPrefix("/") ? String(target.dropFirst()) : target
@@ -692,11 +804,19 @@ private func swaggerPage(title: String, document: String) -> String {
         default: safeTitle.append(c)
         }
     }
-    var url = ""
-    writeJSONString(document, into: &url)
+    // The URL as a JavaScript string: JSON's escaping, and `<` and the two
+    // line separators JavaScript once refused written as escapes too, so
+    // nothing in it can close the script element.
+    var quoted = JSONOutput()
+    quoted.write(document)
     var script = ""
-    for c in url {
-        if c == "<" { script += "\\u003c" } else { script.append(c) }
+    for scalar in String(decoding: quoted.bytes, as: UTF8.self).unicodeScalars {
+        switch scalar {
+        case "<": script += "\\u003c"
+        case "\u{2028}": script += "\\u2028"
+        case "\u{2029}": script += "\\u2029"
+        default: script.unicodeScalars.append(scalar)
+        }
     }
     return """
     <!doctype html>

@@ -1,127 +1,190 @@
 //===----------------------------------------------------------------------===//
-// WebSockets: the engine side.
+// WebSocket handlers.
 //
-// A WebSocket is an HTTP/1.1 request that stops being HTTP. The request head
-// is parsed by the ordinary parser and routed like any other request, so
-// middleware and extractors run in front of it. The route's handler accepts
-// the upgrade (WebSocketAPI.swift), and from the moment the 101 goes out the
-// connection carries RFC 6455 frames instead, in its own state (`.websocket`)
-// rather than pretending to still be mid-response.
+//     app.webSocket("/echo") { (ws: WebSocket) async throws in
+//         for try await message in ws {
+//             try await ws.send(message)
+//         }
+//     }
 //
-// Frames are decoded as they arrive, whether or not the handler is reading:
-// a ping has to be answered and a pong seen on time, or a healthy peer that
-// the handler is merely busy with would be timed out. Data messages decoded
-// ahead of the handler queue on the connection's `WSChannel`, and once the
-// queue is full the socket is no longer read, which makes a slow handler TCP
-// backpressure rather than memory.
+// A WebSocket arrives as an HTTP/1.1 GET with `Upgrade: websocket`, and is a
+// route like any other until it is accepted: middleware runs in front of it
+// and extractors run before it, so a request refused by either is answered
+// with an ordinary status and never becomes a WebSocket. Once every extractor
+// has what it needs, the upgrade is answered 101, and the handler runs in a
+// task of its own for as long as the WebSocket lasts, while the connection's
+// task reads its frames (WebSocketSession.swift). When the handler returns,
+// a WebSocket it did not close is closed for it: 1000, or 1011 if it threw.
 //
-// Frames are decoded only once their whole payload is buffered. The message
-// size limit already bounds that, and whole-frame decoding removes a class of
-// resumption bug from the mask and validation state machine.
+// The handler sees whole messages. Fragments are joined, text is checked to
+// be UTF-8, pings are answered and the server's own keepalive pings sent,
+// whether or not the handler is reading. Messages the handler has not read
+// yet queue up to `--ws-max-queue` and `--ws-max-queue-bytes`; past that
+// the socket is not read, so a peer sending faster than the handler reads is
+// slowed by TCP rather than held in memory. A send waits while more than
+// `ServerConfig.writeHighWaterMark` is queued for a peer that reads slowly.
 //
-// The close handshake is RFC 6455's: a close is answered with a close, and
-// the connection ends once both have gone and what was queued is written. A
-// close the server sent first waits `--ws-ping-timeout` for the reply.
+// A WebSocket may be shared with child tasks: one receives while another
+// sends. One task at a time receives.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import AvianHTTP
+import GarudaWire
+import Synchronization
+import Vega
 
-/// Per-connection WebSocket framing state. Default-constructible, because
-/// connections live in a flat slab that is initialised in bulk.
-public struct WebSocketState {
-    /// The handshake has been answered with 101.
-    public var accepted = false
-    /// A close frame has gone out; nothing more may be sent.
-    public var closeSent = false
-    /// A close frame has come in.
-    public var closeReceived = false
-    /// When the close went out, for giving up on the reply.
-    public var closeSentAt: UInt64 = 0
-    /// The close code of a protocol violation that came in behind messages
-    /// the handler has not read yet, or 0. The violation is acted on once
-    /// they have been read, so replies to them go out before the close.
-    public var pendingFailure: UInt16 = 0
-    /// When the violation arrived, for not waiting on a handler forever.
-    public var pendingFailureAt: UInt64 = 0
-
-    /// Opcode of the message being assembled across continuation frames.
-    public var messageOpcode: UInt8 = 0
-    public var assembling = false
-    public var validator = UTF8Validator()
-    /// The message being assembled.
-    public var message = ByteBuffer()
-
-    /// When the outstanding keepalive ping was sent, or 0.
-    public var pingSentAt: UInt64 = 0
-    /// --ws-compress: what was agreed, or nil when nothing was.
-    public var deflate: WSDeflateAgreement? = nil
-    /// zlib contexts, made on first use rather than at the handshake: a
-    /// connection that never sends a compressed message never pays for one.
-    public var deflater: UnsafeMutableRawPointer? = nil
-    public var inflater: UnsafeMutableRawPointer? = nil
-    /// The message being assembled arrived compressed.
-    public var messageCompressed = false
-
-    /// What the handler reads from and waits on.
-    var channel: WSChannel? = nil
-
-    public init() {}
+/// One whole WebSocket message.
+public enum WebSocketMessage: Sendable, Equatable {
+    case text(String)
+    case binary([UInt8])
 }
 
-/// The part of a WebSocket its handler shares with the engine. A class,
-/// because the handler holds it past the connection: messages that arrived
-/// before a close are still read after the slot is gone.
-final class WSChannel {
-    var queue: [WebSocketMessage] = []
-    var queuedBytes = 0
-    /// The peer sent its close, or the connection ended. Nothing more will be
-    /// queued.
-    var ended = false
-    /// The connection's slot has been released. The engine can no longer be
-    /// asked for anything.
-    var gone = false
-    var closeCode: UInt16 = WSCloseCode.abnormal
-    var closeReason: [UInt8] = []
-    var receiveWaiter: UnsafeContinuation<Void, Never>? = nil
-    /// The senders waiting for the backlog to drain -- all of them, not the
-    /// first only: one let through because another was already waiting would
-    /// be free to queue frames for ever against a peer reading nothing.
-    var writeWaiters: [WebSocketWriteWaiter] = []
-    /// Timed waits (`WebSocket.sleep`) to end early when the connection goes.
-    var sleeps: [Int32] = []
+/// Why a WebSocket operation did not complete.
+public enum WebSocketError: Error, Equatable, Sendable {
+    /// The WebSocket has ended, or a close has been sent: nothing more can
+    /// be sent on it.
+    case closed
+    /// Another task is already waiting to receive. A WebSocket has one
+    /// reader at a time.
+    case busy
+}
 
-    var isWriteWaiting: Bool { !writeWaiters.isEmpty }
+/// The close codes a handler sends and reads most (RFC 6455 section 7.4.1).
+public enum WebSocketCloseCode {
+    public static let normal: UInt16 = 1000
+    public static let goingAway: UInt16 = 1001
+    public static let protocolError: UInt16 = 1002
+    public static let unsupportedData: UInt16 = 1003
+    /// Read only: the peer's close carried no code.
+    public static let noStatus: UInt16 = 1005
+    /// Read only: the connection ended without a close.
+    public static let abnormal: UInt16 = 1006
+    public static let invalidPayload: UInt16 = 1007
+    public static let policyViolation: UInt16 = 1008
+    public static let messageTooBig: UInt16 = 1009
+    public static let internalError: UInt16 = 1011
+}
 
-    /// Resumes every sender waiting for room. Each reads the backlog again
-    /// for itself and waits again if it is still above the mark.
-    func wakeWriters() {
-        let waiting = writeWaiters
-        guard !waiting.isEmpty else { return }
-        writeWaiters = []
-        for waiter in waiting { waiter.wake.take()?.resume() }
+/// A WebSocket, for as long as its handler runs.
+public final class WebSocket: Sendable {
+    let session: WebSocketSession
+    /// The subprotocol agreed in the handshake: the first of the route's
+    /// `subprotocols` that the client offered, or nil.
+    public let subprotocol: String?
+    /// The subprotocols the client offered, in its order.
+    public let offeredSubprotocols: [String]
+
+    init(session: WebSocketSession, subprotocol: String?, offeredSubprotocols: [String]) {
+        self.session = session
+        self.subprotocol = subprotocol
+        self.offeredSubprotocols = offeredSubprotocols
     }
 
-    func wakeAll() {
-        receiveWaiter.take()?.resume()
-        wakeWriters()
+    /// Whether nothing more can be sent: a close went out, or the connection
+    /// has ended.
+    public var isClosed: Bool { session.isClosed }
+
+    /// The code the peer closed with, 1005 when its close carried none, or
+    /// 1006 when the connection ended without one. Nil until the peer's side
+    /// has ended.
+    public var closeCode: UInt16? { session.peerClose?.code }
+
+    /// The reason the peer gave with its close, or empty.
+    public var closeReason: String { session.peerClose?.reason ?? "" }
+
+    /// Bytes sent and not yet taken by the peer. A send waits while this is
+    /// above `ServerConfig.writeHighWaterMark`.
+    public var queuedBytes: Int { session.channel.backlog }
+
+    /// The next message from the peer, waiting for one if none has arrived.
+    /// Nil once the peer has closed or the connection has ended, after every
+    /// message that arrived before that has been read.
+    public func receive() async throws -> WebSocketMessage? {
+        try await session.receive()
+    }
+
+    /// Sends a text message.
+    public func send(_ text: String) async throws {
+        var text = text
+        let queued = text.withUTF8 { session.send(.text, $0) }
+        try await session.settle(queued)
+    }
+
+    /// Sends a binary message.
+    public func send(_ bytes: [UInt8]) async throws {
+        let queued = bytes.withUnsafeBufferPointer { session.send(.binary, $0) }
+        try await session.settle(queued)
+    }
+
+    /// Sends a message as the kind it is.
+    public func send(_ message: WebSocketMessage) async throws {
+        switch message {
+        case .text(let text): try await send(text)
+        case .binary(let bytes): try await send(bytes)
+        }
+    }
+
+    /// Starts the close handshake with `code` and `reason`, which the peer
+    /// receives. Messages still arriving before the peer's close are read as
+    /// usual; `receive` returns nil once it comes. Closing twice does nothing.
+    ///
+    /// `code` must be one an endpoint may send: 1000 to 1003, 1007 to 1014,
+    /// or 3000 to 4999. The reason is cut to 123 bytes.
+    public func close(code: UInt16 = WebSocketCloseCode.normal, reason: String = "") {
+        precondition(WebSocketCodec.isSendableCloseCode(code), "\(code) is not a close code a server may send")
+        session.sendClose(code: code, reason: Array(reason.utf8))
+    }
+
+    /// Waits `milliseconds` between sends. Throws `closed` if the connection
+    /// ends first, at once rather than when the time is up.
+    public func sleep(milliseconds: UInt64) async throws {
+        try await sleep(for: .milliseconds(Int64(clamping: milliseconds)))
+    }
+
+    /// Waits `duration` between sends. Throws `closed` if the connection
+    /// ends first.
+    public func sleep(for duration: Duration) async throws {
+        if session.isOver { throw WebSocketError.closed }
+        do {
+            try await Runtime.sleep(for: duration)
+        } catch {
+            throw WebSocketError.closed
+        }
+        if session.isOver { throw WebSocketError.closed }
     }
 }
 
-/// One sender's place in the queue for room, so that a cancelled send takes
-/// its own continuation back and leaves everyone else's alone.
-///
-/// Unchecked on the same ground as `WSChannel`: it belongs to one worker,
-/// whose one thread is the only one that ever touches it.
-final class WebSocketWriteWaiter: @unchecked Sendable {
-    var wake: UnsafeContinuation<Void, Never>? = nil
+extension WebSocket: AsyncSequence {
+    public typealias Element = WebSocketMessage
+
+    public struct AsyncIterator: AsyncIteratorProtocol {
+        let socket: WebSocket
+        public mutating func next() async throws -> WebSocketMessage? {
+            try await socket.receive()
+        }
+    }
+
+    /// The messages from the peer, until it closes.
+    public func makeAsyncIterator() -> AsyncIterator {
+        AsyncIterator(socket: self)
+    }
 }
 
-/// RFC 6455 section 1.3.
-private let wsGUID: StaticString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+extension WebSocket {
+    /// Subscribes the WebSocket to `topics`, until it ends (Broadcast.swift).
+    /// With `after`, messages published since that one are delivered first.
+    public func subscribe(_ topics: Topic..., after: BroadcastID? = nil) throws(BroadcastError) -> Subscription {
+        try subscribe(topics, after: after)
+    }
 
-/// What the handshake asked for, read from the request head at dispatch.
+    public func subscribe(_ topics: [Topic], after: BroadcastID? = nil) throws(BroadcastError) -> Subscription {
+        let session = self.session
+        return try TopicBus.current().subscribe(topics, after: after) { !session.isGone }
+    }
+}
+
+// MARK: - The handshake
+
+/// What the handshake asked for, read from the request at dispatch.
 struct WebSocketOffer {
     enum Problem: Error {
         /// Not an upgrade at all: answered 426 with `Upgrade: websocket`.
@@ -130,671 +193,403 @@ struct WebSocketOffer {
         case version
         /// An upgrade missing what it needs: 400.
         case malformed
-        /// A request on an HTTP/2 or HTTP/3 stream that is not an extended
-        /// CONNECT for a WebSocket served here.
+        /// Over HTTP/2 or HTTP/3, a request that is not an extended CONNECT.
         case multiplexed
+        /// --no-websockets, or an extended CONNECT for another protocol:
+        /// 501.
+        case disabled
     }
 
-    /// Sec-WebSocket-Key: HTTP/1.1 only.
-    var key: ByteSpan?
+    var key: [UInt8]
     var subprotocols: [String]
-    var extensions: [ByteSpan]
-}
+    var extensions: [[UInt8]]
 
-extension Worker {
-
-    // MARK: - Handshake
-
-    /// Reads the WebSocket handshake from the request on `slot`.
-    mutating func websocketOffer(_ slot: Int) -> Result<WebSocketOffer, WebSocketOffer.Problem> {
-        let c = table[slot]
-        let stream = c.pointee.isStream
-        // On HTTP/2 and HTTP/3 a WebSocket is an extended CONNECT, and a plain
-        // GET to its route is not one.
-        if stream && !streamWebSocketAllowed(slot) { return .failure(.multiplexed) }
-        ensureHeaders(slot)
-        let head = c.pointee.head
-        let base = c.pointee.headBase()
-
-        var key: ByteSpan? = nil
+    /// The offer `request` makes, or what is wrong with it.
+    static func read(_ request: borrowing Request) -> Result<WebSocketOffer, Problem> {
+        let x = request.exchange
+        // Over HTTP/2 and HTTP/3 a WebSocket is an extended CONNECT (RFC
+        // 8441, RFC 9220).
+        var multiplexed = false, overHTTP3 = false
+        switch x.pointee.link {
+        case .http2: multiplexed = true
+        case .http3: multiplexed = true; overHTTP3 = true
+        default: break
+        }
+        if multiplexed {
+            switch x.pointee.connectProtocol {
+            case .none, .webtransport: return .failure(.multiplexed)
+            case .other: return .failure(.disabled)
+            case .websocket:
+                // HTTP/3 offers extended CONNECT for WebTransport whatever
+                // --websocket-protocols says.
+                if overHTTP3 && !x.pointee.websocketLimits.overHTTP3 { return .failure(.disabled) }
+                return readExtendedConnect(request)
+            }
+        }
+        guard x.pointee.canUpgrade else {
+            return .failure(x.pointee.websocketsRefused ? .disabled : .notUpgrade)
+        }
+        var key: [UInt8]? = nil
         var sawUpgrade = false
         var sawConnection = false
         var version = -1
         var subprotocols: [String] = []
-        var extensions: [ByteSpan] = []
-
-        var i = 0
-        while i < head.headerCount {
-            let h = headers[i]
-            i += 1
-            let np = base + Int(h.name.offset)
-            let vp = base + Int(h.value.offset)
-            let vLen = Int(h.value.length)
-            switch h.name.length {
-            case 7 where equalsLowercased(np, 7, "upgrade"):
-                sawUpgrade = sawUpgrade || containsTokenLowercased(vp, vLen, "websocket")
-            case 10 where equalsLowercased(np, 10, "connection"):
-                sawConnection = sawConnection || containsTokenLowercased(vp, vLen, "upgrade")
-            case 17 where equalsLowercased(np, 17, "sec-websocket-key"):
-                key = ByteSpan(vp, vLen)
-            case 21 where equalsLowercased(np, 21, "sec-websocket-version"):
-                version = parseDecimal(vp, vLen)
-            case 22 where equalsLowercased(np, 22, "sec-websocket-protocol"):
-                forEachListItem(vp, vLen) { p, n in
-                    subprotocols.append(String(decoding: UnsafeBufferPointer(start: p, count: n), as: UTF8.self))
+        var extensions: [[UInt8]] = []
+        request.forEachHeader { name, value in
+            switch name.count {
+            case 7 where lowercasedEquals(name, "upgrade"):
+                sawUpgrade = sawUpgrade || containsToken(value, "websocket")
+            case 10 where lowercasedEquals(name, "connection"):
+                sawConnection = sawConnection || containsToken(value, "upgrade")
+            case 17 where lowercasedEquals(name, "sec-websocket-key"):
+                key = value.withUnsafeBufferPointer { Array($0) }
+            case 21 where lowercasedEquals(name, "sec-websocket-version"):
+                version = value.withUnsafeBufferPointer { b in
+                    Int(String(decoding: b, as: UTF8.self).trimmingSpaces) ?? -1
                 }
-            case 24 where equalsLowercased(np, 24, "sec-websocket-extensions"):
-                extensions.append(ByteSpan(vp, vLen))
+            case 22 where lowercasedEquals(name, "sec-websocket-protocol"):
+                forEachItem(value) { subprotocols.append(String(decoding: $0, as: UTF8.self)) }
+            case 24 where lowercasedEquals(name, "sec-websocket-extensions"):
+                extensions.append(value.withUnsafeBufferPointer { Array($0) })
             default:
                 break
             }
         }
-        if stream {
-            // RFC 8441 section 5: no key and no Upgrade, since the stream is
-            // the tunnel; the version is still sent.
-            guard version == 13 else { return .failure(.version) }
-            return .success(WebSocketOffer(key: nil, subprotocols: subprotocols, extensions: extensions))
-        }
-        guard head.method == .get, sawUpgrade, sawConnection else { return .failure(.notUpgrade) }
-        guard head.httpMinor == 1 else { return .failure(.malformed) }
+        guard request.method == .get, sawUpgrade, sawConnection else { return .failure(.notUpgrade) }
+        guard request.version == (1, 1) else { return .failure(.malformed) }
         guard version == 13 else { return .failure(.version) }
         // A key is 16 random bytes in base64: 24 characters.
         guard let key, key.count == 24 else { return .failure(.malformed) }
-        _ = key
         return .success(WebSocketOffer(key: key, subprotocols: subprotocols, extensions: extensions))
     }
 
-    /// Answers the upgrade on `slot` with 101 and switches the connection to
-    /// frames. Nil, with nothing sent, when the request is no longer there to
-    /// accept.
-    mutating func acceptWebSocket(_ slot: Int, _ offer: WebSocketOffer,
-                                  subprotocol: String?) -> WSChannel? {
-        let c = table[slot]
-        if c.pointee.isStream { return acceptStreamWebSocket(slot, offer, subprotocol: subprotocol) }
-        guard c.pointee.state == .dispatching, !c.pointee.flags.contains(.responseStarted),
-              !c.pointee.flags.contains(.timedOut), let key = offer.key else { return nil }
-        // A deadline bounds a request, and this is no longer one.
-        disarmDeadline(slot)
-
-        c.pointee.ws = WebSocketState()
-        if config.wsCompress && !offer.extensions.isEmpty {
-            c.pointee.ws.deflate = WSDeflate.negotiate(offer.extensions)
-        }
-
-        dates.refresh()
-        var out = c.pointee.write
-        out.reserve(256)
-        out.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n")
-        out.write("Connection: Upgrade\r\nSec-WebSocket-Accept: ")
-        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 28) { accept in
-            computeAcceptKey(key, into: accept.baseAddress!)
-            out.write(UnsafePointer(accept.baseAddress!), 28)
-        }
-        out.writeCRLF()
-        if var subprotocol {
-            out.write("Sec-WebSocket-Protocol: ")
-            subprotocol.withUTF8 { if let p = $0.baseAddress, $0.count > 0 { out.write(p, $0.count) } }
-            out.writeCRLF()
-        }
-        if let agreement = c.pointee.ws.deflate {
-            out.write("Sec-WebSocket-Extensions: ")
-            agreement.writeResponse(into: &out)
-            out.writeCRLF()
-        }
-        // What middleware added -- a cookie, a request ID -- goes out with the
-        // 101, the only response a WebSocket has. The handshake's own headers
-        // are the server's.
-        forEachHeaderRecord(c.pointee.responseHeaders) { name, value in
-            if !HTTPResponseWriter.classify(name).isEmpty { return }
-            if name.count == 7 && equalsLowercased(name.base, 7, "upgrade") { return }
-            if name.count > 14 && equalsLowercased(name.base, 14, "sec-websocket-") { return }
-            _ = HTTPResponseWriter.writeHeader(&out, name: name, value: value)
-        }
-        HTTPResponseWriter.writeDate(&out, dates)
-        out.write("Server: garuda\r\n")
-        HTTPResponseWriter.endHead(&out)
-        c.pointee.write = out
-
-        let channel = WSChannel()
-        c.pointee.ws.channel = channel
-        c.pointee.ws.accepted = true
-        c.pointee.state = .websocket
-        c.pointee.flags.insert(.websocketMode)
-        c.pointee.flags.insert(.responseStarted)
-        // The connection either carries frames or ends.
-        c.pointee.flags.remove(.keepAlive)
-        c.pointee.lastActivity = av_monotonic_ms()
-        logAccess(slot, status: 101)
-        if !flush(slot) { return channel }
-        // Frames may now arrive, and a client that sent them straight after
-        // the handshake has them in the read buffer already.
-        pumpWebSocket(slot)
-        if table[slot].pointee.state == .websocket { updateWebSocketReadInterest(slot) }
-        return channel
-    }
-
-    /// The 28-character Sec-WebSocket-Accept value.
-    func computeAcceptKey(_ key: ByteSpan, into out: UnsafeMutablePointer<UInt8>) {
-        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 64) { scratch in
-            let p = scratch.baseAddress!
-            memcpy(p, key.base, 24)
-            memcpy(p + 24, wsGUID.utf8Start, 36)
-            withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 20) { digest in
-                av_sha1(p, 60, digest.baseAddress!)
-                _ = out.withMemoryRebound(to: CChar.self, capacity: 28) { o in
-                    av_base64(digest.baseAddress!, 20, o)
+    /// RFC 8441's handshake: the extended CONNECT itself stands for the
+    /// upgrade, and there is no key, so only the version, subprotocols and
+    /// extensions are read.
+    private static func readExtendedConnect(_ request: borrowing Request) -> Result<WebSocketOffer, Problem> {
+        var version = -1
+        var subprotocols: [String] = []
+        var extensions: [[UInt8]] = []
+        request.forEachHeader { name, value in
+            switch name.count {
+            case 21 where lowercasedEquals(name, "sec-websocket-version"):
+                version = value.withUnsafeBufferPointer { b in
+                    Int(String(decoding: b, as: UTF8.self).trimmingSpaces) ?? -1
                 }
-            }
-        }
-    }
-
-    // MARK: - Receiving
-
-    /// Whether the queue has taken as much as it should before the peer is
-    /// made to wait. One message is always let through, so a single large one
-    /// cannot deadlock against the byte budget.
-    func websocketQueueFull(_ slot: Int) -> Bool {
-        guard let channel = table[slot].pointee.ws.channel else { return false }
-        if channel.queue.count >= config.maxWebsocketQueue { return true }
-        return !channel.queue.isEmpty && channel.queuedBytes >= config.maxWebsocketQueueBytes
-    }
-
-    /// Decodes every buffered frame: control frames are answered now, and
-    /// complete data messages are queued for the handler.
-    mutating func pumpWebSocket(_ slot: Int) {
-        pumpWebSocketFrames(slot)
-        if table[slot].pointee.isStream && table[slot].pointee.state == .websocket {
-            releaseStreamWebSocketCredit(slot)
-        }
-    }
-
-    private mutating func pumpWebSocketFrames(_ slot: Int) {
-        let c = table[slot]
-        guard c.pointee.state == .websocket, c.pointee.ws.accepted else { return }
-        let limit = config.maxWebsocketMessageSize
-
-        while !c.pointee.ws.closeReceived {
-            if websocketQueueFull(slot) { break }
-            let available = c.pointee.read.readableBytes
-            if available == 0 { break }
-            let base = UnsafePointer(c.pointee.read.readPointer)
-
-            switch WebSocketCodec.parseHeader(base, available, maxPayload: limit,
-                                              allowRSV1: c.pointee.ws.deflate != nil) {
-            case .needMore:
-                updateWebSocketReadInterest(slot)
-                return
-            case .failure(let error):
-                failWebSocket(slot, code: error == .messageTooBig
-                              ? WSCloseCode.messageTooBig : WSCloseCode.protocolError)
-                return
-            case .header(let header):
-                // Every frame from a client is masked (RFC 6455 section 5.1).
-                // An unmasked one is a broken client, or an attempt to have an
-                // intermediary read the payload as something else.
-                guard header.masked else {
-                    failWebSocket(slot, code: WSCloseCode.protocolError)
-                    return
-                }
-                if available < header.totalLength {
-                    updateWebSocketReadInterest(slot)
-                    return
-                }
-                let payload = base + header.headerLength
-                if header.opcode.isControl {
-                    let length = header.totalLength
-                    if !handleControlFrame(slot, header, payload, header.payloadLength) { return }
-                    c.pointee.read.consume(length)
-                    continue
-                }
-                if !decodeDataFrame(slot, header, payload, header.payloadLength, limit) { return }
-            }
-        }
-        updateWebSocketReadInterest(slot)
-    }
-
-    /// Accumulates one data frame, queueing the message when it completes.
-    /// False once the connection has been failed.
-    private mutating func decodeDataFrame(_ slot: Int, _ header: WSFrameHeader,
-                                          _ payload: UnsafePointer<UInt8>, _ n: Int,
-                                          _ limit: Int) -> Bool {
-        let c = table[slot]
-        if header.opcode == .continuation {
-            guard c.pointee.ws.assembling else {
-                failWebSocket(slot, code: WSCloseCode.protocolError)
-                return false
-            }
-        } else {
-            // A new message while one is still in progress.
-            guard !c.pointee.ws.assembling else {
-                failWebSocket(slot, code: WSCloseCode.protocolError)
-                return false
-            }
-            c.pointee.ws.assembling = true
-            c.pointee.ws.messageOpcode = header.opcode.rawValue
-            c.pointee.ws.messageCompressed = header.rsv1
-            c.pointee.ws.validator = UTF8Validator()
-            c.pointee.ws.message.clear()
-        }
-
-        // For a compressed message this bounds the compressed bytes; what they
-        // inflate to is held to the same limit as they inflate.
-        if c.pointee.ws.message.readableBytes + n > limit {
-            failWebSocket(slot, code: WSCloseCode.messageTooBig)
-            return false
-        }
-        let isText = c.pointee.ws.messageOpcode == WSOpcode.text.rawValue
-        if n > 0 {
-            c.pointee.ws.message.reserve(n)
-            WebSocketCodec.unmask(c.pointee.ws.message.writePointer, payload, n, header.mask)
-            // Checked as it arrives, so an invalid message fails at the frame
-            // that makes it invalid. Compressed bytes are checked once inflated.
-            if isText && !c.pointee.ws.messageCompressed
-                && !c.pointee.ws.validator.feed(UnsafePointer(c.pointee.ws.message.writePointer), n) {
-                failWebSocket(slot, code: WSCloseCode.invalidPayload)
-                return false
-            }
-            c.pointee.ws.message.advanceWriter(n)
-        }
-        c.pointee.read.consume(header.totalLength)
-        if !header.fin { return true }
-        c.pointee.ws.assembling = false
-
-        if c.pointee.ws.messageCompressed {
-            var inflated = ByteBuffer()
-            defer { inflated.destroy() }
-            let status = inflateMessage(slot, into: &inflated, limit: limit)
-            if status != 0 {
-                failWebSocket(slot, code: status)
-                return false
-            }
-            if isText {
-                var validator = UTF8Validator()
-                let count = inflated.readableBytes
-                if count > 0 && (!validator.feed(UnsafePointer(inflated.readPointer), count)
-                                 || !validator.isComplete) {
-                    failWebSocket(slot, code: WSCloseCode.invalidPayload)
-                    return false
-                }
-            }
-            queueWebSocketMessage(slot, inflated, text: isText)
-        } else {
-            if isText && !c.pointee.ws.validator.isComplete {
-                failWebSocket(slot, code: WSCloseCode.invalidPayload)
-                return false
-            }
-            queueWebSocketMessage(slot, c.pointee.ws.message, text: isText)
-        }
-        c.pointee.ws.message.clear()
-        return true
-    }
-
-    private mutating func queueWebSocketMessage(_ slot: Int, _ payload: borrowing ByteBuffer, text: Bool) {
-        guard let channel = table[slot].pointee.ws.channel else { return }
-        let count = payload.readableBytes
-        let bytes = UnsafeBufferPointer(start: count > 0 ? UnsafePointer(payload.readPointer) : nil,
-                                        count: count)
-        channel.queue.append(text ? .text(String(decoding: bytes, as: UTF8.self)) : .binary(Array(bytes)))
-        channel.queuedBytes += count + 64
-        channel.receiveWaiter.take()?.resume()
-    }
-
-    /// Inflates the compressed message into `out`. 0, or the close code to
-    /// fail the connection with: 1009 when it inflates past the message limit
-    /// -- a few kilobytes of zeros can claim gigabytes -- 1007 when it is not
-    /// deflate at all, 1011 when there is no memory for zlib.
-    private mutating func inflateMessage(_ slot: Int, into out: inout ByteBuffer, limit: Int) -> UInt16 {
-        let c = table[slot]
-        guard let agreement = c.pointee.ws.deflate else { return WSCloseCode.protocolError }
-        if c.pointee.ws.inflater == nil {
-            c.pointee.ws.inflater = av_ws_inflate_new(agreement.inflateWindowBits)
-        }
-        guard let z = c.pointee.ws.inflater else { return WSCloseCode.internalError }
-
-        // The sender strips the empty block that ends a sync flush.
-        let tail: [UInt8] = [0x00, 0x00, 0xFF, 0xFF]
-        tail.withUnsafeBufferPointer { c.pointee.ws.message.write($0.baseAddress!, 4) }
-
-        var input = UnsafePointer(c.pointee.ws.message.readPointer)
-        var remaining = c.pointee.ws.message.readableBytes
-        var ended = false
-        while true {
-            if out.readableBytes > limit { return WSCloseCode.messageTooBig }
-            out.reserve(min(max(remaining * 4, 4096), 1 << 20))
-            let room = min(out.writableBytes, limit + 1 - out.readableBytes)
-            var consumed = 0
-            var produced = 0
-            let rc = av_ws_inflate_run(z, input, remaining, out.writePointer, room, &consumed, &produced)
-            input += consumed
-            remaining -= consumed
-            out.advanceWriter(produced)
-            if rc < 0 { return WSCloseCode.invalidPayload }
-            if out.readableBytes > limit { return WSCloseCode.messageTooBig }
-            if rc == 2 {
-                // The client ended its deflate stream; what follows is at most
-                // the tail put back above.
-                ended = true
-                break
-            }
-            if remaining == 0 && rc == 0 { break }
-            if consumed == 0 && produced == 0 && rc == 0 { return WSCloseCode.invalidPayload }
-        }
-        if ended || agreement.clientNoContextTakeover {
-            if av_ws_inflate_reset(z) != 0 { return WSCloseCode.internalError }
-        }
-        return 0
-    }
-
-    /// Reads while the queue has room, and writes while bytes are queued.
-    mutating func updateWebSocketReadInterest(_ slot: Int) {
-        let c = table[slot]
-        // A stream has no descriptor: flow control is its read interest.
-        guard c.pointee.state == .websocket, !c.pointee.isStream else { return }
-        var mask: PollMask = websocketQueueFull(slot) || c.pointee.ws.closeReceived ? [] : .read
-        if !c.pointee.write.isEmpty { mask.insert(.write) }
-        setInterest(slot, mask)
-    }
-
-    /// Ping, pong and close, answered without the handler. False once the
-    /// connection has been failed or closed.
-    private mutating func handleControlFrame(_ slot: Int, _ header: WSFrameHeader,
-                                             _ payload: UnsafePointer<UInt8>, _ n: Int) -> Bool {
-        let c = table[slot]
-        // At most 125 bytes, which the header parser has checked.
-        return withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 125) { scratch in
-            let p = scratch.baseAddress!
-            if n > 0 { WebSocketCodec.unmask(p, payload, n, header.mask) }
-            switch header.opcode {
-            case .ping:
-                if !c.pointee.ws.closeSent {
-                    WebSocketCodec.writeFrame(&c.pointee.write, opcode: .pong, fin: true,
-                                              payload: n > 0 ? UnsafePointer(p) : nil, length: n)
-                    if !flush(slot) { return false }
-                }
-            case .pong:
-                c.pointee.ws.pingSentAt = 0
-            case .close:
-                var code = WSCloseCode.noStatus
-                if n == 1 {
-                    failWebSocket(slot, code: WSCloseCode.protocolError)
-                    return false
-                }
-                if n >= 2 {
-                    code = UInt16(p[0]) << 8 | UInt16(p[1])
-                    // A close with a code no endpoint may send, or a reason that
-                    // is not UTF-8, is itself a protocol error.
-                    guard WebSocketCodec.isSendableCloseCode(code) else {
-                        failWebSocket(slot, code: WSCloseCode.protocolError)
-                        return false
-                    }
-                    var validator = UTF8Validator()
-                    if n > 2 && (!validator.feed(UnsafePointer(p + 2), n - 2) || !validator.isComplete) {
-                        failWebSocket(slot, code: WSCloseCode.invalidPayload)
-                        return false
-                    }
-                }
-                c.pointee.ws.closeReceived = true
-                if let channel = c.pointee.ws.channel {
-                    channel.closeCode = code
-                    channel.closeReason = n > 2 ? Array(UnsafeBufferPointer(start: UnsafePointer(p + 2), count: n - 2)) : []
-                    channel.ended = true
-                    channel.receiveWaiter.take()?.resume()
-                }
-                // Anything after a close is not part of the conversation.
-                c.pointee.read.clear()
-                // Answered with the same code, which ends the handshake; the
-                // connection goes once the answer is written. A close of ours
-                // that went first has had its answer now.
-                if c.pointee.ws.closeSent {
-                    closeWebSocketIfDone(slot)
-                } else {
-                    sendCloseFrame(slot, code: code == WSCloseCode.noStatus ? WSCloseCode.normal : code,
-                                   reason: nil, reasonLength: 0)
-                }
-                return false
+            case 22 where lowercasedEquals(name, "sec-websocket-protocol"):
+                forEachItem(value) { subprotocols.append(String(decoding: $0, as: UTF8.self)) }
+            case 24 where lowercasedEquals(name, "sec-websocket-extensions"):
+                extensions.append(value.withUnsafeBufferPointer { Array($0) })
             default:
                 break
             }
-            return true
         }
+        guard version == 13 else { return .failure(.version) }
+        return .success(WebSocketOffer(key: [], subprotocols: subprotocols, extensions: extensions))
     }
 
-    // MARK: - Sending
-
-    /// Frames one message from the handler. False when the connection can no
-    /// longer send: closed, or failed while compressing.
-    mutating func sendWebSocketMessage(_ slot: Int, opcode: WSOpcode,
-                                       _ p: UnsafePointer<UInt8>?, _ n: Int) -> Bool {
-        let c = table[slot]
-        guard c.pointee.state == .websocket, !c.pointee.ws.closeSent else { return false }
-        if let agreement = c.pointee.ws.deflate, let p, n >= WSDeflate.minimumMessage {
-            if c.pointee.ws.deflater == nil {
-                c.pointee.ws.deflater = av_ws_deflate_new(agreement.deflateWindowBits, WSDeflate.memoryLevel)
-            }
-            // Without a compressor the message goes out as it is: the extension
-            // lets any message be sent uncompressed.
-            if let z = c.pointee.ws.deflater {
-                var compressed = ByteBuffer()
-                defer { compressed.destroy() }
-                guard deflateMessage(z, p, n, into: &compressed) else {
-                    // The context is in an unknown state, and the client's copy
-                    // of it would no longer match anything sent after.
-                    failWebSocket(slot, code: WSCloseCode.internalError)
-                    return false
-                }
-                WebSocketCodec.writeFrame(&c.pointee.write, opcode: opcode, fin: true, rsv1: true,
-                                          payload: UnsafePointer(compressed.readPointer),
-                                          length: compressed.readableBytes)
-                if agreement.serverNoContextTakeover { _ = av_ws_deflate_reset(z) }
-                return flush(slot)
-            }
-        }
-        WebSocketCodec.writeFrame(&c.pointee.write, opcode: opcode, fin: true, payload: p, length: n)
-        return flush(slot)
-    }
-
-    /// One message, compressed with a sync flush and without the empty block
-    /// that ends it, which the receiver puts back.
-    private func deflateMessage(_ z: UnsafeMutableRawPointer, _ p: UnsafePointer<UInt8>, _ n: Int,
-                                into out: inout ByteBuffer) -> Bool {
-        var input = p
-        var remaining = n
-        while true {
-            out.reserve(max(1024, remaining / 2 + 64))
-            var consumed = 0
-            var produced = 0
-            let rc = av_ws_deflate_run(z, input, remaining, out.writePointer, out.writableBytes,
-                                       &consumed, &produced)
-            input += consumed
-            remaining -= consumed
-            out.advanceWriter(produced)
-            if rc < 0 { return false }
-            if rc == 0 && remaining == 0 { break }
-            if rc == 0 && consumed == 0 && produced == 0 { return false }
-        }
-        let length = out.readableBytes
-        guard length >= 4 else { return false }
-        let tail = out.readPointer + length - 4
-        guard tail[0] == 0x00, tail[1] == 0x00, tail[2] == 0xFF, tail[3] == 0xFF else { return false }
-        out.truncate(to: length - 4)
-        return true
-    }
-
-    /// What the connection has queued and the peer has not taken yet.
-    func websocketBacklog(_ slot: Int) -> Int {
-        // On HTTP/3 bytes go to the transport at once; what counts is what it
-        // holds unacknowledged.
-        streamBacklog(slot)
-    }
-
-    /// Ends the WebSocket's connection, or on HTTP/2 and HTTP/3 its stream:
-    /// cleanly once the closes are done, or abandoned.
-    mutating func endWebSocket(_ slot: Int, clean: Bool) {
-        if table[slot].pointee.isStream {
-            endStreamWebSocket(slot, clean: clean)
-        } else {
-            closeConnection(slot)
-        }
-    }
-
-    /// Queues a close frame. Once the peer's close has also come, the
-    /// connection ends when the write buffer drains.
-    mutating func sendCloseFrame(_ slot: Int, code: UInt16,
-                                 reason: UnsafePointer<UInt8>?, reasonLength: Int) {
-        let c = table[slot]
-        guard c.pointee.state == .websocket, !c.pointee.ws.closeSent else { return }
-        c.pointee.ws.closeSent = true
-        c.pointee.ws.closeSentAt = av_monotonic_ms()
-        WebSocketCodec.writeClose(&c.pointee.write, code: code, reason: reason, reasonLength: reasonLength)
-        // Writers waiting for room will never get to use it.
-        c.pointee.ws.channel?.wakeWriters()
-        if !flush(slot) { return }
-        closeWebSocketIfDone(slot)
-    }
-
-    /// Ends the connection once both closes have been exchanged and written,
-    /// or the peer has gone.
-    mutating func closeWebSocketIfDone(_ slot: Int) {
-        let c = table[slot]
-        guard c.pointee.state == .websocket, c.pointee.write.isEmpty else { return }
-        if (c.pointee.ws.closeSent && c.pointee.ws.closeReceived)
-            || c.pointee.flags.contains(.peerClosed) {
-            endWebSocket(slot, clean: true)
-        }
-    }
-
-    /// Ends the connection because the peer broke the protocol.
-    ///
-    /// Messages that arrived before the violation are still the handler's:
-    /// while any are unread, the close waits for them to be read, so that
-    /// what the handler answers them with goes out first, as it would have
-    /// had the frames arrived one at a time.
-    mutating func failWebSocket(_ slot: Int, code: UInt16) {
-        let c = table[slot]
-        // Nothing further from this peer can be trusted.
-        c.pointee.read.clear()
-        c.pointee.ws.closeReceived = true
-        if let channel = c.pointee.ws.channel, !channel.gone, !channel.queue.isEmpty,
-           c.pointee.state == .websocket, !c.pointee.ws.closeSent {
-            c.pointee.ws.pendingFailure = code
-            c.pointee.ws.pendingFailureAt = av_monotonic_ms()
-            if !c.pointee.isStream { setInterest(slot, c.pointee.write.isEmpty ? [] : .write) }
-            return
-        }
-        applyWebSocketFailure(slot, code: code)
-    }
-
-    /// Acts on a violation that was waiting for the handler to catch up.
-    mutating func applyPendingWebSocketFailure(_ slot: Int) {
-        let c = table[slot]
-        let code = c.pointee.ws.pendingFailure
-        guard code != 0, c.pointee.state == .websocket else { return }
-        c.pointee.ws.pendingFailure = 0
-        applyWebSocketFailure(slot, code: code)
-    }
-
-    private mutating func applyWebSocketFailure(_ slot: Int, code: UInt16) {
-        let c = table[slot]
-        if let channel = c.pointee.ws.channel, !channel.ended {
-            channel.closeCode = code
-            channel.ended = true
-            channel.receiveWaiter.take()?.resume()
-        }
-        if c.pointee.state == .websocket && !c.pointee.ws.closeSent {
-            sendCloseFrame(slot, code: code, reason: nil, reasonLength: 0)
-        } else {
-            closeWebSocketIfDone(slot)
-        }
-    }
-
-    // MARK: - Readiness and housekeeping
-
-    mutating func handleWebSocketReadable(_ slot: Int) {
-        // One whole frame has to fit, and a frame is bounded by the message
-        // limit plus its header. Reading further ahead would let a peer pin
-        // twice the configured limit per connection.
-        if !fill(slot, .read, limit: config.maxWebsocketMessageSize &+ 1024) { return }
-        let c = table[slot]
-        if c.pointee.state != .websocket { return }
-        pumpWebSocket(slot)
-        guard table[slot].pointee.state == .websocket else { return }
-        if c.pointee.flags.contains(.peerClosed) {
-            // The socket ended without a close frame: 1006, as RFC 6455 says
-            // to report it.
-            if let channel = c.pointee.ws.channel, !channel.ended {
-                channel.ended = true
-                channel.receiveWaiter.take()?.resume()
-            }
-            if c.pointee.write.isEmpty { closeConnection(slot) } else { c.pointee.ws.closeReceived = true }
-        }
-    }
-
-    /// Keepalive pings, dead-peer detection, and a close nobody answered.
-    mutating func sweepWebSocket(_ slot: Int, now: UInt64) {
-        let c = table[slot]
-        if c.pointee.ws.pendingFailure != 0 {
-            if now &- c.pointee.ws.pendingFailureAt > config.websocketPingTimeoutMs {
-                applyPendingWebSocketFailure(slot)
-            }
-            return
-        }
-        if c.pointee.ws.closeSent {
-            if now &- c.pointee.ws.closeSentAt > config.websocketPingTimeoutMs { endWebSocket(slot, clean: false) }
-            return
-        }
-        let interval = config.websocketPingIntervalMs
-        if interval == 0 { return }
-        if c.pointee.ws.pingSentAt != 0 {
-            // No pong came back: the peer is gone even if the socket has not
-            // noticed, which is what pings are for.
-            if now &- c.pointee.ws.pingSentAt > config.websocketPingTimeoutMs { endWebSocket(slot, clean: false) }
-            return
-        }
-        if now &- c.pointee.lastActivity < interval { return }
-        WebSocketCodec.writeFrame(&c.pointee.write, opcode: .ping, fin: true, payload: nil, length: 0)
-        c.pointee.ws.pingSentAt = now
-        _ = flush(slot)
-    }
-
-    /// Wakes a handler waiting to send once the backlog has fallen to the
-    /// write low-water mark.
-    mutating func resumeWebSocketWriter(_ slot: Int) {
-        let c = table[slot]
-        guard let channel = c.pointee.ws.channel, channel.isWriteWaiting,
-              streamBacklog(slot) <= config.writeLowWaterMark else { return }
-        channel.wakeWriters()
-    }
-
-    /// Releases everything a WebSocket holds. Called from `closeConnection`.
-    mutating func releaseWebSocket(_ slot: Int) {
-        let c = table[slot]
-        if let channel = c.pointee.ws.channel {
-            c.pointee.ws.channel = nil
-            channel.ended = true
-            channel.gone = true
-            channel.wakeAll()
-            for id in channel.sleeps { wakeTimed(id) }
-            channel.sleeps.removeAll()
-        }
-        if let z = c.pointee.ws.deflater { av_ws_deflate_free(z) }
-        if let z = c.pointee.ws.inflater { av_ws_inflate_free(z) }
-        c.pointee.ws.message.destroy()
-        c.pointee.ws = WebSocketState()
+    /// The 28-character Sec-WebSocket-Accept value.
+    func acceptValue() -> String {
+        let guid: [UInt8] = Array("258EAFA5-E914-47DA-95CA-C5AB0DC85B11".utf8)
+        return StandardBase64.encode(sha1(key + guid))
     }
 }
 
-/// Calls `body` with each comma-separated item of a header value, trimmed of
-/// spaces and tabs. Empty items are skipped.
-func forEachListItem(_ p: UnsafePointer<UInt8>, _ n: Int, _ body: (UnsafePointer<UInt8>, Int) -> Void) {
-    var start = 0
-    while start <= n {
-        var end = start
-        while end < n, p[end] != cComma { end += 1 }
-        var lo = start
-        var hi = end
-        while lo < hi, p[lo] == cSP || p[lo] == cHT { lo += 1 }
-        while hi > lo, p[hi - 1] == cSP || p[hi - 1] == cHT { hi -= 1 }
-        if hi > lo { body(p + lo, hi - lo) }
-        start = end + 1
+private func lowercasedEquals(_ span: Span<UInt8>, _ name: StaticString) -> Bool {
+    span.withUnsafeBufferPointer { b in
+        let n = name.utf8Start
+        for i in 0..<b.count where asciiLowercased(b[i]) != n[i] { return false }
+        return true
     }
+}
+
+private func asciiLowercased(_ c: UInt8) -> UInt8 {
+    c >= 0x41 && c <= 0x5A ? c | 0x20 : c
+}
+
+/// Calls `body` with each comma-separated item, trimmed of spaces and tabs;
+/// empty ones are skipped.
+private func forEachItem(_ value: Span<UInt8>, _ body: (UnsafeBufferPointer<UInt8>) -> Void) {
+    value.withUnsafeBufferPointer { b in
+        var start = 0
+        while start <= b.count {
+            var end = start
+            while end < b.count, b[end] != 0x2C { end += 1 }
+            var lo = start
+            var hi = end
+            while lo < hi, b[lo] == 0x20 || b[lo] == 0x09 { lo += 1 }
+            while hi > lo, b[hi - 1] == 0x20 || b[hi - 1] == 0x09 { hi -= 1 }
+            if hi > lo { body(UnsafeBufferPointer(rebasing: b[lo..<hi])) }
+            start = end + 1
+        }
+    }
+}
+
+private func containsToken(_ value: Span<UInt8>, _ token: String) -> Bool {
+    var found = false
+    forEachItem(value) { item in
+        if !found && item.count == token.utf8.count
+            && zip(item, token.utf8).allSatisfy({ asciiLowercased($0) == $1 }) { found = true }
+    }
+    return found
+}
+
+extension String {
+    var trimmingSpaces: Substring {
+        var s = self[...]
+        while s.first == " " || s.first == "\t" { s = s.dropFirst() }
+        while s.last == " " || s.last == "\t" { s = s.dropLast() }
+        return s
+    }
+}
+
+/// SHA-1, which the handshake's accept value is made with (RFC 6455 section
+/// 4.2.2) and nothing else here: it hashes 60 bytes per WebSocket.
+func sha1(_ message: [UInt8]) -> [UInt8] {
+    var h: (UInt32, UInt32, UInt32, UInt32, UInt32) = (0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0)
+    var data = message
+    let bits = UInt64(message.count) &* 8
+    data.append(0x80)
+    while data.count % 64 != 56 { data.append(0) }
+    for shift in stride(from: 56, through: 0, by: -8) { data.append(UInt8(truncatingIfNeeded: bits >> UInt64(shift))) }
+    var w = [UInt32](repeating: 0, count: 80)
+    for chunk in stride(from: 0, to: data.count, by: 64) {
+        for i in 0..<16 {
+            let b = chunk + i * 4
+            w[i] = UInt32(data[b]) << 24 | UInt32(data[b + 1]) << 16 | UInt32(data[b + 2]) << 8 | UInt32(data[b + 3])
+        }
+        for i in 16..<80 {
+            let v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]
+            w[i] = v << 1 | v >> 31
+        }
+        var (a, b, c, d, e) = h
+        for i in 0..<80 {
+            let f: UInt32, k: UInt32
+            switch i {
+            case 0..<20: f = (b & c) | (~b & d); k = 0x5A827999
+            case 20..<40: f = b ^ c ^ d; k = 0x6ED9EBA1
+            case 40..<60: f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC
+            default: f = b ^ c ^ d; k = 0xCA62C1D6
+            }
+            let t = (a << 5 | a >> 27) &+ f &+ e &+ k &+ w[i]
+            e = d
+            d = c
+            c = b << 30 | b >> 2
+            b = a
+            a = t
+        }
+        h = (h.0 &+ a, h.1 &+ b, h.2 &+ c, h.3 &+ d, h.4 &+ e)
+    }
+    var out: [UInt8] = []
+    for word in [h.0, h.1, h.2, h.3, h.4] {
+        out += [UInt8(word >> 24), UInt8(truncatingIfNeeded: word >> 16),
+                UInt8(truncatingIfNeeded: word >> 8), UInt8(truncatingIfNeeded: word)]
+    }
+    return out
+}
+
+// MARK: - Registration
+
+/// A handler taking extracted values, in a struct: a function with a
+/// parameter pack cannot be held as a generic value on its own.
+struct VariadicWebSocketHandler<each E>: @unchecked Sendable {
+    let call: @concurrent (WebSocket, repeat each E) async throws -> Void
+}
+
+/// Carries what a handler was given onto the task that runs it.
+struct CarriedHandler: @unchecked Sendable {
+    let run: @concurrent (WebSocket) async throws -> Void
+}
+
+extension RouteBuilder {
+    /// Serves WebSockets on `pattern`, with extractors. Every extractor runs
+    /// before the upgrade is accepted, so one that refuses the request
+    /// refuses the WebSocket with an ordinary status.
+    ///
+    ///     app.webSocket("/room/:id", subprotocols: ["chat.v2"]) {
+    ///         (ws: WebSocket, room: Path<Int>, user: Context<User>) async throws in … }
+    ///
+    /// `subprotocols` are the ones this route speaks, most preferred first;
+    /// the first one the client offered is agreed. A client that offered none
+    /// of them is still accepted, with `ws.subprotocol` nil.
+    ///
+    /// A request to the route that is not a WebSocket upgrade is answered 426
+    /// with `Upgrade: websocket`, and one asking for another version 426
+    /// with `Sec-WebSocket-Version: 13`.
+    @discardableResult
+    public func webSocket<each E: RequestExtractor>(
+        _ pattern: String,
+        subprotocols: [String] = [],
+        _ handler: sending @escaping @concurrent (WebSocket, repeat each E) async throws -> Void
+    ) -> OpenAPIOperation {
+        let handler = VariadicWebSocketHandler<repeat each E>(call: handler)
+        on(.get, pattern) { request, response in
+            let offer: WebSocketOffer
+            switch WebSocketOffer.read(request) {
+            case .success(let found):
+                offer = found
+            case .failure(let problem):
+                refuseWebSocket(problem, response)
+                return
+            }
+            var parameter = 0
+            let run = bindWebSocketHandler(handler,
+                                           repeat try await (each E).extract(from: request, parameter: &parameter))
+            let chosen = subprotocols.first { offer.subprotocols.contains($0) }
+            acceptWebSocket(request.exchange, offer, subprotocol: chosen, run: run)
+        }
+        var claims = 0
+        var states: [Any.Type] = []
+        repeat claims += pathClaims((each E).self)
+        repeat states += requiredState((each E).self)
+        noteRoute(.get, pattern, pathParameters: claims, states: states)
+        let operation = OpenAPIOperation(.get, pattern)
+        repeat operation.describeExtractor((each E).self)
+        operation.response(.switchingProtocols, "The connection becomes a WebSocket")
+        operation.response(HTTPStatus(426), "Not a WebSocket upgrade")
+        document(operation)
+        return operation
+    }
+}
+
+/// The handler with its extracted values applied. A closure rather than the
+/// values themselves, because the task that runs it cannot capture a
+/// parameter pack.
+func bindWebSocketHandler<each E>(_ handler: VariadicWebSocketHandler<repeat each E>,
+                                  _ values: repeat each E) -> CarriedHandler {
+    CarriedHandler { socket in try await handler.call(socket, repeat each values) }
+}
+
+func refuseWebSocket(_ problem: WebSocketOffer.Problem, _ response: borrowing Response) {
+    switch problem {
+    case .notUpgrade:
+        response.addHeader("upgrade", "websocket")
+        response.send(status: HTTPStatus(426), "this route speaks WebSocket\n")
+    case .version:
+        response.addHeader("sec-websocket-version", "13")
+        response.send(status: HTTPStatus(426), "WebSocket version 13 is the one spoken here\n")
+    case .malformed:
+        response.send(status: .badRequest, "the WebSocket handshake is incomplete\n")
+    case .multiplexed:
+        response.send(status: .badRequest, "a WebSocket over HTTP/2 or HTTP/3 starts with an extended CONNECT\n")
+    case .disabled:
+        response.send(status: HTTPStatus(501), "WebSockets are turned off\n")
+    }
+}
+
+/// Answers the upgrade: the 101 is written by the connection once the
+/// handler has returned, and the connection becomes the WebSocket's; over
+/// HTTP/2 and HTTP/3, the 200, and the stream becomes it.
+func acceptWebSocket(_ x: UnsafeMutablePointer<Exchange>, _ offer: WebSocketOffer, subprotocol: String?,
+                     run: CarriedHandler) {
+    let limits = x.pointee.websocketLimits
+    let deflate = limits.compress && !offer.extensions.isEmpty
+        ? offer.extensions.withSpans { WSDeflate.negotiate($0) } : nil
+    let response = Response(x)
+    let multiplexed: Bool
+    switch x.pointee.link {
+    case .http2, .http3: multiplexed = true
+    default: multiplexed = false
+    }
+    if !multiplexed {
+        response.addHeader("upgrade", "websocket")
+        response.addHeader("sec-websocket-accept", offer.acceptValue())
+    }
+    if let subprotocol { response.addHeader("sec-websocket-protocol", subprotocol) }
+    if let deflate {
+        var value = ByteBuffer()
+        defer { value.destroy() }
+        deflate.writeResponse(into: &value)
+        response.addHeader("sec-websocket-extensions", value.readableSpan.string)
+    }
+    // Over HTTP/2 and HTTP/3 a 200 opens the stream as the WebSocket's (RFC
+    // 8441, RFC 9220), its body the frames, which are not to be compressed
+    // twice.
+    x.pointee.status = multiplexed ? 200 : 101
+    if multiplexed { x.pointee.noCompress = true }
+    x.pointee.answered = true
+    x.pointee.touchedStream = true
+    x.pointee.upgrade = WebSocketUpgrade(run: run, subprotocol: subprotocol,
+                                         offered: offer.subprotocols, deflate: deflate, limits: limits)
+}
+
+extension Array where Element == [UInt8] {
+    /// The values as `ByteSpan`s, for as long as `body` runs.
+    func withSpans<R>(_ body: ([ByteSpan]) -> R) -> R {
+        var spans: [ByteSpan] = []
+        var pinned: [UnsafeMutableBufferPointer<UInt8>] = []
+        for value in self {
+            let copy = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: Swift.max(1, value.count))
+            _ = copy.initialize(from: value)
+            pinned.append(copy)
+            spans.append(ByteSpan(UnsafePointer(copy.baseAddress!), value.count))
+        }
+        defer { for p in pinned { p.deallocate() } }
+        return body(spans)
+    }
+}
+
+/// An accepted upgrade, on its way from the route to the connection.
+final class WebSocketUpgrade: @unchecked Sendable {
+    let run: CarriedHandler
+    let subprotocol: String?
+    let offered: [String]
+    let deflate: WSDeflateAgreement?
+    let limits: WebSocketLimits
+    /// What the client sent after the handshake: frames already.
+    var leftover: [UInt8] = []
+
+    init(run: CarriedHandler, subprotocol: String?, offered: [String], deflate: WSDeflateAgreement?,
+         limits: WebSocketLimits) {
+        self.run = run
+        self.subprotocol = subprotocol
+        self.offered = offered
+        self.deflate = deflate
+        self.limits = limits
+    }
+}
+
+/// --ws-*: what every WebSocket is held to.
+struct WebSocketLimits: Sendable {
+    var enabled: Bool
+    /// --websocket-protocols.
+    var protocols: WebSocketProtocols
+    var maxMessage: Int
+    var pingInterval: Duration
+    var pingTimeout: Duration
+    var maxQueue: Int
+    var maxQueueBytes: Int
+    var compress: Bool
+
+    /// ServerConfig's defaults.
+    init() {
+        enabled = true
+        protocols = .all
+        maxMessage = 16 * 1024 * 1024
+        pingInterval = .seconds(20)
+        pingTimeout = .seconds(20)
+        maxQueue = 32
+        maxQueueBytes = 4 * 1024 * 1024
+        compress = false
+    }
+
+    init(_ config: ServerConfig) {
+        enabled = config.websocketsEnabled
+        protocols = config.websocketProtocols
+        maxMessage = max(125, config.maxWebsocketMessageSize)
+        pingInterval = config.websocketPingInterval
+        pingTimeout = config.websocketPingTimeout
+        maxQueue = max(1, config.maxWebsocketQueue)
+        maxQueueBytes = max(1, config.maxWebsocketQueueBytes)
+        compress = config.websocketCompress
+    }
+}
+
+extension WebSocketLimits {
+    /// WebSockets are served over HTTP/1.1's upgrade.
+    var overHTTP1: Bool { enabled && protocols.contains(.http1) }
+    /// And over HTTP/2's extended CONNECT, which is then offered.
+    var overHTTP2: Bool { enabled && protocols.contains(.http2) }
+    /// And over HTTP/3's (RFC 9220).
+    var overHTTP3: Bool { enabled && protocols.contains(.http3) }
 }

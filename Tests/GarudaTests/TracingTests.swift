@@ -1,10 +1,9 @@
 import Testing
-import CAvian
-import AvianCore
-import AvianHTTP
-import Tracing
-import InMemoryTracing
 @testable import Garuda
+import GarudaTesting
+import InMemoryTracing
+import Tracing
+import VegaDBTracing
 
 // app.tracing: the spans a request, and what its handler does, leave behind.
 //
@@ -21,68 +20,20 @@ private func tracedApp(_ tracer: InMemoryTracer) -> Application {
     return app
 }
 
+extension InMemoryTracer {
+    /// The spans of the traces this test's requests began. Tests share a
+    /// process, and a shard's tracer is the process's: a pool another suite
+    /// made while this tracer was installed reports its round trips here, as
+    /// traces of their own.
+    var ownSpans: [FinishedInMemorySpan] {
+        let all = finishedSpans
+        let traces = Set(all.filter { $0.kind == .server }.map(\.traceID))
+        return all.filter { traces.contains($0.traceID) }
+    }
+}
+
 private func duration(_ span: FinishedInMemorySpan) -> UInt64 {
     span.endInstant.nanosecondsSinceEpoch - span.startInstant.nanosecondsSinceEpoch
-}
-
-nonisolated(unsafe) private var seenContext: String? = nil
-
-/// An origin that answers every request with a fixed response, and keeps
-/// each request's head to be looked at.
-private final class RecordingOrigin {
-    let fd: Int32
-    let port: UInt16
-    var response = Array("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".utf8)
-    private(set) var heads: [String] = []
-    private var open: [Int32] = []
-
-    init?() {
-        let opened = "127.0.0.1".withCString { av_listen_tcp($0, 0, 16, 0, 0) }
-        guard opened >= 0 else { return nil }
-        fd = opened
-        port = av_local_port(opened)
-    }
-
-    deinit {
-        for peer in open { _ = av_close(peer) }
-        _ = av_close(fd)
-    }
-
-    var url: String { "http://127.0.0.1:\(port)" }
-
-    func pump() {
-        var address = [CChar](repeating: 0, count: 64)
-        var peerPort: UInt16 = 0
-        let peer = av_accept(fd, &address, 64, &peerPort)
-        if peer >= 0 { open.append(peer) }
-        for peer in open {
-            var buffer = [UInt8](repeating: 0, count: 65536)
-            let got = buffer.withUnsafeMutableBytes { av_read(peer, $0.baseAddress, $0.count) }
-            guard got > 0 else { continue }
-            let head = String(decoding: buffer.prefix(got), as: UTF8.self)
-            guard head.contains("\r\n\r\n") else { continue }
-            heads.append(head.lowercased())
-            _ = response.withUnsafeBytes { av_write(peer, $0.baseAddress, $0.count) }
-        }
-    }
-}
-
-nonisolated(unsafe) private var callOutcome = ""
-
-/// Runs `GET /call` on `app` while the origin answers.
-private func call(_ app: Application, _ origin: RecordingOrigin, headers: String = "") throws -> String {
-    callOutcome = ""
-    let client = app.test
-    let wire = try TestWire(client)
-    wire.send("GET /call HTTP/1.1\r\nHost: test\r\n\(headers)\r\n")
-    _ = wire.turn(until: {
-        origin.pump()
-        return !callOutcome.isEmpty
-    }, turns: 40_000)
-    // The answer goes out after the outcome is set; the request's span ends
-    // with it.
-    _ = wire.receive()
-    return callOutcome
 }
 
 @Suite("Tracing", .serialized)
@@ -95,7 +46,7 @@ struct TracingTests {
         let response = try app.test.get("/users/42", headers: [("User-Agent", "probe/1")])
         #expect(response.status == 200)
 
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         let span = try #require(spans.first)
         #expect(spans.count == 1)
         #expect(span.operationName == "GET /users/:id")
@@ -111,12 +62,33 @@ struct TracingTests {
         #expect(span.status == nil)
     }
 
+    @Test func anHTTP2StreamIsASpanToo() throws {
+        let tracer = InMemoryTracer()
+        let app = tracedApp(tracer)
+        app.get("/users/:id") { request, response in
+            await Task.yield()
+            response.send("user \(request.parameter(0))")
+        }
+        let h2 = try app.test.http2()
+        #expect(try h2.get("/users/7").text == "user 7")
+        #expect(try h2.get("/users/8").text == "user 8")
+        let spans = tracer.ownSpans
+        #expect(spans.count == 2)
+        #expect(spans.allSatisfy { $0.operationName == "GET /users/:id" })
+        #expect(spans.allSatisfy { $0.attributes.get("network.protocol.version") == .string("2") })
+        let paths = spans.compactMap { span -> String? in
+            if case .string(let path)? = span.attributes.get("url.path") { return path }
+            return nil
+        }
+        #expect(paths.sorted() == ["/users/7", "/users/8"])
+    }
+
     @Test func aMissIsNamedForItsMethodAlone() throws {
         let tracer = InMemoryTracer()
         let app = tracedApp(tracer)
         app.get("/here") { _, response in response.send("here") }
         #expect(try app.test.get("/users/42").status == 404)
-        let span = try #require(tracer.finishedSpans.first)
+        let span = try #require(tracer.ownSpans.first)
         // Never the path: every path a scanner tries would be a name.
         #expect(span.operationName == "GET")
         #expect(span.attributes.get("http.route") == nil)
@@ -131,7 +103,7 @@ struct TracingTests {
         app.get("/") { _, response in response.send("ok") }
         _ = try app.test.get("/", headers: [(InMemoryTracer.traceIDKey, "trace-7"),
                                             (InMemoryTracer.spanIDKey, "caller-3")])
-        let span = try #require(tracer.finishedSpans.first)
+        let span = try #require(tracer.ownSpans.first)
         #expect(span.traceID == "trace-7")
         #expect(span.parentSpanID == "caller-3")
     }
@@ -140,12 +112,12 @@ struct TracingTests {
         let tracer = InMemoryTracer()
         let app = tracedApp(tracer)
         app.get("/boom") { _, _ in throw Boom() }
-        app.get("/forbidden") { _, _ in throw HTTPError.forbidden("no") }
+        app.get("/forbidden") { _, _ in throw HTTPError(.forbidden, "no") }
         let client = app.test
         #expect(try client.get("/boom").status == 500)
         #expect(try client.get("/forbidden").status == 403)
 
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         #expect(spans.count == 2)
         let boom = try #require(spans.first { $0.operationName == "GET /boom" })
         #expect(boom.status?.code == .error)
@@ -163,17 +135,17 @@ struct TracingTests {
         app.get("/sync") { _, response in
             tracer.withSpan("render") { _ in response.send("ok") }
         }
-        app.onAsync(.get, "/async") { _, response in
-            await loopYield()
-            try await response.sleep(milliseconds: 1)
-            await tracer.withSpan("load") { _ in await loopYield() }
+        app.get("/async") { _, response in
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(1))
+            await tracer.withSpan("load") { _ in await Task.yield() }
             response.send("ok")
         }
         let client = app.test
         _ = try client.get("/sync")
         _ = try client.get("/async")
 
-        let spans = tracer.finishedSpans
+        let spans = tracer.ownSpans
         for (child, parent) in [("render", "GET /sync"), ("load", "GET /async")] {
             let inner = try #require(spans.first { $0.operationName == child })
             let outer = try #require(spans.first { $0.operationName == parent })
@@ -185,14 +157,14 @@ struct TracingTests {
     @Test func theContextIsTheRequestsOwnOnATaskThatServedAnotherBefore() throws {
         let tracer = InMemoryTracer()
         let app = tracedApp(tracer)
-        app.onAsync(.get, "/who") { _, response in
-            await loopYield()
+        app.get("/who") { _, response in
+            await Task.yield()
             response.send(ServiceContext.current?.inMemorySpanContext?.spanID ?? "none")
         }
         let client = app.test
         let first = try client.get("/who").text
         let second = try client.get("/who").text
-        let ids = tracer.finishedSpans.map(\.spanID)
+        let ids = tracer.ownSpans.map(\.spanID)
         #expect(ids == [first, second])
         #expect(first != second)
     }
@@ -200,16 +172,16 @@ struct TracingTests {
     @Test func aStreamedResponsesSpanEndsWithItsBody() throws {
         let tracer = InMemoryTracer()
         let app = tracedApp(tracer)
-        app.onAsync(.get, "/lines") { _, response in
+        app.get("/lines") { _, response in
             let body = response.stream(contentType: "text/plain")
             try await body.write("one\n")
-            try await response.sleep(milliseconds: 30)
+            try await Task.sleep(for: .milliseconds(30))
             try await body.write("two\n")
         }
         let response = try app.test.get("/lines")
         #expect(response.text == "one\ntwo\n")
-        let span = try #require(tracer.finishedSpans.first)
-        #expect(tracer.finishedSpans.count == 1)
+        let span = try #require(tracer.ownSpans.first)
+        #expect(tracer.ownSpans.count == 1)
         #expect(span.operationName == "GET /lines")
         #expect(span.attributes.get("http.response.status_code") == .int64(200))
         // Not ended with the head, which went out before the wait.
@@ -219,130 +191,72 @@ struct TracingTests {
     @Test func aStreamThatFailsPartWayFailsItsSpan() throws {
         let tracer = InMemoryTracer()
         let app = tracedApp(tracer)
-        app.onAsync(.get, "/half") { _, response in
+        app.get("/half") { _, response in
             let body = response.stream(contentType: "text/plain")
             try await body.write("one\n")
             throw Boom()
         }
         _ = try? app.test.get("/half")
-        let span = try #require(tracer.finishedSpans.first)
+        let span = try #require(tracer.ownSpans.first)
         #expect(span.status?.code == .error)
         #expect(span.errors.count == 1)
     }
 
-    @Test func anOutboundCallIsAClientSpanThatCarriesTheTraceOn() throws {
-        guard let origin = RecordingOrigin() else { Issue.record("no socket"); return }
+    @Test func aDatabaseRoundTripIsAClientSpanUnderTheRequest() throws {
         let tracer = InMemoryTracer()
         let app = tracedApp(tracer)
-        let url = origin.url + "/upstream?token=secret&page=2"
-        app.onAsync(.get, "/call") { request, response in
-            do {
-                let answer = try await request.client.send(.get, url)
-                callOutcome = answer.text
-            } catch {
-                callOutcome = "\(error)"
+        app.get("/query") { _, response in
+            // As a vega-db client does with each statement.
+            let configured = DatabaseTracing.installed
+            if let span = configured?.start({
+                var operation = DatabaseOperation(system: "postgresql", name: "SELECT")
+                operation.operation = "SELECT"
+                operation.queryText = "select 1"
+                operation.serverAddress = "db"
+                operation.serverPort = 5432
+                return operation
+            }) {
+                span.end()
             }
-            response.send(callOutcome)
-        }
-        #expect(try call(app, origin) == "ok")
-
-        let spans = tracer.finishedSpans
-        let server = try #require(spans.first { $0.kind == .server })
-        let client = try #require(spans.first { $0.kind == .client })
-        #expect(client.operationName == "GET")
-        #expect(client.parentSpanID == server.spanID)
-        #expect(client.traceID == server.traceID)
-        #expect(client.attributes.get("http.request.method") == .string("GET"))
-        #expect(client.attributes.get("http.response.status_code") == .int64(200))
-        #expect(client.attributes.get("server.address") == .string("127.0.0.1"))
-        #expect(client.attributes.get("server.port") == .int64(Int64(origin.port)))
-        // The query's names are kept, its values -- a token, often -- not.
-        #expect(client.attributes.get("url.full")
-                == .string(origin.url + "/upstream?token=REDACTED&page=REDACTED"))
-
-        // The upstream is told which span called it.
-        let head = try #require(origin.heads.first)
-        #expect(head.contains("\(InMemoryTracer.traceIDKey): \(client.traceID)"))
-        #expect(head.contains("\(InMemoryTracer.spanIDKey): \(client.spanID)"))
-    }
-
-    @Test func aCallAnswered4xxOrThatFailsFailsItsSpan() throws {
-        guard let origin = RecordingOrigin() else { Issue.record("no socket"); return }
-        origin.response = Array("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".utf8)
-        let tracer = InMemoryTracer()
-        let app = tracedApp(tracer)
-        let url = origin.url + "/gone"
-        app.onAsync(.get, "/call") { request, response in
-            var client = request.client
-            client.timeoutMilliseconds = 2_000
-            let found = try await client.send(.get, url)
-            do {
-                // Nothing listens on port 1.
-                _ = try await client.send(.get, "http://127.0.0.1:1/")
-                callOutcome = "\(found.status) connected"
-            } catch {
-                callOutcome = "\(found.status) \((error as? ClientError)?.kind ?? "other")"
+            if let span = configured?.start({ DatabaseOperation(system: "redis", name: "GET") }) {
+                span.fail(DatabaseFailure(Boom(), type: "WRONGTYPE", statusCode: "WRONGTYPE"))
             }
-            response.send(callOutcome)
+            response.send(configured == nil ? "untraced" : "traced")
         }
-        #expect(try call(app, origin) == "404 connect")
-
-        let clients = tracer.finishedSpans.filter { $0.kind == .client }
-        #expect(clients.count == 2)
-        let gone = try #require(clients.first { $0.attributes.get("server.port") == .int64(Int64(origin.port)) })
-        #expect(gone.status?.code == .error)
-        #expect(gone.attributes.get("error.type") == .string("404"))
-        let refused = try #require(clients.first { $0.attributes.get("server.port") == .int64(1) })
-        #expect(refused.status?.code == .error)
-        #expect(refused.attributes.get("error.type") == .string("connect"))
-        #expect(refused.errors.count == 1)
-    }
-
-    @Test func aStreamedCallsSpanEndsWithItsBody() throws {
-        guard let origin = RecordingOrigin() else { Issue.record("no socket"); return }
-        let tracer = InMemoryTracer()
-        let app = tracedApp(tracer)
-        let url = origin.url + "/stream"
-        app.onAsync(.get, "/call") { request, response in
-            let upstream = try await request.client.stream(.get, url)
-            // Open while the body is still to be read.
-            let openBefore = tracer.activeSpans.filter { $0.kind == .client }.count
-            let body = try await upstream.collect()
-            let openAfter = tracer.activeSpans.filter { $0.kind == .client }.count
-            callOutcome = "\(String(decoding: body, as: UTF8.self)) \(openBefore) \(openAfter)"
-            response.send(callOutcome)
-        }
-        #expect(try call(app, origin) == "ok 1 0")
-        let client = try #require(tracer.finishedSpans.first { $0.kind == .client })
-        #expect(client.attributes.get("http.response.status_code") == .int64(200))
-        #expect(client.status == nil)
+        #expect(try app.test.get("/query").text == "traced")
+        let spans = tracer.ownSpans
+        let request = try #require(spans.first { $0.operationName == "GET /query" })
+        let select = try #require(spans.first { $0.operationName == "SELECT" })
+        let get = try #require(spans.first { $0.operationName == "GET" })
+        #expect(select.parentSpanID == request.spanID)
+        #expect(select.kind == .client)
+        #expect(select.attributes.get("db.system.name") == .string("postgresql"))
+        #expect(select.attributes.get("db.query.text") == .string("select 1"))
+        #expect(select.attributes.get("server.port") == .int64(5432))
+        #expect(select.status == nil)
+        #expect(get.parentSpanID == request.spanID)
+        #expect(get.status?.code == .error)
+        #expect(get.attributes.get("db.response.status_code") == .string("WRONGTYPE"))
+        #expect(get.attributes.get("error.type") == .string("WRONGTYPE"))
+        DatabaseTracing.installed = nil
     }
 
     @Test func withoutTracingNothingIsTraced() throws {
         let tracer = InMemoryTracer()
         let app = Application()
         app.get("/") { _, response in
+            tracer.withSpan("inner") { _ in }
             response.send(ServiceContext.current == nil ? "none" : "some")
         }
         #expect(try app.test.get("/").text == "none")
-        #expect(tracer.finishedSpans.isEmpty)
+        // The span started by hand is a root of its own; no request span.
+        #expect(tracer.finishedSpans.map(\.operationName) == ["inner"])
     }
-
-    // MARK: Pieces
 
     @Test func aURLLosesItsCredentialsAndQueryValues() {
-        #expect(redactedURL("https://user:pw@example.com/a?x=1&y=&z") == "https://example.com/a?x=REDACTED&y=REDACTED&z")
-        #expect(redactedURL("http://example.com:8080/a/b") == "http://example.com:8080/a/b")
-        #expect(redactedURL("http://example.com/a#part") == "http://example.com/a")
-        // An @ in the path is not a user.
-        #expect(redactedURL("http://example.com/users/@me") == "http://example.com/users/@me")
-    }
-
-    @Test func aStatementIsNamedForItsFirstWord() {
-        #expect(sqlOperation("select * from users") == "SELECT")
-        #expect(sqlOperation("  \n(SELECT 1)") == "SELECT")
-        #expect(sqlOperation("with recent as (select 1) select * from recent") == "WITH")
-        #expect(sqlOperation("-- a comment first\nselect 1") == nil)
-        #expect(sqlOperation("") == nil)
+        #expect(redactedURL("https://ana:secret@api.example/v1/x?token=abc&page=2#top")
+                == "https://api.example/v1/x?token=REDACTED&page=REDACTED")
+        #expect(redactedURL("http://h/p?flag&k=v") == "http://h/p?flag&k=REDACTED")
+        #expect(redactedURL("http://h/p") == "http://h/p")
     }
 }

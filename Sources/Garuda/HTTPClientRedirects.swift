@@ -2,7 +2,7 @@
 // What the HTTP client does around one exchange: follow the redirects its
 // policy allows, and decode the body the server compressed.
 //
-//     var client = request.client
+//     var client = HTTPClient()
 //     client.redirects = .sameOrigin()
 //     let answer = try await client.get("https://api.example.com/v1/report")
 //     answer.url   // where it ended up
@@ -16,8 +16,7 @@
 // one too many is `tooManyRedirects`.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
-import AvianHTTP
+import GarudaWire
 import Tracing
 
 /// Which redirects an `HTTPClient` follows.
@@ -173,16 +172,16 @@ extension HTTPClient {
     }
 
     /// The span of one call, with the trace it belongs to added to `headers`
-    /// for the server to continue. Nil when the worker does not trace.
+    /// for the server to continue. Nil when nothing traces.
     func startHTTPClientSpan(_ method: HTTPMethod, _ url: String,
-                             _ headers: inout [(String, String)]) -> (any Span)? {
-        guard let tracer = worker.pointee.tracer else { return nil }
-        let name = method.token.map { String(describing: $0) } ?? "HTTP"
-        let span = tracer.startSpan(name, ofKind: .client)
+                             _ headers: inout [(String, String)]) -> (any Tracing.Span)? {
+        guard let tracer = ShardTracer.current else { return nil }
+        let name = method.name
+        let span = tracer.startSpan(name, context: ServiceContext.current ?? .topLevel, ofKind: .client)
         if span.isRecording {
             let origin = ClientOrigin(url)
             span.updateAttributes { attributes in
-                attributes["http.request.method"] = name == "HTTP" ? "_OTHER" : name
+                attributes["http.request.method"] = name
                 attributes["url.full"] = redactedURL(url)
                 if let origin {
                     attributes["server.address"] = origin.host
@@ -232,10 +231,10 @@ extension HTTPClient {
     func decoded(_ response: ClientResponse) throws(ClientError) -> ClientResponse {
         guard decompress, !response.body.isEmpty,
               let coding = response.header("content-encoding"),
-              ContentDecoder.canDecode(coding) else { return response }
+              RequestDecoder.canDecode(coding) else { return response }
         let body: [UInt8]
         do {
-            body = try ContentDecoder.decode(response.body, contentEncoding: coding, limit: maxBodyBytes)
+            body = try RequestDecoder.decode(response.body, contentEncoding: coding, limit: maxBodyBytes)
         } catch {
             throw error == .tooLarge ? .bodyTooLarge : .undecodableBody
         }
@@ -245,10 +244,6 @@ extension HTTPClient {
         return ClientResponse(status: response.status, reason: response.reason, headers: headers,
                               body: body, reusedConnection: response.reusedConnection)
     }
-}
-
-private func named(_ name: String, _ lowercase: String) -> Bool {
-    name.utf8.count == lowercase.utf8.count && name.lowercased() == lowercase
 }
 
 /// `reference`, a Location value, made absolute against the http or https

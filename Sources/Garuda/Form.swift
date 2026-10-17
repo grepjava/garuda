@@ -7,12 +7,13 @@
 //
 //     app.post("/login") { (form: Form<Credentials>) in ... }
 //
+// The whole body has arrived before the handler is called, so this is a
+// parse over bytes the connection already holds.
+//
 // A body sent as something else is a 415 rather than a 400: the client sent a
 // kind of document this route does not take, which is not the same as sending
 // a malformed one.
 //===----------------------------------------------------------------------===//
-
-import AvianCore
 
 /// A `application/x-www-form-urlencoded` body, decoded into a type.
 public struct Form<Value: Decodable>: RequestExtractor {
@@ -23,7 +24,7 @@ public struct Form<Value: Decodable>: RequestExtractor {
     }
 
     public static func extract(from request: borrowing Request,
-                               parameter: inout Int) throws -> Self {
+                               parameter: inout Int) async throws -> Self {
         let contentType = request.header("content-type") ?? ""
         guard mediaType(of: contentType) == "application/x-www-form-urlencoded" else {
             throw FormError.wrongContentType(contentType)

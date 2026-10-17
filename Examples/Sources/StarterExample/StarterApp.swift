@@ -10,45 +10,42 @@
 // 1. `StarterConfiguration.fromEnvironment` reads and checks the environment
 //    before anything else. A bad environment fails here, with every problem
 //    listed, rather than on a request.
-// 2. `app.state` builds the pool, the keys and the issuer in each worker,
-//    after the fork. Nothing is shared between workers, so nothing is locked.
-// 3. `app.prepare` migrates the schema and hashes the timing password, before
-//    the worker accepts anything.
+// 2. `app.state` builds the pool, the keys, the issuer and the hash a login
+//    for an unknown email is checked against, in each shard as it starts.
+//    Nothing is shared between shards, and nothing in it changes once built,
+//    so the shard's threads share it without a lock.
+// 3. `app.onShardStart` migrates the schema and names the administrators,
+//    before the shard accepts anything.
 // 4. Middleware, then routes. What runs before a handler is registered before
 //    it; MIDDLEWARE.md has the order to add things in.
 //
 // What is a flag and what is an environment variable: the server's own
-// concerns (port, workers, TLS, body limits, rate limits) are flags, because
+// concerns (port, shards, TLS, body limits, rate limits) are flags, because
 // the server parses them and CONFIG.md documents them. The application's
 // concerns (database, signing key, sign-ups) are environment variables,
 // because a deployment sets them as secrets.
 //===----------------------------------------------------------------------===//
 
-import Garuda
+import GarudaPostgres
 
-/// The starter application. Every worker builds its own state from
+/// The starter application. Every shard builds its own state from
 /// `configuration`.
+///
+/// With no signing key, one is made up here, which serves one process. A
+/// server of several shards needs every shard to sign with the same key, so
+/// `starter serve` makes it before this, and hands it on in the environment.
 public func starterApp(_ given: StarterConfiguration) -> Application {
-    var configuration = given
-    if configuration.signingKeyPEM == nil {
-        // Development with no key given: one for this run, made here in the
-        // parent so every worker signs and checks with the same one. Tokens
-        // stop working when the process restarts, which is what a key nobody
-        // wrote down means. Production is refused a default by
-        // `fromEnvironment`.
-        configuration.signingKeyPEM = try? JWTKey.generate(.ES256, keyID: "access").privatePEM
-    }
-    let settled = configuration
+    let settled = given.withDevelopmentKey()
     let app = Application()
 
-    // One state value per worker, built after the fork.
-    app.state { _ in try Services(settled) } shutdown: { $0.close() }
+    // One state value per shard, built as it starts.
+    app.state { _ in try await Services.make(settled) } shutdown: { $0.close() }
 
-    // Before this worker serves: the schema, and the hash a login for an
-    // unknown email is checked against. Every worker runs it; the first to
-    // take the advisory lock migrates and the rest find nothing to do.
-    app.prepare { start in
-        try await start.state(Services.self).warmUp()
+    // Before this shard serves: the schema, and the administrators the
+    // deployment names. Every shard runs it; the first to take the advisory
+    // lock migrates and the rest find nothing to do.
+    app.onShardStart { start in
+        try await start.state(Services.self).prepare()
     }
 
     // What signs and checks access tokens, so `JWT<AccessClaims>` works in
@@ -58,9 +55,9 @@ public func starterApp(_ given: StarterConfiguration) -> Application {
     app.jwtVerifier { _ in try Services.keys(for: settled) }
 
     // Housekeeping: a refresh token whose family has ended is of no use to
-    // anyone. Hourly, in one worker, a minute after it starts so a deployment
+    // anyone. Hourly, in one shard, a minute after it starts so a deployment
     // is not spent on cleaning up.
-    app.every(3600, firstAfter: 60, onWorker: 0) { start in
+    app.every(.seconds(3600), firstAfter: .seconds(60), onShard: 0) { start in
         let store = PostgresRefreshTokenStore(try start.state(Services.self).pool)
         let removed = try await store.deleteExpired()
         if removed > 0 { AppLog.info("cleared expired refresh tokens", ["count": "\(removed)"]) }
@@ -69,13 +66,13 @@ public func starterApp(_ given: StarterConfiguration) -> Application {
     app.securityHeaders()
 
     // Liveness: no database, so it answers while the database is down and a
-    // supervisor does not restart a worker for something it cannot fix.
+    // supervisor does not restart a shard for something it cannot fix.
     app.get("/health") { "ok" }
-        .summary("Whether this worker is running")
+        .summary("Whether this shard is running")
         .tags("ops")
 
     // Readiness: takes a connection from the pool, so a load balancer stops
-    // sending traffic to a worker whose database has gone.
+    // sending traffic to a shard whose database has gone.
     app.get("/ready") { (services: State<Services>) async throws -> String in
         struct One: Decodable { let one: Int }
         guard try await services.value.pool.first(One.self, "select 1 as one")?.one == 1 else {
@@ -83,7 +80,7 @@ public func starterApp(_ given: StarterConfiguration) -> Application {
         }
         return "ready"
     }
-        .summary("Whether this worker can reach the database")
+        .summary("Whether this shard can reach the database")
         .tags("ops")
         .response(.serviceUnavailable, "The database did not answer")
 

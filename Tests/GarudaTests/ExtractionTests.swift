@@ -1,6 +1,6 @@
 import Testing
-import AvianCore
 @testable import Garuda
+import GarudaTesting
 
 private struct Person: Codable, Equatable {
     var id: Int
@@ -21,7 +21,7 @@ private struct Search: Codable, Equatable {
 
 private func extractingApp() -> Application {
     let app = Application()
-    app.get("/hello") {
+    app.get("/hello") { () in
         "hello"
     }
     app.get("/person/:id") { (id: Path<Int>) in
@@ -39,13 +39,13 @@ private func extractingApp() -> Application {
     app.get("/maybe/:id") { (id: Path<Int>) -> JSON<Person>? in
         id.value == 1 ? JSON(Person(id: 1, name: "Ada")) : nil
     }
-    app.get("/nothing") {
+    app.get("/nothing") { () in
         HTTPStatus.noContent
     }
-    app.get("/page") {
+    app.get("/page") { () in
         HTML("<h1>hi</h1>")
     }
-    app.get("/go") {
+    app.get("/go") { () in
         Redirect(to: "/hello")
     }
     app.get("/both/:id") { (id: Path<Int>, query: Query<Search>) in
@@ -58,7 +58,7 @@ private func extractingApp() -> Application {
     return app
 }
 
-@Suite("Typed extraction", .serialized)
+@Suite("Typed extraction")
 struct ExtractionTests {
     @Test func aHandlerWithNoInputsAnswersWithItsValue() throws {
         let client = extractingApp().test

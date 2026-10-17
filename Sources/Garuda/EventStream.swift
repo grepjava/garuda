@@ -7,7 +7,7 @@
 //             while events.isOpen {
 //                 tick += 1
 //                 try await events.send("\(tick)", event: "tick", id: "\(tick)")
-//                 try await events.sleep(milliseconds: 1000)
+//                 try await events.sleep(for: .seconds(1))
 //             }
 //         }
 //     }
@@ -20,25 +20,27 @@
 // own. The body is a `ResponseBodyWriter`'s, so backpressure, cancellation
 // and the protocol framing are the same as for any streamed response.
 //
-// A stream that goes quiet for `--sse-keep-alive` seconds is sent a comment
-// by the worker, whatever the handler is waiting on, so a proxy that closes
-// idle connections sees traffic and a client that has gone is noticed when the
-// write fails. Events are written whole, so a comment never lands inside one;
-// a handler writing to `body` directly should write whole events too.
+// A stream that goes quiet for `ServerConfig.eventKeepAlive` is sent a
+// comment, whatever the handler is waiting on, so a proxy that closes idle
+// connections sees traffic and a client that has gone is noticed when the
+// write fails. Events are written whole, so a comment never lands inside
+// one; a handler writing to `body` directly should write whole events too.
+//
+// The head goes at once -- a client's EventSource opens on it -- rather than
+// with the first event, which may be a long way off.
 //===----------------------------------------------------------------------===//
-
-import CAvian
-import AvianCore
 
 /// A comment line and the blank line that ends it: ignored by the client.
 private let eventKeepAliveComment: [UInt8] = [0x3A, 0x0A, 0x0A]
 
 /// The events of one `text/event-stream` response.
-public final class EventSink: @unchecked Sendable {
+public final class EventSink: Sendable {
     public let body: ResponseBodyWriter
 
-    init(_ body: ResponseBodyWriter) {
+    init(_ body: ResponseBodyWriter, keepAlive: Duration?) {
         self.body = body
+        let channel = body.channel
+        channel.keepAlive(every: keepAlive ?? channel.keepAliveDefault, comment: eventKeepAliveComment)
     }
 
     /// Whether events still reach the client.
@@ -51,15 +53,18 @@ public final class EventSink: @unchecked Sendable {
         try await body.write(EventSink.encode(data, event: event, id: id, retry: retry))
     }
 
-    /// A comment line, which the client ignores. Worth sending every so often
-    /// on a quiet stream, so proxies that close idle connections see traffic.
+    /// A comment line, which the client ignores.
     public func comment(_ text: String = "") async throws(HandlerWaitError) {
         var out = ""
         EventSink.eachLine(text) { out += ":" + ($0.isEmpty ? "" : " " + $0) + "\n" }
         try await body.write(out + "\n")
     }
 
-    /// Waits between events, as `ResponseBodyWriter.sleep` does.
+    /// Waits between events. Throws `cancelled` if the request ends first.
+    public func sleep(for duration: Duration) async throws(HandlerWaitError) {
+        try await body.sleep(for: duration)
+    }
+
     public func sleep(milliseconds: UInt64) async throws(HandlerWaitError) {
         try await body.sleep(milliseconds: milliseconds)
     }
@@ -80,9 +85,9 @@ public final class EventSink: @unchecked Sendable {
     /// Calls `body` with each line of `text`, split on CRLF, CR or LF, the
     /// three the format recognises. An empty string is one empty line.
     static func eachLine(_ text: String, _ body: (Substring) -> Void) {
-        var start = text.unicodeScalars.startIndex
-        var i = start
         let scalars = text.unicodeScalars
+        var start = scalars.startIndex
+        var i = start
         while i < scalars.endIndex {
             let c = scalars[i]
             if c == "\r" || c == "\n" {
@@ -112,20 +117,20 @@ public final class EventSink: @unchecked Sendable {
     }
 }
 
-/// A `text/event-stream` response, as a typed async handler's answer. The
-/// events are sent by `produce`, and the stream ends when it returns.
+/// A `text/event-stream` response, as a typed handler's answer. The events
+/// are sent by `produce`, and the stream ends when it returns.
 ///
 /// Sets `cache-control: no-cache` unless the handler set its own: an event
 /// stream held by a cache is one that never arrives.
 public struct EventStream: ResponseConvertible {
     public var status: HTTPStatus?
-    /// Seconds of quiet before a keep-alive comment: nil for
-    /// `--sse-keep-alive`, 0 for none.
-    public var keepAlive: Int?
-    let produce: (EventSink) async throws -> Void
+    /// Quiet before a keep-alive comment: nil for
+    /// `ServerConfig.eventKeepAlive`, zero for none.
+    public var keepAlive: Duration?
+    let produce: @Sendable (EventSink) async throws -> Void
 
-    public init(status: HTTPStatus? = nil, keepAlive: Int? = nil,
-                _ produce: sending @escaping (EventSink) async throws -> Void) {
+    public init(status: HTTPStatus? = nil, keepAlive: Duration? = nil,
+                _ produce: @escaping @Sendable (EventSink) async throws -> Void) {
         self.status = status
         self.keepAlive = keepAlive
         self.produce = produce
@@ -133,67 +138,43 @@ public struct EventStream: ResponseConvertible {
 
     public func write(to response: borrowing Response) throws {
         let produce = self.produce
-        if response.isActive && !response.worker.pointee.hasHeader(response.slot, "cache-control") {
+        let keepAlive = self.keepAlive
+        if !response.exchange.pointee.hasResponseHeader("cache-control") {
             response.addHeader("cache-control", "no-cache")
         }
-        response.startStream(status: status, contentType: "text/event-stream") { body in
-            try await produce(EventSink(body))
-        }
-        if response.isActive {
-            response.worker.pointee.armEventKeepAlive(response.slot, seconds: keepAlive)
-        }
+        try StreamingBody(status: status, contentType: "text/event-stream") { body in
+            let events = EventSink(body, keepAlive: keepAlive)
+            try await body.flush()
+            try await produce(events)
+        }.write(to: response)
     }
 }
 
 extension Response {
-    /// Starts a `text/event-stream` response from an async handler, and sends
-    /// its head now.
-    /// `keepAlive` is the seconds of quiet before a keep-alive comment: nil
-    /// for `--sse-keep-alive`, 0 for none.
-    public func eventStream(status: HTTPStatus? = nil, keepAlive: Int? = nil) -> EventSink {
-        if isActive && !worker.pointee.hasHeader(slot, "cache-control") {
+    /// Starts a `text/event-stream` response and sends its head.
+    /// `keepAlive` is the quiet before a keep-alive comment: nil for
+    /// `ServerConfig.eventKeepAlive`, zero for none.
+    public func eventStream(status: HTTPStatus? = nil, keepAlive: Duration? = nil) async -> EventSink {
+        if !exchange.pointee.isStreamingAlready && !exchange.pointee.hasResponseHeader("cache-control") {
             addHeader("cache-control", "no-cache")
         }
-        let sink = EventSink(stream(status: status, contentType: "text/event-stream"))
-        if isActive { worker.pointee.armEventKeepAlive(slot, seconds: keepAlive) }
-        return sink
+        let body = stream(status: status, contentType: "text/event-stream")
+        let events = EventSink(body, keepAlive: keepAlive)
+        try? await body.flush()
+        return events
     }
 }
 
-extension Worker {
-    /// Starts an event stream's keep-alive comments, once its head has gone.
-    mutating func armEventKeepAlive(_ slot: Int, seconds: Int?) {
-        let c = table[slot]
-        // A HEAD, or a response a hook answered in its place, has no body.
-        guard c.pointee.flags.contains(.streamingResponse) else { return }
-        let ms = seconds.map { UInt64(max(0, $0)) &* 1000 } ?? config.eventKeepAliveMs
-        c.pointee.eventKeepAliveMs = UInt32(min(ms, UInt64(UInt32.max)))
-        c.pointee.eventKeepAliveDue = av_monotonic_ms() &+ ms
-    }
-
-    /// Sends a quiet event stream its comment. Nothing is sent to one whose
-    /// client has stopped reading: a writer is already waiting on it, and the
-    /// request timeout deals with it.
-    mutating func sendEventKeepAlive(_ slot: Int) {
-        let c = table[slot]
-        guard c.pointee.state == .dispatching, c.pointee.flags.contains(.streamingResponse),
-              !c.pointee.flags.contains(.responseComplete) else {
-            c.pointee.eventKeepAliveMs = 0
-            return
-        }
-        c.pointee.eventKeepAliveDue = av_monotonic_ms() &+ UInt64(c.pointee.eventKeepAliveMs)
-        guard !hasWriterWaiting(slot) else { return }
-        _ = eventKeepAliveComment.withUnsafeBufferPointer { streamBody(slot, $0.baseAddress!, $0.count) }
-    }
-
-    /// Whether the handler has set a response header named `name`, which is
-    /// given in lowercase.
-    func hasHeader(_ slot: Int, _ name: StaticString) -> Bool {
+extension Exchange {
+    /// Whether the handler has set a response header `name`, given in
+    /// lowercase.
+    func hasResponseHeader(_ name: StaticString) -> Bool {
         var found = false
-        let count = name.utf8CodeUnitCount
-        forEachHeaderRecord(table[slot].pointee.responseHeaders) { key, _ in
-            if key.count == count && equalsLowercased(key.base, count, name) { found = true }
+        forEachResponseHeader { key, _ in
+            if !found && key.equals(name) { found = true }
         }
         return found
     }
+
+    var isStreamingAlready: Bool { channel != nil }
 }

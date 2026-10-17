@@ -1,37 +1,41 @@
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#elseif os(Windows)
+import ucrt
+#endif
+@_spi(Testing) import Garuda
+import GarudaTesting
+import Synchronization
 import Testing
-import CAvian
-@testable import Garuda
+import Vega
 
-// Offloaded routes: extracted on the worker, run on its blocking pool, and
-// answered back on the worker, which serves other requests meanwhile.
+// Offloaded routes: extracted on a worker, run on the blocking pool, and
+// answered back on a worker, which serves other requests meanwhile.
 
-/// A gate a pool thread waits at until the test opens it.
-private final class Gate: @unchecked Sendable {
-    let lock = av_mutex_new()!
-    let opened = av_cond_new()!
-    var open = false
-
-    deinit {
-        av_cond_free(opened)
-        av_mutex_free(lock)
-    }
+/// A gate pool threads wait at until the test opens it: blocking work, as an
+/// offloaded handler's is.
+private final class Gate: Sendable {
+    let isOpen = Atomic<Bool>(false)
+    /// Handlers that have reached the gate.
+    let waiting = Atomic<Int>(0)
+    /// Requests answered after waiting at it.
+    let answered = Atomic<Int>(0)
 
     func wait() {
-        av_mutex_lock(lock)
-        while !open { av_cond_wait(opened, lock) }
-        av_mutex_unlock(lock)
+        waiting.add(1, ordering: .sequentiallyConsistent)
+        while !isOpen.load(ordering: .acquiring) {
+            #if canImport(Glibc) || canImport(Darwin)
+            usleep(200)
+            #endif
+        }
     }
 
-    func release() {
-        av_mutex_lock(lock)
-        open = true
-        av_cond_broadcast(opened)
-        av_mutex_unlock(lock)
+    func open() {
+        isOpen.store(true, ordering: .releasing)
     }
 }
-
-/// Opened by the test to let `/held` finish.
-private let heldGate = Gate()
 
 private struct Order: Codable, Sendable {
     var item: String
@@ -47,117 +51,16 @@ private struct Receipt: Codable, Sendable {
     var onWorker: Bool
 }
 
-/// Whether the calling thread is a worker's.
-private func onAWorker() -> Bool { av_worker_current() != nil }
-
-/// A connection kept open, written to and read from by hand, so a test can
-/// leave one request outstanding while another is answered.
-private final class Wire {
-    let client: TestClient
-    let fd: Int32
-    let slot: Int
-    private let capacity = 16384
-    private let buffer: UnsafeMutablePointer<UInt8>
-    private var got = 0
-    private var closed = false
-
-    init(_ client: TestClient) throws {
-        self.client = client
-        let opened = try client.connect()
-        fd = opened.client
-        slot = opened.slot
-        buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
-    }
-
-    deinit {
-        close()
-        buffer.deallocate()
-    }
-
-    func close() {
-        guard !closed else { return }
-        closed = true
-        _ = av_close(fd)
-    }
-
-    func send(_ request: String) {
-        var request = request
-        request.withUTF8 { _ = av_write(fd, $0.baseAddress!, $0.count) }
-    }
-
-    /// Bytes waiting now, without turning the worker.
-    @discardableResult
-    func pending() -> Int {
-        while got < capacity {
-            let n = av_read(fd, buffer + got, capacity - got)
-            if n <= 0 { break }
-            got += n
-        }
-        return got
-    }
-
-    /// Turns until one whole response has arrived, then takes it out of the
-    /// buffer and returns its status.
-    func receiveStatus(turns: Int = 5_000) -> Int? {
-        for _ in 0..<turns {
-            client.turn()
-            pending()
-            guard let total = completeLength(), total == got else { continue }
-            let code = status()
-            got = 0
-            return code
-        }
-        return nil
-    }
-
-    private func status() -> Int? {
-        guard got > 12 else { return nil }
-        var i = 9
-        var code = 0
-        while i < got, buffer[i] >= 48, buffer[i] <= 57 {
-            code = code * 10 + Int(buffer[i] - 48)
-            i += 1
-        }
-        return code > 0 ? code : nil
-    }
-
-    /// The length of the response at the start of the buffer once all of it
-    /// is there. Every response here states a Content-Length.
-    private func completeLength() -> Int? {
-        var end = 0
-        while end + 3 < got {
-            if buffer[end] == 13 && buffer[end + 1] == 10
-                && buffer[end + 2] == 13 && buffer[end + 3] == 10 { break }
-            end += 1
-        }
-        guard end + 3 < got else { return nil }
-        let name: StaticString = "\r\ncontent-length: "
-        var i = 0
-        while i < end {
-            var matched = 0
-            while matched < name.utf8CodeUnitCount && i + matched < end
-                    && (buffer[i + matched] | (matched >= 2 ? 0x20 : 0)) == name.utf8Start[matched] {
-                matched += 1
-            }
-            if matched == name.utf8CodeUnitCount {
-                var length = 0
-                var d = i + matched
-                while d < end && buffer[d] >= 48 && buffer[d] <= 57 {
-                    length = length * 10 + Int(buffer[d] - 48)
-                    d += 1
-                }
-                let total = end + 4 + length
-                return total <= got ? total : nil
-            }
-            i += 1
-        }
-        return nil
-    }
+private struct Prices: Sendable {
+    let tea: Int
 }
 
-@Suite("Offloaded routes", .serialized)
+/// Whether the calling thread is one of a runtime's workers.
+private func onAWorker() -> Bool { Runtime.currentWorker != nil }
+
+@Suite("Offloaded routes")
 struct OffloadTests {
-    private func offloadApp() -> Application {
+    private func offloadApp(_ gate: Gate = Gate()) -> Application {
         let app = Application()
         app.offload.get("/sum/:n") { (n: Path<Int>) -> String in
             "\((1...n.value).reduce(0, +)) \(onAWorker() ? "worker" : "pool")"
@@ -168,17 +71,17 @@ struct OffloadTests {
         }
         app.offload.get("/refused") { () throws -> String in throw HTTPError.conflict("no") }
         app.offload.get("/held") { () -> String in
-            heldGate.wait()
+            gate.wait()
             return "held"
         }
         app.group("/api") {
             app.offload.get("/ping") { () -> Text in Text("pong") }
         }
-        app.get("/quick") { "quick" }
+        app.get("/quick") { () in "quick" }
         return app
     }
 
-    /// The handler runs on a pool thread, not the worker, and what it
+    /// The handler runs on a pool thread, not a worker, and what it
     /// returns is the response.
     @Test func anOffloadedHandlerRunsOffTheWorkerAndAnswers() throws {
         let client = offloadApp().test
@@ -203,17 +106,57 @@ struct OffloadTests {
         #expect(try offloadApp().test.get("/refused").status == 409)
     }
 
-    /// While an offloaded handler runs, its worker answers other requests.
-    @Test func theWorkerServesOthersWhileAnOffloadedHandlerRuns() throws {
-        let client = offloadApp().test
-        let held = try Wire(client)
-        held.send("GET /held HTTP/1.1\r\nHost: test\r\n\r\n")
-        for _ in 0..<10 { client.turn() }
-        let other = try Wire(client)
-        other.send("GET /quick HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(other.receiveStatus() == 200)
-        #expect(held.pending() == 0)
-        heldGate.release()
-        #expect(held.receiveStatus() == 200)
+    /// While offloaded handlers block -- more of them than the runtime has
+    /// workers -- the workers answer other requests.
+    @Test func theWorkersServeOthersWhileOffloadedHandlersBlock() async throws {
+        let gate = Gate()
+        let client = offloadApp(gate).test
+        // Every test's client shares one small runtime: with the whole suite
+        // running, the held requests can wait their turn for seconds.
+        client.timeout = .seconds(60)
+        let held = 3
+        try #require(held > 2, "more than the test client's workers")
+        let requests = (0..<held).map { _ in
+            Task.detached { () async throws -> HTTPStatus in
+                let response = try await Runtime.blocking { try client.get("/held") }
+                gate.answered.add(1, ordering: .sequentiallyConsistent)
+                return response.status
+            }
+        }
+        // Every held handler has a pool thread and is blocked on it.
+        let clock = ContinuousClock()
+        let giveUp = clock.now + .seconds(30)
+        while gate.waiting.load(ordering: .sequentiallyConsistent) < held && clock.now < giveUp {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(gate.waiting.load(ordering: .sequentiallyConsistent) == held)
+
+        let quick = try await Runtime.blocking { try client.get("/quick") }
+        #expect(quick.text == "quick")
+        #expect(gate.answered.load(ordering: .sequentiallyConsistent) == 0)
+
+        gate.open()
+        for request in requests { #expect(try await request.value == 200) }
+    }
+
+    /// An offloaded route is a typed route to everything but where its
+    /// handler runs: its path parameters and the state it takes are checked
+    /// before serving, and state built for the shard can be taken.
+    @Test func anOffloadedRouteIsCheckedAndTakesState() throws {
+        let app = Application()
+        app.state { _ in Prices(tea: 3) }
+        app.offload.get("/price/:item") { (item: Path<String>, prices: State<Prices>) -> String in
+            "\(item.value) \(prices.value.tea)"
+        }
+        #expect(app.problems().isEmpty, "\(app.problems())")
+        #expect(try app.test.get("/price/tea").text == "tea 3")
+
+        let wrong = Application()
+        wrong.offload.get("/wrong/:id") { (id: Path<Int>, extra: Path<Int>) -> String in "x" }
+        wrong.offload.get("/unbuilt") { (prices: State<Prices>) -> String in "x" }
+        #expect(wrong.problems() == [
+            "GET /wrong/:id takes 2 Path parameters, and its pattern has 1",
+            "GET /unbuilt asks for State<Prices>, and no app.state builds it",
+        ])
     }
 }

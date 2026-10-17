@@ -2,20 +2,35 @@
 // Answers with a type: JSON, text, HTML, bytes, a redirect.
 //
 // Each sets the content type the kind implies, unless the handler set one of
-// its own, and then goes through the same response sink as everything else.
-// JSON is encoded into a buffer the worker keeps and reuses, so answering a
-// request costs no allocation for the buffer after the first.
+// its own. JSON is encoded with a writer the connection keeps and reuses, so
+// answering a request costs no allocation for it after the first.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
+import GarudaWire
 
 extension Response {
     /// Answers with `value` as JSON, and `content-type: application/json`.
     /// Throws what the coder throws: a value that cannot be written, such as
     /// an infinite Double, is the handler's mistake and becomes a 500.
     public func send<T: Encodable>(status: HTTPStatus? = nil, json value: T) throws {
-        guard isActive else { return }
-        try worker.pointee.respond(slot, status: (status ?? self.status).code, json: value)
+        let x = exchange
+        guard !x.pointee.answered else { return }
+        let code = (status ?? self.status).code
+        let writer: JSONWriter
+        if let kept = x.pointee.jsonWriter {
+            writer = kept
+        } else {
+            writer = JSONWriter()
+            x.pointee.jsonWriter = writer
+        }
+        // Encoded before anything is added to the answer, so a value that
+        // cannot be written leaves no JSON content type on the error.
+        try JSONCoder.encode(value, with: writer) { bytes, count in
+            if !x.pointee.hasContentType {
+                _ = x.pointee.addContentType("application/json")
+            }
+            x.pointee.answer(code, bytes, count)
+        }
     }
 
     /// Answers with `body` as `text/plain; charset=utf-8`.
@@ -53,69 +68,24 @@ extension Response {
     /// The content type this kind of answer implies, unless the handler has
     /// already said what it is sending.
     private func setContentTypeIfUnset(_ value: StaticString) {
-        guard !worker.pointee.hasContentType(slot) else { return }
-        addHeader("content-type", value)
-    }
-}
-
-extension Worker {
-    /// Whether the handler has set a content type of its own.
-    ///
-    /// `mutating` though it changes nothing: called from a mutating method,
-    /// a non-mutating one is handed `self` by value, and a `Worker` is large
-    /// enough that the copy -- every field, and a retain of each reference
-    /// in it -- showed in the profile of every JSON answer.
-    mutating func hasContentType(_ slot: Int) -> Bool {
-        var found = false
-        forEachHeaderRecord(table[slot].pointee.responseHeaders) { name, _ in
-            if name.count == 12 && equalsLowercased(name.base, 12, "content-type") { found = true }
-        }
-        return found
-    }
-
-    /// Encodes `value` into the worker's own buffer and answers with it.
-    mutating func respond(_ slot: Int, status: Int, json value: some Encodable) throws {
-        // The worker's own writer, kept between answers. An Encodable that
-        // somehow answers another request while this one is mid-document
-        // gets a writer of its own rather than a share of this one.
-        let reuse = !jsonWriterBusy
-        let writer = reuse ? (jsonWriter ?? JSONWriter()) : JSONWriter()
-        if reuse {
-            jsonWriter = writer
-            jsonWriterBusy = true
-        }
-        defer {
-            if reuse { jsonWriterBusy = false } else { writer.destroy() }
-        }
-        // Encoded before anything is added to the answer, so a value that
-        // cannot be written leaves no JSON content type on the error.
-        try JSONCoder.encode(value, with: writer) { bytes, count in
-            if !hasContentType(slot) {
-                let name: StaticString = "content-type"
-                let type: StaticString = "application/json"
-                _ = addResponseHeader(slot, ByteSpan(name.utf8Start, name.utf8CodeUnitCount),
-                                      ByteSpan(type.utf8Start, type.utf8CodeUnitCount))
-            }
-            respond(slot, status: status, bytes, count)
-        }
+        guard !exchange.pointee.hasContentType else { return }
+        _ = exchange.pointee.addContentType(value)
     }
 
     /// Answers a `ResponseError` with its status, and `{"error":"..."}` when
     /// it says why -- with `"fields"` as well when it knows which fields are
     /// at fault.
-    mutating func respondError(_ slot: Int, status: HTTPStatus, reason: String?,
-                               fields: [ValidationProblem] = []) {
+    func sendError(status: HTTPStatus, reason: String?, fields: [ValidationProblem] = []) {
         guard let reason else {
-            respond(slot, status: status.code, nil, 0)
+            send(status: status)
             return
         }
         // Through the coder, so that a reason holding a quote or a newline is
         // still one JSON string.
         do {
-            try respond(slot, status: status.code,
-                        json: ErrorBody(error: reason, fields: fields.isEmpty ? nil : fields))
+            try send(status: status, json: ErrorBody(error: reason, fields: fields.isEmpty ? nil : fields))
         } catch {
-            respond(slot, status: status.code, nil, 0)
+            send(status: status)
         }
     }
 }

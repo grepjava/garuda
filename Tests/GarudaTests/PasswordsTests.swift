@@ -1,8 +1,8 @@
-import Testing
-import GarudaPostgres
 @testable import Garuda
+import GarudaTesting
+import Testing
 
-// Password hashes, session tokens, and state reached from middleware.
+// Password hashes and session tokens.
 
 @Suite("Passwords and tokens")
 struct PasswordsTests {
@@ -58,6 +58,15 @@ struct PasswordsTests {
         #expect(try await Passwords.verify("pw", against: good))
     }
 
+    @Test func aHashMadeElsewhereVerifies() async throws {
+        // The format is Garuda 1's, so a user table from it carries over: "pw"
+        // with the salt "saltsaltsaltsalt", 1,000 iterations, made by Python's
+        // hashlib.pbkdf2_hmac.
+        let stored = "$pbkdf2-sha256$i=1000$c2FsdHNhbHRzYWx0c2FsdA$T7epWfxBHiKQQGlNJ3+9CM17dQuKVeWu++anuIAf6vg"
+        #expect(try await Passwords.verify("pw", against: stored))
+        #expect(try await !Passwords.verify("pW", against: stored))
+    }
+
     @Test func tokensAreRandomAndURLSafe() {
         let a = Tokens.random(), b = Tokens.random()
         #expect(a != b)
@@ -72,67 +81,12 @@ struct PasswordsTests {
         #expect(Tokens.digest("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
     }
 
-    @Test func hashingRunsOffTheWorker() throws {
+    @Test func hashingRunsOffTheWorkers() throws {
         let app = Application()
         app.get("/hash") { () async throws -> String in
             let stored = try await Passwords.hash("pw", iterations: 1_000)
             return try await Passwords.verify("pw", against: stored) ? "verified" : "refused"
         }
         #expect(try app.test.get("/hash").text == "verified")
-    }
-}
-
-@Suite("State from middleware")
-struct StateFromMiddlewareTests {
-    final class Sessions: @unchecked Sendable {
-        let tokens: [String: String]
-        init(_ tokens: [String: String]) { self.tokens = tokens }
-    }
-
-    enum Who: RequestContextKey { typealias Value = String }
-
-    @Test func authenticateHandsTheWorkersStateToItsCheck() throws {
-        let app = Application()
-        app.state { _ in Sessions(["t0k3n": "ada"]) }
-        app.group("/api") {
-            app.authenticate(bearer: Who.self, state: Sessions.self) { token, sessions in
-                sessions.tokens[token]
-            }
-            app.get("/me") { (who: Context<Who>) in who.value }
-        }
-        app.group("/admin") {
-            app.authenticate(basic: Who.self, realm: "admin", state: Sessions.self) { user, password, sessions in
-                sessions.tokens[password] == user ? user : nil
-            }
-            app.get("/") { (who: Context<Who>) in "admin \(who.value)" }
-        }
-        let client = app.test
-        #expect(try client.get("/api/me", headers: [("authorization", "Bearer t0k3n")]).text == "ada")
-        #expect(try client.get("/api/me", headers: [("authorization", "Bearer other")]).status == .unauthorized)
-        let missing = try client.get("/api/me")
-        #expect(missing.status == .unauthorized)
-        #expect(missing.header("www-authenticate") == "Bearer")
-        let basic = "Basic " + Base64.encode(Array("ada:t0k3n".utf8))
-        #expect(try client.get("/admin", headers: [("authorization", basic)]).text == "admin ada")
-        #expect(try client.get("/admin").header("www-authenticate")?.hasPrefix("Basic realm=\"admin\"") == true)
-    }
-
-    @Test func middlewareReadsStateAndAMissingOneIsAServerFault() throws {
-        let app = Application()
-        app.state { _ in Sessions(["x": "y"]) }
-        app.use { request, _ in
-            let sessions = try request.state(Sessions.self)
-            return sessions.tokens.count == 1 ? nil : HTTPStatus.serviceUnavailable
-        }
-        app.get("/ok") { () in "ok" }
-        #expect(try app.test.get("/ok").text == "ok")
-
-        let bare = Application()
-        bare.use { request, _ in
-            _ = try request.state(Sessions.self)
-            return nil
-        }
-        bare.get("/ok") { () in "ok" }
-        #expect(try bare.test.get("/ok").status == .internalServerError)
     }
 }

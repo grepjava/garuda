@@ -1,7 +1,7 @@
 import Testing
-import CAvian
-import AvianCore
+import Vega
 @testable import Garuda
+import GarudaTesting
 
 private struct HandlerFailure: Error {}
 
@@ -27,17 +27,9 @@ private func sample() -> Application {
         throw HandlerFailure()
     }
     app.get("/later/:ms") { request, response in
-        let ms = UInt64(request.withParameter(0) { $0.integer } ?? 1)
-        response.after(milliseconds: ms) { _, response in
-            response.send(status: 202, "late")
-        }
-    }
-    app.get("/request-id") { request, response in
-        if let id = request.requestID {
-            response.send(id)
-        } else {
-            response.send(status: 200)
-        }
+        let ms = request.withParameter(0) { $0.integer } ?? 1
+        try await Runtime.sleep(for: .milliseconds(ms))
+        response.send(status: 202, "late")
     }
     app.get("/copies/:id") { request, response in
         // Owned copies, kept past the closures that could have lent them.
@@ -49,17 +41,14 @@ private func sample() -> Application {
     app.get("/context/:n") { request, response in
         let before = request[context: Remembered.self]
         request[context: Remembered.self] = request.withParameter(0) { $0.integer }
-        response.after(milliseconds: 1) { request, response in
-            let after = request[context: Remembered.self]
-            response.send("before=\(before.map(String.init) ?? "none") after=\(after.map(String.init) ?? "none")")
-        }
+        try await Runtime.sleep(for: .milliseconds(1))
+        let after = request[context: Remembered.self]
+        response.send("before=\(before.map(String.init) ?? "none") after=\(after.map(String.init) ?? "none")")
     }
     return app
 }
 
-/// Serialized: each test client turns a worker on the test's own thread, and
-/// the engine keeps its current worker in one process-wide slot.
-@Suite("Application and its test client", .serialized)
+@Suite("Application and its test client")
 struct ApplicationTests {
     @Test func routesAnswerThroughTheEngine() throws {
         let client = sample().test
@@ -141,11 +130,12 @@ struct ApplicationTests {
 
     @Test func aHandlerCanWaitOnATimer() throws {
         let client = sample().test
-        let started = av_monotonic_ms()
+        let clock = ContinuousClock()
+        let started = clock.now
         let response = try client.get("/later/30")
         #expect(response.status == 202)
         #expect(response.text == "late")
-        #expect(av_monotonic_ms() - started >= 25)
+        #expect(clock.now - started >= .milliseconds(25))
     }
 
     @Test func oneClientServesRequestAfterRequest() throws {
@@ -159,23 +149,11 @@ struct ApplicationTests {
     @Test func contextCrossesAWaitButNotARequest() throws {
         let client = sample().test
         #expect(try client.get("/context/7").text == "before=none after=7")
-        // The next request most likely takes the same slot; it starts empty.
-        #expect(try client.get("/context/9").text == "before=none after=9")
-    }
-
-    @Test func aCancelledWaitNeverAnswersALaterRequest() throws {
-        let client = sample().test
-        // A client that asks for a 40 ms wait and goes away after two turns:
-        // the worker closes the connection with the timer still armed.
-        try client.abandon(Array("GET /later/40 HTTP/1.1\r\nHost: test\r\n\r\n".utf8), turns: 2)
-        #expect(client.worker.pointee.table.liveCount == 0)
-        // A new request, very likely on the same slot, before the old deadline.
-        #expect(try client.get("/user/5").text == "5")
-        // Past the old deadline: nothing resumes into the reused slot.
-        let started = av_monotonic_ms()
-        while av_monotonic_ms() - started < 80 { client.turn() }
-        #expect(client.worker.pointee.table.liveCount == 0)
-        #expect(try client.get("/user/6").text == "6")
+        let raw = "GET /context/8 HTTP/1.1\r\nHost: t\r\n\r\nGET /context/9 HTTP/1.1\r\nHost: t\r\n\r\n"
+        // The second request on the connection reuses the first's exchange;
+        // it starts empty.
+        #expect(try client.sendPipelined(raw: Array(raw.utf8)).map(\.text)
+                == ["before=none after=8", "before=none after=9"])
     }
 
     @Test func applicationsInOneProcessKeepTheirOwnRoutes() throws {
@@ -188,16 +166,6 @@ struct ApplicationTests {
         #expect(try first.test.get("/second").status == 404)
         #expect(try second.test.get("/second").text == "two")
         #expect(try second.test.get("/first").status == 404)
-    }
-
-    @Test func aTestConfigurationReachesTheWorker() throws {
-        var config = ServerConfig()
-        config.maxConnections = 16
-        config.requestID = true
-        let response = try sample().testClient(configuration: config).get("/request-id")
-        let id = response.header("x-request-id")
-        #expect(id != nil)
-        #expect(response.text == id)
     }
 
     @Test func aRawRequestIsParsedByTheEngine() throws {

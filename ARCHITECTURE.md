@@ -1,757 +1,429 @@
 # Architecture
 
 Garuda is one Swift executable: the `Garuda` library plus the routes an
-application registers. A supervisor process owns the listening sockets and
-forks worker processes. Each worker is one thread running a readiness poller
-over a flat table of connections. The worker parses HTTP/1.1, HTTP/2 and
-HTTP/3 itself, runs handlers on that thread, and writes every answer through
-one response sink. The binary links OpenSSL, zlib and the Swift runtime.
-Foundation is not linked.
+application registers. It runs on [Vega](https://github.com/grepjava/vega), a
+Tokio-style work-stealing runtime for Swift. A supervisor process starts
+**shards**; each shard is a process with its own Vega runtime, a handful of
+worker threads pinned to one cache domain's CPUs. Inside a shard every
+connection is a task, and tasks are stolen between threads at any `await`.
+Garuda parses HTTP/1.1, HTTP/2 and HTTP/3 itself, the last on its own QUIC
+implementation. Foundation is not linked.
 
 Protocol details are in [TRANSPORT.md](TRANSPORT.md), flags in
 [CONFIG.md](CONFIG.md), the handler API in [HANDLER-API.md](HANDLER-API.md),
-and project status in [README.md](README.md).
+running in production in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ---
 
 ## Source tree
 
-The protocol and systems layers come from
-[aviancore](https://github.com/grepjava/aviancore), a separate package that
-other Swift servers share. Garuda depends on it by version; its modules are the
-first four rows below. Everything from `GarudaPostgres` down lives in this
+The runtime, sockets, TLS, cryptography, file I/O, the shared wire formats
+and QUIC come from Vega; the database drivers from
+[vega-db](https://github.com/grepjava/vega-db). Both are separate packages
+Garuda depends on by version. Everything below lives in this
 repository.
 
 | Target | What it holds |
 | --- | --- |
-| `CAvian` (aviancore) | C shim: epoll/kqueue, sockets, signals, fork, `sendfile`, TLS over TCP (`avian_tls.c`), crypto primitives for QUIC (`avian_crypto.c`), UDP with `recvmmsg` and GSO (`avian_udp.c`), ACME, compression, and the shared-memory tables for metrics, rate limiting and the response cache |
-| `AvianCore` (aviancore) | `ByteBuffer`, `BufferPool`, `Poller`, logging, civil time |
-| `AvianHTTP` (aviancore) | HTTP/1.1 parser, chunked decoder, response writer and parser, HPACK, QPACK, HTTP/2 and HTTP/3 framing, WebSocket framing, forwarded-header trust, cache policy |
-| `AvianQUIC` (aviancore) | QUIC transport: packets, crypto, loss recovery, streams, the TLS 1.3 handshake |
-| `GarudaPostgres` | PostgreSQL wire protocol, session state machines, SCRAM-SHA-256, binary values. No sockets. |
-| `Garuda` | Supervisor, worker loop, connection table, HTTP/2 and HTTP/3 servers, dispatch, routes, middleware, response sink, handler tasks, timers, outbound connections, HTTP client, DNS resolver, PostgreSQL pool, streaming responses, WebTransport, static files, reload, ACME, metrics, CLI |
+| `GarudaWire` | HTTP on the wire as byte-level state machines: the HTTP/1.1 parser and writer, chunked decoding, content-coding negotiation, forwarded-header trust, the response-cache policy. No sockets, no allocation on the hot path. Vendored from aviancore's `AvianHTTP`. It re-exports Vega's `VegaWire` (`ByteBuffer`, HPACK, HTTP/2 and WebSocket frames, permessage-deflate) and `VegaHTTP3` (HTTP/3 frames, QPACK) |
+| `CGarudaShared` | C over shared memory, for what the shards share: the response cache table (`garuda_cache.c`) and the topic bus (`garuda_bus.c`) |
+| `Garuda` | The server (shards, connections, HTTP/1.1, HTTP/2 and HTTP/3 serving, TLS), dispatch, routes, middleware, extractors, the heavy lane, streaming, WebSocket and WebTransport, the HTTP client, sessions, JWT, the CLI |
+| `GarudaTesting` | `app.test`: requests through the real HTTP/1 connection over an in-memory stream |
+| `GarudaJSON`, `GarudaMacros` | `@JSON` and `@PostgresRow`, the only code that needs swift-syntax |
+| `GarudaPostgres`, `GarudaRedis`, `GarudaSQLite`, `GarudaSQL` | vega-db's drivers re-exported, joined to Garuda's `UUID`, `Timestamp`, JSON and stores |
 | `garuda-server` | The `garuda` executable: the benchmark routes, served through the handler API |
 | `garuda-conformance` | Routes that make engine behaviour observable to the end-to-end suites |
-| `GarudaFuzzTargets`, `pgfuzz` | Fuzz targets and their driver ([fuzz/README.md](fuzz/README.md)) |
 
 ```mermaid
 flowchart BT
-    subgraph aviancore
-        CAvian
-        Core[AvianCore] --> CAvian
-        HTTP[AvianHTTP] --> Core
-        QUIC[AvianQUIC] --> Core
-        QUIC --> HTTP
+    subgraph vega[Vega]
+        Vega[Vega: runtime, scheduler,<br/>sockets, shards]
+        VegaIO
+        VegaTLS
+        VegaCrypto
+        VegaFS
+        VegaWire
+        VegaHTTP3
+        VegaQUIC
     end
-    PG[GarudaPostgres] --> Core
-    PG --> CAvian
-    Garuda --> Core
-    Garuda --> HTTP
-    Garuda --> QUIC
-    Garuda --> PG
+    subgraph vegadb[vega-db]
+        VegaPostgres
+        VegaRedis
+        VegaSQLite
+    end
+    Wire[GarudaWire] --> VegaWire & VegaHTTP3
+    VegaQUIC --> VegaWire & VegaCrypto
+    Garuda --> Wire
+    Garuda --> VegaQUIC
+    Garuda --> CGarudaShared
+    Garuda --> Vega & VegaIO & VegaTLS & VegaCrypto & VegaFS
+    GP[GarudaPostgres] --> Garuda
+    GP --> VegaPostgres
+    GR[GarudaRedis] --> Garuda
+    GR --> VegaRedis
+    GS[GarudaSQLite] --> Garuda
+    GS --> VegaSQLite
     server["garuda-server<br/>product: garuda"] --> Garuda
-    conf[garuda-conformance] --> Garuda
-    conf --> Core
-    conf --> HTTP
-    FT[GarudaFuzzTargets] --> Garuda
-    FT --> Core
-    FT --> HTTP
-    FT --> QUIC
-    pgfuzz --> FT
-    pgfuzz --> CAvian
 ```
 
-Swift never imports an OpenSSL header. TLS sessions, contexts and keys are
-opaque handles behind functions in the shim.
+TLS sessions, keys and the cryptographic primitives are Vega's, over BoringSSL
+by default or the system's OpenSSL 3 (a package trait). Swift in Garuda never
+imports a TLS library header.
 
 ---
 
-## Processes
+## Shards
 
 ```mermaid
 flowchart TB
-    subgraph S["Supervisor (Runtime.swift)"]
-        LS["TCP listener: one, shared (--balance adaptive, accept)<br/>or one per worker slot, SO_REUSEPORT (reuseport)<br/>unix socket: one, shared"]
-        HC["hand-off channels: one per worker slot<br/>(--balance adaptive)"]
-        SP["signal pipe<br/>SIGTERM, SIGINT, SIGQUIT, SIGHUP"]
-        RW["ReloadWatcher (--reload)"]
+    subgraph S["Supervisor (Vega: Runtime.sharded)"]
+        LS["listeners: one per port, shared (--balance shared),<br/>or bound by each shard with SO_REUSEPORT (reuseport)"]
+        SIG["signals: SIGTERM, SIGINT, SIGQUIT, SIGHUP"]
     end
-    SHM[("shared mmap<br/>metrics page, load page,<br/>rate-limit table, response cache")]
-    ACME["ACME helper process<br/>(--acme-domain)"]
-    W1["worker 1"]
-    WN["worker N"]
-    S -- "fork, inherits its slot's listener" --> W1
-    S -- "fork" --> WN
-    S -- "fork, exit status" --> ACME
-    W1 -- "readiness byte" --> S
-    WN -- "readiness byte" --> S
-    W1 --- SHM
-    WN --- SHM
-    W1 -. "idle connections, SCM_RIGHTS" .-> WN
-    W1 -. "own sockets, SO_REUSEPORT:<br/>QUIC UDP, metrics, --redirect-http" .- NET((network))
+    SHM[("shared regions<br/>ticket key, rate-limit table, metrics,<br/>response cache, topic ring")]
+    S -- "fork (Linux) or spawn (macOS)" --> S1
+    S -- "..." --> SN
+    subgraph S1["shard 0: one process"]
+        RT1["Vega runtime: T workers pinned to one cache domain"]
+    end
+    subgraph SN["shard K-1"]
+        RTN["Vega runtime"]
+    end
+    S1 --- SHM
+    SN --- SHM
 ```
 
-### Supervisor
+`app.run()` parses the command line, checks the routes (`app.problems()`),
+loads the certificates once to fail early, compiles the application, and hands
+the process to Vega's `Runtime.sharded` (`Run.swift`). The process becomes the
+**supervisor**. Before starting any shard it:
 
-Everything runs under a supervisor, including a single worker
-(`GarudaRuntime.runSupervisor`). Before the first fork it:
+- binds the listeners: the main port, the `--redirect-http` port and the
+  `--metrics-port`. Under `--balance shared` it binds one socket per port and
+  every shard accepts on it; under `reuseport` each shard binds its own
+  `SO_REUSEPORT` socket;
+- maps the **shared regions** (below), laid out from the configuration so the
+  supervisor and every shard agree which is which (`SharedMemory.swift`).
 
-- opens the listening sockets. By default (`--balance adaptive`, and
-  `accept`), TCP gets one socket that every worker accepts from. Under
-  `--balance reuseport` it gets one socket per worker slot, each with
-  `SO_REUSEPORT`, so each worker has its own accept queue. A unix socket is always one descriptor shared by every
-  worker, because a path binds once;
-- under `--balance adaptive`, makes one hand-off channel per worker slot
-  ([Balancing connections](#balancing-connections));
-- maps the shared pages (below);
-- compiles the application's routes (`Application.compile`), so every worker
-  inherits the same read-only table.
+Then it starts K shards. On Linux a shard is forked from the supervisor. On
+macOS, where system libraries do not survive a fork without exec, it is a
+`posix_spawn` of the same executable with the same arguments: the shard runs
+`main` again, up to `app.run()`, and Vega tells it from its environment which
+shard it is. That is why the routes must come out the same on every run.
 
-Workers are forked with `av_fork_worker`, which blocks the piped signals across
-the fork so none is lost. A child closes every other slot's listener and every
-other slot's receiving end of the hand-off channels. The supervisor keeps all
-listeners and channels open for its whole life. The kernel assigns a
-connection to a socket in the `SO_REUSEPORT` group when the SYN arrives, so a
-socket that closed would take its queue with it. A replacement worker inherits
-the same socket instead; with one shared socket the question does not arise.
+The supervisor is one thread and serves nothing. It restarts a shard that
+crashes (at once, then backing off from 100 ms to 5 s while it keeps crashing
+within a second of starting), passes `SIGTERM` on as `SIGTERM` and `SIGINT` or
+`SIGQUIT` as `SIGINT`, kills shards still alive after the grace period, and
+on `SIGHUP` restarts the shards one at a time.
 
-Each worker opens its own QUIC UDP socket, metrics listener and
-`--redirect-http` listener, also with `SO_REUSEPORT`.
+**K and T.** By default K is one shard per last-level cache domain (an L3, from
+sysfs), and T is the number of CPUs in that domain, each worker pinned to one
+of them. `--shards 0` runs everything in the process that was started, with
+no supervisor and unpinned threads: the default on macOS and the only mode on
+Windows.
 
-After forking, a worker builds its poller, TLS context and listeners, runs the
-`app.state` factories and `onWorkerStart` hooks, then writes one byte on its
-readiness pipe. The supervisor reads the pipe: one byte means ready, end of
-file means the worker died during start-up.
+### Why processes and threads
 
-### Shared memory
-
-Four tables are anonymous shared mappings created before the fork:
-
-- **Metrics** (`avian_metrics.c`): two counter slots per worker, cache-line
-  aligned. A replacement worker takes the other slot of its pair, so it never
-  writes over the worker it replaces.
-- **Load** (`avian_load.c`, unless `--balance reuseport`): one cache line per
-  metrics slot, where each worker publishes how loaded it is. See below.
-- **Rate limit** (`avian_ratelimit.c`, `--rate-limit`): GCRA per client
-  address, atomic entries, open addressing with a per-server random seed.
-- **Response cache** (`avian_cache.c`, `--cache-size`): size-classed slots with
-  version words so readers never see a half-written entry. It is flushed on
-  every reload. Handler responses are not stored in it yet.
-
-Everything else is per worker: connections, buffers, timers, handler tasks,
-outbound connections, the DNS cache, and anything built by `app.state`.
-
-### Balancing connections
-
-Workers share nothing while they serve, so nothing inside a worker knows
-whether another has more than its share. `--balance` decides how connections
-are spread (`Balancing.swift`):
-
-| Mode | Where a new connection goes | Connections already placed |
-|---|---|---|
-| `adaptive` (default) | one shared listener; a worker ahead of the others steps back | quick ones move off a worker where they would wait; slow ones are gathered so that some workers stay free of them |
-| `accept` | as `adaptive` | stay where they landed |
-| `reuseport` | a listener per worker with `SO_REUSEPORT`; the kernel hashes the connection's addresses | stay where they landed |
-
-**Why it matters.** The kernel's hash ignores load. In one benchmark run, 64
-keep-alive connections on 8 workers landed 3 on one worker and 13 on another.
-Worse, it ignores cost: a worker that happens to hold a connection making
-two-millisecond requests keeps every quick request on it waiting behind them.
-On macOS `SO_REUSEPORT` gives every connection to one socket.
-
-On the bench box, with 4 workers, 62 connections asking for a path parameter
-and 2 asking for a route that holds the CPU for 2 ms, the quick requests'
-p99 was:
-
-| | slow requests from the start (`skew`) | slow requests from a second in (`spike`) |
-|---|---|---|
-| `reuseport` | 2.8–3.5 ms | 2.9–3.7 ms |
-| `accept` | 0.6–1.3 ms | 3.0–3.6 ms |
-| `adaptive` | 0.9–1.2 ms | 0.9–1.1 ms |
-| axum | 1.1–1.2 ms | 1.1–1.2 ms |
-
-With 8 workers, and 8 slow connections among 64 -- one for every worker --
-the quick requests fared as follows, over two runs each:
-
-| | `skew` req/s | `skew` p99 | `spike` req/s | `spike` p99 |
-|---|---:|---:|---:|---:|
-| `reuseport` | 21,000–43,000 | 6.3–7.3 ms | 70,000–79,000 | 6.6–7.6 ms |
-| `accept` | 87,000–91,000 | 3.9–4.2 ms | 104,000–109,000 | 3.6–3.9 ms |
-| `adaptive` | 70,000–71,000 | 3.3–3.4 ms | 121,000–130,000 | 2.4–2.8 ms |
-| axum | 49,000–50,000 | 3.2–3.6 ms | 64,000 | 3.0–3.1 ms |
-
-Before slow connections were gathered (below), `adaptive` managed 20,000–
-24,000 requests a second on `skew` at a p99 of 6.4–7.0 ms.
-
-On uniform load the three modes measure about the same, except that the
-shared listener takes 0.5 to 1.5 ms off the p99 of small requests and 2 ms
-off HTTP/2's. BENCHMARKS.md has the runs.
-
-#### The load page
-
-`avian_load.c` maps one cache line per metrics slot before the first fork,
-which is two per worker slot so a replacement never shares a line with the
-worker it replaces. Each worker writes only its own line:
-
-- **busy**: the share of its time the loop spent working rather than waiting
-  in `epoll_wait`, in thousandths, measured over 10 ms windows and smoothed,
-  each window weighing a quarter;
-- **connections**: how many it holds, written whenever that changes;
-- **accepting**: whether it is watching the shared listener right now;
-- **wait**: how long a request arriving now would wait (below);
-- **heavy**: how many of its connections are heavy (below);
-- **waiting since**: set while it waits. An idle loop does not turn, so it
-  cannot refresh its reading; a reader discounts a waiting worker's busy
-  reading to nothing over 20 ms instead.
-
-A worker pays two clock reads and a few relaxed stores to its own line per
-loop turn and per connection. It reads the others' lines once per accept pass
-and once every 2 ms in its balance tick.
-
-#### Placement: one shared listener
-
-The supervisor opens one TCP socket, and every worker watches it. Every idle
-worker is woken for a new connection, and a busy one sees it on its next turn.
-Each takes the connection it was woken for, if it is still there. Before each
-further accept in the same pass, it reads the load page and steps back if it
-is **ahead** (`BalancePolicy.standing`) of a worker that is accepting:
-
-- **busier**: at least 500 busy and 250 busier than the least busy; or
-- **more connections**: more than the fewest by max(3, an eighth), counted
-  only against workers about as free as itself. A worker holding fewer
-  because it is flat out with them is no yardstick.
-
-Stepping back removes the listener from its poller. The worker takes it back
-the moment it is no longer ahead, checked every loop turn with the loop
-waiting at most 1 ms at a time, and after 50 ms whatever the readings say.
-
-Two details keep a queued connection from waiting on nobody:
-
-- Only accepting workers are compared against. Otherwise workers could each
-  defer to another that had just stepped back itself, and leave connections
-  queued with all of them idle. A worker with nobody accepting to defer to
-  takes everything.
-- The listener is not registered with `EPOLLEXCLUSIVE`. An exclusive wake-up
-  tells a waiting connection to one worker only, and if that one then stepped
-  back, the rest of the queue would wait for the next arrival to wake someone
-  else. It is used only where nobody steps back: a unix socket under
-  `reuseport`, or a single worker.
-
-kqueue wakes every worker the same way, so macOS behaves as Linux does.
-
-#### Moving idle connections
-
-Placement cannot fix connections already placed, and cannot know which
-connections will turn out to be slow. Under `adaptive`, a worker moves idle
-connections to another worker where they would wait less.
-
-**The wait.** A worker serves in turns: it collects what is ready, works
-through all of it, and waits again. A request that arrives mid-turn waits for
-the rest of that turn. So the expected wait is the share of time spent working
-times the mean remaining length of a turn:
-
-    wait = busy · E[T²] / (2 · E[T])
-
-where T is how long each turn worked. The second moment is what matters. It
-is long where one request takes milliseconds, and long where many quick
-requests arrive together, and two workers equally busy differ by exactly
-that. Half busy with 2 ms requests reads 500 µs; flat out with turns of 44
-quick requests at 15 µs each reads 330 µs.
-
-**When.** A worker with a wait of at least 100 µs that has stayed more than
-twice that of another worker, plus 100 µs, for 100 ms sends it a quarter of
-its connections, at most 8, then waits 100 ms for the readings to catch up
-(`BalancePolicy.moveTarget`).
-
-**Which.** HTTP/1 connections between requests that have served at least one:
-nothing buffered or waiting to be written, no file or body in flight, no
-handler parked, not WebSocket, HTTP/2 or half-closed, and either plaintext or
-TLS the kernel carries both ways (below). Cheapest first, by each
-connection's smoothed time from dispatch to answer. Neither a heavy connection
-nor the costliest one goes: moving those would move the load rather than share
-it, while moving the cheap ones out from behind them is what shortens their
-wait.
-
-**How.** The supervisor makes one datagram unix socket pair per worker slot
-before the fork. The sending worker removes the socket from its poller, sends
-the descriptor with `SCM_RIGHTS` together with a note (the peer's address and
-port, the requests served, whether TLS is the kernel's), and closes its own
-copy. The receiving worker adopts it as it would an accepted connection. A
-request the client sends meanwhile waits in the socket and is read by the new
-worker. A connection that moved stays put for a second. A connection the
-channel cannot take right now stays where it is.
-
-For example, 4 workers hold 16 quick connections each when two clients start
-calling a route that takes 2 ms. Their two workers' waits climb to around a
-millisecond while the others stay near 100 µs. After 100 ms each of the two
-sends 4 of its quick connections to the worker with the shortest wait, and
-again every 100 ms, until only the slow connections are left or the waits
-are within the margins.
-
-#### Gathering slow connections
-
-Moving quick connections needs a worker with a short wait to move them to.
-When slow connections arrive first, onto idle workers, placement spreads them
-evenly, and with as many slow connections as workers each worker gets one.
-Every quick request then waits behind a slow one wherever it goes, and there
-is nowhere better to move it. That is the case where Tokio's work stealing did
-better than moving connections: 20,000 quick requests a second against axum's
-49,000.
-
-So slow connections are gathered onto fewer workers, freeing the others for
-the quick ones (`BalancePolicy.gatherTarget`).
-
-- **Heavy.** Each connection keeps a smoothed reading of how long its requests
-  hold the loop, from dispatch until the loop gets back, each request weighing
-  an eighth (`holdUs`). Past 500 µs the connection is heavy. The second request
-  of 3 ms makes it so; one slow request among quick ones does not. A request
-  answered by an async handler holds the loop only until the handler starts,
-  so waiting on a database never makes a connection heavy. Each worker
-  publishes its count.
-- **When.** Quick requests are waiting (some worker holds connections that are
-  not heavy, with a wait of at least 100 µs), and no worker without heavy
-  connections has a wait under 100 µs. If one did, the ordinary moves above
-  would send the quick connections there.
-- **Who, and where to.** The worker holding the fewest heavy connections gives
-  -- the highest slot among equals -- to the one holding the most, the lowest
-  slot among equals. Every worker reading the same page picks the same pair,
-  and a heavy connection only ever moves toward a worker with more of them, so
-  it never comes back. It keeps the same 100 ms sustain and cooldown as other
-  moves.
-- **How far.** Slow requests always keep at least half the workers. Beyond
-  that they would pay more than the quick ones gain.
-- **Back again.** When a worker holds two or more gathered connections and two
-  workers without any sit idle (under 250 busy), it hands one back to the
-  idler of them, so slow requests get the CPU again once the quick load has
-  gone (`BalancePolicy.spreadTarget`).
-
-For example, 8 slow connections land one per worker, then 56 quick ones
-arrive. Worker 7 gives its slow connection to worker 0, and the ordinary moves
-send quick connections to worker 7. While worker 7 is flat out with them (its
-wait over 100 µs), worker 6 gives its slow one to worker 0 as well, and so on
-until the quick ones have enough room or four workers are free. The slow
-requests then share four workers instead of eight.
-
-**TLS connections do not move.** The session lives in the memory of the
-process that did the handshake, so it cannot travel with the descriptor. Only
-the kernel holding the keys would let it, and BoringSSL has no kernel TLS
-([TRANSPORT.md](TRANSPORT.md#kernel-tls-not-available)). The machinery for it
-is still here and compiles out; an OpenSSL build restores it.
-
-**What never moves:** a request in progress, HTTP/2 connections (their HPACK
-tables and streams are the worker's), WebSocket and other streams, and
-HTTP/3, whose packets arrive on each worker's own UDP socket.
-
-#### Why processes rather than threads
-
-Tokio, the runtime behind axum, balances by moving tasks between threads of
-one process. An idle thread takes ready tasks from a busy one's queue, at any
-`await`, so it rebalances TLS and HTTP/2 connections and requests in flight.
-Garuda's workers are processes instead, for two reasons:
+Garuda 1 ran one thread per process and balanced by moving connections between
+processes. Garuda 2 keeps the process boundary and puts work stealing inside
+it:
 
 - **A trap ends a process.** A force-unwrapped `nil`, an index out of range,
   integer overflow or a failed `precondition` stops a Swift process at once:
-  nothing unwinds and nothing can catch it. In Rust the same bugs are panics,
-  which unwind, and Tokio contains one to the task that raised it. In
-  Garuda a trap ends one worker and the connections it held; the supervisor
-  starts a replacement on the same listener, and the other workers never
-  notice. Threads would lose every connection on every thread.
-- **Nothing is shared on a request's path**: no locks, no atomics, no
-  cross-thread wake-ups. That is where Garuda's median latency comes from.
+  nothing unwinds and nothing can catch it. Tokio contains a Rust panic to its
+  task; Swift has no equivalent. With K shards a trap takes down 1/K of the
+  connections, and the supervisor starts the shard again.
+- **Work stealing balances what processes cannot.** Inside a shard an idle
+  thread takes ready tasks from a busy one at any `await`, so TLS
+  connections, HTTP/2 streams and requests in flight all rebalance. Garuda 1
+  could move only idle HTTP/1 connections.
+- **A shard per cache domain** keeps a connection's memory in one cache and
+  the cross-thread traffic that stealing costs inside it.
 
-Moving an HTTP/1 connection between requests is about the granularity at
-which Tokio moves an HTTP/1 connection's task. What processes give up is
-moving TLS, HTTP/2, and requests in flight.
+### Shared regions
 
-#### Restarts
+What has to be the server's rather than one shard's lives in memory the
+supervisor maps before the first shard starts, the same bytes in every shard
+and kept across shard restarts (Vega's `ShardOptions.sharedRegions`). Only
+atomics and offsets live there, never pointers, since each process maps it at
+its own address. No lock is ever held across processes: a shard that crashed
+holding one would hold it for ever.
 
-Under `accept` and `adaptive` the one listener belongs to the supervisor for
-its whole life, so a queued connection is never lost when a worker is
-replaced. A draining worker removes the listener from its poller, marks its
-load slot draining so that nobody hands it anything more, and stops reading
-its channel. Anything already sent waits in the channel, which belongs to the
-slot, for the replacement. The supervisor clears the load slot of every worker
-it reaps, since a worker that crashed cleared nothing itself.
+| region | when | what |
+|---|---|---|
+| TLS ticket key | `--tls-cert` | drawn by the first shard to start; every shard seals and opens session tickets with it, so a client resumes whichever shard it reaches (`TLS.swift`) |
+| rate-limit table | `--rate-limit` | 65,536 entries of a client hash and its GCRA arrival time, updated by compare-and-swap, keyed with a per-server random seed (`RateLimit.swift`) |
+| metrics | `--metrics-port` | a row of counters per worker thread per shard, each written by its thread alone; a scrape sums them all (`Metrics.swift`) |
+| response cache | `--cache-size` | size-classed slots, each guarded by a version word used as a sequence lock; a writer claims a slot with its process ID, and a slot whose claimant died is taken over (`garuda_cache.c`) |
+| topic ring | `--broadcast-size` | messages a `Topic` publishes, with rising numbers for `Last-Event-ID` (`garuda_bus.c`) |
 
-After a `--reload` exec, the new supervisor maps a new load page and makes new
-channels. Workers adopted from the previous image hand connections only to
-each other until they are replaced.
+The **topic ring** has one writer at a time, claimed by compare-and-swap with
+the writer's process ID. Each shard has one thread that sleeps on a wake word
+in the region -- a futex on Linux, `os_sync` on Darwin -- reads what was
+published, and hands it to the subscribers that shard holds. A burst costs one
+wake per shard, not one per message. Readers take no claim: a reader copies a
+message out and checks the writer has not since reached around the ring to it.
 
-### Reload and signals
-
-A worker that exits on its own is restarted in its slot. `SIGHUP` replaces the
-workers one slot at a time:
-
-1. fork the replacement and move the slot to the other metrics slot;
-2. wait for its readiness byte, bounded at 60 s. Both workers serve the slot
-   meanwhile;
-3. send the old worker `SIGQUIT`;
-4. when it exits, move to the next slot.
-
-If a replacement dies before it is ready, the slot returns to the old worker
-and the pass stops. A reload requested during a pass queues another pass.
-
-`--reload` watches the executable (`ReloadWatcher.swift`) with inotify or
-kqueue, and also re-stats it every `--reload-interval`. A change counts once
-the file has held still for 300 ms. Forked workers cannot run new code, so the
-supervisor re-executes itself (`Reexec.swift`): it waits until no pass,
-handover or ACME helper is in flight, checks that the new file runs, and
-`exec`s it with the listener descriptors and worker pids in `GARUDA_REEXEC`.
-The new image adopts the workers and replaces them as `SIGHUP` would. A change
-to a TLS certificate or key starts a replacement pass without an exec.
-
-`--acme-domain` runs the ACME client in a forked helper process, one at a time.
-Exit 0 means a new certificate is on disk and starts a replacement pass.
-Failures back off from one minute, doubling up to six hours.
-
-Shutdown:
-
-- `SIGTERM`: forwarded to workers. With `--drain-delay`, a worker keeps serving
-  but fails `--health-check-path` with 503, then drains.
-- `SIGINT`, `SIGQUIT`: drain now. A second one cuts a drain delay short.
-- Draining closes keep-alive connections idle between requests (not freshly
-  accepted ones that may already hold a request), stops polling and closes the
-  listener, leaves the load page and its hand-off channel, and ends the loop
-  once the connection table is empty.
-- `--graceful-timeout` bounds in-flight requests. A `SIGALRM` watchdog
-  `_exit`s the worker 10 s after that, and the supervisor `SIGKILL`s any worker
-  alive past drain delay + grace period + 2 s.
+Everything else is per shard: connections, buffers, `app.state` (database
+pools, clients, caches), in-memory session and token stores, and timers.
 
 ---
 
-## Inside a worker
+## Inside a shard
 
 ```mermaid
 flowchart TB
-    P["Poller<br/>epoll / kqueue, level-triggered"]
-    subgraph INB[Inbound]
-        ACC["accept, TLS handshake<br/>(OpenSSL, TLS.swift)"]
-        UDP["QUIC socket<br/>QUICListener, QUICConnection"]
-        T[("connection table<br/>slots: connections and streams")]
-        H1["HTTP/1.1 parser"]
-        H2["HTTP/2 frames, HPACK"]
-        H3["HTTP/3 frames, QPACK"]
+    subgraph RT["Vega runtime (one shard)"]
+        W1["worker 1<br/>local queue, LIFO slot, I/O driver, timers"]
+        W2["worker 2"]
+        WT["worker T"]
+        INJ["inject queue"]
+        BP["blocking pool"]
     end
-    D["dispatch seam<br/>health check, rate limit, static files, cache"]
-    R["route trie<br/>CompiledRoutes.match"]
-    MW["middleware + handler"]
-    TP["handler task pool<br/>WorkerExecutor"]
-    TM["TimerHeap, ReadyQueue"]
-    SINK["response sink<br/>respond / respondH2 / respondH3"]
-    subgraph OUTB[Outbound]
-        OT[("outbound table")]
-        CL["HTTPClient, HTTP2Client"]
-        DNS["Resolver"]
-        PGP["PostgresPool"]
-    end
-    P --> ACC --> T
-    P --> UDP --> T
-    T --> H1 & H2 & H3
-    H1 & H2 & H3 --> D --> R --> MW
-    MW -- "sync: inline" --> SINK
-    MW -- "async" --> TP --> SINK
-    TP <--> TM
-    TP <--> OT
-    CL & DNS & PGP --> OT
-    P <--> OT
-    SINK --> T
+    ACC["accept loops<br/>(one per thread)"] --> C1["connection task<br/>HTTP/1.1"]
+    ACC --> C2["connection task<br/>HTTP/2 reader + writer"]
+    UDP["UDP sockets, one per thread<br/>QUIC endpoint task each"]
+    C2 --> POOL["stream task pool"]
+    UDP --> POOL
+    C1 & POOL --> D["dispatch: health, rate limit,<br/>static files, cache, routes"]
+    D --> HL{"heavy?"}
+    HL -- "no" --> H["middleware + handler"]
+    HL -- "yes: wait for a permit" --> H
+    H -. "app.offload" .-> BP
 ```
 
-### The loop
+### The runtime
 
-A worker is one `Worker` struct reached through a raw pointer, held in a C
-thread-local. `runSynchronousLoop` is:
+Vega's scheduler follows Tokio's multi-threaded one. Each worker thread has a
+local queue of ready tasks and a LIFO slot for the task it just woke, so a
+request handed from one task to another runs next on the same thread, with
+its data still in cache. A worker with nothing to do steals half the queue of
+a random busy one, or takes from the shared inject queue, and when there is
+nothing anywhere it spins briefly and then sleeps in its own I/O driver until
+an event or its next timer. Every Vega primitive spends from a per-task budget
+and yields when it runs out, since Swift cannot preempt a task.
 
-```swift
-while running {
-    let n = poller.wait(timeoutMillis: quicPollTimeout(200))   // at most 32 events
-    if n > 0 { processEvents(n) }   // then flush the batch's HTTP/1 responses
-    fireDueTimers()                 // TimerHeap -> ReadyQueue
-    drainReadyQueue()               // at most 64 resumes
-    runHandlerTasks()               // drain the task executor
-    quicTick()                      // QUIC timers, at most every 4 ms
-    sweepTimeouts()                 // once a second
-    if draining && quiescent { running = false }
-}
-```
+Each worker has its own I/O driver: an io_uring ring on Linux 6.7 and later
+(submitted on the local ring, completed there, resumed on any thread), epoll
+elsewhere on Linux, kqueue on macOS. `--io` chooses. Each also has its own
+timer wheel.
 
-The poll timeout is 200 ms, cut to the nearest QUIC or timer deadline (rounded
-up), and 0 while the ready queue holds work.
+The package is built with `NonisolatedNonsendingByDefault`, as Vega is: an
+async function runs on its caller's executor, so a call into a handler and
+back is no hop.
 
-**Short turns.** A turn takes at most 32 events (`Worker.eventsPerTurn`); the
-rest stay ready and are taken on the next turn, straight away. A turn answers
-everything it took before it waits again, so a request that arrives mid-turn
-waits for the rest of it. With 64 busy connections on one worker and no cap, a
-turn took all 64, and a request that just missed one waited for most of two:
-the p99 of small requests was twice their median. Capped at 32, it went from
-1.0 ms to 0.65 at the same throughput. Tokio does the same kind of thing: a
-worker thread checks for new I/O every 61 tasks.
+### Connections
 
-**Short time slices.** Each worker asks the kernel for a 300 µs scheduler
-slice (`--sched-slice`; EEVDF's custom slice, Linux 6.12 and later). A worker
-owns its connections, so when another thread takes its CPU, every one of them
-waits until the worker gets it back -- up to a whole slice, 2.8 ms by default
-on an 8-CPU machine. A Tokio thread that loses its CPU leaves its work to the
-other threads. With the load generator sharing the 8 CPUs, the kernel took the
-CPU from Garuda's workers 3,200 to 3,600 times a second, against 700 to 800
-for axum's threads, and the p99 of JSON and JWT requests sat at the default
-slice, about 3 ms. With 300 µs slices it came down to 1.7 to 2.1 ms, level with
-axum, at the same throughput. Where the machine is not oversubscribed the
-slice changes nothing: a worker that is not preempted never reaches its end.
+A shard runs one accept loop per thread (`--acceptors`), so a new connection
+usually starts on the thread that accepted it. Vega sets `TCP_NODELAY` on
+every accepted socket.
 
-### Connection slots and identity
+**Every connection is a task.** An HTTP/1.1 connection's task owns its read
+buffer and its **exchange** -- the request's offsets, the response's status,
+headers and body -- and runs a loop: parse a head from the bytes in hand,
+read more only when there is no whole head, take the body, dispatch, write
+the answer into the output buffer. Pipelined requests are answered in a
+batch, flushed when the task is about to wait for input. Every wait on the
+client is bounded by a timeout. The parts of a connection -- read buffer,
+output buffer, exchange -- are kept when it ends, in a list per worker thread,
+and the next connection on that thread takes them, so short connections cost
+no allocation and no fight over malloc's arenas (`ConnectionCache.swift`).
 
-Connections live in one contiguous slab of `Connection` structs with a free
-list (`Connection.swift`). A poller token is `(generation << 24) | slot`.
-`allocate` bumps the slot's generation, so an event for a descriptor closed
-earlier in the same batch is discarded with one compare. Fixed tokens at the
-top of the range name the listener, signal pipe, QUIC socket, metrics and
-redirect listeners, and eight pending scrapes. Outbound connections set bit 62.
+Over TLS the accepted socket is handed to Vega's `TLSStream` for the
+handshake, bounded by `tlsHandshakeTimeout`, and is then served as plain text
+is. SNI picks the certificate from a store every handshake consults, which
+`--tls-reload` replaces without touching open connections.
 
-A slot is a connection or a stream. Each HTTP/2 and HTTP/3 request stream takes
-a slot from the same table with `fd = -1` and `parentSlot` pointing at its
-connection. An HTTP/3 connection's own slot has no descriptor either. Dispatch,
-timers and cancellation treat all of them alike.
+**HTTP/2** (`HTTP2.swift`, `HTTP2Writer.swift`). A connection becomes HTTP/2
+when ALPN chose `h2`, or when a cleartext client opens with the preface,
+looked for in the HTTP/1 read buffer. The connection's task becomes its
+**reader**: it reads frames, owns the HPACK decoder and the stream table, and
+enforces every limit. A second task, the **writer**, writes control frames and
+answers that could not be written by their own stream. A stream's request is
+decoded into its own exchange, described exactly as an HTTP/1.1 head would be,
+so routing and middleware see a request like any other. Its body is collected
+whole (or, for an `onStreamingBody` route, handed to the handler through a
+pipe as DATA arrives), then the stream runs in a task from the shard's
+**stream pool**, so a handler that waits holds up no other stream. A stream whose answer is ready
+writes it itself when nobody else is writing and the windows take it whole.
 
-A request is identified by `(slot, generation, requestId)`. The generation
-changes when the slot is allocated. `requestId` changes at every request on the
-slot, so a keep-alive connection's second request is distinct from its first.
-Timers, queued resumes, handler tasks and `Response` values all carry this
-triple and check it before acting.
+**HTTP/3** (`HTTP3.swift`, `HTTP3Connection.swift`). Each shard binds one UDP
+socket per thread with `SO_REUSEPORT`, so the kernel spreads clients across
+them. Each socket has one **endpoint** task that owns everything QUIC for it:
+the connection-ID table, every `QUICConnection` (from Vega's `VegaQUIC`, which does
+no I/O of its own) and the HTTP/3 state on top. Nothing there is locked. Its
+loop receives a batch of datagrams, waiting no longer than the earliest QUIC
+timer; feeds each to its connection; runs due timers; takes the answers
+request tasks posted; and sends what every connection has to say, coalesced
+with UDP GSO where the kernel allows. Requests run in the shard's stream pool,
+as HTTP/2 streams do. QPACK runs with a dynamic table of capacity zero, so no
+header block ever waits on another stream.
 
-States: `readingHead → readingBody → dispatching → writing`, then back to
-`readingHead` or closed. Long-lived states are `http2` and `http3`, plus
-`closing` for a stream whose response finished before its upload did. A full
-table answers 503 and closes. Accepts are bounded at 64 per wake-up, and
-`EMFILE` pauses accepting until a slot frees.
+**Inline answers.** A route that has run many times without ever suspending,
+and is not heavy, is answered where its request arrived: by the HTTP/2 reader
+when it is the connection's only stream, by the QUIC endpoint once the
+datagrams in hand are handled. That saves the hand-off to a pooled task,
+which costs more than such a route does. One run that suspends sends the
+route to the pool for good.
+
+**Cancellation.** An HTTP/2 `RST_STREAM`, or an HTTP/3 reset, cancels the
+stream's task -- Swift task cancellation, so a handler waiting on I/O or a
+sleep stops waiting. Pooled tasks are reused, and cancellation cannot be
+undone, so a cancelled task finishes its stream and ends rather than going
+back to the pool. The rapid-reset defence (CVE-2023-44487) bounds the ratio
+of streams cancelled to streams answered.
 
 ### A request, from bytes to response
 
-1. **Read.** `fill` drains the socket into a pooled read buffer. Over TLS it
-   keeps reading while OpenSSL holds decrypted bytes the poller cannot see.
-2. **Parse.** `HTTPParser.parse` yields offsets into the read buffer and
-   allocates nothing. HTTP/2 and HTTP/3 rebuild the head as HTTP/1.1 text in
-   the stream slot and run the same parser.
-3. **Begin.** `beginRequest` bumps `requestId`, cancels anything left from the
-   previous request, decides keep-alive, answers 413 for an oversized
-   `Content-Length`, sends `100 Continue` if asked, and sets up body framing.
-4. **Body.** The whole body is buffered before dispatch, on every protocol.
-   An HTTP/1.1 body is never read past its declared end.
-5. **Dispatch** (`Worker.dispatch`): request ID and trace context, then in
-   order `--no-websockets` (501 for an upgrade), `--health-check-path`,
-   `--rate-limit` (429), `--static-dir`, `--compress` negotiation,
-   `--cache-size`, a refusal of any extended CONNECT that is not WebTransport,
-   and finally `dispatchRoute`.
-6. **Route.** `CompiledRoutes.match` walks a flat byte trie built from the
-   patterns: literal before `:param` before trailing `*rest`, with
-   backtracking, at most 8 parameters stored as offsets. No match is 404; a
-   path another method would match is 405 with `Allow`. A route's deadline, if
-   any, is armed here.
-7. **Handler.** `runHandler` calls the handler with `Request` and `Response`,
-   `~Copyable` views of the slot. Middleware was composed into each route's
-   handler at compile time: synchronous middleware up to the first async one
-   runs inline, and the rest of the chain and the handler run on a task.
-   Typed handlers take extractors (`Path`, `Query`, `Body`, `Form`, `State`
-   and others) and return a `ResponseConvertible`.
-8. **Sink.** `respond` (`Respond.swift`) runs any `onSend` hooks, then writes
-   status, `Date`, `Server`, server headers (Alt-Svc, HSTS, X-Request-ID)
-   unless the handler set them, the handler's headers, framing and body. A body
-   longer than a declared `Content-Length` is cut to it; a shorter one closes
-   the HTTP/1.1 connection or resets the stream. On streams it encodes with
-   HPACK or QPACK instead (`respondH2`, `respondH3`).
-9. **Write.** A finished HTTP/1 response waits in its write buffer until the
-   end of the event batch, or until 16 are queued, and they go out together.
-   `finishResponse` then returns the slot to `readingHead` and processes any
-   pipelined bytes, or closes it.
+1. **Read and parse.** `HTTPParser` (in `GarudaWire`) yields offsets into the
+   read buffer and allocates nothing. HTTP/2 and HTTP/3 build the same
+   description from HPACK or QPACK.
+2. **Body.** The whole body is collected before dispatch, on every protocol,
+   held to `--max-body` or the route's own `app.maxBodySize`. An
+   `onStreamingBody` route is dispatched at the head instead, and its handler
+   reads the body as it arrives: on HTTP/1.1 from the connection, on HTTP/2
+   and HTTP/3 from a pipe whose stream window grows only as it is read.
+3. **Screening** (`Dispatch.swift`). The request ID and trace context are
+   recorded; then `--health-check-path`, `--rate-limit`, `--static-dir` and
+   the `--cache-size` lookup, each answering without the application when it
+   can.
+4. **Route.** The route table is a flat byte trie compiled once, before
+   serving, and only read afterwards: no lock and no reference count to find a
+   route. Literal before `:param` before trailing `*rest`, with backtracking;
+   parameters are offsets into the path. No match is a scope fallback,
+   `--spa-fallback` or 404; a path another method would match is 405 with
+   `Allow`.
+5. **Heavy lane.** A heavy route waits for a permit (below).
+6. **Middleware and handler.** A route's chain of middleware was composed at
+   compile time; per request it is one call per layer. Each layer can answer
+   without calling `next`, change the response after it, or catch what the
+   handler threw. Typed handlers take their extractors in order and return a
+   value that writes itself into the response.
+7. **Answer.** The connection writes the response: `onSend` hooks, status,
+   `Date`, `Server`, the server's own fields (Alt-Svc, HSTS, `X-Request-ID`)
+   unless the handler set them, the handler's headers, framing and body. A
+   streamed body is written as it is produced, chunked on HTTP/1.1 and DATA
+   frames on HTTP/2 and HTTP/3; a write waits while more than 512 KiB is
+   queued, until it is down to 128 KiB. A `Content-Length` the handler set is
+   held to: a longer body is cut, and a shorter one closes the HTTP/1.1
+   connection or resets the stream.
 
 A handler that throws gets 500, or the status of a `ResponseError`. One that
-returns without answering or waiting gets 500.
+returns without answering gets 500.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant L as Worker loop
-    participant R as dispatch + routes
-    participant T as Handler task
-    participant Q as TimerHeap / ReadyQueue
-    participant S as Response sink
+`Request` and `Response` are `~Copyable` views of the exchange, one pointer
+each. A handler cannot keep either past its return, because the next request
+on the connection reuses the memory; holding one across an `await` is fine,
+because the connection task is the one suspended in the handler, whichever
+thread it resumes on.
 
-    C->>L: request bytes (poller event)
-    L->>R: parse, beginRequest, dispatch
-    alt synchronous handler
-        R->>S: handler runs inline, respond()
-        S->>L: head + body in write buffer
-        L->>C: flushed at end of event batch
-    else async handler
-        R->>T: runOnTask: resume an idle task
-        T->>T: handler runs inline until it awaits
-        T->>Q: response.sleep: arm timer op, park
-        T-->>L: loop continues with other work
-        Q->>Q: fireDueTimers: op due, enqueueReady
-        Q->>T: drainReadyQueue: check (slot, generation, requestId), wake
-        T->>S: handler resumes, respond()
-        S->>L: write buffer
-        L->>C: flush
-        T->>T: taskFinished, task returns to idle pool
-    end
-```
+### The heavy lane
 
-### Handler tasks
+Work stealing alone lets a burst of requests that each hold the CPU for
+milliseconds take every thread of a shard, and a quick request then waits
+behind them. So each route keeps a smoothed average of how long its handler
+holds a thread (`HeavyLane.swift`). A route whose average passes
+`--heavy-threshold` (500 µs by default), or one registered through
+`app.heavy`, is **heavy**: its handler runs only while it holds one of the
+shard's heavy-lane permits, of which there are half as many as threads,
+rounded up. The other threads are always left to everything else.
 
-An async handler does not get a `Task` per request (`HandlerTasks.swift`).
-Each worker owns a `WorkerExecutor`, a `TaskExecutor` whose jobs run only on
-the worker's thread when the loop drains it, and a pool of long-lived tasks
-that prefer it. A request resumes an idle task, which runs the handler inline
-in the same loop turn until it answers or awaits. When all tasks are busy a new
-one is started, up to 1,024 or the connection capacity, whichever is lower.
-Past that the request waits in the pool's queue. The pool is created on the
-first async request. `HandlerTaskTests` checks that a warm async request
-allocates nothing on glibc.
+Heavy handlers are also spread over the shard's physical cores. Two on the
+hyperthreads of one core share its execution units, and leave quick requests
+one core fewer than one on each core does: on the `skew` workload, at four
+threads on two cores, that is 84k quick requests a second against 125k. So a
+heavy handler that has its permit, on a core where another already runs while
+some core runs none, moves to whichever worker is free next
+(`Runtime.yieldToAnyWorker`), a few times at most, and is counted on the core
+it ends up on (`Runtime.currentCore`). The permit's next waiter resumes where
+the permit was released, on a core just freed, so once spread the handlers
+stay spread without moving again. Where the platform does not say which CPUs
+share a core (only Linux does), handlers run where they are.
 
-To the rest of the engine, a request on a task is a continuation of kind
-`.task`. Waits on the engine (`Response.sleep`, a streamed body's write) park
-the task with an `UnsafeContinuation` and resume it through the ready queue or
-the executor, never inline from the code that made room.
+"Holds a thread" is not wall time. A handler that awaits a database or a
+timer gives its thread up while it waits, and is not heavy for waiting. Vega
+stamps each job a thread runs; a handler that finishes in the job it started
+in never suspended, and only then is its time a sample. Heavy routes are
+timed every run, so one that turns quick leaves the lane promptly; light ones
+one run in sixteen. A handler that computes between awaits is not seen this
+way, and belongs in `app.heavy`. `--no-heavy-lane` turns the lane off.
 
-### Timers and continuations
+### Blocking work
 
-`AsyncOps.swift` holds three fixed-capacity structures, sized to the
-connection table:
+A handler that blocks its thread -- a synchronous file read, a C library
+that waits -- takes it from every other request on the shard. `app.offload`
+registers a route whose handler runs on Vega's blocking pool (`Runtime.blocking`,
+Tokio's `spawn_blocking`), with its extractors taken and its answer written on
+a worker. Work that only computes belongs in the heavy lane instead, which
+needs no thread of its own.
 
-- **`AsyncOpPool`**: op records with a free list. Each stores slot,
-  `requestId`, kind (`timer`, `deadline`, `outbound`, `timedWait`), a
-  microsecond deadline and its heap index. Allocation bumps a generation.
-- **`TimerHeap`**: a min-heap of `(deadlineUs, opIndex, opGeneration)`. Ops can
-  be removed from the middle. Deadlines use the monotonic microsecond clock
-  plus one, so a timer never fires early.
-- **`ReadyQueue`**: a ring buffer of `(slot, generation, requestId, ticket)`.
-  The ticket is a per-worker serial stamped on the connection when it becomes
-  ready, so only the newest entry can resume it. Stale entries are skipped at
-  drain time, and a full queue is compacted in place.
+### Deadlines
 
-A connection holds at most one continuation op (`contOp`) and one route
-deadline op (`deadlineOp`). A synchronous handler can wait with
-`Response.after(milliseconds:then:)`, which parks a handler closure on the
-slot.
-
-A route deadline (`app.deadline`) fires as a separate op. It answers 504, marks
-the request `.timedOut` so later sends from the handler are dropped, and
-cancels the task. It bounds waiting, not computing: nothing preempts a handler
-that loops without awaiting.
-
-### Cancellation
-
-`cancelOps` frees the op named by `contOp`, unlinks it from the heap, drops a
-parked handler closure, cancels the request's task (or its place in the task
-queue), and ends a streamed-body writer's wait. It runs at every request start,
-on keep-alive completion, and from `closeConnection`. An HTTP/2 `RST_STREAM`,
-an HTTP/3 `RESET_STREAM` or `STOP_SENDING`, and a parent connection closing
-all reach `closeConnection`. A cancelled task's wait throws
-`HandlerWaitError.cancelled`, the handler unwinds, and the task returns to the
-pool.
-
-A handler waiting on something other than the engine, such as an outbound
-socket, is not unwound when its request ends. Those waits have their own
-timeouts. When it resumes, every `Response` operation checks
-`(slot, generation, requestId)` and drops an answer for a request that is gone.
-`response.isCancelled` lets a handler check for itself.
-
-`response.cancellable { … }` (Cancellation.swift) is how such a wait is given
-up on rather than merely noticed. The handler task cannot be cancelled --
-tasks are pooled and reused, and a task cancelled in Swift's sense stays
-cancelled -- so the body runs in an unstructured task of its own, on the same
-worker executor, and the handler races it against a waiter registered on the
-connection slot. Every path that ends a request wakes those waiters:
-`cancelOps` covers a closed connection, a reset stream and the next request on
-a keep-alive, and `deadlineFired` covers the deadline, which does not go
-through `cancelOps` while a task holds the slot.
-
-The body is cancelled when the handler gives up, and a body that pays no
-attention to cancellation keeps running on the worker's thread. What it gives
-back is the handler task and nothing else, so the worker counts those
-(`Worker.abandonedWaits`), logs once on the way past
-`ServerConfig.maxAbandonedWaits`, and answers the health check 503 until it
-has caught up -- out of rotation rather than failing requests that have
-nothing to do with what is stuck.
+`app.deadline(_:)` runs a scope's routes under Vega's I/O deadline: a socket,
+pipe or database wait still pending when the time is up gives up, and a
+request still unanswered is answered 504. A deadline bounds waiting, not
+computing.
 
 ### Outbound I/O
 
-Connections a worker makes (`Outbound.swift`) are registered on the same
-poller and served on the same thread. They live in their own slab (256 per
-worker), not the connection table, so an idle pooled connection does not stop
-a draining worker from looking quiescent. They are closed when the worker
-tears down. Idle connections are pooled per destination (8 per key, 30 s) and
-watched for readability, so a peer hang-up is noticed before reuse. A connect
-is bounded by an `outbound` timer op. A socket has one waiter, parked as a
-continuation and resumed from the poller event.
+The HTTP client and the database drivers run on the same Vega runtime as the
+server, on the same threads: an outbound call is an await like any other.
+Their connection pools belong to the shard, shared by every thread in it. The
+HTTP client keeps one HTTP/2 connection per origin shared by every request,
+with a reader task of its own. SQLite runs its statements on Vega's blocking
+pool. [CONNECTORS.md](CONNECTORS.md) has the details.
 
-Built on it:
+### Shutting down
 
-- **HTTP client** (`HTTPClient.swift`, `HTTP2Client.swift`): HTTP/1.1 and
-  HTTP/2, chosen by ALPN. HTTP/2 connections are shared by every request to the
-  same place; the request waiting for data holds a read baton. Redirects are
-  not followed. Pooled TLS connections are keyed by host name, trust store and
-  ALPN offer.
-- **DNS** (`Resolver.swift`): a stub resolver over UDP on the poller, using
-  `/etc/resolv.conf` read once at start-up, retrying over TCP when an answer is
-  truncated. `getaddrinfo` is never called. Answers, including negative ones,
-  are cached per worker.
-- **PostgreSQL** (`Postgres.swift`, `PostgresPool.swift`, `GarudaPostgres`):
-  a pool per worker, built by `app.state` after the fork. TLS required by
-  default, SCRAM-SHA-256, parameters bound separately from SQL, a per-connection
-  prepared-statement cache, binary results for common types on repeated
-  statements, and transactions. `TimedWait.swift` bounds a wait for a pooled
-  connection.
+Each shard watches for its own signals. On `SIGTERM` with `--drain-delay`, it
+first marks itself unready: the health check answers 503 and HTTP/1.1
+connections close after their response. Then, or at once on `SIGINT` or
+`SIGQUIT`, WebSockets are sent a 1001 close, HTTP/2 connections a GOAWAY once
+their WebSockets have closed, HTTP/3 connections a GOAWAY; the accept loops
+stop; and what is in progress has `--graceful-timeout` to finish. Then the
+shard stops its scheduled jobs, runs its `onShardStop` hooks, shuts its state
+down newest first, and exits.
 
 ---
 
-## Keeping allocation off the request path
+## Keeping allocation and sharing off the request path
 
-- Connections are slab entries reached by pointer, not objects.
-- `ByteBuffer` is a pointer and three integers with an explicit `destroy()`.
-  Read buffers come from a LIFO `BufferPool`.
-- The parser yields offsets. Routes match bytes. Header values, parameters and
-  the body reach a handler as byte spans unless it asks for a `String`.
-- Request headers live in one worker-wide table. A request whose table was
-  overwritten by another request's parse has its head parsed again from bytes
-  that stay in place, never copied.
-- `setInterest` skips `epoll_ctl` when the mask is unchanged.
-- `accept4`, `TCP_NODELAY`, `sendfile` for static files in the clear,
-  `recvmmsg` and UDP GSO for QUIC.
+- A request's bytes stay where they arrived; the parser records offsets.
+  Header values, parameters and the body reach a handler as `Span`s unless it
+  asks for a `String`.
+- The route table and middleware chains are compiled once and only read.
+- Connection parts and HTTP/2 streams, with their exchanges and buffers, are
+  reused; a warm connection's stream costs no allocation. Stream tasks are
+  pooled.
+- Metrics are a row per worker thread, written by that thread alone.
+- `sendfile` for static files over cleartext HTTP/1.1, and UDP GSO for QUIC.
 
-Classes are used where the cost is per process or per connection:
-`H2Connection`, `H3Connection`, `QUICConnection`, `QUICListener`, the handler
-task pool, the supervisor's state.
+`Tests/GarudaTests/AllocationTests.swift` counts allocations on the request
+path.
 
-## Limits
-
-- `--max-header-size`, a header count limit, and `--max-body` counted
-  cumulatively on every protocol. `--max-connections` per worker.
-- A write buffer that grew past four read-buffer sizes is freed once drained.
-- A stream moves bytes to its connection only while the connection's write
-  buffer is under the write high-water mark (512 KiB). A streamed response
-  waits above that mark and resumes at the low-water mark (128 KiB).
-- `sweepTimeouts` enforces `--keep-alive` on idle connections and
-  `--request-timeout` on a head, body, write or streamed response that stopped
-  moving. HTTP/2 connections time out only when they have no streams. QUIC uses
-  its negotiated idle timeout.
-
-## Not wired to handlers yet
-
-- **Response compression and the response cache** do not apply to handler
-  responses. Pre-compressed static files (`--compress-static`) are served.
+---
 
 ## Testing
 
-- `swift test`: parser, HPACK, QUIC packet protection and streams, route
-  table, middleware, extraction, JSON, async ops, handler tasks (including the
-  allocation count), deadlines, streaming responses, response hooks, outbound
-  connections, HTTP client, DNS, PostgreSQL wire and session (plus integration
-  tests against a server), and the fuzz corpus. Handlers are driven through
-  `TestClient`, which adopts one end of a socket pair into a worker's table.
+- `swift test`: the wire layer (parser, HPACK, QPACK, frames), QUIC (packet
+  protection against RFC 9001's vectors, streams, a handshake against the
+  tests' own QUIC client), the route table, middleware, extraction, JSON,
+  HTTP/1.1, HTTP/2 and HTTP/3 serving, WebSocket, the HTTP client, the
+  allocation counts, and the database products against real servers when one
+  is reachable. Handlers are driven through `app.test` (`GarudaTesting`), which
+  runs the real HTTP/1 connection over an in-memory stream.
+- `Tests/CompileFail`: handler code that must not compile, such as a borrowed
+  body stored past the handler.
 - `scripts/`: end-to-end suites against independent clients, including
   `http2-test.py` (`h2`), `http3-test.py` and `webtransport-test.py`
-  (`aioquic`), `router-streams-test.py`, `handler-test.py` (against
-  `garuda-conformance`), `feature-test.py`, and shell scripts for ACME, static
-  files, rate limiting, redirects, SNI, draining and reload.
-- `pgfuzz`: see [fuzz/README.md](fuzz/README.md).
+  (`aioquic`), `handler-test.py` against `garuda-conformance`, and shell
+  scripts for static files, compression, the cache, rate limiting, redirects,
+  request IDs, draining and reload; `upload-test.py` for streamed request
+  bodies and resumable uploads.
+- `pgfuzz`: a mutation fuzzer over 14 targets (`GarudaFuzzTargets`), from the
+  HTTP/1.1, HPACK, QPACK, WebSocket, QUIC, JSON, Redis and PostgreSQL parsers
+  to whole HTTP/2, HTTP/3 and QUIC connections, each checking invariants
+  beyond not crashing. `swift test` replays the seeds and `fuzz/corpus`
+  (`GarudaFuzzTests`), and CI runs the fuzzer under AddressSanitizer.
+  [fuzz/README.md](fuzz/README.md) has the targets.

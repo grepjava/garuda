@@ -1,9 +1,8 @@
 //===----------------------------------------------------------------------===//
 // Authorization: who may reach a route, once it is known whose request it is.
 //
-// Authentication says who is asking (Authentication.swift, JWT.swift, and the
-// session stores). This says whether they may, as a rule named once and used
-// wherever it applies:
+// Authentication says who is asking (Authentication.swift, JWT.swift). This
+// says whether they may, as a rule named once and used wherever it applies:
 //
 //     extension Policy where Value == User {
 //         static let admin = Policy(needs: "an administrator") { $0.role == .admin }
@@ -33,11 +32,17 @@
 // the closure form of `authorize`; a rule about one row -- whether this order
 // is this customer's -- belongs in the handler, which has the row, and throws
 // `AuthorizationError(needs:)` to answer the same way.
+//
+// Each `authorize` is one middleware: it reads the context the authentication
+// in front of it filled, and either calls `next` or throws.
+//
+// Each `authorize` also writes its 403, saying what would have been enough,
+// into the OpenAPI entry of every route in its scope (`describeForbidden`).
 //===----------------------------------------------------------------------===//
 
 /// A named rule about who may reach a route.
 ///
-/// `Sendable`, because a policy is written once and used from every worker: a
+/// `Sendable`, because a policy is written once and used from every thread: a
 /// `static let` is how a rule is named, and that is a global.
 public struct Policy<Value>: Sendable {
     /// What the route needs, written to follow "this route needs": "an
@@ -102,6 +107,19 @@ public struct AuthorizationError: ResponseError, Equatable, Hashable, Sendable {
     }
 }
 
+/// `authorize`: the rule about what is under `Key`.
+struct ContextAuthorization<Key: RequestContextKey>: Middleware {
+    let needs: String?
+    let allows: @Sendable (Key.Value) async throws -> Bool
+
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
+        guard let who = request[context: Key.self] else { throw HTTPError.unauthorized }
+        guard try await allows(who) else { throw AuthorizationError(needs: needs) }
+        try await next()
+    }
+}
+
 extension RouteBuilder {
     /// Requires `policy` of whoever the request belongs to, for every route in
     /// the current scope. It runs in the order of `use`, so it goes after the
@@ -112,43 +130,26 @@ extension RouteBuilder {
     /// authenticates with, and the `authenticate` in front of it is what
     /// challenges a request that brought no credentials at all.
     public func authorize<Key: RequestContextKey>(_ key: Key.Type, _ policy: Policy<Key.Value>) {
+        let allows = policy.allows
+        use(ContextAuthorization<Key>(needs: policy.needs) { allows($0) })
         describeForbidden(policy.needs)
-        use { request, _ in
-            guard let who = request[context: key] else { throw HTTPError.unauthorized }
-            guard policy.allows(who) else { throw AuthorizationError(needs: policy.needs) }
-            return nil
-        }
     }
 
     /// `authorize` with the rule written where it is used rather than named:
     ///
     ///     app.authorize(CurrentUser.self, needs: "an administrator") { $0.role == .admin }
-    public func authorize<Key: RequestContextKey>(
-        _ key: Key.Type, needs: String? = nil, _ allows: @escaping (Key.Value) -> Bool
-    ) {
-        describeForbidden(needs)
-        use { request, _ in
-            guard let who = request[context: key] else { throw HTTPError.unauthorized }
-            guard allows(who) else { throw AuthorizationError(needs: needs) }
-            return nil
-        }
-    }
-
-    /// `authorize` for a rule that has to ask something: whether this account
-    /// is a member of this project, whether the subscription is paid up. It
-    /// runs on every request in the scope, so what it asks should be quick or
-    /// cached; a rule about the row a handler is about belongs in the handler.
+    ///
+    /// The rule may await, for one that has to ask something: whether this
+    /// account is a member of this project, whether the subscription is paid
+    /// up. It runs on every request in the scope, so what it asks should be
+    /// quick or cached; a rule about the row a handler is about belongs in
+    /// the handler.
     public func authorize<Key: RequestContextKey>(
         _ key: Key.Type, needs: String? = nil,
-        _ allows: sending @escaping (Key.Value) async throws -> Bool
+        _ allows: @escaping @Sendable (Key.Value) async throws -> Bool
     ) {
-        nonisolated(unsafe) let allows = allows
+        use(ContextAuthorization<Key>(needs: needs, allows: allows))
         describeForbidden(needs)
-        use { request, _ async throws -> (any ResponseConvertible)? in
-            guard let who = request[context: key] else { throw HTTPError.unauthorized }
-            guard try await allows(who) else { throw AuthorizationError(needs: needs) }
-            return nil
-        }
     }
 
     /// Requires `policy` of the claims of the token `authenticate(jwt:)`
@@ -157,32 +158,19 @@ extension RouteBuilder {
     ///     app.authenticate(jwt: AccessClaims.self, verifier: keys)
     ///     app.authorize(jwt: AccessClaims.self, .scope("orders:write"))
     public func authorize<Claims: Decodable>(jwt claims: Claims.Type, _ policy: Policy<Claims>) {
+        let allows = policy.allows
+        use(ContextAuthorization<JWTContextKey<Claims>>(needs: policy.needs) { allows($0.claims) })
         describeForbidden(policy.needs)
-        use { request, _ in
-            guard let jwt = request[context: JWTContextKey<Claims>.self] else {
-                throw HTTPError.unauthorized
-            }
-            guard policy.allows(jwt.claims) else { throw AuthorizationError(needs: policy.needs) }
-            return nil
-        }
     }
 
     /// `authorize(jwt:)` with the rule written where it is used.
     public func authorize<Claims: Decodable>(
-        jwt claims: Claims.Type, needs: String? = nil, _ allows: @escaping (Claims) -> Bool
+        jwt claims: Claims.Type, needs: String? = nil, _ allows: @escaping @Sendable (Claims) -> Bool
     ) {
+        use(ContextAuthorization<JWTContextKey<Claims>>(needs: needs) { allows($0.claims) })
         describeForbidden(needs)
-        use { request, _ in
-            guard let jwt = request[context: JWTContextKey<Claims>.self] else {
-                throw HTTPError.unauthorized
-            }
-            guard allows(jwt.claims) else { throw AuthorizationError(needs: needs) }
-            return nil
-        }
     }
-}
 
-extension RouteBuilder {
     /// The 403 every route in this scope can now answer, in the OpenAPI
     /// document, saying what would have been enough.
     func describeForbidden(_ needs: String?) {

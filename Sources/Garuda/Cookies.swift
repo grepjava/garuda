@@ -5,18 +5,25 @@
 //     app.post("/login") { request, response in
 //         response.setCookie(Cookie("theme", "dark"))
 //         response.setCookie(Cookie("session", token), key: keys, .encrypted)
+//         response.send(status: .noContent)
 //     }
 //     app.get("/") { request, response in
 //         let theme = request.cookie("theme") ?? "light"
 //         let session = request.cookie("session", key: keys, .encrypted)   // nil if tampered with
+//         …
 //     }
+//
+// **Reading.** The Cookie headers are read where they arrived, byte by byte;
+// only the value asked for becomes a String. `request.cookies`, and the
+// `Cookies` extractor, make every one of them into a dictionary, for the
+// handler that wants them all.
 //
 // **Defaults.** A cookie made here is `Path=/`, `HttpOnly` and
 // `SameSite=Lax` unless it says otherwise, and `Secure` when the request came
-// over HTTPS (directly, or from a trusted proxy that said so). Those are the
-// settings a session cookie wants, and the ones a cookie gets wrong most when
-// they have to be remembered. `SameSite=None` is always `Secure`, since
-// browsers refuse it otherwise.
+// over HTTPS (`Request.arrivedOverHTTPS`). Those are the settings a session
+// cookie wants, and the ones a cookie gets wrong most when they have to be
+// remembered. `SameSite=None` is always `Secure`, since browsers refuse it
+// otherwise.
 //
 // **Values.** RFC 6265 allows a cookie value only a subset of ASCII. A plain
 // cookie's value must already be in it -- `setCookie` refuses one that is not,
@@ -28,7 +35,7 @@
 // cookies can be neither read nor changed: AES-256-GCM with a random nonce,
 // the name as associated data. Either way the name is bound in, so a value
 // cannot be moved from one cookie to another, and a cookie that fails its
-// check reads as absent.
+// check reads as absent. The cryptography is VegaCrypto's.
 //
 // A `CookieKey` is a secret of at least 32 bytes. Signing and encryption use
 // different keys derived from it with HKDF. Previous secrets can be given
@@ -36,10 +43,8 @@
 // one, so a secret can be replaced without logging everyone out.
 //===----------------------------------------------------------------------===//
 
-import CAvian
-import AvianCore
-import AvianHTTP
-import GarudaPostgres
+import GarudaWire
+import VegaCrypto
 
 /// A cookie to set.
 public struct Cookie: Sendable, Equatable {
@@ -56,9 +61,9 @@ public struct Cookie: Sendable, Equatable {
     /// Seconds until the cookie expires. Nil for a cookie that ends with the
     /// browser session; 0 or less removes it.
     public var maxAge: Int? = nil
-    /// When the cookie expires, for clients older than Max-Age. Usually left
-    /// nil in favour of `maxAge`.
-    public var expires: Timestamp? = nil
+    /// When the cookie expires, in seconds since the Unix epoch, for clients
+    /// older than Max-Age. Usually left nil in favour of `maxAge`.
+    public var expires: Int64? = nil
     /// Nil: `Secure` when the request came over HTTPS.
     public var secure: Bool? = nil
     public var httpOnly = true
@@ -121,34 +126,17 @@ public struct CookieKey: Sendable {
 
     /// A new 32-byte secret in base64url, to generate once and keep.
     public static func randomSecret() -> String {
-        base64URLEncode(randomBytes(32))
+        base64URLEncode(SecureRandom.bytes(32))
     }
 
     private static func derive(_ secret: [UInt8]) -> Derived {
-        var prk = [UInt8](repeating: 0, count: 32)
-        let salt = Array("garuda cookies".utf8)
-        let extracted = secret.withUnsafeBytes { s in
-            salt.withUnsafeBytes { a in
-                prk.withUnsafeMutableBytes { o in
-                    av_hkdf_extract(Int32(AV_SHA256), a.baseAddress, a.count, s.baseAddress, s.count,
-                                    o.baseAddress!.assumingMemoryBound(to: UInt8.self))
-                }
-            }
-        }
-        precondition(extracted >= 0, "HKDF is unavailable")
+        let prk = HKDF.extract(.sha256, salt: Array("garuda cookies".utf8), inputKeyMaterial: secret)
         func expand(_ info: String) -> [UInt8] {
-            var out = [UInt8](repeating: 0, count: 32)
-            let label = Array(info.utf8)
-            let rc = prk.withUnsafeBytes { p in
-                label.withUnsafeBytes { l in
-                    out.withUnsafeMutableBytes { o in
-                        av_hkdf_expand(Int32(AV_SHA256), p.baseAddress, p.count, l.baseAddress, l.count,
-                                       o.baseAddress!.assumingMemoryBound(to: UInt8.self), 32)
-                    }
-                }
+            do {
+                return try HKDF.expand(.sha256, pseudoRandomKey: prk, info: Array(info.utf8), length: 32)
+            } catch {
+                preconditionFailure("HKDF is unavailable: \(error)")
             }
-            precondition(rc >= 0, "HKDF is unavailable")
-            return out
         }
         return Derived(signing: expand("signing"), encryption: expand("encryption"))
     }
@@ -160,51 +148,101 @@ extension Request {
     /// The value of the cookie `name`, or nil. When a client sends the name
     /// twice, the first is taken: browsers send the most specific path first.
     public func cookie(_ name: String) -> String? {
-        var found: String? = nil
-        forEachCookie { cookieName, value in
-            if found == nil && cookieName == name { found = value }
+        let x = exchange
+        var wanted = name
+        return wanted.withUTF8 { wanted -> String? in
+            var found: String? = nil
+            x.pointee.forEachCookie { cookieName, value in
+                guard cookieName.equals(wanted) else { return true }
+                found = value.string
+                return false
+            }
+            return found
         }
-        return found
     }
 
     /// Every cookie the request carries, the first value of each name.
     public var cookies: [String: String] {
         var all: [String: String] = [:]
-        forEachCookie { name, value in
-            if all[name] == nil { all[name] = value }
+        exchange.pointee.forEachCookie { name, value in
+            let key = name.string
+            if all[key] == nil { all[key] = value.string }
+            return true
         }
         return all
     }
 
     /// The value of a signed or encrypted cookie, or nil when it is absent or
-    /// fails its check under every secret `key` holds.
+    /// fails its check under every secret `key` holds. A copy that fails does
+    /// not hide a genuine one sent after it under the same name.
     public func cookie(_ name: String, key: CookieKey, _ protection: CookieProtection) -> String? {
-        var found: String? = nil
-        forEachCookie { cookieName, value in
-            guard found == nil, cookieName == name else { return }
-            found = unprotectCookie(name: name, value: value, key: key, protection)
+        let x = exchange
+        var wanted = name
+        return wanted.withUTF8 { wanted -> String? in
+            var found: String? = nil
+            x.pointee.forEachCookie { cookieName, value in
+                guard cookieName.equals(wanted) else { return true }
+                found = unprotectCookie(name: name, value: value.string, key: key, protection)
+                return found == nil
+            }
+            return found
         }
-        return found
     }
+}
 
-    /// Calls `body` with each name and value in the Cookie headers, in order.
-    /// HTTP/2 and HTTP/3 clients may send one header per cookie.
-    func forEachCookie(_ body: (String, String) -> Void) {
-        forEachHeader { name, value in
-            guard name.count == 6, equalsLowercasedSpan(name, "cookie") else { return }
-            let text = value.string
-            for pair in text.split(separator: ";", omittingEmptySubsequences: true) {
-                let trimmed = pair.drop { $0 == " " || $0 == "\t" }
-                guard let equals = trimmed.firstIndex(of: "=") else { continue }
-                let cookieName = trimmed[..<equals].trimmingTrailingSpaces()
-                var cookieValue = trimmed[trimmed.index(after: equals)...].trimmingTrailingSpaces()
-                if cookieValue.count >= 2, cookieValue.hasPrefix("\""), cookieValue.hasSuffix("\"") {
-                    cookieValue = String(cookieValue.dropFirst().dropLast())
+extension Exchange {
+    /// Calls `body` with each cookie's name and value in the Cookie headers,
+    /// in order, until it returns false. HTTP/2 and HTTP/3 clients may send
+    /// one header per cookie. A pair is `name=value` between semicolons,
+    /// spaces around it dropped and a quoted value unquoted; one without `=`
+    /// or with no name is passed over.
+    func forEachCookie(_ body: (ByteSpan, ByteSpan) -> Bool) {
+        var h = 0
+        while h < head.headerCount {
+            let header = headers[h]
+            h &+= 1
+            guard header.name.count == 6, equalsLowercased(base + Int(header.name.offset), 6, "cookie") else {
+                continue
+            }
+            let v = header.value.span(in: base).base
+            let n = Int(header.value.count)
+            var p = 0
+            while p < n {
+                var end = p
+                while end < n && v[end] != 0x3B { end &+= 1 }               // ;
+                var start = p
+                while start < end && isCookieSpace(v[start]) { start &+= 1 }
+                var equals = start
+                while equals < end && v[equals] != 0x3D { equals &+= 1 }   // =
+                if equals < end {
+                    var nameEnd = equals
+                    while nameEnd > start && isCookieSpace(v[nameEnd &- 1]) { nameEnd &-= 1 }
+                    var valueStart = equals &+ 1
+                    var valueEnd = end
+                    while valueEnd > valueStart && isCookieSpace(v[valueEnd &- 1]) { valueEnd &-= 1 }
+                    if valueEnd &- valueStart >= 2 && v[valueStart] == 0x22 && v[valueEnd &- 1] == 0x22 {
+                        valueStart &+= 1
+                        valueEnd &-= 1
+                    }
+                    if nameEnd > start,
+                       !body(ByteSpan(v + start, nameEnd &- start), ByteSpan(v + valueStart, valueEnd &- valueStart)) {
+                        return
+                    }
                 }
-                guard !cookieName.isEmpty else { continue }
-                body(cookieName, cookieValue)
+                p = end &+ 1
             }
         }
+    }
+}
+
+@inline(__always)
+private func isCookieSpace(_ c: UInt8) -> Bool { c == 0x20 || c == 0x09 }
+
+extension ByteSpan {
+    /// Whether the span holds exactly `bytes`.
+    func equals(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard count == bytes.count else { return false }
+        return count == 0 || memcmpEqual(base, bytes.baseAddress!, count)
     }
 }
 
@@ -214,7 +252,7 @@ public struct Cookies: RequestExtractor, Sendable {
 
     public subscript(_ name: String) -> String? { all[name] }
 
-    public static func extract(from request: borrowing Request, parameter: inout Int) throws -> Cookies {
+    public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Cookies {
         Cookies(all: request.cookies)
     }
 }
@@ -224,10 +262,11 @@ public struct Cookies: RequestExtractor, Sendable {
 extension Response {
     /// Adds a Set-Cookie header for `cookie`. False, adding nothing, when its
     /// name is not a token, its value holds a character a cookie value may
-    /// not, or its path or domain holds `;` or a control character.
+    /// not, its path or domain holds `;` or a control character, or the
+    /// response has already been written.
     @discardableResult
     public func setCookie(_ cookie: Cookie) -> Bool {
-        guard isActive, let header = setCookieHeader(cookie, value: cookie.value) else { return false }
+        guard let header = setCookieHeader(cookie, value: cookie.value) else { return false }
         return addHeader("set-cookie", header)
     }
 
@@ -235,7 +274,7 @@ extension Response {
     /// encrypted with `key`'s current secret. Its value may be any string.
     @discardableResult
     public func setCookie(_ cookie: Cookie, key: CookieKey, _ protection: CookieProtection) -> Bool {
-        guard isActive else { return false }
+        guard !exchange.pointee.committed else { return false }
         let value = protectCookie(name: cookie.name, value: cookie.value, key: key, protection)
         guard let header = setCookieHeader(cookie, value: value) else { return false }
         return addHeader("set-cookie", header)
@@ -246,13 +285,12 @@ extension Response {
     @discardableResult
     public func removeCookie(_ name: String, path: String? = "/", domain: String? = nil) -> Bool {
         var cookie = Cookie(name, "", path: path, domain: domain, maxAge: 0)
-        cookie.expires = Timestamp(secondsSinceEpoch: 0)
+        cookie.expires = 0
         return setCookie(cookie)
     }
 
     func setCookieHeader(_ cookie: Cookie, value: String) -> String? {
-        let https = String(describing: worker.pointee.requestScheme(slot)) == "https"
-        return Garuda.setCookieHeader(cookie, value: value, https: https)
+        Garuda.setCookieHeader(cookie, value: value, https: Request(exchange).arrivedOverHTTPS)
     }
 }
 
@@ -272,10 +310,11 @@ func setCookieHeader(_ cookie: Cookie, value: String, https: Bool) -> String? {
     }
     if let maxAge = cookie.maxAge { header += "; Max-Age=\(max(0, maxAge))" }
     if let expires = cookie.expires {
-        var date = [CChar](repeating: 0, count: 30)
-        let seconds = expires.microsecondsSinceEpoch / 1_000_000
-        _ = date.withUnsafeMutableBufferPointer { av_http_date($0.baseAddress!, seconds) }
-        header += "; Expires=" + String(decoding: date.prefix(29).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        let date = String(unsafeUninitializedCapacity: 29) { buffer in
+            DateCache.format(expires, into: buffer.baseAddress!)
+            return 29
+        }
+        header += "; Expires=" + date
     }
     let secure = cookie.secure ?? https
     if secure || cookie.sameSite == Cookie.SameSite.none { header += "; Secure" }
@@ -306,26 +345,6 @@ func isAttributeValue(_ value: String) -> Bool {
     value.utf8.allSatisfy { $0 >= 0x20 && $0 != 0x7F && $0 != 0x3B }
 }
 
-func equalsLowercasedSpan(_ span: Span<UInt8>, _ literal: StaticString) -> Bool {
-    guard span.count == literal.utf8CodeUnitCount else { return false }
-    for i in span.indices {
-        var c = span[i]
-        if c >= 0x41 && c <= 0x5A { c |= 0x20 }
-        if c != literal.utf8Start[i] { return false }
-    }
-    return true
-}
-
-extension Substring {
-    func trimmingTrailingSpaces() -> String {
-        var end = endIndex
-        while end > startIndex, self[index(before: end)] == " " || self[index(before: end)] == "\t" {
-            end = index(before: end)
-        }
-        return String(self[..<end])
-    }
-}
-
 /// The value to send for a protected cookie.
 func protectCookie(name: String, value: String, key: CookieKey, _ protection: CookieProtection) -> String {
     let current = key.keys[0]
@@ -334,9 +353,14 @@ func protectCookie(name: String, value: String, key: CookieKey, _ protection: Co
         let encoded = base64URLEncode(Array(value.utf8))
         return encoded + "." + base64URLEncode(cookieMAC(current.signing, name: name, encoded: encoded))
     case .encrypted:
-        let nonce = randomBytes(12)
-        let sealed = aeadSeal(current.encryption, nonce: nonce, aad: Array(name.utf8), Array(value.utf8))
-        return base64URLEncode(nonce + sealed)
+        let nonce = SecureRandom.bytes(AEADAlgorithm.nonceByteCount)
+        do {
+            let aead = try AEAD(.aes256GCM, key: current.encryption)
+            let sealed = try aead.seal(nonce: nonce, aad: Array(name.utf8), plaintext: Array(value.utf8))
+            return base64URLEncode(nonce + sealed)
+        } catch {
+            preconditionFailure("AES-256-GCM failed to seal: \(error)")
+        }
     }
 }
 
@@ -347,17 +371,21 @@ func unprotectCookie(name: String, value: String, key: CookieKey, _ protection: 
         guard let dot = value.lastIndex(of: "."),
               let mac = base64Decode(String(value[value.index(after: dot)...])), mac.count == 32 else { return nil }
         let encoded = String(value[..<dot])
-        for keys in key.keys where constantTimeEquals(cookieMAC(keys.signing, name: name, encoded: encoded), mac) {
+        for keys in key.keys where ConstantTime.equals(cookieMAC(keys.signing, name: name, encoded: encoded), mac) {
             guard let bytes = base64Decode(encoded) else { return nil }
             return String(validating: bytes, as: UTF8.self)
         }
         return nil
     case .encrypted:
-        guard let bytes = base64Decode(value), bytes.count >= 12 + 16 else { return nil }
-        let nonce = Array(bytes[0..<12])
-        let sealed = Array(bytes[12...])
+        let tag = AEADAlgorithm.tagByteCount
+        let nonceCount = AEADAlgorithm.nonceByteCount
+        guard let bytes = base64Decode(value), bytes.count >= nonceCount + tag else { return nil }
+        let nonce = Array(bytes[0..<nonceCount])
+        let sealed = Array(bytes[nonceCount...])
+        let aad = Array(name.utf8)
         for keys in key.keys {
-            if let plain = aeadOpen(keys.encryption, nonce: nonce, aad: Array(name.utf8), sealed) {
+            guard let aead = try? AEAD(.aes256GCM, key: keys.encryption) else { return nil }
+            if let plain = try? aead.open(nonce: nonce, aad: aad, ciphertext: sealed) {
                 return String(validating: plain, as: UTF8.self)
             }
         }
@@ -366,95 +394,5 @@ func unprotectCookie(name: String, value: String, key: CookieKey, _ protection: 
 }
 
 private func cookieMAC(_ key: [UInt8], name: String, encoded: String) -> [UInt8] {
-    let message = Array((name + "=" + encoded).utf8)
-    var out = [UInt8](repeating: 0, count: 32)
-    let rc = key.withUnsafeBytes { k in
-        message.withUnsafeBytes { m in
-            out.withUnsafeMutableBytes { o in
-                av_hmac(Int32(AV_SHA256), k.baseAddress, k.count, m.baseAddress, m.count,
-                        o.baseAddress!.assumingMemoryBound(to: UInt8.self))
-            }
-        }
-    }
-    precondition(rc >= 0, "HMAC-SHA256 is unavailable")
-    return out
-}
-
-private func aeadSeal(_ key: [UInt8], nonce: [UInt8], aad: [UInt8], _ plain: [UInt8]) -> [UInt8] {
-    guard let aead = key.withUnsafeBufferPointer({ av_aead_new(Int32(AV_AEAD_AES256GCM), $0.baseAddress) }) else {
-        fatalError("AES-256-GCM is unavailable")
-    }
-    defer { av_aead_free(aead) }
-    var out = [UInt8](repeating: 0, count: plain.count + 16)
-    let n = nonce.withUnsafeBufferPointer { nb in
-        aad.withUnsafeBytes { a in
-            plain.withUnsafeBytes { p in
-                out.withUnsafeMutableBufferPointer { o in
-                    av_aead_seal(aead, nb.baseAddress, a.baseAddress, a.count, p.baseAddress, p.count, o.baseAddress)
-                }
-            }
-        }
-    }
-    precondition(n == plain.count + 16, "AES-256-GCM failed to seal")
-    return out
-}
-
-private func aeadOpen(_ key: [UInt8], nonce: [UInt8], aad: [UInt8], _ sealed: [UInt8]) -> [UInt8]? {
-    guard let aead = key.withUnsafeBufferPointer({ av_aead_new(Int32(AV_AEAD_AES256GCM), $0.baseAddress) }) else {
-        return nil
-    }
-    defer { av_aead_free(aead) }
-    var out = [UInt8](repeating: 0, count: sealed.count)
-    let n = nonce.withUnsafeBufferPointer { nb in
-        aad.withUnsafeBytes { a in
-            sealed.withUnsafeBytes { s in
-                out.withUnsafeMutableBufferPointer { o in
-                    av_aead_open(aead, nb.baseAddress, a.baseAddress, a.count, s.baseAddress, s.count, o.baseAddress)
-                }
-            }
-        }
-    }
-    guard n >= 0 else { return nil }
-    return Array(out.prefix(n))
-}
-
-func randomBytes(_ count: Int) -> [UInt8] {
-    var raw = [UInt8](repeating: 0, count: count)
-    guard raw.withUnsafeMutableBytes({ av_random_bytes($0.baseAddress, $0.count) }) == 0 else {
-        fatalError("the system's random number generator failed")
-    }
-    return raw
-}
-
-func base64URLEncode(_ bytes: [UInt8]) -> String {
-    var out: [UInt8] = []
-    for c in Base64.encode(bytes).utf8 {
-        switch c {
-        case UInt8(ascii: "+"): out.append(UInt8(ascii: "-"))
-        case UInt8(ascii: "/"): out.append(UInt8(ascii: "_"))
-        case UInt8(ascii: "="): break
-        default: out.append(c)
-        }
-    }
-    return String(decoding: out, as: UTF8.self)
-}
-
-/// Base64 or base64url, padded or not.
-func base64Decode(_ text: String) -> [UInt8]? {
-    var standard: [UInt8] = []
-    for c in text.utf8 {
-        switch c {
-        case UInt8(ascii: "-"): standard.append(UInt8(ascii: "+"))
-        case UInt8(ascii: "_"): standard.append(UInt8(ascii: "/"))
-        case UInt8(ascii: "="): break
-        case UInt8(ascii: "A")...UInt8(ascii: "Z"), UInt8(ascii: "a")...UInt8(ascii: "z"),
-             UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "+"), UInt8(ascii: "/"):
-            standard.append(c)
-        default:
-            return nil
-        }
-    }
-    if standard.count % 4 == 1 { return nil }
-    while standard.count % 4 != 0 { standard.append(UInt8(ascii: "=")) }
-    return Base64.decode(String(decoding: standard, as: UTF8.self))
+    HMAC.authenticationCode(.sha256, key: key, data: Array((name + "=" + encoded).utf8))
 }

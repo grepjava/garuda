@@ -1,5 +1,6 @@
-import Testing
 @testable import Garuda
+import GarudaTesting
+import Testing
 
 // Authorization: a named rule, what it answers, and where it runs.
 
@@ -32,7 +33,7 @@ private struct ScopedToken: Codable, Sendable, ScopedClaims {
 /// An application whose scopes each require something different.
 private func peopleApp() -> Application {
     let app = Application()
-    app.get("/open") { "open" }
+    app.get("/open") { () in "open" }
     app.group("/admin") {
         app.authenticate(bearer: CurrentPerson.self) { people[$0] }
         app.authorize(CurrentPerson.self, .admin)
@@ -42,14 +43,19 @@ private func peopleApp() -> Application {
         app.authenticate(bearer: CurrentPerson.self) { people[$0] }
         // Either role, and paid either way: the rule reads as the answer does.
         app.authorize(CurrentPerson.self, Policy.admin.or(.billing).and(.paid))
-        app.get("") { "invoices" }
+        app.get("/") { () in "invoices" }
     }
     app.group("/reports") {
         app.authenticate(bearer: CurrentPerson.self) { people[$0] }
         app.authorize(CurrentPerson.self, needs: "the reporting role") { $0.roles.contains("reports") }
-        app.get("") { "reports" }
+        app.get("/") { () in "reports" }
     }
     return app
+}
+
+/// The body of an error answer.
+private struct ErrorAnswer: Decodable {
+    let error: String
 }
 
 @Suite("Authorization", .serialized)
@@ -79,7 +85,7 @@ struct AuthorizationTests {
         #expect(try client.get("/invoices", headers: [("authorization", "Bearer grace")]).text == "invoices")
         let refused = try client.get("/invoices", headers: [("authorization", "Bearer mary")])
         #expect(refused.status == .forbidden)
-        #expect(try refused.json(ErrorBody.self).error
+        #expect(try refused.json(ErrorAnswer.self).error
                     == "this route needs an administrator or the billing role and a paid account")
     }
 
@@ -87,20 +93,31 @@ struct AuthorizationTests {
         let client = peopleApp().test
         let refused = try client.get("/reports", headers: [("authorization", "Bearer ada")])
         #expect(refused.status == .forbidden)
-        #expect(try refused.json(ErrorBody.self).error == "this route needs the reporting role")
+        #expect(try refused.json(ErrorAnswer.self).error == "this route needs the reporting role")
     }
 
     @Test func aRuleThatAwaits() throws {
         let app = Application()
         app.authenticate(bearer: CurrentPerson.self) { people[$0] }
         app.authorize(CurrentPerson.self, needs: "a member") { person async throws -> Bool in
-            await loopYield()
+            await Task.yield()
             return person.name != "mary"
         }
-        app.get("/project") { "project" }
+        app.get("/project") { () in "project" }
         let client = app.test
         #expect(try client.get("/project", headers: [("authorization", "Bearer ada")]).text == "project")
         #expect(try client.get("/project", headers: [("authorization", "Bearer mary")]).status == .forbidden)
+    }
+
+    @Test func aRuleWithNobodyToJudgeIs401() throws {
+        // An `authorize` with no `authenticate` in front: nothing under the
+        // key, so nothing is known about who is asking.
+        let app = Application()
+        app.authorize(CurrentPerson.self, .admin)
+        app.get("/x") { () in "x" }
+        let answer = try app.test.get("/x")
+        #expect(answer.status == .unauthorized)
+        #expect(answer.header("www-authenticate") == nil)
     }
 
     @Test func aRuleAboutPartOfAValue() throws {
@@ -109,7 +126,7 @@ struct AuthorizationTests {
         let app = Application()
         app.authenticate(bearer: CurrentPerson.self) { people[$0] }
         app.authorize(CurrentPerson.self, admin.about { (person: Person) in person.roles })
-        app.get("/thing") { "thing" }
+        app.get("/thing") { () in "thing" }
         let client = app.test
         #expect(try client.get("/thing", headers: [("authorization", "Bearer ada")]).text == "thing")
         #expect(try client.get("/thing", headers: [("authorization", "Bearer grace")]).status == .forbidden)
@@ -148,21 +165,21 @@ struct AuthorizationTests {
 struct ScopeDocumentationTests {
     private func documented() -> Application {
         let app = Application()
-        app.get("/open") { "open" }
+        app.get("/open") { () in "open" }
         app.group("/admin") {
             // A route registered before the rules, to show that a scope's
             // rules reach every route in it and not only those after them.
-            app.get("/first") { "first" }
+            app.get("/first") { () in "first" }
             app.authenticate(bearer: CurrentPerson.self) { people[$0] }
             app.authorize(CurrentPerson.self, .admin)
-            app.get("/stats") { "stats" }
-            app.get("/quiet") { "quiet" }
+            app.get("/stats") { () in "stats" }
+            app.get("/quiet") { () in "quiet" }
                 .response(.forbidden, "Only the owner may see this")
         }
         let router = Router()
         router.authenticate(basic: CurrentPerson.self, realm: "reports") { user, _ in people[user] }
         router.authorize(CurrentPerson.self, needs: "the reporting role") { $0.roles.contains("reports") }
-        router.get("/daily") { "daily" }
+        router.get("/daily") { () in "daily" }
         app.nest("/reports", router)
         return app
     }
@@ -207,6 +224,23 @@ struct ScopeDocumentationTests {
         #expect(app.openAPIJSON(info) == app.openAPIJSON(info))
     }
 
+    @Test func aRouterMountedTwiceIsGuardedOnlyWhereItIs() throws {
+        // A router's routes share their entries between the places it is
+        // mounted; what one scope says must not reach the other.
+        let router = Router()
+        router.get("/daily") { () in "daily" }
+        let app = Application()
+        app.group("/guarded") {
+            app.authenticate(bearer: CurrentPerson.self) { people[$0] }
+            app.merge(router)
+        }
+        app.nest("/public", router)
+        let paths = app.openAPIDocument(OpenAPIInfo(title: "Twice", version: "1"))["paths"]
+        #expect(paths?["/guarded/daily"]?["get"]?["security"] == [["bearerAuth": []]])
+        #expect(paths?["/public/daily"]?["get"]?["security"] == nil)
+        #expect(paths?["/public/daily"]?["get"]?["responses"]?["401"] == nil)
+    }
+
     @Test func aJWTScopeIsDocumentedAsAJWT() throws {
         let set = try JWTKeys([try JWTKey.generate(.ES256, keyID: "k")])
         let app = Application()
@@ -214,13 +248,24 @@ struct ScopeDocumentationTests {
         app.group("/orders") {
             app.authenticate(jwt: ScopedToken.self, verifier: set)
             app.authorize(jwt: ScopedToken.self, .scope("orders:write"))
-            app.post("") { "made" }
+            app.post("/") { () in "made" }
         }
         let document = app.openAPIDocument(OpenAPIInfo(title: "Orders", version: "1"))
         let post = document["paths"]?["/orders"]?["post"]
         #expect(post?["responses"]?["403"] == ["description": "Needs the scope orders:write"])
         #expect(post?["responses"]?["401"] == ["description": "No valid bearer token"])
         #expect(document["components"]?["securitySchemes"]?["bearerAuth"]?["bearerFormat"] == "JWT")
+    }
+
+    @Test func aJWTExtractorIsDocumentedAsABearerJWT() throws {
+        let app = Application()
+        app.get("/me") { (jwt: JWT<ScopedToken>) in jwt.claims.sub }
+        let document = app.openAPIDocument(OpenAPIInfo(title: "Me", version: "1"))
+        let me = document["paths"]?["/me"]?["get"]
+        #expect(me?["security"] == [["bearerAuth": []]])
+        #expect(me?["responses"]?["401"] == ["description": "No valid bearer token"])
+        #expect(document["components"]?["securitySchemes"]?["bearerAuth"]
+                    == ["type": "http", "scheme": "bearer", "bearerFormat": "JWT"])
     }
 }
 
@@ -243,20 +288,20 @@ struct ScopeAuthorizationTests {
     }
 
     @Test func aRouterGuardsItsOwnRoutesWithoutBeingHandedTheKeys() throws {
-        // What a feature module needs: the verifier comes from the worker, so
+        // What a feature module needs: the verifier comes from the shard, so
         // the router can be built and mounted on its own.
         let set = try JWTKeys([try JWTKey.generate(.ES256, keyID: "k")])
         let orders = Router()
         orders.authenticate(jwt: ScopedToken.self)
         orders.authorize(jwt: ScopedToken.self, .scope("orders:write"))
-        orders.post("") { (jwt: JWT<ScopedToken>) async in "made for \(jwt.claims.sub)" }
+        orders.post("/") { (jwt: JWT<ScopedToken>) async in "made for \(jwt.claims.sub)" }
 
         let app = Application()
         app.jwtVerifier { _ in set }
         app.nest("/orders", orders)
         let client = app.test
 
-        let future = Int(Timestamp.now.secondsSinceEpoch) + 3600
+        let future = Int(epochSeconds()) + 3600
         func bearer(_ scope: String) throws -> [(String, String)] {
             [("authorization",
               "Bearer " + (try set.sign(ScopedToken(sub: "ada", exp: future, scope: scope))))]
@@ -279,11 +324,11 @@ struct ScopeAuthorizationTests {
         app.group("/orders") {
             app.authenticate(jwt: ScopedToken.self, verifier: set)
             app.authorize(jwt: ScopedToken.self, .scope("orders:write"))
-            app.post("") { (jwt: JWT<ScopedToken>) async in "made for \(jwt.claims.sub)" }
+            app.post("/") { (jwt: JWT<ScopedToken>) async in "made for \(jwt.claims.sub)" }
         }
         let client = app.test
 
-        let future = Int(Timestamp.now.secondsSinceEpoch) + 3600
+        let future = Int(epochSeconds()) + 3600
         func bearer(_ scope: String?) throws -> [(String, String)] {
             [("authorization",
               "Bearer " + (try set.sign(ScopedToken(sub: "ada", exp: future, scope: scope))))]
@@ -297,5 +342,21 @@ struct ScopeAuthorizationTests {
         #expect(try client.post("/orders", body: "", headers: try bearer(nil)).status == .forbidden)
         // No token at all is the authentication's answer, not this one.
         #expect(try client.post("/orders", body: "").status == .unauthorized)
+    }
+
+    @Test func aRuleWrittenWhereItIsUsedAboutClaims() throws {
+        let set = try JWTKeys([try JWTKey.generate(.HS256)])
+        let app = Application()
+        app.authenticate(jwt: ScopedToken.self, verifier: set)
+        app.authorize(jwt: ScopedToken.self, needs: "ada") { $0.sub == "ada" }
+        app.get("/x") { () in "x" }
+        let client = app.test
+        let future = Int(epochSeconds()) + 3600
+        let ada = try set.sign(ScopedToken(sub: "ada", exp: future, scope: nil))
+        let bob = try set.sign(ScopedToken(sub: "bob", exp: future, scope: nil))
+        #expect(try client.get("/x", headers: [("authorization", "Bearer \(ada)")]).text == "x")
+        let refused = try client.get("/x", headers: [("authorization", "Bearer \(bob)")])
+        #expect(refused.status == .forbidden)
+        #expect(refused.text == #"{"error":"this route needs ada"}"#)
     }
 }

@@ -1,107 +1,128 @@
 //===----------------------------------------------------------------------===//
-// Routes whose handler only computes, run off the worker.
+// Routes whose handler blocks, run on the blocking pool.
 //
 //     app.offload.post("/thumbnail") { (image: Body<Upload>) -> Bytes in
 //         Bytes(resize(image.value.bytes), contentType: "image/png")
 //     }
 //
-// A worker is one thread, so a handler that computes for long holds up every
-// other request on it (SlowHandlers.swift). An offloaded route takes its
-// extractors on the worker as any typed route does, runs its handler on the
-// worker's blocking pool (BlockingPool.swift), and writes what the handler
+// A shard has a few worker threads, one a core, and every connection of the
+// shard is served on them. A handler that blocks its thread -- a synchronous
+// file read, a C library that waits on a lock or the network, a call into
+// something that sleeps -- takes one of those threads away from every other
+// request until it returns; a few of them at once and the shard stops
+// answering. An offloaded route takes its extractors on the worker as any
+// typed route does, runs its handler on Vega's blocking pool
+// (`Runtime.blocking`, Tokio's `spawn_blocking`), and writes what the handler
 // returned back on the worker, which serves other requests meanwhile. It is
-// `try await blocking { … }` around the whole handler, said where the route is
-// declared.
+// `try await Runtime.blocking { … }` around the whole handler, said where the
+// route is declared.
 //
-// Only a handler that computes can go: it is synchronous, so it cannot await
-// the database, Redis or the HTTP client, which belong to their worker and
-// refuse to be used from another thread. What it is handed and what it returns
-// cross to the pool's thread and back, so they must be `Sendable`. `State` is
-// not, so a worker's pools stay on their worker; `Cancellation` and `Session`
-// are, but point into the worker, and are refused when the route is
-// registered.
+// Work that only computes for long is the heavy lane's (HeavyLane.swift):
+// it bounds how many threads such handlers hold, measured or declared with
+// `app.heavy`, and keeps them on the workers, where they need no thread of
+// their own. Offloading is for work that does not compute while it holds its
+// thread.
+//
+// Only a synchronous handler can go: it runs on a pool thread, where nothing
+// awaits, so the work that awaits -- the database, the HTTP client -- belongs
+// in an ordinary async route. What it is handed and what it returns cross to
+// the pool's thread and back, so they must be `Sendable`. Every extractor is
+// a value copied out of the request, and `State` is shared by every thread of
+// its shard already, so any of them may be taken.
+//
+// A pool thread cannot be stopped. A deadline (Deadline.swift) does not cut
+// an offloaded handler short, and a client that goes away does not either:
+// the handler runs to its end and its answer is dropped.
 //===----------------------------------------------------------------------===//
 
-import AvianHTTP
+import GarudaWire
+import Vega
 
-/// The routes of a builder whose handlers run on the worker's blocking pool:
+/// The routes of a builder whose handlers run on the blocking pool:
 /// `app.offload.get(…)`.
 public struct OffloadedRoutes<Builder: RouteBuilder> {
+    @usableFromInline
     let builder: Builder
 
-    /// Registers an offloaded handler for `method` and `pattern`.
-    @discardableResult
-    public func on<each E: RequestExtractor & Sendable, R: ResponseConvertible & Sendable>(
-        _ method: HTTPMethod, _ pattern: String,
-        _ handler: @Sendable @escaping (repeat each E) throws -> R
-    ) -> OpenAPIOperation {
-        repeat requireOffloadable((each E).self, method, pattern)
-        builder.onAsync(method, pattern) { request, response in
-            var parameter = 0
-            let values = (repeat (each E).awaitsExtraction
-                ? try await extractForAsyncRoute((each E).self, request, &parameter, response)
-                : try (each E).extract(from: request, parameter: &parameter))
-            let answer = try await blocking { try handler(repeat each values) }
-            try answer.write(to: response)
-        }
-        return builder.documented(method, pattern, (repeat each E).self, R.self)
+    @usableFromInline
+    init(builder: Builder) {
+        self.builder = builder
     }
 
-    @discardableResult
+    /// Registers an offloaded handler for `method` and `pattern`, and returns
+    /// its OpenAPI entry, as a typed route does.
+    @inlinable @discardableResult
+    public func on<each E: RequestExtractor & Sendable, R: ResponseConvertible & Sendable>(
+        _ method: HTTPMethod, _ pattern: String,
+        _ handler: @escaping @Sendable (repeat each E) throws -> R
+    ) -> OpenAPIOperation {
+        // A typed route whose handler is the hop: the extractors are taken
+        // on the worker, the handler runs on the pool, and the answer is
+        // written back on the worker by the typed route's own code, which
+        // also notes the route for `problems()` and the OpenAPI document.
+        builder.on(method, pattern, offloading(handler))
+    }
+
+    @inlinable @discardableResult
     public func get<each E: RequestExtractor & Sendable, R: ResponseConvertible & Sendable>(
-        _ pattern: String, _ handler: @Sendable @escaping (repeat each E) throws -> R
+        _ pattern: String, _ handler: @escaping @Sendable (repeat each E) throws -> R
     ) -> OpenAPIOperation {
         on(.get, pattern, handler)
     }
 
-    @discardableResult
+    @inlinable @discardableResult
     public func post<each E: RequestExtractor & Sendable, R: ResponseConvertible & Sendable>(
-        _ pattern: String, _ handler: @Sendable @escaping (repeat each E) throws -> R
+        _ pattern: String, _ handler: @escaping @Sendable (repeat each E) throws -> R
     ) -> OpenAPIOperation {
         on(.post, pattern, handler)
     }
 
-    @discardableResult
+    @inlinable @discardableResult
     public func put<each E: RequestExtractor & Sendable, R: ResponseConvertible & Sendable>(
-        _ pattern: String, _ handler: @Sendable @escaping (repeat each E) throws -> R
+        _ pattern: String, _ handler: @escaping @Sendable (repeat each E) throws -> R
     ) -> OpenAPIOperation {
         on(.put, pattern, handler)
     }
 
-    @discardableResult
+    @inlinable @discardableResult
     public func patch<each E: RequestExtractor & Sendable, R: ResponseConvertible & Sendable>(
-        _ pattern: String, _ handler: @Sendable @escaping (repeat each E) throws -> R
+        _ pattern: String, _ handler: @escaping @Sendable (repeat each E) throws -> R
     ) -> OpenAPIOperation {
         on(.patch, pattern, handler)
     }
 
-    @discardableResult
+    @inlinable @discardableResult
     public func delete<each E: RequestExtractor & Sendable, R: ResponseConvertible & Sendable>(
-        _ pattern: String, _ handler: @Sendable @escaping (repeat each E) throws -> R
+        _ pattern: String, _ handler: @escaping @Sendable (repeat each E) throws -> R
     ) -> OpenAPIOperation {
         on(.delete, pattern, handler)
     }
 }
 
-extension RouteBuilder {
-    /// Registers routes whose handlers only compute, and run on the worker's
-    /// blocking pool rather than on the worker: `app.offload.get(…)`.
-    public var offload: OffloadedRoutes<Self> { OffloadedRoutes(builder: self) }
+/// `handler` as an async handler that runs it on the blocking pool.
+@inlinable
+func offloading<each E: Sendable, R: Sendable>(
+    _ handler: @escaping @Sendable (repeat each E) throws -> R
+) -> @concurrent @Sendable (repeat each E) async throws -> R {
+    { (values: repeat each E) async throws -> R in
+        try await Runtime.blocking { try handler(repeat each values) }
+    }
 }
 
-/// An extractor that is `Sendable` but points into its worker, and so cannot
-/// be handed to an offloaded handler.
-protocol WorkerBoundExtractor {}
+/// --blocking-queue: the shard's blocking pool lets that much work wait for
+/// a thread (ShardOptions.blockingQueue), and refuses more with
+/// `BlockingQueueFull`, which answers 503 -- for `app.offload` routes and
+/// for any handler's own `Runtime.blocking`, as Garuda 1's pool refused
+/// whatever was handed to it. Work left to wait longer than any client
+/// will is worse than none: a pool that cannot keep up only gets further
+/// behind, and a refusal says so at once.
+extension BlockingQueueFull: ResponseError {
+    public var status: HTTPStatus { .serviceUnavailable }
+    public var reason: String? { "the blocking pool is full" }
+}
 
-extension Cancellation: WorkerBoundExtractor {}
-extension Session: WorkerBoundExtractor {}
-extension Optional: WorkerBoundExtractor where Wrapped: WorkerBoundExtractor {}
-extension Result: WorkerBoundExtractor where Success: WorkerBoundExtractor {}
-
-/// Stops the program when an offloaded route takes an extractor that points
-/// into its worker.
-func requireOffloadable<E: RequestExtractor>(_ type: E.Type, _ method: HTTPMethod, _ pattern: String) {
-    precondition(!(E.self is any WorkerBoundExtractor.Type),
-                 "route \(pattern): \(E.self) belongs to the worker, so an offloaded handler "
-                    + "cannot take it; register the route without offload")
+extension RouteBuilder {
+    /// Registers routes whose handlers block, and run on the blocking pool
+    /// rather than on one of the shard's worker threads: `app.offload.get(…)`.
+    public var offload: OffloadedRoutes<Self> { OffloadedRoutes(builder: self) }
 }

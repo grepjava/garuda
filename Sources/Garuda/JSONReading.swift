@@ -18,7 +18,8 @@
 // Codable way for a type that does not.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
+import GarudaWire
+
 
 /// A key just read from an object, as the bytes it is: matching one costs a
 /// length and a comparison rather than a `String`.
@@ -333,7 +334,9 @@ public struct JSONReader {
     }
 
     /// The magnitude and sign just read, as the type that asked for them.
-    @usableFromInline
+    /// Inlinable, so it is specialized where `@JSON` code calls it, rather
+    /// than run generically through the type's witnesses.
+    @inlinable
     func narrow<T: FixedWidthInteger>(_ magnitude: UInt64, negative: Bool,
                                               to type: T.Type) throws -> T {
         if negative {

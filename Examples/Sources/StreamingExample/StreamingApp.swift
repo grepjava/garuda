@@ -8,22 +8,30 @@
 //
 // What it shows:
 //
-// - `EventStream` for events, with keep-alive comments and the stream ending
-//   when the handler returns.
+// - `EventStream` for events, with keep-alive comments (`--sse-keep-alive`)
+//   and the stream ending when the handler returns.
 // - `StreamingBody` for a body too large to build in memory. A write waits
 //   while the client is behind, so a slow reader slows the producer, not the
 //   server's memory.
-// - `onStreamingBody` for an upload read as it arrives, with a size limit of
-//   its own. Unread bytes hold back the client, so the disk sets the pace.
-//   The file I/O runs on the blocking pool.
+// - An upload read as it arrives (`onStreamingBody`), with a size limit of
+//   its own, and written to disk a buffer at a time through VegaFS. The body
+//   is never all in memory, and the disk sets the pace: the client is let
+//   send more only as the handler reads.
+// - An offloaded route (`app.offload`) for a handler that blocks on the file
+//   system: it runs on Vega's blocking pool rather than on one of the shard's
+//   worker threads.
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Garuda
+import Vega
+import VegaFS
 
 struct CountdownQuery: Decodable {
     let from: Int?
@@ -47,41 +55,31 @@ private func validName(_ name: String) -> Bool {
     }
 }
 
-/// A file descriptor, handed to the blocking pool and back.
-private struct Descriptor: Sendable {
-    let fd: Int32
-}
-
-/// Why a file operation failed, with the errno.
-struct FileError: Error {
-    let operation: String
-    let errno: Int32
-}
-
 /// The streaming examples, storing uploads in `uploadDirectory`, which must
-/// exist. `tickMilliseconds` is how far apart countdown events are.
-public func streamingApp(uploadDirectory: String, tickMilliseconds: UInt64 = 1000,
-                         maxUploadBytes: Int = 1 << 30) -> Application {
+/// exist. `tick` is how far apart countdown events are.
+public func streamingApp(uploadDirectory: String, tick: Duration = .seconds(1),
+                         maxUploadBytes: Int = 64 << 20) -> Application {
     let app = Application()
 
-    app.get("/countdown") { (query: Query<CountdownQuery>) async throws in
+    app.get("/countdown") { (query: Query<CountdownQuery>) in
         let from = min(max(query.value.from ?? 10, 0), 60)
-        return EventStream(keepAlive: 15_000) { events in
+        return EventStream { events in
             for n in stride(from: from, through: 1, by: -1) {
                 try await events.send(String(n), event: "tick", id: String(n))
-                try await events.sleep(milliseconds: tickMilliseconds)
+                // Throws when the client goes away, which ends the loop.
+                try await events.sleep(for: tick)
             }
             try await events.send("liftoff", event: "done")
             // Returning ends the stream.
         }
     }
 
-    app.get("/export.csv") { (query: Query<ExportQuery>) async throws in
+    app.get("/export.csv") { (query: Query<ExportQuery>) in
         let rows = min(max(query.value.rows ?? 1000, 0), 10_000_000)
         return StreamingBody(contentType: "text/csv") { body in
             try await body.write("id,square,label\n")
             // Rows are batched into writes of about 64 KiB, rather than one
-            // write per row.
+            // write per row. A write waits while the client is behind.
             var batch = ""
             batch.reserveCapacity(70_000)
             for id in 0..<rows {
@@ -95,69 +93,44 @@ public func streamingApp(uploadDirectory: String, tickMilliseconds: UInt64 = 100
         }
     }
 
+    // Read as it arrives, never more than `maxUploadBytes`: a declared length
+    // past it is answered 413 before the handler runs, and a body that grows
+    // past it makes the read throw, which answers 413.
     app.onStreamingBody(.put, "/uploads/:name", maxBodySize: maxUploadBytes) { request, response, body in
         let name = request.parameter(0)
-        guard validName(name) else {
-            // Answered without reading the body; the engine discards it, or
-            // closes an HTTP/1.1 connection with too much of it left.
-            response.send(status: .badRequest)
-            return
-        }
+        guard validName(name) else { throw HTTPError(.badRequest, "not an upload name") }
         let final = uploadDirectory + "/" + name
         let partial = final + ".partial"
-
         // Written to a partial file and renamed when complete, so a reader
         // never sees half an upload under its name.
-        let file = try await blocking { () throws -> Descriptor in
-            let fd = open(partial, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-            guard fd >= 0 else { throw FileError(operation: "open", errno: errno) }
-            return Descriptor(fd: fd)
-        }
-        var written = 0
-        var descriptorOpen = true
+        var bytes = 0
         do {
-            while let chunk = try await body.read() {
-                try await blocking {
-                    var offset = 0
-                    while offset < chunk.count {
-                        let n = chunk.withUnsafeBytes { write(file.fd, $0.baseAddress! + offset, $0.count - offset) }
-                        if n < 0 && errno == EINTR { continue }
-                        guard n > 0 else { throw FileError(operation: "write", errno: errno) }
-                        offset += n
-                    }
-                }
-                written += chunk.count
+            let file = try await File.create(partial, permissions: 0o644)
+            var buffer = IOBuffer(capacity: 256 * 1024)
+            // A read waits for the client, a write for the disk; neither holds
+            // a worker thread meanwhile.
+            while try await body.read(into: &buffer) > 0 {
+                try await file.write(buffer)
+                bytes += buffer.count
+                buffer.clear()
             }
-            // Closed in here whatever happens, so the descriptor is never
-            // closed twice -- a second close could hit a file opened since.
-            descriptorOpen = false
-            try await blocking {
-                let synced = fsync(file.fd) == 0 ? 0 : errno
-                close(file.fd)
-                guard synced == 0 else { throw FileError(operation: "fsync", errno: synced) }
-                guard rename(partial, final) == 0 else { throw FileError(operation: "rename", errno: errno) }
-            }
+            try await file.sync()
+            try await FileSystem.rename(partial, to: final)
         } catch {
-            // Cut off, too large, or the disk refused: nothing is kept.
-            let stillOpen = descriptorOpen
-            try? await blocking {
-                if stillOpen { close(file.fd) }
-                unlink(partial)
-            }
+            // Too large, cut off, or the disk said no: nothing is left behind.
+            try? await FileSystem.removeFile(partial)
             throw error
         }
-        try response.send(status: .created, json: UploadInfo(name: name, bytes: written))
+        try response.send(status: .created, json: UploadInfo(name: name, bytes: bytes))
     }
 
-    app.get("/uploads/:name") { (name: Path<String>) async throws -> JSON<UploadInfo>? in
+    // `stat` blocks on the disk, so this handler is offloaded: it runs on the
+    // blocking pool, and the worker thread goes on serving.
+    app.offload.get("/uploads/:name") { (name: Path<String>) throws -> JSON<UploadInfo>? in
         guard validName(name.value) else { throw HTTPError(.badRequest, "not an upload name") }
-        let path = uploadDirectory + "/" + name.value
-        let size = try await blocking { () -> Int? in
-            var info = stat()
-            guard stat(path, &info) == 0 else { return nil }
-            return Int(info.st_size)
-        }
-        return size.map { JSON(UploadInfo(name: name.value, bytes: $0)) }
+        var info = stat()
+        guard stat(uploadDirectory + "/" + name.value, &info) == 0 else { return nil }
+        return JSON(UploadInfo(name: name.value, bytes: Int(info.st_size)))
     }
 
     return app

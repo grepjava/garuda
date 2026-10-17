@@ -1,0 +1,12 @@
+user      axum                128880 req/s   p50    0.490   p95    0.639   p99     0.724 ms   cpu    30 us/req   mem     6 MiB   errors 0
+json      axum                103609 req/s   p50    0.605   p95    0.962   p99     1.138 ms   cpu    38 us/req   mem     6 MiB   errors 0
+churn     axum                 24866 req/s   p50    2.553   p95    3.024   p99     3.824 ms   cpu   140 us/req   mem     6 MiB   errors 0
+skew      axum                 11873 req/s   p50    4.545   p95    7.503   p99     9.382 ms   cpu   342 us/req   mem     6 MiB   errors 0
+skew-slow axum                  1108 req/s   p50    7.262   p99    10.937 ms
+spike     axum                 34387 req/s   p50    0.461   p95    6.503   p99     7.831 ms   cpu   118 us/req   mem     7 MiB   errors 0
+h2        axum                 94516 req/s   p50    0.678   p95    0.845   p99     0.941 ms   cpu    42 us/req   mem     7 MiB   errors 0
+stream    axum                 31568 req/s   p50    2.002   p95    2.185   p99     2.380 ms   cpu    83 us/req   mem     7 MiB   errors 0
+download  axum                  2092 req/s   p50   30.569   p95   35.740   p99    42.788 ms   cpu  1803 us/req   mem     8 MiB   errors 0
+upload    axum                  1367 req/s   p50   46.257   p95   77.543   p99    88.211 ms   cpu  2934 us/req   mem    11 MiB   errors 0
+db        axum                 32528 req/s   p50    1.945   p95    2.725   p99     3.096 ms   cpu    79 us/req   mem    11 MiB   errors 0
+65 s

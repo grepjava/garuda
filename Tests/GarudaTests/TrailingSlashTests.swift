@@ -1,6 +1,6 @@
 import Testing
-@testable import Garuda
-import AvianHTTP
+import Garuda
+import GarudaTesting
 
 // A trailing slash no route has: exact by default, redirected, or ignored.
 
@@ -9,21 +9,16 @@ struct TrailingSlashTests {
     private func app(_ policy: TrailingSlash?) -> Application {
         let app = Application()
         if let policy { app.trailingSlash(policy) }
-        app.get("/users") { "users" }
+        app.get("/users") { () in "users" }
         app.post("/users") { request, response in response.send("created \(request.body.count)") }
         app.get("/users/:id") { (id: Path<String>) in "user \(id.value)" }
-        app.get("/docs/") { "docs with slash" }
-        app.get("/") { "root" }
-        app.put("/only-put") { "put" }
+        app.get("/docs/") { () in "docs with slash" }
+        app.get("/") { () in "root" }
+        app.put("/only-put") { () in "put" }
         app.group("/app") {
             app.fallback { _, response in response.send(status: .notFound, "app fallback") }
         }
-        app.group("/app") { app.get("/page") { "page" } }
-        app.onStreamingBody(.post, "/upload") { _, response, body in
-            var total = 0
-            while let bytes = try await body.read(maxBytes: 1000) { total += bytes.count }
-            response.send("streamed \(total)")
-        }
+        app.group("/app") { app.get("/page") { () in "page" } }
         return app
     }
 
@@ -70,29 +65,14 @@ struct TrailingSlashTests {
         #expect(try client.get("/only-put/").header("allow") == "PUT")
         #expect(try client.get("/docs/").text == "docs with slash")
         #expect(try client.get("/missing/").status == 404)
-        #expect(try client.post("/upload/", body: [UInt8](repeating: 1, count: 5000)).text == "streamed 5000")
-    }
-
-    @Test func aStreamingRouteKeepsItsOwnLimitWithoutTheSlash() throws {
-        let app = Application()
-        app.trailingSlash(.ignore)
-        app.onStreamingBody(.post, "/upload", maxBodySize: 1 << 20) { _, response, body in
-            var total = 0
-            while let bytes = try await body.read(maxBytes: 4096) { total += bytes.count }
-            response.send("streamed \(total)")
-        }
-        var config = ServerConfig()
-        config.maxConnections = 16
-        config.maxBodySize = 1000
-        let client = app.testClient(configuration: config)
-        // Matched at the head, so --max-body does not apply to it.
-        #expect(try client.post("/upload/", body: [UInt8](repeating: 1, count: 5000)).text == "streamed 5000")
+        #expect(try client.get("/app/page/").text == "page")
+        #expect(try client.get("/app/other/").text == "app fallback")
     }
 
     @Test func aRedirectNeverPointsAtAnotherHost() throws {
         let app = Application()
         app.trailingSlash(.redirect)
-        app.put("/*path") { "put" }
+        app.put("/*path") { () in "put" }
         let client = app.test
         #expect(try client.get("/files/").header("location") == "/files")
         let doubled = try client.get("//evil.example/")
@@ -102,5 +82,20 @@ struct TrailingSlashTests {
         let backslash = try client.get("/\\evil.example/")
         #expect(backslash.status == 405)
         #expect(backslash.header("location") == nil)
+    }
+
+    @Test func middlewareRunsForTheRouteAnIgnoredSlashReaches() throws {
+        let app = Application()
+        app.trailingSlash(.ignore)
+        app.group("/api") {
+            app.use { _, response, next in
+                response.addHeader("x-layer", "api")
+                try await next()
+            }
+            app.get("/items") { () in "items" }
+        }
+        let response = try app.test.get("/api/items/")
+        #expect(response.text == "items")
+        #expect(response.header("x-layer") == "api")
     }
 }

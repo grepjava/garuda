@@ -7,25 +7,31 @@
 //         app.authenticate(bearer: CurrentUser.self) { token in
 //             try await sessions.user(forToken: token)
 //         }
-//         app.get("/me") { (user: Context<CurrentUser>) in user.value }
+//         app.get("/me") { (user: Context<CurrentUser>) in JSON(user.value) }
 //     }
 //
 // `authenticate` is a middleware in the scope it is called in, in the order
 // of `use`. It reads the Authorization header, hands what it carries to the
-// closure, and keeps what the closure returns in the request's context for
-// the middleware and handlers after it. A request without the header, with a
-// malformed one, or whose credentials the closure returns nil for is answered
-// 401 with the WWW-Authenticate challenge RFC 9110 requires. A closure that
-// throws answers as a handler that throws does.
+// closure, and keeps what the closure returns in the request's context
+// (`request[context: CurrentUser.self]`) for the middleware and handlers
+// inside it. A request without the header, with a malformed one, or whose
+// credentials the closure returns nil for is answered 401 with the
+// WWW-Authenticate challenge RFC 9110 requires, and the handler never runs. A
+// closure that throws answers as a handler that throws does.
+//
+// The header is read where it lies; the only allocation is the String the
+// closure is handed.
 //
 // `BearerToken` and `BasicCredentials` are the same parsing as extractors, for
 // a handler that checks credentials itself. `constantTimeEquals` compares a
 // secret without telling a caller, by how long it took, how much was right.
+//
+// Each `authenticate` also writes its security scheme and its 401 into the
+// OpenAPI entry of every route in its scope (`describeBearerScope`,
+// `describeBasicScope`), when the document is built: nothing per request.
 //===----------------------------------------------------------------------===//
 
-import AvianCore
-import AvianHTTP
-import GarudaPostgres
+import GarudaWire
 
 /// The token of an `Authorization: Bearer` header (RFC 6750). A request
 /// without one is answered 401 with `WWW-Authenticate: Bearer`.
@@ -36,11 +42,8 @@ public struct BearerToken: RequestExtractor, Sendable {
         self.token = token
     }
 
-    public static func extract(from request: borrowing Request, parameter: inout Int) throws -> Self {
-        guard let header = request.header("authorization"), let token = parseBearer(header) else {
-            request.worker.pointee.addHeader(request.slot, "www-authenticate", "Bearer")
-            throw HTTPError.unauthorized
-        }
+    public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Self {
+        guard let token = bearerToken(request) else { throw Unauthenticated(challenge: "Bearer") }
         return BearerToken(token)
     }
 }
@@ -56,13 +59,31 @@ public struct BasicCredentials: RequestExtractor, Sendable {
         self.password = password
     }
 
-    public static func extract(from request: borrowing Request, parameter: inout Int) throws -> Self {
-        guard let header = request.header("authorization"), let credentials = parseBasic(header) else {
-            request.worker.pointee.addHeader(request.slot, "www-authenticate", basicChallenge("restricted"))
-            throw HTTPError.unauthorized
+    public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> Self {
+        guard let credentials = basicCredentials(request) else {
+            throw Unauthenticated(challenge: basicChallenge("restricted"))
         }
         return credentials
     }
+}
+
+/// A request refused for want of credentials, or for the ones it brought:
+/// 401, with the `WWW-Authenticate` challenge that says what would do.
+///
+/// The challenge is added when the error becomes the answer, not before, so
+/// an extractor made optional -- `BearerToken?` -- that is refused leaves no
+/// challenge on a response that went on without it.
+public struct Unauthenticated: ResponseError, Equatable, Sendable {
+    /// The `WWW-Authenticate` value: `Bearer`, `Basic realm="…"`.
+    public var challenge: String
+    public var reason: String?
+
+    public init(challenge: String, reason: String? = nil) {
+        self.challenge = challenge
+        self.reason = reason
+    }
+
+    public var status: HTTPStatus { .unauthorized }
 }
 
 /// Whether `a` and `b` hold the same bytes, taking as long whichever byte
@@ -86,39 +107,48 @@ public func constantTimeEquals(_ a: String, _ b: String) -> Bool {
     }
 }
 
+// MARK: - Middleware
+
+/// `authenticate(bearer:)`.
+struct BearerAuthentication<Key: RequestContextKey>: Middleware {
+    let verify: @Sendable (_ token: String, _ request: borrowing Request) async throws -> Key.Value?
+
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
+        guard let token = bearerToken(request), let who = try await verify(token, request) else {
+            return challenge(response, "Bearer")
+        }
+        request[context: Key.self] = who
+        try await next()
+    }
+}
+
+/// `authenticate(basic:)`.
+struct BasicAuthentication<Key: RequestContextKey>: Middleware {
+    let challenge: String
+    let verify: @Sendable (_ username: String, _ password: String,
+                           _ request: borrowing Request) async throws -> Key.Value?
+
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
+        guard let credentials = basicCredentials(request),
+              let who = try await verify(credentials.username, credentials.password, request) else {
+            return Garuda.challenge(response, challenge)
+        }
+        request[context: Key.self] = who
+        try await next()
+    }
+}
+
 extension RouteBuilder {
     /// Requires an `Authorization: Bearer` token of every request in the
     /// current scope. `verify` returns who the token belongs to, kept under
     /// `key` in the request's context, or nil to answer 401.
     public func authenticate<Key: RequestContextKey>(
-        bearer key: Key.Type, _ verify: @escaping (_ token: String) throws -> Key.Value?
+        bearer key: Key.Type, _ verify: @escaping @Sendable (_ token: String) async throws -> Key.Value?
     ) {
+        use(BearerAuthentication<Key> { token, _ in try await verify(token) })
         describeBearerScope()
-        use { request, _ in
-            guard let header = request.header("authorization"), let token = parseBearer(header),
-                  let who = try verify(token) else {
-                return Challenge("Bearer")
-            }
-            request[context: key] = who
-            return nil
-        }
-    }
-
-    /// `authenticate(bearer:)` with a `verify` that awaits: a session store,
-    /// a database, another service.
-    public func authenticate<Key: RequestContextKey>(
-        bearer key: Key.Type, _ verify: sending @escaping (_ token: String) async throws -> Key.Value?
-    ) {
-        nonisolated(unsafe) let verify = verify
-        describeBearerScope()
-        use { request, _ async throws -> (any ResponseConvertible)? in
-            guard let header = request.header("authorization"), let token = parseBearer(header),
-                  let who = try await verify(token) else {
-                return Challenge("Bearer")
-            }
-            request[context: key] = who
-            return nil
-        }
     }
 
     /// Requires `Authorization: Basic` credentials of every request in the
@@ -127,91 +157,46 @@ extension RouteBuilder {
     /// `realm`.
     public func authenticate<Key: RequestContextKey>(
         basic key: Key.Type, realm: String = "restricted",
-        _ verify: @escaping (_ username: String, _ password: String) throws -> Key.Value?
+        _ verify: @escaping @Sendable (_ username: String, _ password: String) async throws -> Key.Value?
     ) {
-        let challenge = basicChallenge(realm)
+        use(BasicAuthentication<Key>(challenge: basicChallenge(realm)) { username, password, _ in
+            try await verify(username, password)
+        })
         describeBasicScope()
-        use { request, _ in
-            guard let header = request.header("authorization"), let credentials = parseBasic(header),
-                  let who = try verify(credentials.username, credentials.password) else {
-                return Challenge(challenge)
-            }
-            request[context: key] = who
-            return nil
-        }
     }
 
-    /// `authenticate(basic:)` with a `verify` that awaits.
-    public func authenticate<Key: RequestContextKey>(
-        basic key: Key.Type, realm: String = "restricted",
-        _ verify: sending @escaping (_ username: String, _ password: String) async throws -> Key.Value?
-    ) {
-        let challenge = basicChallenge(realm)
-        nonisolated(unsafe) let verify = verify
-        describeBasicScope()
-        use { request, _ async throws -> (any ResponseConvertible)? in
-            guard let header = request.header("authorization"), let credentials = parseBasic(header),
-                  let who = try await verify(credentials.username, credentials.password) else {
-                return Challenge(challenge)
-            }
-            request[context: key] = who
-            return nil
-        }
-    }
-}
-
-extension RouteBuilder {
     /// `authenticate(bearer:)` with what `app.state` built for `Service` in
-    /// the worker -- the database the sessions are in -- handed to `verify`.
+    /// the shard -- the database the sessions are in -- handed to `verify`.
     ///
     /// ```
-    /// app.authenticate(bearer: CurrentUser.self, state: SQLiteDatabase.self) { token, db in
-    ///     try await db.first(User.self, "select ... where token_digest = ?", Tokens.digest(token))
+    /// app.authenticate(bearer: CurrentUser.self, state: Database.self) { token, db in
+    ///     try await db.user(forTokenDigest: Tokens.digest(token))
     /// }
     /// ```
-    public func authenticate<Key: RequestContextKey, Service>(
+    ///
+    /// A shard without that state answers 500: the program never built it.
+    public func authenticate<Key: RequestContextKey, Service: Sendable>(
         bearer key: Key.Type, state service: Service.Type,
-        _ verify: sending @escaping (_ token: String, _ state: Service) async throws -> Key.Value?
+        _ verify: @escaping @Sendable (_ token: String, _ state: Service) async throws -> Key.Value?
     ) {
-        nonisolated(unsafe) let verify = verify
+        use(BearerAuthentication<Key> { token, request in
+            try await verify(token, try request.state(Service.self))
+        })
         describeBearerScope()
-        use { request, _ async throws -> (any ResponseConvertible)? in
-            let state = try request.state(Service.self)
-            guard let header = request.header("authorization"), let token = parseBearer(header) else {
-                return Challenge("Bearer")
-            }
-            nonisolated(unsafe) let unsafeState = state
-            guard let who = try await verify(token, unsafeState) else { return Challenge("Bearer") }
-            request[context: key] = who
-            return nil
-        }
     }
 
-    /// `authenticate(basic:)` with what `app.state` built for `Service` in the
-    /// worker handed to `verify`.
-    public func authenticate<Key: RequestContextKey, Service>(
+    /// `authenticate(basic:)` with what `app.state` built for `Service` in
+    /// the shard handed to `verify`.
+    public func authenticate<Key: RequestContextKey, Service: Sendable>(
         basic key: Key.Type, realm: String = "restricted", state service: Service.Type,
-        _ verify: sending @escaping (_ username: String, _ password: String, _ state: Service) async throws -> Key.Value?
+        _ verify: @escaping @Sendable (_ username: String, _ password: String, _ state: Service) async throws -> Key.Value?
     ) {
-        let challenge = basicChallenge(realm)
-        nonisolated(unsafe) let verify = verify
+        use(BasicAuthentication<Key>(challenge: basicChallenge(realm)) { username, password, request in
+            try await verify(username, password, try request.state(Service.self))
+        })
         describeBasicScope()
-        use { request, _ async throws -> (any ResponseConvertible)? in
-            let state = try request.state(Service.self)
-            guard let header = request.header("authorization"), let credentials = parseBasic(header) else {
-                return Challenge(challenge)
-            }
-            nonisolated(unsafe) let unsafeState = state
-            guard let who = try await verify(credentials.username, credentials.password, unsafeState) else {
-                return Challenge(challenge)
-            }
-            request[context: key] = who
-            return nil
-        }
     }
-}
 
-extension RouteBuilder {
     /// What every route of this scope takes and can answer, once an
     /// `authenticate` guards it. The same words the `BearerToken` and
     /// `BasicCredentials` extractors use, so a route guarded either way reads
@@ -231,18 +216,10 @@ extension RouteBuilder {
     }
 }
 
-/// A 401 with its challenge.
-struct Challenge: ResponseConvertible {
-    let value: String
-
-    init(_ value: String) {
-        self.value = value
-    }
-
-    func write(to response: borrowing Response) throws {
-        response.addHeader("www-authenticate", value)
-        try HTTPStatus.unauthorized.write(to: response)
-    }
+/// Answers 401 with the challenge `value`.
+func challenge(_ response: borrowing Response, _ value: String) {
+    response.addHeader("www-authenticate", value)
+    response.send(status: .unauthorized)
 }
 
 /// `Basic realm="…", charset="UTF-8"`, with the realm's quotes and
@@ -256,64 +233,84 @@ func basicChallenge(_ realm: String) -> String {
     return "Basic realm=\"\(quoted)\", charset=\"UTF-8\""
 }
 
-/// The credentials after an auth scheme, compared without regard to case,
-/// and the spaces that follow it. Nil for another scheme or nothing after it.
-private func credentials(_ header: String, scheme: String) -> Substring? {
-    let bytes = header.utf8
-    guard bytes.count > scheme.utf8.count else { return nil }
-    var index = bytes.startIndex
-    for expected in scheme.utf8 {
-        guard asciiLower(bytes[index]) == expected else { return nil }
-        index = bytes.index(after: index)
-    }
-    guard bytes[index] == 0x20 else { return nil }
-    let rest = header[index...].drop { $0 == " " }
-    return rest.isEmpty ? nil : rest
+// MARK: - Parsing
+
+/// The token of the request's Bearer header, or nil.
+func bearerToken(_ request: borrowing Request) -> String? {
+    guard let header = request.headerBytes("authorization") else { return nil }
+    return parseBearer(UnsafeBufferPointer(start: header.base, count: header.count))
+}
+
+/// The credentials of the request's Basic header, or nil.
+func basicCredentials(_ request: borrowing Request) -> BasicCredentials? {
+    guard let header = request.headerBytes("authorization") else { return nil }
+    return parseBasic(UnsafeBufferPointer(start: header.base, count: header.count))
 }
 
 /// The token68 of a Bearer header, or nil.
-///
-/// Read as bytes: it is on the path of every request a token guards.
 func parseBearer(_ header: String) -> String? {
     var header = header
-    return header.withUTF8 { bytes -> String? in
-        let scheme = 6
-        guard bytes.count > scheme + 1 else { return nil }
-        var i = 0
-        for expected in "bearer".utf8 {
-            guard asciiLower(bytes[i]) == expected else { return nil }
-            i += 1
-        }
-        guard bytes[i] == 0x20 else { return nil }
-        while i < bytes.count && bytes[i] == 0x20 { i += 1 }
-        guard i < bytes.count else { return nil }
-        let start = i
-        // token68: letters, digits, -._~+/ and trailing =.
-        var seenEquals = false
-        while i < bytes.count {
-            switch bytes[i] {
-            case UInt8(ascii: "="):
-                seenEquals = true
-            case UInt8(ascii: "a")...UInt8(ascii: "z"), UInt8(ascii: "A")...UInt8(ascii: "Z"),
-                 UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "-"), UInt8(ascii: "."),
-                 UInt8(ascii: "_"), UInt8(ascii: "~"), UInt8(ascii: "+"), UInt8(ascii: "/"):
-                if seenEquals { return nil }
-            default:
-                return nil
-            }
-            i += 1
-        }
-        return String(decoding: UnsafeBufferPointer(rebasing: bytes[start...]), as: UTF8.self)
+    return header.withUTF8 { parseBearer($0) }
+}
+
+/// The same, read as bytes: it is on the path of every request a token
+/// guards.
+func parseBearer(_ bytes: UnsafeBufferPointer<UInt8>) -> String? {
+    let scheme = 6
+    guard bytes.count > scheme + 1 else { return nil }
+    var i = 0
+    for expected in "bearer".utf8 {
+        guard asciiLower(bytes[i]) == expected else { return nil }
+        i += 1
     }
+    guard bytes[i] == 0x20 else { return nil }
+    while i < bytes.count && bytes[i] == 0x20 { i += 1 }
+    guard i < bytes.count else { return nil }
+    let start = i
+    // token68: letters, digits, -._~+/ and trailing =.
+    var seenEquals = false
+    while i < bytes.count {
+        switch bytes[i] {
+        case UInt8(ascii: "="):
+            seenEquals = true
+        case UInt8(ascii: "a")...UInt8(ascii: "z"), UInt8(ascii: "A")...UInt8(ascii: "Z"),
+             UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "-"), UInt8(ascii: "."),
+             UInt8(ascii: "_"), UInt8(ascii: "~"), UInt8(ascii: "+"), UInt8(ascii: "/"):
+            if seenEquals { return nil }
+        default:
+            return nil
+        }
+        i += 1
+    }
+    return String(decoding: UnsafeBufferPointer(rebasing: bytes[start...]), as: UTF8.self)
 }
 
 /// The user name and password of a Basic header, or nil for one that is not
 /// base64 of UTF-8 with a colon.
 func parseBasic(_ header: String) -> BasicCredentials? {
-    guard let encoded = credentials(header, scheme: "basic"),
-          let decoded = Base64.decode(String(encoded)),
-          let colon = decoded.firstIndex(of: UInt8(ascii: ":")) else { return nil }
-    guard let username = String(validating: decoded[..<colon], as: UTF8.self),
+    var header = header
+    return header.withUTF8 { parseBasic($0) }
+}
+
+func parseBasic(_ bytes: UnsafeBufferPointer<UInt8>) -> BasicCredentials? {
+    // The scheme, compared without regard to case, a space, and any more
+    // spaces before the credentials.
+    let scheme = 5
+    guard bytes.count > scheme + 1 else { return nil }
+    var i = 0
+    for expected in "basic".utf8 {
+        guard asciiLower(bytes[i]) == expected else { return nil }
+        i += 1
+    }
+    guard bytes[i] == 0x20 else { return nil }
+    while i < bytes.count && bytes[i] == 0x20 { i += 1 }
+    guard i < bytes.count else { return nil }
+    // The standard alphabet only, as StandardBase64.decode has it.
+    let encoded = UnsafeBufferPointer(rebasing: bytes[i...])
+    for byte in encoded where byte == UInt8(ascii: "-") || byte == UInt8(ascii: "_") { return nil }
+    guard let decoded = base64Decode(encoded),
+          let colon = decoded.firstIndex(of: UInt8(ascii: ":")),
+          let username = String(validating: decoded[..<colon], as: UTF8.self),
           let password = String(validating: decoded[(colon + 1)...], as: UTF8.self) else { return nil }
     return BasicCredentials(username: username, password: password)
 }

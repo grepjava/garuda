@@ -12,7 +12,7 @@
 //                            validation: JWTValidation(issuer: "shop"))
 //     app.jwtVerifier { _ in keys }
 //
-//     let token = try keys.sign(UserClaims(sub: "42", exp: Timestamp.now.secondsSinceEpoch + 900, role: "admin"))
+//     let token = try keys.sign(UserClaims(sub: "42", exp: now + 900, role: "admin"))
 //     app.get("/me") { (jwt: JWT<UserClaims>) in "user \(jwt.claims.sub)" }
 //
 // A token is three base64url parts: a header naming the algorithm and key, the
@@ -35,18 +35,23 @@
 // Keys: HMAC secrets (HS256/384/512, at least as long as the hash), and RSA
 // (RS and PS, 2048 bits and up), ECDSA (ES256/384/512) and Ed25519 (EdDSA)
 // from PEM or JWK. `JWTKey.generate` makes one. Verifying needs only the
-// public half; signing needs the private one.
+// public half; signing needs the private one. The cryptography is Vega's
+// (VegaCrypto); nothing here computes a hash or a signature itself.
+//
+// A shard's threads share one verifier. What a verify reads is immutable
+// once built -- the keys, the validation -- except the cache of headers seen
+// before, which a reader scans without a lock (`JWTHeaderCache`).
 //===----------------------------------------------------------------------===//
 
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
+#elseif os(Windows)
+import ucrt
 #endif
 import Synchronization
-import AvianCore
-import AvianHTTP
-import CGarudaJWT
+import VegaCrypto
 
 /// The signature algorithms of RFC 7518 and RFC 8037, by their JWS names.
 public enum JWTAlgorithm: String, Sendable, CaseIterable, Codable {
@@ -56,47 +61,25 @@ public enum JWTAlgorithm: String, Sendable, CaseIterable, Codable {
     case ES256, ES384, ES512
     case EdDSA
 
-    var code: Int32 {
-        switch self {
-        case .HS256: GJW_HS256
-        case .HS384: GJW_HS384
-        case .HS512: GJW_HS512
-        case .RS256: GJW_RS256
-        case .RS384: GJW_RS384
-        case .RS512: GJW_RS512
-        case .PS256: GJW_PS256
-        case .PS384: GJW_PS384
-        case .PS512: GJW_PS512
-        case .ES256: GJW_ES256
-        case .ES384: GJW_ES384
-        case .ES512: GJW_ES512
-        case .EdDSA: GJW_EDDSA
-        }
-    }
-
     /// Whether this is HS256, HS384 or HS512, signed with a shared secret.
     public var isHMAC: Bool { self == .HS256 || self == .HS384 || self == .HS512 }
 
-    /// The key type a key for this algorithm must be.
-    var keyType: Int32 {
+    /// VegaCrypto's name for a public-key algorithm; nil for HMAC. The JWS
+    /// names are the same.
+    var signatureAlgorithm: SignatureAlgorithm? {
+        isHMAC ? nil : SignatureAlgorithm(rawValue: rawValue)
+    }
+
+    /// The hash an HMAC algorithm uses.
+    var hash: HashAlgorithm {
         switch self {
-        case .HS256, .HS384, .HS512: 0
-        case .RS256, .RS384, .RS512, .PS256, .PS384, .PS512: GJW_KEY_RSA
-        case .ES256: GJW_KEY_EC_P256
-        case .ES384: GJW_KEY_EC_P384
-        case .ES512: GJW_KEY_EC_P521
-        case .EdDSA: GJW_KEY_ED25519
+        case .HS384: .sha384
+        case .HS512: .sha512
+        default: .sha256
         }
     }
 
-    var hashLength: Int {
-        switch self {
-        case .HS256: 32
-        case .HS384: 48
-        case .HS512: 64
-        default: 0
-        }
-    }
+    var hashLength: Int { isHMAC ? hash.byteCount : 0 }
 }
 
 /// Why a token or a key was refused.
@@ -138,39 +121,36 @@ public enum JWTError: Error, Equatable, Sendable, ResponseError {
     }
 }
 
+/// Seconds since the epoch, by the system's clock: what `exp` and `nbf` are
+/// compared with.
+func epochSeconds() -> Int64 {
+    Int64(time(nil))
+}
+
 // MARK: - Keys
 
 /// A key for one algorithm: an HMAC secret, or a public or private key.
-public final class JWTKey: @unchecked Sendable {
+public final class JWTKey: Sendable {
     public let algorithm: JWTAlgorithm
     /// The `kid` a token names this key by, if any.
     public let keyID: String?
-    let secret: [UInt8]
-    let handle: OpaquePointer?
-    /// An HMAC secret keyed once, for every token it checks.
-    private let mac: OpaquePointer?
-    /// Whether this key can sign: an HMAC secret or a private key.
-    public let canSign: Bool
+    /// An HMAC secret, keyed once for every token it checks.
+    let mac: HMAC?
+    /// The private key, when this key can sign with one.
+    let signing: SigningKey?
+    /// The public key; nil for an HMAC secret.
+    let publicKey: PublicKey?
 
-    private init(algorithm: JWTAlgorithm, keyID: String?, secret: [UInt8], handle: OpaquePointer?, canSign: Bool) {
+    /// Whether this key can sign: an HMAC secret or a private key.
+    public var canSign: Bool { mac != nil || signing != nil }
+
+    private init(algorithm: JWTAlgorithm, keyID: String?, mac: HMAC? = nil,
+                 signing: SigningKey? = nil, publicKey: PublicKey? = nil) {
         self.algorithm = algorithm
         self.keyID = keyID
-        self.secret = secret
-        self.handle = handle
-        self.canSign = canSign
-        mac = algorithm.isHMAC ? gjw_mac_new(algorithm.code, secret, secret.count) : nil
-    }
-
-    deinit {
-        if let handle { gjw_key_free(handle) }
-        if let mac { gjw_mac_free(mac) }
-    }
-
-    /// The MAC of `input` under this HMAC secret, or a negative length.
-    private func hmac(_ input: UnsafeBufferPointer<UInt8>, into out: UnsafeMutableBufferPointer<UInt8>) -> Int {
-        let data = input.baseAddress ?? UnsafePointer(bitPattern: 1)!
-        if let mac { return Int(gjw_mac_compute(mac, data, input.count, out.baseAddress, out.count)) }
-        return Int(gjw_hmac(algorithm.code, secret, secret.count, data, input.count, out.baseAddress, out.count))
+        self.mac = mac
+        self.signing = signing
+        self.publicKey = publicKey ?? signing?.publicKey
     }
 
     /// An HMAC secret, at least as many bytes as the algorithm's hash.
@@ -180,7 +160,13 @@ public final class JWTKey: @unchecked Sendable {
         guard secret.count >= algorithm.hashLength else {
             throw .invalidKey("an \(algorithm) secret is at least \(algorithm.hashLength) bytes")
         }
-        return JWTKey(algorithm: algorithm, keyID: keyID, secret: secret, handle: nil, canSign: true)
+        let mac: HMAC
+        do {
+            mac = try HMAC(algorithm.hash, key: secret)
+        } catch {
+            throw .invalidKey("the secret could not be keyed: \(error)")
+        }
+        return JWTKey(algorithm: algorithm, keyID: keyID, mac: mac)
     }
 
     public static func hmac(_ secret: String, algorithm: JWTAlgorithm = .HS256,
@@ -192,20 +178,33 @@ public final class JWTKey: @unchecked Sendable {
     /// private key, which also signs.
     public static func pem(_ pem: String, algorithm: JWTAlgorithm, keyID: String? = nil) throws(JWTError) -> JWTKey {
         guard !algorithm.isHMAC else { throw .invalidKey("an HMAC key is a secret, not PEM") }
-        var hasPrivate: Int32 = 0
-        var text = pem
-        let handle = text.withUTF8 { bytes in
-            bytes.withMemoryRebound(to: CChar.self) { gjw_key_from_pem($0.baseAddress, $0.count, &hasPrivate) }
+        // A private key first, since a public key is all a private key's PEM
+        // would give the other way round.
+        if let signing = try? SigningKey(pem: pem) {
+            try check(signing.publicKey, for: algorithm)
+            return JWTKey(algorithm: algorithm, keyID: keyID, signing: signing)
         }
-        return try wrap(handle, algorithm: algorithm, keyID: keyID, canSign: hasPrivate != 0)
+        let publicKey: PublicKey
+        do {
+            publicKey = try PublicKey(pem: pem)
+        } catch {
+            throw .invalidKey("not a public key, certificate or private key in PEM")
+        }
+        try check(publicKey, for: algorithm)
+        return JWTKey(algorithm: algorithm, keyID: keyID, publicKey: publicKey)
     }
 
     /// A new private key for `algorithm`.
     public static func generate(_ algorithm: JWTAlgorithm, keyID: String? = nil) throws(JWTError) -> JWTKey {
-        if algorithm.isHMAC {
-            return try hmac(randomBytes(algorithm.hashLength), algorithm: algorithm, keyID: keyID)
+        guard let signatureAlgorithm = algorithm.signatureAlgorithm else {
+            return try hmac(SecureRandom.bytes(algorithm.hashLength), algorithm: algorithm, keyID: keyID)
         }
-        return try wrap(gjw_key_generate(algorithm.keyType, 2048), algorithm: algorithm, keyID: keyID, canSign: true)
+        do {
+            let signing = try SigningKey.generate(signatureAlgorithm.keyType)
+            return JWTKey(algorithm: algorithm, keyID: keyID, signing: signing)
+        } catch {
+            throw .invalidKey("a \(algorithm) key could not be made: \(error)")
+        }
     }
 
     /// A public key from a JWK: `kty` RSA with `n` and `e`, EC with `crv`, `x`
@@ -222,112 +221,92 @@ public final class JWTKey: @unchecked Sendable {
             }
             return decoded
         }
+        let components: PublicKey.Components
+        let chosen: JWTAlgorithm
         switch jwk.kty {
         case "RSA":
             let n = try bytes(jwk.n, "n")
             let e = try bytes(jwk.e, "e")
-            guard let chosen = algorithm ?? named else { throw .invalidKey("an RSA JWK needs an algorithm") }
-            return try wrap(gjw_key_from_rsa(n, n.count, e, e.count), algorithm: chosen, keyID: jwk.kid, canSign: false)
+            guard let algorithm = algorithm ?? named else { throw .invalidKey("an RSA JWK needs an algorithm") }
+            components = .rsa(modulus: n, exponent: e)
+            chosen = algorithm
         case "EC":
-            let (type, curveAlgorithm): (Int32, JWTAlgorithm) = switch jwk.crv {
-            case "P-256": (GJW_KEY_EC_P256, .ES256)
-            case "P-384": (GJW_KEY_EC_P384, .ES384)
-            case "P-521": (GJW_KEY_EC_P521, .ES512)
+            let (curve, curveAlgorithm): (KeyType, JWTAlgorithm) = switch jwk.crv {
+            case "P-256": (.p256, .ES256)
+            case "P-384": (.p384, .ES384)
+            case "P-521": (.p521, .ES512)
             default: throw .invalidKey("an EC JWK's crv is P-256, P-384 or P-521")
             }
-            let x = try bytes(jwk.x, "x")
-            let y = try bytes(jwk.y, "y")
-            return try wrap(gjw_key_from_ec(type, x, x.count, y, y.count), algorithm: algorithm ?? named ?? curveAlgorithm,
-                            keyID: jwk.kid, canSign: false)
+            components = .ec(curve: curve, x: try bytes(jwk.x, "x"), y: try bytes(jwk.y, "y"))
+            chosen = algorithm ?? named ?? curveAlgorithm
         case "OKP":
             guard jwk.crv == "Ed25519" else { throw .invalidKey("an OKP JWK's crv is Ed25519") }
-            let x = try bytes(jwk.x, "x")
-            return try wrap(gjw_key_from_ed25519(x, x.count), algorithm: algorithm ?? .EdDSA, keyID: jwk.kid, canSign: false)
+            components = .ed25519(x: try bytes(jwk.x, "x"))
+            chosen = algorithm ?? .EdDSA
         case "oct":
             let k = try bytes(jwk.k, "k")
-            guard let chosen = algorithm ?? named else { throw .invalidKey("an oct JWK needs an algorithm") }
-            return try hmac(k, algorithm: chosen, keyID: jwk.kid)
+            guard let algorithm = algorithm ?? named else { throw .invalidKey("an oct JWK needs an algorithm") }
+            return try hmac(k, algorithm: algorithm, keyID: jwk.kid)
         default:
             throw .invalidKey("a JWK's kty is RSA, EC, OKP or oct")
         }
+        guard !chosen.isHMAC else { throw .invalidKey("a \(jwk.kty) JWK is not an HMAC secret") }
+        let publicKey: PublicKey
+        do {
+            publicKey = try PublicKey(components)
+        } catch {
+            throw .invalidKey("the JWK's members are not a key")
+        }
+        try check(publicKey, for: chosen)
+        return JWTKey(algorithm: chosen, keyID: jwk.kid, publicKey: publicKey)
     }
 
-    private static func wrap(_ handle: OpaquePointer?, algorithm: JWTAlgorithm, keyID: String?,
-                             canSign: Bool) throws(JWTError) -> JWTKey {
-        guard let handle else { throw .invalidKey("not a key libcrypto accepts, or an RSA key under 2048 bits") }
-        guard gjw_key_type(handle) == algorithm.keyType else {
-            gjw_key_free(handle)
+    /// Refuses a key that is not one for `algorithm`, or an RSA key too small
+    /// to trust.
+    private static func check(_ key: PublicKey, for algorithm: JWTAlgorithm) throws(JWTError) {
+        guard let signatureAlgorithm = algorithm.signatureAlgorithm, key.type == signatureAlgorithm.keyType else {
             throw .invalidKey("the key is not a key for \(algorithm)")
         }
-        return JWTKey(algorithm: algorithm, keyID: keyID, secret: [], handle: handle, canSign: canSign)
+        if key.type == .rsa && key.bits < 2048 { throw .invalidKey("an RSA key is at least 2048 bits") }
     }
 
     /// The public key as PEM, or nil for an HMAC secret.
-    public var publicPEM: String? { pem(privateKey: false) }
+    public var publicPEM: String? { publicKey?.pem }
 
     /// The private key as PKCS #8 PEM, or nil when there is none.
-    public var privatePEM: String? { canSign ? pem(privateKey: true) : nil }
-
-    private func pem(privateKey: Bool) -> String? {
-        guard let handle else { return nil }
-        let length = gjw_key_pem(handle, privateKey ? 1 : 0, nil, 0)
-        guard length > 0 else { return nil }
-        var out = [CChar](repeating: 0, count: length)
-        guard gjw_key_pem(handle, privateKey ? 1 : 0, &out, out.count) == length else { return nil }
-        return String(decoding: out.map { UInt8(bitPattern: $0) }, as: UTF8.self)
-    }
+    public var privatePEM: String? { signing?.pem }
 
     /// The public key as a JWK, for a key set others verify with. Nil for an
     /// HMAC secret, which is never published.
     public var publicJWK: JWK? {
-        guard let handle else { return nil }
+        guard let publicKey else { return nil }
         var jwk = JWK(kty: "", kid: keyID, alg: algorithm.rawValue, use: "sig")
-        switch gjw_key_type(handle) {
-        case GJW_KEY_RSA:
-            var n = [UInt8](repeating: 0, count: 1024)
-            var e = [UInt8](repeating: 0, count: 16)
-            var nLength = n.count
-            var eLength = e.count
-            guard gjw_key_rsa_numbers(handle, &n, &nLength, &e, &eLength) == 0 else { return nil }
+        switch publicKey.components {
+        case let .rsa(n, e):
             jwk.kty = "RSA"
-            jwk.n = base64URLEncode(Array(n.prefix(nLength)))
-            jwk.e = base64URLEncode(Array(e.prefix(eLength)))
-        case GJW_KEY_EC_P256, GJW_KEY_EC_P384, GJW_KEY_EC_P521:
-            var x = [UInt8](repeating: 0, count: 66)
-            var y = [UInt8](repeating: 0, count: 66)
-            var xLength = x.count
-            var yLength = y.count
-            guard gjw_key_ec_point(handle, &x, &xLength, &y, &yLength) == 0 else { return nil }
+            jwk.n = base64URLEncode(n)
+            jwk.e = base64URLEncode(e)
+        case let .ec(curve, x, y):
             jwk.kty = "EC"
-            jwk.crv = algorithm == .ES256 ? "P-256" : algorithm == .ES384 ? "P-384" : "P-521"
-            jwk.x = base64URLEncode(Array(x.prefix(xLength)))
-            jwk.y = base64URLEncode(Array(y.prefix(yLength)))
-        case GJW_KEY_ED25519:
-            var x = [UInt8](repeating: 0, count: 32)
-            var length = x.count
-            guard gjw_key_raw_public(handle, &x, &length) == 0 else { return nil }
+            jwk.crv = curve.curveName
+            jwk.x = base64URLEncode(x)
+            jwk.y = base64URLEncode(y)
+        case let .ed25519(x):
             jwk.kty = "OKP"
             jwk.crv = "Ed25519"
-            jwk.x = base64URLEncode(Array(x.prefix(length)))
-        default:
-            return nil
+            jwk.x = base64URLEncode(x)
         }
         return jwk
     }
 
     func sign(_ input: [UInt8]) throws(JWTError) -> [UInt8] {
-        guard canSign else { throw .cannotSign }
-        var out = [UInt8](repeating: 0, count: 1024)
-        let length: Int
-        if algorithm.isHMAC {
-            length = input.withUnsafeBufferPointer { data in
-                out.withUnsafeMutableBufferPointer { hmac(data, into: $0) }
-            }
-        } else {
-            length = gjw_sign(handle, algorithm.code, input, input.count, &out, out.count)
+        if let mac { return mac.authenticationCode(for: input) }
+        guard let signing, let signatureAlgorithm = algorithm.signatureAlgorithm else { throw .cannotSign }
+        do {
+            return try signing.signature(for: input, algorithm: signatureAlgorithm)
+        } catch {
+            throw .cannotSign
         }
-        guard length > 0 else { throw .cannotSign }
-        return Array(out.prefix(length))
     }
 
     func verify(_ input: [UInt8], signature: [UInt8]) -> Bool {
@@ -338,18 +317,17 @@ public final class JWTKey: @unchecked Sendable {
 
     /// Whether `signature` is this key's over `input`, read where they lie.
     func verify(_ input: UnsafeBufferPointer<UInt8>, signature: UnsafeBufferPointer<UInt8>) -> Bool {
-        if algorithm.isHMAC {
-            return withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 64) { mac in
-                let length = hmac(input, into: mac)
-                guard length > 0, signature.count == length else { return false }
-                var difference: UInt8 = 0
-                for i in 0..<length { difference |= mac[i] ^ signature[i] }
-                return difference == 0
-            }
+        if let mac {
+            let code = mac.authenticationCode(for: UnsafeRawBufferPointer(input))
+            guard signature.count == code.count else { return false }
+            // Every byte compared whichever differs: how long this takes says
+            // nothing about how much of a forged MAC was right.
+            var difference: UInt8 = 0
+            for i in 0..<code.count { difference |= code[i] ^ signature[i] }
+            return difference == 0
         }
-        let data = input.baseAddress ?? UnsafePointer(bitPattern: 1)!
-        let signed = signature.baseAddress ?? UnsafePointer(bitPattern: 1)!
-        return gjw_verify(handle, algorithm.code, data, input.count, signed, signature.count) == 1
+        guard let publicKey, let signatureAlgorithm = algorithm.signatureAlgorithm else { return false }
+        return publicKey.isValidSignature(Array(signature), for: Array(input), algorithm: signatureAlgorithm)
     }
 }
 
@@ -534,8 +512,9 @@ struct RegisteredClaims {
 public final class JWTKeys: @unchecked Sendable {
     public let keys: [JWTKey]
     public let validation: JWTValidation
-    /// Seconds since the epoch; tests set their own.
-    var clock: @Sendable () -> Int64 = { Timestamp.now.secondsSinceEpoch }
+    /// Seconds since the epoch; tests set their own, before the keys are
+    /// shared.
+    var clock: @Sendable () -> Int64 = { epochSeconds() }
     /// Headers already decoded: an issuer writes the same one on every token.
     let headers = JWTHeaderCache()
 
@@ -588,7 +567,7 @@ public final class JWTKeys: @unchecked Sendable {
     /// Everything read where it lies in the token's bytes: the header and
     /// its key from the cache when seen before, the signature checked over
     /// the first two parts in place, and the claims decoded from a scratch
-    /// buffer on the stack. Nothing is allocated but the claims themselves.
+    /// buffer on the stack.
     func check<Claims: Decodable>(_ token: String, as type: Claims.Type) throws -> Claims {
         guard token.utf8.count <= ParsedToken.maxBytes else { throw JWTError.malformed }
         var text = token
@@ -601,19 +580,19 @@ public final class JWTKeys: @unchecked Sendable {
             } else {
                 let header = try ParsedToken.header(headerPart)
                 key = self.key(for: header)
-                headers.keep(header, key: key, for: headerPart)
+                headers.keep(key, for: headerPart)
             }
             guard let key else { throw JWTError.unknownKey }
             let payloadPart = UnsafeBufferPointer(rebasing: all[(first + 1)..<second])
             let signaturePart = UnsafeBufferPointer(rebasing: all[(second + 1)...])
             let verified = withUnsafeTemporaryAllocation(of: UInt8.self, capacity: signaturePart.count) { signature in
-                guard let length = base64URLDecode(signaturePart, into: signature) else { return false }
+                guard let length = base64Decode(signaturePart, into: signature) else { return false }
                 return key.verify(UnsafeBufferPointer(rebasing: all[0..<second]),
                                   signature: UnsafeBufferPointer(rebasing: signature[0..<length]))
             }
             guard verified else { throw JWTError.badSignature }
             return try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: payloadPart.count) { scratch in
-                guard let length = base64URLDecode(payloadPart, into: scratch) else { throw JWTError.malformed }
+                guard let length = base64Decode(payloadPart, into: scratch) else { throw JWTError.malformed }
                 return try ParsedToken.validClaims(type, UnsafeBufferPointer(rebasing: scratch[0..<length]),
                                                    validation: validation, now: clock())
             }
@@ -649,8 +628,8 @@ struct ParsedToken {
             do throws(JWTError) {
                 let (first, second) = try ParsedToken.dots(all)
                 let header = try ParsedToken.header(UnsafeBufferPointer(rebasing: all[0..<first]))
-                guard let payload = base64URLDecode(UnsafeBufferPointer(rebasing: all[(first + 1)..<second])),
-                      let signature = base64URLDecode(UnsafeBufferPointer(rebasing: all[(second + 1)...])) else {
+                guard let payload = base64Decode(UnsafeBufferPointer(rebasing: all[(first + 1)..<second])),
+                      let signature = base64Decode(UnsafeBufferPointer(rebasing: all[(second + 1)...])) else {
                     return .failure(.malformed)
                 }
                 return .success((header, Array(all[0..<second]), payload, signature))
@@ -682,7 +661,7 @@ struct ParsedToken {
     /// The header part decoded and checked: an algorithm this knows, and no
     /// `crit`.
     static func header(_ part: UnsafeBufferPointer<UInt8>) throws(JWTError) -> JWTHeader {
-        guard let bytes = base64URLDecode(part),
+        guard let bytes = base64Decode(part),
               let decoded = try? JSONCoder.decode(JWTHeader.self, from: bytes) else { throw .malformed }
         if decoded.crit != nil { throw .unsupported("crit") }
         guard JWTAlgorithm(rawValue: decoded.alg) != nil else { throw .unsupported(decoded.alg) }
@@ -723,81 +702,64 @@ struct ParsedToken {
 /// Headers a key set has decoded and found usable, by their bytes, with the
 /// key each one names -- or none, for a header naming a key the set does not
 /// have. A handful at most: one per issuer and key, in practice.
-final class JWTHeaderCache: Sendable {
-    struct Entry: Sendable {
+///
+/// Read on every verify, from any of the shard's threads, and written almost
+/// never. So an entry, once published, never changes: a reader loads how many
+/// there are and scans that many, without a lock. Writers take one between
+/// themselves, and the cache only grows, to `capacity`.
+final class JWTHeaderCache: @unchecked Sendable {
+    struct Entry {
         let bytes: [UInt8]
-        let header: JWTHeader
         let key: JWTKey?
     }
 
-    private let entries = Mutex<[Entry]>([])
     static let capacity = 8
 
-    func entry(for bytes: UnsafeBufferPointer<UInt8>) -> Entry? {
-        entries.withLock { entries in
-            for entry in entries where entry.bytes.count == bytes.count {
-                let same = entry.bytes.withUnsafeBufferPointer {
-                    memcmp($0.baseAddress!, bytes.baseAddress!, bytes.count) == 0
-                }
-                if same { return entry }
-            }
-            return nil
-        }
+    private let entries = UnsafeMutablePointer<Entry>.allocate(capacity: JWTHeaderCache.capacity)
+    /// How many entries are published; each below it is initialized.
+    private let published = Atomic<Int>(0)
+    private let writing = Mutex<Void>(())
+
+    deinit {
+        entries.deinitialize(count: published.load(ordering: .acquiring))
+        entries.deallocate()
     }
 
-    func keep(_ header: JWTHeader, key: JWTKey?, for bytes: UnsafeBufferPointer<UInt8>) {
-        entries.withLock { entries in
+    func entry(for bytes: UnsafeBufferPointer<UInt8>) -> Entry? {
+        let count = published.load(ordering: .acquiring)
+        var i = 0
+        while i < count {
+            if Self.same(entries[i].bytes, bytes) { return entries[i] }
+            i &+= 1
+        }
+        return nil
+    }
+
+    func keep(_ key: JWTKey?, for bytes: UnsafeBufferPointer<UInt8>) {
+        writing.withLock { _ in
+            let count = published.load(ordering: .relaxed)
             // Full, the cache stays as it is: headers that vary without end
             // are decoded each time rather than churning it.
-            guard entries.count < JWTHeaderCache.capacity else { return }
-            entries.append(Entry(bytes: Array(bytes), header: header, key: key))
+            guard count < JWTHeaderCache.capacity else { return }
+            // Another thread may have kept the same header since this one
+            // looked.
+            for i in 0..<count where Self.same(entries[i].bytes, bytes) { return }
+            (entries + count).initialize(to: Entry(bytes: Array(bytes), key: key))
+            published.store(count + 1, ordering: .releasing)
         }
     }
-}
 
-/// base64url as JWS writes it -- no padding, though padding is let through --
-/// decoded from bytes. The standard alphabet's + and / are taken too.
-func base64URLDecode(_ input: UnsafeBufferPointer<UInt8>) -> [UInt8]? {
-    var failed = false
-    let out = [UInt8](unsafeUninitializedCapacity: input.count) { buffer, written in
-        if let length = base64URLDecode(input, into: buffer) {
-            written = length
-        } else {
-            failed = true
+    private static func same(_ kept: [UInt8], _ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard kept.count == bytes.count else { return false }
+        return kept.withUnsafeBufferPointer { kept in
+            var i = 0
+            while i < kept.count {
+                if kept[i] != bytes[i] { return false }
+                i &+= 1
+            }
+            return true
         }
     }
-    return failed ? nil : out
-}
-
-/// The same, into `out`, which has room for at least `input.count` bytes.
-/// Returns how many were written, or nil.
-func base64URLDecode(_ input: UnsafeBufferPointer<UInt8>, into out: UnsafeMutableBufferPointer<UInt8>) -> Int? {
-    var count = input.count
-    while count > 0 && input[count - 1] == UInt8(ascii: "=") { count -= 1 }
-    if count % 4 == 1 { return nil }
-    var written = 0
-    var accumulated: UInt32 = 0
-    var bits = 0
-    for i in 0..<count {
-        let byte = input[i]
-        let value: UInt8
-        switch byte {
-        case UInt8(ascii: "A")...UInt8(ascii: "Z"): value = byte &- UInt8(ascii: "A")
-        case UInt8(ascii: "a")...UInt8(ascii: "z"): value = byte &- UInt8(ascii: "a") &+ 26
-        case UInt8(ascii: "0")...UInt8(ascii: "9"): value = byte &- UInt8(ascii: "0") &+ 52
-        case UInt8(ascii: "-"), UInt8(ascii: "+"): value = 62
-        case UInt8(ascii: "_"), UInt8(ascii: "/"): value = 63
-        default: return nil
-        }
-        accumulated = (accumulated << 6) | UInt32(value)
-        bits += 6
-        if bits >= 8 {
-            bits -= 8
-            out[written] = UInt8(truncatingIfNeeded: accumulated >> UInt32(bits))
-            written += 1
-        }
-    }
-    return written
 }
 
 // MARK: - In routes
@@ -806,15 +768,14 @@ enum JWTContextKey<Claims: Decodable>: RequestContextKey {
     typealias Value = JWT<Claims>
 }
 
+/// The challenge for a token that was presented and refused (RFC 6750 3.1).
+let invalidTokenChallenge = #"Bearer error="invalid_token""#
+
 /// A verified token and its claims, from `Authorization: Bearer`, checked by
-/// the verifier `app.jwtVerifier` registered.
-/// A request without a valid token is answered 401.
-///
-/// A synchronous route may take one: with `JWTKeys`, or a `JWKSVerifier`
-/// whose keys are in hand, a token is checked without awaiting anything. A
-/// synchronous route that finds a `JWKSVerifier` still to fetch its keys
-/// answers 503 and starts the fetch; an async route waits for it instead.
-public struct JWT<Claims: Decodable>: AsyncRequestExtractor {
+/// the verifier `app.jwtVerifier` registered -- or, behind
+/// `authenticate(jwt:)`, the token that middleware already checked. A request
+/// without a valid token is answered 401.
+public struct JWT<Claims: Decodable>: RequestExtractor {
     public let claims: Claims
     /// The token as it came.
     public let token: String
@@ -824,39 +785,9 @@ public struct JWT<Claims: Decodable>: AsyncRequestExtractor {
         self.token = token
     }
 
-    public static var extractsSynchronously: Bool { true }
-
-    public static func extract(from request: borrowing Request, parameter: inout Int) throws -> JWT {
-        if let verified = request[context: JWTContextKey<Claims>.self] { return verified }
-        let token = try bearer(request)
-        let verifier = try request.state((any JWTVerifying).self)
-        do {
-            if let claims = try verifier.verifyNow(token, as: Claims.self) {
-                return JWT(claims: claims, token: token)
-            }
-        } catch let error as JWTError where error.status == .unauthorized {
-            request.worker.pointee.addHeader(request.slot, "www-authenticate", #"Bearer error="invalid_token""#)
-            throw error
-        }
-        // The verifier has to wait for something first -- its keys -- which
-        // a synchronous route cannot. It is started now, for the requests
-        // after this one.
-        let worker = request.worker
-        let pool = worker.pointee.handlerTasks ?? worker.pointee.makeHandlerTasks()
-        Task(executorPreference: pool.executor) {
-            _ = try? await verifier.verify(token, as: AnyClaims.self)
-        }
-        throw JWTError.keySetUnavailable
-    }
-
     public static func extract(from request: borrowing Request, parameter: inout Int) async throws -> JWT {
         if let verified = request[context: JWTContextKey<Claims>.self] { return verified }
-        let worker = request.worker
-        let slot = request.slot
-        let connection = request.connection
-        let generation = connection.pointee.generation
-        let requestId = connection.pointee.requestId
-        let token = try bearer(request)
+        guard let token = bearerToken(request) else { throw Unauthenticated(challenge: "Bearer") }
         let verifier = try request.state((any JWTVerifying).self)
         do {
             if let claims = try verifier.verifyNow(token, as: Claims.self) {
@@ -864,27 +795,9 @@ public struct JWT<Claims: Decodable>: AsyncRequestExtractor {
             }
             return JWT(claims: try await verifier.verify(token, as: Claims.self), token: token)
         } catch let error as JWTError where error.status == .unauthorized {
-            if worker.pointee.stillHolds(slot, generation: generation, requestId: requestId) {
-                worker.pointee.addHeader(slot, "www-authenticate", #"Bearer error="invalid_token""#)
-            }
-            throw error
+            throw Unauthenticated(challenge: invalidTokenChallenge, reason: error.reason)
         }
     }
-
-    /// The token of `Authorization: Bearer`, or a 401 with the challenge.
-    private static func bearer(_ request: borrowing Request) throws -> String {
-        guard let header = request.header("authorization"), let token = parseBearer(header) else {
-            request.worker.pointee.addHeader(request.slot, "www-authenticate", "Bearer")
-            throw HTTPError.unauthorized
-        }
-        return token
-    }
-}
-
-/// Claims read for nothing: what a fetch started for a synchronous route
-/// checks its token as.
-private struct AnyClaims: Decodable {
-    init(from decoder: any Decoder) throws {}
 }
 
 /// What checks tokens for `JWT<Claims>` and `authenticate(jwt:)`: a `JWTKeys`
@@ -914,65 +827,55 @@ extension JWTKeys: JWTVerifying {
 }
 
 extension Application {
-    /// Registers what `JWT<Claims>` checks tokens with, built in each worker:
+    /// Registers what `JWT<Claims>` and `authenticate(jwt:)` check tokens
+    /// with, built in each shard as its state:
     ///
     ///     app.jwtVerifier { _ in keys }
-    public func jwtVerifier(_ make: @escaping (_ worker: Int) throws -> any JWTVerifying) {
+    public func jwtVerifier(_ make: @escaping @Sendable (_ start: ShardContext) async throws -> any JWTVerifying) {
         state(make)
+    }
+}
+
+/// `authenticate(jwt:)`: a bearer JWT checked, and kept in the context.
+struct JWTAuthentication<Claims: Decodable>: Middleware {
+    /// Nil: the one `app.jwtVerifier` registered, found in the shard.
+    let verifier: (any JWTVerifying)?
+
+    func handle(_ request: borrowing Request, _ response: borrowing Response,
+                next: () async throws -> Void) async throws {
+        guard let token = bearerToken(request) else { return challenge(response, "Bearer") }
+        let verifier = try self.verifier ?? request.state((any JWTVerifying).self)
+        let claims: Claims
+        do {
+            if let now = try verifier.verifyNow(token, as: Claims.self) {
+                claims = now
+            } else {
+                claims = try await verifier.verify(token, as: Claims.self)
+            }
+        } catch let error as JWTError where error.status == .unauthorized {
+            return challenge(response, invalidTokenChallenge)
+        }
+        request[context: JWTContextKey<Claims>.self] = JWT(claims: claims, token: token)
+        try await next()
     }
 }
 
 extension RouteBuilder {
     /// Requires a valid bearer JWT of every request in the current scope,
-    /// checked by `verifier`, and keeps it for handlers that take
-    /// `JWT<Claims>`. A request without one is answered 401 with the
-    /// challenge RFC 6750 describes.
-    /// `authenticate(jwt:verifier:)` with the verifier `app.jwtVerifier`
-    /// registered, found in the worker rather than passed in -- so a `Router`
-    /// built on its own can guard its routes without being handed the keys.
+    /// checked by the verifier `app.jwtVerifier` registered -- found in the
+    /// shard rather than passed in, so a `Router` built on its own can guard
+    /// its routes without being handed the keys -- and keeps it for handlers
+    /// that take `JWT<Claims>`. A request without one is answered 401 with
+    /// the challenge RFC 6750 describes.
     public func authenticate<Claims: Decodable>(jwt claims: Claims.Type) {
+        use(JWTAuthentication<Claims>(verifier: nil))
         describeBearerScope(format: "JWT")
-        use { request, response async throws -> (any ResponseConvertible)? in
-            guard let header = request.header("authorization"), let token = parseBearer(header) else {
-                return Challenge("Bearer")
-            }
-            let verifier = try request.state((any JWTVerifying).self)
-            do {
-                let verified: Claims
-                if let now = try verifier.verifyNow(token, as: Claims.self) {
-                    verified = now
-                } else {
-                    verified = try await verifier.verify(token, as: Claims.self)
-                }
-                guard response.isActive else { throw HandlerWaitError.cancelled }
-                request[context: JWTContextKey<Claims>.self] = JWT(claims: verified, token: token)
-                return nil
-            } catch let error as JWTError where error.status == .unauthorized {
-                return Challenge(#"Bearer error="invalid_token""#)
-            }
-        }
     }
 
+    /// `authenticate(jwt:)` with the verifier given here.
     public func authenticate<Claims: Decodable>(jwt claims: Claims.Type, verifier: any JWTVerifying) {
+        use(JWTAuthentication<Claims>(verifier: verifier))
         describeBearerScope(format: "JWT")
-        use { request, response async throws -> (any ResponseConvertible)? in
-            guard let header = request.header("authorization"), let token = parseBearer(header) else {
-                return Challenge("Bearer")
-            }
-            do {
-                let verified: Claims
-                if let now = try verifier.verifyNow(token, as: Claims.self) {
-                    verified = now
-                } else {
-                    verified = try await verifier.verify(token, as: Claims.self)
-                }
-                guard response.isActive else { throw HandlerWaitError.cancelled }
-                request[context: JWTContextKey<Claims>.self] = JWT(claims: verified, token: token)
-                return nil
-            } catch let error as JWTError where error.status == .unauthorized {
-                return Challenge(#"Bearer error="invalid_token""#)
-            }
-        }
     }
 }
 

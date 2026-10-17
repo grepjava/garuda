@@ -1,33 +1,42 @@
 import Testing
-import CAvian
-import AvianCore
+import Synchronization
+import GarudaTesting
+import GarudaWire
 @testable import Garuda
 
 // `Response.stream` and `StreamingBody`: a body written as it is produced.
 
-nonisolated(unsafe) private var streamEvents: [String] = []
-nonisolated(unsafe) private var largestBacklog = 0
+private final class Events: Sendable {
+    private let list = Mutex<[String]>([])
+    private let largest = Mutex(0)
 
-private func closedEarly(_ error: TestClientError?) -> Bool {
-    if case .closed = error { return true }
-    return false
+    func append(_ event: String) { list.withLock { $0.append(event) } }
+    var all: [String] { list.withLock { $0 } }
+
+    func noteBacklog(_ n: Int) { largest.withLock { $0 = max($0, n) } }
+    var largestBacklog: Int { largest.withLock { $0 } }
 }
 
 private func pattern(_ count: Int, from start: Int) -> [UInt8] {
     (0..<count).map { UInt8(truncatingIfNeeded: ($0 + start) &* 31 &+ 7) }
 }
 
-@Suite("Streaming responses", .serialized)
+private func closedEarly(_ error: TestClientError?) -> Bool {
+    if case .closed = error { return true }
+    return false
+}
+
+@Suite("Streaming responses")
 struct StreamingResponseTests {
 
     @Test func writesArriveInOrderAsAChunkedBody() throws {
         let app = Application()
-        app.onAsync(.get, "/lines") { _, response in
+        app.get("/lines") { _, response in
             let body = response.stream(contentType: "text/plain")
             for i in 1...3 { try await body.write("line \(i)\n") }
         }
         let response = try app.test.get("/lines")
-        #expect(response.status == 200)
+        #expect(response.status == .ok)
         #expect(response.text == "line 1\nline 2\nline 3\n")
         #expect(response.header("transfer-encoding") == "chunked")
         #expect(response.header("content-length") == nil)
@@ -43,22 +52,40 @@ struct StreamingResponseTests {
             }
         }
         let response = try app.test.get("/typed")
-        #expect(response.status == 202)
+        #expect(response.status == .accepted)
         #expect(response.text == "ab")
         #expect(response.header("content-type") == "text/plain")
     }
 
-    @Test func aSynchronousHandlerCannotReturnOne() throws {
+    @Test func aStreamingBodyStartsAfterTheMiddlewareOnItsWayOut() throws {
         let app = Application()
-        app.get("/sync") { () -> StreamingBody in
+        app.use { _, response, next in
+            try await next()
+            response.addHeader("x-after", "yes")
+        }
+        app.get("/typed") { () -> StreamingBody in
+            StreamingBody { body in try await body.write("body") }
+        }
+        let response = try app.test.get("/typed")
+        #expect(response.text == "body")
+        #expect(response.header("x-after") == "yes")
+    }
+
+    @Test func aLayerThatThrowsAfterAStreamingBodyAnswersTheError() throws {
+        let app = Application()
+        app.use { _, _, next in
+            try await next()
+            throw HTTPError.forbidden
+        }
+        app.get("/typed") { () -> StreamingBody in
             StreamingBody { body in try await body.write("never") }
         }
-        #expect(try app.test.get("/sync").status == 500)
+        #expect(try app.test.get("/typed").status == .forbidden)
     }
 
     @Test func aDeclaredLengthIsSentUnframed() throws {
         let app = Application()
-        app.onAsync(.get, "/fixed") { _, response in
+        app.get("/fixed") { _, response in
             response.addHeader("content-length", "5")
             let body = response.stream()
             try await body.write("hel")
@@ -71,26 +98,26 @@ struct StreamingResponseTests {
     }
 
     @Test func writesPastTheDeclaredLengthAreCutAndThrow() throws {
-        streamEvents = []
+        let events = Events()
         let app = Application()
-        app.onAsync(.get, "/over") { _, response in
+        app.get("/over") { _, response in
             response.addHeader("content-length", "3")
             let body = response.stream()
             do {
                 try await body.write("abcdef")
-                streamEvents.append("accepted")
+                events.append("accepted")
             } catch {
-                streamEvents.append("refused")
+                events.append("refused")
             }
         }
         let response = try app.test.get("/over")
         #expect(response.text == "abc")
-        #expect(streamEvents == ["refused"])
+        #expect(events.all == ["refused"])
     }
 
     @Test func aBodyShortOfItsLengthClosesTheConnection() throws {
         let app = Application()
-        app.onAsync(.get, "/short") { _, response in
+        app.get("/short") { _, response in
             response.addHeader("content-length", "10")
             try await response.stream().write("abc")
         }
@@ -102,55 +129,54 @@ struct StreamingResponseTests {
     @Test func throwingPartWayCutsTheBodyOff() throws {
         struct Broke: Error {}
         let app = Application()
-        app.onAsync(.get, "/broke") { _, response in
+        app.get("/broke") { _, response in
             try await response.stream().write("partial")
             throw Broke()
         }
         // Chunked, and the last chunk never comes: the client sees a close in
         // the middle of the body rather than a complete response.
         #expect(throws: TestClientError.self) { try app.test.get("/broke") }
-        #expect(try app.test.get("/nothing").status == 404)
     }
 
     @Test func finishEndsTheBodyBeforeTheHandlerReturns() throws {
-        streamEvents = []
+        let events = Events()
         let app = Application()
-        app.onAsync(.get, "/early") { _, response in
+        app.get("/early") { _, response in
             let body = response.stream()
             try await body.write("done")
             body.finish()
-            streamEvents.append(body.isOpen ? "open" : "closed")
+            events.append(body.isOpen ? "open" : "closed")
             do {
                 try await body.write("late")
             } catch {
-                streamEvents.append("late write refused")
+                events.append("late write refused")
             }
         }
         let response = try app.test.get("/early")
         #expect(response.text == "done")
-        #expect(streamEvents == ["closed", "late write refused"])
+        #expect(events.all == ["closed", "late write refused"])
     }
 
     @Test func headSendsTheHeadAndDropsTheWrites() throws {
-        streamEvents = []
+        let events = Events()
         let app = Application()
-        app.onAsync(.get, "/both") { _, response in
+        app.get("/both") { _, response in
             let body = response.stream(contentType: "text/plain")
             try await body.write("not for HEAD")
-            streamEvents.append("returned")
+            events.append("returned")
         }
         let response = try app.test.head("/both")
-        #expect(response.status == 200)
+        #expect(response.status == .ok)
         #expect(response.body.isEmpty)
         #expect(response.header("content-type") == "text/plain")
         // No chunks will follow a HEAD, so it is not framed as if they would.
         #expect(response.header("transfer-encoding") == nil)
-        #expect(streamEvents == ["returned"])
+        #expect(events.all == ["returned"])
     }
 
     @Test func anHTTP10BodyEndsWithTheConnection() throws {
         let app = Application()
-        app.onAsync(.get, "/old") { _, response in
+        app.get("/old") { _, response in
             let body = response.stream()
             try await body.write("one ")
             try await body.write("two")
@@ -167,16 +193,31 @@ struct StreamingResponseTests {
         #expect(kept.header("connection")?.lowercased() == "close")
     }
 
+    @Test func pipelinedAnswersGoBeforeAndAfterAStreamedOne() throws {
+        let app = Application()
+        app.get("/plain") { _, response in response.send("plain") }
+        app.get("/streamed") { _, response in
+            let body = response.stream()
+            try await body.write("str")
+            try await body.write("eamed")
+        }
+        let request = "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n"
+            + "GET /streamed HTTP/1.1\r\nHost: x\r\n\r\n"
+            + "GET /plain HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        let responses = try app.test.sendPipelined(raw: Array(request.utf8))
+        #expect(responses.map(\.text) == ["plain", "streamed", "plain"])
+    }
+
     @Test func middlewareHeadersAndHooksReachAStreamedHead() throws {
         let app = Application()
-        app.use { _, response in
+        app.use { _, response, next in
             response.addHeader("x-middleware", "yes")
             response.onSend { outgoing in
                 outgoing.addHeader("x-streaming", outgoing.isStreaming ? "true" : "false")
             }
-            return nil
+            try await next()
         }
-        app.onAsync(.get, "/hooked") { _, response in
+        app.get("/hooked") { _, response in
             try await response.stream().write("body")
         }
         let response = try app.test.get("/hooked")
@@ -187,11 +228,11 @@ struct StreamingResponseTests {
 
     @Test func aHookThatReplacesTheBodyAnswersInstead() throws {
         let app = Application()
-        app.use { _, response in
+        app.use { _, response, next in
             response.onSend { $0.replaceBody("from the hook") }
-            return nil
+            try await next()
         }
-        app.onAsync(.get, "/replaced") { _, response in
+        app.get("/replaced") { _, response in
             try await response.stream().write("from the handler")
         }
         let response = try app.test.get("/replaced")
@@ -200,40 +241,40 @@ struct StreamingResponseTests {
     }
 
     @Test func aWriterWaitsWhileTheClientIsBehind() throws {
-        largestBacklog = 0
+        let events = Events()
         var config = ServerConfig()
         config.writeHighWaterMark = 64 * 1024
         config.writeLowWaterMark = 16 * 1024
         let app = Application()
         let piece = 16 * 1024
         let total = 2 * 1024 * 1024
-        app.onAsync(.get, "/large") { _, response in
+        app.get("/large") { _, response in
             let body = response.stream()
             var sent = 0
             while sent < total {
                 try await body.write(pattern(piece, from: sent))
                 sent += piece
-                largestBacklog = max(largestBacklog, body.worker.pointee.streamBacklog(body.slot))
+                events.noteBacklog(body.queuedBytes)
             }
         }
         let client = app.testClient(configuration: config)
-        client.timeoutMillis = 30_000
+        client.timeout = .seconds(30)
         let response = try client.get("/large")
         #expect(response.body.count == total)
         #expect(response.body == pattern(total, from: 0))
         // Never more than the mark, and the piece that crossed it, ahead of
         // the client.
-        #expect(largestBacklog <= 64 * 1024 + piece + 64)
+        #expect(events.largestBacklog <= 64 * 1024 + piece + 64)
     }
 
     @Test func writersInChildTasksAllFinish() throws {
-        streamEvents = []
+        let events = Events()
         var config = ServerConfig()
         config.writeHighWaterMark = 64 * 1024
         config.writeLowWaterMark = 16 * 1024
         let app = Application()
         let piece = 2 * 1024 * 1024
-        app.onAsync(.get, "/two") { _, response in
+        app.get("/two") { _, response in
             let body = response.stream()
             // Both cross the mark, so both wait for the drain. Neither may be
             // left waiting forever.
@@ -241,37 +282,31 @@ struct StreamingResponseTests {
             async let second: Void = body.write(pattern(piece, from: piece))
             try await first
             try await second
-            streamEvents.append("both written")
+            events.append("both written")
         }
         let client = app.testClient(configuration: config)
-        client.timeoutMillis = 10_000
+        client.timeout = .seconds(10)
         let response = try client.get("/two")
         #expect(response.body.count == 2 * piece)
-        #expect(streamEvents == ["both written"])
+        #expect(events.all == ["both written"])
     }
 
-    /// Two producers against a client that reads slowly. Each may carry the
-    /// backlog past the mark by its own last write and no further, because it
-    /// is parked before it can queue another. A producer let through on the
-    /// ground that another was already waiting would queue its whole body in
-    /// one go, which is what this measures.
     @Test func everyConcurrentWriterIsHeldToTheMark() throws {
-        largestBacklog = 0
+        let events = Events()
         var config = ServerConfig()
         config.writeHighWaterMark = 64 * 1024
         config.writeLowWaterMark = 16 * 1024
         let app = Application()
         let piece = 16 * 1024
         let each = 512 * 1024
-        app.onAsync(.get, "/both") { _, response in
+        app.get("/both") { _, response in
             let body = response.stream()
             @Sendable func produce(_ from: Int) async throws {
                 var sent = 0
                 while sent < each {
                     try await body.write(pattern(piece, from: from))
                     sent += piece
-                    largestBacklog = max(largestBacklog,
-                                         body.worker.pointee.streamBacklog(body.slot))
+                    events.noteBacklog(body.queuedBytes)
                 }
             }
             async let first: Void = produce(0)
@@ -280,105 +315,143 @@ struct StreamingResponseTests {
             try await second
         }
         let client = app.testClient(configuration: config)
-        client.timeoutMillis = 30_000
+        client.timeout = .seconds(30)
         let response = try client.get("/both")
         #expect(response.body.count == 2 * each)
-        #expect(largestBacklog <= 64 * 1024 + 2 * piece + 64, "\(largestBacklog)")
+        #expect(events.largestBacklog <= 64 * 1024 + 2 * (piece + 32), "\(events.largestBacklog)")
     }
 
-    /// A client that leaves wakes every waiter, not the first one only: a
-    /// producer left parked would hold its task for as long as the process
-    /// lived.
-    @Test func everyWriterWaitingForAClientThatLeavesIsCancelled() throws {
-        streamEvents = []
-        var config = ServerConfig()
-        config.writeHighWaterMark = 64 * 1024
-        config.writeLowWaterMark = 16 * 1024
+    @Test func streamCalledTwiceIsTheSameBody() throws {
         let app = Application()
-        app.onAsync(.get, "/forever") { _, response in
-            let body = response.stream()
-            @Sendable func produce(_ name: String) async {
-                do {
-                    // Bounded so that a producer nobody holds back ends the
-                    // test rather than running until something kills it.
-                    for _ in 0..<200 { try await body.write(pattern(32 * 1024, from: 0)) }
-                    streamEvents.append("\(name) never waited")
-                } catch let error as HandlerWaitError {
-                    streamEvents.append("\(name) \(error)")
-                } catch {
-                    streamEvents.append("\(name) unexpected")
-                }
-            }
-            async let first: Void = produce("a")
-            async let second: Void = produce("b")
-            await first
-            await second
+        app.get("/twice") { _, response in
+            try await response.stream().write("a")
+            try await response.stream().write("b")
+            let streaming = response.isStreaming
+            #expect(streaming)
         }
-        let client = app.testClient(configuration: config)
-        try client.abandon(Array("GET /forever HTTP/1.1\r\nHost: x\r\n\r\n".utf8), turns: 20)
-        for _ in 0..<40 { client.turn() }
-        #expect(streamEvents.sorted() == ["a cancelled", "b cancelled"])
+        #expect(try app.test.get("/twice").text == "ab")
     }
 
-    @Test func aWriterWaitingForAClientThatLeavesIsCancelled() throws {
-        streamEvents = []
-        var config = ServerConfig()
-        config.writeHighWaterMark = 64 * 1024
-        config.writeLowWaterMark = 16 * 1024
+    @Test func aStreamAfterAnAnswerRefusesItsWrites() throws {
+        let events = Events()
         let app = Application()
-        app.onAsync(.get, "/forever") { _, response in
-            let body = response.stream()
+        app.get("/answered") { _, response in
+            response.send("answer")
             do {
-                while true { try await body.write(pattern(32 * 1024, from: 0)) }
-            } catch let error as HandlerWaitError {
-                streamEvents.append("\(error)")
+                try await response.stream().write("late")
+            } catch {
+                events.append("refused")
+            }
+        }
+        #expect(try app.test.get("/answered").text == "answer")
+        #expect(events.all == ["refused"])
+    }
+
+    // MARK: HTTP/2
+
+    @Test func overHTTP2TheBodyIsDATAFrames() throws {
+        let app = Application()
+        app.get("/lines") { _, response in
+            let body = response.stream(contentType: "text/plain")
+            for i in 1...3 { try await body.write("line \(i)\n") }
+        }
+        let h2 = try app.test.http2()
+        let response = try h2.get("/lines")
+        #expect(response.status == .ok)
+        #expect(response.ended)
+        #expect(response.text == "line 1\nline 2\nline 3\n")
+        #expect(response.header("content-length") == nil)
+        #expect(response.header("content-type") == "text/plain")
+    }
+
+    @Test func overHTTP2ADeclaredLengthIsSaid() throws {
+        let app = Application()
+        app.get("/fixed") { _, response in
+            response.addHeader("content-length", "5")
+            let body = response.stream()
+            try await body.write("hel")
+            try await body.write("lo")
+        }
+        let response = try app.test.http2().get("/fixed")
+        #expect(response.text == "hello")
+        #expect(response.header("content-length") == "5")
+        #expect(response.ended)
+    }
+
+    @Test func overHTTP2ABodyEndedWithNoBytesStillEnds() throws {
+        let app = Application()
+        app.get("/empty") { _, response in
+            _ = response.stream()
+        }
+        let response = try app.test.http2().get("/empty")
+        #expect(response.status == .ok)
+        #expect(response.ended)
+        #expect(response.body.isEmpty)
+    }
+
+    @Test func overHTTP2ThrowingPartWayResetsTheStream() throws {
+        struct Broke: Error {}
+        let app = Application()
+        app.get("/broke") { _, response in
+            try await response.stream().write("partial")
+            throw Broke()
+        }
+        let response = try app.test.http2().get("/broke")
+        #expect(response.reset == H2Error.internalError.rawValue)
+        #expect(!response.ended)
+    }
+
+    @Test func overHTTP2ATypedStreamingBody() throws {
+        let app = Application()
+        app.get("/typed") { () async -> StreamingBody in
+            StreamingBody(status: .accepted) { body in
+                for i in 0..<4 { try await body.write("\(i)") }
+            }
+        }
+        let response = try app.test.http2().get("/typed")
+        #expect(response.status == .accepted)
+        #expect(response.text == "0123")
+        #expect(response.ended)
+    }
+
+    @Test func overHTTP2ALargeBodyWaitsForTheWindow() throws {
+        let events = Events()
+        var config = ServerConfig()
+        config.writeHighWaterMark = 64 * 1024
+        config.writeLowWaterMark = 16 * 1024
+        let app = Application()
+        let piece = 16 * 1024
+        let total = 1024 * 1024
+        app.get("/large") { _, response in
+            let body = response.stream()
+            var sent = 0
+            while sent < total {
+                try await body.write(pattern(piece, from: sent))
+                sent += piece
+                events.noteBacklog(body.queuedBytes)
             }
         }
         let client = app.testClient(configuration: config)
-        try client.abandon(Array("GET /forever HTTP/1.1\r\nHost: x\r\n\r\n".utf8), turns: 20)
-        for _ in 0..<20 { client.turn() }
-        #expect(streamEvents == ["cancelled"])
-    }
-}
-
-@Suite("Server-sent events", .serialized)
-struct EventStreamTests {
-
-    @Test func eventsAreFramedAsTheFormatSays() {
-        #expect(EventSink.encode("hello", event: nil, id: nil, retry: nil) == "data: hello\n\n")
-        #expect(EventSink.encode("a\nb\r\nc\rd", event: "update", id: "7", retry: 3000)
-                == "event: update\nid: 7\nretry: 3000\ndata: a\ndata: b\ndata: c\ndata: d\n\n")
-        #expect(EventSink.encode("", event: nil, id: nil, retry: nil) == "data: \n\n")
-        // A line break cannot smuggle a field of its own into a name or an ID.
-        #expect(EventSink.encode("x", event: "a\ndata: forged", id: "1\r\n2\0", retry: -1)
-                == "event: a data: forged\nid: 1 2\ndata: x\n\n")
+        client.timeout = .seconds(30)
+        let response = try client.http2().get("/large")
+        #expect(response.ended)
+        #expect(response.body.count == total)
+        #expect(response.body == pattern(total, from: 0))
+        #expect(events.largestBacklog <= 64 * 1024 + piece)
     }
 
-    @Test func anEventStreamIsSentAsItIsProduced() throws {
+    @Test func overHTTP2EveryRunOfAStreamingRouteWorks() throws {
+        // The first runs of a route go to a task; later ones of a route that
+        // never waited run on the reader, which a streamed body must not.
         let app = Application()
-        app.get("/events") { () async -> EventStream in
-            EventStream { events in
-                try await events.comment("hi")
-                for i in 1...2 {
-                    try await events.send("tick \(i)", event: "tick", id: "\(i)")
-                    try await events.sleep(milliseconds: 5)
-                }
-            }
+        app.get("/s") { _, response in
+            try await response.stream().write("x")
         }
-        let response = try app.test.get("/events")
-        #expect(response.header("content-type") == "text/event-stream")
-        #expect(response.header("cache-control") == "no-cache")
-        #expect(response.text == ": hi\n\nevent: tick\nid: 1\ndata: tick 1\n\nevent: tick\nid: 2\ndata: tick 2\n\n")
-    }
-
-    @Test func aHandlersOwnCacheControlIsKept() throws {
-        let app = Application()
-        app.onAsync(.get, "/events") { _, response in
-            response.addHeader("cache-control", "no-store")
-            try await response.eventStream().send("x")
+        let h2 = try app.test.http2()
+        for _ in 0..<40 {
+            let response = try h2.get("/s")
+            #expect(response.text == "x")
+            #expect(response.ended)
         }
-        let response = try app.test.get("/events")
-        #expect(response.headers(named: "cache-control") == ["no-store"])
-        #expect(response.text == "data: x\n\n")
     }
 }

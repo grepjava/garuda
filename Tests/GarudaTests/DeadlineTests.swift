@@ -1,359 +1,96 @@
+import Garuda
+import GarudaTesting
 import Testing
-import CAvian
-import AvianCore
-@testable import Garuda
+import Vega
 
-/// Where `/park` waits, so a test can wake it after its deadline has passed.
-nonisolated(unsafe) private var parkedPastDeadline: UnsafeContinuation<Void, Never>? = nil
-/// What `/park` saw about its own request when it woke.
-nonisolated(unsafe) private var sawCancelled: Bool? = nil
-/// Whether `/park` ran on past its dropped `send`, rather than trapping.
-nonisolated(unsafe) private var ranPastLateSend = false
-/// How many times `/spin` yielded, and whether it saw its request cancelled.
-nonisolated(unsafe) private var spins = 0
-nonisolated(unsafe) private var spinSawCancelled: Bool? = nil
-/// What keeps `/spin-free` yielding, until a test lets it stop.
-nonisolated(unsafe) private var keepSpinning = false
+/// Waits on a read nobody will ever answer: a loopback connection whose other
+/// end never writes.
+func waitForever() async throws {
+    let listener = try TCPListener.bind(host: "127.0.0.1", port: 0)
+    let client = try await TCPStream.connect(to: SocketAddress(host: "127.0.0.1", port: listener.localPort))
+    let server = try await listener.accept()
+    var buffer = IOBuffer(capacity: 16)
+    _ = try await client.read(into: &buffer)
+    _ = server
+}
 
-private func deadlineApp() -> Application {
-    let app = Application()
-    app.deadline(milliseconds: 20) {
-        // Waits far longer than it is allowed.
-        app.onAsync(.get, "/slow") { _, response in
-            try await response.sleep(milliseconds: 5_000)
-            response.send("slept")
-        }
-        // Answers at once, well inside.
-        app.onAsync(.get, "/quick") { _, response in
-            response.send("quick")
-        }
-        // A synchronous handler waiting on a timer of its own.
-        app.get("/slow-sync") { _, response in
-            response.after(milliseconds: 5_000) { _, later in
-                later.send("late")
+@Suite struct DeadlineTests {
+    @Test func aWaitPastTheDeadlineIs504() throws {
+        let app = Application()
+        app.deadline(.milliseconds(50)) {
+            app.get("/stuck") { () async throws -> String in
+                try await waitForever()
+                return "unreached"
             }
         }
-        // Parks where the engine cannot reach it, so the deadline fires while
-        // it is still suspended and it wakes after being answered for.
-        app.onAsync(.get, "/park") { _, response in
-            await withUnsafeContinuation { parkedPastDeadline = $0 }
-            sawCancelled = response.isCancelled
-            response.send("far too late")
-            ranPastLateSend = true
-        }
-        app.deadline(milliseconds: 5_000) {
-            // Waits past the outer deadline but well inside the inner one.
-            app.onAsync(.get, "/inner") { _, response in
-                try await response.sleep(milliseconds: 40)
-                response.send("inner")
-            }
-        }
+        let response = try app.test.get("/stuck")
+        #expect(response.status == 504)
     }
-    app.deadline(milliseconds: 5) {
-        // Never waits on the engine, only yields. Bounded, so that a worker
-        // that cannot get its turn back fails the test rather than hangs it.
-        app.onAsync(.get, "/spin") { _, response in
-            spins = 0
-            while !response.isCancelled && spins < 2_000_000 {
-                spins += 1
+
+    @Test func aQuickRouteIsUntouched() throws {
+        let app = Application()
+        app.deadline(.seconds(5)) {
+            app.get("/quick") { () async throws in
                 await Task.yield()
+                return "quick"
             }
-            spinSawCancelled = response.isCancelled
-            response.send("spun")
         }
-    }
-    // Outside every deadline block.
-    app.onAsync(.get, "/spin-free") { _, response in
-        let until = av_monotonic_ms() &+ 10_000
-        while keepSpinning && av_monotonic_ms() < until { await Task.yield() }
-        response.send("stopped")
-    }
-    // Outside every deadline block.
-    app.onAsync(.get, "/unbounded") { _, response in
-        try await response.sleep(milliseconds: 40)
-        response.send("unbounded")
-    }
-    return app
-}
-
-/// One keep-alive connection, driven directly. `TestClient.get` opens and
-/// closes a connection per request, and closing frees everything the request
-/// held -- which hides whether the engine gives it back at the request
-/// boundary, and hides whether a handler that wakes late can still reach a
-/// request the slot is still holding. Both need the connection kept open.
-private final class Wire {
-    let client: TestClient
-    let fd: Int32
-    let slot: Int
-    private let capacity = 16384
-    private let buffer: UnsafeMutablePointer<UInt8>
-    private var got = 0
-    private var closed = false
-
-    init(_ client: TestClient) throws {
-        self.client = client
-        let opened = try client.connect()
-        fd = opened.client
-        slot = opened.slot
-        buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+        #expect(try app.test.get("/quick").text == "quick")
     }
 
-    deinit {
-        close()
-        buffer.deallocate()
-    }
-
-    func close() {
-        guard !closed else { return }
-        closed = true
-        _ = av_close(fd)
-    }
-
-    func send(_ request: String) {
-        var request = request
-        request.withUTF8 { _ = av_write(fd, $0.baseAddress!, $0.count) }
-    }
-
-    /// Bytes waiting now, without turning the worker.
-    @discardableResult
-    func pending() -> Int {
-        while got < capacity {
-            let n = av_read(fd, buffer + got, capacity - got)
-            if n <= 0 { break }
-            got += n
+    @Test func routesOutsideHaveNone() throws {
+        let app = Application()
+        app.deadline(.milliseconds(50)) {
+            app.get("/bounded") { () in "b" }
         }
-        return got
+        app.get("/free") { () async throws -> String in
+            try await Runtime.sleep(for: .milliseconds(120))
+            return "free"
+        }
+        #expect(try app.test.get("/free").text == "free")
     }
 
-    /// Turns until one whole response has arrived, then takes it out of the
-    /// buffer and returns its status.
-    func receiveStatus(turns: Int = 5_000) -> Int? {
-        for _ in 0..<turns {
-            client.turn()
-            pending()
-            guard let total = completeLength(), total == got else { continue }
-            let code = status()
-            got = 0
-            return code
-        }
-        return nil
-    }
-
-    private func status() -> Int? {
-        guard got > 12 else { return nil }
-        var i = 9
-        var code = 0
-        while i < got, buffer[i] >= 48, buffer[i] <= 57 {
-            code = code * 10 + Int(buffer[i] - 48)
-            i += 1
-        }
-        return code > 0 ? code : nil
-    }
-
-    /// The length of the response at the start of the buffer once all of it
-    /// is there. Every response here states a Content-Length.
-    private func completeLength() -> Int? {
-        var end = 0
-        while end + 3 < got {
-            if buffer[end] == 13 && buffer[end + 1] == 10
-                && buffer[end + 2] == 13 && buffer[end + 3] == 10 { break }
-            end += 1
-        }
-        guard end + 3 < got else { return nil }
-        let name: StaticString = "\r\ncontent-length: "
-        var i = 0
-        while i < end {
-            var matched = 0
-            while matched < name.utf8CodeUnitCount && i + matched < end
-                    && (buffer[i + matched] | (matched >= 2 ? 0x20 : 0)) == name.utf8Start[matched] {
-                matched += 1
-            }
-            if matched == name.utf8CodeUnitCount {
-                var length = 0
-                var d = i + matched
-                while d < end && buffer[d] >= 48 && buffer[d] <= 57 {
-                    length = length * 10 + Int(buffer[d] - 48)
-                    d += 1
+    @Test func aHandlerThatCatchesTheTimeoutAnswersItself() throws {
+        let app = Application()
+        app.deadline(.milliseconds(50)) {
+            app.get("/fallback") { () async throws -> String in
+                do {
+                    try await waitForever()
+                    return "unreached"
+                } catch let error as IOError where error == .timedOut {
+                    return "cached copy"
                 }
-                let total = end + 4 + length
-                return total <= got ? total : nil
             }
-            i += 1
         }
-        return nil
-    }
-}
-
-/// Serialized for the same reason as the other handler suites: each client
-/// turns a worker on the test's own thread.
-@Suite("Route deadlines", .serialized)
-struct DeadlineTests {
-    @Test func aHandlerThatPassesItsDeadlineIs504() throws {
-        let client = deadlineApp().test
-        #expect(try client.get("/slow").status == 504)
+        let response = try app.test.get("/fallback")
+        #expect(response.status == 200)
+        #expect(response.text == "cached copy")
     }
 
-    @Test func aHandlerInsideItsDeadlineIsUntouched() throws {
-        let client = deadlineApp().test
-        #expect(try client.get("/quick").text == "quick")
-    }
-
-    /// A deadline bounds waiting whoever is doing it: a synchronous handler
-    /// parked on `after` is cut short the same way a task is.
-    @Test func aSynchronousWaitIsBoundedToo() throws {
-        let client = deadlineApp().test
-        #expect(try client.get("/slow-sync").status == 504)
-    }
-
-    @Test func aRouteWithNoDeadlineIsNotBounded() throws {
-        let client = deadlineApp().test
-        #expect(try client.get("/unbounded").text == "unbounded")
-    }
-
-    @Test func theInnermostDeadlineApplies() throws {
-        let client = deadlineApp().test
-        #expect(try client.get("/inner").text == "inner")
-    }
-
-    /// The deadline is the request's, not the connection's. `.timedOut` says
-    /// the handler no longer speaks for the request, so it has to be cleared
-    /// when the same connection carries the next one -- otherwise that
-    /// request's own answer would be dropped and the client would hang.
-    @Test func aTimeoutDoesNotCarryToTheNextRequestOnTheSameConnection() throws {
-        let client = deadlineApp().test
-        let wire = try Wire(client)
-        wire.send("GET /slow HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(wire.receiveStatus() == 504)
-        wire.send("GET /quick HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(wire.receiveStatus() == 200)
-    }
-
-    /// Nothing preempts a handler that is not waiting on the engine, so a
-    /// deadline answers the client and leaves the handler running. When it
-    /// wakes, the slot is still holding that very request on a connection
-    /// that is still open -- so identity alone cannot tell it to stop, and
-    /// only `.timedOut` can. Its answer must go nowhere, and quietly:
-    /// answering late here is the deadline's doing, not a mistake of its own.
-    @Test func aTimedOutHandlerCannotAnswerWhenItWakes() throws {
-        parkedPastDeadline = nil
-        sawCancelled = nil
-        ranPastLateSend = false
-        let client = deadlineApp().test
-        let wire = try Wire(client)
-        wire.send("GET /park HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(wire.receiveStatus() == 504)
-        #expect(parkedPastDeadline != nil)
-
-        client.onWorker { parkedPastDeadline.take()?.resume() }
-        client.turn()
-        #expect(sawCancelled == true)
-        #expect(ranPastLateSend)
-        // Nothing more went out on the wire.
-        #expect(wire.pending() == 0)
-    }
-
-    /// A handler that only ever yields never waits on the engine, and used
-    /// to keep the worker running it until it stopped: its deadline did not
-    /// get a turn. Runs of the handler tasks are budgeted now, so the timer
-    /// fires, the client has its 504 and the handler sees the cancellation.
-    @Test func aHandlerThatOnlyYieldsStillMeetsItsDeadline() throws {
-        spinSawCancelled = nil
-        let client = deadlineApp().test
-        let wire = try Wire(client)
-        wire.send("GET /spin HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(wire.receiveStatus() == 504)
-        for _ in 0..<5_000 where spinSawCancelled == nil { client.turn() }
-        #expect(spinSawCancelled == true)
-        #expect(spins < 2_000_000)
-        #expect(wire.pending() == 0)
-    }
-
-    /// Nor does a yielding handler keep the worker from other connections.
-    @Test func anotherConnectionIsAnsweredWhileAHandlerKeepsYielding() throws {
-        keepSpinning = true
-        defer { keepSpinning = false }
-        let client = deadlineApp().test
-        let spinning = try Wire(client)
-        spinning.send("GET /spin-free HTTP/1.1\r\nHost: test\r\n\r\n")
-        for _ in 0..<10 { client.turn() }
-        let other = try Wire(client)
-        other.send("GET /quick HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(other.receiveStatus() == 200)
-        #expect(keepSpinning)
-        #expect(spinning.pending() == 0)
-        keepSpinning = false
-        #expect(spinning.receiveStatus() == 200)
-    }
-
-    /// A deadline is one op per request, and the request boundary is what
-    /// gives it back. Closing the connection frees it too, so this has to
-    /// hold the connection open to see the boundary do its job.
-    @Test func aDeadlineOpIsGivenBackAtEachRequestBoundary() throws {
-        let client = deadlineApp().test
-        let wire = try Wire(client)
-        for _ in 0..<5 {
-            wire.send("GET /quick HTTP/1.1\r\nHost: test\r\n\r\n")
-            #expect(wire.receiveStatus() == 200)
-            #expect(client.worker.pointee.asyncOps.liveCount == 0)
+    @Test func middlewareOutsideSeesThe504() throws {
+        let app = Application()
+        app.use { _, response, next in
+            try await next()
+            response.addHeader("x-status", "\(response.status.code)")
         }
-    }
-
-    /// Every op in the pool taken, as a worker under pressure might have them:
-    /// what is left is given back afterwards.
-    private func fillOpPool(_ client: TestClient) -> [Int] {
-        var ops: [Int] = []
-        while let op = client.worker.pointee.asyncOps.allocate(slot: 0, requestId: 0, kind: .timer,
-                                                               deadlineUs: 0) {
-            ops.append(op.index)
+        app.deadline(.milliseconds(50)) {
+            app.get("/stuck") { () async throws -> String in
+                try await waitForever()
+                return "unreached"
+            }
         }
-        return ops
+        let response = try app.test.get("/stuck")
+        #expect(response.status == 504)
+        #expect(response.header("x-status") == "504")
     }
 
-    /// A request dispatched while the op pool is full still has its deadline:
-    /// it is given an op as soon as one is free. It used to be dropped, and
-    /// the request ran unbounded however long the pool took to recover.
-    @Test func aDeadlineArmedWithTheOpPoolFullIsArmedOnceThereIsRoom() throws {
-        parkedPastDeadline = nil
-        let client = deadlineApp().test
-        let ops = fillOpPool(client)
-        let wire = try Wire(client)
-        wire.send("GET /park HTTP/1.1\r\nHost: test\r\n\r\n")
-        for _ in 0..<500 where parkedPastDeadline == nil { client.turn() }
-        #expect(parkedPastDeadline != nil)
-        #expect(client.worker.pointee.unarmedDeadlines.count == 1)
-        for op in ops { client.worker.pointee.asyncOps.free(op) }
-        #expect(wire.receiveStatus() == 504)
-        #expect(client.worker.pointee.unarmedDeadlines.isEmpty)
-        client.onWorker { parkedPastDeadline.take()?.resume() }
-        client.turn()
-        #expect(wire.pending() == 0)
-    }
-
-    /// With the pool full for longer than the deadline, the worker answers
-    /// 504 itself when the time is up.
-    @Test func aDeadlineIsKeptWhileTheOpPoolStaysFull() throws {
-        parkedPastDeadline = nil
-        let client = deadlineApp().test
-        let ops = fillOpPool(client)
-        let wire = try Wire(client)
-        wire.send("GET /park HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(wire.receiveStatus() == 504)
-        #expect(client.worker.pointee.unarmedDeadlines.isEmpty)
-        for op in ops { client.worker.pointee.asyncOps.free(op) }
-        client.onWorker { parkedPastDeadline.take()?.resume() }
-        client.turn()
-        #expect(wire.pending() == 0)
-    }
-
-    /// A request that ends before its deadline leaves nothing behind for the
-    /// next one on its slot.
-    @Test func aDeadlineWithoutAnOpEndsWithItsRequest() throws {
-        let client = deadlineApp().test
-        let ops = fillOpPool(client)
-        let wire = try Wire(client)
-        wire.send("GET /quick HTTP/1.1\r\nHost: test\r\n\r\n")
-        #expect(wire.receiveStatus() == 200)
-        #expect(client.worker.pointee.unarmedDeadlines.isEmpty)
-        for op in ops { client.worker.pointee.asyncOps.free(op) }
+    @Test func deadlineScopesKeepPrefixesOfTheirGroup() throws {
+        let app = Application()
+        app.group("/api") {
+            app.deadline(.seconds(1)) {
+                app.get("/x") { () in "x" }
+            }
+        }
+        #expect(try app.test.get("/api/x").text == "x")
     }
 }

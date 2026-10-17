@@ -14,24 +14,16 @@
 // the 3.5 it saves.
 //===----------------------------------------------------------------------===//
 
-import Synchronization
-
 enum JSONFastPath {
     /// The reader a type has, or none, by type.
-    private static let readers = Mutex<[ObjectIdentifier: (any JSONReadable.Type)?]>([:])
-    /// Whether a type writes itself. The value is not kept: writing needs
-    /// the value cast, not the type.
-    private static let writers = ConformanceCache { $0 is any JSONWritable.Type }
+    private static let readers = TypeTable<any JSONReadable.Type> { $0 as? any JSONReadable.Type }
+    /// The writer a type has, or none: its conformance, so writing calls
+    /// through it without casting the value.
+    private static let writers = TypeTable<any JSONWritable.Type> { $0 as? any JSONWritable.Type }
 
     /// The type's own reader, or nil where it has none.
     static func reader(for type: Any.Type) -> (any JSONReadable.Type)? {
-        let key = ObjectIdentifier(type)
-        return readers.withLock { readers in
-            if let found = readers[key] { return found }
-            let answer = type as? any JSONReadable.Type
-            readers[key] = answer
-            return answer
-        }
+        readers.value(for: type)
     }
 
     /// The bytes `value` writes for itself, or nil for Codable to write it.
@@ -47,19 +39,26 @@ enum JSONFastPath {
     }
 
     /// Writes `value` into `output` with its own writer, or answers false
-    /// for Codable to write it. The buffer belongs to the caller: a worker
-    /// keeps one for every answer it writes, and nothing is shared between
-    /// threads.
-    static func write(_ value: some Any, into output: inout JSONOutput) throws -> Bool {
-        guard writers.holds(type(of: value)), let writable = value as? any JSONWritable else {
-            return false
-        }
+    /// for Codable to write it. The buffer belongs to the caller: a
+    /// connection keeps one for every answer it writes, and nothing is
+    /// shared between threads.
+    static func write<T>(_ value: T, into output: inout JSONOutput) throws -> Bool {
+        guard let writer = writers.value(for: T.self) else { return false }
         output.reset()
-        writable.write(json: &output)
+        withUnsafePointer(to: value) { writer.writeJSON(at: UnsafeRawPointer($0), into: &output) }
         // A value that is not JSON -- an infinite Double -- is the handler's
         // mistake, and is refused rather than sent, as through Codable.
         if let problem = output.problem { throw problem }
         return true
+    }
+}
+
+extension JSONWritable {
+    /// Writes the value at `p`, which is one of these. Static, so that it
+    /// can be called on the conformance the table holds, with no cast of
+    /// the value to the protocol.
+    fileprivate static func writeJSON(at p: UnsafeRawPointer, into output: inout JSONOutput) {
+        p.assumingMemoryBound(to: Self.self).pointee.write(json: &output)
     }
 }
 
