@@ -546,9 +546,9 @@ in [Examples/](Examples/README.md).
 - **`Sources/Garuda`** holds the public API beside the engine, so there is no
   module boundary on the request path. Engine types stay `internal` where the
   API does not need them.
-- **`Sources/GarudaWire`** and **`Sources/GarudaQUIC`** are the protocols as
-  state machines over bytes: the HTTP/1.1 parser, HPACK, QPACK, frames, and
-  QUIC. Neither touches a socket.
+- **`Sources/GarudaWire`** is the HTTP/1.1 protocol as a state machine over
+  bytes. HPACK, QPACK, the frames and QUIC are Vega's (`VegaWire`,
+  `VegaHTTP3`, `VegaQUIC`). None of them touches a socket.
 - **`Sources/garuda-server`** serves the-benchmarker's contract and the
   workloads through the public API, so the benchmark measures what
   applications use.

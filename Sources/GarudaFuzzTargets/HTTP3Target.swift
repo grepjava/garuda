@@ -26,7 +26,7 @@
 //===----------------------------------------------------------------------===//
 
 @_spi(Testing) import Garuda
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import QUICTestPeer
 import Vega

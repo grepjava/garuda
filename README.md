@@ -27,7 +27,8 @@ app.get("/person/:id") { (id: Path<Int>) async in
 ```
 
 This is Garuda 2. It runs on [Vega](https://github.com/grepjava/vega), a
-work-stealing runtime for Swift in the shape of Tokio: an idle thread takes a
+work-stealing runtime for Swift in the shape of Tokio and an alternative to
+SwiftNIO ([how they compare](https://github.com/grepjava/vega#vega-swiftnio-and-tokio)): an idle thread takes a
 waiting task from a busy one, at any `await`. Every handler is async, and a
 handler that does not suspend runs inline in the task that read its request,
 with no hop onto another executor and nothing allocated. The engine parses
@@ -49,10 +50,10 @@ This project is an independent effort. It is not an IBM product, and it is not a
   <a href="https://github.com/grepjava/garuda/blob/main/LICENSE"><img src="https://img.shields.io/github/license/grepjava/garuda" alt="MIT license"></a>
 </p>
 
-**Garuda 2 is in development, and not released yet.** Garuda 1 is released
-(1.1) and stays on the `release/1.x` branch. [COMPATIBILITY.md](COMPATIBILITY.md)
-is the guide to moving from Garuda 1 to Garuda 2, and [Status](#status) below
-lists what Garuda 2 does not have yet.
+**Garuda 2.0.0 is released** (2026-10-16; [RELEASE.md](RELEASE.md) has what
+changed). Garuda 1 (1.1) stays on the `release/1.x` branch.
+[COMPATIBILITY.md](COMPATIBILITY.md) is the guide to moving from Garuda 1 to
+Garuda 2, and [Status](#status) below lists what Garuda 2 does not have yet.
 
 ## Features
 
@@ -745,7 +746,7 @@ These work without any handler code, set by flags:
 
 - **HTTP/1.1** with a parser strict where it prevents request smuggling,
   **HTTP/2** over TLS and cleartext, and **HTTP/3** over QUIC (`--http3`).
-  QUIC and QPACK are Garuda's own Swift (`GarudaQUIC`, `GarudaWire`), over
+  QUIC and QPACK are Swift, from Vega (`VegaQUIC`, `VegaHTTP3`), over
   the same TLS library as the rest.
 - **TLS** through Vega's `VegaTLS`, on BoringSSL by default or the system's
   OpenSSL 3, with several certificates chosen by SNI on both TCP and QUIC, and
@@ -840,9 +841,9 @@ checks, and how to run them under AddressSanitizer.
 
 ## Status
 
-Garuda 2 is in development and has no release yet. Garuda 1 is released and
-stays on `release/1.x`; an application not ready to move pins
-`from: "1.1.0"`. From 2.0 on, Garuda 2 follows semantic versioning, and
+Garuda 2.0.0 is the current release. Garuda 1 stays on `release/1.x`; an
+application not ready to move pins `from: "1.1.0"`. From 2.0 on, Garuda
+follows semantic versioning, and
 [COMPATIBILITY.md](COMPATIBILITY.md#versions-from-20-on) says what that
 covers.
 

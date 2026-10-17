@@ -1,12 +1,12 @@
 //===----------------------------------------------------------------------===//
-// A QUIC v1 client with exactly what the tests need, for GarudaQUICTests and
-// GarudaTests alike.
+// A QUIC v1 client with exactly what the tests need, for VegaQUICTests and
+// the servers built on VegaQUIC alike.
 //
-// GarudaQUIC is server-only, so the client is the tests' own: a ClientHello
+// VegaQUIC is server-only, so the client is the tests' own: a ClientHello
 // built by hand, its key schedule straight from VegaCrypto (HKDF's
-// expandLabel, not GarudaQUIC's quicExpandLabel), the server's Finished and
+// expandLabel, not VegaQUIC's quicExpandLabel), the server's Finished and
 // CertificateVerify checked rather than trusted. Packets are protected with
-// GarudaQUIC's QUICProtect, which the RFC vectors cover separately. One cipher
+// VegaQUIC's QUICProtect, which the RFC vectors cover separately. One cipher
 // suite (TLS_AES_128_GCM_SHA256), X25519, and a path that loses nothing: what
 // arrives out of order is not reordered, only what repeats is skipped.
 //
@@ -14,8 +14,8 @@
 // it can be an ordinary target.
 //===----------------------------------------------------------------------===//
 
-import GarudaQUIC
-import GarudaWire
+import VegaQUIC
+import VegaWire
 import VegaCrypto
 import VegaTLS
 

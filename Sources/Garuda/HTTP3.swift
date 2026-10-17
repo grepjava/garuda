@@ -4,7 +4,7 @@
 // QUIC is nothing like the TCP path. There is no accept: a datagram arrives,
 // its destination connection ID is looked up, and either it belongs to a
 // connection or it is the first packet of a new one. Ordering, loss recovery
-// and congestion control all happen inside `QUICConnection` (GarudaQUIC),
+// and congestion control all happen inside `QUICConnection` (VegaQUIC),
 // which does no I/O of its own: it is handed datagrams and asked for them.
 //
 // Each shard binds a UDP socket per thread with SO_REUSEPORT, so the kernel
@@ -43,7 +43,7 @@
 // answered -- or when the grace period runs out.
 //===----------------------------------------------------------------------===//
 
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import Synchronization
 import Vega

@@ -2,7 +2,7 @@ import Synchronization
 import Testing
 @_spi(Testing) @testable import Garuda
 @_spi(Testing) import GarudaTesting
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import QUICTestPeer
 import Vega

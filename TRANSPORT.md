@@ -9,7 +9,7 @@ experimental and serves from a single process.
 | --- | --- |
 | HTTP/1.1, HTTP/1.0 | cleartext and TLS |
 | HTTP/2 | `h2` over TLS via ALPN, `h2c` with prior knowledge |
-| HTTP/3 | with `--http3`, over Garuda's own QUIC (`Sources/GarudaQUIC`) |
+| HTTP/3 | with `--http3`, over Vega's QUIC (`VegaQUIC`) |
 | WebTransport | over HTTP/3, through `app.webTransport` routes |
 | WebSocket | HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220), through `app.webSocket` routes |
 
@@ -319,7 +319,7 @@ stream or the connection ends.
 
 ## HTTP/3 and QUIC
 
-QUIC is Garuda's own, in Swift (`Sources/GarudaQUIC`). It does no I/O: the
+QUIC is Vega's, in Swift (`VegaQUIC`; Garuda 1's, moved to Vega in 0.5.0). It does no I/O: the
 endpoint hands it datagrams and asks it for datagrams. Cryptographic
 primitives (hashes, HKDF, AEAD, key exchange, signatures) come from Vega's
 `VegaCrypto`, on the same TLS library as TCP.
@@ -779,9 +779,8 @@ HTTP/2 and HTTP/3) and `scripts/upload-test.py` (streamed request bodies and
 resumable uploads on all three). They run the `garuda` and
 `garuda-conformance` binaries.
 
-`swift test` covers the HTTP/1.1 parser, HPACK, WebSocket framing and deflate
-(`GarudaWireTests`); QUIC packet protection, the handshake and streams
-(`GarudaQUICTests`); and each transport end to end (`GarudaTests`:
+`swift test` covers the HTTP/1.1 parser (`GarudaWireTests`) and each
+transport end to end (`GarudaTests`:
 `HTTP2Tests`, `HTTP3Tests`, `HTTP3TunnelTests`, `HTTP2WebSocketTests`,
 `WebSocketTests`, `TLSTests`, `StreamingResponseTests`, `EventStreamTests`,
 `InterimTests`, `RequestLimitsTests`, `LargeBodyTests`, `RequestBodyTests`,

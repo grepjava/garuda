@@ -34,30 +34,6 @@ public let cAt: UInt8 = 64
 public let cLeftBracket: UInt8 = 91
 public let cRightBracket: UInt8 = 93
 
-/// A borrowed view of bytes we do not own. Trivial, so it never touches ARC and
-/// is passed in registers.
-public struct ByteSpan {
-    public var base: UnsafePointer<UInt8>
-    public var count: Int
-
-    @inlinable
-    public init(_ base: UnsafePointer<UInt8>, _ count: Int) {
-        self.base = base
-        self.count = count
-    }
-
-    @inlinable public var isEmpty: Bool { count == 0 }
-
-    @inlinable
-    public subscript(i: Int) -> UInt8 { base[i] }
-
-    @inlinable
-    public func dropFirst(_ n: Int) -> ByteSpan { ByteSpan(base + n, count - n) }
-
-    @inlinable
-    public func prefix(_ n: Int) -> ByteSpan { ByteSpan(base, n < count ? n : count) }
-}
-
 /// ASCII lowercase without a branch: only letters have bit 0x20 free in a way
 /// that maps A-Z onto a-z, and the mask is computed from an unsigned compare.
 @inlinable

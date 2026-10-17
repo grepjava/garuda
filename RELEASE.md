@@ -6,7 +6,7 @@ have been deleted rather than left where they would be read as its history.
 Nothing below them was ever published as Garuda.
 
 **Keeping this file.** A change someone using Garuda would notice gets a line
-under the version being prepared -- now [2.0.0](#200--unreleased) -- in the
+under the version being prepared -- now [2.0.1](#201--unreleased) -- in the
 commit that makes it. When a version is cut, its heading gets the date, and a
 new section for the next version goes above it.
 
@@ -73,7 +73,13 @@ nothing relevant.
 
 ---
 
-## 2.0.0 — unreleased
+## 2.0.1 — unreleased
+
+Nothing yet.
+
+---
+
+## 2.0.0 — 2026-10-16
 
 Garuda 2 is a rewrite of the server on [Vega](https://github.com/grepjava/vega),
 a work-stealing runtime, under the same application API. Routes, typed
@@ -89,7 +95,7 @@ resolves to 2.0.
 
 It needs Swift 6.2 or newer, and runs on Linux and on macOS 26.4 or newer
 (Vega's floor; Garuda 1 ran on macOS 15). Windows is experimental. It depends
-on Vega 0.4.10 and vega-db 0.2.4, and no longer on aviancore.
+on Vega 0.5.0 and vega-db 0.2.5, and no longer on aviancore.
 
 Benchmarks ([BENCHMARKS.md](BENCHMARKS.md#garuda-200), six rotated rounds on a clock-capped box,
 Garuda 1.1 and axum 0.8 alongside). Against Garuda 1.1: `skew` +41%, `spike` +34%, `json` +9%,
@@ -213,8 +219,8 @@ the API.
 - **HTTP/1.1**, with the parser strict where that prevents request
   smuggling, and **HTTP/2** over TLS and in cleartext, both on Vega's
   sockets.
-- **HTTP/3** (`--http3`) runs on `GarudaQUIC`, Garuda's own QUIC: Garuda 1's
-  ported onto `GarudaWire` and `VegaCrypto`, with one UDP socket per thread,
+- **HTTP/3** (`--http3`) runs on Vega's `VegaQUIC`: Garuda 1's QUIC, ported onto
+  `VegaCrypto` and moved into Vega 0.5.0, with one UDP socket per thread,
   over the same TLS library as the rest. A client that changes address must
   pass path validation before the server follows it. There is no QUIC session
   resumption or 0-RTT.

@@ -30,7 +30,7 @@
 // (HTTP3WebTransport.swift).
 //===----------------------------------------------------------------------===//
 
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import Synchronization
 import Vega

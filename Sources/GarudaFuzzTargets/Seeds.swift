@@ -14,7 +14,7 @@
 // from its seed.
 //===----------------------------------------------------------------------===//
 
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import QUICTestPeer
 

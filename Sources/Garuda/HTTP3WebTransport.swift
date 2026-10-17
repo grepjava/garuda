@@ -39,7 +39,7 @@
 // checks the routing, capsules and closing against aioquic.
 //===----------------------------------------------------------------------===//
 
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import Synchronization
 import Vega

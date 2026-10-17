@@ -33,14 +33,14 @@ let vegaTraits: Set<Package.Dependency.Trait> = [
 /// Garuda needs.
 let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.4.10"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.5.0"), traits: vegaTraits)
 
 /// vega-db, by version; or, with GARUDA_VEGA_DB_PATH set, a local checkout.
 /// A local Vega under it as well takes VEGA_PATH, which vega-db reads, set
 /// to the same checkout as GARUDA_VEGA_PATH.
 let vegaDBPackage: Package.Dependency = Context.environment["GARUDA_VEGA_DB_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.2.4"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.2.5"), traits: vegaTraits)
 
 /// A module of vega-db.
 func vegaDB(_ name: String) -> Target.Dependency {
@@ -103,17 +103,12 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-syntax", from: "602.0.0"),
     ],
     targets: [
-        // HTTP on the wire as byte-level state machines: the HTTP/1.1 parser,
-        // HPACK, QPACK, frames. No sockets, no allocation on the hot path.
-        // Vendored from aviancore's AvianHTTP; see Sources/GarudaWire/VENDORED.md.
-        .target(name: "GarudaWire", exclude: ["VENDORED.md"], swiftSettings: sharedSwiftSettings),
-        // QUIC as a sans-I/O state machine: packets, packet protection, loss
-        // recovery, streams, and the server side of TLS 1.3 that QUIC runs
-        // its handshake on. Datagrams in, datagrams out; no sockets, no
-        // clock. Ported from aviancore's AvianQUIC, its cryptography on
-        // VegaCrypto. HTTP/3 (in Garuda) sits on it.
-        .target(name: "GarudaQUIC", dependencies: ["GarudaWire", vega("VegaCrypto")],
-                swiftSettings: sharedSwiftSettings),
+        // HTTP on the wire as byte-level state machines: the HTTP/1.1 parser
+        // and writer, and header policies. No sockets, no allocation on the
+        // hot path. HPACK, QPACK and the frames are Vega's (VegaWire,
+        // VegaHTTP3), re-exported. See Sources/GarudaWire/VENDORED.md.
+        .target(name: "GarudaWire", dependencies: [vega("VegaWire"), vega("VegaHTTP3")],
+                exclude: ["VENDORED.md"], swiftSettings: sharedSwiftSettings),
         // VegaTLS serves HTTPS (TLS.swift). VegaCrypto: Garuda has no
         // cryptography of its own. Signed and
         // encrypted cookies (HMAC, HKDF, AES-GCM), JWT signing and verifying,
@@ -122,7 +117,7 @@ let package = Package(
         // response cache's table (garuda_cache.c).
         .target(name: "CGarudaShared"),
         .target(name: "Garuda",
-                dependencies: ["GarudaWire", "GarudaQUIC", "CGarudaShared", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"),
+                dependencies: ["GarudaWire", vega("VegaQUIC"), "CGarudaShared", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"),
                                vega("VegaTLS"),
                                vega("VegaFS"), vega("VegaExtras"), vegaDB("VegaDBTracing"),
                                .product(name: "Tracing", package: "swift-distributed-tracing")],
@@ -165,7 +160,7 @@ let package = Package(
         // them, as fuzz targets; `pgfuzz` mutates inputs against them and
         // GarudaFuzzTests replays fuzz/corpus through them (fuzz/README.md).
         .target(name: "GarudaFuzzTargets",
-                dependencies: ["Garuda", "GarudaWire", "GarudaQUIC", "GarudaTesting", "QUICTestPeer",
+                dependencies: ["Garuda", "GarudaWire", vega("VegaQUIC"), "GarudaTesting", "QUICTestPeer",
                                vega("Vega"), vega("VegaIO"), vega("VegaCrypto"), vega("VegaTLS"),
                                vegaDB("VegaPostgres"), vegaDB("VegaRedis")],
                 swiftSettings: sharedSwiftSettings),
@@ -175,16 +170,12 @@ let package = Package(
         .target(name: "CAllocationCounter", path: "Tests/CAllocationCounter"),
         .testTarget(name: "GarudaWireTests", dependencies: ["GarudaWire"],
                     swiftSettings: sharedSwiftSettings),
-        // The tests' own QUIC client, for GarudaQUICTests and GarudaTests.
-        .target(name: "QUICTestPeer", dependencies: ["GarudaQUIC", "GarudaWire", vega("VegaCrypto"), vega("VegaTLS")],
+        // The tests' own QUIC client (a copy of Vega's), for GarudaTests and the fuzz targets.
+        .target(name: "QUICTestPeer", dependencies: [vega("VegaQUIC"), vega("VegaWire"), vega("VegaCrypto"), vega("VegaTLS")],
                 path: "Tests/QUICTestPeer", swiftSettings: sharedSwiftSettings),
-        // VegaTLS only for a self-signed certificate the handshake test serves.
-        .testTarget(name: "GarudaQUICTests",
-                    dependencies: ["GarudaQUIC", "GarudaWire", "QUICTestPeer", vega("VegaCrypto"), vega("VegaTLS")],
-                    swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaTests",
                     dependencies: ["Garuda", "GarudaWire", "GarudaTesting", "CAllocationCounter",
-                                   "GarudaQUIC", "QUICTestPeer", vega("Vega"),
+                                   vega("VegaQUIC"), "QUICTestPeer", vega("Vega"),
                                    .product(name: "Tracing", package: "swift-distributed-tracing"),
                                    .product(name: "InMemoryTracing", package: "swift-distributed-tracing"),
                                    vegaDB("VegaDBTracing")],

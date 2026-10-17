@@ -17,15 +17,15 @@ running in production in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Source tree
 
-The runtime, sockets, TLS, cryptography and file I/O come from Vega; the
-database drivers from [vega-db](https://github.com/grepjava/vega-db). Both are
-separate packages Garuda depends on by version. Everything below lives in this
+The runtime, sockets, TLS, cryptography, file I/O, the shared wire formats
+and QUIC come from Vega; the database drivers from
+[vega-db](https://github.com/grepjava/vega-db). Both are separate packages
+Garuda depends on by version. Everything below lives in this
 repository.
 
 | Target | What it holds |
 | --- | --- |
-| `GarudaWire` | HTTP on the wire as byte-level state machines: the HTTP/1.1 parser, chunked decoding, HPACK, QPACK, HTTP/2 and HTTP/3 frames, WebSocket frames and permessage-deflate, content-coding negotiation, forwarded-header trust, the response-cache policy. No sockets, no allocation on the hot path. Vendored from aviancore's `AvianHTTP` |
-| `GarudaQUIC` | QUIC as a sans-I/O state machine: packets, packet protection, loss recovery and congestion control, streams, path validation, and the server side of the TLS 1.3 handshake QUIC carries. Datagrams in, datagrams out, no clock. Its cryptography is Vega's `VegaCrypto` |
+| `GarudaWire` | HTTP on the wire as byte-level state machines: the HTTP/1.1 parser and writer, chunked decoding, content-coding negotiation, forwarded-header trust, the response-cache policy. No sockets, no allocation on the hot path. Vendored from aviancore's `AvianHTTP`. It re-exports Vega's `VegaWire` (`ByteBuffer`, HPACK, HTTP/2 and WebSocket frames, permessage-deflate) and `VegaHTTP3` (HTTP/3 frames, QPACK) |
 | `CGarudaShared` | C over shared memory, for what the shards share: the response cache table (`garuda_cache.c`) and the topic bus (`garuda_bus.c`) |
 | `Garuda` | The server (shards, connections, HTTP/1.1, HTTP/2 and HTTP/3 serving, TLS), dispatch, routes, middleware, extractors, the heavy lane, streaming, WebSocket and WebTransport, the HTTP client, sessions, JWT, the CLI |
 | `GarudaTesting` | `app.test`: requests through the real HTTP/1 connection over an in-memory stream |
@@ -42,17 +42,19 @@ flowchart BT
         VegaTLS
         VegaCrypto
         VegaFS
+        VegaWire
+        VegaHTTP3
+        VegaQUIC
     end
     subgraph vegadb[vega-db]
         VegaPostgres
         VegaRedis
         VegaSQLite
     end
-    Wire[GarudaWire]
-    QUIC[GarudaQUIC] --> Wire
-    QUIC --> VegaCrypto
+    Wire[GarudaWire] --> VegaWire & VegaHTTP3
+    VegaQUIC --> VegaWire & VegaCrypto
     Garuda --> Wire
-    Garuda --> QUIC
+    Garuda --> VegaQUIC
     Garuda --> CGarudaShared
     Garuda --> Vega & VegaIO & VegaTLS & VegaCrypto & VegaFS
     GP[GarudaPostgres] --> Garuda
@@ -249,7 +251,7 @@ writes it itself when nobody else is writing and the windows take it whole.
 **HTTP/3** (`HTTP3.swift`, `HTTP3Connection.swift`). Each shard binds one UDP
 socket per thread with `SO_REUSEPORT`, so the kernel spreads clients across
 them. Each socket has one **endpoint** task that owns everything QUIC for it:
-the connection-ID table, every `QUICConnection` (from `GarudaQUIC`, which does
+the connection-ID table, every `QUICConnection` (from Vega's `VegaQUIC`, which does
 no I/O of its own) and the HTTP/3 state on top. Nothing there is locked. Its
 loop receives a batch of datagrams, waiting no longer than the earliest QUIC
 timer; feeds each to its connection; runs due timers; takes the answers

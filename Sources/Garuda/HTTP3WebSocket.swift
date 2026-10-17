@@ -21,7 +21,7 @@
 // H3_REQUEST_CANCELLED.
 //===----------------------------------------------------------------------===//
 
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import Synchronization
 import Vega

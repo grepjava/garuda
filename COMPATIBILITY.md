@@ -333,8 +333,8 @@ with an outside ACME client, answer its HTTP-01 challenges with
 - **Metrics.** The per-route series (`garuda_route_*`),
   `garuda_connection_slots`, and the hand-off and deferred-accept counters
   are gone.
-- **HTTP/3** runs on Garuda's own QUIC (`GarudaQUIC`), one UDP socket per
-  thread, ported from Garuda 1's and using the same TLS library as the rest.
+- **HTTP/3** runs on Vega's QUIC (`VegaQUIC`), one UDP socket per
+  thread, Garuda 1's QUIC ported and using the same TLS library as the rest.
   A client that changes address must pass path validation before the server
   follows it.
 - **TLS** has a 10-second handshake timeout, and session tickets resume across

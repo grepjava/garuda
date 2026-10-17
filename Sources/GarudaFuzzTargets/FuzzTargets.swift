@@ -33,7 +33,7 @@
 
 import Garuda
 import GarudaWire
-import GarudaQUIC
+import VegaQUIC
 import VegaPostgres
 import VegaRedis
 

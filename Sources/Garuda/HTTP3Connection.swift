@@ -25,7 +25,7 @@
 // which bounds the ratio of requests cancelled to requests answered.
 //===----------------------------------------------------------------------===//
 
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import Synchronization
 import Vega

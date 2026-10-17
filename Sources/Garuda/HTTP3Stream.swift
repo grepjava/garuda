@@ -37,7 +37,7 @@
 // its next request: a request costs no allocation once a connection is warm.
 //===----------------------------------------------------------------------===//
 
-import GarudaQUIC
+import VegaQUIC
 import GarudaWire
 import Synchronization
 import Vega
