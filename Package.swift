@@ -33,14 +33,14 @@ let vegaTraits: Set<Package.Dependency.Trait> = [
 /// Garuda needs.
 let vegaPackage: Package.Dependency = Context.environment["GARUDA_VEGA_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega.git", .upToNextMinor(from: "0.5.0"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega.git", from: "1.0.0", traits: vegaTraits)
 
 /// vega-db, by version; or, with GARUDA_VEGA_DB_PATH set, a local checkout.
 /// A local Vega under it as well takes VEGA_PATH, which vega-db reads, set
 /// to the same checkout as GARUDA_VEGA_PATH.
 let vegaDBPackage: Package.Dependency = Context.environment["GARUDA_VEGA_DB_PATH"].map {
     .package(path: $0, traits: vegaTraits)
-} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.2.5"), traits: vegaTraits)
+} ?? .package(url: "https://github.com/grepjava/vega-db.git", .upToNextMinor(from: "0.3.0"), traits: vegaTraits)
 
 /// A module of vega-db.
 func vegaDB(_ name: String) -> Target.Dependency {
@@ -88,11 +88,12 @@ let package = Package(
     ],
     dependencies: [
         // The runtime: work-stealing scheduler, sharded processes, sockets,
-        // TLS. upToNextMinor, not `from:`: Vega is below 1.0, so a minor
-        // release may change its API.
+        // TLS. From 1.0, Vega follows semantic versioning.
         vegaPackage,
         // PostgreSQL, Redis and SQLite. Resolved by everyone, built only for
         // an application that imports one of the database products.
+        // upToNextMinor: vega-db is below 1.0, where a minor release may
+        // change its API.
         vegaDBPackage,
         // Traces: a request's span, and its outbound calls' under it
         // (Tracing.swift). The API alone; the application picks a tracer.

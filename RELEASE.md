@@ -6,7 +6,7 @@ have been deleted rather than left where they would be read as its history.
 Nothing below them was ever published as Garuda.
 
 **Keeping this file.** A change someone using Garuda would notice gets a line
-under the version being prepared -- now [2.0.1](#201--unreleased) -- in the
+under the version being prepared -- now [2.1.1](#211--unreleased) -- in the
 commit that makes it. When a version is cut, its heading gets the date, and a
 new section for the next version goes above it.
 
@@ -73,9 +73,32 @@ nothing relevant.
 
 ---
 
-## 2.0.1 — unreleased
+## 2.1.1 — unreleased
 
 Nothing yet.
+
+---
+
+## 2.1.0 — 2026-10-19
+
+Garuda on Vega 1.0.0 and vega-db 0.3.0. An application's code is unchanged:
+handlers, middleware, configuration and the command line work as in 2.0.0,
+including `run(arguments:)` skipping `argv[0]` and the shard count sized from
+the CPUs the process may run on when `--shards` and `--workers` are not given.
+
+- Vega 1.0 freezes Vega's API, and Garuda follows its names: the HTTP/2,
+  HTTP/3, WebSocket and QUIC vocabulary under their full names
+  (`HTTP2FrameHeader`, `HTTP3ErrorCode`, `WebSocketCloseCode`,
+  `QUICConnectionState`), `PollStamp`, `ShardConfiguration`,
+  `timeout(for:)` and `withIOTimeout(for:)`. An application that imports
+  Vega's modules itself meets the same renames; Vega's v1.0.0 release
+  notes list them.
+- Garuda depends on Vega `from: "1.0.0"`, now that Vega follows semantic
+  versioning, and on vega-db `0.3.x`.
+- GarudaTesting: `TestFrame.kind` and `has(_:)`, and
+  `HTTP2TestConnection.send(_:flags:stream:payload:)`, which took Vega's frame
+  types, are package rather than public. `send(raw:)` and the frame's `type`
+  and `flags` bytes are public as before.
 
 ---
 
