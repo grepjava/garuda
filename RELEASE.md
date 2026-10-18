@@ -84,9 +84,17 @@ Fixes for 2.1.0 on Linux.
 - **`--blocking-queue` refuses again.** In Vega 1.0 `Runtime.blocking` always
   waits its turn, and `Runtime.tryBlocking` is the call that refuses. 2.1.0's
   `app.offload` routes called `blocking`, so past `--blocking-queue` they
-  queued instead of answering 503; they call `tryBlocking` now. A handler's
-  own blocking work that should be refused uses `Runtime.tryBlocking` and
-  throws `BlockingQueueFull()` when it returns nil.
+  queued instead of answering 503; they call `tryBlocking` now.
+- **A handler's own `Runtime.blocking` no longer answers 503** past
+  `--blocking-queue`, as it did in 2.0: it waits for a thread. Work that should
+  be refused calls `Runtime.tryBlocking` and throws `BlockingQueueFull()` when
+  it returns nil:
+
+  ```swift
+  guard let hash = try await Runtime.tryBlocking({ try expensiveHash(password) }) else {
+      throw BlockingQueueFull()
+  }
+  ```
 
 ---
 

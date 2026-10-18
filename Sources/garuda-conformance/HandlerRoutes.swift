@@ -257,14 +257,15 @@ func addHandlerRoutes(_ app: Application) {
         return HTTPStatus.ok
     }
 
-    // Work on the blocking pool: a sleep that would stop the worker, and
-    // work that throws.
+    // Work on the blocking pool: a sleep that would stop the worker, refused
+    // past --blocking-queue, and work that throws.
     app.get("/blocking/sleep/:ms") { (ms: Path<Int>) async throws -> String in
         let micros = UInt32(min(5000, max(1, ms.value))) * 1000
-        return try await Runtime.blocking { () throws -> String in
+        guard let slept = try await Runtime.tryBlocking({ () throws -> String in
             usleep(micros)
             return "slept"
-        }
+        }) else { throw BlockingQueueFull() }
+        return slept
     }
 
     app.get("/blocking/throw") { () async throws -> String in
