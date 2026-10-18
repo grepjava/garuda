@@ -6,9 +6,12 @@ be noticed, and these runs are how.
 
 The reference points are axum and actix on Rust, Vert.x on the JVM, and
 Hummingbird and Vapor on Swift, all from
-[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.netlify.app/).
+[the-benchmarker/web-frameworks](https://web-frameworks-benchmark.vercel.app/).
 Every server but Garuda runs that suite's own application, built as the suite
-builds it, under the suite's load command.
+builds it, under the suite's load command. Garuda's own entry in that suite is
+kept at [benchmarks/web-frameworks/swift/garuda](benchmarks/web-frameworks/swift/garuda);
+[DEPLOYMENT.md](DEPLOYMENT.md#the-web-frameworks-entry) says what it must
+keep doing.
 
 ## Garuda 2 against Garuda 1 and axum
 

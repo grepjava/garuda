@@ -302,6 +302,14 @@ was four single-threaded ones, and is still: `--workers 4` keeps that shape as
 runs the default `--shards auto`, which sizes itself from the CPUs' cache
 domains.
 
+A `--workers` count the application worked out from the host's CPUs, as
+`sysconf(_SC_NPROCESSORS_ONLN)` gives it, is wrong inside a cpuset. Garuda 1
+started that many single-threaded processes and the kernel spread them over
+the CPUs the container was allowed; Garuda 2 pins each shard to a CPU, so
+eight shards in a two-CPU cpuset sit four to a CPU, and p99 at 64 connections
+went from 0.5 ms to 9 ms for no throughput. Leave the count to `auto`, which
+reads the affinity mask, or take it from `nproc`, which does too.
+
 **New:** `--shards`, `--threads`, `--no-pin`, `--io`, `--acceptors`,
 `--heavy-threshold`, `--no-heavy-lane`, `--tls-reload`, `--acme-webroot`.
 `SERVER_HOSTNAME` and `SERVER_PORT` in the environment set the host and port.

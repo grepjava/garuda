@@ -30,6 +30,11 @@ extension Application {
     /// Serves with the configuration on the command line, and never returns:
     /// the process exits when the server stops, 2 when the command line or the
     /// routes are wrong.
+    ///
+    /// `arguments` is an argv: its first element is the program name and is
+    /// skipped, so a list of flags needs one in front,
+    /// `[CommandLine.arguments[0], "--port", "3000"]`. Garuda 1 took the
+    /// flags alone.
     public func run(arguments: [String] = CommandLine.arguments) -> Never {
         switch ServerConfig.parse(arguments) {
         case .exit(let status):
