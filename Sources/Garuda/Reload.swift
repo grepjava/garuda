@@ -109,11 +109,11 @@ final class ReloadWatcher: @unchecked Sendable {
         let logged = options.onEvent
         options.onEvent = { event in
             logged?(event)
-            switch event {
+            switch event.kind {
             case .restartingSupervisor:
                 Log.info("executable rebuilt; restarting the supervisor on it")
-            case .supervisorRestartFailed(let reason):
-                Log.error("--reload: \(reason); keeping the current executable")
+            case .supervisorRestartFailed:
+                Log.error("--reload: \(event.reason ?? "unknown"); keeping the current executable")
             default:
                 break
             }
@@ -131,7 +131,7 @@ final class ReloadWatcher: @unchecked Sendable {
         }
         let settled = notifiedAt != 0 && now &- notifiedAt >= ReloadWatcher.settle
         let pendingDue = pendingSince != 0 && now &- pendingSince >= ReloadWatcher.stable
-        if !settled && !pendingDue && now &- lastScan < interval { return .none }
+        if !settled && !pendingDue && now &- lastScan < interval { return .nothing }
         if settled { notifiedAt = 0 }
         lastScan = now
 
@@ -139,15 +139,15 @@ final class ReloadWatcher: @unchecked Sendable {
         if executable == executableSignature && certificates == certificateSignature {
             // Nothing, or a change since undone.
             pendingSince = 0
-            return .none
+            return .nothing
         }
         if pendingSince == 0 || executable != pendingExecutable || certificates != pendingCertificates {
             pendingExecutable = executable
             pendingCertificates = certificates
             pendingSince = now
-            return .none
+            return .nothing
         }
-        if now &- pendingSince < ReloadWatcher.stable { return .none }
+        if now &- pendingSince < ReloadWatcher.stable { return .nothing }
 
         pendingSince = 0
         let rebuilt = executable != executableSignature
@@ -161,7 +161,7 @@ final class ReloadWatcher: @unchecked Sendable {
             Log.info("certificate changed on disk; reloading workers")
             return .reload
         }
-        return .none
+        return .nothing
     }
 
     /// Whether inotify had anything to say, read to the end.

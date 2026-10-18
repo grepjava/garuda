@@ -75,7 +75,18 @@ nothing relevant.
 
 ## 2.1.1 — unreleased
 
-Nothing yet.
+Fixes for 2.1.0 on Linux.
+
+- **Garuda builds on Linux again.** The process supervisor's code (`--reload`,
+  the reload log) still matched Vega's `ShardEvent` and `ShardWatchAction` as
+  enums; in Vega 1.0 they are structs. 2.1.0 built on macOS and Windows, which
+  do not compile that code, and failed on Linux.
+- **`--blocking-queue` refuses again.** In Vega 1.0 `Runtime.blocking` always
+  waits its turn, and `Runtime.tryBlocking` is the call that refuses. 2.1.0's
+  `app.offload` routes called `blocking`, so past `--blocking-queue` they
+  queued instead of answering 503; they call `tryBlocking` now. A handler's
+  own blocking work that should be refused uses `Runtime.tryBlocking` and
+  throws `BlockingQueueFull()` when it returns nil.
 
 ---
 

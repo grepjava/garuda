@@ -1064,15 +1064,16 @@ final class ReloadLog: @unchecked Sendable {
     private var waiting: Set<Int>?
 
     func saw(_ event: ShardEvent) {
-        switch event {
-        case .started(let shard, _):
+        switch event.kind {
+        case .started:
+            guard let shard = event.shard else { return }
             running.insert(shard)
             guard var left = waiting else { return }
             left.remove(shard)
             waiting = left.isEmpty ? nil : left
             if left.isEmpty { Log.info("workers reloaded") }
-        case .exited(let shard, _, _, _):
-            running.remove(shard)
+        case .exited:
+            if let shard = event.shard { running.remove(shard) }
         case .reloading:
             Log.info("reloading workers")
             waiting = running.isEmpty ? nil : running

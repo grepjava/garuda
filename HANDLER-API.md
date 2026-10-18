@@ -384,8 +384,10 @@ the worker. The handler is not async: the work that awaits belongs in an
 ordinary route. What it takes and returns crosses threads, so it must be
 `Sendable`. A pool thread cannot be stopped: neither a deadline nor a client
 that goes away cuts an offloaded handler short. Work that finds every thread
-busy and `--blocking-queue` pieces already waiting is refused: the route, or
-a handler's own `Runtime.blocking`, answers 503.
+busy and `--blocking-queue` pieces already waiting is refused: the route
+answers 503. A handler's own blocking work is refused the same way through
+`Runtime.tryBlocking`, which returns nil instead of queueing (throw
+`BlockingQueueFull()` for the 503); `Runtime.blocking` always waits its turn.
 
 The heavy lane is for work that computes; offloading is for work that blocks
 without computing.
