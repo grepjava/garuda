@@ -146,11 +146,11 @@ struct DeclaredLengthHTTP2Tests {
         #expect(response.headers(named: "content-length") == ["10"])
         #expect(response.body == letters(3))
         #expect(!response.ended)
-        #expect(response.reset == H2Error.internalError.rawValue)
+        #expect(response.reset == HTTP2ErrorCode.internalError.rawValue)
         // Nothing to send at all is reset just the same.
         let empty = try h2.get("/length/10/0")
         #expect(!empty.ended)
-        #expect(empty.reset == H2Error.internalError.rawValue)
+        #expect(empty.reset == HTTP2ErrorCode.internalError.rawValue)
         // The connection survives the reset streams.
         #expect(try h2.get("/").status == .ok)
     }
@@ -213,9 +213,9 @@ struct DeclaredLengthHTTP3Tests {
         try withServer(lengthApp()) { client, _ in
             try await client.connect()
             let answer = try await get(client, 0, "/length/10/3")
-            #expect(answer.reset == HTTP3Error.internalError)
+            #expect(answer.reset == HTTP3ErrorCode.internalError.rawValue)
             let empty = try await get(client, 4, "/length/10/0")
-            #expect(empty.reset == HTTP3Error.internalError)
+            #expect(empty.reset == HTTP3ErrorCode.internalError.rawValue)
             #expect(try await get(client, 8, "/").status == 200)
         }
     }

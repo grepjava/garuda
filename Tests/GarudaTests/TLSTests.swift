@@ -53,7 +53,7 @@ func https(_ app: Application, _ store: CertificateStore, serverName: String?, t
     let limits = ConnectionLimits(ServerConfig())
     var configuration = TLSConfiguration.client(trustRoots: pem.map { .certificates($0) } ?? .system,
                                                 applicationProtocols: ["http/1.1"])
-    if pem == nil { configuration.verification = .none }
+    if pem == nil { configuration.verification = .disabled }
     let client = try TLSContext(configuration)
     let rt = TLSTestRuntime.shared
     return try rt.block { () async throws -> (String, [UInt8]?, String?) in

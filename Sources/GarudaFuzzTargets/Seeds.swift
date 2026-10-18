@@ -14,7 +14,9 @@
 // from its seed.
 //===----------------------------------------------------------------------===//
 
-import VegaQUIC
+import VegaWire
+@_spi(Garuda) import VegaHTTP3Core
+@_spi(Garuda) import VegaQUICCore
 import GarudaWire
 import QUICTestPeer
 

@@ -71,7 +71,7 @@ extension Application {
     }
 }
 
-extension HTTP1Connection {
+extension HTTP1Client {
     /// Tells the observers and the access log how the request was answered.
     /// `headParsed`: false for a request refused before its head could be
     /// read, which has no method or path to report.

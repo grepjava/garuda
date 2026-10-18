@@ -11,7 +11,7 @@ import Vega
 /// handler, so the difference in their counts is what one request costs.
 final class AllocationProbe: @unchecked Sendable {
     let capacity = 1024
-    let stamps: UnsafeMutablePointer<JobStamp>
+    let stamps: UnsafeMutablePointer<PollStamp?>
     let counts: UnsafeMutablePointer<Int>
     var taken = 0
 
@@ -28,7 +28,7 @@ final class AllocationProbe: @unchecked Sendable {
     @inline(__always)
     func take() {
         guard taken < capacity else { return }
-        stamps[taken] = Runtime.currentJobStamp
+        stamps[taken] = Runtime.currentPollStamp
         counts[taken] = Int(garuda_test_allocations())
         taken += 1
     }

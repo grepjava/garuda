@@ -31,9 +31,12 @@
 // from coming back.
 //===----------------------------------------------------------------------===//
 
+@_spi(Garuda) import VegaHTTP2Core
+@_spi(Garuda) import VegaHTTP3Core
+@_spi(Garuda) import VegaWebSocketCore
+@_spi(Garuda) import VegaQUICCore
 import Garuda
 import GarudaWire
-import VegaQUIC
 import VegaPostgres
 import VegaRedis
 

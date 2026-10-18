@@ -1,3 +1,5 @@
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
 import Synchronization
 import Testing
 @testable import Garuda
@@ -15,16 +17,16 @@ final class PeerConnection: @unchecked Sendable {
     var input = IOBuffer(capacity: 64 * 1024)
     var decoder = HPACKDecoder(maxTableSize: 4096)
     /// Every frame read, by type, for a script to look at afterwards.
-    var seen: [H2FrameHeader] = []
+    var seen: [HTTP2FrameHeader] = []
 
     init(_ stream: consuming TCPStream) { self.stream = stream }
 
     deinit { decoder.destroy() }
 
     struct Frame {
-        var header: H2FrameHeader
+        var header: HTTP2FrameHeader
         var payload: [UInt8]
-        var type: H2FrameType? { H2FrameType(rawValue: header.type) }
+        var type: HTTP2FrameType? { HTTP2FrameType(rawValue: header.type) }
     }
 
     struct Request {
@@ -50,11 +52,11 @@ final class PeerConnection: @unchecked Sendable {
     }
 
     func readFrame() async throws -> Frame {
-        try await fill(H2FrameHeader.size)
-        let header = input.withUnsafeBytes { H2FrameHeader.parse($0.baseAddress!.assumingMemoryBound(to: UInt8.self)) }
-        try await fill(H2FrameHeader.size + header.length)
-        let payload = input.withUnsafeBytes { Array($0[H2FrameHeader.size..<(H2FrameHeader.size + header.length)]) }
-        input.consume(H2FrameHeader.size + header.length)
+        try await fill(HTTP2FrameHeader.size)
+        let header = input.withUnsafeBytes { HTTP2FrameHeader.parse($0.baseAddress!.assumingMemoryBound(to: UInt8.self)) }
+        try await fill(HTTP2FrameHeader.size + header.length)
+        let payload = input.withUnsafeBytes { Array($0[HTTP2FrameHeader.size..<(HTTP2FrameHeader.size + header.length)]) }
+        input.consume(HTTP2FrameHeader.size + header.length)
         seen.append(header)
         return Frame(header: header, payload: payload)
     }
@@ -108,20 +110,20 @@ final class PeerConnection: @unchecked Sendable {
         return Request(stream: id, fields: fields, endStream: ends)
     }
 
-    func send(_ type: H2FrameType, flags: H2Flags = [], stream id: UInt32, _ payload: [UInt8] = []) async throws {
+    func send(_ type: HTTP2FrameType, flags: HTTP2Flags = [], stream id: UInt32, _ payload: [UInt8] = []) async throws {
         try await sendRaw(type.rawValue, flags: flags, stream: id, payload)
     }
 
-    func sendRaw(_ type: UInt8, flags: H2Flags = [], stream id: UInt32, _ payload: [UInt8]) async throws {
+    func sendRaw(_ type: UInt8, flags: HTTP2Flags = [], stream id: UInt32, _ payload: [UInt8]) async throws {
         var out = ByteBuffer(capacity: payload.count + 16)
-        H2FrameHeader(length: payload.count, rawType: type, flags: flags, streamID: id).write(into: &out)
+        HTTP2FrameHeader(length: payload.count, rawType: type, flags: flags, streamID: id).write(into: &out)
         if !payload.isEmpty { payload.withUnsafeBufferPointer { out.write($0.baseAddress!, $0.count) } }
         let bytes = Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
         out.destroy()
         try await bytes.withUnsafeBytesAsync { (b) async throws(IOError) in try await stream.write(b) }
     }
 
-    func settings(_ entries: [(H2Setting, UInt32)] = [], ack: Bool = false) async throws {
+    func settings(_ entries: [(HTTP2Setting, UInt32)] = [], ack: Bool = false) async throws {
         var payload: [UInt8] = []
         for (setting, value) in entries {
             payload += [UInt8(setting.rawValue >> 8), UInt8(setting.rawValue & 0xFF)] + be32(value)
@@ -134,7 +136,7 @@ final class PeerConnection: @unchecked Sendable {
     }
 
     /// Answers the opening: our settings, and an ack of the client's.
-    func handshake(_ entries: [(H2Setting, UInt32)] = []) async throws {
+    func handshake(_ entries: [(HTTP2Setting, UInt32)] = []) async throws {
         #expect(try await readPreface())
         try await settings(entries)
         try await settings(ack: true)
@@ -362,10 +364,10 @@ struct HTTP2ClientPeerTests {
         let (result, _) = try against { peer in
             try await peer.handshake()
             let id = try await peer.readRequest().stream
-            try await peer.send(.rstStream, stream: id, be32(H2Error.internalError.rawValue))
+            try await peer.send(.rstStream, stream: id, be32(HTTP2ErrorCode.internalError.rawValue))
             await peer.drain()
         }
-        #expect(failure(result) == .streamReset(H2Error.internalError.rawValue))
+        #expect(failure(result) == .streamReset(HTTP2ErrorCode.internalError.rawValue))
     }
 
     @Test func aPingIsAnsweredAndSettingsAcknowledged() throws {
@@ -449,7 +451,7 @@ struct HTTP2ClientPeerTests {
                 let b = try await peer.readRequest()
                 let reset = a.field(":path") == "/reset" ? a : b
                 let answered = a.field(":path") == "/reset" ? b : a
-                try await peer.send(.rstStream, stream: reset.stream, be32(H2Error.refusedStream.rawValue + 1))
+                try await peer.send(.rstStream, stream: reset.stream, be32(HTTP2ErrorCode.refusedStream.rawValue + 1))
                 try await peer.respond(answered.stream, body: "fine")
                 await peer.drain()
             }])
@@ -460,7 +462,7 @@ struct HTTP2ClientPeerTests {
             async let two = outcome(client, peer.url + "/fine")
             return await (one, two)
         }
-        #expect(failure(first) == .streamReset(H2Error.refusedStream.rawValue + 1))
+        #expect(failure(first) == .streamReset(HTTP2ErrorCode.refusedStream.rawValue + 1))
         #expect((try? second.get().text) == "fine")
     }
 

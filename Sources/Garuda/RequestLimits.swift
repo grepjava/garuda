@@ -151,7 +151,7 @@ func acquirePlaces(_ permits: [Vega.Semaphore]) -> Bool {
 
 // MARK: - The connection side
 
-extension HTTP1Connection {
+extension HTTP1Client {
     /// `bodyRule(_:_:_:matched:)` for this connection's exchange.
     mutating func bodyRule(_ app: CompiledApplication, matched: inout Int32) -> BodyRule {
         Garuda.bodyRule(x, app, limits, matched: &matched)

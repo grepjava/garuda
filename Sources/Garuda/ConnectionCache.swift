@@ -14,6 +14,7 @@
 // lock. Parts that grew large -- a big body -- are freed instead of kept.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 import Vega
 

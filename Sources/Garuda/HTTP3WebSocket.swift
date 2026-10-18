@@ -21,7 +21,8 @@
 // H3_REQUEST_CANCELLED.
 //===----------------------------------------------------------------------===//
 
-import VegaQUIC
+import VegaWire
+@_spi(Garuda) import VegaQUICCore
 import GarudaWire
 import Synchronization
 import Vega
@@ -154,7 +155,7 @@ extension QUICEndpoint {
         inbound.close()
         lock.withLock { _ in
             s.task = nil
-            if abandoned { s.failCode = HTTP3Error.requestCancelled }
+            if abandoned { s.failCode = HTTP3ErrorCode.requestCancelled.rawValue }
             channel.closeH3Locked(s, failed: abandoned)
             s.taskDone = true
             post(s)

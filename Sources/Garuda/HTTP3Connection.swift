@@ -25,14 +25,16 @@
 // which bounds the ratio of requests cancelled to requests answered.
 //===----------------------------------------------------------------------===//
 
-import VegaQUIC
+import VegaWire
+@_spi(Garuda) import VegaHTTP3Core
+@_spi(Garuda) import VegaQUICCore
 import GarudaWire
 import Synchronization
 import Vega
 
 final class H3Connection {
     unowned(unsafe) let endpoint: QUICEndpoint
-    let quic: QUICConnection
+    let quic: QUICConnectionState
     /// Where the peer is, and which of our addresses it wrote to: what the
     /// connection's datagrams are sent to and from.
     var peer: SocketAddress
@@ -105,7 +107,7 @@ final class H3Connection {
     @exclusivity(unchecked) var localLimitUni: UInt64 = 0
     @exclusivity(unchecked) var localLimitBidi: UInt64 = 0
 
-    init(endpoint: QUICEndpoint, quic: QUICConnection, peer: SocketAddress, local: SocketAddress?,
+    init(endpoint: QUICEndpoint, quic: QUICConnectionState, peer: SocketAddress, local: SocketAddress?,
          localCID: QUICConnectionID, originalDCID: QUICConnectionID) {
         self.endpoint = endpoint
         self.quic = quic
@@ -211,13 +213,13 @@ final class H3Connection {
         // Only h3 is served. Anything else negotiated is a protocol this
         // server does not speak, and the transport says so.
         if quic.selectedALPN != h3ALPN {
-            fail(HTTP3Error.generalProtocolError)
+            fail(HTTP3ErrorCode.generalProtocolError.rawValue)
             return
         }
         began = true
         remote = SocketPeer(address: peer.host, port: peer.port ?? 0)
         guard let control = quic.openStream(unidirectional: true) else {
-            fail(HTTP3Error.streamCreationError)
+            fail(HTTP3ErrorCode.streamCreationError.rawValue)
             return
         }
         controlOut = control
@@ -308,7 +310,7 @@ final class H3Connection {
                 // A WebTransport session's: its identifier follows the type,
                 // and the two together are the whole prefix.
                 guard let sessionID = r.varint() else {
-                    if available >= 16 { fail(HTTP3Error.generalProtocolError) }
+                    if available >= 16 { fail(HTTP3ErrorCode.generalProtocolError.rawValue) }
                     return
                 }
                 stream.receive.ready.consume(r.offset)
@@ -317,23 +319,23 @@ final class H3Connection {
             stream.receive.ready.consume(r.offset)
             switch type {
             case HTTP3StreamType.control:
-                if peerControl != .max { return fail(HTTP3Error.streamCreationError) }
+                if peerControl != .max { return fail(HTTP3ErrorCode.streamCreationError.rawValue) }
                 peerControl = id
             case HTTP3StreamType.qpackEncoder:
-                if peerEncoder != .max { return fail(HTTP3Error.streamCreationError) }
+                if peerEncoder != .max { return fail(HTTP3ErrorCode.streamCreationError.rawValue) }
                 peerEncoder = id
             case HTTP3StreamType.qpackDecoder:
-                if peerDecoder != .max { return fail(HTTP3Error.streamCreationError) }
+                if peerDecoder != .max { return fail(HTTP3ErrorCode.streamCreationError.rawValue) }
                 peerDecoder = id
             case HTTP3StreamType.push:
                 // Only a server pushes.
-                return fail(HTTP3Error.streamCreationError)
+                return fail(HTTP3ErrorCode.streamCreationError.rawValue)
             default:
                 // An extension's stream, or a reserved type: the peer is told
                 // we are not interested rather than left waiting, and the
                 // stream is let go of, so its credit comes back.
                 stream.receive.ready.clear()
-                quic.stopSending(id, code: HTTP3Error.streamCreationError)
+                quic.stopSending(id, code: HTTP3ErrorCode.streamCreationError.rawValue)
                 quic.releaseStream(id)
                 return
             }
@@ -346,7 +348,7 @@ final class H3Connection {
             // 9204 section 4.3.1). Anything else is an error, not noise.
             let ready = stream.receive.ready
             for i in 0..<ready.readableBytes where ready.readPointer[i] != 0x20 {
-                return fail(HTTP3Error.qpackEncoderStreamError)
+                return fail(HTTP3ErrorCode.qpackEncoderStreamError.rawValue)
             }
             stream.receive.ready.clear()
         } else if id == peerDecoder {
@@ -356,12 +358,12 @@ final class H3Connection {
         guard !quic.isClosed && quic.status != .closing else { return }
         // A critical stream may not end while the connection lasts.
         if stream.receive.finished && stream.receive.ready.readableBytes == 0 {
-            return fail(HTTP3Error.closedCriticalStream)
+            return fail(HTTP3ErrorCode.closedCriticalStream.rawValue)
         }
         quic.extendStreamWindow(id, consumed: stream.receive.received &- UInt64(stream.receive.ready.readableBytes))
     }
 
-    private func readControl(_ stream: QUICStream) {
+    private func readControl(_ stream: QUICStreamState) {
         while true {
             let available = stream.receive.ready.readableBytes
             if available == 0 { break }
@@ -370,13 +372,13 @@ final class H3Connection {
             guard let type = r.varint(), let length = r.varintAsInt() else { break }
             // A control frame is read whole; none of ours is large, and a
             // peer's that is cannot be one we want.
-            if length > 64 * 1024 { return fail(HTTP3Error.excessiveLoad) }
+            if length > 64 * 1024 { return fail(HTTP3ErrorCode.excessiveLoad.rawValue) }
             if r.remaining < length { break }
             let header = r.offset
-            if !settingsSeen && type != HTTP3FrameType.settings { return fail(HTTP3Error.missingSettings) }
+            if !settingsSeen && type != HTTP3FrameType.settings { return fail(HTTP3ErrorCode.missingSettings.rawValue) }
             switch type {
             case HTTP3FrameType.settings:
-                if settingsSeen { return fail(HTTP3Error.frameUnexpected) }
+                if settingsSeen { return fail(HTTP3ErrorCode.frameUnexpected.rawValue) }
                 if !applySettings(base + header, length) { return }
                 settingsSeen = true
             case HTTP3FrameType.goaway:
@@ -387,9 +389,9 @@ final class H3Connection {
                 break
             case HTTP3FrameType.data, HTTP3FrameType.headers, HTTP3FrameType.pushPromise:
                 // These belong on a request stream and nowhere else.
-                return fail(HTTP3Error.frameUnexpected)
+                return fail(HTTP3ErrorCode.frameUnexpected.rawValue)
             default:
-                if HTTP3FrameType.isReservedFromHTTP2(type) { return fail(HTTP3Error.frameUnexpected) }
+                if HTTP3FrameType.isReservedFromHTTP2(type) { return fail(HTTP3ErrorCode.frameUnexpected.rawValue) }
                 // Unknown types are skipped: that is how new frames deploy.
             }
             stream.receive.ready.consume(header &+ length)
@@ -402,20 +404,20 @@ final class H3Connection {
         var seen: [UInt64] = []
         while !r.isEmpty {
             guard let id = r.varint(), let value = r.varint() else {
-                fail(HTTP3Error.frameError)
+                fail(HTTP3ErrorCode.frameError.rawValue)
                 return false
             }
             // HTTP/2's identifiers are reserved, and a setting may be given
             // once (RFC 9114 section 7.2.4).
             if HTTP3Setting.isReservedFromHTTP2(id) || seen.contains(id) {
-                fail(HTTP3Error.settingsError)
+                fail(HTTP3ErrorCode.settingsError.rawValue)
                 return false
             }
             seen.append(id)
             switch id {
             case HTTP3Setting.enableConnectProtocol, HTTP3Setting.h3Datagram:
                 if value > 1 {
-                    fail(HTTP3Error.settingsError)
+                    fail(HTTP3ErrorCode.settingsError.rawValue)
                     return false
                 }
             default:
@@ -450,7 +452,7 @@ final class H3Connection {
             var r = QUICReader(UnsafePointer(stream.receive.ready.readPointer), available)
             if let type = r.varint(), type == HTTP3FrameType.webTransportStream {
                 guard let sessionID = r.varint() else {
-                    if available >= 16 { fail(HTTP3Error.frameError) }
+                    if available >= 16 { fail(HTTP3ErrorCode.frameError.rawValue) }
                     return
                 }
                 stream.receive.ready.consume(r.offset)
@@ -475,19 +477,19 @@ final class H3Connection {
             var r = QUICReader(base, available)
             guard let type = r.varint(), let length = r.varintAsInt() else {
                 // Two varints are sixteen bytes at most.
-                if available >= 16 { return fail(HTTP3Error.frameError) }
+                if available >= 16 { return fail(HTTP3ErrorCode.frameError.rawValue) }
                 break
             }
             let header = r.offset
-            if HTTP3FrameType.isReservedFromHTTP2(type) { return fail(HTTP3Error.frameUnexpected) }
+            if HTTP3FrameType.isReservedFromHTTP2(type) { return fail(HTTP3ErrorCode.frameUnexpected.rawValue) }
             switch type {
             case HTTP3FrameType.headers:
                 // A header block is decoded whole -- QPACK has no way to
                 // resume -- so one too large to take is refused rather than
                 // waited for: its stream's window would never let it arrive.
                 if length > settings.maxHeadSize &* 2 {
-                    if let current = s { abort(current, code: HTTP3Error.excessiveLoad) } else {
-                        refuse(id, code: HTTP3Error.excessiveLoad)
+                    if let current = s { abort(current, code: HTTP3ErrorCode.excessiveLoad.rawValue) } else {
+                        refuse(id, code: HTTP3ErrorCode.excessiveLoad.rawValue)
                     }
                     return
                 }
@@ -497,7 +499,7 @@ final class H3Connection {
                     // thing on the stream: nothing downstream wants it, but
                     // it still has to decode.
                     if current.trailersSeen || !current.receiving && !current.refused && !current.isTunnel {
-                        return fail(HTTP3Error.frameUnexpected)
+                        return fail(HTTP3ErrorCode.frameUnexpected.rawValue)
                     }
                     var decoded = true
                     var tooLarge = false
@@ -509,8 +511,8 @@ final class H3Connection {
                         decoded = false
                     }
                     // Too large is the request's failing, as its head's is.
-                    if tooLarge { return abort(current, code: HTTP3Error.excessiveLoad) }
-                    if !decoded { return fail(HTTP3Error.qpackDecompressionFailed) }
+                    if tooLarge { return abort(current, code: HTTP3ErrorCode.excessiveLoad.rawValue) }
+                    if !decoded { return fail(HTTP3ErrorCode.qpackDecompressionFailed.rawValue) }
                     current.trailersSeen = true
                     stream.receive.ready.consume(header &+ length)
                 } else {
@@ -526,14 +528,14 @@ final class H3Connection {
                     if started.isTunnel && started.inbound == nil { return }
                 }
             case HTTP3FrameType.data:
-                guard let current = s else { return fail(HTTP3Error.frameUnexpected) }
-                if current.trailersSeen { return fail(HTTP3Error.frameUnexpected) }
+                guard let current = s else { return fail(HTTP3ErrorCode.frameUnexpected.rawValue) }
+                if current.trailersSeen { return fail(HTTP3ErrorCode.frameUnexpected.rawValue) }
                 stream.receive.ready.consume(header)
                 current.frameType = type
                 current.frameRemaining = length
             case HTTP3FrameType.settings, HTTP3FrameType.goaway, HTTP3FrameType.maxPushID,
                  HTTP3FrameType.cancelPush, HTTP3FrameType.pushPromise:
-                return fail(HTTP3Error.frameUnexpected)
+                return fail(HTTP3ErrorCode.frameUnexpected.rawValue)
             default:
                 // Unknown frame types are skipped, which is what makes new
                 // frames deployable. Before the request, one is skipped only
@@ -545,7 +547,7 @@ final class H3Connection {
                 } else if available &- header >= length {
                     stream.receive.ready.consume(header &+ length)
                 } else {
-                    if header &+ length > settings.streamWindow { return refuse(id, code: HTTP3Error.excessiveLoad) }
+                    if header &+ length > settings.streamWindow { return refuse(id, code: HTTP3ErrorCode.excessiveLoad.rawValue) }
                     break reading
                 }
             }
@@ -553,23 +555,23 @@ final class H3Connection {
         guard let current = s else {
             // Ended without a request (RFC 9114 section 4.1): nothing, or a
             // frame the end cut short.
-            if stream.receive.finished { refuse(id, code: HTTP3Error.requestIncomplete) }
+            if stream.receive.finished { refuse(id, code: HTTP3ErrorCode.requestIncomplete.rawValue) }
             return
         }
         guard current.inTable else { return }
         if current.isTunnel {
             // The client's FIN is its side of the tunnel ending.
             if stream.receive.finished && stream.receive.ready.readableBytes == 0 {
-                if current.frameRemaining > 0 { return fail(HTTP3Error.frameError) }
+                if current.frameRemaining > 0 { return fail(HTTP3ErrorCode.frameError.rawValue) }
                 current.inbound?.end()
             }
             if let inbound = current.inbound { extendTunnel(current, inbound) }
             return
         }
         // A frame the stream's end cut short (RFC 9114 section 7.1).
-        if stream.receive.finished && stream.receive.ready.readableBytes > 0 { return fail(HTTP3Error.frameError) }
+        if stream.receive.finished && stream.receive.ready.readableBytes > 0 { return fail(HTTP3ErrorCode.frameError.rawValue) }
         if stream.receive.finished && stream.receive.ready.readableBytes == 0 && (current.receiving || current.refused) {
-            if current.frameRemaining > 0 { return fail(HTTP3Error.frameError) }
+            if current.frameRemaining > 0 { return fail(HTTP3ErrorCode.frameError.rawValue) }
             if current.refused {
                 current.refused = false
                 return
@@ -578,7 +580,7 @@ final class H3Connection {
             // it declared is malformed.
             let head = current.x.pointee.head
             if head.flags.contains(.hasContentLength) && head.contentLength != current.received {
-                return abort(current, code: HTTP3Error.messageError)
+                return abort(current, code: HTTP3ErrorCode.messageError.rawValue)
             }
             if current.streaming {
                 current.receiving = false
@@ -607,7 +609,7 @@ final class H3Connection {
     /// Opens the stream's window by what has been read: the body is the
     /// handler's once it is here, so a byte buffered is a byte consumed, and
     /// the body limit bounds the buffer.
-    private func extend(_ stream: QUICStream, _ s: H3Stream?) {
+    private func extend(_ stream: QUICStreamState, _ s: H3Stream?) {
         guard let s, s.receiving || s.refused else { return }
         quic.extendStreamWindow(s.id, consumed: stream.receive.received &- UInt64(stream.receive.ready.readableBytes))
     }
@@ -624,7 +626,7 @@ final class H3Connection {
         s.received &+= n
         let head = s.x.pointee.head
         if head.flags.contains(.hasContentLength) && s.received > head.contentLength {
-            abort(s, code: HTTP3Error.messageError)
+            abort(s, code: HTTP3ErrorCode.messageError.rawValue)
             return false
         }
         if s.streaming, let pipe = s.pipe {
@@ -655,7 +657,7 @@ final class H3Connection {
                               nowMs now: UInt64) -> H3Stream? {
         // After GOAWAY, a request it said would not be served is not.
         if id >= goawayID || endpoint.stopping && goawayID == .max {
-            refuse(id, code: HTTP3Error.requestRejected)
+            refuse(id, code: HTTP3ErrorCode.requestRejected.rawValue)
             return nil
         }
         let s = take(id)
@@ -686,11 +688,11 @@ final class H3Connection {
             return s
         case .compression:
             recycle(s)
-            fail(HTTP3Error.qpackDecompressionFailed)
+            fail(HTTP3ErrorCode.qpackDecompressionFailed.rawValue)
             return nil
         case .malformed:
             recycle(s)
-            refuse(id, code: HTTP3Error.messageError)
+            refuse(id, code: HTTP3ErrorCode.messageError.rawValue)
             return nil
         case .ok:
             break
@@ -780,7 +782,7 @@ final class H3Connection {
             s.staged.clear()
             s.bodyEnded = false
             s.bodyFailed = false
-            s.failCode = HTTP3Error.internalError
+            s.failCode = HTTP3ErrorCode.internalError.rawValue
             s.wt = nil
         }
         s.x.pointee.reset()
@@ -861,11 +863,11 @@ final class H3Connection {
         if !orphans.isEmpty && orphans[id] != nil {
             // Held for a session that never came: nobody will read it.
             orphans[id] = nil
-            return refuse(id, code: HTTP3Error.webTransportSessionGone)
+            return refuse(id, code: HTTP3ErrorCode.webTransportSessionGone.rawValue)
         }
         if id == peerControl || id == peerEncoder || id == peerDecoder {
             // A critical stream: losing it loses the connection.
-            return fail(HTTP3Error.closedCriticalStream)
+            return fail(HTTP3ErrorCode.closedCriticalStream.rawValue)
         }
         guard QUICStreamKind.isBidirectional(id) && QUICStreamKind.isClientInitiated(id) else {
             // A unidirectional stream not yet typed, or one already let go.
@@ -880,7 +882,7 @@ final class H3Connection {
         if let s, s.sendEnded { return }
         // A WebTransport session's CONNECT stream: losing it loses the
         // session, which is no rapid reset.
-        if let s, s.isTunnel && s.inbound == nil { return abort(s, code: HTTP3Error.requestCancelled) }
+        if let s, s.isTunnel && s.inbound == nil { return abort(s, code: HTTP3ErrorCode.requestCancelled.rawValue) }
         // The same accounting HTTP/2 keeps, for the same attack. A request
         // costs a header decode and a task whatever happens to it afterwards,
         // and cancelling it hands the stream credit straight back, so a peer
@@ -891,12 +893,12 @@ final class H3Connection {
         resetBudget &-= 1
         if resetBudget <= 0 {
             Log.warning("h3 peer cancelled far more requests than it completed")
-            return fail(HTTP3Error.excessiveLoad)
+            return fail(HTTP3ErrorCode.excessiveLoad.rawValue)
         }
         if let s {
-            abort(s, code: HTTP3Error.requestCancelled)
+            abort(s, code: HTTP3ErrorCode.requestCancelled.rawValue)
         } else {
-            refuse(id, code: HTTP3Error.requestCancelled)
+            refuse(id, code: HTTP3ErrorCode.requestCancelled.rawValue)
         }
     }
 
@@ -965,7 +967,7 @@ final class H3Connection {
             return (s.taskDone, s.wt, cancelled)
         }
         // `RequestBody.cancel`: the stream is reset as cancelled.
-        if cancelled && s.inTable && !closed { abort(s, code: HTTP3Error.requestCancelled) }
+        if cancelled && s.inTable && !closed { abort(s, code: HTTP3ErrorCode.requestCancelled.rawValue) }
         if done && s.taskActive {
             s.taskActive = false
             tasks &-= 1
@@ -1018,7 +1020,7 @@ final class H3Connection {
             }
             // A body short of its declared length is reset, not ended: a FIN
             // would tell the client the truncated body was all of it.
-            if s.bodySent == length { endSend(s, resetCode: s.short ? HTTP3Error.internalError : nil) }
+            if s.bodySent == length { endSend(s, resetCode: s.short ? HTTP3ErrorCode.internalError.rawValue : nil) }
         } else if streamed && ended {
             // A body cut off part-way cannot be ended honestly.
             endSend(s, resetCode: failed ? code : nil)
@@ -1038,7 +1040,7 @@ final class H3Connection {
         // Answered before the request was whole: the client is told to stop
         // sending the rest, without calling it an error.
         if let stream = quic.stream(s.id), !stream.receive.finished {
-            quic.stopSending(s.id, code: HTTP3Error.noError)
+            quic.stopSending(s.id, code: HTTP3ErrorCode.noError.rawValue)
             stream.receive.ready.clear()
         }
         finish(s)
@@ -1058,7 +1060,7 @@ final class H3Connection {
             if s.streaming, let pipe = s.pipe, pipe.held > 0 { continue }
             stalled.append(s)
         }
-        for s in stalled { abort(s, code: HTTP3Error.requestIncomplete) }
+        for s in stalled { abort(s, code: HTTP3ErrorCode.requestIncomplete.rawValue) }
         if !stalled.isEmpty { endpoint.touch(self) }
     }
 
@@ -1089,7 +1091,7 @@ final class H3Connection {
         }
         if force || (streams.isEmpty && tasks == 0 && settled) {
             closeHTTP()
-            quic.close(HTTP3Error.noError, application: true)
+            quic.close(HTTP3ErrorCode.noError.rawValue, application: true)
         }
     }
 

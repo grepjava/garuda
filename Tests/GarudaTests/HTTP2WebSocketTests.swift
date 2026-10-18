@@ -1,5 +1,6 @@
 import Synchronization
 import Testing
+@_spi(Garuda) import VegaHTTP2Core
 @_spi(Testing) import GarudaTesting
 import GarudaWire
 import Vega
@@ -47,16 +48,16 @@ extension HTTP2TestConnection {
 struct HTTP2WebSocketTests {
     @Test func theServerOffersExtendedConnect() throws {
         let h2 = try echoApp().test.http2()
-        #expect(h2.serverSettings[H2Setting.enableConnectProtocol.rawValue] == 1)
+        #expect(h2.serverSettings[HTTP2Setting.enableConnectProtocol.rawValue] == 1)
 
         var config = ServerConfig()
         config.websocketProtocols = [.http1]
         let without = try echoApp().testClient(configuration: config).http2()
-        #expect(without.serverSettings[H2Setting.enableConnectProtocol.rawValue] == nil)
+        #expect(without.serverSettings[HTTP2Setting.enableConnectProtocol.rawValue] == nil)
         // Not offered: :protocol is malformed.
         try without.sendHeaders(stream: 1, extendedConnect, endStream: false)
         let reset = try without.nextFrame { $0.stream == 1 && $0.kind == .rstStream }
-        #expect(reset.map(errorCode) == H2Error.protocolError.rawValue)
+        #expect(reset.map(errorCode) == HTTP2ErrorCode.protocolError.rawValue)
     }
 
     @Test func messagesRoundTripOnTheStream() throws {
@@ -117,7 +118,7 @@ struct HTTP2WebSocketTests {
             return try h2.nextFrame { $0.stream == id && $0.kind == .rstStream }
                 .map(errorCode)
         }
-        let protocolError = H2Error.protocolError.rawValue
+        let protocolError = HTTP2ErrorCode.protocolError.rawValue
         #expect(try resetCode(extendedConnect.filter { $0.0 != ":authority" }) == protocolError)
         #expect(try resetCode(extendedConnect, endStream: true) == protocolError)
         var get = extendedConnect

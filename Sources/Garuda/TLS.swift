@@ -29,7 +29,7 @@
 // is sealed with a key, and every shard must hold the same one, or a client
 // whose next connection lands on another shard is turned away to a full
 // handshake. The key lives in memory the shards share (Vega's
-// ShardOptions.sharedRegions): the first shard to start draws it, and the
+// ShardConfiguration.sharedRegions): the first shard to start draws it, and the
 // others, and any shard restarted later, read it.
 //===----------------------------------------------------------------------===//
 
@@ -41,6 +41,7 @@ import Darwin
 import ucrt
 import WinSDK
 #endif
+import VegaWire
 import GarudaWire
 import Synchronization
 import Vega
@@ -216,7 +217,7 @@ func handshake(_ stream: consuming TCPStream, _ store: CertificateStore,
                handshakeTimeout: Duration) async -> TLSStream<TCPStream>? {
     var pending: TCPStream? = consume stream
     do {
-        return try await Runtime.withIODeadline(handshakeTimeout) { () async throws(IOError) -> TLSStream<TCPStream> in
+        return try await Runtime.withIOTimeout(for: handshakeTimeout) { () async throws(IOError) -> TLSStream<TCPStream> in
             try await TLSStream.accept(pending.take()!, context: store.handshakeContext)
         }
     } catch {
@@ -230,7 +231,7 @@ func serveTCP(_ stream: consuming TCPStream, app: CompiledApplication, limits: C
               http2: HTTP2Service?) async {
     let peer = socketPeer(stream)
     await serveConnection(stream, app: app, limits: limits, peer: peer, secure: false, http2: http2,
-                          halves: { $0.halves() }, close: { _ in }, closeWriter: { _ in },
+                          halves: { $0.split() }, close: { _ in }, closeWriter: { _ in },
                           heldWriter: HeldTCPStream.self)
 }
 
@@ -244,7 +245,7 @@ func serveTLSConnection(_ stream: consuming TCPStream, _ store: CertificateStore
     let h2 = http2 != nil && secured.applicationProtocol == "h2"
     await serveConnection(secured, app: app, limits: limits, peer: peer, secure: true, http2: http2,
                           negotiatedH2: h2,
-                          halves: { $0.halves() },
+                          halves: { $0.split() },
                           close: { secured in _ = try? await secured.close() },
                           closeWriter: { writer in try? await writer.close() })
 }

@@ -28,6 +28,8 @@
 // sends. One task at a time receives.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaWebSocketCore
 import GarudaWire
 import Synchronization
 import Vega
@@ -484,7 +486,7 @@ func acceptWebSocket(_ x: UnsafeMutablePointer<Exchange>, _ offer: WebSocketOffe
                      run: CarriedHandler) {
     let limits = x.pointee.websocketLimits
     let deflate = limits.compress && !offer.extensions.isEmpty
-        ? offer.extensions.withSpans { WSDeflate.negotiate($0) } : nil
+        ? offer.extensions.withSpans { WebSocketDeflate.negotiate($0) } : nil
     let response = Response(x)
     let multiplexed: Bool
     switch x.pointee.link {
@@ -534,12 +536,12 @@ final class WebSocketUpgrade: @unchecked Sendable {
     let run: CarriedHandler
     let subprotocol: String?
     let offered: [String]
-    let deflate: WSDeflateAgreement?
+    let deflate: WebSocketDeflateAgreement?
     let limits: WebSocketLimits
     /// What the client sent after the handshake: frames already.
     var leftover: [UInt8] = []
 
-    init(run: CarriedHandler, subprotocol: String?, offered: [String], deflate: WSDeflateAgreement?,
+    init(run: CarriedHandler, subprotocol: String?, offered: [String], deflate: WebSocketDeflateAgreement?,
          limits: WebSocketLimits) {
         self.run = run
         self.subprotocol = subprotocol

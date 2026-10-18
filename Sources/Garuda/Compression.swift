@@ -21,6 +21,7 @@
 // weak: the bytes it named are not the ones sent.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import CVegaCompress
 import GarudaWire
 

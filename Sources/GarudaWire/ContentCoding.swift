@@ -12,6 +12,7 @@
 
 
 /// A content coding the server can produce, in the numbering the C layer uses.
+import VegaWire
 public enum ContentCoding: UInt8, Sendable {
     case identity = 0
     case gzip = 1

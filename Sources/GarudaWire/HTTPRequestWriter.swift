@@ -29,6 +29,7 @@
 
 /// What a caller-supplied request header was recognised as, so the client
 /// knows which ones it must still synthesise and which it must refuse.
+import VegaWire
 public struct RequestHeaderKind: OptionSet, Sendable {
     public let rawValue: UInt8
     @inlinable public init(rawValue: UInt8) { self.rawValue = rawValue }

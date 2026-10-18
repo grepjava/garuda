@@ -50,15 +50,15 @@ public final class TestWebSocket: @unchecked Sendable {
     }
 
     public func send(_ text: String) throws {
-        try sendFrame(opcode: WSOpcode.text.rawValue, Array(text.utf8))
+        try sendFrame(opcode: WebSocketOpcode.text.rawValue, Array(text.utf8))
     }
 
     public func send(_ bytes: [UInt8]) throws {
-        try sendFrame(opcode: WSOpcode.binary.rawValue, bytes)
+        try sendFrame(opcode: WebSocketOpcode.binary.rawValue, bytes)
     }
 
     public func ping(_ payload: [UInt8] = []) throws {
-        try sendFrame(opcode: WSOpcode.ping.rawValue, payload)
+        try sendFrame(opcode: WebSocketOpcode.ping.rawValue, payload)
     }
 
     /// The next whole message, waiting for it. Nil once the server has
@@ -68,11 +68,11 @@ public final class TestWebSocket: @unchecked Sendable {
         while true {
             guard let frame = try nextFrame() else { return nil }
             switch frame.opcode {
-            case WSOpcode.ping.rawValue:
-                try sendFrame(opcode: WSOpcode.pong.rawValue, frame.payload)
-            case WSOpcode.pong.rawValue:
+            case WebSocketOpcode.ping.rawValue:
+                try sendFrame(opcode: WebSocketOpcode.pong.rawValue, frame.payload)
+            case WebSocketOpcode.pong.rawValue:
                 break
-            case WSOpcode.close.rawValue:
+            case WebSocketOpcode.close.rawValue:
                 if frame.payload.count >= 2 {
                     closeCode = UInt16(frame.payload[0]) << 8 | UInt16(frame.payload[1])
                     closeReason = String(decoding: frame.payload[2...], as: UTF8.self)
@@ -80,7 +80,7 @@ public final class TestWebSocket: @unchecked Sendable {
                     closeCode = 1005
                 }
                 return nil
-            case WSOpcode.continuation.rawValue:
+            case WebSocketOpcode.continuation.rawValue:
                 guard var message = assembling else { throw TestClientError.malformed }
                 message.payload += frame.payload
                 assembling = message
@@ -96,12 +96,12 @@ public final class TestWebSocket: @unchecked Sendable {
     public func close(code: UInt16 = 1000, reason: String = "") throws {
         var payload = [UInt8(code >> 8), UInt8(truncatingIfNeeded: code)]
         payload += Array(reason.utf8)
-        try sendFrame(opcode: WSOpcode.close.rawValue, payload)
+        try sendFrame(opcode: WebSocketOpcode.close.rawValue, payload)
         while closeCode == nil, try receive() != nil {}
     }
 
     private static func message(_ opcode: UInt8, _ payload: [UInt8]) -> WebSocketMessage {
-        opcode == WSOpcode.text.rawValue ? .text(String(decoding: payload, as: UTF8.self)) : .binary(payload)
+        opcode == WebSocketOpcode.text.rawValue ? .text(String(decoding: payload, as: UTF8.self)) : .binary(payload)
     }
 
     // MARK: Frames
@@ -125,7 +125,7 @@ public final class TestWebSocket: @unchecked Sendable {
         let bytes = frame
         do {
             try runtime.block { () async throws(IOError) -> Void in
-                try await Runtime.withIODeadline(limit) { () async throws(IOError) -> Void in
+                try await Runtime.withIOTimeout(for: limit) { () async throws(IOError) -> Void in
                     let raw = UnsafeMutableRawBufferPointer.allocate(byteCount: max(1, bytes.count), alignment: 1)
                     defer { raw.deallocate() }
                     raw.copyBytes(from: bytes)
@@ -173,7 +173,7 @@ public final class TestWebSocket: @unchecked Sendable {
         let got: [UInt8]
         do {
             got = try runtime.block { () async throws(IOError) -> [UInt8] in
-                try await Runtime.withIODeadline(limit) { () async throws(IOError) -> [UInt8] in
+                try await Runtime.withIOTimeout(for: limit) { () async throws(IOError) -> [UInt8] in
                     var buffer = IOBuffer(capacity: 64 * 1024)
                     _ = try await stream.pointer.pointee.read(into: &buffer)
                     return buffer.withUnsafeBytes { Array($0) }
@@ -208,7 +208,7 @@ extension TestClient {
         try app.startForTesting(on: rt)
         let pair = duplex(capacity: 1 << 20)
         rt.spawn(with: pair.second) { stream in
-            await app.serveConnection(stream, halves: { $0.halves() }, config: config,
+            await app.serveConnection(stream, halves: { $0.split() }, config: config,
                                       remoteAddress: "127.0.0.1", remotePort: 40000)
         }
         let client = pair.first
@@ -219,7 +219,7 @@ extension TestClient {
         var received: [UInt8] = []
         do {
             received = try rt.block { () async throws(IOError) -> [UInt8] in
-                try await Runtime.withIODeadline(limit) { () async throws(IOError) -> [UInt8] in
+                try await Runtime.withIOTimeout(for: limit) { () async throws(IOError) -> [UInt8] in
                     let raw = UnsafeMutableRawBufferPointer.allocate(byteCount: max(1, bytes.count), alignment: 1)
                     defer { raw.deallocate() }
                     raw.copyBytes(from: bytes)

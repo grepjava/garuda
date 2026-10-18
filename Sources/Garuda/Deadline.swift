@@ -38,7 +38,7 @@ struct DeadlineMiddleware: Middleware {
     func handle(_ request: borrowing Request, _ response: borrowing Response,
                 next: () async throws -> Void) async throws {
         do {
-            try await Runtime.withIODeadline(limit) { () async throws -> Void in try await next() }
+            try await Runtime.withIOTimeout(for: limit) { () async throws -> Void in try await next() }
         } catch let error as IOError where error == .timedOut {
             // A layer inside may have answered already, and caught nothing.
             if !response.isFinished {

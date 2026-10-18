@@ -31,6 +31,7 @@
 // connections -- belongs to the process (HTTPClientConnections.swift).
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 import Vega
 
@@ -200,7 +201,7 @@ public struct HTTPClient: Sendable {
     func waiting<T>(_ body: () async throws(IOError) -> T) async throws(ClientError) -> T {
         let until = try waitDeadline()
         do {
-            return try await Runtime.withIODeadline(until: until, body)
+            return try await Runtime.withIOTimeout(until: until, body)
         } catch {
             throw ClientError(error)
         }
@@ -259,7 +260,7 @@ extension HTTPClient {
         while true {
             do {
                 return try await startOnce(method, url, headers: headers, body: body, streaming: streaming)
-            } catch .streamReset(H2Error.refusedStream.rawValue) where tries < 2 {
+            } catch .streamReset(HTTP2ErrorCode.refusedStream.rawValue) where tries < 2 {
                 tries += 1
             }
         }

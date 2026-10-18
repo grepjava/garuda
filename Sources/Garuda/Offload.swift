@@ -110,7 +110,7 @@ func offloading<each E: Sendable, R: Sendable>(
 }
 
 /// --blocking-queue: the shard's blocking pool lets that much work wait for
-/// a thread (ShardOptions.blockingQueue), and refuses more with
+/// a thread (ShardConfiguration.blockingQueue), and refuses more with
 /// `BlockingQueueFull`, which answers 503 -- for `app.offload` routes and
 /// for any handler's own `Runtime.blocking`, as Garuda 1's pool refused
 /// whatever was handed to it. Work left to wait longer than any client

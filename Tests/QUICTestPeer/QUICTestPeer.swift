@@ -14,15 +14,15 @@
 // it can be an ordinary target.
 //===----------------------------------------------------------------------===//
 
-import VegaQUIC
+@_spi(Garuda) import VegaQUICCore
 import VegaWire
 import VegaCrypto
 import VegaTLS
 
 /// What the peer found wrong with what the server sent.
-public struct QUICTestPeerError: Error, CustomStringConvertible {
-    public let description: String
-    public init(_ description: String) { self.description = description }
+package struct QUICTestPeerError: Error, CustomStringConvertible {
+    package let description: String
+    package init(_ description: String) { self.description = description }
 }
 
 func need<T>(_ value: T?, _ what: @autoclosure () -> String) throws -> T {
@@ -34,33 +34,33 @@ func needTrue(_ value: Bool, _ what: @autoclosure () -> String) throws {
     if !value { throw QUICTestPeerError(what()) }
 }
 
-public func hsBytes(_ p: UnsafePointer<UInt8>, _ n: Int) -> [UInt8] {
+package func hsBytes(_ p: UnsafePointer<UInt8>, _ n: Int) -> [UInt8] {
     [UInt8](UnsafeBufferPointer(start: p, count: n))
 }
 
-public func hsVarint(_ v: UInt64) -> [UInt8] {
+package func hsVarint(_ v: UInt64) -> [UInt8] {
     var b = [UInt8](repeating: 0, count: 8)
     let n = b.withUnsafeMutableBufferPointer { quicWriteVarint(v, $0.baseAddress!) }
     return Array(b[0..<n])
 }
 
-public func hsU16(_ v: Int) -> [UInt8] { [UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)] }
-public func hsU24(_ v: Int) -> [UInt8] {
+package func hsU16(_ v: Int) -> [UInt8] { [UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)] }
+package func hsU24(_ v: Int) -> [UInt8] {
     [UInt8(truncatingIfNeeded: v >> 16), UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)]
 }
 
-public func cryptoFrame(offset: Int, _ data: [UInt8]) -> [UInt8] {
+package func cryptoFrame(offset: Int, _ data: [UInt8]) -> [UInt8] {
     [0x06] + hsVarint(UInt64(offset)) + hsVarint(UInt64(data.count)) + data
 }
 
 /// A STREAM frame with an offset and a length.
-public func streamFrame(_ id: UInt64, offset: Int = 0, _ data: [UInt8], fin: Bool) -> [UInt8] {
+package func streamFrame(_ id: UInt64, offset: Int = 0, _ data: [UInt8], fin: Bool) -> [UInt8] {
     [UInt8(0x08 | 0x04 | 0x02 | (fin ? 0x01 : 0))] + hsVarint(id) + hsVarint(UInt64(offset))
         + hsVarint(UInt64(data.count)) + data
 }
 
 /// A RESET_STREAM frame.
-public func resetStreamFrame(_ id: UInt64, code: UInt64, finalSize: Int) -> [UInt8] {
+package func resetStreamFrame(_ id: UInt64, code: UInt64, finalSize: Int) -> [UInt8] {
     [0x04] + hsVarint(id) + hsVarint(code) + hsVarint(UInt64(finalSize))
 }
 
@@ -68,13 +68,13 @@ private func expandLabel(_ secret: [UInt8], _ label: String, _ context: [UInt8] 
     try HKDF.expandLabel(.sha256, secret: secret, label: label, context: context, length: 32)
 }
 
-public final class QUICTestPeer {
-    public let originalDCID: QUICConnectionID
-    public let scid = QUICConnectionID.random()
-    public var serverCID = QUICConnectionID()
-    public var keys = [QUICKeyPair](repeating: QUICKeyPair(), count: 3)
-    public var nextPacketNumber: [UInt64] = [0, 0, 0]
-    public var largestReceived: [Int64] = [-1, -1, -1]
+package final class QUICTestPeer {
+    package let originalDCID: QUICConnectionID
+    package let scid = QUICConnectionID.random()
+    package var serverCID = QUICConnectionID()
+    package var keys = [QUICKeyPair](repeating: QUICKeyPair(), count: 3)
+    package var nextPacketNumber: [UInt64] = [0, 0, 0]
+    package var largestReceived: [Int64] = [-1, -1, -1]
     var cryptoIn: [[UInt8]] = [[], [], []]
     var cryptoConsumed = [0, 0, 0]
 
@@ -83,36 +83,36 @@ public final class QUICTestPeer {
     var handshakeSecret: [UInt8] = []
     var clientHandshakeSecret: [UInt8] = []
     var serverHandshakeSecret: [UInt8] = []
-    public private(set) var finishedMessage: [UInt8] = []
+    package private(set) var finishedMessage: [UInt8] = []
 
-    public private(set) var alpn: [UInt8] = []
-    public private(set) var serverParameters: QUICTransportParameters?
-    public private(set) var certificate: [UInt8] = []
-    public private(set) var certificateVerified = false
-    public private(set) var serverFinishedVerified = false
-    public private(set) var handshakeDone = false
+    package private(set) var alpn: [UInt8] = []
+    package private(set) var serverParameters: QUICTransportParameters?
+    package private(set) var certificate: [UInt8] = []
+    package private(set) var certificateVerified = false
+    package private(set) var serverFinishedVerified = false
+    package private(set) var handshakeDone = false
     /// What each stream carried from the server, in order.
-    public var streams: [UInt64: [UInt8]] = [:]
+    package var streams: [UInt64: [UInt8]] = [:]
     /// Streams the server finished.
-    public var finished: Set<UInt64> = []
+    package var finished: Set<UInt64> = []
     /// Streams the server reset, with the code.
-    public var resets: [UInt64: UInt64] = [:]
+    package var resets: [UInt64: UInt64] = [:]
     /// Streams the server asked to stop sending on, with the code.
-    public var stopSending: [UInt64: UInt64] = [:]
-    public private(set) var closeCode: UInt64?
+    package var stopSending: [UInt64: UInt64] = [:]
+    package private(set) var closeCode: UInt64?
     /// The data of each PATH_CHALLENGE and PATH_RESPONSE the server sent.
-    public var pathChallenges: [[UInt8]] = []
-    public var pathResponses: [[UInt8]] = []
+    package var pathChallenges: [[UInt8]] = []
+    package var pathResponses: [[UInt8]] = []
     /// The highest MAX_STREAMS (bidirectional) the server sent.
-    public private(set) var maxStreamsBidi: UInt64 = 0
+    package private(set) var maxStreamsBidi: UInt64 = 0
     /// The datagrams the server sent (RFC 9221), in order.
-    public var datagrams: [[UInt8]] = []
+    package var datagrams: [[UInt8]] = []
     /// The largest DATAGRAM frame offered to the server; 0 offers none.
-    public var maxDatagramFrameSize: UInt64 = 0
+    package var maxDatagramFrameSize: UInt64 = 0
 
     /// `dcidLength`: how long the identifier the client invents for the
     /// server is, which RFC 9000 says must be at least eight bytes.
-    public init(dcidLength: Int = 8) throws {
+    package init(dcidLength: Int = 8) throws {
         originalDCID = QUICConnectionID.random(length: dcidLength)
         kex = try KeyExchange(.x25519)
         transcript = try Hash(.sha256)
@@ -127,7 +127,7 @@ public final class QUICTestPeer {
 
     /// A ClientHello offering `alpn`, with transport parameters that allow
     /// the server what it needs.
-    public func clientHello(serverName: String, alpn offered: [String]) -> [UInt8] {
+    package func clientHello(serverName: String, alpn offered: [String]) -> [UInt8] {
         var extensions: [UInt8] = []
         func add(_ type: Int, _ body: [UInt8]) { extensions += hsU16(type) + hsU16(body.count) + body }
 
@@ -169,7 +169,7 @@ public final class QUICTestPeer {
 
     /// One packet at a level, protected. An Initial is padded to fill a
     /// 1200-byte datagram, as a client's must be, unless `padded` is false.
-    public func packet(_ level: QUICLevel, _ frames: [UInt8], padded: Bool = true) throws -> [UInt8] {
+    package func packet(_ level: QUICLevel, _ frames: [UInt8], padded: Bool = true) throws -> [UInt8] {
         let pn = nextPacketNumber[level.rawValue]
         nextPacketNumber[level.rawValue] += 1
         var header: [UInt8]
@@ -207,22 +207,22 @@ public final class QUICTestPeer {
 
     /// An ACK of everything received at a level, in one range: what arrives
     /// on a path that loses nothing.
-    public func ack(_ level: QUICLevel) -> [UInt8] {
+    package func ack(_ level: QUICLevel) -> [UInt8] {
         let largest = largestReceived[level.rawValue]
         if largest < 0 { return [] }
         return [0x02] + hsVarint(UInt64(largest)) + hsVarint(0) + hsVarint(0) + hsVarint(UInt64(largest))
     }
 
     /// The client's Finished, with an ACK of the server's Handshake packets.
-    public func finishedPacket() throws -> [UInt8] {
+    package func finishedPacket() throws -> [UInt8] {
         try packet(.handshake, ack(.handshake) + cryptoFrame(offset: 0, finishedMessage))
     }
 
     /// Whether the server's whole first flight has arrived.
-    public var handshakeReceived: Bool { !finishedMessage.isEmpty }
+    package var handshakeReceived: Bool { !finishedMessage.isEmpty }
 
     /// Takes one datagram from the server.
-    public func receive(_ datagram: [UInt8]) throws {
+    package func receive(_ datagram: [UInt8]) throws {
         var datagram = datagram
         try datagram.withUnsafeMutableBufferPointer { buf in
             var offset = 0

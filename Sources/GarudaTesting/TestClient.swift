@@ -195,12 +195,12 @@ public final class TestClient: @unchecked Sendable {
         let received: [UInt8] = try rt.block { () async throws -> [UInt8] in
             let pair = duplex(capacity: 1 << 20)
             rt.spawn(with: pair.second) { stream in
-                await app.serveConnection(stream, halves: { $0.halves() }, config: config,
+                await app.serveConnection(stream, halves: { $0.split() }, config: config,
                                           remoteAddress: address, remotePort: port)
             }
             let client = pair.first
             do {
-                return try await Runtime.withIODeadline(limit) { () async throws(IOError) -> [UInt8] in
+                return try await Runtime.withIOTimeout(for: limit) { () async throws(IOError) -> [UInt8] in
                     let raw = UnsafeMutableRawBufferPointer.allocate(byteCount: bytes.count, alignment: 1)
                     defer { raw.deallocate() }
                     raw.copyBytes(from: bytes)

@@ -43,6 +43,7 @@
 // one, so a secret can be replaced without logging everyone out.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 import VegaCrypto
 

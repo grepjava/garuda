@@ -1,3 +1,4 @@
+import VegaWire
 import Testing
 import GarudaTesting
 import GarudaWire

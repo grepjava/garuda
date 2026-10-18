@@ -12,6 +12,7 @@
 // byte-pushing path, so it uses ordinary Swift arrays and lets ARC manage them.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)

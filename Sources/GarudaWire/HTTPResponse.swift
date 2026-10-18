@@ -10,6 +10,7 @@
 
 /// What a response header was recognised as, so the writer knows which ones it
 /// still has to synthesise.
+import VegaWire
 public struct ResponseHeaderKind: OptionSet, Sendable {
     public let rawValue: UInt8
     @inlinable public init(rawValue: UInt8) { self.rawValue = rawValue }

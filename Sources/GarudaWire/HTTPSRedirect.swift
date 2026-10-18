@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 
+import VegaWire
 public enum HTTPSRedirect {
 
     /// 301 for GET and HEAD, which every client follows. 308 for anything

@@ -4,7 +4,7 @@
 //===----------------------------------------------------------------------===//
 
 import Garuda
-import VegaExtras
+import VegaCompression
 
 /// The text every compressible body is, so the test compares what it decodes
 /// with one expected file.
@@ -16,7 +16,7 @@ let compressibleText: [UInt8] = {
 
 func addCompressionRoutes(_ app: Application) {
     let text = compressibleText
-    let packed = (try? Compressor.compress(text, VegaExtras.ContentCoding.gzip)) ?? []
+    let packed = (try? Compressor.compress(text, VegaCompression.ContentCoding.gzip)) ?? []
 
     func plain(_ pattern: String, _ headers: [(String, String)] = [], body: [UInt8]? = nil) {
         app.get(pattern) { _, response in

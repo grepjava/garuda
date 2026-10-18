@@ -10,7 +10,7 @@
 //     let answers = try h2.responses([slow, fast])
 //
 //     try h2.send(.rstStream, stream: slow, payload: h2.uint32(8))
-//     #expect(try h2.goaway()?.code == H2Error.protocolError.rawValue)
+//     #expect(try h2.goaway()?.code == HTTP2ErrorCode.protocolError.rawValue)
 //
 // The connection is served exactly as a shard serves a cleartext socket that
 // opens with the HTTP/2 preface (prior knowledge) -- the same detection, the
@@ -25,6 +25,8 @@
 // kept, for a test that looks at frames rather than responses.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
 @_spi(Testing) import Garuda
 import GarudaWire
 import Vega
@@ -39,9 +41,9 @@ public struct TestFrame: Sendable {
     public let payload: [UInt8]
 
     /// The frame's type, or nil for one the protocol does not define.
-    public var kind: H2FrameType? { H2FrameType(rawValue: type) }
+    package var kind: HTTP2FrameType? { HTTP2FrameType(rawValue: type) }
 
-    public func has(_ flag: H2Flags) -> Bool { flags & flag.rawValue != 0 }
+    package func has(_ flag: HTTP2Flags) -> Bool { flags & flag.rawValue != 0 }
 }
 
 /// A stream's response as a test sees it.
@@ -85,14 +87,14 @@ extension TestClient {
     /// A new HTTP/2 connection, by prior knowledge. With `handshake` (the
     /// default) the preface and SETTINGS -- `settings` among them -- are
     /// sent and the server's SETTINGS read before this returns.
-    public func http2(settings: [(H2Setting, UInt32)] = [], handshake: Bool = true) throws -> HTTP2TestConnection {
+    public func http2(settings: [(HTTP2Setting, UInt32)] = [], handshake: Bool = true) throws -> HTTP2TestConnection {
         try http2(on: TestClient.runtime, settings: settings, handshake: handshake)
     }
 
     /// The same, served on `runtime` rather than the one test clients
     /// share: for a test that shuts that runtime's HTTP/2 down.
     @_spi(Testing)
-    public func http2(on runtime: Runtime, settings: [(H2Setting, UInt32)] = [],
+    public func http2(on runtime: Runtime, settings: [(HTTP2Setting, UInt32)] = [],
                       handshake: Bool = true) throws -> HTTP2TestConnection {
         let connection = try HTTP2TestConnection(client: self, runtime: runtime)
         if handshake { try connection.handshake(settings: settings) }
@@ -141,7 +143,7 @@ public final class HTTP2TestConnection: @unchecked Sendable {
         let pair = duplex(capacity: 1 << 20)
         box = DuplexBox(pair.first)
         rt.spawn(with: pair.second) { stream in
-            await app.serveConnection(stream, halves: { $0.halves() }, config: config, runtime: rt,
+            await app.serveConnection(stream, halves: { $0.split() }, config: config, runtime: rt,
                                       remoteAddress: address, remotePort: port)
         }
     }
@@ -222,7 +224,7 @@ public final class HTTP2TestConnection: @unchecked Sendable {
         let limit = timeout
         return try runtime.block { () async throws -> T in
             do {
-                return try await Runtime.timeout(limit) { () async throws -> T in
+                return try await Runtime.timeout(for: limit) { () async throws -> T in
                     guard let stream = box.stream.take() else { throw TestClientError.closed(received: 0) }
                     do {
                         let result = try await operation(stream)
@@ -247,7 +249,7 @@ public final class HTTP2TestConnection: @unchecked Sendable {
     }
 
     /// Sends one frame of any type, valid or not.
-    public func send(_ type: H2FrameType, flags: H2Flags = [], stream: UInt32, payload: [UInt8] = []) throws {
+    package func send(_ type: HTTP2FrameType, flags: HTTP2Flags = [], stream: UInt32, payload: [UInt8] = []) throws {
         try send(raw: frame(type.rawValue, flags: flags.rawValue, stream: stream, payload: payload))
     }
 
@@ -257,14 +259,14 @@ public final class HTTP2TestConnection: @unchecked Sendable {
     }
 
     /// The preface and SETTINGS, then waits for the server's SETTINGS.
-    public func handshake(settings: [(H2Setting, UInt32)] = []) throws {
-        try send(raw: HTTP2.preface + frame(H2FrameType.settings.rawValue, stream: 0, payload: settingsPayload(settings)))
+    public func handshake(settings: [(HTTP2Setting, UInt32)] = []) throws {
+        try send(raw: HTTP2.preface + frame(HTTP2FrameType.settings.rawValue, stream: 0, payload: settingsPayload(settings)))
         while serverSettings.isEmpty {
             guard try receive() else { throw TestClientError.closed(received: 0) }
         }
     }
 
-    public func settingsPayload(_ settings: [(H2Setting, UInt32)]) -> [UInt8] {
+    public func settingsPayload(_ settings: [(HTTP2Setting, UInt32)]) -> [UInt8] {
         settings.flatMap { [UInt8(truncatingIfNeeded: $0.0.rawValue >> 8), UInt8(truncatingIfNeeded: $0.0.rawValue)]
             + uint32($0.1) }
     }
@@ -294,9 +296,9 @@ public final class HTTP2TestConnection: @unchecked Sendable {
         var offset = 0
         repeat {
             let n = min(frameSize, encoded.count - offset)
-            var flags: UInt8 = offset + n >= encoded.count ? H2Flags.endHeaders.rawValue : 0
-            if offset == 0 && endStream { flags |= H2Flags.endStream.rawValue }
-            bytes += frame(offset == 0 ? H2FrameType.headers.rawValue : H2FrameType.continuation.rawValue,
+            var flags: UInt8 = offset + n >= encoded.count ? HTTP2Flags.endHeaders.rawValue : 0
+            if offset == 0 && endStream { flags |= HTTP2Flags.endStream.rawValue }
+            bytes += frame(offset == 0 ? HTTP2FrameType.headers.rawValue : HTTP2FrameType.continuation.rawValue,
                            flags: flags, stream: id, payload: Array(encoded[offset..<offset + n]))
             offset += n
         } while offset < encoded.count
@@ -329,7 +331,7 @@ public final class HTTP2TestConnection: @unchecked Sendable {
     }
 
     /// RST_STREAM on `id`.
-    public func reset(_ id: UInt32, code: H2Error = .cancel) throws {
+    public func reset(_ id: UInt32, code: HTTP2ErrorCode = .cancel) throws {
         try send(.rstStream, stream: id, payload: uint32(code.rawValue))
     }
 
@@ -444,15 +446,15 @@ public final class HTTP2TestConnection: @unchecked Sendable {
                 let id = UInt16(f.payload[i]) << 8 | UInt16(f.payload[i + 1])
                 let value = HTTP2TestConnection.uint32(f.payload, i + 2)
                 serverSettings[id] = value
-                if id == H2Setting.initialWindowSize.rawValue {
+                if id == HTTP2Setting.initialWindowSize.rawValue {
                     let delta = Int(value) - initialWindow
                     initialWindow = Int(value)
                     for key in streamWindows.keys { streamWindows[key]! += delta }
                 }
-                if id == H2Setting.maxFrameSize.rawValue { maxFrameSize = Int(value) }
+                if id == HTTP2Setting.maxFrameSize.rawValue { maxFrameSize = Int(value) }
                 i += 6
             }
-            replies += frame(H2FrameType.settings.rawValue, flags: H2Flags.ack.rawValue, stream: 0)
+            replies += frame(HTTP2FrameType.settings.rawValue, flags: HTTP2Flags.ack.rawValue, stream: 0)
         case .windowUpdate:
             let increment = Int(HTTP2TestConnection.uint32(f.payload, 0) & 0x7FFF_FFFF)
             if f.stream == 0 {
@@ -481,9 +483,9 @@ public final class HTTP2TestConnection: @unchecked Sendable {
             streams[f.stream, default: HTTP2TestResponse()].body += payload
             if f.has(.endStream) { streams[f.stream, default: HTTP2TestResponse()].ended = true }
             if autoWindowUpdate && !f.payload.isEmpty {
-                replies += frame(H2FrameType.windowUpdate.rawValue, stream: 0, payload: uint32(UInt32(f.payload.count)))
+                replies += frame(HTTP2FrameType.windowUpdate.rawValue, stream: 0, payload: uint32(UInt32(f.payload.count)))
                 if !f.has(.endStream) {
-                    replies += frame(H2FrameType.windowUpdate.rawValue, stream: f.stream,
+                    replies += frame(HTTP2FrameType.windowUpdate.rawValue, stream: f.stream,
                                      payload: uint32(UInt32(f.payload.count)))
                 }
             }

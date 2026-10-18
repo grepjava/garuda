@@ -30,6 +30,7 @@
 // a server without it, or with --log-level above info, does no work for it.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 
 /// One field's value: text, a whole number, a fraction or a truth value.

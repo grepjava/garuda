@@ -37,7 +37,10 @@
 // its next request: a request costs no allocation once a connection is warm.
 //===----------------------------------------------------------------------===//
 
-import VegaQUIC
+@_spi(Garuda) import VegaQUICCore
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
+@_spi(Garuda) import VegaHTTP3Core
 import GarudaWire
 import Synchronization
 import Vega
@@ -125,7 +128,7 @@ final class H3Stream: @unchecked Sendable {
     @exclusivity(unchecked) var bodyEnded = false
     @exclusivity(unchecked) var bodyFailed = false
     /// What a failed body's stream is reset with.
-    @exclusivity(unchecked) var failCode = HTTP3Error.internalError
+    @exclusivity(unchecked) var failCode = HTTP3ErrorCode.internalError.rawValue
     /// The WebTransport session on the stream, once its task has staged the
     /// 200 (HTTP3WebTransport.swift).
     @exclusivity(unchecked) var wt: WTSession?
@@ -307,7 +310,7 @@ extension QUICEndpoint {
         if limits.requestID { x.pointee.assignRequestID(trusting: limits.requestIDTrust) }
         if limits.traceContext { x.pointee.readTraceParent() }
         if observing { x.pointee.started = monotonicNanos() }
-        let stamp = Runtime.currentJobStamp
+        let stamp = Runtime.currentPollStamp
         await dispatchInline(x, app, matched: s.matched, observing: observing)
         // A cancelled run may have been cut short before it could wait: it
         // says nothing about the route.

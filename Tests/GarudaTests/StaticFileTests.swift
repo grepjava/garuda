@@ -1,3 +1,4 @@
+import VegaWire
 import Testing
 #if canImport(Glibc)
 import Glibc

@@ -1,3 +1,5 @@
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
 import Synchronization
 import Testing
 @testable import Garuda
@@ -83,10 +85,10 @@ struct HTTP2Tests {
 
     @Test func theServerSaysWhatItAllows() throws {
         let h2 = try app().test.http2()
-        #expect(h2.serverSettings[H2Setting.maxConcurrentStreams.rawValue] == 128)
-        #expect(h2.serverSettings[H2Setting.enablePush.rawValue] == 0)
-        #expect(h2.serverSettings[H2Setting.initialWindowSize.rawValue] == UInt32(256 * 1024))
-        #expect(h2.serverSettings[H2Setting.maxFrameSize.rawValue] == 16384)
+        #expect(h2.serverSettings[HTTP2Setting.maxConcurrentStreams.rawValue] == 128)
+        #expect(h2.serverSettings[HTTP2Setting.enablePush.rawValue] == 0)
+        #expect(h2.serverSettings[HTTP2Setting.initialWindowSize.rawValue] == UInt32(256 * 1024))
+        #expect(h2.serverSettings[HTTP2Setting.maxFrameSize.rawValue] == 16384)
     }
 
     @Test func thePathSurvivesHPACK() throws {
@@ -202,11 +204,11 @@ struct HTTP2Tests {
     @Test func aHostThatDiffersFromTheAuthorityIsReset() throws {
         let h2 = try app().test.http2()
         let differs = try h2.response(try h2.request("GET", "/", headers: [("host", "elsewhere.example")]))
-        #expect(differs.reset == H2Error.protocolError.rawValue)
+        #expect(differs.reset == HTTP2ErrorCode.protocolError.rawValue)
         #expect(differs.status == nil)
         // An empty :authority is not the same as a Host that names something.
         let empty = try h2.response(try h2.request("GET", "/", headers: [("host", "test")], authority: ""))
-        #expect(empty.reset == H2Error.protocolError.rawValue)
+        #expect(empty.reset == HTTP2ErrorCode.protocolError.rawValue)
         // And the connection goes on.
         #expect(try h2.get("/user/after").text == "after")
     }
@@ -394,14 +396,14 @@ struct HTTP2Tests {
         for _ in 0..<300 {
             let id = h2.nextStream
             h2.nextStream += 2
-            burst += h2.frame(H2FrameType.headers.rawValue,
-                              flags: H2Flags.endHeaders.rawValue | H2Flags.endStream.rawValue, stream: id,
+            burst += h2.frame(HTTP2FrameType.headers.rawValue,
+                              flags: HTTP2Flags.endHeaders.rawValue | HTTP2Flags.endStream.rawValue, stream: id,
                               payload: h2.headerBlock([(":method", "GET"), (":scheme", "http"),
                                                        (":authority", "test"), (":path", "/delay/5000")]))
-            burst += h2.frame(H2FrameType.rstStream.rawValue, stream: id, payload: h2.uint32(8))
+            burst += h2.frame(HTTP2FrameType.rstStream.rawValue, stream: id, payload: h2.uint32(8))
         }
         try h2.send(raw: burst)
-        #expect(try h2.goaway()?.code == H2Error.enhanceYourCalm.rawValue)
+        #expect(try h2.goaway()?.code == HTTP2ErrorCode.enhanceYourCalm.rawValue)
         #expect(h2.waitForClose())
         // Other connections are unaffected.
         #expect(try app().test.http2().get("/").status == .ok)
@@ -410,10 +412,10 @@ struct HTTP2Tests {
     @Test func streamsPastTheLimitAreRefused() throws {
         let client = app().testClient(configuration: config { $0.h2MaxConcurrentStreams = 2 })
         let h2 = try client.http2()
-        #expect(h2.serverSettings[H2Setting.maxConcurrentStreams.rawValue] == 2)
+        #expect(h2.serverSettings[HTTP2Setting.maxConcurrentStreams.rawValue] == 2)
         let a = try h2.request("GET", "/delay/300"), b = try h2.request("GET", "/delay/300")
         let c = try h2.request("GET", "/delay/300")
-        #expect(try h2.response(c).reset == H2Error.refusedStream.rawValue)
+        #expect(try h2.response(c).reset == HTTP2ErrorCode.refusedStream.rawValue)
         #expect(try h2.responses([a, b]).map(\.status) == [.ok, .ok])
         // Room again once they are done.
         #expect(try h2.get("/").status == .ok)
@@ -435,7 +437,7 @@ struct HTTP2Tests {
                                 endStream: false)
         try h2.sendHeaders(stream: id, [("x-checksum", "1")])
         let response = try h2.response(id)
-        #expect(response.reset == H2Error.protocolError.rawValue)
+        #expect(response.reset == HTTP2ErrorCode.protocolError.rawValue)
         #expect(response.status == nil)
         #expect(try h2.get("/user/after-reset").text == "after-reset")
     }
@@ -443,13 +445,13 @@ struct HTTP2Tests {
     @Test func aBodyLongerThanDeclaredIsRefused() throws {
         let h2 = try app().test.http2()
         let id = try h2.request("POST", "/user", headers: [("content-length", "2")], body: Array("abc".utf8))
-        #expect(try h2.response(id).reset == H2Error.protocolError.rawValue)
+        #expect(try h2.response(id).reset == HTTP2ErrorCode.protocolError.rawValue)
     }
 
     @Test func anEndedRequestWithADeclaredBodyIsRefused() throws {
         let h2 = try app().test.http2()
         let id = try h2.request("POST", "/user", headers: [("content-length", "5")])
-        #expect(try h2.response(id).reset == H2Error.protocolError.rawValue)
+        #expect(try h2.response(id).reset == HTTP2ErrorCode.protocolError.rawValue)
     }
 
     @Test func aBodyPastTheLimitIs413AndTheStreamReset() throws {
@@ -461,7 +463,7 @@ struct HTTP2Tests {
         let response = try h2.response(id)
         #expect(response.status == .contentTooLarge)
         let reset = try #require(try h2.nextFrame { $0.kind == .rstStream && $0.stream == id })
-        #expect(reset.payload == h2.uint32(H2Error.noError.rawValue))
+        #expect(reset.payload == h2.uint32(HTTP2ErrorCode.noError.rawValue))
         // A declared length past the limit is refused before the body.
         let declared = try h2.request("POST", "/user", headers: [("content-length", "4096")], endStream: false)
         #expect(try h2.response(declared).status == .contentTooLarge)
@@ -479,19 +481,19 @@ struct HTTP2Tests {
         func refused(_ fields: [(String, String)], _ frames: Int) throws {
             let id = h2.nextStream
             h2.nextStream += 2
-            var bytes = h2.frame(H2FrameType.headers.rawValue, flags: H2Flags.endHeaders.rawValue, stream: id,
+            var bytes = h2.frame(HTTP2FrameType.headers.rawValue, flags: HTTP2Flags.endHeaders.rawValue, stream: id,
                                  payload: h2.headerBlock([(":method", "POST"), (":scheme", "http"),
                                                           (":authority", "test"), (":path", "/user")] + fields))
             let piece = body.count / frames
             for i in 0..<frames {
-                bytes += h2.frame(H2FrameType.data.rawValue, flags: i == frames - 1 ? H2Flags.endStream.rawValue : 0,
+                bytes += h2.frame(HTTP2FrameType.data.rawValue, flags: i == frames - 1 ? HTTP2Flags.endStream.rawValue : 0,
                                   stream: id, payload: Array(body[i * piece..<(i + 1) * piece]))
             }
             try h2.send(raw: bytes)
             let response = try h2.response(id)
             #expect(response.status == .contentTooLarge)
             let reset = try #require(try h2.nextFrame { $0.kind == .rstStream && $0.stream == id })
-            #expect(reset.payload == h2.uint32(H2Error.noError.rawValue))
+            #expect(reset.payload == h2.uint32(HTTP2ErrorCode.noError.rawValue))
         }
         // Refused at the HEADERS, for its declared length.
         try refused([("content-length", "4096")], 1)
@@ -536,7 +538,7 @@ struct HTTP2Tests {
 
     // MARK: Protocol errors
 
-    private func expectGoaway(_ code: H2Error, _ send: (HTTP2TestConnection) throws -> Void,
+    private func expectGoaway(_ code: HTTP2ErrorCode, _ send: (HTTP2TestConnection) throws -> Void,
                               sourceLocation: SourceLocation = #_sourceLocation) throws {
         let h2 = try app().test.http2()
         try send(h2)
@@ -608,7 +610,7 @@ struct HTTP2Tests {
             return try h2.response(id).reset
         }
         let base = [(":method", "GET"), (":scheme", "http"), (":authority", "test"), (":path", "/")]
-        let malformed = H2Error.protocolError.rawValue
+        let malformed = HTTP2ErrorCode.protocolError.rawValue
         #expect(try reset(base + [("Upper", "x")]) == malformed)
         #expect(try reset(base + [("connection", "keep-alive")]) == malformed)
         #expect(try reset(base + [("transfer-encoding", "chunked")]) == malformed)
@@ -666,7 +668,7 @@ struct HTTP2Tests {
             return try h2.response(id).reset
         }
         let base = [(":method", "GET"), (":scheme", "http"), (":authority", "test"), (":path", "/")]
-        let malformed = H2Error.protocolError.rawValue
+        let malformed = HTTP2ErrorCode.protocolError.rawValue
         #expect(try reset(base + [("x-control", "a\u{01}b")]) == malformed)
         #expect(try reset(base + [("x-del", "a\u{7F}b")]) == malformed)
         #expect(try reset(base + [("cookie", "a=\u{01}")]) == malformed)
@@ -689,7 +691,7 @@ struct HTTP2Tests {
         let h2 = try app().test.http2()
         let id = try h2.request("GET", "/delay/300")
         try h2.send(.data, stream: id, payload: [1])
-        #expect(try h2.response(id).reset == H2Error.streamClosed.rawValue)
+        #expect(try h2.response(id).reset == HTTP2ErrorCode.streamClosed.rawValue)
         #expect(try h2.get("/").status == .ok)
     }
 
@@ -717,7 +719,7 @@ struct HTTP2Tests {
         let id = try h2.request("GET", "/delay/200")
         try h2.send(.goaway, stream: 0, payload: h2.uint32(0) + h2.uint32(0))
         // No new streams after it.
-        #expect(try h2.response(try h2.request("GET", "/")).reset == H2Error.refusedStream.rawValue)
+        #expect(try h2.response(try h2.request("GET", "/")).reset == HTTP2ErrorCode.refusedStream.rawValue)
         #expect(try h2.response(id).status == .ok)
         #expect(h2.waitForClose())
     }
@@ -731,15 +733,15 @@ struct HTTP2Tests {
         // What SIGTERM does to a shard's HTTP/2.
         HTTP2Service.forTesting(runtime).shutdown()
         let goaway = try #require(try h2.goaway())
-        #expect(goaway.code == H2Error.noError.rawValue)
+        #expect(goaway.code == HTTP2ErrorCode.noError.rawValue)
         #expect(goaway.lastStream == slow + 2)
         // Nothing new is taken; what was taken is finished.
-        #expect(try h2.response(try h2.request("GET", "/")).reset == H2Error.refusedStream.rawValue)
+        #expect(try h2.response(try h2.request("GET", "/")).reset == HTTP2ErrorCode.refusedStream.rawValue)
         #expect(try h2.response(slow).status == .ok)
         #expect(h2.waitForClose())
         // A connection opened after shutdown began is told at once.
         let late = try app().test.http2(on: runtime)
-        #expect(try late.goaway()?.code == H2Error.noError.rawValue)
+        #expect(try late.goaway()?.code == HTTP2ErrorCode.noError.rawValue)
     }
 
     // MARK: Opening
@@ -747,14 +749,14 @@ struct HTTP2Tests {
     @Test func aBadPrefaceIsRefused() throws {
         let h2 = try app().test.http2(handshake: false)
         try h2.send(raw: Array("PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n".utf8))
-        #expect(try h2.goaway()?.code == H2Error.protocolError.rawValue)
+        #expect(try h2.goaway()?.code == HTTP2ErrorCode.protocolError.rawValue)
         #expect(h2.waitForClose())
     }
 
     @Test func framesWithoutThePrefaceAreRefused() throws {
         let h2 = try app().test.http2(handshake: false)
         try h2.send(.settings, stream: 0)
-        #expect(try h2.goaway()?.code == H2Error.protocolError.rawValue)
+        #expect(try h2.goaway()?.code == HTTP2ErrorCode.protocolError.rawValue)
     }
 
     @Test func http1IsStillServedBesideIt() throws {
@@ -769,7 +771,7 @@ struct HTTP2Tests {
         let client = app().testClient(configuration: config { $0.http2Only = true })
         let h1 = try client.http2(handshake: false)
         try h1.send(raw: Array("GET / HTTP/1.1\r\nHost: test\r\n\r\n".utf8))
-        #expect(try h1.goaway()?.code == H2Error.protocolError.rawValue)
+        #expect(try h1.goaway()?.code == HTTP2ErrorCode.protocolError.rawValue)
         #expect(try client.http2().get("/").status == .ok)
     }
 
@@ -817,7 +819,7 @@ struct HTTP2TLSTests {
         let compiled = app.compile()
         let limits = ConnectionLimits(ServerConfig())
         var configuration = TLSConfiguration.client(trustRoots: .system, applicationProtocols: protocols)
-        configuration.verification = .none
+        configuration.verification = .disabled
         let client = try TLSContext(configuration)
         let rt = TLSTestRuntime.shared
         let service = HTTP2Service.forTesting(rt)

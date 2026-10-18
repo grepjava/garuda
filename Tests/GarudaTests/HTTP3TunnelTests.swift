@@ -1,7 +1,7 @@
+@_spi(Garuda) import VegaQUICCore
 import Synchronization
 import Testing
 @_spi(Testing) @testable import Garuda
-import VegaQUIC
 import GarudaWire
 import QUICTestPeer
 import Vega
@@ -132,7 +132,7 @@ struct HTTP3WebSocketTests {
                                      fin: false)
             // No pong ever comes.
             let answer = try await client.answer(0)
-            #expect(answer.reset == HTTP3Error.requestCancelled)
+            #expect(answer.reset == HTTP3ErrorCode.requestCancelled.rawValue)
             #expect(try serverFrames(client.peer.streams[0] ?? []).contains { $0.0 == 0x9 })
         }
     }
@@ -305,7 +305,7 @@ struct HTTP3WebTransportTests {
             try await client.pump(timeout: .seconds(3)) { client.peer.closeCode != nil }
             #expect(client.peer.finished.contains(0))
             #expect(afterHead(client.peer.streams[0] ?? []) == closeCapsule(0, ""))
-            #expect(client.peer.closeCode == HTTP3Error.noError)
+            #expect(client.peer.closeCode == HTTP3ErrorCode.noError.rawValue)
         }
     }
 }

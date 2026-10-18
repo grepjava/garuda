@@ -72,7 +72,7 @@ extension Application {
         }
 
         #if os(Linux) || os(macOS)
-        var options = ShardOptions(shards: config.shards ?? Application.defaultShards,
+        var options = ShardConfiguration(shards: config.shards ?? Application.defaultShards,
                                    workersPerShard: config.threads)
         options.pinThreads = config.pinThreads
         options.idleSpin = Application.idleSpin
@@ -168,7 +168,7 @@ extension Application {
             for stream in streams {
                 group.addTask {
                     var stream = stream
-                    return await stream.recv() ? stream.signal : nil
+                    return (try? await stream.recv()) != nil ? stream.signal : nil
                 }
             }
             if let delay {
@@ -379,7 +379,7 @@ extension Application {
                         for server in all { group.addTask { await server.shutdown(gracePeriod: grace) } }
                     }
                 }
-                for server in all { await server.wait() }
+                for server in all { try? await server.wait() }
                 await quic?.wait()
                 await app.stopShard(shard)
             }

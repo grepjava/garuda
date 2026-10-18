@@ -2,6 +2,7 @@
 // --cache-size: what a shared cache may keep, and what keeps a request out.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import Testing
 @testable import GarudaWire
 

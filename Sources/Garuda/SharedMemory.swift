@@ -3,7 +3,7 @@
 //
 // A count that has to be the server's and not one shard's -- a client's
 // requests under --rate-limit, the --metrics-port page -- lives in a region
-// of Vega's (ShardOptions.sharedRegions): mapped once, before the shards
+// of Vega's (ShardConfiguration.sharedRegions): mapped once, before the shards
 // start, and the same memory in each. The regions are laid out here from the
 // config, so the supervisor that maps them and the shards that use them
 // agree on which is which. A server in one process takes the same layout

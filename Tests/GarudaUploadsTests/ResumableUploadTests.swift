@@ -641,7 +641,7 @@ struct ResumableUploadTests {
         let probe = try app.test.head(location)
         #expect(probe.header("upload-offset") == "50")
         // Reset as cancelled: the client is told to stop sending.
-        #expect(try quiet.response(stream).reset == H2Error.cancel.rawValue)
+        #expect(try quiet.response(stream).reset == HTTP2ErrorCode.cancel.rawValue)
 
         let rest = try app.test.request("PATCH", location, headers: partial(50, complete: true),
                                         body: pattern(50, from: 50))

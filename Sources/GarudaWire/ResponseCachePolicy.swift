@@ -13,6 +13,7 @@
 
 
 /// The directives of one or more Cache-Control fields.
+import VegaWire
 public struct CacheControl: Sendable {
     public var maxAge = -1
     public var sharedMaxAge = -1

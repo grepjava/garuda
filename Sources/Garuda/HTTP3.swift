@@ -4,7 +4,7 @@
 // QUIC is nothing like the TCP path. There is no accept: a datagram arrives,
 // its destination connection ID is looked up, and either it belongs to a
 // connection or it is the first packet of a new one. Ordering, loss recovery
-// and congestion control all happen inside `QUICConnection` (VegaQUIC),
+// and congestion control all happen inside `QUICConnectionState` (VegaQUIC),
 // which does no I/O of its own: it is handed datagrams and asked for them.
 //
 // Each shard binds a UDP socket per thread with SO_REUSEPORT, so the kernel
@@ -14,7 +14,7 @@
 // one.
 //
 // A socket has one ENDPOINT task, and the endpoint owns everything QUIC for
-// it: the table from connection ID to connection, every `QUICConnection`, and
+// it: the table from connection ID to connection, every `QUICConnectionState`, and
 // the HTTP/3 state on top (HTTP3Connection.swift). Nothing else touches any of
 // it, so none of it is locked. Its loop: receive a batch of datagrams, waiting
 // no longer than the earliest QUIC timer; feed each to its connection (or
@@ -24,7 +24,7 @@
 // coalesced into one segmented send (UDP GSO) where the kernel allows.
 //
 // Requests run as tasks from the shard's stream pool, as HTTP/2 streams do,
-// and never touch a `QUICConnection`. A task hands its answer to the endpoint
+// and never touch a `QUICConnectionState`. A task hands its answer to the endpoint
 // by posting its stream (HTTP3Stream.swift) under the endpoint's lock and
 // firing the endpoint's wake-up trigger, which ends the endpoint's wait on
 // the socket early. The endpoint moves what was posted onto the QUIC stream as
@@ -43,7 +43,7 @@
 // answered -- or when the grace period runs out.
 //===----------------------------------------------------------------------===//
 
-import VegaQUIC
+@_spi(Garuda) import VegaQUICCore
 import GarudaWire
 import Synchronization
 import Vega
@@ -201,7 +201,7 @@ final class QUICEndpoint: @unchecked Sendable {
     let lock = Mutex<Void>(())
     /// Ends the endpoint's wait on the socket: a task posted something, or
     /// shutdown began.
-    let wake = IODeadlineTrigger()
+    let wake = IOTimeoutTrigger()
     /// Streams with something for the endpoint: an answer, body bytes, an
     /// end, a task finished.
     @exclusivity(unchecked) var posted: [Unmanaged<H3Stream>] = []
@@ -280,9 +280,9 @@ final class QUICEndpoint: @unchecked Sendable {
 
     /// The configuration a new connection is made with: the certificates as
     /// they are now, so a reload reaches the next handshake.
-    func quicConfig() -> QUICServerConfig {
-        var config = QUICServerConfig(certKeys: certificates(), alpn: [h3ALPN])
-        config.maxIdleTimeoutMs = settings.idleTimeoutMs
+    func quicConfig() -> QUICServerConfiguration {
+        var config = QUICServerConfiguration(certificateKeys: certificates(), applicationProtocols: ["h3"])
+        config.maxIdleTimeout = .milliseconds(settings.idleTimeoutMs)
         config.initialMaxStreamData = UInt64(settings.streamWindow)
         config.initialMaxData = UInt64(settings.streamWindow) &* 8
         config.initialMaxStreamsBidi = UInt64(settings.maxStreams)
@@ -311,7 +311,7 @@ final class QUICEndpoint: @unchecked Sendable {
             var received = 0
             do {
                 let wait: Duration = busy ? .zero : waitBefore(now)
-                received = try await Runtime.withIODeadline(wait, trigger: wake) { () async throws(IOError) -> Int in
+                received = try await Runtime.withIOTimeout(for: wait, trigger: wake) { () async throws(IOError) -> Int in
                     try await socket.receive(&batch)
                 }
             } catch let error where error == .timedOut {
@@ -543,7 +543,7 @@ final class QUICEndpoint: @unchecked Sendable {
     private func accept(_ p: UnsafeMutablePointer<UInt8>, _ n: Int, header: QUICPacketHeader,
                         from peer: SocketAddress, to local: SocketAddress?, ecn: UInt8, nowMs now: UInt64) {
         let localCID = QUICConnectionID.random()
-        guard let quic = QUICConnection(config: quicConfig(), version: header.version, clientDCID: header.dcid,
+        guard let quic = QUICConnectionState(config: quicConfig(), version: header.version, clientDCID: header.dcid,
                                         clientSCID: header.scid, localCID: localCID, nowMs: now) else { return }
         let connection = H3Connection(endpoint: self, quic: quic, peer: peer, local: local,
                                       localCID: localCID, originalDCID: header.dcid)

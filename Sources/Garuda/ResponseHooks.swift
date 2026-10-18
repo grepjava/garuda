@@ -29,6 +29,7 @@
 // connection refuses before it is routed (a head too large, a body too long).
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 
 /// Sees the response a request is about to send, and may change it.

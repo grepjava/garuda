@@ -31,6 +31,7 @@ import Synchronization
 import Vega
 import VegaFS
 import VegaIO
+import VegaCrypto
 import VegaTLS
 
 /// Why a connection did not come up.
@@ -215,7 +216,7 @@ final class ClientConnections: Sendable {
     func context(caFile: String, alpn: [String]) async throws(OutboundError) -> TLSContext {
         let name = caFile + "\u{0}" + alpn.joined(separator: ",")
         if let made = contexts.withLock({ $0[name] }) { return made }
-        let roots: TLSConfiguration.TrustRoots
+        let roots: TrustRoots
         if caFile.isEmpty {
             roots = .system
         } else {
@@ -243,7 +244,7 @@ final class ClientConnections: Sendable {
         do throws(OutboundError) {
             let addresses: [SocketAddress]
             do {
-                addresses = try await Runtime.withIODeadline(until: deadline) { () async throws(IOError) -> [SocketAddress] in
+                addresses = try await Runtime.withIOTimeout(until: deadline) { () async throws(IOError) -> [SocketAddress] in
                     try await SocketAddress.lookup(host: host, port: Int(port))
                 }
             } catch {
@@ -252,18 +253,18 @@ final class ClientConnections: Sendable {
                 throw OutboundError.unresolved
             }
             do {
-                return try await Runtime.withIODeadline(until: deadline) { () async throws(IOError) -> Connected in
+                return try await Runtime.withIOTimeout(until: deadline) { () async throws(IOError) -> Connected in
                     let tcp = try await TCPStream.connect(to: addresses)
                     guard let context else {
                         guard forceHTTP2 else { return .http1(ClientConnection(key: key, transport: TCPClientTransport(tcp))) }
-                        let halves = tcp.halves()
+                        let halves = tcp.split()
                         return .http2(SplitReader(halves.reader), SplitWriter(halves.writer))
                     }
                     let tls = try await TLSStream.connect(tcp, serverName: host, context: context)
                     guard forceHTTP2 || tls.applicationProtocol == "h2" else {
                         return .http1(ClientConnection(key: key, transport: TLSClientTransport(tls)))
                     }
-                    let halves = tls.halves()
+                    let halves = tls.split()
                     return .http2(SplitReader(halves.reader), SplitWriter(halves.writer))
                 }
             } catch {

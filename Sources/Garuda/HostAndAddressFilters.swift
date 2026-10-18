@@ -26,6 +26,7 @@
 // is.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 
 extension RouteBuilder {

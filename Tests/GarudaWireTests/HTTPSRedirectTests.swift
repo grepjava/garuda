@@ -2,6 +2,7 @@
 // --redirect-http: the Location a plain request is sent to, and what is refused.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import Testing
 @testable import GarudaWire
 

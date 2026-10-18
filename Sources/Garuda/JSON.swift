@@ -14,6 +14,7 @@
 // value can run the stack out.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 
 

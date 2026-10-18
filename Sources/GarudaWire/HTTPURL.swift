@@ -28,6 +28,7 @@
 //===----------------------------------------------------------------------===//
 
 
+import VegaWire
 public enum HTTPURLScheme: UInt8, Sendable {
     case http
     case https

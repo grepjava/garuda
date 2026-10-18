@@ -21,6 +21,8 @@
 // with CANCEL.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
 import GarudaWire
 import Synchronization
 import Vega

@@ -17,6 +17,7 @@
 //     HPACK decoder, as a client's would.
 //===----------------------------------------------------------------------===//
 
+@_spi(Garuda) import VegaHTTP2Core
 import Garuda
 import GarudaTesting
 import GarudaWire
@@ -81,7 +82,7 @@ extension Fuzz {
             if f.stream != 0 && f.stream & 1 == 0 && f.kind != .rstStream {
                 return "frame \(i), a \(f.type), on stream \(f.stream)"
             }
-            if f.payload.count > H2FrameHeader.defaultMaxFrameSize {
+            if f.payload.count > HTTP2FrameHeader.defaultMaxFrameSize {
                 return "frame \(i) is \(f.payload.count) bytes, past the client's maximum"
             }
             switch f.kind {

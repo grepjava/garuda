@@ -126,7 +126,7 @@ func readArrival<S: AsyncReader & ~Copyable>(
     _ stream: borrowing S, _ parts: UnsafeMutablePointer<ConnectionParts>, timeout: Duration
 ) async throws(IOError) -> Int {
     let arrival = parts.pointee.arrival
-    let n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+    let n = try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Int in
         try await stream.read(into: &parts.pointee.input, arrival: arrival)
     }
     if n > 0 { parts.pointee.arrived = arrival.pointee.microseconds ?? wallClockMicros() }
@@ -211,7 +211,7 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     held.initialize(to: stream)
     x.pointee.link = .http1(HeldStream(pointer: UnsafeMutableRawPointer(held), writer: writer ?? HeldWriter<S>.self),
                             parts, StreamLimits(limits))
-    var connection = HTTP1Connection(limits: limits, parts: parts, cache: app.connections,
+    var connection = HTTP1Client(limits: limits, parts: parts, cache: app.connections,
                                      observing: limits.accessLog || !app.observers.isEmpty || app.metrics != nil
                                          || app.tracer != nil)
     await connection.run(held.pointee, app: app)
@@ -225,7 +225,7 @@ func serveHTTP1<S: AsyncReader & AsyncWriter & ~Copyable>(
     return back
 }
 
-struct HTTP1Connection: ~Copyable {
+struct HTTP1Client: ~Copyable {
     let limits: ConnectionLimits
     /// The buffers and the exchange, borrowed from the cache for the
     /// connection's life (ConnectionCache.swift).
@@ -374,7 +374,7 @@ struct HTTP1Connection: ~Copyable {
                 let base = x.pointee.heldBody.map { held in held.withUnsafeBytes { $0.baseAddress! } }
                     ?? UnsafeRawPointer(x.pointee.responseBody.readPointer)
                 let body = UnsafeRawBufferPointer(start: base, count: count)
-                try await Runtime.withWriteStallTimeout(limits.writeTimeout) { () async throws(IOError) in
+                try await Runtime.withWriteStallTimeout(for: limits.writeTimeout) { () async throws(IOError) in
                     try await stream.write(body)
                 }
             }
@@ -439,7 +439,7 @@ struct HTTP1Connection: ~Copyable {
             if available == 0 && limits.requestStart {
                 n = try await readArrival(stream, parts, timeout: timeout)
             } else {
-                n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+                n = try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Int in
                     try await stream.read(into: &parts.pointee.input)
                 }
             }
@@ -466,7 +466,7 @@ struct HTTP1Connection: ~Copyable {
             compact()
             parts.pointee.input.reserveCapacity(need)
             while parts.pointee.input.count < need {
-                let n = try await Runtime.withIODeadline(limits.bodyTimeout) { () async throws(IOError) -> Int in
+                let n = try await Runtime.withIOTimeout(for: limits.bodyTimeout) { () async throws(IOError) -> Int in
                     try await stream.read(into: &parts.pointee.input)
                 }
                 if n == 0 { return false }
@@ -520,7 +520,7 @@ struct HTTP1Connection: ~Copyable {
                 // undecoded needs to stay, but the head ahead of it does too.
                 compact()
                 if parts.pointee.input.spareCapacity < 4096 { parts.pointee.input.reserveCapacity(parts.pointee.input.capacity * 2) }
-                let n = try await Runtime.withIODeadline(limits.bodyTimeout) { () async throws(IOError) -> Int in
+                let n = try await Runtime.withIOTimeout(for: limits.bodyTimeout) { () async throws(IOError) -> Int in
                     try await stream.read(into: &parts.pointee.input)
                 }
                 if n == 0 { return false }
@@ -636,7 +636,7 @@ struct HTTP1Connection: ~Copyable {
         // it has gone for the write timeout, as Garuda 1 closed a connection
         // stuck writing. Free until the socket is full: only then does the
         // wait get a timer.
-        try await Runtime.withWriteStallTimeout(limits.writeTimeout) { () async throws(IOError) in
+        try await Runtime.withWriteStallTimeout(for: limits.writeTimeout) { () async throws(IOError) in
             try await stream.write(bytes)
         }
         if parts.pointee.output.allocatedCapacity > limits.readBufferSize * 4 {

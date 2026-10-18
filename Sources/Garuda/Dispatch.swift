@@ -113,7 +113,7 @@ func runHandler(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication,
     }
     let start = monotonicNanos()
     let sampled = costs.shouldSample(index, heavy: heavy, now: start)
-    let stamp = sampled ? Runtime.currentJobStamp : .none
+    let stamp = sampled ? Runtime.currentPollStamp : .none
     do {
         try await handler(Request(x), Response(x))
         if let produce = x.pointee.producer {
@@ -149,7 +149,7 @@ func runHandler(_ x: UnsafeMutablePointer<Exchange>, _ app: CompiledApplication,
         if case .http1 = x.pointee.link {} else { x.pointee.settleHeldBody() }
     }
     // A handler that suspended gave its thread up; its time says nothing.
-    if sampled && Runtime.currentJobStamp == stamp {
+    if sampled && Runtime.currentPollStamp == stamp {
         costs.record(index, nanos: monotonicNanos() &- start)
     }
     costs.releaseCore(core)

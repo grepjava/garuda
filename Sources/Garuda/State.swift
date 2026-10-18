@@ -12,7 +12,7 @@
 // it accepts anything, so a pool, a client or a cache belongs to that shard
 // alone; every thread of the shard shares it, which is why it is Sendable.
 // What every shard must see lives outside the processes, in a database, or in
-// a shared region (Vega's ShardOptions.sharedRegions).
+// a shared region (Vega's ShardConfiguration.sharedRegions).
 //
 // A factory or a start hook that throws stops the shard's start-up: it exits
 // rather than serve without what it needs, and the supervisor tries again.

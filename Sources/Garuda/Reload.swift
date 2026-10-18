@@ -89,7 +89,7 @@ final class ReloadWatcher: @unchecked Sendable {
     /// With no supervisor there is nothing to restart, so --reload brings
     /// one shard where the platform would serve in-process, unless
     /// --shards 0 was asked for.
-    static func install(_ config: ServerConfig, into options: inout ShardOptions) {
+    static func install(_ config: ServerConfig, into options: inout ShardConfiguration) {
         if options.shards == 0 {
             guard config.shards == nil else {
                 Log.warning("--reload restarts the shards' supervisor, and --shards 0 has none; it has no effect")

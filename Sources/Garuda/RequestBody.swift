@@ -40,6 +40,7 @@
 // first.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 import Synchronization
 import Vega
@@ -228,7 +229,7 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
     /// Ends a read waiting on the client, for `cancel`. Not the task: a
     /// cancelled task could not store what it had been given -- a file
     /// write on io_uring fails at once with ECANCELED.
-    private let wake = IODeadlineTrigger()
+    private let wake = IOTimeoutTrigger()
     /// The handler is running, between the two `attach` calls.
     private var running = false
 
@@ -377,7 +378,7 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
         }
         if received > limit {
             // Nothing past the limit is handed over.
-            buffer.count &-= produced
+            buffer.removeLast(produced)
             throw fail(.tooLarge)
         }
         return produced
@@ -391,7 +392,7 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
             continueOwed = false
             let line: StaticString = "HTTP/1.1 100 Continue\r\n\r\n"
             do {
-                try await Runtime.withIODeadline(writeTimeout, trigger: wake) { () async throws(IOError) -> Void in
+                try await Runtime.withIOTimeout(for: writeTimeout, trigger: wake) { () async throws(IOError) -> Void in
                     try await held.write(UnsafeRawBufferPointer(start: line.utf8Start, count: line.utf8CodeUnitCount))
                 }
             } catch {
@@ -406,12 +407,12 @@ final class H1RequestBody: RequestBodySource, @unchecked Sendable {
                 let base = UnsafeMutableRawPointer(mutating: parts.pointee.input.withUnsafeBytes { $0.baseAddress! })
                 (base + headEnd).copyMemory(from: base + at, byteCount: unread)
             }
-            parts.pointee.input.count = headEnd &+ unread
+            parts.pointee.input.removeLast(parts.pointee.input.count &- (headEnd &+ unread))
             at = headEnd
         }
         let n: Int
         do {
-            n = try await Runtime.withIODeadline(timeout, trigger: wake) { () async throws(IOError) -> Int in
+            n = try await Runtime.withIOTimeout(for: timeout, trigger: wake) { () async throws(IOError) -> Int in
                 try await reader.read(held.pointer, into: &parts.pointee.input)
             }
         } catch {

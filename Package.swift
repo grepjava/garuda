@@ -107,7 +107,8 @@ let package = Package(
         // and writer, and header policies. No sockets, no allocation on the
         // hot path. HPACK, QPACK and the frames are Vega's (VegaWire,
         // VegaHTTP3), re-exported. See Sources/GarudaWire/VENDORED.md.
-        .target(name: "GarudaWire", dependencies: [vega("VegaWire"), vega("VegaHTTP3")],
+        .target(name: "GarudaWire", dependencies: [vega("VegaWire"), vega("VegaHTTP2Core"), vega("VegaHTTP3Core"),
+                                                  vega("VegaWebSocketCore")],
                 exclude: ["VENDORED.md"], swiftSettings: sharedSwiftSettings),
         // VegaTLS serves HTTPS (TLS.swift). VegaCrypto: Garuda has no
         // cryptography of its own. Signed and
@@ -119,7 +120,7 @@ let package = Package(
         .target(name: "Garuda",
                 dependencies: ["GarudaWire", vega("VegaQUIC"), "CGarudaShared", vega("Vega"), vega("VegaIO"), vega("VegaCrypto"),
                                vega("VegaTLS"),
-                               vega("VegaFS"), vega("VegaExtras"), vegaDB("VegaDBTracing"),
+                               vega("VegaFS"), vega("VegaCompression"), vegaDB("VegaDBTracing"),
                                .product(name: "Tracing", package: "swift-distributed-tracing")],
                 swiftSettings: sharedSwiftSettings),
         .target(name: "GarudaTesting",
@@ -152,7 +153,7 @@ let package = Package(
                           path: "Sources/garuda-server",
                           swiftSettings: sharedSwiftSettings),
         .executableTarget(name: "garuda-conformance",
-                          dependencies: ["Garuda", "GarudaUploads", vega("Vega"), vega("VegaExtras"),
+                          dependencies: ["Garuda", "GarudaUploads", vega("Vega"), vega("VegaCompression"),
                                          vega("VegaFS")],
                           path: "Sources/garuda-conformance",
                           swiftSettings: sharedSwiftSettings),
@@ -171,7 +172,7 @@ let package = Package(
         .testTarget(name: "GarudaWireTests", dependencies: ["GarudaWire"],
                     swiftSettings: sharedSwiftSettings),
         // The tests' own QUIC client (a copy of Vega's), for GarudaTests and the fuzz targets.
-        .target(name: "QUICTestPeer", dependencies: [vega("VegaQUIC"), vega("VegaWire"), vega("VegaCrypto"), vega("VegaTLS")],
+        .target(name: "QUICTestPeer", dependencies: [vega("VegaQUICCore"), vega("VegaWire"), vega("VegaCrypto"), vega("VegaTLS")],
                 path: "Tests/QUICTestPeer", swiftSettings: sharedSwiftSettings),
         .testTarget(name: "GarudaTests",
                     dependencies: ["Garuda", "GarudaWire", "GarudaTesting", "CAllocationCounter",

@@ -11,6 +11,7 @@
 /// A range inside the connection read buffer. 32-bit because a request head is
 /// capped well below 4 GiB, which halves the size of the header table and keeps
 /// more of it in cache.
+import VegaWire
 public struct HTTPSlice: Equatable, Sendable {
     public var offset: UInt32
     public var length: UInt32

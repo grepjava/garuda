@@ -1,8 +1,11 @@
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
+@_spi(Garuda) import VegaHTTP3Core
+@_spi(Garuda) import VegaQUICCore
 import Synchronization
 import Testing
 @_spi(Testing) @testable import Garuda
 @_spi(Testing) import GarudaTesting
-import VegaQUIC
 import GarudaWire
 import QUICTestPeer
 import Vega
@@ -226,7 +229,7 @@ final class H3Client: @unchecked Sendable {
 func receiveDatagram(_ socket: borrowing UDPSocket, timeout: Duration) async throws(IOError) -> [UInt8]? {
     var buffer = IOBuffer(capacity: 2048)
     do {
-        _ = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+        _ = try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Int in
             try await socket.receive(into: &buffer)
         }
     } catch {
@@ -509,7 +512,7 @@ struct HTTP3Tests {
             try await client.request(0, [(":method", "POST"), (":scheme", "https"), (":authority", "localhost"),
                                          (":path", "/echo"), ("content-length", "5")], body: [1, 2, 3])
             let answer = try await client.answer(0)
-            #expect(answer.reset == HTTP3Error.messageError)
+            #expect(answer.reset == HTTP3ErrorCode.messageError.rawValue)
         }
     }
 
@@ -519,10 +522,10 @@ struct HTTP3Tests {
             // No :scheme.
             try await client.request(0, [(":method", "GET"), (":authority", "localhost"), (":path", "/")])
             let answer = try await client.answer(0)
-            #expect(answer.reset == HTTP3Error.messageError)
+            #expect(answer.reset == HTTP3ErrorCode.messageError.rawValue)
             // A Host that differs from :authority (RFC 9114 section 4.3.1).
             let differs = try await client.get(4, "/", headers: [("host", "elsewhere")])
-            #expect(differs.reset == HTTP3Error.messageError)
+            #expect(differs.reset == HTTP3ErrorCode.messageError.rawValue)
             #expect(try await client.get(8, "/user/still").text == "still")
         }
     }
@@ -546,7 +549,7 @@ struct HTTP3Tests {
                 + hsVarint(0) + hsVarint(3) + [1, 2, 3]
                 + headersFrame([("x-big", String(repeating: "a", count: 40_000))])
             try await client.sendStream(0, frames, fin: true)
-            #expect(try await client.answer(0).reset == HTTP3Error.excessiveLoad)
+            #expect(try await client.answer(0).reset == HTTP3ErrorCode.excessiveLoad.rawValue)
             #expect(client.peer.closeCode == nil)
             #expect(try await client.get(4, "/user/after").text == "after")
         }
@@ -563,7 +566,7 @@ struct HTTP3Tests {
             // A capacity of one, past the zero the server allows.
             try await client.sendStream(2, [0x21], offset: 3, fin: false)
             try await client.pump { client.peer.closeCode != nil }
-            #expect(client.peer.closeCode == HTTP3Error.qpackEncoderStreamError)
+            #expect(client.peer.closeCode == HTTP3ErrorCode.qpackEncoderStreamError.rawValue)
         }
     }
 
@@ -573,16 +576,16 @@ struct HTTP3Tests {
             try await client.connect()
             // A frame header the stream's end cuts off: HEADERS' type alone.
             try await client.sendStream(0, [0x01], fin: true)
-            #expect(try await client.answer(0).reset == HTTP3Error.requestIncomplete)
+            #expect(try await client.answer(0).reset == HTTP3ErrorCode.requestIncomplete.rawValue)
             // A HEADERS frame cut short.
             let head = headersFrame([(":method", "GET"), (":scheme", "https"), (":authority", "localhost"),
                                      (":path", "/")])
             try await client.sendStream(4, Array(head.dropLast(2)), fin: true)
-            #expect(try await client.answer(4).reset == HTTP3Error.requestIncomplete)
+            #expect(try await client.answer(4).reset == HTTP3ErrorCode.requestIncomplete.rawValue)
             // An unknown frame ahead of the request that fits the window by
             // its length, but not with its header too.
             try await client.sendStream(8, hsVarint(0x21) + hsVarint(16_383), fin: false)
-            #expect(try await client.answer(8).reset == HTTP3Error.excessiveLoad)
+            #expect(try await client.answer(8).reset == HTTP3ErrorCode.excessiveLoad.rawValue)
             #expect(try await client.get(12, "/user/after").text == "after")
         }
     }
@@ -700,9 +703,9 @@ struct HTTP3Tests {
             let request = try headersFrame([(":method", "GET"), (":scheme", "https"),
                                              (":authority", "localhost"), (":path", "/delay/2000")]).count
             try await client.send(try client.peer.packet(.application, client.peer.ack(.application)
-                + resetStreamFrame(0, code: HTTP3Error.requestCancelled, finalSize: request)))
+                + resetStreamFrame(0, code: HTTP3ErrorCode.requestCancelled.rawValue, finalSize: request)))
             let answer = try await client.answer(0)
-            #expect(answer.reset == HTTP3Error.requestCancelled)
+            #expect(answer.reset == HTTP3ErrorCode.requestCancelled.rawValue)
             #expect(answer.status == 0)
             #expect(try await client.get(4, "/user/next").text == "next")
         }
@@ -719,7 +722,7 @@ struct HTTP3Tests {
             let control = try h3Frames(Array((client.peer.streams[3] ?? []).dropFirst()))
             let goaway = try #require(control.first { $0.0 == 0x07 })
             #expect(goaway.1 == hsVarint(4))
-            #expect(client.peer.closeCode == HTTP3Error.noError)
+            #expect(client.peer.closeCode == HTTP3ErrorCode.noError.rawValue)
         }
     }
 }

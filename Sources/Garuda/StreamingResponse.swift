@@ -45,9 +45,12 @@
 // buffer.
 //===----------------------------------------------------------------------===//
 
+@_spi(Garuda) import VegaQUICCore
+import VegaWire
+@_spi(Garuda) import VegaHTTP3Core
 import GarudaWire
 import Synchronization
-import Vega
+@_spi(Garuda) import Vega
 import VegaFS
 import VegaIO
 #if canImport(Glibc)
@@ -665,7 +668,7 @@ final class BodyChannel: @unchecked Sendable {
         while true {
             var ok = true
             do {
-                try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Void in
+                try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Void in
                     try await held.write(UnsafeRawBufferPointer(start: buffer.readPointer,
                                                                 count: buffer.readableBytes))
                 }
@@ -930,7 +933,7 @@ final class BodyChannel: @unchecked Sendable {
                 do {
                     let at = start + sent
                     let left = count - sent
-                    n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+                    n = try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Int in
                         try await held.sendFile(file.descriptor, offset: at, count: left)
                     }
                 } catch {

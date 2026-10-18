@@ -53,6 +53,8 @@
 // cancelled to streams answered.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
 import GarudaWire
 import Synchronization
 import Vega
@@ -75,9 +77,9 @@ struct HTTP2Limits: Sendable {
         enabled = config.http2Enabled || config.http2Only
         only = config.http2Only
         maxConcurrentStreams = max(1, config.h2MaxConcurrentStreams)
-        maxFrameSize = min(max(config.h2MaxFrameSize, H2FrameHeader.defaultMaxFrameSize), 0xFF_FFFF)
-        initialWindowSize = min(max(config.h2InitialWindowSize, H2FrameHeader.defaultInitialWindowSize),
-                                H2FrameHeader.maxWindowSize)
+        maxFrameSize = min(max(config.h2MaxFrameSize, HTTP2FrameHeader.defaultMaxFrameSize), 0xFF_FFFF)
+        initialWindowSize = min(max(config.h2InitialWindowSize, HTTP2FrameHeader.defaultInitialWindowSize),
+                                HTTP2FrameHeader.maxWindowSize)
         maxHeaderListSize = config.maxHeadSize
         // Deep enough that a whole window of streams can be cancelled at once,
         // which is what a navigation away from a page full of subresources
@@ -211,9 +213,9 @@ func serveConnection<S: AsyncReader & AsyncWriter & ~Copyable, R: AsyncReader & 
         app.connections.give(parts, limits: limits)
         // RFC 9113 section 3.4: GOAWAY, then close.
         var out = ByteBuffer()
-        H2FrameHeader(length: 8, type: .goaway, flags: [], streamID: 0).write(into: &out)
+        HTTP2FrameHeader(length: 8, type: .goaway, flags: [], streamID: 0).write(into: &out)
         HTTP2.writeUInt32(0, into: &out)
-        HTTP2.writeUInt32(H2Error.protocolError.rawValue, into: &out)
+        HTTP2.writeUInt32(HTTP2ErrorCode.protocolError.rawValue, into: &out)
         _ = try? await stream.write(UnsafeRawBufferPointer(start: out.readPointer, count: out.readableBytes))
         out.destroy()
         await close(stream)
@@ -258,7 +260,7 @@ func opening<S: AsyncReader & AsyncWriter & ~Copyable>(
             if count == 0 && limits.requestStart {
                 n = try await readArrival(stream, parts, timeout: timeout)
             } else {
-                n = try await Runtime.withIODeadline(timeout) { () async throws(IOError) -> Int in
+                n = try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Int in
                     try await stream.read(into: &parts.pointee.input)
                 }
             }
@@ -332,7 +334,7 @@ final class H2Stream: @unchecked Sendable {
 
     // The writer's.
     /// RST_STREAM to send after the answer: a 413 tells the client to stop.
-    @exclusivity(unchecked) var resetAfter: H2Error?
+    @exclusivity(unchecked) var resetAfter: HTTP2ErrorCode?
     @exclusivity(unchecked) var sent = 0
     @exclusivity(unchecked) var length = 0
     @exclusivity(unchecked) var grant = 0
@@ -359,7 +361,7 @@ final class H2Stream: @unchecked Sendable {
     /// The writer has seen the end and sends END_STREAM with the last bytes.
     @exclusivity(unchecked) var ending = false
     /// What a body cut off part-way is reset with.
-    @exclusivity(unchecked) var failCode = H2Error.internalError
+    @exclusivity(unchecked) var failCode = HTTP2ErrorCode.internalError
 
     // An extended CONNECT's (HTTP2WebSocket.swift).
     /// Where its DATA goes, as it arrives, for the WebSocket to read.
@@ -434,9 +436,9 @@ final class H2Connection: @unchecked Sendable {
     @exclusivity(unchecked) var spare: [H2Stream] = []
     /// Every stream made, so they live as long as the connection.
     @exclusivity(unchecked) var made: [H2Stream] = []
-    @exclusivity(unchecked) var sendWindow = H2FrameHeader.defaultInitialWindowSize
-    @exclusivity(unchecked) var peerMaxFrameSize = H2FrameHeader.defaultMaxFrameSize
-    @exclusivity(unchecked) var peerInitialWindowSize = H2FrameHeader.defaultInitialWindowSize
+    @exclusivity(unchecked) var sendWindow = HTTP2FrameHeader.defaultInitialWindowSize
+    @exclusivity(unchecked) var peerMaxFrameSize = HTTP2FrameHeader.defaultMaxFrameSize
+    @exclusivity(unchecked) var peerInitialWindowSize = HTTP2FrameHeader.defaultInitialWindowSize
     /// Streams the writer has ended since the reader last looked: each
     /// buys back one cancellation.
     @exclusivity(unchecked) var earned = 0
@@ -473,7 +475,7 @@ final class H2Connection: @unchecked Sendable {
     @exclusivity(unchecked) var wOut = ByteBuffer(capacity: 16 * 1024)
     @exclusivity(unchecked) var wBlock = ByteBuffer(capacity: 1024)
     @exclusivity(unchecked) var fieldCache = H2FieldCache()
-    @exclusivity(unchecked) var frameSizeForRole = H2FrameHeader.defaultMaxFrameSize
+    @exclusivity(unchecked) var frameSizeForRole = HTTP2FrameHeader.defaultMaxFrameSize
 
     // Links in the service's list, under its lock.
     @exclusivity(unchecked) unowned(unsafe) var previousConnection: H2Connection?
@@ -513,7 +515,7 @@ final class H2Connection: @unchecked Sendable {
         self.secure = secure
         observing = limits.accessLog || !app.observers.isEmpty || app.metrics != nil || app.tracer != nil
         acceptsConnectProtocol = limits.websocket.overHTTP2
-        recvWindow = H2FrameHeader.defaultInitialWindowSize
+        recvWindow = HTTP2FrameHeader.defaultInitialWindowSize
         resetBudget = settings.resetBudget
         ready.reserveCapacity(16)
         streams.reserveCapacity(16)
@@ -533,7 +535,7 @@ final class H2Connection: @unchecked Sendable {
     /// have to be the first thing sent.
     func begin() {
         parts.pointee.input.consume(HTTP2.preface.count)
-        let entries: [(H2Setting, Int)] = [
+        let entries: [(HTTP2Setting, Int)] = [
             (.maxConcurrentStreams, settings.maxConcurrentStreams),
             (.initialWindowSize, settings.initialWindowSize),
             (.maxFrameSize, settings.maxFrameSize),
@@ -550,14 +552,14 @@ final class H2Connection: @unchecked Sendable {
         }
         // A connection window larger than the default lets one upload use the
         // link; the per-stream window is what bounds a stream.
-        let bump = settings.initialWindowSize - H2FrameHeader.defaultInitialWindowSize
+        let bump = settings.initialWindowSize - HTTP2FrameHeader.defaultInitialWindowSize
         if bump > 0 {
             frame(&control, 4, .windowUpdate, [], 0)
             HTTP2.writeUInt32(UInt32(bump), into: &control)
             recvWindow = settings.initialWindowSize
         }
         // Room for the largest frame we accept, header and all.
-        let room = 2 * (settings.maxFrameSize + H2FrameHeader.size)
+        let room = 2 * (settings.maxFrameSize + HTTP2FrameHeader.size)
         if parts.pointee.input.capacity < room { parts.pointee.input.reserveCapacity(room) }
     }
 
@@ -581,7 +583,7 @@ final class H2Connection: @unchecked Sendable {
         goawaySent = true
         frame(&control, 8, .goaway, [], 0)
         HTTP2.writeUInt32(lastPeerStream, into: &control)
-        HTTP2.writeUInt32(H2Error.noError.rawValue, into: &control)
+        HTTP2.writeUInt32(HTTP2ErrorCode.noError.rawValue, into: &control)
         wake.notifyOne()
     }
 
@@ -616,13 +618,13 @@ final class H2Connection: @unchecked Sendable {
                 failed = true
                 break
             }
-            if parts.pointee.input.spareCapacity < H2FrameHeader.size + settings.maxFrameSize {
+            if parts.pointee.input.spareCapacity < HTTP2FrameHeader.size + settings.maxFrameSize {
                 parts.pointee.input.reserveCapacity(parts.pointee.input.capacity * 2)
             }
             do {
                 // Woken at least this often to look at idleness and stalled
                 // uploads; a read interrupted this way has read nothing.
-                let n = try await Runtime.withIODeadline(limits.keepAliveTimeout) { () async throws(IOError) -> Int in
+                let n = try await Runtime.withIOTimeout(for: limits.keepAliveTimeout) { () async throws(IOError) -> Int in
                     try await reader.read(into: &parts.pointee.input)
                 }
                 if n == 0 { break }
@@ -690,7 +692,7 @@ final class H2Connection: @unchecked Sendable {
                     goawaySent = true
                     frame(&control, 8, .goaway, [], 0)
                     HTTP2.writeUInt32(lastPeerStream, into: &control)
-                    HTTP2.writeUInt32(H2Error.noError.rawValue, into: &control)
+                    HTTP2.writeUInt32(HTTP2ErrorCode.noError.rawValue, into: &control)
                 }
             }
             return true
@@ -786,23 +788,23 @@ final class H2Connection: @unchecked Sendable {
         let base = parts.pointee.input.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) }
         start = 0
         var ok = true
-        while count &- start >= H2FrameHeader.size {
-            let header = H2FrameHeader.parse(base + start)
+        while count &- start >= HTTP2FrameHeader.size {
+            let header = HTTP2FrameHeader.parse(base + start)
             if header.length > settings.maxFrameSize {
                 ok = connectionError(.frameSizeError)
                 break
             }
-            if count &- start &- H2FrameHeader.size < header.length { break }
+            if count &- start &- HTTP2FrameHeader.size < header.length { break }
             // A header block may not be interleaved with anything else.
-            if expectingContinuation && header.type != H2FrameType.continuation.rawValue {
+            if expectingContinuation && header.type != HTTP2FrameType.continuation.rawValue {
                 ok = connectionError(.protocolError)
                 break
             }
-            if !handleFrame(header, base + start + H2FrameHeader.size) {
+            if !handleFrame(header, base + start + HTTP2FrameHeader.size) {
                 ok = false
                 break
             }
-            start &+= H2FrameHeader.size &+ header.length
+            start &+= HTTP2FrameHeader.size &+ header.length
             if inlineStream != nil { break }
         }
         if ok && start > 0 { parts.pointee.input.consume(start) }
@@ -811,10 +813,10 @@ final class H2Connection: @unchecked Sendable {
         return ok
     }
 
-    func handleFrame(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handleFrame(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         // Unknown frame types are discarded: that is how extensions are
         // meant to be ignorable.
-        guard let type = H2FrameType(rawValue: header.type) else { return true }
+        guard let type = HTTP2FrameType(rawValue: header.type) else { return true }
         switch type {
         case .data: return handleData(header, payload)
         case .headers: return handleHeaders(header, payload)
@@ -831,7 +833,7 @@ final class H2Connection: @unchecked Sendable {
 
     // MARK: DATA
 
-    func handleData(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handleData(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         if header.streamID == 0 { return connectionError(.protocolError) }
         // Flow control is accounted before anything else can refuse the
         // frame: the peer has spent the window whether or not we want it.
@@ -938,7 +940,7 @@ final class H2Connection: @unchecked Sendable {
     /// DATA for a body its handler reads as it arrives: handed to the pipe,
     /// which gives the stream's window back as the handler reads. Held to
     /// the declared length and the route's limit as a collected body is.
-    func deliverBody(_ s: H2Stream, _ pipe: BodyPipe, _ header: H2FrameHeader, _ p: UnsafePointer<UInt8>,
+    func deliverBody(_ s: H2Stream, _ pipe: BodyPipe, _ header: HTTP2FrameHeader, _ p: UnsafePointer<UInt8>,
                      _ length: Int) -> Bool {
         s.received += length
         let head = s.x.pointee.head
@@ -1014,7 +1016,7 @@ final class H2Connection: @unchecked Sendable {
     @exclusivity(unchecked) var refusedStreams: [UInt32] = []
     static let refusedKept = 16
 
-    func handleHeaders(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handleHeaders(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         let id = header.streamID
         if id == 0 || id % 2 == 0 { return connectionError(.protocolError) }
         var offset = 0
@@ -1062,7 +1064,7 @@ final class H2Connection: @unchecked Sendable {
         return true
     }
 
-    func handleContinuation(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handleContinuation(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         if !expectingContinuation || header.streamID != blockStream { return connectionError(.protocolError) }
         if headerBlock.readableBytes + header.length > settings.maxHeaderListSize * 2 {
             return connectionError(.enhanceYourCalm)
@@ -1310,7 +1312,7 @@ final class H2Connection: @unchecked Sendable {
         lock.withLock { _ in
             guard s.streaming, !s.reset, !s.closed else { return }
             frame(&control, 4, .rstStream, [], s.id)
-            HTTP2.writeUInt32(H2Error.cancel.rawValue, into: &control)
+            HTTP2.writeUInt32(HTTP2ErrorCode.cancel.rawValue, into: &control)
             cancel(s)
             s.closed = true
             wake.notifyOne()
@@ -1419,7 +1421,7 @@ final class H2Connection: @unchecked Sendable {
         if limits.requestID { x.pointee.assignRequestID(trusting: limits.requestIDTrust) }
         if limits.traceContext { x.pointee.readTraceParent() }
         if observing { x.pointee.started = monotonicNanos() }
-        let stamp = Runtime.currentJobStamp
+        let stamp = Runtime.currentPollStamp
         await dispatchInline(x, app, matched: s.matched, observing: observing)
         // A cancelled run may have been cut short before it could wait: it
         // says nothing about the route.
@@ -1515,7 +1517,7 @@ final class H2Connection: @unchecked Sendable {
 
     // MARK: Other frames
 
-    func handlePriority(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handlePriority(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         if header.streamID == 0 { return connectionError(.protocolError) }
         if header.length != 5 {
             streamError(header.streamID, .frameSizeError)
@@ -1529,7 +1531,7 @@ final class H2Connection: @unchecked Sendable {
         return true
     }
 
-    func handleReset(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handleReset(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         if header.streamID == 0 { return connectionError(.protocolError) }
         if header.length != 4 { return connectionError(.frameSizeError) }
         guard let s = find(header.streamID) else {
@@ -1560,21 +1562,20 @@ final class H2Connection: @unchecked Sendable {
         return true
     }
 
-    func handleSettings(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handleSettings(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         if header.streamID != 0 { return connectionError(.protocolError) }
         if header.flags.contains(.ack) {
             return header.length == 0 ? true : connectionError(.frameSizeError)
         }
         if header.length % 6 != 0 { return connectionError(.frameSizeError) }
         var i = 0
-        var failure: H2Error?
+        var failure: HTTP2ErrorCode?
         lock.withLock { _ in
             while i < header.length && failure == nil {
                 let id = (UInt16(payload[i]) << 8) | UInt16(payload[i + 1])
                 let value = HTTP2.readUInt32(payload + i + 2)
                 i += 6
-                guard let setting = H2Setting(rawValue: id) else { continue }
-                switch setting {
+                switch HTTP2Setting(rawValue: id) {
                 case .headerTableSize:
                     // Bounds what we may use when encoding; we never index.
                     break
@@ -1584,7 +1585,7 @@ final class H2Connection: @unchecked Sendable {
                     // The first limits pushes only; the second is advisory.
                     break
                 case .initialWindowSize:
-                    if value > UInt32(H2FrameHeader.maxWindowSize) {
+                    if value > UInt32(HTTP2FrameHeader.maxWindowSize) {
                         failure = .flowControlError
                         break
                     }
@@ -1596,15 +1597,18 @@ final class H2Connection: @unchecked Sendable {
                     if delta != 0 {
                         for s in streams where !s.closed {
                             s.sendWindow += delta
-                            if s.sendWindow > H2FrameHeader.maxWindowSize { failure = .flowControlError }
+                            if s.sendWindow > HTTP2FrameHeader.maxWindowSize { failure = .flowControlError }
                         }
                     }
                 case .maxFrameSize:
-                    if value < UInt32(H2FrameHeader.defaultMaxFrameSize) || value > 0xFF_FFFF {
+                    if value < UInt32(HTTP2FrameHeader.defaultMaxFrameSize) || value > 0xFF_FFFF {
                         failure = .protocolError
                         break
                     }
                     peerMaxFrameSize = Int(value)
+                default:
+                    // Unknown settings are ignored (RFC 9113 section 6.5.2).
+                    break
                 }
             }
             if failure == nil {
@@ -1616,7 +1620,7 @@ final class H2Connection: @unchecked Sendable {
         return true
     }
 
-    func handlePing(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handlePing(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         if header.streamID != 0 { return connectionError(.protocolError) }
         if header.length != 8 { return connectionError(.frameSizeError) }
         if header.flags.contains(.ack) { return true }
@@ -1625,7 +1629,7 @@ final class H2Connection: @unchecked Sendable {
         return true
     }
 
-    func handleGoaway(_ header: H2FrameHeader) -> Bool {
+    func handleGoaway(_ header: HTTP2FrameHeader) -> Bool {
         if header.streamID != 0 { return connectionError(.protocolError) }
         if header.length < 8 { return connectionError(.frameSizeError) }
         // No new streams, but the connection is not ours to drop: the peer
@@ -1638,7 +1642,7 @@ final class H2Connection: @unchecked Sendable {
         return true
     }
 
-    func handleWindowUpdate(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    func handleWindowUpdate(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         if header.length != 4 { return connectionError(.frameSizeError) }
         let increment = Int(HTTP2.readUInt32(payload) & 0x7FFF_FFFF)
         if header.streamID == 0 {
@@ -1646,7 +1650,7 @@ final class H2Connection: @unchecked Sendable {
             let overflow = lock.withLock { _ -> Bool in
                 sendWindow += increment
                 wake.notifyOne()
-                return sendWindow > H2FrameHeader.maxWindowSize
+                return sendWindow > HTTP2FrameHeader.maxWindowSize
             }
             return overflow ? connectionError(.flowControlError) : true
         }
@@ -1662,7 +1666,7 @@ final class H2Connection: @unchecked Sendable {
             if s.closed { return false }
             s.sendWindow += increment
             wake.notifyOne()
-            return s.sendWindow > H2FrameHeader.maxWindowSize
+            return s.sendWindow > HTTP2FrameHeader.maxWindowSize
         }
         if overflow { streamError(header.streamID, .flowControlError) }
         return true
@@ -1672,7 +1676,7 @@ final class H2Connection: @unchecked Sendable {
 
     /// GOAWAY with `code`, and the connection ends once it is sent. Always
     /// false, for the frame handlers to return.
-    func connectionError(_ code: H2Error) -> Bool {
+    func connectionError(_ code: HTTP2ErrorCode) -> Bool {
         Log.debug("h2 connection error, code \(code.rawValue)")
         post()
         lock.withLock { _ in
@@ -1689,7 +1693,7 @@ final class H2Connection: @unchecked Sendable {
     }
 
     /// Resets one stream, abandoning whatever it was doing.
-    func streamError(_ id: UInt32, _ code: H2Error) {
+    func streamError(_ id: UInt32, _ code: HTTP2ErrorCode) {
         if let s = find(id) {
             lock.withLock { _ in cancel(s) }
             remove(s)
@@ -1697,7 +1701,7 @@ final class H2Connection: @unchecked Sendable {
         rst(id, code)
     }
 
-    func rst(_ id: UInt32, _ code: H2Error) {
+    func rst(_ id: UInt32, _ code: HTTP2ErrorCode) {
         frame(&outgoing, 4, .rstStream, [], id)
         HTTP2.writeUInt32(code.rawValue, into: &outgoing)
     }
@@ -1923,8 +1927,8 @@ func requestHost(_ base: UnsafePointer<UInt8>, _ authority: (Int, Int)?, _ host:
 
 /// Writes a frame header into `out`.
 @inline(__always)
-func frame(_ out: inout ByteBuffer, _ length: Int, _ type: H2FrameType, _ flags: H2Flags, _ stream: UInt32) {
-    H2FrameHeader(length: length, type: type, flags: flags, streamID: stream).write(into: &out)
+func frame(_ out: inout ByteBuffer, _ length: Int, _ type: HTTP2FrameType, _ flags: HTTP2Flags, _ stream: UInt32) {
+    HTTP2FrameHeader(length: length, type: type, flags: flags, streamID: stream).write(into: &out)
 }
 
 /// A valid pointer for an empty header block or value.

@@ -31,6 +31,7 @@
 // a client can only ask the question that can be answered exactly.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 import Vega
 import VegaFS

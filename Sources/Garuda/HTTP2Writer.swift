@@ -20,7 +20,7 @@
 //
 //   - control frames first, in the order the reader made them;
 //   - a newly answered stream's head: the `onSend` hooks, then `:status`
-//     and the response headers, as `HTTP1Connection.writeResponse` writes
+//     and the response headers, as `HTTP1Client.writeResponse` writes
 //     them -- date, server and content-length added, the headers that frame
 //     an HTTP/1 message or manage its connection dropped -- as HEADERS and
 //     as many CONTINUATIONs as the peer's frame size needs;
@@ -36,6 +36,8 @@
 // write side is closed.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
 import GarudaWire
 import Vega
 import VegaIO
@@ -197,7 +199,7 @@ extension H2Connection {
         while true {
             var stop = false
             var role = false
-            var frameSize = H2FrameHeader.defaultMaxFrameSize
+            var frameSize = HTTP2FrameHeader.defaultMaxFrameSize
             lock.withLock { _ in
                 stop = stopping
                 if writing {
@@ -483,7 +485,7 @@ extension H2Connection {
         var first = true
         repeat {
             let n = min(frameSize, total - offset)
-            var flags: H2Flags = offset + n >= total ? .endHeaders : []
+            var flags: HTTP2Flags = offset + n >= total ? .endHeaders : []
             if first && endStream { flags.insert(.endStream) }
             frame(&out, n, first ? .headers : .continuation, flags, id)
             if n > 0 { out.write(block.pointer(at: origin + offset), n) }
@@ -594,7 +596,7 @@ extension H2Connection {
     func ended(_ s: H2Stream, into out: inout ByteBuffer) {
         if s.short {
             frame(&out, 4, .rstStream, [], s.id)
-            HTTP2.writeUInt32(H2Error.internalError.rawValue, into: &out)
+            HTTP2.writeUInt32(HTTP2ErrorCode.internalError.rawValue, into: &out)
             return
         }
         guard let code = s.resetAfter else { return }

@@ -39,7 +39,9 @@
 // checks the routing, capsules and closing against aioquic.
 //===----------------------------------------------------------------------===//
 
-import VegaQUIC
+import VegaWire
+@_spi(Garuda) import VegaHTTP3Core
+@_spi(Garuda) import VegaQUICCore
 import GarudaWire
 import Synchronization
 import Vega
@@ -324,7 +326,7 @@ extension H3Connection {
         // Holding a bounded number of streams covers reordering; past that
         // the peer is told to give up on them rather than left waiting.
         if orphans.count >= wtMaxOrphanStreams {
-            refuse(id, code: HTTP3Error.webTransportBufferedStreamRejected)
+            refuse(id, code: HTTP3ErrorCode.webTransportBufferedStreamRejected.rawValue)
             return
         }
         orphans[id] = (sessionID, bidirectional, UInt64(prefix))
@@ -428,7 +430,7 @@ extension H3Connection {
             }
             st.opened = true
             if st.session.torn {
-                quic.resetStream(id, code: HTTP3Error.webTransportSessionGone)
+                quic.resetStream(id, code: HTTP3ErrorCode.webTransportSessionGone.rawValue)
                 quic.releaseStream(id)
                 st.retired = true
                 continue
@@ -488,7 +490,7 @@ extension H3Connection {
     }
 
     /// Reads the capsules on a live session's CONNECT stream.
-    func readSession(_ s: H3Stream, _ stream: QUICStream) {
+    func readSession(_ s: H3Stream, _ stream: QUICStreamState) {
         // Until the session's 200 has been posted, what the client sends
         // waits on the stream, held back by its window.
         guard let session = s.liveSession, !session.torn else { return }
@@ -505,13 +507,13 @@ extension H3Connection {
             let base = UnsafePointer(stream.receive.ready.readPointer)
             var r = QUICReader(base, available)
             guard let type = r.varint(), let length = r.varintAsInt() else {
-                if available >= 16 { return abort(s, code: HTTP3Error.messageError) }
+                if available >= 16 { return abort(s, code: HTTP3ErrorCode.messageError.rawValue) }
                 break
             }
             let header = r.offset
             if type == HTTP3Capsule.closeWebTransportSession {
                 // A 32-bit application code and a UTF-8 reason, read whole.
-                if length < 4 || length > 4 &+ wtMaxCloseReason { return abort(s, code: HTTP3Error.messageError) }
+                if length < 4 || length > 4 &+ wtMaxCloseReason { return abort(s, code: HTTP3ErrorCode.messageError.rawValue) }
                 if r.remaining < length { break }
                 let p = base + header
                 let code = UInt32(p[0]) << 24 | UInt32(p[1]) << 16 | UInt32(p[2]) << 8 | UInt32(p[3])
@@ -569,9 +571,9 @@ extension H3Connection {
         for st in owned where st.opened && !st.retired {
             st.retired = true
             wtStreams[st.id] = nil
-            if !st.sendDone { quic.resetStream(st.id, code: HTTP3Error.webTransportSessionGone) }
+            if !st.sendDone { quic.resetStream(st.id, code: HTTP3ErrorCode.webTransportSessionGone.rawValue) }
             if let stream = quic.stream(st.id), !stream.receive.finished, !(st.local && !st.bidirectional) {
-                quic.stopSending(st.id, code: HTTP3Error.webTransportSessionGone)
+                quic.stopSending(st.id, code: HTTP3ErrorCode.webTransportSessionGone.rawValue)
                 stream.receive.ready.clear()
             }
             quic.releaseStream(st.id)
@@ -583,7 +585,7 @@ extension H3Connection {
         for (id, orphan) in orphans where orphan.session == session.sessionID { named.append(id) }
         for id in named {
             orphans[id] = nil
-            refuse(id, code: HTTP3Error.webTransportSessionGone)
+            refuse(id, code: HTTP3ErrorCode.webTransportSessionGone.rawValue)
         }
     }
 

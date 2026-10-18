@@ -29,6 +29,7 @@
 // `Cache-Status: garuda; hit` to say where it came from.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import CGarudaShared
 import GarudaWire
 import VegaCrypto

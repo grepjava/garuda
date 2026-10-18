@@ -397,7 +397,7 @@ struct StreamingResponseTests {
             throw Broke()
         }
         let response = try app.test.http2().get("/broke")
-        #expect(response.reset == H2Error.internalError.rawValue)
+        #expect(response.reset == HTTP2ErrorCode.internalError.rawValue)
         #expect(!response.ended)
     }
 

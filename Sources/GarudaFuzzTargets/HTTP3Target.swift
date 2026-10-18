@@ -25,8 +25,10 @@
 // HTTP/3; each input gets a connection of its own.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaHTTP3Core
+@_spi(Garuda) import VegaQUICCore
 @_spi(Testing) import Garuda
-import VegaQUIC
 import GarudaWire
 import QUICTestPeer
 import Vega
@@ -83,7 +85,7 @@ private final class H3FuzzClient {
             guard left > .zero else { return false }
             var buffer = IOBuffer(capacity: 2048)
             do {
-                _ = try await Runtime.withIODeadline(left) { () async throws(IOError) -> Int in
+                _ = try await Runtime.withIOTimeout(for: left) { () async throws(IOError) -> Int in
                     try await socket.pointee.receive(into: &buffer)
                 }
             } catch {

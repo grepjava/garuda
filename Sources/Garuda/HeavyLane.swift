@@ -94,11 +94,11 @@ final class RouteCosts: @unchecked Sendable {
     /// `stamp` is the job it started in. Off a Vega worker nothing can be
     /// told, and nothing is noted. One run that suspends is enough for good.
     @inline(__always)
-    func noteRun(_ index: Int, startedIn stamp: JobStamp) {
-        guard stamp != .none else { return }
+    func noteRun(_ index: Int, startedIn stamp: PollStamp?) {
+        guard let stamp else { return }
         let n = quiet[index].load(ordering: .relaxed)
         if n == RouteCosts.suspends { return }
-        if Runtime.currentJobStamp != stamp {
+        if Runtime.currentPollStamp != stamp {
             quiet[index].store(RouteCosts.suspends, ordering: .relaxed)
         } else if n < RouteCosts.steadyRuns {
             quiet[index].store(n &+ 1, ordering: .relaxed)

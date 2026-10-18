@@ -25,6 +25,8 @@
 // the stream.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaWebSocketCore
 import CVegaCompress
 import GarudaWire
 import Synchronization
@@ -34,12 +36,12 @@ import VegaIO
 final class WebSocketSession: @unchecked Sendable {
     let limits: WebSocketLimits
     let channel: BodyChannel
-    let deflate: WSDeflateAgreement?
+    let deflate: WebSocketDeflateAgreement?
     /// Where a close sent from outside the reader is flushed from.
     let runtime: Runtime?
     /// Ends the reader's wait for the socket: a close nobody answered, or a
     /// server going away.
-    let wake = IODeadlineTrigger()
+    let wake = IOTimeoutTrigger()
 
     // The inbound side, under `lock`.
     private let lock = Mutex<Void>(())
@@ -54,7 +56,7 @@ final class WebSocketSession: @unchecked Sendable {
     private var ended = false
     /// The connection has ended: nothing more can be sent.
     private var gone = false
-    private var closeCode: UInt16 = WSCloseCode.abnormal
+    private var closeCode: UInt16 = WebSocketCloseCode.abnormal
     private var closeReason: [UInt8] = []
     /// A violation behind messages the handler has not read: acted on once
     /// they have been.
@@ -84,7 +86,7 @@ final class WebSocketSession: @unchecked Sendable {
     /// When the reader learnt the close was sent, for giving up on its reply.
     private let closeSentAt = Atomic<UInt64>(0)
 
-    init(limits: WebSocketLimits, channel: BodyChannel, deflate: WSDeflateAgreement?, runtime: Runtime?) {
+    init(limits: WebSocketLimits, channel: BodyChannel, deflate: WebSocketDeflateAgreement?, runtime: Runtime?) {
         self.limits = limits
         self.channel = channel
         self.deflate = deflate
@@ -200,12 +202,12 @@ final class WebSocketSession: @unchecked Sendable {
     // MARK: Sending
 
     /// Frames one message onto the channel, compressed if that was agreed.
-    func send(_ opcode: WSOpcode, _ bytes: UnsafeBufferPointer<UInt8>) -> BodyChannel.Queued {
+    func send(_ opcode: WebSocketOpcode, _ bytes: UnsafeBufferPointer<UInt8>) -> BodyChannel.Queued {
         if isGone { return .refused }
         return sendLock.withLock { _ -> BodyChannel.Queued in
             guard !closeSent else { return .refused }
             frame.clear()
-            if let deflate, bytes.count >= WSDeflate.minimumMessage, let base = bytes.baseAddress,
+            if let deflate, bytes.count >= WebSocketDeflate.minimumMessage, let base = bytes.baseAddress,
                let compressed = compress(deflate, base, bytes.count) {
                 WebSocketCodec.writeFrame(&frame, opcode: opcode, fin: true, rsv1: true,
                                           payload: compressed.base, length: compressed.count)
@@ -227,7 +229,7 @@ final class WebSocketSession: @unchecked Sendable {
 
     /// A control frame the reader answers with: a pong, unless a close has
     /// gone out.
-    private func sendControl(_ opcode: WSOpcode, _ payload: UnsafePointer<UInt8>?, _ count: Int) {
+    private func sendControl(_ opcode: WebSocketOpcode, _ payload: UnsafePointer<UInt8>?, _ count: Int) {
         sendLock.withLock { _ in
             guard !closeSent else { return }
             frame.clear()
@@ -272,10 +274,10 @@ final class WebSocketSession: @unchecked Sendable {
     /// `n` bytes compressed with a sync flush, without the empty block that
     /// ends it, which the receiver puts back. Nil to send them as they are.
     /// Under `sendLock`.
-    private func compress(_ agreement: WSDeflateAgreement, _ p: UnsafePointer<UInt8>, _ n: Int)
+    private func compress(_ agreement: WebSocketDeflateAgreement, _ p: UnsafePointer<UInt8>, _ n: Int)
         -> (base: UnsafePointer<UInt8>, count: Int)? {
         if deflater == nil {
-            deflater = cv_ws_deflate_new(agreement.deflateWindowBits, WSDeflate.memoryLevel)
+            deflater = cv_ws_deflate_new(agreement.deflateWindowBits, WebSocketDeflate.memoryLevel)
         }
         guard let z = deflater else { return nil }
         // Behind the frame's own header, which goes first in `frame`; the
@@ -349,7 +351,7 @@ final class WebSocketSession: @unchecked Sendable {
             }
             let wait = nextWait()
             do {
-                let n = try await Runtime.withIODeadline(wait, trigger: wake) { () async throws(IOError) -> Int in
+                let n = try await Runtime.withIOTimeout(for: wait, trigger: wake) { () async throws(IOError) -> Int in
                     try await reader.read(into: &input)
                 }
                 if n == 0 { break reading }
@@ -463,7 +465,7 @@ final class WebSocketSession: @unchecked Sendable {
                 case .needMore:
                     return
                 case .failure(let error):
-                    fail(error == .messageTooBig ? WSCloseCode.messageTooBig : WSCloseCode.protocolError)
+                    fail(error == .messageTooBig ? WebSocketCloseCode.messageTooBig : WebSocketCloseCode.protocolError)
                     over()
                     return
                 case .header(let header):
@@ -472,7 +474,7 @@ final class WebSocketSession: @unchecked Sendable {
                     // to have an intermediary read the payload as something
                     // else.
                     guard header.masked else {
-                        fail(WSCloseCode.protocolError)
+                        fail(WebSocketCloseCode.protocolError)
                         over()
                         return
                     }
@@ -492,7 +494,7 @@ final class WebSocketSession: @unchecked Sendable {
     }
 
     /// Ping, pong and close. False once the WebSocket is over.
-    private func control(_ header: WSFrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    private func control(_ header: WebSocketFrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         let n = header.payloadLength
         // At most 125 bytes, which the header parser has checked.
         return withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 125) { scratch in
@@ -507,22 +509,22 @@ final class WebSocketSession: @unchecked Sendable {
                 return true
             case .close:
                 if n == 1 {
-                    fail(WSCloseCode.protocolError)
+                    fail(WebSocketCloseCode.protocolError)
                     return false
                 }
-                var code = WSCloseCode.noStatus
+                var code = WebSocketCloseCode.noStatus
                 var reason: [UInt8] = []
                 if n >= 2 {
                     code = UInt16(p[0]) << 8 | UInt16(p[1])
                     // A close with a code no endpoint may send, or a reason
                     // that is not UTF-8, is itself a protocol error.
                     guard WebSocketCodec.isSendableCloseCode(code) else {
-                        fail(WSCloseCode.protocolError)
+                        fail(WebSocketCloseCode.protocolError)
                         return false
                     }
                     var check = UTF8Validator()
                     if n > 2 && (!check.feed(UnsafePointer(p + 2), n - 2) || !check.isComplete) {
-                        fail(WSCloseCode.invalidPayload)
+                        fail(WebSocketCloseCode.invalidPayload)
                         return false
                     }
                     reason = Array(UnsafeBufferPointer(start: UnsafePointer(p + 2), count: n - 2))
@@ -530,7 +532,7 @@ final class WebSocketSession: @unchecked Sendable {
                 peerClosed(code: code, reason: reason)
                 // Answered with the same code, which ends the handshake; a
                 // close of ours that went first has had its answer now.
-                sendClose(code: code == WSCloseCode.noStatus ? WSCloseCode.normal : code, reason: [],
+                sendClose(code: code == WebSocketCloseCode.noStatus ? WebSocketCloseCode.normal : code, reason: [],
                           byReader: true)
                 return false
             default:
@@ -541,13 +543,13 @@ final class WebSocketSession: @unchecked Sendable {
 
     /// One data frame onto the message being assembled; the message onto
     /// the queue once it is whole. False once the WebSocket is over.
-    private func data(_ header: WSFrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
+    private func data(_ header: WebSocketFrameHeader, _ payload: UnsafePointer<UInt8>) -> Bool {
         let n = header.payloadLength
         if header.opcode == .continuation {
-            guard assembling else { return failed(WSCloseCode.protocolError) }
+            guard assembling else { return failed(WebSocketCloseCode.protocolError) }
         } else {
             // A new message while one is still in progress.
-            guard !assembling else { return failed(WSCloseCode.protocolError) }
+            guard !assembling else { return failed(WebSocketCloseCode.protocolError) }
             assembling = true
             messageText = header.opcode == .text
             messageCompressed = header.rsv1
@@ -556,7 +558,7 @@ final class WebSocketSession: @unchecked Sendable {
         }
         // For a compressed message this bounds the compressed bytes; what
         // they inflate to is held to the same limit as they inflate.
-        if message.readableBytes + n > limits.maxMessage { return failed(WSCloseCode.messageTooBig) }
+        if message.readableBytes + n > limits.maxMessage { return failed(WebSocketCloseCode.messageTooBig) }
         if n > 0 {
             message.reserve(n)
             WebSocketCodec.unmask(message.writePointer, payload, n, header.mask)
@@ -564,7 +566,7 @@ final class WebSocketSession: @unchecked Sendable {
             // that makes it invalid. Compressed bytes are checked inflated.
             if messageText && !messageCompressed
                 && !validator.feed(UnsafePointer(message.writePointer), n) {
-                return failed(WSCloseCode.invalidPayload)
+                return failed(WebSocketCloseCode.invalidPayload)
             }
             message.advanceWriter(n)
         }
@@ -579,12 +581,12 @@ final class WebSocketSession: @unchecked Sendable {
                 var check = UTF8Validator()
                 let count = inflated.readableBytes
                 if count > 0 && (!check.feed(UnsafePointer(inflated.readPointer), count) || !check.isComplete) {
-                    return failed(WSCloseCode.invalidPayload)
+                    return failed(WebSocketCloseCode.invalidPayload)
                 }
             }
             enqueue(inflated)
         } else {
-            if messageText && !validator.isComplete { return failed(WSCloseCode.invalidPayload) }
+            if messageText && !validator.isComplete { return failed(WebSocketCloseCode.invalidPayload) }
             enqueue(message)
         }
         message.clear()
@@ -610,9 +612,9 @@ final class WebSocketSession: @unchecked Sendable {
     /// kilobytes of zeros can claim gigabytes -- 1007 when it is not deflate
     /// at all, 1011 when there is no memory for zlib.
     private func inflate(into out: inout ByteBuffer) -> UInt16 {
-        guard let agreement = deflate else { return WSCloseCode.protocolError }
+        guard let agreement = deflate else { return WebSocketCloseCode.protocolError }
         if inflater == nil { inflater = cv_ws_inflate_new(agreement.inflateWindowBits) }
-        guard let z = inflater else { return WSCloseCode.internalError }
+        guard let z = inflater else { return WebSocketCloseCode.internalError }
         let limit = limits.maxMessage
         // The sender strips the empty block that ends a sync flush.
         let tail: [UInt8] = [0x00, 0x00, 0xFF, 0xFF]
@@ -621,7 +623,7 @@ final class WebSocketSession: @unchecked Sendable {
         var remaining = message.readableBytes
         var ended = false
         while true {
-            if out.readableBytes > limit { return WSCloseCode.messageTooBig }
+            if out.readableBytes > limit { return WebSocketCloseCode.messageTooBig }
             out.reserve(min(max(remaining * 4, 4096), 1 << 20))
             let room = min(out.writableBytes, limit + 1 - out.readableBytes)
             var consumed = 0
@@ -630,8 +632,8 @@ final class WebSocketSession: @unchecked Sendable {
             input += consumed
             remaining -= consumed
             out.advanceWriter(produced)
-            if rc < 0 { return WSCloseCode.invalidPayload }
-            if out.readableBytes > limit { return WSCloseCode.messageTooBig }
+            if rc < 0 { return WebSocketCloseCode.invalidPayload }
+            if out.readableBytes > limit { return WebSocketCloseCode.messageTooBig }
             if rc == 2 {
                 // The client ended its deflate stream; what follows is at
                 // most the tail put back above.
@@ -639,10 +641,10 @@ final class WebSocketSession: @unchecked Sendable {
                 break
             }
             if remaining == 0 && rc == 0 { break }
-            if consumed == 0 && produced == 0 && rc == 0 { return WSCloseCode.invalidPayload }
+            if consumed == 0 && produced == 0 && rc == 0 { return WebSocketCloseCode.invalidPayload }
         }
         if ended || agreement.clientNoContextTakeover {
-            if cv_ws_inflate_reset(z) != 0 { return WSCloseCode.internalError }
+            if cv_ws_inflate_reset(z) != 0 { return WebSocketCloseCode.internalError }
         }
         return 0
     }
@@ -726,12 +728,12 @@ final class WebSocketSession: @unchecked Sendable {
             w?.resume()
             return
         }
-        sendClose(code: failed ? WSCloseCode.internalError : WSCloseCode.normal, reason: [])
+        sendClose(code: failed ? WebSocketCloseCode.internalError : WebSocketCloseCode.normal, reason: [])
     }
 
     /// The server is going away: 1001, then the usual wait for the reply.
     func goAway() {
-        sendClose(code: WSCloseCode.goingAway, reason: [])
+        sendClose(code: WebSocketCloseCode.goingAway, reason: [])
     }
 
     /// The reader and the handler are done: what is queued goes, and then

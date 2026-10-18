@@ -14,6 +14,7 @@
 // so nothing moves underneath it, whichever thread it resumes on.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 
 /// What one request and its answer are made of, reused for each request on a

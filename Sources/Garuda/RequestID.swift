@@ -31,6 +31,7 @@
 // ignored, as the specification asks.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
 import GarudaWire
 
 enum RequestID {

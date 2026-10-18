@@ -15,6 +15,8 @@
 // a request once its final answer has been decided.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
 import GarudaWire
 import Vega
 import VegaIO
@@ -53,7 +55,7 @@ extension Response {
             HTTPResponseWriter.endHead(&parts.pointee.output)
             let output = parts.pointee.output
             do {
-                try await Runtime.withIODeadline(limits.writeTimeout) { () async throws(IOError) -> Void in
+                try await Runtime.withIOTimeout(for: limits.writeTimeout) { () async throws(IOError) -> Void in
                     try await held.write(UnsafeRawBufferPointer(start: output.readPointer,
                                                                 count: output.readableBytes))
                 }

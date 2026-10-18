@@ -3,7 +3,7 @@
 // request going there.
 //
 // A frame loop of its own rather than the server's. The framing primitives are
-// shared -- H2FrameHeader, the flags, the settings, the preface, HPACK -- but
+// shared -- HTTP2FrameHeader, the flags, the settings, the preface, HPACK -- but
 // half of the server's connection is server state: a concurrency limit imposed
 // on a peer, the highest identifier a peer opened, the reset budget that
 // answers CVE-2023-44487. A client opens and cancels its own streams.
@@ -42,6 +42,8 @@
 // lock could reach the wire after a larger one and be illegal on arrival.
 //===----------------------------------------------------------------------===//
 
+import VegaWire
+@_spi(Garuda) import VegaHTTP2Core
 import GarudaWire
 import Synchronization
 import Vega
@@ -118,15 +120,15 @@ final class H2Shared: @unchecked Sendable {
     // Under the lock.
 
     /// What the peer imposed, in its SETTINGS.
-    var peerMaxFrameSize = H2FrameHeader.defaultMaxFrameSize
-    var peerInitialWindowSize = H2FrameHeader.defaultInitialWindowSize
+    var peerMaxFrameSize = HTTP2FrameHeader.defaultMaxFrameSize
+    var peerInitialWindowSize = HTTP2FrameHeader.defaultInitialWindowSize
     var peerMaxConcurrentStreams = Int.max
     /// What we advertised.
-    let maxFrameSize = H2FrameHeader.defaultMaxFrameSize
-    let initialWindowSize = H2FrameHeader.defaultInitialWindowSize
+    let maxFrameSize = HTTP2FrameHeader.defaultMaxFrameSize
+    let initialWindowSize = HTTP2FrameHeader.defaultInitialWindowSize
     /// Connection-level flow control, separate from every stream's.
-    var sendWindow = H2FrameHeader.defaultInitialWindowSize
-    var recvWindow = H2FrameHeader.defaultInitialWindowSize
+    var sendWindow = HTTP2FrameHeader.defaultInitialWindowSize
+    var recvWindow = HTTP2FrameHeader.defaultInitialWindowSize
     /// Client streams are odd, RFC 9113 section 5.1.1.
     var nextStreamID: UInt32 = 1
     var streams: [UInt32: ClientH2Stream] = [:]
@@ -175,13 +177,13 @@ final class H2Shared: @unchecked Sendable {
     }
 
     /// Queues a reply for whoever next holds the write lock. Under the lock.
-    func queueControl(_ type: H2FrameType, flags: H2Flags = [], stream: UInt32,
+    func queueControl(_ type: HTTP2FrameType, flags: HTTP2Flags = [], stream: UInt32,
                       length: Int, _ payload: (inout ByteBuffer) -> Void) {
-        H2FrameHeader(length: length, type: type, flags: flags, streamID: stream).write(into: &control)
+        HTTP2FrameHeader(length: length, type: type, flags: flags, streamID: stream).write(into: &control)
         payload(&control)
     }
 
-    func queueReset(_ id: UInt32, _ code: H2Error) {
+    func queueReset(_ id: UInt32, _ code: HTTP2ErrorCode) {
         queueControl(.rstStream, stream: id, length: 4) { HTTP2.writeUInt32(code.rawValue, into: &$0) }
     }
 
@@ -219,7 +221,7 @@ final class H2Shared: @unchecked Sendable {
             if !pending.isEmpty {
                 // Its own deadline: the replies are nobody's request's.
                 do {
-                    try await Runtime.withIODeadline(.seconds(10)) { () async throws(IOError) in
+                    try await Runtime.withIOTimeout(for: .seconds(10)) { () async throws(IOError) in
                         try await pending.withUnsafeBytesAsync { (bytes) async throws(IOError) in try await writer.write(bytes) }
                     }
                 } catch {
@@ -264,7 +266,7 @@ final class H2Shared: @unchecked Sendable {
                     lock.withLock { _ in
                         queueControl(.goaway, stream: 0, length: 8) { out in
                             HTTP2.writeUInt32(0, into: &out)
-                            HTTP2.writeUInt32(H2Error.protocolError.rawValue, into: &out)
+                            HTTP2.writeUInt32(HTTP2ErrorCode.protocolError.rawValue, into: &out)
                         }
                     }
                     flushControl()
@@ -279,7 +281,7 @@ final class H2Shared: @unchecked Sendable {
                 let n: Int
                 if idle {
                     // Nobody is waiting on it: kept for the pool's idle time.
-                    n = try await Runtime.withIODeadline(ClientConnections.shared.idleTime) { () async throws(IOError) -> Int in
+                    n = try await Runtime.withIOTimeout(for: ClientConnections.shared.idleTime) { () async throws(IOError) -> Int in
                         try await reader.read(into: &input)
                     }
                 } else {
@@ -310,11 +312,11 @@ final class H2Shared: @unchecked Sendable {
         var failure: ClientError? = nil
         var woken: [ClientH2Stream] = []
         input.withUnsafeBytes { raw in
-            guard raw.count >= H2FrameHeader.size else { return }
+            guard raw.count >= HTTP2FrameHeader.size else { return }
             let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
             lock.withLock { _ in
-                while raw.count - at >= H2FrameHeader.size {
-                    let header = H2FrameHeader.parse(base + at)
+                while raw.count - at >= HTTP2FrameHeader.size {
+                    let header = HTTP2FrameHeader.parse(base + at)
                     // Bounded before a byte of the payload is waited for. A
                     // length beyond what we advertised is a frame we never
                     // agreed to take.
@@ -322,12 +324,12 @@ final class H2Shared: @unchecked Sendable {
                         failure = .protocolError
                         return
                     }
-                    guard raw.count - at >= H2FrameHeader.size + header.length else { return }
-                    if let error = dispatch(header, base + at + H2FrameHeader.size, &woken) {
+                    guard raw.count - at >= HTTP2FrameHeader.size + header.length else { return }
+                    if let error = dispatch(header, base + at + HTTP2FrameHeader.size, &woken) {
                         failure = error
                         return
                     }
-                    at += H2FrameHeader.size + header.length
+                    at += HTTP2FrameHeader.size + header.length
                 }
             }
         }
@@ -338,15 +340,15 @@ final class H2Shared: @unchecked Sendable {
 
     /// Handles one frame, under the lock. Returns an error only for what ends
     /// the connection; a stream's troubles are recorded on the stream.
-    private func dispatch(_ header: H2FrameHeader, _ payload: UnsafePointer<UInt8>,
+    private func dispatch(_ header: HTTP2FrameHeader, _ payload: UnsafePointer<UInt8>,
                           _ woken: inout [ClientH2Stream]) -> ClientError? {
         // A header block may not be interleaved with anything, and a peer
         // that does it has left a block of unknown provenance half assembled.
-        if expectingContinuation && header.type != H2FrameType.continuation.rawValue {
+        if expectingContinuation && header.type != HTTP2FrameType.continuation.rawValue {
             return .protocolError
         }
 
-        switch H2FrameType(rawValue: header.type) {
+        switch HTTP2FrameType(rawValue: header.type) {
         case .settings:
             if header.streamID != 0 || header.length % 6 != 0 { return .protocolError }
             if header.flags.contains(.ack) { return nil }
@@ -354,19 +356,19 @@ final class H2Shared: @unchecked Sendable {
             while at < header.length {
                 let id = UInt16(payload[at]) << 8 | UInt16(payload[at + 1])
                 let value = HTTP2.readUInt32(payload + at + 2)
-                switch H2Setting(rawValue: id) {
+                switch HTTP2Setting(rawValue: id) {
                 case .maxFrameSize:
                     guard value >= 16384 && value <= 16_777_215 else { return .protocolError }
                     peerMaxFrameSize = Int(value)
                 case .initialWindowSize:
-                    guard value <= UInt32(H2FrameHeader.maxWindowSize) else { return .protocolError }
+                    guard value <= UInt32(HTTP2FrameHeader.maxWindowSize) else { return .protocolError }
                     // Applies to every open stream, by the difference, and may
                     // leave a window negative: RFC 9113 section 6.9.2.
                     let delta = Int(value) - peerInitialWindowSize
                     peerInitialWindowSize = Int(value)
                     for stream in streams.values {
                         stream.sendWindow += delta
-                        if stream.sendWindow > H2FrameHeader.maxWindowSize { return .protocolError }
+                        if stream.sendWindow > HTTP2FrameHeader.maxWindowSize { return .protocolError }
                     }
                 case .maxConcurrentStreams:
                     peerMaxConcurrentStreams = Int(value)
@@ -387,14 +389,14 @@ final class H2Shared: @unchecked Sendable {
             if header.streamID == 0 {
                 if increment == 0 { return .protocolError }
                 sendWindow += increment
-                if sendWindow > H2FrameHeader.maxWindowSize { return .protocolError }
+                if sendWindow > HTTP2FrameHeader.maxWindowSize { return .protocolError }
                 woken.append(contentsOf: streams.values)
             } else if let stream = streams[header.streamID] {
                 if increment == 0 {
                     failStream(stream, .protocolError, reset: .protocolError, &woken)
                 } else {
                     stream.sendWindow += increment
-                    if stream.sendWindow > H2FrameHeader.maxWindowSize {
+                    if stream.sendWindow > HTTP2FrameHeader.maxWindowSize {
                         failStream(stream, .protocolError, reset: .flowControlError, &woken)
                     }
                     woken.append(stream)
@@ -416,7 +418,7 @@ final class H2Shared: @unchecked Sendable {
             // at, which is what makes them safe to send again elsewhere.
             for stream in streams.values where stream.id > lastStream {
                 stream.closedByPeer = true
-                stream.error = .streamReset(code == 0 ? H2Error.refusedStream.rawValue : code)
+                stream.error = .streamReset(code == 0 ? HTTP2ErrorCode.refusedStream.rawValue : code)
                 woken.append(stream)
             }
 
@@ -431,7 +433,7 @@ final class H2Shared: @unchecked Sendable {
         case .headers, .continuation:
             var start = 0
             var end = header.length
-            if header.type == H2FrameType.headers.rawValue {
+            if header.type == HTTP2FrameType.headers.rawValue {
                 if header.streamID == 0 || header.streamID % 2 == 0 { return .protocolError }
                 if header.flags.contains(.padded) {
                     guard header.length >= 1 else { return .protocolError }
@@ -585,7 +587,7 @@ final class H2Shared: @unchecked Sendable {
     }
 
     /// Ends one stream, telling the peer why, without touching the others.
-    private func failStream(_ stream: ClientH2Stream, _ error: ClientError, reset code: H2Error,
+    private func failStream(_ stream: ClientH2Stream, _ error: ClientError, reset code: HTTP2ErrorCode,
                             _ woken: inout [ClientH2Stream]) {
         stream.error = error
         queueReset(stream.id, code)
@@ -810,14 +812,14 @@ extension HTTPClient {
         let shared = H2Shared(key: key, reader: reader, writer: writer)
         var out = ByteBuffer(capacity: 128)
         HTTP2.preface.withUnsafeBufferPointer { out.write($0.baseAddress!, $0.count) }
-        let entries: [(H2Setting, UInt32)] = [
-            (.maxFrameSize, UInt32(H2FrameHeader.defaultMaxFrameSize)),
-            (.initialWindowSize, UInt32(H2FrameHeader.defaultInitialWindowSize)),
+        let entries: [(HTTP2Setting, UInt32)] = [
+            (.maxFrameSize, UInt32(HTTP2FrameHeader.defaultMaxFrameSize)),
+            (.initialWindowSize, UInt32(HTTP2FrameHeader.defaultInitialWindowSize)),
             // Nothing here answers a promise, and saying so up front keeps a
             // server from reserving streams this client would only reset.
             (.enablePush, 0),
         ]
-        H2FrameHeader(length: entries.count * 6, type: .settings, flags: [], streamID: 0).write(into: &out)
+        HTTP2FrameHeader(length: entries.count * 6, type: .settings, flags: [], streamID: 0).write(into: &out)
         for (setting, value) in entries {
             out.writeByte(UInt8(truncatingIfNeeded: setting.rawValue >> 8))
             out.writeByte(UInt8(truncatingIfNeeded: setting.rawValue))
@@ -1003,10 +1005,10 @@ extension HTTPClient {
             var first = true
             repeat {
                 let n = min(limit, block.count - at)
-                var flags: H2Flags = []
+                var flags: HTTP2Flags = []
                 if at + n == block.count { flags.insert(.endHeaders) }
                 if first && endStream { flags.insert(.endStream) }
-                H2FrameHeader(length: n, type: first ? .headers : .continuation, flags: flags,
+                HTTP2FrameHeader(length: n, type: first ? .headers : .continuation, flags: flags,
                               streamID: stream.id).write(into: &out)
                 block.withUnsafeBufferPointer { out.write($0.baseAddress! + at, n) }
                 at += n
@@ -1017,7 +1019,7 @@ extension HTTPClient {
         guard let frames else {
             let dead = shared.lock.withLock { _ in shared.dead }
             await shared.unlockWriting()
-            throw dead ?? .streamReset(H2Error.refusedStream.rawValue)
+            throw dead ?? .streamReset(HTTP2ErrorCode.refusedStream.rawValue)
         }
         do {
             try await shared.writeLocked(self, frames)
@@ -1054,7 +1056,7 @@ extension HTTPClient {
                 let last = sent + n == body.count
                 var out = ByteBuffer(capacity: n + 16)
                 defer { out.destroy() }
-                H2FrameHeader(length: n, type: .data, flags: last ? .endStream : [], streamID: stream.id)
+                HTTP2FrameHeader(length: n, type: .data, flags: last ? .endStream : [], streamID: stream.id)
                     .write(into: &out)
                 body.withUnsafeBufferPointer { out.write($0.baseAddress! + sent, n) }
                 return Array(UnsafeBufferPointer(start: out.readPointer, count: out.readableBytes))
@@ -1071,7 +1073,7 @@ extension HTTPClient {
                 throw error
             }
             await shared.unlockWriting()
-            sent += frame.count - H2FrameHeader.size
+            sent += frame.count - HTTP2FrameHeader.size
         }
     }
 

@@ -10,7 +10,7 @@
 // connection's keys first.
 //===----------------------------------------------------------------------===//
 
-import VegaQUIC
+@_spi(Garuda) import VegaQUICCore
 import GarudaWire
 import QUICTestPeer
 import VegaCrypto
@@ -24,27 +24,27 @@ enum QUICFixture {
         return try! CertificateKey(chainPEM: identity.certificateChain, keyPEM: identity.privateKey)
     }()
 
-    nonisolated(unsafe) static let config = QUICServerConfig(certKey: certificate, alpn: [Array("h3".utf8)])
+    nonisolated(unsafe) static let config = QUICServerConfiguration(certificateKey: certificate, applicationProtocols: ["h3"])
 
     /// A certificate with enough names that the server's first flight is
     /// more than three times a client's Initial, so the limit on what it may
     /// send before the address is validated is reached, not merely obeyed.
-    nonisolated(unsafe) static let largeConfig: QUICServerConfig = {
+    nonisolated(unsafe) static let largeConfig: QUICServerConfiguration = {
         let names = ["localhost"] + (0..<160).map { "name-\($0).localhost.example" }
         let identity = try! TLSIdentity.selfSigned(names: names)
         let key = try! CertificateKey(chainPEM: identity.certificateChain, keyPEM: identity.privateKey)
-        return QUICServerConfig(certKey: key, alpn: [Array("h3".utf8)])
+        return QUICServerConfiguration(certificateKey: key, applicationProtocols: ["h3"])
     }()
 
     static let nowMs: UInt64 = 1_000
 
-    static func deliver(_ datagram: [UInt8], to server: QUICConnection, nowMs: UInt64 = nowMs) {
+    static func deliver(_ datagram: [UInt8], to server: QUICConnectionState, nowMs: UInt64 = nowMs) {
         var datagram = datagram
         datagram.withUnsafeMutableBufferPointer { server.receive($0.baseAddress!, $0.count, ecn: 0, nowMs: nowMs) }
     }
 
     /// Everything the server has to send, as the listener would drain it.
-    static func drain(_ server: QUICConnection, nowMs: UInt64 = nowMs) -> [[UInt8]] {
+    static func drain(_ server: QUICConnectionState, nowMs: UInt64 = nowMs) -> [[UInt8]] {
         var out: [[UInt8]] = []
         var buffer = [UInt8](repeating: 0, count: 1500)
         // Bounded: a connection that never stops producing is a finding of
@@ -59,17 +59,17 @@ enum QUICFixture {
 
     /// A server for the client's first Initial, made as the listener makes
     /// one: from the IDs in the header.
-    static func server(for first: [UInt8], config: QUICServerConfig = config) -> QUICConnection? {
+    static func server(for first: [UInt8], config: QUICServerConfiguration = config) -> QUICConnectionState? {
         let header = first.withUnsafeBufferPointer {
             QUICPacket.parseHeader($0.baseAddress!, $0.count, localCIDLength: quicLocalCIDLength)
         }
         guard header.isValid, header.type == .initial else { return nil }
-        return QUICConnection(config: config, version: header.version, clientDCID: header.dcid,
+        return QUICConnectionState(config: config, version: header.version, clientDCID: header.dcid,
                               clientSCID: header.scid, localCID: QUICConnectionID.random(), nowMs: nowMs)
     }
 
     /// A connection through its handshake, both ends.
-    static func connected() throws -> (client: QUICTestPeer, server: QUICConnection) {
+    static func connected() throws -> (client: QUICTestPeer, server: QUICConnectionState) {
         let client = try QUICTestPeer()
         let hello = client.clientHello(serverName: "localhost", alpn: ["h3"])
         let first = try client.packet(.initial, cryptoFrame(offset: 0, hello))
@@ -97,7 +97,7 @@ extension Fuzz {
     /// garbage has let the input corrupt its own state.
     static func quicFrames(_ base: UnsafePointer<UInt8>, _ n: Int) -> String? {
         let client: QUICTestPeer
-        let server: QUICConnection
+        let server: QUICConnectionState
         do {
             (client, server) = try QUICFixture.connected()
         } catch {
