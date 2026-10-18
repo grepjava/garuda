@@ -75,7 +75,17 @@ nothing relevant.
 
 ## 2.0.1 — unreleased
 
-Nothing yet.
+- The the-benchmarker `web-frameworks` entry,
+  `benchmarks/web-frameworks/swift/garuda`, is brought to 2.0, as posted on
+  their update pull request: `app.run(arguments:)` without `exit`, an argv
+  with the program name first, and no `--workers`. The count it took from
+  `sysconf` was the host's, and inside the suite's cpuset eight pinned shards
+  on two CPUs put p99 at 9 ms against 0.5 ms self-sized, for no throughput.
+- `DEPLOYMENT.md` describes that entry, its three-route contract and how the
+  suite builds and runs it, and its container section, `CONFIG.md` and
+  `COMPATIBILITY.md` say to take a shard count from the affinity mask, never
+  from the host's CPU count. The doc comment on `run(arguments:)` says the
+  array is an argv.
 
 ---
 

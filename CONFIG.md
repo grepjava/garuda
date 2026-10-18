@@ -76,7 +76,11 @@ has how this works.
   the process.
 - `--workers N` is accepted as Garuda 1's name for `--shards N --threads 1`: N
   single-threaded shards, the shape Garuda 1's N processes had. A `--threads`
-  given as well wins.
+  given as well wins. Take N from the CPUs the process may run on, not from
+  the host: in a container confined to a cpuset, `sysconf(_SC_NPROCESSORS_ONLN)`
+  and `nproc --all` still count the host, and shards beyond the allowed CPUs
+  are laid over them round-robin and pinned, several to a CPU. `nproc` reads
+  the affinity mask; `auto` needs no count at all.
 
 **`--balance`.** How the shards share the listening port:
 

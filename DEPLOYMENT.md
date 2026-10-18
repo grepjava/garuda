@@ -67,6 +67,15 @@ garuda --shards 1 --threads 4        # a pod limited to four CPUs
 The environment variable `VEGA_SHARDS` overrides `--shards`, which is handy
 where the command line is fixed.
 
+A count the application works out for itself has the opposite blind spot:
+`sysconf(_SC_NPROCESSORS_ONLN)`, `nproc --all` and `/proc/cpuinfo` give the
+host's CPUs, not the cpuset's. Passed as `--shards N` or `--workers N`, the
+shards beyond the allowed CPUs are laid over them round-robin and pinned,
+several to a CPU. Under a two-CPU cpuset, `--workers 8` put eight
+single-threaded shards on two CPUs: p99 at 64 connections went from 0.5 ms to
+9 ms, with no more requests a second. Count with `nproc`, which reads the
+affinity mask, or leave the count to `auto`.
+
 ---
 
 ## Signals
@@ -251,3 +260,38 @@ garuda --host 127.0.0.1 --port 8000 --forwarded-allow-ips 127.0.0.1
   `request.log` lines.
 
 [CONFIG.md](CONFIG.md#observability) has the formats and the metric names.
+
+---
+
+## The web-frameworks entry
+
+Garuda is listed in
+[the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks),
+whose results are the [Web Frameworks Benchmark](https://web-frameworks-benchmark.vercel.app/).
+The entry is `swift/garuda` there, and
+[benchmarks/web-frameworks/swift/garuda](benchmarks/web-frameworks/swift/garuda)
+here is the same three files, kept in step: a `Package.swift` pinning the
+published tag, a `config.yaml` naming the version and the reviewer, and one
+`main.swift`.
+
+- **The contract** is three routes: `GET /` answers an empty 200,
+  `GET /user/:id` echoes the id as the body, and `POST /user` answers an empty
+  200. Their RSpec suite checks them in CI; their CI builds the image and
+  checks the routes but does not benchmark.
+- **How it runs.** Their `swift/Dockerfile` builds with
+  `swift build -c release -Xswiftc -enforce-exclusivity=unchecked` on the
+  `swift:6.3` image and starts the binary as the container's first process
+  with no arguments and `SERVER_HOSTNAME` and `SERVER_PORT` in the
+  environment, on the host's network. When the harness is given `SERVER_CPUS`
+  the container is confined to that cpuset and the load, `zrk --closed` over
+  keep-alive connections at 64, 256 and 512, runs on the other CPUs.
+- **What the entry does.** It hands `app.run(arguments:)` an argv of its own,
+  program name first, with `--host`, `--port` and `--log-level error`, and
+  nothing else: no `--workers`, so Garuda sizes its shards from the cpuset
+  (above). Its command line is otherwise ignored.
+- **Renovate bumps the pin** at every Garuda tag, so a release that changes
+  `run(arguments:)` or the command line breaks the entry at the next bump and
+  the maintainer @-mentions the reviewer on the update pull request. 2.0 did
+  that twice: `run` returning `Never` and the array becoming an argv. A
+  change to either must come with a new `main.swift` here and in a pull
+  request there.
