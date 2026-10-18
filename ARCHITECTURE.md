@@ -51,10 +51,10 @@ flowchart BT
         VegaRedis
         VegaSQLite
     end
-    Wire[GarudaWire] --> VegaWire & VegaHTTP3
-    VegaQUIC --> VegaWire & VegaCrypto
+    Wire[GarudaWire] --> VegaWire & VegaHTTP2Core & VegaHTTP3Core & VegaWebSocketCore
+    VegaQUICCore --> VegaWire & VegaCrypto
     Garuda --> Wire
-    Garuda --> VegaQUIC
+    Garuda --> VegaQUICCore
     Garuda --> CGarudaShared
     Garuda --> Vega & VegaIO & VegaTLS & VegaCrypto & VegaFS
     GP[GarudaPostgres] --> Garuda
@@ -145,7 +145,7 @@ it:
 
 What has to be the server's rather than one shard's lives in memory the
 supervisor maps before the first shard starts, the same bytes in every shard
-and kept across shard restarts (Vega's `ShardOptions.sharedRegions`). Only
+and kept across shard restarts (Vega's `ShardConfiguration.sharedRegions`). Only
 atomics and offsets live there, never pointers, since each process maps it at
 its own address. No lock is ever held across processes: a shard that crashed
 holding one would hold it for ever.
@@ -251,7 +251,7 @@ writes it itself when nobody else is writing and the windows take it whole.
 **HTTP/3** (`HTTP3.swift`, `HTTP3Connection.swift`). Each shard binds one UDP
 socket per thread with `SO_REUSEPORT`, so the kernel spreads clients across
 them. Each socket has one **endpoint** task that owns everything QUIC for it:
-the connection-ID table, every `QUICConnection` (from Vega's `VegaQUIC`, which does
+the connection-ID table, every `QUICConnectionState` (from Vega's `VegaQUICCore`, which does
 no I/O of its own) and the HTTP/3 state on top. Nothing there is locked. Its
 loop receives a batch of datagrams, waiting no longer than the earliest QUIC
 timer; feeds each to its connection; runs due timers; takes the answers

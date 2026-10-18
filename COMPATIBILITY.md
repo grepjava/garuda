@@ -37,7 +37,7 @@ resolves to 2.0.
 
 | | Garuda 1 | Garuda 2 |
 |---|---|---|
-| Engine | aviancore 0.7 (`CAvian`, `AvianCore`, `AvianHTTP`, `AvianQUIC`) | Vega 0.4 and vega-db 0.2 |
+| Engine | aviancore 0.7 (`CAvian`, `AvianCore`, `AvianHTTP`, `AvianQUIC`) | Vega and vega-db: 1.0 and 0.3 from 2.1.0 |
 | Platforms | Linux; macOS 15 | Linux; macOS 26.4 (Vega's floor); Windows experimental, one process only |
 | TLS library | vendored BoringSSL for TLS, plus the system's `libcrypto` for JWT, ACME and QUIC | one library for everything, chosen by trait: `BoringSSL` (default, vendored) or `OpenSSL` (the system's OpenSSL 3) |
 | System packages | OpenSSL and zlib development files | zlib development files only, by default |
@@ -341,7 +341,7 @@ with an outside ACME client, answer its HTTP-01 challenges with
 - **Metrics.** The per-route series (`garuda_route_*`),
   `garuda_connection_slots`, and the hand-off and deferred-accept counters
   are gone.
-- **HTTP/3** runs on Vega's QUIC (`VegaQUIC`), one UDP socket per
+- **HTTP/3** runs on Vega's QUIC (`VegaQUICCore`), one UDP socket per
   thread, Garuda 1's QUIC ported and using the same TLS library as the rest.
   A client that changes address must pass path validation before the server
   follows it.

@@ -746,7 +746,7 @@ These work without any handler code, set by flags:
 
 - **HTTP/1.1** with a parser strict where it prevents request smuggling,
   **HTTP/2** over TLS and cleartext, and **HTTP/3** over QUIC (`--http3`).
-  QUIC and QPACK are Swift, from Vega (`VegaQUIC`, `VegaHTTP3`), over
+  QUIC and QPACK are Swift, from Vega (`VegaQUICCore`, `VegaHTTP3Core`), over
   the same TLS library as the rest.
 - **TLS** through Vega's `VegaTLS`, on BoringSSL by default or the system's
   OpenSSL 3, with several certificates chosen by SNI on both TCP and QUIC, and

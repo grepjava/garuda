@@ -348,7 +348,7 @@ take this now": a scope's `concurrencyLimit` reached, and the health check
 while the server drains. A slow route is not that.
 
 The routes inside `app.deadline(limit) { … }` run under Vega's I/O deadline
-(`Runtime.withIODeadline`). A socket, pipe or database wait still pending when
+(`Runtime.withIOTimeout(for:)`). A socket, pipe or database wait still pending when
 the time is up gives up with `IOError.timedOut`, and so does any that would
 start after it. If that reaches the deadline unanswered, the request is
 answered 504. A deadline bounds I/O waits, not computing: nothing preempts a
@@ -548,7 +548,8 @@ in [Examples/](Examples/README.md).
   API does not need them.
 - **`Sources/GarudaWire`** is the HTTP/1.1 protocol as a state machine over
   bytes. HPACK, QPACK, the frames and QUIC are Vega's (`VegaWire`,
-  `VegaHTTP3`, `VegaQUIC`). None of them touches a socket.
+  `VegaHTTP2Core`, `VegaHTTP3Core`, `VegaWebSocketCore`, `VegaQUICCore`).
+  None of them touches a socket.
 - **`Sources/garuda-server`** serves the-benchmarker's contract and the
   workloads through the public API, so the benchmark measures what
   applications use.

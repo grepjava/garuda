@@ -9,7 +9,7 @@ experimental and serves from a single process.
 | --- | --- |
 | HTTP/1.1, HTTP/1.0 | cleartext and TLS |
 | HTTP/2 | `h2` over TLS via ALPN, `h2c` with prior knowledge |
-| HTTP/3 | with `--http3`, over Vega's QUIC (`VegaQUIC`) |
+| HTTP/3 | with `--http3`, over Vega's QUIC (`VegaQUICCore`) |
 | WebTransport | over HTTP/3, through `app.webTransport` routes |
 | WebSocket | HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220), through `app.webSocket` routes |
 
@@ -319,7 +319,7 @@ stream or the connection ends.
 
 ## HTTP/3 and QUIC
 
-QUIC is Vega's, in Swift (`VegaQUIC`; Garuda 1's, moved to Vega in 0.5.0). It does no I/O: the
+QUIC is Vega's, in Swift (`VegaQUICCore`; Garuda 1's, moved to Vega in 0.5.0). It does no I/O: the
 endpoint hands it datagrams and asks it for datagrams. Cryptographic
 primitives (hashes, HKDF, AEAD, key exchange, signatures) come from Vega's
 `VegaCrypto`, on the same TLS library as TCP.

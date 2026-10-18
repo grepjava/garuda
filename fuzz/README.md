@@ -25,7 +25,7 @@ mutation fuzzer in this package. The targets live in
 | `postgres` | PostgreSQL backend messages: framing, every message body, column values, arrays and COPY rows |
 
 The connection targets run in process with no I/O except `h3`'s socket:
-`quic-frames` and `tls-hello` drive Vega's `VegaQUIC` against the tests' own client
+`quic-frames` and `tls-hello` drive Vega's `VegaQUICCore` against the tests' own client
 (`Tests/QUICTestPeer`), `h2` serves an `Application` over GarudaTesting's
 in-memory duplex, and `h3` serves one on 127.0.0.1 for the whole run. They
 take milliseconds an input where the parsers take microseconds. For `h3`, the
