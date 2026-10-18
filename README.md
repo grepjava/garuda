@@ -4,56 +4,89 @@
 
 # Garuda
 
-Garuda is a Swift web framework and the HTTP server underneath it. It is my attempt to create a spiritual successor to [Kitura](https://github.com/Kitura/Kitura): a server written in Swift, with its own HTTP engine, for the protocols and the application features a production service needs today.
-
-The application API is modelled after [axum](https://github.com/tokio-rs/axum). Routes, typed extractors, and the set of features a production framework is expected to offer follow axum's shape. [Garuda and axum](#garuda-and-axum) compares the two area by area. The HTTP engine is Garuda's own.
-
-The same route in each. axum names the parameter in braces; Garuda uses a colon. Both take it as a typed `Path` and answer JSON.
-
-```rust
-// axum
-async fn person(Path(id): Path<i32>) -> Json<Person> {
-    Json(Person { id, name: "Ada".into() })
-}
-
-let app = Router::new().route("/person/{id}", get(person));
-```
+Garuda is a web framework for Swift with its own HTTP engine. A handler is an
+async closure that asks for what it needs and returns what it means, in the
+shape of [axum](https://github.com/tokio-rs/axum). Underneath are HTTP/1.1,
+HTTP/2 and HTTP/3, TLS, and the middleware, databases and operations a
+production service needs. No Foundation, no SwiftNIO.
 
 ```swift
-// Garuda
-app.get("/person/:id") { (id: Path<Int>) async in
-    JSON(Person(id: id.value, name: "Ada"))
+import Garuda
+import GarudaPostgres
+
+struct Order: Codable { let id: Int; let name: String }
+
+let app = Application()
+
+app.state { _ in PostgresPool(PostgresConfiguration(host: "db", user: "shop", password: "secret")) }
+
+app.get("/orders/:id") { (id: Path<Int>, db: State<PostgresPool>) async throws in
+    guard let order = try await db.value.first(Order.self, "select id, name from orders where id = $1", id.value) else {
+        throw HTTPError(.notFound, "no order \(id.value)")
+    }
+    return JSON(order)
 }
+
+app.run()
 ```
 
-This is Garuda 2. It runs on [Vega](https://github.com/grepjava/vega), a
-work-stealing runtime for Swift in the shape of Tokio and an alternative to
-SwiftNIO ([how they compare](https://github.com/grepjava/vega#vega-swiftnio-and-tokio)): an idle thread takes a
-waiting task from a busy one, at any `await`. Every handler is async, and a
-handler that does not suspend runs inline in the task that read its request,
-with no hop onto another executor and nothing allocated. The engine parses
-HTTP/1.1, HTTP/2 and HTTP/3 itself, the last on Garuda's own QUIC.
-
-A supervisor starts **shards**. A shard is a process with its own Vega runtime
-over several threads, so work is stolen between the threads of a shard and
-never between shards. That boundary matters more in Swift than in Rust: a
-force-unwrapped `nil` ends the process, where Tokio catches a panic inside the
-task that raised it. Here a crash takes only that shard's connections, and the
-supervisor starts the shard again. [Shards are processes](#shards-are-processes)
-has the rest, and [ARCHITECTURE.md](ARCHITECTURE.md) the design.
-
-Swift 6.2 or newer. No Foundation, no SwiftNIO.
-
-This project is an independent effort. It is not an IBM product, and it is not a continuation maintained by the Kitura project.
+The handler takes the path parameter and the connection pool as typed
+extractors, awaits the query, and answers JSON. The thrown `HTTPError` is the
+response: a 404 with `{"error":"no order 7"}`. A value that will not decode,
+a missing parameter, a rule a body breaks -- each is answered before the
+handler runs. `app.run()` reads the command line and serves.
 
 <p align="center">
   <a href="https://github.com/grepjava/garuda/blob/main/LICENSE"><img src="https://img.shields.io/github/license/grepjava/garuda" alt="MIT license"></a>
 </p>
 
-**Garuda 2.1.0 is released** (2026-10-19, on Vega 1.0; [RELEASE.md](RELEASE.md)
-has what changed). Garuda 1 (1.1) stays on the `release/1.x` branch.
-[COMPATIBILITY.md](COMPATIBILITY.md) is the guide to moving from Garuda 1 to
-Garuda 2, and [Status](#status) below lists what Garuda 2 does not have yet.
+## Quick start
+
+```swift
+// Package.swift
+platforms: [.macOS("26.4")],
+dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "2.1.0")],
+targets: [.executableTarget(name: "app", dependencies: [.product(name: "Garuda", package: "garuda")])]
+```
+
+```swift
+// Sources/app/main.swift
+import Garuda
+
+let app = Application()
+app.get("/hello/:name") { (name: Path<String>) async in "Hello, \(name.value)" }
+app.run()
+```
+
+```bash
+swift build -c release
+.build/release/app --port 8000
+curl http://127.0.0.1:8000/hello/Ada
+```
+
+The snippet at the top is the same with `GarudaPostgres` added to the
+dependencies and a PostgreSQL to point it at.
+
+Swift 6.2 or newer, on Linux or macOS 26.4 or newer. Every flag `app.run()`
+reads is in [CONFIG.md](CONFIG.md), and [INSTALLATION.md](INSTALLATION.md)
+has the system packages, the TLS library choice and certificates. The
+databases, resumable uploads and the test client are products of their own:
+`GarudaPostgres`, `GarudaRedis`, `GarudaSQLite`, `GarudaUploads` and
+`GarudaTesting`.
+
+[Examples/](Examples/README.md) has eight complete applications to run and
+copy from: a todo API, sign-in, streaming, chat, WebTransport, a file
+service, per-user uploads, and a starter.
+
+**How it runs.** Handlers run on [Vega](https://github.com/grepjava/vega), a
+work-stealing runtime for Swift in the shape of Tokio: an idle thread takes
+waiting work from a busy one at any `await`, and a handler that never
+suspends runs inline in the task that read its request, with nothing
+allocated. On Linux a supervisor runs the application as several **shard**
+processes, each a runtime over a few threads, so a crash takes only that
+shard's connections and the shard is started again. [Shards are
+processes](#shards-are-processes) says what that means for state, and
+[ARCHITECTURE.md](ARCHITECTURE.md) has the design.
 
 ## Features
 
@@ -81,60 +114,8 @@ Garuda 2, and [Status](#status) below lists what Garuda 2 does not have yet.
 | Process model | A supervisor starts shard processes, each a work-stealing runtime over several threads. In-memory state is per shard |
 | Platforms | Linux, and macOS 26.4 or newer, on Swift 6.2 or newer. Windows is experimental, and serves in one process only |
 
-Not in Garuda 2: a built-in ACME client, QUIC 0-RTT and session resumption,
-kernel TLS, `multipart/byteranges`, and reads from Redis replicas.
-[What Garuda 2 does not have](COMPATIBILITY.md#what-garuda-2-does-not-have)
-lists what Garuda 1 had.
-
-[BENCHMARKS.md](BENCHMARKS.md) has the benchmark method and
-[Garuda 2 against Garuda 1 and axum](BENCHMARKS.md#garuda-2-against-garuda-1-and-axum),
-measured on the same clock-capped machine, with links to the code each server
-runs.
-
-## Quick start
-
-```bash
-swift build -c release
-.build/release/garuda --port 8000
-curl -i http://127.0.0.1:8000/user/42
-```
-
-The `garuda` binary serves a small benchmark application. Your own application
-depends on the `Garuda` library:
-
-```swift
-// Package.swift
-platforms: [.macOS("26.4")],
-dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "2.0.0")],
-targets: [.executableTarget(name: "app", dependencies: [.product(name: "Garuda", package: "garuda")])]
-```
-
-```swift
-// Sources/app/main.swift
-import Garuda
-
-struct Person: Codable { let id: Int; let name: String }
-
-let app = Application()
-app.get("/person/:id") { (id: Path<Int>) async in
-    JSON(Person(id: id.value, name: "Ada"))
-}
-app.run()
-```
-
-`app.run()` reads the same command-line flags as the `garuda` binary, and does
-not return. Swift 6.2 or newer, on Linux or macOS 26.4 -- 6.2 because a
-borrowed body is a `Span`, macOS 26.4 because Vega's executor needs that
-release's runtime. [INSTALLATION.md](INSTALLATION.md) lists the system
-packages, the TLS library traits and certificates.
-
-The databases, resumable uploads and the test client are products of their
-own: `GarudaPostgres`, `GarudaRedis`, `GarudaSQLite`, `GarudaUploads` and
-`GarudaTesting`.
-
-[Examples/](Examples/README.md) has eight complete applications to run and
-copy from, all on Garuda 2: a todo API, sign-in, streaming, chat,
-WebTransport, a file service, per-user uploads, and a starter.
+[BENCHMARKS.md](BENCHMARKS.md) measures Garuda against Garuda 1 and axum on
+one clock-capped machine, with links to the code each server runs.
 
 ## Writing handlers
 
@@ -175,33 +156,18 @@ struct NewOrder: Decodable, Validated {
 }
 ```
 
-Every broken rule is answered at once, as 422 with the fields named: `{"error":"quantity must be at least 1","fields":[{"field":"quantity","message":"must be at least 1"}]}`. A decoding failure fills `fields` the same way, from the path it already reports, so one answer tells a form where each message goes whichever of the two refused the request.
+Every broken rule is answered at once, as 422 with the fields named, and a
+decoding failure fills the same `fields` list, so a form learns where each
+message goes from one answer.
 
 Handler closures are `@Sendable`: the threads of a shard run them at once, so
 what they capture must be safe to share.
 
-JSON goes through Garuda's own coder over `Encodable` and `Decodable`, which
-reads only the keys a type asks for, straight from the request bytes. `@JSON`
-takes a type off `Codable` altogether:
-
-```swift
-import GarudaJSON
-
-@JSON struct Order: Codable {
-    let id: Int
-    let name: String
-    let tags: [String]
-}
-```
-
-Nothing at the call site changes -- the same `Body<Order>`, the same
-`JSON(order)` -- and the type keeps `Codable` for everything else.
-`@PostgresRow`, from `GarudaSQL`, does the same for a database row: a
-property is read from the column of its own name. The macro writes the
-reading and the writing out longhand, and the bytes are the same ones Codable
-sent; on the JSON workload it takes about a fifth off the time a request
-takes. It lives in its own module because it is the only part of Garuda that
-needs swift-syntax.
+JSON goes through Garuda's own coder over `Encodable` and `Decodable`,
+straight from the request bytes. When a type is hot, `@JSON` from
+`GarudaJSON` writes its coding out longhand and takes about a fifth off a
+JSON request, with nothing at the call site changing; `@PostgresRow` does
+the same for a database row.
 
 ### The raw layer
 
@@ -286,86 +252,38 @@ app.group("/api") {
 }
 ```
 
-- `app.state` builds a value once in each shard, before it accepts a
-  connection, and every thread of the shard shares it, so it is `Sendable`.
-  One value per type; registering a type twice is refused. `onShardStart` and
-  `onShardStop` run hooks as a shard starts and stops.
-- `app.problems()` is what the routes cannot do, found before serving: a
-  handler taking more `Path` extractors than its pattern has parameters, or
-  asking for a `State<T>` nothing registered. `run()` logs them and exits 2
-  instead of starting, and a test can assert `app.problems().isEmpty`.
-- `app.use` wraps every route in its scope, whether it is called before or
-  after the routes. It calls `next()` to run the rest of the chain, or answers
-  without calling it; after `next()` it can change the status and headers, or
-  catch what the handler threw. `response.onSend` sees and changes the final
-  response, whoever answered.
-- `request[context: Key.self]` carries values from middleware to the handler,
-  which reads them with `Context<Key>`.
-- `app.cors` sets the scope's CORS policy. It answers preflights, including to
-  paths routed only for other methods, and runs ahead of the scope's
-  middleware, so a preflight never meets authentication and a 401 still
-  reaches the page.
-- `app.authenticate(bearer:)` and `app.authenticate(basic:)` read the
-  Authorization header and keep who it belongs to in the context, or answer
-  401 with the challenge. With `state:`, the check is handed what `app.state`
-  built, such as the database sessions live in. `BearerToken` and
-  `BasicCredentials` are the same as extractors, and `constantTimeEquals`
-  compares secrets.
-- `app.authorize(CurrentUser.self, .admin)` requires a named rule of every
-  route in the scope, once `authenticate` has said whose request it is. A
-  `Policy` is `(Value) -> Bool` with a name, combined with `and`, `or` and
-  `about`, and callable in a test without a request. A rule that does not hold
-  is 403 saying what would have been enough; nobody under the key is 401.
-  `authorize(jwt:)` reads the claims a scope verified, and
-  `Policy.scope("orders:write")` an OAuth 2.0 scope in them. Both
-  `authenticate` and `authorize` add what they can answer, and the security
-  scheme, to every route of the scope in the OpenAPI document.
-- `JWT<Claims>` takes a verified JSON Web Token (HS, RS, PS, ES or EdDSA),
-  keys from PEM, JWK or a secret, with `exp`, `nbf`, `iss` and `aud` checked;
-  `keys.sign(claims)` issues one and `keys.publicJWKS` publishes the key set.
-  `JWKSVerifier` checks tokens from an identity provider against its JWK Set.
-  `TokenIssuer` pairs short-lived access tokens with refresh tokens that rotate
-  on every use and revoke their whole chain when a spent one is reused.
-- `Passwords.hash` and `Passwords.verify` use PBKDF2-HMAC-SHA256 on Vega's
-  blocking pool. `Tokens.random()` makes a session token and `Tokens.digest`
-  what to store in its place.
-- `request.log.info("order placed", ["order": "\(id)"])` writes to the
-  application log with the request's method, path, request ID and trace
-  context on the line. `AppLog` is the same log outside a request.
-  `--log-format json` makes every line one JSON object.
-- `app.onResponse { done in … }` sees every request once it is answered: the
-  matched route's pattern, status, duration, request ID and trace, and why a
-  route failed. This is what per-route metrics or error reporting hang from.
-- `app.maxBodySize(64 << 20) { … }` gives a scope's routes a body limit of
-  their own in place of `--max-body`, applied before the body is read.
-  `app.concurrencyLimit(8) { … }` lets that many of a scope's handlers run at
-  once in each shard, and answers the next 503.
-- `request.cookie("theme")` and `response.setCookie(Cookie("theme", "dark"))`
-  read and set cookies. A cookie is `Path=/`, `HttpOnly` and `SameSite=Lax`
-  unless it says otherwise, and `Secure` over HTTPS. With a `CookieKey`, a
-  cookie is signed (HMAC-SHA256) or encrypted (AES-256-GCM), and one that was
-  tampered with reads as absent. The key takes previous secrets for rotation.
-- `app.sessions(store: …)` gives a scope's routes a `Session`: a map of strings
-  kept in memory, Redis or SQLite, found by a random ID in a cookie.
-  `try await session.set("user", id)` writes it to the store before it returns.
-  `session.renew()` moves it to a new ID at login, and `session.destroy()`
-  deletes it and its cookie. A `MemorySessionStore` belongs to one shard.
-- `app.csrfProtection()` refuses, with 403, a POST, PUT, PATCH or DELETE that
-  the browser says another site's page started, from Sec-Fetch-Site or else
-  Origin against Host. It needs no tokens in forms. `trustedOrigins` lets a
-  front end on another origin through.
-- `app.securityHeaders()` puts nosniff, frame, referrer and cross-origin
-  policies on every answer in its scope, and Strict-Transport-Security on
-  those over HTTPS. A Content-Security-Policy is one field away, and a header a
-  route sets itself is kept.
-- `app.trailingSlash(.redirect)` answers `/users/` with a 308 to `/users` when
-  only that is routed, and `.ignore` serves it from `/users` directly. Routes
-  match exactly by default.
-- `app.requestDecompression()` decodes a gzip, deflate, br or zstd request body
-  before the handler reads it, held to the route's body limit as it inflates.
-- `app.allowedHosts(["example.com", "*.example.com"])` answers 400 to a request
-  for any other Host, and `app.addressFilter(allow: ["10.0.0.0/8"])` answers
-  403 to a client address outside the list or on a `deny` list.
+- **`app.state`** builds a value once in each shard, before it serves, and
+  every thread of the shard shares it, so it is `Sendable`. A handler takes
+  it as `State<T>`.
+- **`app.use`** wraps every route in its scope, wherever the call is. It calls
+  `try await next()` to run the rest of the chain, or answers without it, and
+  after `next()` it can still change the status and headers or catch what
+  the handler threw.
+- **`request[context: Key.self]`** carries values from middleware to the
+  handler, which reads them as `Context<Key>`.
+- **Who is asking:** `app.authenticate(bearer:)` and `(basic:)` keep who a
+  request belongs to in the context or answer 401; `app.authorize` requires a
+  named `Policy` of every route in the scope and says in its 403 which rule
+  failed; `JWT<Claims>` verifies tokens (HS, RS, PS, ES, EdDSA) and
+  `JWKSVerifier` checks them against an identity provider's key set;
+  `TokenIssuer` pairs access tokens with rotating refresh tokens;
+  `Passwords` hashes with PBKDF2 off the serving threads.
+- **Browser safety:** `app.cors` answers preflights ahead of everything else;
+  `app.csrfProtection` refuses cross-site writes with no tokens in forms;
+  `app.securityHeaders` sets nosniff, frame, referrer and cross-origin
+  policies; cookies are `HttpOnly` and `SameSite=Lax` unless told otherwise,
+  and signed or encrypted with a `CookieKey`; `app.sessions` keeps a session
+  in memory, Redis or SQLite.
+- **Limits and shape:** `app.deadline`, `app.maxBodySize` and
+  `app.concurrencyLimit` on a scope; `app.trailingSlash`,
+  `app.requestDecompression`, `app.allowedHosts` and `app.addressFilter`.
+- **Seeing what happened:** `request.log.info("order placed", ["order": "\(id)"])`
+  writes a line carrying the request's method, path, ID and trace, and
+  `app.onResponse` sees every answered request with its route, status and
+  duration, which per-route metrics and error reporting hang from.
+- **`app.problems()`** lists what the routes cannot do -- a `State<T>` nothing
+  registered, more `Path`s than the pattern has parameters -- and `run()`
+  refuses to start with any, so a test can assert the list is empty.
 
 [MIDDLEWARE.md](MIDDLEWARE.md) has every piece in detail, and how to write
 your own.
@@ -448,17 +366,11 @@ with `Garuda`, and joins it to Garuda's `UUID`, `Timestamp` and JSON coder. A
 pool is made in `app.state`, so each shard has its own: a pool of 8
 connections is 8 per shard.
 
-**PostgreSQL** (`GarudaPostgres`) supports SCRAM-SHA-256, TLS (required by
-default) and a pool with an acquire timeout. Rows decode into `Decodable`
-types by column name. `db.transaction { tx in … }` commits or rolls back.
-Statements stay prepared on each connection, and values are read in binary.
-`UUID`, `Timestamp`, `PostgresDate`, `PostgresTime`, `PostgresInterval`,
-`PostgresNumeric` (exact, kept as its digits) and `PostgresJSON<T>` come
-without Foundation. An array column is a Swift list, and a list binds as one.
-`app.listen` hears `NOTIFY` in each shard, on a connection of its own,
-reconnecting with its channels when the server restarts. `copyIn` and
-`copyOut` are `COPY` in both directions, and `pool.migrate` brings a schema up
-to date.
+**PostgreSQL** (`GarudaPostgres`) is the pool in the snippet at the top:
+SCRAM-SHA-256, TLS by default, rows decoded into `Decodable` types by column
+name, `db.transaction { tx in … }`, statements kept prepared, `LISTEN` and
+`NOTIFY`, `COPY` both ways, and `pool.migrate`. Dates, times, intervals,
+numerics and JSON columns come as types of their own, without Foundation.
 
 **Redis** (`GarudaRedis`):
 
@@ -472,14 +384,9 @@ app.get("/visits/:page") { (page: Path<String>, redis: State<RedisPool>) async t
 }
 ```
 
-RESP3 through HELLO, and RESP2 for servers older than Redis 6; Valkey works
-the same. TLS is required by default, and ACL users, databases and unix
-sockets are supported. Commands come with typed replies, and `send` takes any
-other. `pipeline` and `transaction` go in one round trip, `session` holds one
-connection for WATCH, and `subscribe` listens to channels and patterns on a
-connection of its own. `RedisCluster` is the same API across a cluster,
-following `MOVED` and `ASK`, and `RedisSentinelPool` finds the master through
-a set of sentinels. Garuda's session and refresh-token stores work on either.
+RESP3 and RESP2, Valkey too, TLS by default, typed replies with `send` for
+any other command, pipelines, transactions, pub/sub, and the same API over a
+cluster (`RedisCluster`) or through sentinels (`RedisSentinelPool`).
 
 **SQLite** (`GarudaSQLite`):
 
@@ -540,23 +447,12 @@ app.webTransport("/room/:id") { (session: WebTransportSession, id: Path<Int>) as
 }
 ```
 
-A streamed body is chunked on HTTP/1.1 and DATA frames on HTTP/2 and HTTP/3.
-A write waits while more than 512 KiB is queued (`writeHighWaterMark`), and a
-throw part-way resets the stream rather than ending it cleanly. A WebSocket
-handler sees whole messages: the engine joins fragments, checks UTF-8, answers
-pings, sends keepalive pings, runs the close handshake and, with
-`--ws-compress`, permessage-deflate. Messages the handler has not read wait in
-a bounded queue, and past it the socket is not read, so a fast sender is
-slowed. A send on a socket whose connection has ended throws
-`WebSocketError.closed`, so a room holding sockets learns who has gone rather
-than writing to them. The same route serves WebSockets over HTTP/1.1, HTTP/2
-and HTTP/3; on the last two, flow control slows just that stream. WebTransport
-runs over HTTP/3 on the same port and routes, with bidirectional and
-unidirectional streams, datagrams and close codes.
-
-A `Topic`'s messages cross shards through a ring in shared memory
-(`--broadcast-size`), which also keeps recent messages for `Last-Event-ID`.
-`response.sendInterim` sends 1xx responses such as 103 Early Hints.
+A write waits while the client is behind, and a throw part-way resets the
+stream. A WebSocket handler sees whole messages, with fragments, pings, the
+close handshake and permessage-deflate handled by the engine, over HTTP/1.1,
+HTTP/2 and HTTP/3 alike. A `Topic` reaches subscribers on every shard and
+replays what a reconnecting client missed. `response.sendInterim` sends 1xx
+responses such as 103 Early Hints.
 
 A route's request body is collected whole before the handler runs, held to
 `--max-body` or the scope's `maxBodySize`, unless the route reads it as it
@@ -573,16 +469,10 @@ app.onStreamingBody(.put, "/uploads/:name", maxBodySize: 10 << 30) { request, re
 }
 ```
 
-This works over HTTP/1.1, HTTP/2 and HTTP/3. Reading is what lets more in: the
-HTTP/2 or HTTP/3 window is given back as the handler reads, so a slow disk
-slows its own upload and nothing else. `body.read(maxBytes:)` and
-`body.readAll(maxBytes:)` hand over `[UInt8]`; `bytesRead`, `expectedLength`
-and `cancel()` are there too. A body that passes `maxBodySize` throws
-`RequestBodyError.tooLarge`, answered 413. A request that ends before its body
-did hands over every byte that arrived and then throws `.incomplete`, answered
-400; a reset HTTP/2 or HTTP/3 stream ends a streaming handler this way rather
-than cancelling it. [HANDLER-API.md](HANDLER-API.md#request-bodies-read-as-they-arrive)
-has the details.
+Reading is what lets more in, so a slow disk slows its own upload and nothing
+else. A body past `maxBodySize` is a 413, and one cut short a 400.
+[HANDLER-API.md](HANDLER-API.md#request-bodies-read-as-they-arrive) has the
+details.
 
 ### Resumable uploads
 
@@ -614,14 +504,6 @@ request that creates an upload, such as whose it is, for the completion
 handler to read as `upload.metadata`. A client's `Repr-Digest` is checked
 before the handler runs, and `await upload.digest()` gives the SHA-256.
 
-A client that comes back while its old request is still appending supersedes
-it: on the same shard the old request is ended and what it received kept; on
-another shard the new request waits a moment, then is answered 409 with
-`Retry-After`. Over HTTP/1.1, ending the old request closes its connection,
-and bytes it had read from the socket but not yet stored are dropped. The
-client resumes from the offset that was stored, so nothing is lost but those
-bytes' transfer.
-
 The [files and uploads examples](Examples/README.md) are whole applications
 built on it.
 
@@ -631,10 +513,9 @@ built on it.
 import GarudaTesting
 import Testing
 
-@Test func personIsFound() throws {
-    let response = try app.test.get("/person/1")
-    #expect(response.status == .ok)
-    #expect(try response.json(Person.self).name == "Ada")
+@Test func missingOrderIs404() throws {
+    let response = try app.test.get("/orders/7")
+    #expect(response.status == .notFound)
 }
 ```
 
@@ -644,9 +525,23 @@ response path. `app.test.http2()` does the same over HTTP/2.
 
 ## Garuda and axum
 
-The application API is modelled after [axum](https://github.com/tokio-rs/axum).
-axum is a mature, widely used framework, so this is where Garuda stands against
-it, area by area.
+The application API is modelled after axum, so this is where Garuda stands
+against it, area by area. The same route in each:
+
+```rust
+// axum
+async fn person(Path(id): Path<i32>) -> Json<Person> {
+    Json(Person { id, name: "Ada".into() })
+}
+let app = Router::new().route("/person/{id}", get(person));
+```
+
+```swift
+// Garuda
+app.get("/person/:id") { (id: Path<Int>) async in
+    JSON(Person(id: id.value, name: "Ada"))
+}
+```
 
 | Area | axum (Tokio) | Garuda |
 |---|---|---|
@@ -841,11 +736,14 @@ checks, and how to run them under AddressSanitizer.
 
 ## Status
 
-Garuda 2.1.0 is the current release. Garuda 1 stays on `release/1.x`; an
-application not ready to move pins `from: "1.1.0"`. From 2.0 on, Garuda
-follows semantic versioning, and
-[COMPATIBILITY.md](COMPATIBILITY.md#versions-from-20-on) says what that
-covers.
+Garuda 2.1.0 is the current release (2026-10-19; [RELEASE.md](RELEASE.md)
+has what changed). Garuda 1 stays on `release/1.x`; an application not ready
+to move pins `from: "1.1.0"`, and [COMPATIBILITY.md](COMPATIBILITY.md) is the
+guide to moving. From 2.0 on, Garuda follows semantic versioning.
+
+Garuda started as a spiritual successor to
+[Kitura](https://github.com/Kitura/Kitura). It is an independent project: not
+an IBM product, and not a continuation maintained by the Kitura project.
 
 ### Not supported yet
 
@@ -860,6 +758,9 @@ covers.
 - QUIC session resumption and 0-RTT.
 - Windows beyond one process: it is experimental, with no shards, no `SIGHUP`
   and no response compression yet.
+
+[What Garuda 2 does not have](COMPATIBILITY.md#what-garuda-2-does-not-have)
+lists what Garuda 1 had.
 
 ## Documentation
 

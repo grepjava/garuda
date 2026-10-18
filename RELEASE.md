@@ -75,7 +75,15 @@ nothing relevant.
 
 ## 2.1.1 — unreleased
 
-Nothing yet.
+- The README opens with a handler that awaits a PostgreSQL query and throws
+  an `HTTPError`, which is what most handlers look like, where every snippet
+  before the middleware section used to be an `async` closure that never
+  suspended. The quick start is a five-line application with no database.
+  The opening is shorter: the runtime, shards and crash semantics are one
+  paragraph with links, the middleware list is grouped by purpose, the
+  database, streaming and upload prose is cut to what a first reader needs,
+  and the axum side-by-side, the release line and the Kitura note move to
+  the sections about them.
 
 ---
 
