@@ -6,7 +6,7 @@ have been deleted rather than left where they would be read as its history.
 Nothing below them was ever published as Garuda.
 
 **Keeping this file.** A change someone using Garuda would notice gets a line
-under the version being prepared -- now [2.1.1](#211--unreleased) -- in the
+under the version being prepared -- now [2.1.2](#212--unreleased) -- in the
 commit that makes it. When a version is cut, its heading gets the date, and a
 new section for the next version goes above it.
 
@@ -73,9 +73,15 @@ nothing relevant.
 
 ---
 
-## 2.1.1 — unreleased
+## 2.1.2 — unreleased
 
-Fixes for 2.1.0 on Linux.
+Nothing yet.
+
+---
+
+## 2.1.1 — 2026-10-19
+
+Fixes for 2.1.0, which does not build on Linux: use 2.1.1.
 
 - **Garuda builds on Linux again.** The process supervisor's code (`--reload`,
   the reload log) still matched Vega's `ShardEvent` and `ShardWatchAction` as
@@ -102,6 +108,8 @@ Fixes for 2.1.0 on Linux.
 ---
 
 ## 2.1.0 — 2026-10-19
+
+**Does not build on Linux; use 2.1.1.**
 
 Garuda on Vega 1.0.0 and vega-db 0.3.0. An application's code is unchanged:
 handlers, middleware, configuration and the command line work as in 2.0.0,

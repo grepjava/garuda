@@ -50,7 +50,7 @@ This project is an independent effort. It is not an IBM product, and it is not a
   <a href="https://github.com/grepjava/garuda/blob/main/LICENSE"><img src="https://img.shields.io/github/license/grepjava/garuda" alt="MIT license"></a>
 </p>
 
-**Garuda 2.1.0 is released** (2026-10-19, on Vega 1.0; [RELEASE.md](RELEASE.md)
+**Garuda 2.1.1 is released** (2026-10-19, on Vega 1.0; [RELEASE.md](RELEASE.md)
 has what changed). Garuda 1 (1.1) stays on the `release/1.x` branch.
 [COMPATIBILITY.md](COMPATIBILITY.md) is the guide to moving from Garuda 1 to
 Garuda 2, and [Status](#status) below lists what Garuda 2 does not have yet.
@@ -841,7 +841,7 @@ checks, and how to run them under AddressSanitizer.
 
 ## Status
 
-Garuda 2.1.0 is the current release. Garuda 1 stays on `release/1.x`; an
+Garuda 2.1.1 is the current release. Garuda 1 stays on `release/1.x`; an
 application not ready to move pins `from: "1.1.0"`. From 2.0 on, Garuda
 follows semantic versioning, and
 [COMPATIBILITY.md](COMPATIBILITY.md#versions-from-20-on) says what that
