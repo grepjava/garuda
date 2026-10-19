@@ -669,7 +669,9 @@ app.post("/hash") { (body: Body<Credentials>) async throws -> HTTPStatus in
 
 `Passwords.hash` and `Passwords.verify` already do this, and VegaFS does it
 for the file system. `--blocking-threads` sizes the pool, and
-`--blocking-queue` bounds what may wait for it.
+`--blocking-queue` bounds what may wait for it: `Runtime.blocking` waits
+whatever the queue, and `Runtime.tryBlocking` returns nil when it is full,
+for a handler to answer with `throw BlockingQueueFull()` (503).
 
 A route whose whole handler is the blocking work can say so where it is
 declared instead:

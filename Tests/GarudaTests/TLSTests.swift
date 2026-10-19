@@ -68,7 +68,9 @@ func https(_ app: Application, _ store: CertificateStore, serverName: String?, t
         defer { Task { await server.shutdown(gracePeriod: .seconds(1)) } }
         let tcp = try await TCPStream.connect(to: SocketAddress(host: "127.0.0.1", port: port))
         let tls = try await TLSStream.connect(tcp, serverName: serverName, context: client)
-        try await tls.write(UnsafeRawBufferPointer(start: request, count: request.utf8.count))
+        var out = IOBuffer(capacity: request.utf8.count)
+        out.append(request)
+        try await tls.write(out)
         var buffer = IOBuffer(capacity: 64 * 1024)
         while try await tls.read(into: &buffer) > 0 {}
         return (buffer.string, tls.peerCertificate, tls.applicationProtocol)

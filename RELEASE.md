@@ -6,7 +6,7 @@ have been deleted rather than left where they would be read as its history.
 Nothing below them was ever published as Garuda.
 
 **Keeping this file.** A change someone using Garuda would notice gets a line
-under the version being prepared -- now [2.1.1](#211--unreleased) -- in the
+under the version being prepared -- now [2.1.2](#212--unreleased) -- in the
 commit that makes it. When a version is cut, its heading gets the date, and a
 new section for the next version goes above it.
 
@@ -73,7 +73,7 @@ nothing relevant.
 
 ---
 
-## 2.1.1 — unreleased
+## 2.1.2 — unreleased
 
 - The README opens with a handler that awaits a PostgreSQL query and throws
   an `HTTPError`, which is what most handlers look like, where every snippet
@@ -87,7 +87,37 @@ nothing relevant.
 
 ---
 
+## 2.1.1 — 2026-10-19
+
+Fixes for 2.1.0, which does not build on Linux: use 2.1.1.
+
+- **Garuda builds on Linux again.** The process supervisor's code (`--reload`,
+  the reload log) still matched Vega's `ShardEvent` and `ShardWatchAction` as
+  enums; in Vega 1.0 they are structs. 2.1.0 built on macOS and Windows, which
+  do not compile that code, and failed on Linux.
+- **`--blocking-queue` refuses again.** In Vega 1.0 `Runtime.blocking` always
+  waits its turn, and `Runtime.tryBlocking` is the call that refuses. 2.1.0's
+  `app.offload` routes called `blocking`, so past `--blocking-queue` they
+  queued instead of answering 503; they call `tryBlocking` now.
+- **A handler's own `Runtime.blocking` no longer answers 503** past
+  `--blocking-queue`, as it did in 2.0: it waits for a thread. Work that should
+  be refused calls `Runtime.tryBlocking` and throws `BlockingQueueFull()` when
+  it returns nil:
+
+  ```swift
+  guard let hash = try await Runtime.tryBlocking({ try expensiveHash(password) }) else {
+      throw BlockingQueueFull()
+  }
+  ```
+- **The tests build with Swift 6.4 on macOS**, whose Darwin overlay makes
+  `system` unavailable, and a TLS test no longer writes its request from a
+  pointer that outlived the string it came from.
+
+---
+
 ## 2.1.0 — 2026-10-19
+
+**Does not build on Linux; use 2.1.1.**
 
 Garuda on Vega 1.0.0 and vega-db 0.3.0. An application's code is unchanged:
 handlers, middleware, configuration and the command line work as in 2.0.0,

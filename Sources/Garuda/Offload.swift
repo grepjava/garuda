@@ -105,15 +105,19 @@ func offloading<each E: Sendable, R: Sendable>(
     _ handler: @escaping @Sendable (repeat each E) throws -> R
 ) -> @concurrent @Sendable (repeat each E) async throws -> R {
     { (values: repeat each E) async throws -> R in
-        try await Runtime.blocking { try handler(repeat each values) }
+        guard let result = try await Runtime.tryBlocking({ try handler(repeat each values) }) else {
+            throw BlockingQueueFull()
+        }
+        return result
     }
 }
 
 /// --blocking-queue: the shard's blocking pool lets that much work wait for
 /// a thread (ShardConfiguration.blockingQueue), and refuses more with
 /// `BlockingQueueFull`, which answers 503 -- for `app.offload` routes and
-/// for any handler's own `Runtime.blocking`, as Garuda 1's pool refused
-/// whatever was handed to it. Work left to wait longer than any client
+/// for a handler's own `Runtime.tryBlocking` that comes back nil, as Garuda
+/// 1's pool refused whatever was handed to it. `Runtime.blocking` always
+/// waits its turn. Work left to wait longer than any client
 /// will is worse than none: a pool that cannot keep up only gets further
 /// behind, and a refusal says so at once.
 extension BlockingQueueFull: ResponseError {
