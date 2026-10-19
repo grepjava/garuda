@@ -95,6 +95,9 @@ Fixes for 2.1.0 on Linux.
       throw BlockingQueueFull()
   }
   ```
+- **The tests build with Swift 6.4 on macOS**, whose Darwin overlay makes
+  `system` unavailable, and a TLS test no longer writes its request from a
+  pointer that outlived the string it came from.
 
 ---
 

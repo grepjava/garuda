@@ -70,12 +70,29 @@ final class Site {
     #else
     func link(_ name: String, to target: String) { symlink(target, path + name) }
 
-    deinit {
-        let command = "rm -rf '\(path)'"
-        _ = command.withCString { system($0) }
-    }
+    deinit { removeTree(path) }
     #endif
 }
+
+#if !os(Windows)
+/// `rm -rf`, without a shell: Swift 6.4's Darwin overlay makes `system`
+/// unavailable. A symlink is unlinked, never followed; only a directory
+/// refuses `unlink`, and is emptied and removed.
+private func removeTree(_ path: String) {
+    if unlink(path) == 0 { return }
+    guard let dir = opendir(path) else { return }
+    var names: [String] = []
+    while let entry = readdir(dir) {
+        let name = withUnsafePointer(to: &entry.pointee.d_name) {
+            String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self))
+        }
+        if name != "." && name != ".." { names.append(name) }
+    }
+    closedir(dir)
+    for name in names { removeTree(path + "/" + name) }
+    rmdir(path)
+}
+#endif
 
 private func pattern(_ count: Int) -> [UInt8] {
     (0..<count).map { UInt8(truncatingIfNeeded: $0 &* 131 &+ 7) }
