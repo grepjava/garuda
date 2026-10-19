@@ -544,7 +544,7 @@ app.get("/person/:id") { (id: Path<Int>) async in
 }
 ```
 
-| Area | axum (Tokio) | Garuda |
+| Area | axum (Tokio) | Garuda (Vega) |
 |---|---|---|
 | Async handlers | `async fn` on a work-stealing pool | async closures on Vega's work-stealing threads; a handler that does not suspend runs inline in the task that read the request, allocating nothing |
 | Spreading load over cores | Idle threads steal tasks from busy ones | The same inside a shard. Shards are processes and do not steal from each other; the kernel spreads connections across them ([differs](#shards-are-processes)) |
