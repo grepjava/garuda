@@ -547,12 +547,12 @@ app.get("/person/:id") { (id: Path<Int>) async in
 | Area | axum (Tokio) | Garuda (Vega) |
 |---|---|---|
 | Async handlers | `async fn` on a work-stealing pool | async closures on Vega's work-stealing threads; a handler that does not suspend runs inline in the task that read the request, allocating nothing |
-| Spreading load over cores | Idle threads steal tasks from busy ones | The same inside a shard. Shards are processes and do not steal from each other; the kernel spreads connections across them ([differs](#shards-are-processes)) |
+| Spreading load over cores | Idle threads steal tasks from busy ones | The same inside a shard. Shards are processes and do not steal from each other; the kernel spreads connections across them ([differs](#shards-are-processes)). With `--shards 0`, one process whose threads steal from each other: axum's shape |
 | Slow handlers | Share the pool with everything else | A route that holds its thread for long runs in the heavy lane, on at most half a shard's threads |
 | Typed extraction | `Path`, `Query`, `Json`, `Form`, `Multipart` | `Path`, `Query`, `Body`, `Form`, `Multipart` |
 | Custom extractors | `FromRequestParts`, `FromRequest`, `Option<T>`, `Result<T, E>` | `RequestExtractor`, whose `extract` may await; `E?`, `Result<E, any Error>` |
 | OpenAPI | utoipa or aide, with derive macros | `app.openAPI`, `app.swaggerUI`; schemas read from `Decodable` types |
-| State | `State<T>`, one `Arc` shared by every thread | `State<T>`, built in each shard and shared by its threads ([differs](#shards-are-processes)) |
+| State | `State<T>`, one `Arc` shared by every thread | `State<T>`, built in each shard and shared by its threads ([differs](#shards-are-processes)); with `--shards 0`, one value shared by every thread, as in axum |
 | Request-scoped values | `Extension<T>` | `request[context:]`, `Context<Key>` |
 | Errors as responses | `IntoResponse` | `ResponseError`, `HTTPError` |
 | Protocols | HTTP/1.1 and HTTP/2 through hyper | HTTP/1.1, HTTP/2 and HTTP/3 |
