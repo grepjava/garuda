@@ -13,6 +13,40 @@ kept at [benchmarks/web-frameworks/swift/garuda](benchmarks/web-frameworks/swift
 [DEPLOYMENT.md](DEPLOYMENT.md#the-web-frameworks-entry) says what it must
 keep doing.
 
+## Garuda 2.1 against 2.0
+
+2.1 moves Garuda onto Vega 1.0 and changes no engine code, and it measures
+the same as 2.0. Run on 2026-10-19 on the 2.0.0 run's box, drivers and
+settings, with fresh builds of both tags (2.1 with 2.1.1's Linux fixes) and
+the servers taking turns to go first. Each figure is the median of six rounds,
+or four for HTTP/3 and hello world:
+
+| | Garuda 2.0 | Garuda 2.1 | 2.1 against 2.0 | axum 0.8 | 2.1 against axum |
+|---|---:|---:|---:|---:|---:|
+| user | 141,352 | 141,572 | +0.2% | 128,814 | +9.9% |
+| json | 123,416 | 122,438 | -0.8% | 103,547 | +18.2% |
+| churn | 25,072 | 25,128 | +0.2% | 24,898 | +0.9% |
+| skew | 124,084 | 125,554 | +1.2% | 11,806 | +963% |
+| spike | 126,720 | 127,475 | +0.6% | 35,096 | +263% |
+| h2 | 95,317 | 95,613 | +0.3% | 94,229 | +1.5% |
+| stream | 36,264 | 36,342 | +0.2% | 31,484 | +15.4% |
+| download | 2,078 | 2,074 | -0.2% | 2,084 | -0.5% |
+| upload | 2,172 | 2,170 | -0.1% | 1,362 | +59.4% |
+| db | 29,195 | 29,171 | -0.1% | 32,644 | -10.6% |
+| HTTPS/1.1 | 113,342 | 113,458 | +0.1% | | |
+| HTTP/2 over TLS | 71,632 | 71,784 | +0.2% | | |
+| HTTP/3 | 50,934 | 51,261 | +0.6% | | |
+| HTTP/2, 8 streams | 138,670 | 138,038 | -0.5% | | |
+| HTTP/3, 8 streams | 137,802 | 138,154 | +0.3% | | |
+| hello, closed | 152,748 | 153,322 | +0.4% | 122,049 | +25.6% |
+| hello, pinned | 89,679 | 90,228 | +0.6% | 76,678 | +17.7% |
+
+CPU a request is the same for both to within 1 µs in every row. Hello
+world's ramp pass is left out: both versions land at about 147k or about
+203k from one run to the next, so its median says which way the runs fell.
+The raw logs and the driver are in
+[benchmarks/results/2.1](benchmarks/results/2.1).
+
 ## Garuda 2 against Garuda 1 and axum
 
 The 2.0.0 run, in brief: one i5-8250U with its clock capped at 2.4 GHz, the
