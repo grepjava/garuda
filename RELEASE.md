@@ -84,6 +84,8 @@ nothing relevant.
   database, streaming and upload prose is cut to what a first reader needs,
   and the axum side-by-side, the release line and the Kitura note move to
   the sections about them.
+- The README says that Garuda 2 is rebuilt on Vega, a new I/O and runtime
+  package modelled after Tokio, in place of aviancore.
 
 ---
 

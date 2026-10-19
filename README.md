@@ -78,11 +78,12 @@ databases, resumable uploads and the test client are products of their own:
 copy from: a todo API, sign-in, streaming, chat, WebTransport, a file
 service, per-user uploads, and a starter.
 
-**How it runs.** Handlers run on [Vega](https://github.com/grepjava/vega), a
-work-stealing runtime for Swift in the shape of Tokio: an idle thread takes
-waiting work from a busy one at any `await`, and a handler that never
-suspends runs inline in the task that read its request, with nothing
-allocated. On Linux a supervisor runs the application as several **shard**
+**How it runs.** Garuda 2 is rebuilt on [Vega](https://github.com/grepjava/vega),
+a new I/O and runtime package for Swift modelled after Tokio, which replaces
+the [aviancore](https://github.com/grepjava/aviancore) engine Garuda 1 ran on.
+Vega is work-stealing: an idle thread takes waiting work from a busy one at
+any `await`, and a handler that never suspends runs inline in the task that
+read its request, with nothing allocated. On Linux a supervisor runs the application as several **shard**
 processes, each a runtime over a few threads, so a crash takes only that
 shard's connections and the shard is started again. [Shards are
 processes](#shards-are-processes) says what that means for state, and
