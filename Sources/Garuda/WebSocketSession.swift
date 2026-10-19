@@ -351,8 +351,9 @@ final class WebSocketSession: @unchecked Sendable {
             }
             let wait = nextWait()
             do {
+                // An idle socket's wait holds no buffer (readHoldingNothing).
                 let n = try await Runtime.withIOTimeout(for: wait, trigger: wake) { () async throws(IOError) -> Int in
-                    try await reader.read(into: &input)
+                    try await readHoldingNothing(reader, into: &input, capacity: 16 * 1024)
                 }
                 if n == 0 { break reading }
                 lastHeard = monotonicNanos()

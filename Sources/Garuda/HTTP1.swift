@@ -433,18 +433,59 @@ struct HTTP1Client: ~Copyable {
                 try await failAndClose(stream, status: 431, headParsed: false)
                 return false
             }
-            makeRoom(for: limits.maxHeadSize)
             let timeout = available == 0 ? limits.keepAliveTimeout : limits.requestHeadTimeout
             let n: Int
-            if available == 0 && limits.requestStart {
-                n = try await readArrival(stream, parts, timeout: timeout)
+            if available == 0 && !limits.requestStart {
+                n = try await receiveIdle(stream, timeout: timeout)
             } else {
-                n = try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Int in
-                    try await stream.read(into: &parts.pointee.input)
+                makeRoom(for: limits.maxHeadSize)
+                if available == 0 {
+                    n = try await readArrival(stream, parts, timeout: timeout)
+                } else {
+                    n = try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Int in
+                        try await stream.read(into: &parts.pointee.input)
+                    }
                 }
             }
             if n == 0 { return false }
         }
+    }
+
+    /// Waits for the next request holding no buffer: the read buffer and
+    /// the output buffer go back while the client is quiet, and are taken
+    /// again once its bytes come (Vega's `receive()` lends the storage they
+    /// arrive in). The bytes received, 0 at the end of the stream.
+    mutating func receiveIdle<S: AsyncReader & ~Copyable>(_ stream: borrowing S, timeout: Duration) async throws(IOError) -> Int {
+        parts.pointee.input.clear()
+        start = 0
+        parts.pointee.input.releaseStorage()
+        cache.parkOutput(&parts.pointee.output)
+        let parts = self.parts, size = limits.readBufferSize
+        let n: Int
+        do throws(IOError) {
+            n = try await Runtime.withIOTimeout(for: timeout) { () async throws(IOError) -> Int in
+                let bytes = try await stream.receive()
+                return bytes.withUnsafeBytes { received in
+                    if received.count > 0 {
+                        parts.pointee.input.reserveCapacity(Swift.max(received.count, size))
+                        _ = parts.pointee.input.append(received)
+                    }
+                    return received.count
+                }
+            }
+        } catch {
+            restoreBuffers()
+            throw error
+        }
+        restoreBuffers()
+        return n
+    }
+
+    /// The buffers `receiveIdle` gave back, taken again.
+    mutating func restoreBuffers() {
+        if parts.pointee.input.capacity == 0 { parts.pointee.input.reserveCapacity(limits.readBufferSize) }
+        cache.restoreOutput(&parts.pointee.output)
+        rebase()
     }
 
     /// Reads the request's body, of at most `limit` bytes: in place for a

@@ -618,14 +618,20 @@ final class H2Connection: @unchecked Sendable {
                 failed = true
                 break
             }
-            if parts.pointee.input.spareCapacity < HTTP2FrameHeader.size + settings.maxFrameSize {
-                parts.pointee.input.reserveCapacity(parts.pointee.input.capacity * 2)
+            // Room for a whole frame behind a partial one. With nothing in
+            // the buffer, the read waits holding no storage, and takes a
+            // receive block's worth again.
+            if parts.pointee.input.count > 0,
+               parts.pointee.input.spareCapacity < HTTP2FrameHeader.size + settings.maxFrameSize {
+                parts.pointee.input.reserveCapacity(
+                    max(parts.pointee.input.capacity * 2, parts.pointee.input.count + HTTP2FrameHeader.size + settings.maxFrameSize))
             }
             do {
                 // Woken at least this often to look at idleness and stalled
                 // uploads; a read interrupted this way has read nothing.
+                let capacity = limits.readBufferSize
                 let n = try await Runtime.withIOTimeout(for: limits.keepAliveTimeout) { () async throws(IOError) -> Int in
-                    try await reader.read(into: &parts.pointee.input)
+                    try await readHoldingNothing(reader, into: &parts.pointee.input, capacity: capacity)
                 }
                 if n == 0 { break }
             } catch let error where error == .timedOut {

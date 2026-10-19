@@ -12,11 +12,17 @@
 // worker thread it ended on, and the next connection on that thread takes
 // them. Each list is only ever touched by its own worker, so it needs no
 // lock. Parts that grew large -- a big body -- are freed instead of kept.
+//
+// A connection waiting for its next request holds neither buffer: the read
+// buffer goes back to Vega's receive blocks and the output buffer to a list
+// here, each worker's own, and the request that ends the wait takes them
+// again (`parkOutput`, `restoreOutput`).
 //===----------------------------------------------------------------------===//
 
 import VegaWire
 import GarudaWire
 import Vega
+import VegaIO
 
 /// The memory one HTTP/1 connection uses, reused from connection to
 /// connection.
@@ -38,7 +44,7 @@ struct ConnectionParts: ~Copyable {
     init(limits: ConnectionLimits, peer: SocketPeer) {
         input = IOBuffer(capacity: limits.readBufferSize)
         output = ByteBuffer()
-        output.reserve(4096)
+        output.reserve(ConnectionCache.outputSize)
         exchange = .allocate(capacity: 1)
         exchange.initialize(to: Exchange(maxHeaders: limits.maxHeaders, remote: peer))
         arrival = .allocate(capacity: 1)
@@ -61,8 +67,16 @@ final class ConnectionCache: @unchecked Sendable {
     /// Parts kept by each worker.
     static let depth = 32
 
+    /// The size of an output buffer as made, and of those kept while their
+    /// connections wait.
+    static let outputSize = 4096
+    /// Output buffers kept by each worker.
+    static let outputDepth = 64
+
     private let lists: UnsafeMutablePointer<UnsafeMutablePointer<ConnectionParts>?>
     private let counts: UnsafeMutablePointer<Int>
+    private let outputs: UnsafeMutablePointer<UnsafeMutableRawPointer?>
+    private let outputCounts: UnsafeMutablePointer<Int>
 
     init() {
         let slots = ConnectionCache.maxWorkers * ConnectionCache.depth
@@ -70,6 +84,11 @@ final class ConnectionCache: @unchecked Sendable {
         lists.initialize(repeating: nil, count: slots)
         counts = .allocate(capacity: ConnectionCache.maxWorkers)
         counts.initialize(repeating: 0, count: ConnectionCache.maxWorkers)
+        let outputSlots = ConnectionCache.maxWorkers * ConnectionCache.outputDepth
+        outputs = .allocate(capacity: outputSlots)
+        outputs.initialize(repeating: nil, count: outputSlots)
+        outputCounts = .allocate(capacity: ConnectionCache.maxWorkers)
+        outputCounts.initialize(repeating: 0, count: ConnectionCache.maxWorkers)
     }
 
     deinit {
@@ -77,9 +96,50 @@ final class ConnectionCache: @unchecked Sendable {
             for i in 0..<counts[w] {
                 if let p = lists[w * ConnectionCache.depth + i] { free(p) }
             }
+            for i in 0..<outputCounts[w] {
+                if let p = outputs[w * ConnectionCache.outputDepth + i] { ConnectionCache.freeOutput(p) }
+            }
         }
         lists.deallocate()
         counts.deallocate()
+        outputs.deallocate()
+        outputCounts.deallocate()
+    }
+
+    /// Take `output`'s storage while its connection waits: kept for this
+    /// worker's next `restoreOutput` if it is the usual size, else freed.
+    /// `output` must hold nothing.
+    func parkOutput(_ output: inout ByteBuffer) {
+        let (p, capacity) = output.release()
+        guard let p else { return }
+        if capacity == ConnectionCache.outputSize, let w = Runtime.currentWorker, w < ConnectionCache.maxWorkers,
+           outputCounts[w] < ConnectionCache.outputDepth {
+            outputs[w * ConnectionCache.outputDepth + outputCounts[w]] = p
+            outputCounts[w] += 1
+            return
+        }
+        ConnectionCache.freeOutput(p, capacity: capacity)
+    }
+
+    /// Free output storage the way `ByteBuffer` frees its own.
+    private static func freeOutput(_ p: UnsafeMutableRawPointer, capacity: Int = outputSize) {
+        var buffer = ByteBuffer(adopting: p, capacity: capacity)
+        buffer.destroy()
+    }
+
+    /// Storage for `output` again, if `parkOutput` took it.
+    func restoreOutput(_ output: inout ByteBuffer) {
+        guard output.allocatedCapacity == 0 else { return }
+        if let w = Runtime.currentWorker, w < ConnectionCache.maxWorkers, outputCounts[w] > 0 {
+            outputCounts[w] -= 1
+            let slot = w * ConnectionCache.outputDepth + outputCounts[w]
+            if let p = outputs[slot] {
+                outputs[slot] = nil
+                output = ByteBuffer(adopting: p, capacity: ConnectionCache.outputSize)
+                return
+            }
+        }
+        output.reserve(ConnectionCache.outputSize)
     }
 
     /// Parts for a new connection to `peer`: this worker's spare, or new.
@@ -90,8 +150,12 @@ final class ConnectionCache: @unchecked Sendable {
             if let p = lists[slot] {
                 lists[slot] = nil
                 // Made under other limits (a test client's): not these.
+                // (A connection that ended while it waited gave its
+                // buffers back: no capacity, and they are taken again.)
                 if p.pointee.exchange.pointee.maxHeaders == limits.maxHeaders
-                    && p.pointee.input.capacity >= limits.readBufferSize {
+                    && (p.pointee.input.capacity >= limits.readBufferSize || p.pointee.input.capacity == 0) {
+                    if p.pointee.input.capacity == 0 { p.pointee.input.reserveCapacity(limits.readBufferSize) }
+                    restoreOutput(&p.pointee.output)
                     p.pointee.exchange.pointee.remote = peer
                     metrics?.add(.poolHits)
                     return p
@@ -135,4 +199,26 @@ final class ConnectionCache: @unchecked Sendable {
         p.deinitialize(count: 1)
         p.deallocate()
     }
+}
+
+/// A read into `input` that holds no storage while it waits, when `input`
+/// is empty: its storage goes back, Vega's `receive()` waits with none, and
+/// `input` takes `capacity` bytes again (or room for what came, if more)
+/// once bytes arrive -- or the wait ends otherwise. With bytes in `input`,
+/// a plain read after them.
+func readHoldingNothing<R: AsyncReader & ~Copyable>(
+    _ reader: borrowing R, into input: inout IOBuffer, capacity: Int
+) async throws(IOError) -> Int {
+    guard input.count == 0 else { return try await reader.read(into: &input) }
+    input.releaseStorage()
+    let bytes: ReceivedBytes
+    do throws(IOError) {
+        bytes = try await reader.receive()
+    } catch {
+        input.reserveCapacity(capacity)
+        throw error
+    }
+    input.reserveCapacity(Swift.max(capacity, bytes.count))
+    input.append(bytes)
+    return bytes.count
 }
