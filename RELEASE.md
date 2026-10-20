@@ -6,7 +6,7 @@ have been deleted rather than left where they would be read as its history.
 Nothing below them was ever published as Garuda.
 
 **Keeping this file.** A change someone using Garuda would notice gets a line
-under the version being prepared -- now [2.1.2](#212--unreleased) -- in the
+under the version being prepared -- now [2.2.0](#220--unreleased) -- in the
 commit that makes it. When a version is cut, its heading gets the date, and a
 new section for the next version goes above it.
 
@@ -73,8 +73,25 @@ nothing relevant.
 
 ---
 
-## 2.1.2 — unreleased
+## 2.2.0 — unreleased
 
+Needs Vega 1.1.
+
+- **Idle connections give their buffers back.** An HTTP/1.1 or HTTP/2
+  connection that has been quiet for `--idle-buffers` milliseconds (100;
+  `ServerConfig.idleBufferDelay`) returns its read buffer to Vega's receive
+  blocks and its output buffer to a per-worker list, and waits in Vega's
+  `receive()`, which holds no buffer, until it is sent more. A WebSocket
+  reader does so as soon as it has nothing buffered. With 20,000 idle
+  keep-alive connections a connection costs 21.5 KiB of the server's memory
+  where it cost 27.0 (20.2 with `--idle-buffers 0`), and with 5,000 over TLS
+  24.5 KiB where it cost 41.2.
+- **`--idle-buffers MS|off`.** `0` gives the buffers back as soon as a
+  connection has nothing to read; `off` (`nil`) keeps them, as 2.1 did. The
+  100 ms default keeps a busy connection, whose next request is usually a
+  fraction of a millisecond away, from giving its buffers back and taking
+  them again for every request: doing that cost 3–7% of throughput on the
+  keep-alive workloads, and with the delay they measure as 2.1 does.
 - The README opens with a handler that awaits a PostgreSQL query and throws
   an `HTTPError`, which is what most handlers look like, where every snippet
   before the middleware section used to be an `async` closure that never

@@ -48,6 +48,20 @@ private func refused(_ flags: [String]) -> Bool {
         }
     }
 
+    @Test func idleBuffersTakeMillisecondsOrOff() {
+        #expect(parsed([])?.idleBufferDelay == .milliseconds(100))
+        #expect(parsed(["--idle-buffers", "250"])?.idleBufferDelay == .milliseconds(250))
+        #expect(parsed(["--idle-buffers", "0"])?.idleBufferDelay == .zero)
+        if let config = parsed(["--idle-buffers", "off"]) {
+            #expect(config.idleBufferDelay == nil)
+        } else {
+            Issue.record("--idle-buffers off did not parse")
+        }
+        for bad in [["--idle-buffers", "-1"], ["--idle-buffers", "1s"], ["--idle-buffers"]] {
+            #expect(refused(bad), "\(bad) parsed")
+        }
+    }
+
     @Test func limitsAndListeningAreParsed() {
         #if os(Windows)
         // No unix sockets to serve on there: the flag is refused.

@@ -440,6 +440,9 @@ extension ServerConfig {
           --max-connections N  connections a shard has open at once; more
                                wait in the backlog (default: no limit)
           --keep-alive MS      idle keep-alive timeout (default 5000)
+          --idle-buffers MS|off
+                               a connection quiet this long gives its buffers
+                               back until it is sent more (default 100)
           --request-timeout MS how long a request may stall mid-message,
                                head or body, or its answer go unread
                                (default 30000)
@@ -845,6 +848,15 @@ extension ServerConfig {
                     return fail("--keep-alive must be milliseconds")
                 }
                 config.keepAliveTimeout = .milliseconds(n)
+            case "--idle-buffers":
+                let v = value()
+                if v == "off" {
+                    config.idleBufferDelay = nil
+                } else if let n = v.flatMap({ Int($0) }), n >= 0 {
+                    config.idleBufferDelay = .milliseconds(n)
+                } else {
+                    return fail("--idle-buffers must be milliseconds or off")
+                }
             case "--sse-keep-alive":
                 guard let n = value().flatMap({ Int($0) }), n >= 0 else {
                     return fail("--sse-keep-alive must be a number of seconds")

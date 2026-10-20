@@ -629,9 +629,9 @@ final class H2Connection: @unchecked Sendable {
             do {
                 // Woken at least this often to look at idleness and stalled
                 // uploads; a read interrupted this way has read nothing.
-                let capacity = limits.readBufferSize
+                let capacity = limits.readBufferSize, delay = limits.idleBufferDelay
                 let n = try await Runtime.withIOTimeout(for: limits.keepAliveTimeout) { () async throws(IOError) -> Int in
-                    try await readHoldingNothing(reader, into: &parts.pointee.input, capacity: capacity)
+                    try await readHoldingNothing(reader, into: &parts.pointee.input, capacity: capacity, after: delay)
                 }
                 if n == 0 { break }
             } catch let error where error == .timedOut {

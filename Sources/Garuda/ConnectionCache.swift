@@ -202,14 +202,29 @@ final class ConnectionCache: @unchecked Sendable {
 }
 
 /// A read into `input` that holds no storage while it waits, when `input`
-/// is empty: its storage goes back, Vega's `receive()` waits with none, and
-/// `input` takes `capacity` bytes again (or room for what came, if more)
-/// once bytes arrive -- or the wait ends otherwise. With bytes in `input`,
-/// a plain read after them.
+/// is empty and nothing has come for `delay` (nil: never): its storage goes
+/// back, Vega's `receive()` waits with none, and `input` takes `capacity`
+/// bytes again (or room for what came, if more) once bytes arrive -- or the
+/// wait ends otherwise. With bytes in `input`, a plain read after them.
+/// The delay is a deadline of its own: one the caller's scope holds (a
+/// trigger) waits for the delay to end before it is seen.
 func readHoldingNothing<R: AsyncReader & ~Copyable>(
-    _ reader: borrowing R, into input: inout IOBuffer, capacity: Int
+    _ reader: borrowing R, into input: inout IOBuffer, capacity: Int, after delay: Duration?
 ) async throws(IOError) -> Int {
-    guard input.count == 0 else { return try await reader.read(into: &input) }
+    guard input.count == 0, let delay else {
+        if input.capacity == 0 { input.reserveCapacity(capacity) }
+        return try await reader.read(into: &input)
+    }
+    if delay > .zero {
+        if input.capacity == 0 { input.reserveCapacity(capacity) }
+        do throws(IOError) {
+            return try await Runtime.withIOTimeout(for: delay) { () async throws(IOError) -> Int in
+                try await reader.read(into: &input)
+            }
+        } catch {
+            if error != .timedOut { throw error }
+        }
+    }
     input.releaseStorage()
     let bytes: ReceivedBytes
     do throws(IOError) {

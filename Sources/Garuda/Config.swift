@@ -68,6 +68,13 @@ public struct ServerConfig: Sendable {
     // --- timeouts ---
     /// How long an idle keep-alive connection is kept.
     public var keepAliveTimeout: Duration = .seconds(5)
+    /// How long a connection waiting for its next request (or HTTP/2 frame)
+    /// keeps its read and output buffers: past it they go back, and the
+    /// wait holds none until bytes arrive. A busy client's next request is
+    /// rarely further behind its last answer, so it keeps them; an idle
+    /// connection costs no buffer. Zero gives them back at once; nil keeps
+    /// them for as long as the connection lasts.
+    public var idleBufferDelay: Duration? = .milliseconds(100)
     /// How long a client has to send a whole request head once it has
     /// started one -- the slowloris bound.
     public var requestHeadTimeout: Duration = .seconds(30)

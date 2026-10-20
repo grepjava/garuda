@@ -148,6 +148,9 @@ rather than copied behind the head.
 ### Timeouts
 
 - An idle connection is closed after `--keep-alive` milliseconds (5000).
+- An HTTP/1.1 or HTTP/2 connection quiet for `--idle-buffers` milliseconds
+  (100) gives its buffers back and waits in Vega's `receive()` until it is
+  sent more.
 - Once a head has begun, each read of the rest of it may wait
   `--request-timeout` milliseconds (`ServerConfig.requestHeadTimeout`,
   30 s).
@@ -747,6 +750,7 @@ process ends.
 | `maxRequestsPerConnection` | none | 0 (unlimited) | HTTP/1.1 requests before `Connection: close` |
 | `pipelineDepth` | none | 16 | HTTP/1.1 answers written as one batch |
 | `keepAliveTimeout` | `--keep-alive MS` | 5 s | idle HTTP/1.1 and HTTP/2 connections, QUIC idle timeout |
+| `idleBufferDelay` | `--idle-buffers MS` | 100 ms | quiet time before an HTTP/1.1 or HTTP/2 connection gives its buffers back; `nil` keeps them |
 | `requestHeadTimeout` | `--request-timeout MS` | 30 s | each read of an HTTP/1.1 head once it has begun |
 | `bodyTimeout` | none | 30 s | a request body that stops arriving, on all three |
 | `tlsHandshakeTimeout` | none | 10 s | the TLS handshake over TCP |

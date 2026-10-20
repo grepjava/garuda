@@ -33,6 +33,8 @@ struct ConnectionLimits: Sendable {
     var maxRequests: Int
     var pipelineDepth: Int
     var keepAliveTimeout: Duration
+    /// --idle-buffers: see `Config.idleBufferDelay`.
+    var idleBufferDelay: Duration?
     var requestHeadTimeout: Duration
     var bodyTimeout: Duration
     /// What a streamed body is held to (StreamingResponse.swift).
@@ -98,6 +100,7 @@ struct ConnectionLimits: Sendable {
         maxRequests = config.maxRequestsPerConnection
         pipelineDepth = max(1, config.pipelineDepth)
         keepAliveTimeout = config.keepAliveTimeout
+        idleBufferDelay = config.idleBufferDelay
         requestHeadTimeout = config.requestHeadTimeout
         bodyTimeout = config.bodyTimeout
         writeTimeout = config.writeTimeout
@@ -435,8 +438,15 @@ struct HTTP1Client: ~Copyable {
             }
             let timeout = available == 0 ? limits.keepAliveTimeout : limits.requestHeadTimeout
             let n: Int
-            if available == 0 && !limits.requestStart {
-                n = try await receiveIdle(stream, timeout: timeout)
+            if available == 0 && !limits.requestStart, let delay = limits.idleBufferDelay {
+                // The idle wait is called from here, not from `readHeld`: a
+                // deeper async frame would stay with every idle connection.
+                let held = min(delay, timeout)
+                if held > .zero, let got = try await readHeld(stream, for: held, timeout: timeout) {
+                    n = got
+                } else {
+                    n = try await receiveIdle(stream, timeout: timeout - held)
+                }
             } else {
                 makeRoom(for: limits.maxHeadSize)
                 if available == 0 {
@@ -449,6 +459,26 @@ struct HTTP1Client: ~Copyable {
             }
             if n == 0 { return false }
         }
+    }
+
+    /// Waits up to `held` for the next request with the buffers kept: the
+    /// bytes read, 0 at the end of the stream, or nil once `held` has passed
+    /// and the wait goes on in `receiveIdle`. When `held` is the whole
+    /// `timeout`, its passing throws `.timedOut`.
+    mutating func readHeld<S: AsyncReader & ~Copyable>(
+        _ stream: borrowing S, for held: Duration, timeout: Duration
+    ) async throws(IOError) -> Int? {
+        makeRoom(for: limits.maxHeadSize)
+        let parts = self.parts
+        do throws(IOError) {
+            return try await Runtime.withIOTimeout(for: held) { () async throws(IOError) -> Int in
+                try await stream.read(into: &parts.pointee.input)
+            }
+        } catch {
+            // The delay's own deadline; a read it ends has read nothing.
+            if error != .timedOut || held == timeout { throw error }
+        }
+        return nil
     }
 
     /// Waits for the next request holding no buffer: the read buffer and
