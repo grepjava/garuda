@@ -25,55 +25,58 @@ import Vega
 import VegaIO
 
 /// What every connection is held to, worked out once from the config.
-struct ConnectionLimits: Sendable {
-    var readBufferSize: Int
-    var maxHeadSize: Int
-    var maxHeaders: Int
-    var maxBodySize: Int
-    var maxRequests: Int
-    var pipelineDepth: Int
-    var keepAliveTimeout: Duration
+/// A class: async frames that pass it along each hold a reference, not a
+/// copy of every field, which an idle connection would keep for as long as
+/// it waits.
+final class ConnectionLimits: Sendable {
+    let readBufferSize: Int
+    let maxHeadSize: Int
+    let maxHeaders: Int
+    let maxBodySize: Int
+    let maxRequests: Int
+    let pipelineDepth: Int
+    let keepAliveTimeout: Duration
     /// --idle-buffers: see `Config.idleBufferDelay`.
-    var idleBufferDelay: Duration?
-    var requestHeadTimeout: Duration
-    var bodyTimeout: Duration
+    let idleBufferDelay: Duration?
+    let requestHeadTimeout: Duration
+    let bodyTimeout: Duration
     /// What a streamed body is held to (StreamingResponse.swift).
-    var writeTimeout: Duration
-    var writeHighWaterMark: Int
-    var writeLowWaterMark: Int
-    var eventKeepAlive: Duration
+    let writeTimeout: Duration
+    let writeHighWaterMark: Int
+    let writeLowWaterMark: Int
+    let eventKeepAlive: Duration
     /// --request-id, and the proxies whose ID is kept: nil when there are
     /// none, so a connection copies no list it would not read (RequestID.swift).
-    var requestID: Bool
-    var requestIDTrust: ForwardedTrust?
+    let requestID: Bool
+    let requestIDTrust: ForwardedTrust?
     /// The proxies whose forwarded headers are believed, nil when there are
     /// none (Forwarded.swift).
-    var trust: ForwardedTrust?
-    var traceContext: Bool
+    let trust: ForwardedTrust?
+    let traceContext: Bool
     /// --scheme https (Forwarded.swift).
-    var assumeHTTPS: Bool
+    let assumeHTTPS: Bool
     /// --request-start-header: each request is stamped as it arrives.
-    var requestStart: Bool
+    let requestStart: Bool
     /// --access-log, as text or JSON (Logging.swift).
-    var accessLog: Bool
-    var accessLogJSON: Bool
+    let accessLog: Bool
+    let accessLogJSON: Bool
     /// HTTP/2's settings and limits (HTTP2.swift).
-    var http2: HTTP2Limits
+    let http2: HTTP2Limits
     /// --static-dir and --spa-fallback, or nil for neither (StaticFiles.swift).
-    var site: StaticSite?
+    let site: StaticSite?
     /// --compress and --compress-min-size (Compression.swift).
-    var compress: Bool
-    var compressMinimum: Int
+    let compress: Bool
+    let compressMinimum: Int
     /// --ws-* (WebSocket.swift).
-    var websocket: WebSocketLimits
+    let websocket: WebSocketLimits
     /// HTTP/3's settings and limits (HTTP3.swift).
-    var http3: HTTP3Limits
+    let http3: HTTP3Limits
     /// What the server adds to every answer that does not set its own:
     /// Alt-Svc over TCP when HTTP/3 is served, Strict-Transport-Security over
     /// TLS with --hsts. Nil where there is nothing to add.
-    var plainFields: ServerFields?
-    var secureFields: ServerFields?
-    var quicFields: ServerFields?
+    let plainFields: ServerFields?
+    let secureFields: ServerFields?
+    let quicFields: ServerFields?
 
     init(_ config: ServerConfig) {
         websocket = WebSocketLimits(config)
@@ -104,8 +107,9 @@ struct ConnectionLimits: Sendable {
         requestHeadTimeout = config.requestHeadTimeout
         bodyTimeout = config.bodyTimeout
         writeTimeout = config.writeTimeout
-        writeHighWaterMark = max(1, config.writeHighWaterMark)
-        writeLowWaterMark = min(max(0, config.writeLowWaterMark), writeHighWaterMark)
+        let highWaterMark = max(1, config.writeHighWaterMark)
+        writeHighWaterMark = highWaterMark
+        writeLowWaterMark = min(max(0, config.writeLowWaterMark), highWaterMark)
         eventKeepAlive = config.eventKeepAlive
         requestID = config.requestID
         requestIDTrust = config.requestID && !config.trust.isEmpty ? config.trust : nil

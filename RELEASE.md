@@ -83,9 +83,10 @@ Needs Vega 1.1.
   blocks and its output buffer to a per-worker list, and waits in Vega's
   `receive()`, which holds no buffer, until it is sent more. A WebSocket
   reader does so as soon as it has nothing buffered. With 20,000 idle
-  keep-alive connections a connection costs 21.5 KiB of the server's memory
-  where it cost 27.0 (20.2 with `--idle-buffers 0`), and with 5,000 over TLS
-  24.5 KiB where it cost 41.2.
+  keep-alive connections a connection costs 14.5 KiB of the server's memory
+  where it cost 27.0, and with 5,000 over TLS 18.3 KiB where it cost 41.2.
+  The limits a connection is held to are shared, not copied into each of its
+  waiting calls.
 - **`--idle-buffers MS|off`.** `0` gives the buffers back as soon as a
   connection has nothing to read; `off` (`nil`) keeps them, as 2.1 did. The
   100 ms default keeps a busy connection, whose next request is usually a
