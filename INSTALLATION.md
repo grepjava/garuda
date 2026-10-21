@@ -289,7 +289,9 @@ swift build -c release --product garuda-conformance
 The database tests skip themselves unless a database is reachable. The
 end-to-end suites in `scripts/` run the release binaries. The shell suites
 need `curl`, and some need `openssl` or `nc`. The HTTP/2, HTTP/3, handler and
-upload suites are Python test clients that need `h2` and `aioquic`.
+upload suites are Python test clients that need `h2` and `aioquic` 1.3.0
+(`pip install h2 aioquic==1.3.0`); aioquic 1.7.0 breaks the WebTransport
+client and one HTTP/3 cancellation check.
 
 `swift test` also replays the fuzz corpus (`GarudaFuzzTests`). The fuzzer
 itself runs longer, and is most useful under AddressSanitizer:

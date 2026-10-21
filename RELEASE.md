@@ -59,7 +59,9 @@ python3 scripts/upload-test.py         # 35, runs garuda-conformance
 python3 scripts/broadcast-test.py      # 36, runs garuda-conformance
 ```
 
-The Python suites need `h2` and `aioquic`.
+The Python suites need `h2` and `aioquic` 1.3.0: under aioquic 1.7.0
+`webtransport-test.py`'s client crashes and router-streams' HTTP/3
+cancellation check fails, neither for a reason in Garuda.
 
 `GARUDA_REDIS` is `host:port:password`, and the password is not optional for a
 full run: the suite has tests that a wrong password is refused and that an ACL
