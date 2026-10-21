@@ -75,7 +75,7 @@ nothing relevant.
 
 ## 2.2.0 — unreleased
 
-Needs Vega 1.1.
+Needs Vega 1.1: Garuda depends on it `from: "1.1.0"`.
 
 - **Idle connections give their buffers back.** An HTTP/1.1 or HTTP/2
   connection that has been quiet for `--idle-buffers` milliseconds (100;
