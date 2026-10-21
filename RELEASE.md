@@ -73,7 +73,7 @@ nothing relevant.
 
 ---
 
-## 2.2.0 — unreleased
+## 2.2.0 — 2026-10-21
 
 Needs Vega 1.1: Garuda depends on it `from: "1.1.0"`.
 

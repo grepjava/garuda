@@ -45,7 +45,7 @@ handler runs. `app.run()` reads the command line and serves.
 ```swift
 // Package.swift
 platforms: [.macOS("26.4")],
-dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "2.1.1")],
+dependencies: [.package(url: "https://github.com/grepjava/garuda", from: "2.2.0")],
 targets: [.executableTarget(name: "app", dependencies: [.product(name: "Garuda", package: "garuda")])]
 ```
 
@@ -737,7 +737,7 @@ checks, and how to run them under AddressSanitizer.
 
 ## Status
 
-Garuda 2.1.1 is the current release (2026-10-19; [RELEASE.md](RELEASE.md)
+Garuda 2.2.0 is the current release (2026-10-21; [RELEASE.md](RELEASE.md)
 has what changed). Garuda 1 stays on `release/1.x`; an application not ready
 to move pins `from: "1.1.0"`, and [COMPATIBILITY.md](COMPATIBILITY.md) is the
 guide to moving. From 2.0 on, Garuda follows semantic versioning.
